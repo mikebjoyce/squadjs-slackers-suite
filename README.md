@@ -1,4 +1,4 @@
-# SmartAssign Plugin v1.0.0
+# SmartAssign Plugin v0.1.3
 
 **Elo-Aware Auto Assignment & Player Lifecycle Logger**
 
@@ -6,10 +6,7 @@
 
 This plugin overrides Squad's native team assignment mechanics to provide smart, fair, and reliable team placements. It perfectly tracks player joins, disconnects, and team changes without relying on buggy game log events, providing highly accurate JSONL lifecycle logs. 
 
-When a player joins the server, the plugin uses a hierarchical logic system to ensure the best possible team assignment:
-1. **Strict Imbalance Checks**: Enforces population caps to prevent lopsided team numbers.
-2. **Reconnect Memory**: Places recently disconnected players back onto their original team (so long as it doesn't violate strict imbalance rules).
-3. **Elo Balancing**: Uses live data from the `EloTracker` plugin to calculate and minimize the skill gap between teams.
+When a player joins the server, the plugin uses a **Unified Scoring System** to ensure optimal team assignment, weighing competitive parity, player preference, and population equity on a single scale.
 
 Additionally, it executes all team changes via a background retry-queue to ensure the swap applies successfully as soon as the engine allows it.
 
@@ -19,7 +16,7 @@ Additionally, it executes all team changes via a background retry-queue to ensur
 
 * **Strict Population Balance**: Respects configurable imbalance margins, and features a "High Pop Threshold" mode that enforces a strict 1-player max difference when the server is near capacity (protecting admin slots and ensuring perfect parity for full servers).
 * **Reconnect Memory**: Stores player disconnect states in a persistent SQLite database. If a player crashes or disconnects, they are automatically placed back on their previous team upon reconnecting.
-* **Elo-Aware Routing**: Integrates with the `EloTracker` plugin to dynamically route new players to the team that will most closely equalize the overall average Elo ratings of both sides.
+* **Elo-Aware Routing**: Integrates with the `EloTracker` plugin to dynamically route new players to the team that will most closely equalize the overall power of both sides.
 * **Reliable Swap Execution**: Squad's RCON can occasionally fail to move players if they are still loading in. This plugin uses a dedicated background queue that retries failed team switches until successful.
 * **Lifecycle Event Logging**: Dumps precise `JOIN`, `LEAVE`, and `TEAM_CHANGE` events (including whether a move was manual, executed by SmartAssign, or a TeamBalancer scramble) into an easily ingestible JSONL file.
 
@@ -84,27 +81,22 @@ highPopThreshold      - (Optional) Total player count at which the plugin goes i
 
 ## How Assignment Works
 
-The plugin evaluates which team a player should join in the following order:
+The plugin evaluates which team a player should join using a hierarchical decision process:
 
-1. **Strict Imbalance Checks (Highest Priority)**
-   The plugin first checks the difference in player counts between Team 1 and Team 2. 
-   - It respects the `maxImbalance` setting.
-   - **High Population Override:** If the server total population reaches the `highPopThreshold`, the allowed imbalance strictly becomes **1 player**.
-   - If placing a player on a specific team would exceed the allowed imbalance limit, they are immediately forced onto the team with fewer players, ignoring all other rules.
+### 1. Strict Population Cap (Highest Priority)
+The plugin first checks the player counts of both teams. If the difference already meets or exceeds the `maxImbalance` limit, the player is immediately assigned to the smaller team.
+*   **High Population Override**: When total players >= `highPopThreshold` (default 96), the plugin enforces a strict **1-player max imbalance**.
 
-2. **Reconnect Preference**
-   If a player recently disconnected and is reconnecting to the server, the plugin checks its database for their previous team. 
-   - The player will be placed back onto their original team.
-   - *Exception:* This rule is skipped if putting them back on their old team would violate the strict imbalance rules from Step 1.
+### 2. Unified Scoring System (Elo-Aware)
+If the hard population cap isn't triggered, the plugin calculates a "cost score" for each team. The player is assigned to the team with the lower score.
 
-3. **Elo Metrics (Skill-based Balancing)**
-   If the player isn't forced by imbalance and isn't reconnecting, the plugin looks for an active `EloTracker` plugin to balance the teams by skill.
-   - It calculates what the new average Elo would be for Team 1 if the player joined them, and does the same for Team 2.
-   - It compares the potential averages and assigns the player to the team that minimizes the skill gap.
+*   **Squared Average Elo Gap (Non-Linear)**: The base score is the **squared difference** between the teams' average Elo ratings (using `Mu^1.1` non-linear scaling) if the player were to join that team. The squared error ensures that large skill gaps are penalized much more heavily than small ones, leading to more stable balancing. The `^1.1` scaling ensures that high-skill players are weighted more accurately, recognizing their outsized impact on match flow.
+*   **Soft Population Penalty**: A penalty of **0.05 units** (in squared-Mu space) is added to a team's score for every player they are ahead of the other team. This favors the smaller team while allowing for better skill equalization within the allowed population margins.
+*   **Reconnect Bonus**: If a player was previously on a team during the current round, that team receives a **0.05 bonus** (score reduction).
 
-4. **Final Safety Check & Fallback**
-   - If the team chosen by the Elo system would violate the maximum allowed player imbalance, the Elo decision is discarded.
-   - If the EloTracker isn't available or fails, it defaults to placing the player on the team with fewer players.
+### 3. Final Safety Check & Fallback
+*   If the scoring system selects a team that would violate the hard population cap, the decision is overridden to maintain balance.
+*   If the `EloTracker` plugin is inactive, the system defaults to pure population balancing (favoring the smaller team).
 
 ## Author
 

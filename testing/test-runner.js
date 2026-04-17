@@ -11,6 +11,18 @@ import SmartAssign from '../plugins/smart-assign.js';
 
 // --- Mocks ---
 
+class MockSADatabase {
+  constructor() {
+    this.reconnectMemory = new Map();
+    this.roundStartTime = Date.now();
+  }
+  async initDB() { return { roundStartTime: this.roundStartTime }; }
+  async saveRoundStartTime(ts) { this.roundStartTime = ts; }
+  async clearReconnectMemory() { this.reconnectMemory.clear(); }
+  async savePlayerDisconnect(steamID, teamID) { this.reconnectMemory.set(steamID, { teamID, time: Date.now() }); }
+  async getReconnectTeam(steamID) { return this.reconnectMemory.get(steamID)?.teamID || null; }
+}
+
 class MockServer {
   constructor() {
     this.players = [];
@@ -63,8 +75,8 @@ class EloTracker {
     }
 
     return {
-      t1: { count: t1Count, avgMu: t1Count ? t1Mu / t1Count : 25.0 },
-      t2: { count: t2Count, avgMu: t2Count ? t2Mu / t2Count : 25.0 }
+      t1: { count: t1Count, avgMu: t1Count ? t1Mu / t1Count : 25.0, sumMu: t1Mu },
+      t2: { count: t2Count, avgMu: t2Count ? t2Mu / t2Count : 25.0, sumMu: t2Mu }
     };
   }
 }
@@ -305,7 +317,7 @@ async function simulateMatch(server, mockEloTracker, match, eosToSteam, randomSe
     const r = getRand();
 
     let action = 'JOIN';
-    if (currentPop >= 102) {
+    if (currentPop >= 100) {
       action = 'LEAVE';
     } else {
       if (r < 0.15 && currentPop > 20) {
@@ -343,14 +355,48 @@ async function simulateMatch(server, mockEloTracker, match, eosToSteam, randomSe
     }
   }
 
+  // Stabilization Phase: Try to balance any final gaps created by late leaves
+  for (let i = 0; i < 10; i++) {
+    const t1 = server.players.filter((p) => p.teamID === 1).length;
+    const t2 = server.players.filter((p) => p.teamID === 2).length;
+    if (Math.abs(t1 - t2) <= 1) break;
+
+    if (pendingJoins.length > 0) {
+      const newPlayer = pendingJoins.shift();
+      server.players.push(newPlayer);
+      await server.emit('PLAYER_CONNECTED', { player: newPlayer });
+      eventLog.push(`[STABILIZE-JOIN] ${newPlayer.name} joined -> Team ${newPlayer.teamID}`);
+    } else if (disconnectedPlayers.length > 0) {
+      const rejoinder = disconnectedPlayers.shift();
+      rejoinder.teamID = 3;
+      server.players.push(rejoinder);
+      await server.emit('PLAYER_CONNECTED', { player: rejoinder });
+      eventLog.push(`[STABILIZE-REJOIN] ${rejoinder.name} rejoined -> Team ${rejoinder.teamID}`);
+    } else {
+      break;
+    }
+  }
+
   const t1End = server.players.filter(p => p.teamID === 1).length;
   const t2End = server.players.filter(p => p.teamID === 2).length;
   const diff = Math.abs(t1End - t2End);
 
   const { t1, t2 } = mockEloTracker.buildRoundStartData();
   const eloDiff = Math.abs(t1.avgMu - t2.avgMu);
+  const sumDiff = Math.abs(t1.sumMu - t2.sumMu);
 
-  return { popDiff: diff, eloDiff, t1End, t2End, t1Elo: t1.avgMu, t2Elo: t2.avgMu, eventLog };
+  return { 
+    popDiff: diff, 
+    eloDiff, 
+    sumDiff, 
+    t1End, 
+    t2End, 
+    t1Elo: t1.avgMu, 
+    t2Elo: t2.avgMu, 
+    t1Sum: t1.sumMu,
+    t2Sum: t2.sumMu,
+    eventLog 
+  };
 }
 
 async function runRealisticLifecycleTests(eloPlugin, basePlugin, improvedPlugin, legacyPlugin, eloServer, baseServer, improvedServer, legacyServer, eloMockTracker, baseMockTracker, improvedMockTracker, legacyMockTracker, eosToSteam) {
@@ -382,28 +428,20 @@ async function runRealisticLifecycleTests(eloPlugin, basePlugin, improvedPlugin,
 
     const randomSequence = Array.from({ length: 2000 }, () => Math.random());
 
-    // 1. Run Production Plugin (Now using Sum-Gap)
-    const eloRes = await simulateMatch(eloServer, eloMockTracker, match, eosToSteam, randomSequence);
-    eloRes.run = matchIndex;
-    eloRes.layer = match.layerName;
+    // Run all simulations in parallel for speed
+    const [eloRes, baseRes, improvedRes, legacyRes] = await Promise.all([
+      simulateMatch(eloServer, eloMockTracker, match, eosToSteam, randomSequence),
+      simulateMatch(baseServer, baseMockTracker, match, eosToSteam, randomSequence),
+      simulateMatch(improvedServer, improvedMockTracker, match, eosToSteam, randomSequence),
+      simulateMatch(legacyServer, legacyMockTracker, match, eosToSteam, randomSequence)
+    ]);
+
+    eloRes.run = baseRes.run = improvedRes.run = legacyRes.run = matchIndex;
+    eloRes.layer = baseRes.layer = improvedRes.layer = legacyRes.layer = match.layerName;
+
     eloResults.push(eloRes);
-
-    // 2. Run Baseline (Naive)
-    const baseRes = await simulateMatch(baseServer, baseMockTracker, match, eosToSteam, randomSequence);
-    baseRes.run = matchIndex;
-    baseRes.layer = match.layerName;
     baseResults.push(baseRes);
-
-    // 3. Run New Improved (Sum-Gap Ref Implementation)
-    const improvedRes = await simulateMatch(improvedServer, improvedMockTracker, match, eosToSteam, randomSequence);
-    improvedRes.run = matchIndex;
-    improvedRes.layer = match.layerName;
     improvedResults.push(improvedRes);
-
-    // 4. Run Legacy (Old Average-based)
-    const legacyRes = await simulateMatch(legacyServer, legacyMockTracker, match, eosToSteam, randomSequence);
-    legacyRes.run = matchIndex;
-    legacyRes.layer = match.layerName;
     legacyResults.push(legacyRes);
 
     if (matchIndex % 10 === 0) process.stdout.write('■');
@@ -422,20 +460,28 @@ async function runRealisticLifecycleTests(eloPlugin, basePlugin, improvedPlugin,
   const impAvgDiff = (improvedResults.reduce((sum, r) => sum + r.eloDiff, 0) / improvedResults.length).toFixed(2);
   const legacyAvgDiff = (legacyResults.reduce((sum, r) => sum + r.eloDiff, 0) / legacyResults.length).toFixed(2);
 
+  const eloSumDiff = (eloResults.reduce((sum, r) => sum + r.sumDiff, 0) / eloResults.length).toFixed(2);
+  const baseSumDiff = (baseResults.reduce((sum, r) => sum + r.sumDiff, 0) / baseResults.length).toFixed(2);
+  const impSumDiff = (improvedResults.reduce((sum, r) => sum + r.sumDiff, 0) / improvedResults.length).toFixed(2);
+  const legacySumDiff = (legacyResults.reduce((sum, r) => sum + r.sumDiff, 0) / legacyResults.length).toFixed(2);
+
   console.log(`🏁 LIFECYCLE TEST COMPARISON SUMMARY 🏁`);
   console.log(`Total Real Matches Tested: ${eloResults.length}\n`);
 
   console.log(`=== NAIVE BASELINE ASSIGN ===`);
   console.log(`Pop Balance <= 1: ${(basePerfectPop / baseResults.length * 100).toFixed(2)}% (${basePerfectPop}/${baseResults.length})`);
-  console.log(`Average Elo Difference: ${baseAvgDiff}\n`);
+  console.log(`Average Elo Difference: ${baseAvgDiff}`);
+  console.log(`Average Sum Difference: ${baseSumDiff}\n`);
 
   console.log(`=== LEGACY SMART ASSIGN (Old Averages) ===`);
   console.log(`Pop Balance <= 1: ${(legacyPerfectPop / legacyResults.length * 100).toFixed(2)}% (${legacyPerfectPop}/${legacyResults.length})`);
-  console.log(`Average Elo Difference: ${legacyAvgDiff}\n`);
+  console.log(`Average Elo Difference: ${legacyAvgDiff}`);
+  console.log(`Average Sum Difference: ${legacySumDiff}\n`);
 
   console.log(`=== NEW SMART ASSIGN (Sum-Gap / Production) ===`);
   console.log(`Pop Balance <= 1: ${(eloPerfectPop / eloResults.length * 100).toFixed(2)}% (${eloPerfectPop}/${eloResults.length})`);
-  console.log(`Average Elo Difference: ${eloAvgDiff}\n`);
+  console.log(`Average Elo Difference: ${eloAvgDiff}`);
+  console.log(`Average Sum Difference: ${eloSumDiff}\n`);
 
   const validImpResults = improvedResults.filter((r) => r.t1End + r.t2End >= 70);
   validImpResults.sort((a, b) => b.eloDiff - a.eloDiff);
@@ -447,9 +493,10 @@ async function runRealisticLifecycleTests(eloPlugin, basePlugin, improvedPlugin,
     const legacyR = legacyResults.find((b) => b.run === impR.run);
 
     console.log(`\n--- Case #${i + 1} (Match ${impR.run}: ${impR.layer}) ---`);
-    console.log(`[NEW   ] Pop: T1: ${impR.t1End} | T2: ${impR.t2End} (Diff: ${impR.popDiff}) -- Elo Diff: ${impR.eloDiff.toFixed(2)}`);
-    console.log(`[LEGACY] Pop: T1: ${legacyR.t1End} | T2: ${legacyR.t2End} (Diff: ${legacyR.popDiff}) -- Elo Diff: ${legacyR.eloDiff.toFixed(2)}`);
-    console.log(`[BASE  ] Pop: T1: ${baseR.t1End} | T2: ${baseR.t2End} (Diff: ${baseR.popDiff}) -- Elo Diff: ${baseR.eloDiff.toFixed(2)}`);
+    console.log(`[NEW   ] Pop: T1: ${impR.t1End} | T2: ${impR.t2End} (Diff: ${impR.popDiff}) -- Elo Diff: ${impR.eloDiff.toFixed(2)} -- Sum Diff: ${impR.sumDiff.toFixed(1)}`);
+    console.log(`         T1 Sum: ${impR.t1Sum.toFixed(1)} (Avg: ${impR.t1Elo.toFixed(2)}) | T2 Sum: ${impR.t2Sum.toFixed(1)} (Avg: ${impR.t2Elo.toFixed(2)})`);
+    console.log(`[LEGACY] Pop: T1: ${legacyR.t1End} | T2: ${legacyR.t2End} (Diff: ${legacyR.popDiff}) -- Elo Diff: ${legacyR.eloDiff.toFixed(2)} -- Sum Diff: ${legacyR.sumDiff.toFixed(1)}`);
+    console.log(`[BASE  ] Pop: T1: ${baseR.t1End} | T2: ${baseR.t2End} (Diff: ${baseR.popDiff}) -- Elo Diff: ${baseR.eloDiff.toFixed(2)} -- Sum Diff: ${baseR.sumDiff.toFixed(1)}`);
   }
 }
 
@@ -484,7 +531,8 @@ async function runTests() {
   const eloServer = new MockServer();
   const eloMockTracker = new EloTracker(eloServer, eloMap);
   eloServer.plugins.push(eloMockTracker);
-  const eloPlugin = new SmartAssign(eloServer, { ...options, imbalanceSoftPenalty: 0 }, { sqlite: new Sequelize('sqlite::memory:', { logging: false }) });
+  const eloPlugin = new SmartAssign(eloServer, { ...options, imbalanceSoftPenalty: 0 });
+  eloPlugin.db = new MockSADatabase();
   eloPlugin.executor = new MockSASwapExecutor(eloServer);
   await eloPlugin.mount();
 
@@ -492,7 +540,8 @@ async function runTests() {
   const baseServer = new MockServer();
   const baseMockTracker = new EloTracker(baseServer, eloMap);
   baseServer.plugins.push(baseMockTracker);
-  const basePlugin = new BaselineAssign(baseServer, options, { sqlite: new Sequelize('sqlite::memory:', { logging: false }) });
+  const basePlugin = new BaselineAssign(baseServer, options);
+  basePlugin.db = new MockSADatabase();
   basePlugin.executor = new MockSASwapExecutor(baseServer);
   await basePlugin.mount();
 
@@ -500,9 +549,8 @@ async function runTests() {
   const improvedServer = new MockServer();
   const improvedMockTracker = new EloTracker(improvedServer, eloMap);
   improvedServer.plugins.push(improvedMockTracker);
-  const improvedPlugin = new ImprovedAssign(improvedServer, options, {
-    sqlite: new Sequelize('sqlite::memory:', { logging: false })
-  });
+  const improvedPlugin = new ImprovedAssign(improvedServer, options);
+  improvedPlugin.db = new MockSADatabase();
   improvedPlugin.executor = new MockSASwapExecutor(improvedServer);
   await improvedPlugin.mount();
 
@@ -510,9 +558,8 @@ async function runTests() {
   const legacyServer = new MockServer();
   const legacyMockTracker = new EloTracker(legacyServer, eloMap);
   legacyServer.plugins.push(legacyMockTracker);
-  const legacyPlugin = new LegacyAssign(legacyServer, options, {
-    sqlite: new Sequelize('sqlite::memory:', { logging: false })
-  });
+  const legacyPlugin = new LegacyAssign(legacyServer, options);
+  legacyPlugin.db = new MockSADatabase();
   legacyPlugin.executor = new MockSASwapExecutor(legacyServer);
   await legacyPlugin.mount();
 

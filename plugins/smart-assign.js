@@ -1,13 +1,49 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v1.0.0                   ║
+ * ║                  SMART ASSIGN PLUGIN v0.1.3                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
  * Handles custom Elo-based player auto-assignment and records player
- * lifecycle events. Tracks joins, leaves, and team changes, managing 
- * reconnect memory and ensuring fair, balanced team assignments upon connection.
+ * lifecycle events. Overrides Squad's native team assignment to provide
+ * competitive parity via Average-Elo balancing, reconnect memory,
+ * and strict population equity rules.
+ *
+ * ─── EXPORTS ─────────────────────────────────────────────────────
+ *
+ * SmartAssign (default)
+ *   Extends BasePlugin. Key methods:
+ *     mount()                          — Initialises DB and lifecycle listeners.
+ *     unmount()                        — Removes listeners and cleans up executor.
+ *     evaluateTeamAssignment(player)    — Core algorithm for team placement.
+ *     logEvent(type, player, data)      — Records lifecycle events to JSONL.
+ *
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
+ *
+ * SADatabase (../utils/sa-database.js)
+ *   Persistent SQLite storage for reconnect memory and round state.
+ * SASwapExecutor (../utils/sa-swap-executor.js)
+ *   Manages the RCON move queue with retry logic for loading players.
+ * EloTracker (Sibling Plugin)
+ *   Provides live TrueSkill Mu ratings for skill-based balancing.
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Algorithm uses a Unified Scoring System:
+ *     1. Hard Pop Cap: Highest priority; prevents imbalance > maxImbalance.
+ *     2. Squared Average Elo Gap: Minimizes resulting team average differences.
+ *     3. Soft Pop Penalty: penalizes score per player of imbalance.
+ *     4. Reconnect Bonus: grants score bonus to a player's old team.
+ * - highPopThreshold (default 96) enforces a strict 1-player max imbalance.
+ * - Event logs include JOIN, LEAVE, TEAM_CHANGE, and MOVE_FAILED.
+ *
+ * ─── CONFIGURATION ───────────────────────────────────────────────
+ *
+ * database: Sequelize connector name (default: 'sqlite').
+ * logPath: Path for JSONL event logging (default: './auto-assign-log.jsonl').
+ * maxImbalance: Max player count difference allowed (default: 2).
+ * highPopThreshold: Pop level for strict 1-player imbalance (default: 96).
  *
  * Author:
  * Discord: `real_slacker`
@@ -21,7 +57,7 @@ import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
 
 export default class SmartAssign {
-  static version = '1.0.0';
+  static version = '0.1.3';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
@@ -166,7 +202,7 @@ export default class SmartAssign {
     this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
     this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
     this.server.removeListener('PLAYER_CONNECTED', this.onPlayerConnected);
-    this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
+    this.server.removeListener('TEAM_BALANCER_SCRAMRAMBLE_EXECUTED', this.onScrambleExecuted);
     this.server.removeListener('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
     this.executor.cleanup();
     Logger.verbose('SmartAssign', 1, 'SmartAssign unmounted.');
@@ -310,17 +346,25 @@ export default class SmartAssign {
     this.logEvent('TEAM_CHANGE', player, { oldTeam, newTeam, source });
   }
 
+  /**
+   * Evaluates and returns the best team (1 or 2) for a joining player.
+   * Uses a Mu-based Unified Scoring System to balance competitive parity,
+   * population equity, and player preference (reconnects).
+   */
   evaluateTeamAssignment(player, reconnectTeam = null) {
     const eloTracker = this.server.plugins.find((p) => p.constructor.name === 'EloTracker');
     const hasElo = eloTracker && eloTracker.ready;
 
+    // 1. DATA COLLECTION
     let t1Count = 0;
     let t2Count = 0;
-    let t1MuSum = 0;
-    let t2MuSum = 0;
+    let t1Power = 0;
+    let t2Power = 0;
+
+    const EXPONENT = 1.1; // Iteration 11: Finalized Squared Average-Gap
 
     for (const p of this.server.players) {
-      if (p.steamID === player.steamID) continue;
+      if (p.steamID === player.steamID) continue; 
 
       const isT1 = String(p.teamID) === '1';
       const isT2 = String(p.teamID) === '2';
@@ -330,78 +374,70 @@ export default class SmartAssign {
 
       if (hasElo && (isT1 || isT2)) {
         let mu = 25.0;
-        if (eloTracker.eloCache && p.eosID && eloTracker.eloCache.has(p.eosID)) {
-          mu = eloTracker.eloCache.get(p.eosID).mu;
-        } else if (eloTracker.eloMap && p.steamID && eloTracker.eloMap.has(p.steamID)) {
-          mu = eloTracker.eloMap.get(p.steamID);
-        }
-
-        if (isT1) t1MuSum += mu;
-        else t2MuSum += mu;
+        if (eloTracker.eloCache && p.eosID && eloTracker.eloCache.has(p.eosID)) mu = eloTracker.eloCache.get(p.eosID).mu;
+        else if (eloTracker.eloMap && p.steamID && eloTracker.eloMap.has(p.steamID)) mu = eloTracker.eloMap.get(p.steamID);
+        
+        const pwr = Math.pow(mu, EXPONENT);
+        if (isT1) t1Power += pwr;
+        else t2Power += pwr;
       }
     }
 
+    // 2. HARD POPULATION CAP (Highest Priority)
     const totalPop = t1Count + t2Count;
     const highPopThreshold = this.options.highPopThreshold || 96;
     const maxImbalance = totalPop >= highPopThreshold ? 1 : this.options.maxImbalance || 2;
 
-    // 1. Hard population imbalance — highest priority
     if (t1Count - t2Count >= maxImbalance) return 2;
     if (t2Count - t1Count >= maxImbalance) return 1;
 
+    // 3. SKILL & PENALTY EVALUATION
     let playerMu = 25.0;
     if (hasElo) {
-      if (eloTracker.eloCache && player.eosID && eloTracker.eloCache.has(player.eosID)) {
-        playerMu = eloTracker.eloCache.get(player.eosID).mu;
-      } else if (eloTracker.eloMap && player.steamID && eloTracker.eloMap.has(player.steamID)) {
-        playerMu = eloTracker.eloMap.get(player.steamID);
+      if (eloTracker.eloCache && player.eosID && eloTracker.eloCache.has(player.eosID)) playerMu = eloTracker.eloCache.get(player.eosID).mu;
+      else if (eloTracker.eloMap && player.steamID && eloTracker.eloMap.has(player.steamID)) playerMu = eloTracker.eloMap.get(player.steamID);
+    }
+    const playerPower = Math.pow(playerMu, EXPONENT);
+
+    if (!hasElo) {
+      if (reconnectTeam) {
+        const wouldViolate = reconnectTeam === 1 ? t1Count + 1 - t2Count > maxImbalance : t2Count + 1 - t1Count > maxImbalance;
+        if (!wouldViolate) return reconnectTeam;
       }
+      return t1Count <= t2Count ? 1 : 2;
     }
 
-    // 2. Reconnect preference — check both population AND Elo impact
-    if (reconnectTeam) {
-      const wouldViolatePop =
-        reconnectTeam === 1
-          ? t1Count + 1 - t2Count > maxImbalance
-          : t2Count + 1 - t1Count > maxImbalance;
+    // Unified Scoring (Squared Average-Gap Model)
+    const avgT1 = t1Count > 0 ? t1Power / t1Count : 25.0;
+    const avgT2 = t2Count > 0 ? t2Power / t2Count : 25.0;
 
-      if (!wouldViolatePop) {
-        if (!hasElo) return reconnectTeam;
+    const newAvgT1 = (t1Power + playerPower) / (t1Count + 1);
+    const newAvgT2 = (t2Power + playerPower) / (t2Count + 1);
 
-        // Only override reconnect if Elo gap is significant AND reconnect worsens it
-        const currentEloDiff =
-          t1Count > 0 && t2Count > 0 ? Math.abs(t1MuSum / t1Count - t2MuSum / t2Count) : 0;
-        const ELO_OVERRIDE_THRESHOLD = 1.5; // mu units
+    let scoreT1 = Math.pow(newAvgT1 - avgT2, 2);
+    let scoreT2 = Math.pow(avgT1 - newAvgT2, 2);
 
-        const sumGap = t1MuSum - t2MuSum;
-        const eloPreferredTeam = Math.abs(sumGap + playerMu) < Math.abs(sumGap - playerMu) ? 1 : 2;
+    // POPULATION PENALTY (Mu units squared)
+    const softPenalty = 0.05; 
+    scoreT1 += (t1Count > t2Count) ? (t1Count - t2Count) * softPenalty : 0;
+    scoreT2 += (t2Count > t1Count) ? (t2Count - t1Count) * softPenalty : 0;
 
-        // Honor reconnect unless it's the wrong Elo team AND the gap is already significant
-        if (reconnectTeam === eloPreferredTeam || currentEloDiff < ELO_OVERRIDE_THRESHOLD) {
-          return reconnectTeam;
-        }
-        Logger.verbose(
-          'SmartAssign',
-          2,
-          `[SmartAssign] Overriding reconnect for ${player.name} due to significant Elo imbalance.`
-        );
-      }
-    }
+    // RECONNECT BONUS
+    const reconnectBonus = 0.05;
+    if (reconnectTeam === 1) scoreT1 -= reconnectBonus;
+    else if (reconnectTeam === 2) scoreT2 -= reconnectBonus;
 
-    // 3. No Elo data → pure population balance
-    if (!hasElo) return t1Count <= t2Count ? 1 : 2;
-
-    // 4. Minimize Elo sum gap
-    const sumGap = t1MuSum - t2MuSum;
-    const diffIfT1 = Math.abs(sumGap + playerMu);
-    const diffIfT2 = Math.abs(sumGap - playerMu);
-
+    // Decision
     let targetTeam;
-    if (diffIfT1 < diffIfT2) targetTeam = 1;
-    else if (diffIfT2 < diffIfT1) targetTeam = 2;
-    else targetTeam = t1Count <= t2Count ? 1 : 2; // Tie → population balance
+    if (scoreT1 < scoreT2) targetTeam = 1;
+    else if (scoreT2 < scoreT1) targetTeam = 2;
+    else targetTeam = t1Count <= t2Count ? 1 : 2; 
 
-    // 5. Final pop safety check
+    // Decision Logging (Verbose 4)
+    Logger.verbose('SmartAssign', 4, `[SmartAssign] Player: ${player.name} (${playerMu.toFixed(1)}Mu) | T1: ${t1Count}p, Power: ${t1Power.toFixed(0)} | T2: ${t2Count}p, Power: ${t2Power.toFixed(0)} | Scores: T1=${scoreT1.toFixed(1)}, T2=${scoreT2.toFixed(1)} -> Target: ${targetTeam}`);
+
+    // 4. FINAL SAFETY CHECK
+    // Overriding the score-based choice if it would violate hard population limits.
     const wouldViolate =
       targetTeam === 1 ? t1Count + 1 - t2Count > maxImbalance : t2Count + 1 - t1Count > maxImbalance;
 
