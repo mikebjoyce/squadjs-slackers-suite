@@ -4,7 +4,7 @@ const { DataTypes } = Sequelize;
 
 export default class SADatabase {
   constructor(server, options, connectors) {
-    this.sequelize = connectors && connectors.sqlite;
+    this.sequelize = connectors && connectors[options.database];
     this.SmartAssignStateModel = null;
     this.ReconnectMemoryModel = null;
     this._mutex = Promise.resolve();
@@ -67,9 +67,11 @@ export default class SADatabase {
       );
 
       // Enforce WAL mode to prevent SQLITE_BUSY deadlocks in high-concurrency environments
-      await this.sequelize.query('PRAGMA journal_mode=WAL;');
-      await this.sequelize.query('PRAGMA synchronous=NORMAL;');
-      
+      if (this.sequelize.getDialect() === 'sqlite') {
+        await this.sequelize.query('PRAGMA journal_mode=WAL;');
+        await this.sequelize.query('PRAGMA synchronous=NORMAL;');
+      }
+
       await this.SmartAssignStateModel.sync({ alter: true });
       await this.ReconnectMemoryModel.sync({ alter: true });
 

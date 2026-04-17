@@ -15,7 +15,7 @@
  * ═══════════════════════════════════════════════════════════════
  */
 
-import { appendFileSync, promises as fsPromises } from 'fs';
+import { promises as fsPromises } from 'fs';
 import Logger from '../../core/logger.js';
 import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
@@ -56,12 +56,6 @@ export default class SmartAssign {
         description: 'Total player count at which the plugin enforces strict 1-player max imbalance (overriding Elo/Reconnects).',
         default: 96,
         type: 'number'
-      },
-      imbalanceSoftPenalty: {
-        required: false,
-        description: 'Small Elo bonus given to the team with fewer players during evaluation. Prevents creating population gaps for negligible Elo gains.',
-        default: 0.15,
-        type: 'number'
       }
     };
   }
@@ -79,6 +73,8 @@ export default class SmartAssign {
     });
 
     this.knownPlayers = new Map();
+    this.currentRoundEvents = [];
+    this.currentRoundStartTime = null;
     this.ready = false;
 
     // State bindings
@@ -103,9 +99,20 @@ export default class SmartAssign {
     }
 
     const threeHours = 3 * 60 * 60 * 1000;
-    if (persistedStartTime && serverRoundStart && Math.abs(persistedStartTime - serverRoundStart) < threeHours) {
+    if (
+      persistedStartTime &&
+      serverRoundStart &&
+      Math.abs(Number(persistedStartTime) - Number(serverRoundStart)) < threeHours
+    ) {
       // It's a resume. Populate known players silently so they don't trigger "JOIN" events
-      Logger.verbose('SmartAssign', 1, 'Restart detected. Resuming round state and silent-populating known players.');
+      Logger.verbose(
+        'SmartAssign',
+        1,
+        'Restart detected. Resuming round state and silent-populating known players.'
+      );
+      this.currentRoundStartTime = Number(persistedStartTime);
+      await this.loadTempEvents();
+
       for (const p of this.server.players) {
         if (p.steamID) {
           this.knownPlayers.set(p.steamID, {
@@ -119,10 +126,15 @@ export default class SmartAssign {
     } else {
       // New round or no data
       Logger.verbose('SmartAssign', 1, 'New round or no persisted state. Starting fresh.');
+
+      // Finalize any leftover temp logs from a previous crashed session
+      await this.finalizeRoundLog();
+
       await this.db.clearReconnectMemory();
       const now = serverRoundStart || Date.now();
       await this.db.saveRoundStartTime(now);
-      
+      this.currentRoundStartTime = now;
+
       // If there are players already, treat them as joins to get them assigned (or silent populate if seeded?)
       // Actually, if we just started, let's silent populate anyway so we don't spam 100 auto-assigns
       for (const p of this.server.players) {
@@ -162,19 +174,23 @@ export default class SmartAssign {
 
   async onNewGame(info) {
     if (!this.ready) return;
-    Logger.verbose('SmartAssign', 1, 'NEW_GAME detected. Clearing reconnect memory.');
+    Logger.verbose('SmartAssign', 1, 'NEW_GAME detected. Finalizing previous round log.');
+
+    await this.finalizeRoundLog();
+
     await this.db.clearReconnectMemory();
     const now = this.server.matchStartTime ? this.server.matchStartTime.getTime() : Date.now();
     await this.db.saveRoundStartTime(now);
-    
+    this.currentRoundStartTime = now;
+
     // Clear known players so anyone connecting gets processed normally
     this.knownPlayers.clear();
   }
 
   async onRoundEnded(info) {
     if (!this.ready) return;
-    Logger.verbose('SmartAssign', 1, 'ROUND_ENDED detected.');
-    // We can clear reconnect memory here or on NEW_GAME. NEW_GAME is safer.
+    Logger.verbose('SmartAssign', 1, 'ROUND_ENDED detected. Finalizing round log.');
+    await this.finalizeRoundLog();
   }
 
   async onScrambleExecuted() {
@@ -397,19 +413,65 @@ export default class SmartAssign {
   logEvent(eventType, player, extraData = {}) {
     if (!this.options.logPath) return;
 
-    const record = {
+    const event = {
       timestamp: Date.now(),
       eventType,
       steamID: player.steamID,
       name: player.name,
       teamID: player.teamID,
       squadID: player.squadID,
-      layerName: this.server.currentLayer ? this.server.currentLayer.name : 'Unknown',
-      gamemode: this.server.currentLayer ? this.server.currentLayer.gamemode : 'Unknown',
       ...extraData
     };
 
-    fsPromises.appendFile(this.options.logPath, JSON.stringify(record) + '\n', 'utf8')
-      .catch(err => Logger.verbose('SmartAssign', 1, `Failed to write log: ${err.message}`));
+    this.currentRoundEvents.push(event);
+
+    // Incremental write to temp file for stability/crash recovery
+    const tempPath = this.options.logPath + '.temp';
+    fsPromises
+      .appendFile(tempPath, JSON.stringify(event) + '\n', 'utf8')
+      .catch((err) => Logger.verbose('SmartAssign', 1, `Failed to write temp log: ${err.message}`));
+  }
+
+  async finalizeRoundLog() {
+    if (this.currentRoundEvents.length === 0) {
+      // Check if there's a temp file we can recover (e.g. after crash)
+      await this.loadTempEvents();
+      if (this.currentRoundEvents.length === 0) return;
+    }
+
+    Logger.verbose('SmartAssign', 1, `Finalizing round log with ${this.currentRoundEvents.length} events.`);
+
+    const roundLog = {
+      startTime: this.currentRoundStartTime || Date.now(),
+      endTime: Date.now(),
+      layerName: this.server.currentLayer ? this.server.currentLayer.name : 'Unknown',
+      gamemode: this.server.currentLayer ? this.server.currentLayer.gamemode : 'Unknown',
+      events: this.currentRoundEvents
+    };
+
+    try {
+      await fsPromises.appendFile(this.options.logPath, JSON.stringify(roundLog) + '\n', 'utf8');
+      const tempPath = this.options.logPath + '.temp';
+      await fsPromises.unlink(tempPath).catch(() => {});
+      this.currentRoundEvents = [];
+    } catch (err) {
+      Logger.verbose('SmartAssign', 1, `Failed to finalize round log: ${err.message}`);
+    }
+  }
+
+  async loadTempEvents() {
+    const tempPath = this.options.logPath + '.temp';
+    try {
+      const data = await fsPromises.readFile(tempPath, 'utf8');
+      const lines = data.trim().split('\n');
+      this.currentRoundEvents = lines.filter((l) => l.trim()).map((l) => JSON.parse(l));
+      Logger.verbose(
+        'SmartAssign',
+        1,
+        `Loaded ${this.currentRoundEvents.length} events from temp log.`
+      );
+    } catch (err) {
+      // File might not exist, which is fine
+    }
   }
 }
