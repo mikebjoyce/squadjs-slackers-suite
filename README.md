@@ -87,14 +87,17 @@ The plugin evaluates which team a player should join using a hierarchical decisi
 The plugin first checks the player counts of both teams. If the difference already meets or exceeds the `maxImbalance` limit, the player is immediately assigned to the smaller team.
 *   **High Population Override**: When total players >= `highPopThreshold` (default 96), the plugin enforces a strict **1-player max imbalance**.
 
-### 2. Unified Scoring System (Elo-Aware)
-If the hard population cap isn't triggered, the plugin calculates a "cost score" for each team. The player is assigned to the team with the lower score.
+### 2. Reconnect Memory & Grace (High Priority)
+If the hard population cap isn't triggered, the plugin checks if the player was previously on a team during the current round. 
+*   **Rejoin Grace**: Reconnecting players are given a **+1 to +2 player imbalance allowance** (compared to fresh joins). This ensures that players can almost always get back to their squads after a crash, even if their team has grown slightly larger in their absence.
+*   **Understandable Fullness**: This grace is reduced when the server is near the `highPopThreshold` to ensure the server still reaches a 50/50 split when full.
 
-*   **Squared Average Elo Gap (Non-Linear)**: The base score is the **squared difference** between the teams' average Elo ratings (using `Mu^1.1` non-linear scaling) if the player were to join that team. The squared error ensures that large skill gaps are penalized much more heavily than small ones, leading to more stable balancing. The `^1.1` scaling ensures that high-skill players are weighted more accurately, recognizing their outsized impact on match flow.
-*   **Soft Population Penalty**: A penalty of **0.05 units** (in squared-Mu space) is added to a team's score for every player they are ahead of the other team. This favors the smaller team while allowing for better skill equalization within the allowed population margins.
-*   **Reconnect Bonus**: If a player was previously on a team during the current round, that team receives a **0.05 bonus** (score reduction).
+### 3. Unified Scoring System (Elo-Aware)
+If no reconnect memory is found, the plugin calculates a "cost score" for each team to determine the best skill-based placement.
+*   **Squared Average Elo Gap (Non-Linear)**: The base score is the **squared difference** between the teams' average Elo ratings (using `Mu^1.05` non-linear scaling) if the player were to join that team. The squared error ensures that large skill gaps are penalized much more heavily than small ones.
+*   **Soft Population Penalty**: A penalty of **0.03 units** is added for every player a team is ahead, favoring the smaller side while allowing for skill-balancing within allowed margins.
 
-### 3. Final Safety Check & Fallback
+### 4. Final Safety Check & Fallback
 *   If the scoring system selects a team that would violate the hard population cap, the decision is overridden to maintain balance.
 *   If the `EloTracker` plugin is inactive, the system defaults to pure population balancing (favoring the smaller team).
 

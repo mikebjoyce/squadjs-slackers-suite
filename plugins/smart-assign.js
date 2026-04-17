@@ -308,15 +308,18 @@ export default class SmartAssign {
 
     // SmartAssign Logic
     const reconnectTeam = await this.db.getReconnectTeam(player.steamID);
-    const targetTeam = this.evaluateTeamAssignment(player, reconnectTeam);
+    const { targetTeam, reason } = this.evaluateTeamAssignment(player, reconnectTeam);
 
     if (reconnectTeam && reconnectTeam === targetTeam) {
-      Logger.verbose('SmartAssign', 2, `[SmartAssign] Applied reconnect memory for ${player.name} -> Team ${targetTeam}`);
+      Logger.verbose('SmartAssign', 2, `[SmartAssign] Applied reconnect memory for ${player.name} -> Team ${targetTeam} (${reason})`);
     } else if (reconnectTeam && reconnectTeam !== targetTeam) {
-      Logger.verbose('SmartAssign', 2, `[SmartAssign] Ignored reconnect memory for ${player.name} (High Pop Equity Enforced) -> Team ${targetTeam}`);
+      Logger.verbose('SmartAssign', 2, `[SmartAssign] Ignored reconnect memory for ${player.name} (Previous: Team ${reconnectTeam}) -> Team ${targetTeam} (${reason})`);
     } else {
-      Logger.verbose('SmartAssign', 2, `[SmartAssign] Evaluated fresh join for ${player.name} -> Team ${targetTeam}`);
+      Logger.verbose('SmartAssign', 2, `[SmartAssign] Evaluated fresh join for ${player.name} -> Team ${targetTeam} (${reason})`);
     }
+
+    // Record the assignment in log
+    this.logEvent('ASSIGNMENT', player, { targetTeam, reason, reconnectTeam });
 
     // If squad/engine put them on the wrong team natively (or they are unassigned)
     // we queue a move.
@@ -361,7 +364,7 @@ export default class SmartAssign {
     let t1Power = 0;
     let t2Power = 0;
 
-    const EXPONENT = 1.1; // Iteration 11: Finalized Squared Average-Gap
+    const EXPONENT = 1.05; // Optimized for parity
 
     for (const p of this.server.players) {
       if (p.steamID === player.steamID) continue; 
@@ -386,12 +389,45 @@ export default class SmartAssign {
     // 2. HARD POPULATION CAP (Highest Priority)
     const totalPop = t1Count + t2Count;
     const highPopThreshold = this.options.highPopThreshold || 96;
-    const maxImbalance = totalPop >= highPopThreshold ? 1 : this.options.maxImbalance || 2;
+    const isRejoin = reconnectTeam === 1 || reconnectTeam === 2;
 
-    if (t1Count - t2Count >= maxImbalance) return 2;
-    if (t2Count - t1Count >= maxImbalance) return 1;
+    // Dynamic maxImbalance: Gradually tightens from 4 to 1 as server fills.
+    let baseMaxImbalance;
+    if (totalPop >= highPopThreshold) {
+      baseMaxImbalance = 1;
+    } else if (totalPop >= 94) {
+      baseMaxImbalance = 1; // Strict parity near full capacity
+    } else if (totalPop >= 88) {
+      baseMaxImbalance = 2;
+    } else if (totalPop >= 80) {
+      baseMaxImbalance = 3;
+    } else {
+      baseMaxImbalance = 4;
+    }
 
-    // 3. SKILL & PENALTY EVALUATION
+    // Rejoins get a significant grace to ensure they get back to their squad.
+    let effectiveMaxImbalance = baseMaxImbalance;
+    if (isRejoin) {
+      if (totalPop >= highPopThreshold) effectiveMaxImbalance = 2; // Allow 2 even when full
+      else effectiveMaxImbalance = baseMaxImbalance + 2; // +2 grace for non-full
+    }
+
+    if (t1Count - t2Count >= effectiveMaxImbalance) return { targetTeam: 2, reason: 'Hard Population Cap' };
+    if (t2Count - t1Count >= effectiveMaxImbalance) return { targetTeam: 1, reason: 'Hard Population Cap' };
+
+    // 3. RECONNECT PRIORITY
+    if (isRejoin) {
+      const wouldViolate = reconnectTeam === 1 
+        ? t1Count + 1 - t2Count > effectiveMaxImbalance 
+        : t2Count + 1 - t1Count > effectiveMaxImbalance;
+      
+      if (!wouldViolate) {
+        Logger.verbose('SmartAssign', 4, `[SmartAssign] Rejoin Priority: ${player.name} -> Team ${reconnectTeam} (Prev Team)`);
+        return { targetTeam: reconnectTeam, reason: 'Reconnect Priority' };
+      }
+    }
+
+    // 4. SKILL & PENALTY EVALUATION
     let playerMu = 25.0;
     if (hasElo) {
       if (eloTracker.eloCache && player.eosID && eloTracker.eloCache.has(player.eosID)) playerMu = eloTracker.eloCache.get(player.eosID).mu;
@@ -400,11 +436,10 @@ export default class SmartAssign {
     const playerPower = Math.pow(playerMu, EXPONENT);
 
     if (!hasElo) {
-      if (reconnectTeam) {
-        const wouldViolate = reconnectTeam === 1 ? t1Count + 1 - t2Count > maxImbalance : t2Count + 1 - t1Count > maxImbalance;
-        if (!wouldViolate) return reconnectTeam;
-      }
-      return t1Count <= t2Count ? 1 : 2;
+      return { 
+        targetTeam: t1Count <= t2Count ? 1 : 2, 
+        reason: 'Population Balance (No Elo)' 
+      };
     }
 
     // Unified Scoring (Squared Average-Gap Model)
@@ -414,36 +449,52 @@ export default class SmartAssign {
     const newAvgT1 = (t1Power + playerPower) / (t1Count + 1);
     const newAvgT2 = (t2Power + playerPower) / (t2Count + 1);
 
-    let scoreT1 = Math.pow(newAvgT1 - avgT2, 2);
-    let scoreT2 = Math.pow(avgT1 - newAvgT2, 2);
+    const baseScoreT1 = Math.pow(newAvgT1 - avgT2, 2);
+    const baseScoreT2 = Math.pow(avgT1 - newAvgT2, 2);
+
+    let scoreT1 = baseScoreT1;
+    let scoreT2 = baseScoreT2;
 
     // POPULATION PENALTY (Mu units squared)
-    const softPenalty = 0.05; 
-    scoreT1 += (t1Count > t2Count) ? (t1Count - t2Count) * softPenalty : 0;
-    scoreT2 += (t2Count > t1Count) ? (t2Count - t1Count) * softPenalty : 0;
-
-    // RECONNECT BONUS
-    const reconnectBonus = 0.05;
-    if (reconnectTeam === 1) scoreT1 -= reconnectBonus;
-    else if (reconnectTeam === 2) scoreT2 -= reconnectBonus;
+    const softPenalty = 0.03; 
+    const penaltyT1 = (t1Count > t2Count) ? (t1Count - t2Count) * softPenalty : 0;
+    const penaltyT2 = (t2Count > t1Count) ? (t2Count - t1Count) * softPenalty : 0;
+    scoreT1 += penaltyT1;
+    scoreT2 += penaltyT2;
 
     // Decision
     let targetTeam;
-    if (scoreT1 < scoreT2) targetTeam = 1;
-    else if (scoreT2 < scoreT1) targetTeam = 2;
-    else targetTeam = t1Count <= t2Count ? 1 : 2; 
+    let subReason = '';
+    if (scoreT1 < scoreT2) {
+      targetTeam = 1;
+      subReason = 'Better Parity Score';
+    } else if (scoreT2 < scoreT1) {
+      targetTeam = 2;
+      subReason = 'Better Parity Score';
+    } else {
+      targetTeam = t1Count <= t2Count ? 1 : 2; 
+      subReason = 'Score Tie - Population Balance';
+    }
+
+    const reason = `Skill Balance (${subReason}: T1=${scoreT1.toFixed(3)}, T2=${scoreT2.toFixed(3)})`;
 
     // Decision Logging (Verbose 4)
-    Logger.verbose('SmartAssign', 4, `[SmartAssign] Player: ${player.name} (${playerMu.toFixed(1)}Mu) | T1: ${t1Count}p, Power: ${t1Power.toFixed(0)} | T2: ${t2Count}p, Power: ${t2Power.toFixed(0)} | Scores: T1=${scoreT1.toFixed(1)}, T2=${scoreT2.toFixed(1)} -> Target: ${targetTeam}`);
+    Logger.verbose('SmartAssign', 4, `[SmartAssign] Player: ${player.name} (${playerMu.toFixed(1)}Mu) | T1: ${t1Count}p, Power: ${t1Power.toFixed(0)} | T2: ${t2Count}p, Power: ${t2Power.toFixed(0)} | Scores: T1=${scoreT1.toFixed(3)}, T2=${scoreT2.toFixed(3)} -> Target: ${targetTeam}`);
 
-    // 4. FINAL SAFETY CHECK
+    // 5. FINAL SAFETY CHECK
     // Overriding the score-based choice if it would violate hard population limits.
     const wouldViolate =
-      targetTeam === 1 ? t1Count + 1 - t2Count > maxImbalance : t2Count + 1 - t1Count > maxImbalance;
+      targetTeam === 1 ? t1Count + 1 - t2Count > effectiveMaxImbalance : t2Count + 1 - t1Count > effectiveMaxImbalance;
 
-    if (wouldViolate) targetTeam = t1Count < t2Count ? 1 : 2;
+    if (wouldViolate) {
+      const finalTeam = t1Count < t2Count ? 1 : 2;
+      return { 
+        targetTeam: finalTeam, 
+        reason: `Hard Population Limit Override (Skill preferred Team ${targetTeam} but would violate)` 
+      };
+    }
 
-    return targetTeam;
+    return { targetTeam, reason };
   }
 
   logEvent(eventType, player, extraData = {}) {

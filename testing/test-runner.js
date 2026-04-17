@@ -117,20 +117,21 @@ class BaselineAssign extends SmartAssign {
     const highPopThreshold = this.options.highPopThreshold || 96;
     const maxImbalance = totalPop >= highPopThreshold ? 1 : (this.options.maxImbalance || 2);
 
-    if (t1Count - t2Count >= maxImbalance) return 2;
-    if (t2Count - t1Count >= maxImbalance) return 1;
+    if (t1Count - t2Count >= maxImbalance) return { targetTeam: 2, reason: 'Hard Population Cap' };
+    if (t2Count - t1Count >= maxImbalance) return { targetTeam: 1, reason: 'Hard Population Cap' };
 
     if (reconnectTeam) {
       const wouldViolate = reconnectTeam === 1 
         ? ((t1Count + 1) - t2Count > maxImbalance)
         : ((t2Count + 1) - t1Count > maxImbalance);
         
-      if (!wouldViolate) return reconnectTeam;
+      if (!wouldViolate) return { targetTeam: reconnectTeam, reason: 'Reconnect Memory' };
     }
 
-    if (t1Count < t2Count) return 1;
-    if (t2Count < t1Count) return 2;
-    return 1;
+    return { 
+      targetTeam: t1Count <= t2Count ? 1 : 2, 
+      reason: 'Population Balance' 
+    };
   }
 }
 
@@ -149,8 +150,8 @@ class LegacyAssign extends SmartAssign {
     const highPopThreshold = this.options.highPopThreshold || 96;
     const maxImbalance = totalPop >= highPopThreshold ? 1 : this.options.maxImbalance || 2;
 
-    if (t1Count - t2Count >= maxImbalance) return 2;
-    if (t2Count - t1Count >= maxImbalance) return 1;
+    if (t1Count - t2Count >= maxImbalance) return { targetTeam: 2, reason: 'Hard Population Cap' };
+    if (t2Count - t1Count >= maxImbalance) return { targetTeam: 1, reason: 'Hard Population Cap' };
 
     if (reconnectTeam) {
       const wouldViolate =
@@ -158,11 +159,12 @@ class LegacyAssign extends SmartAssign {
           ? t1Count + 1 - t2Count > maxImbalance
           : t2Count + 1 - t1Count > maxImbalance;
 
-      if (!wouldViolate) return reconnectTeam;
+      if (!wouldViolate) return { targetTeam: reconnectTeam, reason: 'Reconnect Memory' };
     }
 
     const eloTracker = this.server.plugins.find((p) => p.constructor.name === 'EloTracker');
     let targetTeam = t1Count <= t2Count ? 1 : 2;
+    let reason = 'Population Balance';
 
     if (eloTracker && eloTracker.ready) {
       const data = eloTracker.buildRoundStartData();
@@ -182,18 +184,28 @@ class LegacyAssign extends SmartAssign {
         if (t1Count < t2Count) scoreT1 -= (t2Count - t1Count) * softPenalty;
         else if (t2Count < t1Count) scoreT2 -= (t1Count - t2Count) * softPenalty;
 
-        if (scoreT1 < scoreT2) targetTeam = 1;
-        else if (scoreT2 < scoreT1) targetTeam = 2;
-        else targetTeam = t1Count <= t2Count ? 1 : 2;
+        if (scoreT1 < scoreT2) {
+          targetTeam = 1;
+          reason = 'Skill Balance (Better Avg Gap)';
+        } else if (scoreT2 < scoreT1) {
+          targetTeam = 2;
+          reason = 'Skill Balance (Better Avg Gap)';
+        } else {
+          targetTeam = t1Count <= t2Count ? 1 : 2;
+          reason = 'Population Balance (Skill Tie)';
+        }
       }
     }
 
     const wouldViolate =
       targetTeam === 1 ? t1Count + 1 - t2Count > maxImbalance : t2Count + 1 - t1Count > maxImbalance;
 
-    if (wouldViolate) targetTeam = t1Count < t2Count ? 1 : 2;
+    if (wouldViolate) {
+      targetTeam = t1Count < t2Count ? 1 : 2;
+      reason = 'Hard Population Cap Override';
+    }
 
-    return targetTeam;
+    return { targetTeam, reason };
   }
 }
 
@@ -208,8 +220,8 @@ class ImprovedAssign extends SmartAssign {
     const maxImbalance = totalPop >= highPopThreshold ? 1 : this.options.maxImbalance || 2;
 
     // 1. Hard population imbalance — highest priority
-    if (t1Count - t2Count >= maxImbalance) return 2;
-    if (t2Count - t1Count >= maxImbalance) return 1;
+    if (t1Count - t2Count >= maxImbalance) return { targetTeam: 2, reason: 'Hard Population Cap' };
+    if (t2Count - t1Count >= maxImbalance) return { targetTeam: 1, reason: 'Hard Population Cap' };
 
     // Compute Elo sums directly from live player list (avoids count mismatch)
     const eloTracker = this.server.plugins.find((p) => p.constructor.name === 'EloTracker');
@@ -246,14 +258,14 @@ class ImprovedAssign extends SmartAssign {
 
         // Honor reconnect unless it's the wrong Elo team AND the gap is already significant
         if (reconnectTeam === eloPreferredTeam || currentEloDiff < ELO_OVERRIDE_THRESHOLD) {
-          return reconnectTeam;
+          return { targetTeam: reconnectTeam, reason: 'Reconnect Memory' };
         }
         // Fall through to Elo routing — reconnect preference is overridden
       }
     }
 
     // 3. No Elo data → pure population balance
-    if (!hasElo) return t1Count <= t2Count ? 1 : 2;
+    if (!hasElo) return { targetTeam: t1Count <= t2Count ? 1 : 2, reason: 'Population Balance' };
 
     // 4. Minimize Elo sum gap
     const sumGap = t1MuSum - t2MuSum;
@@ -261,17 +273,24 @@ class ImprovedAssign extends SmartAssign {
     const diffIfT2 = Math.abs(sumGap - playerMu);
 
     let targetTeam;
+    let reason = 'Skill Balance (Min Sum Gap)';
     if (diffIfT1 < diffIfT2) targetTeam = 1;
     else if (diffIfT2 < diffIfT1) targetTeam = 2;
-    else targetTeam = t1Count <= t2Count ? 1 : 2; // Tie → population balance
+    else {
+      targetTeam = t1Count <= t2Count ? 1 : 2; // Tie → population balance
+      reason = 'Population Balance (Skill Tie)';
+    }
 
     // 5. Final pop safety check
     const wouldViolate =
       targetTeam === 1 ? t1Count + 1 - t2Count > maxImbalance : t2Count + 1 - t1Count > maxImbalance;
 
-    if (wouldViolate) targetTeam = t1Count < t2Count ? 1 : 2;
+    if (wouldViolate) {
+      targetTeam = t1Count < t2Count ? 1 : 2;
+      reason = 'Hard Population Cap Override';
+    }
 
-    return targetTeam;
+    return { targetTeam, reason };
   }
 }
 
@@ -280,6 +299,11 @@ class ImprovedAssign extends SmartAssign {
 async function simulateMatch(server, mockEloTracker, match, eosToSteam, randomSequence) {
   let randIndex = 0;
   const getRand = () => randomSequence[randIndex++];
+
+  let rejoinAttempts = 0;
+  let rejoinSuccesses = 0;
+  const eventLog = [];
+  server.eventLog = eventLog; // Expose to plugin
 
   server.matchStartTime = new Date();
   await server.emit('NEW_GAME');
@@ -310,7 +334,6 @@ async function simulateMatch(server, mockEloTracker, match, eosToSteam, randomSe
   }
 
   const disconnectedPlayers = [];
-  const eventLog = [];
 
   for (let step = 0; step < 100; step++) {
     const currentPop = server.players.length;
@@ -342,10 +365,16 @@ async function simulateMatch(server, mockEloTracker, match, eosToSteam, randomSe
     else if (action === 'REJOIN') {
       const rejoinIdx = Math.floor(getRand() * disconnectedPlayers.length);
       const rejoinder = disconnectedPlayers.splice(rejoinIdx, 1)[0];
+      const previousTeam = rejoinder.teamID;
       rejoinder.teamID = 3;
       server.players.push(rejoinder);
       await server.emit('PLAYER_CONNECTED', { player: rejoinder });
-      eventLog.push(`[REJOIN] ${rejoinder.name} rejoined -> Assigned to Team ${rejoinder.teamID}`);
+      
+      const success = (String(rejoinder.teamID) === String(previousTeam));
+      rejoinAttempts++;
+      if (success) rejoinSuccesses++;
+      
+      eventLog.push(`[REJOIN] ${rejoinder.name} rejoined (Previous: Team ${previousTeam}) -> Assigned to Team ${rejoinder.teamID} | ${success ? 'SUCCESS' : 'MOVED'}`);
     } 
     else if (action === 'JOIN') {
       const newPlayer = pendingJoins.shift();
@@ -368,10 +397,16 @@ async function simulateMatch(server, mockEloTracker, match, eosToSteam, randomSe
       eventLog.push(`[STABILIZE-JOIN] ${newPlayer.name} joined -> Team ${newPlayer.teamID}`);
     } else if (disconnectedPlayers.length > 0) {
       const rejoinder = disconnectedPlayers.shift();
+      const previousTeam = rejoinder.teamID;
       rejoinder.teamID = 3;
       server.players.push(rejoinder);
       await server.emit('PLAYER_CONNECTED', { player: rejoinder });
-      eventLog.push(`[STABILIZE-REJOIN] ${rejoinder.name} rejoined -> Team ${rejoinder.teamID}`);
+      
+      const success = (String(rejoinder.teamID) === String(previousTeam));
+      rejoinAttempts++;
+      if (success) rejoinSuccesses++;
+
+      eventLog.push(`[STABILIZE-REJOIN] ${rejoinder.name} rejoined (Previous: Team ${previousTeam}) -> Team ${rejoinder.teamID} | ${success ? 'SUCCESS' : 'MOVED'}`);
     } else {
       break;
     }
@@ -395,6 +430,8 @@ async function simulateMatch(server, mockEloTracker, match, eosToSteam, randomSe
     t2Elo: t2.avgMu, 
     t1Sum: t1.sumMu,
     t2Sum: t2.sumMu,
+    rejoinAttempts,
+    rejoinSuccesses,
     eventLog 
   };
 }
@@ -465,23 +502,30 @@ async function runRealisticLifecycleTests(eloPlugin, basePlugin, improvedPlugin,
   const impSumDiff = (improvedResults.reduce((sum, r) => sum + r.sumDiff, 0) / improvedResults.length).toFixed(2);
   const legacySumDiff = (legacyResults.reduce((sum, r) => sum + r.sumDiff, 0) / legacyResults.length).toFixed(2);
 
+  const eloRejoinRate = (eloResults.reduce((sum, r) => sum + (r.rejoinAttempts > 0 ? r.rejoinSuccesses / r.rejoinAttempts : 1), 0) / eloResults.length * 100).toFixed(2);
+  const baseRejoinRate = (baseResults.reduce((sum, r) => sum + (r.rejoinAttempts > 0 ? r.rejoinSuccesses / r.rejoinAttempts : 1), 0) / baseResults.length * 100).toFixed(2);
+  const legacyRejoinRate = (legacyResults.reduce((sum, r) => sum + (r.rejoinAttempts > 0 ? r.rejoinSuccesses / r.rejoinAttempts : 1), 0) / legacyResults.length * 100).toFixed(2);
+
   console.log(`🏁 LIFECYCLE TEST COMPARISON SUMMARY 🏁`);
   console.log(`Total Real Matches Tested: ${eloResults.length}\n`);
 
   console.log(`=== NAIVE BASELINE ASSIGN ===`);
   console.log(`Pop Balance <= 1: ${(basePerfectPop / baseResults.length * 100).toFixed(2)}% (${basePerfectPop}/${baseResults.length})`);
   console.log(`Average Elo Difference: ${baseAvgDiff}`);
-  console.log(`Average Sum Difference: ${baseSumDiff}\n`);
+  console.log(`Average Sum Difference: ${baseSumDiff}`);
+  console.log(`Rejoin Persistence: ${baseRejoinRate}%\n`);
 
   console.log(`=== LEGACY SMART ASSIGN (Old Averages) ===`);
   console.log(`Pop Balance <= 1: ${(legacyPerfectPop / legacyResults.length * 100).toFixed(2)}% (${legacyPerfectPop}/${legacyResults.length})`);
   console.log(`Average Elo Difference: ${legacyAvgDiff}`);
-  console.log(`Average Sum Difference: ${legacySumDiff}\n`);
+  console.log(`Average Sum Difference: ${legacySumDiff}`);
+  console.log(`Rejoin Persistence: ${legacyRejoinRate}%\n`);
 
   console.log(`=== NEW SMART ASSIGN (Sum-Gap / Production) ===`);
   console.log(`Pop Balance <= 1: ${(eloPerfectPop / eloResults.length * 100).toFixed(2)}% (${eloPerfectPop}/${eloResults.length})`);
   console.log(`Average Elo Difference: ${eloAvgDiff}`);
-  console.log(`Average Sum Difference: ${eloSumDiff}\n`);
+  console.log(`Average Sum Difference: ${eloSumDiff}`);
+  console.log(`Rejoin Persistence: ${eloRejoinRate}%\n`);
 
   const validImpResults = improvedResults.filter((r) => r.t1End + r.t2End >= 70);
   validImpResults.sort((a, b) => b.eloDiff - a.eloDiff);
@@ -497,6 +541,11 @@ async function runRealisticLifecycleTests(eloPlugin, basePlugin, improvedPlugin,
     console.log(`         T1 Sum: ${impR.t1Sum.toFixed(1)} (Avg: ${impR.t1Elo.toFixed(2)}) | T2 Sum: ${impR.t2Sum.toFixed(1)} (Avg: ${impR.t2Elo.toFixed(2)})`);
     console.log(`[LEGACY] Pop: T1: ${legacyR.t1End} | T2: ${legacyR.t2End} (Diff: ${legacyR.popDiff}) -- Elo Diff: ${legacyR.eloDiff.toFixed(2)} -- Sum Diff: ${legacyR.sumDiff.toFixed(1)}`);
     console.log(`[BASE  ] Pop: T1: ${baseR.t1End} | T2: ${baseR.t2End} (Diff: ${baseR.popDiff}) -- Elo Diff: ${baseR.eloDiff.toFixed(2)} -- Sum Diff: ${baseR.sumDiff.toFixed(1)}`);
+    
+    console.log(`\nDetailed Decision Log (NEW SMART ASSIGN):`);
+    // Show last 10 algorithm decisions or rejoins for context
+    const algoEvents = impR.eventLog.filter(e => e.includes('[ALGO]') || e.includes('[REJOIN]')).slice(-15);
+    for(const e of algoEvents) console.log(`  ${e}`);
   }
 }
 
@@ -534,6 +583,14 @@ async function runTests() {
   const eloPlugin = new SmartAssign(eloServer, { ...options, imbalanceSoftPenalty: 0 });
   eloPlugin.db = new MockSADatabase();
   eloPlugin.executor = new MockSASwapExecutor(eloServer);
+
+  // Custom logEvent for test-runner visibility
+  eloPlugin.logEvent = (type, player, data) => {
+    if (type === 'ASSIGNMENT' && eloServer.eventLog) {
+      eloServer.eventLog.push(`[ALGO] ${player.name} -> Team ${data.targetTeam}: ${data.reason}`);
+    }
+  };
+
   await eloPlugin.mount();
 
   // 2. Setup Baseline
@@ -552,6 +609,14 @@ async function runTests() {
   const improvedPlugin = new ImprovedAssign(improvedServer, options);
   improvedPlugin.db = new MockSADatabase();
   improvedPlugin.executor = new MockSASwapExecutor(improvedServer);
+
+  // Custom logEvent for test-runner visibility
+  improvedPlugin.logEvent = (type, player, data) => {
+    if (type === 'ASSIGNMENT' && improvedServer.eventLog) {
+      improvedServer.eventLog.push(`[ALGO] ${player.name} -> Team ${data.targetTeam}: ${data.reason}`);
+    }
+  };
+
   await improvedPlugin.mount();
 
   // 4. Setup Legacy
@@ -561,6 +626,14 @@ async function runTests() {
   const legacyPlugin = new LegacyAssign(legacyServer, options);
   legacyPlugin.db = new MockSADatabase();
   legacyPlugin.executor = new MockSASwapExecutor(legacyServer);
+
+  // Custom logEvent for test-runner visibility
+  legacyPlugin.logEvent = (type, player, data) => {
+    if (type === 'ASSIGNMENT' && legacyServer.eventLog) {
+      legacyServer.eventLog.push(`[ALGO] ${player.name} -> Team ${data.targetTeam}: ${data.reason}`);
+    }
+  };
+
   await legacyPlugin.mount();
 
   await runRealisticLifecycleTests(
