@@ -1,4 +1,4 @@
-# SmartAssign Plugin v0.1.3
+# SmartAssign Plugin v0.1.4
 
 **Elo-Aware Auto Assignment & Player Lifecycle Logger**
 
@@ -6,7 +6,7 @@
 
 This plugin overrides Squad's native team assignment mechanics to provide smart, fair, and reliable team placements. It perfectly tracks player joins, disconnects, and team changes without relying on buggy game log events, providing highly accurate JSONL lifecycle logs. 
 
-When a player joins the server, the plugin uses a **Logistic Win-Probability Model** to ensure optimal team assignment, weighing competitive parity, player preference, and population equity on a single scale. This approach is optimized for **Real-World Maintenance**, where servers stay at 95+ players with constant churn.
+When a player joins the server, the plugin uses an optimized **Logistic Win-Probability Model (Hybrid v0.1.4)** to ensure optimal team assignment. This version has been rigorously benchmarked against real-world churn scenarios and high-population steady states to maintain perfect parity while maximizing skill balance.
 
 Additionally, it executes all team changes via a background retry-queue to ensure the swap applies successfully as soon as the engine allows it.
 
@@ -49,8 +49,8 @@ Add this to your `config.json` inside the `plugins` array.
   "enabled": true,
   "database": "sqlite",
   "logPath": "./smart-assign-log.jsonl",
-  "maxImbalance": 2,
-  "highPopThreshold": 96
+  "enableSmartAssign": true,
+  "enableEventLogging": true
 }
 ```
 
@@ -71,10 +71,10 @@ squad-server/
 
 ```text
 Core Settings:
-database              - (Required) A valid Sequelize connector (e.g. "sqlite") used to store the reconnect memory so it survives SquadJS restarts.
-logPath               - (Optional) File path to save the JSONL lifecycle logs (Joins, Leaves, Team Changes). Defaults to './auto-assign-log.jsonl'.
-maxImbalance          - (Optional) The maximum player imbalance allowed before the plugin strictly forces players to the smaller team regardless of Elo metrics or Reconnect Memory. Defaults to 2.
-highPopThreshold      - (Optional) Total player count at which the plugin goes into "Strict Equity Mode", mathematically forcing maxImbalance to 1 (overriding Elo/Reconnect preferences) to protect near-full servers. Defaults to 96.
+database              - (Required) A valid Sequelize connector (e.g. "sqlite") used to store the reconnect memory.
+logPath               - (Optional) File path to save the JSONL lifecycle logs. Defaults to './auto-assign-log.jsonl'.
+enableSmartAssign     - (Optional) Defaults to true. If false, the plugin runs in passive data-collection mode (logging only, no player moves).
+enableEventLogging    - (Optional) Defaults to true. Toggles the JSONL lifecycle logging.
 ```
 
 ---
@@ -86,7 +86,8 @@ SmartAssign uses a hierarchical decision process optimized for competitive parit
 ### 1. Hard Population Cap (Dynamic)
 The plugin first checks the player counts of both teams. It gradually tightens the population cap as the server fills to allow for better skill-balancing during seeding while ensuring perfect parity when full.
 - **Seeding (<70 players)**: Up to 4-player imbalance allowed.
-- **Mid-Pop (70-94 players)**: Tightens to 2-3 player difference.
+- **Mid-Pop (70-84 players)**: Tightens to 3-player difference.
+- **High-Pop (85-94 players)**: Tightens to 2-player difference.
 - **Maintenance (95+ players)**: **Strict 1-player parity enforced.**
 
 ### 2. Reconnect Memory & Grace (High Priority)
@@ -96,7 +97,7 @@ Players rejoining within the same round are given a **+2 player imbalance allowa
 If no reconnect memory is found, the system estimates the "Win Probability" of both teams using a logistic curve.
 *   **Mu Scaling (Exponent 1.10)**: Player Elo (Mu) is weighted non-linearly to correctly value the disproportionate impact of high-skill "pro" players on team power.
 *   **50/50 Target**: It assigns the player to the team that brings the match closest to a theoretical 50/50 win chance.
-*   **Soft Population Penalty**: A small bias (0.01 probability units) favors the smaller team when skill gaps are negligible.
+*   **Optimized Hybrid Tuning (v0.1.4)**: Uses a refined **Logistic Scale of 15** and **Soft Penalty of 0.06**, identified via evolutionary benchmarking as the "Goldilocks Zone" for balancing competitive parity with population equity.
 
 ### 4. Final Safety Check & Fallback
 *   If the scoring system selects a team that would violate the hard population cap, the decision is overridden.

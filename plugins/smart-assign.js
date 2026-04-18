@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v0.1.3                   ║
+ * ║                  SMART ASSIGN PLUGIN v0.1.4                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -31,19 +31,19 @@
  * ─── NOTES ───────────────────────────────────────────────────────
  *
  * - Algorithm uses a Unified Scoring System:
- *     1. Hard Pop Cap: Highest priority; prevents imbalance > maxImbalance.
+ *     1. Hard Pop Cap: Highest priority; prevents imbalance beyond dynamic thresholds.
  *     2. Squared Average Elo Gap: Minimizes resulting team average differences.
  *     3. Soft Pop Penalty: penalizes score per player of imbalance.
  *     4. Reconnect Bonus: grants score bonus to a player's old team.
- * - highPopThreshold (default 96) enforces a strict 1-player max imbalance.
+ * - Strict 1-player max imbalance enforced at high population (96+).
  * - Event logs include JOIN, LEAVE, TEAM_CHANGE, and MOVE_FAILED.
  *
  * ─── CONFIGURATION ───────────────────────────────────────────────
  *
  * database: Sequelize connector name (default: 'sqlite').
  * logPath: Path for JSONL event logging (default: './auto-assign-log.jsonl').
- * maxImbalance: Max player count difference allowed (default: 2).
- * highPopThreshold: Pop level for strict 1-player imbalance (default: 96).
+ * enableSmartAssign: Toggle auto-assignment logic (default: true).
+ * enableEventLogging: Toggle JSONL event logging (default: true).
  *
  * Author:
  * Discord: `real_slacker`
@@ -57,7 +57,7 @@ import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
 
 export default class SmartAssign {
-  static version = '0.1.3';
+  static version = '0.1.4';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
@@ -75,23 +75,23 @@ export default class SmartAssign {
         description: 'Sequelize/SQLite connector.',
         default: 'sqlite'
       },
+      enableSmartAssign: {
+        required: false,
+        description: 'Whether to actually move players. If false, plugin runs in passive data-collection mode.',
+        default: true,
+        type: 'boolean'
+      },
+      enableEventLogging: {
+        required: false,
+        description: 'Toggle the JSONL event logging output.',
+        default: true,
+        type: 'boolean'
+      },
       logPath: {
         required: false,
         description: 'Path to JSONL file for player lifecycle events.',
         default: './auto-assign-log.jsonl',
         type: 'string'
-      },
-      maxImbalance: {
-        required: false,
-        description: 'Maximum player imbalance allowed before forcing balance.',
-        default: 2,
-        type: 'number'
-      },
-      highPopThreshold: {
-        required: false,
-        description: 'Total player count at which the plugin enforces strict 1-player max imbalance (overriding Elo/Reconnects).',
-        default: 96,
-        type: 'number'
       }
     };
   }
@@ -357,7 +357,11 @@ export default class SmartAssign {
     // If squad/engine put them on the wrong team natively (or they are unassigned)
     // we queue a move.
     if (String(player.teamID) !== String(targetTeam)) {
-      this.executor.queueMove(player.steamID, targetTeam);
+      if (this.options.enableSmartAssign !== false) {
+        this.executor.queueMove(player.steamID, targetTeam);
+      } else {
+        Logger.verbose('SmartAssign', 2, `[SmartAssign] Passive mode: skipping move for ${player.name} to Team ${targetTeam}`);
+      }
     }
   }
 
@@ -397,10 +401,10 @@ export default class SmartAssign {
     let t1Power = 0;
     let t2Power = 0;
 
-    const EXPONENT = 1.10; // Optimized weighting for top-tier players (Iteration 33)
+    const EXPONENT = 1.10;
 
     for (const p of this.server.players) {
-      if (p.steamID === player.steamID) continue; 
+      if (p.steamID === player.steamID) continue;
 
       const isT1 = String(p.teamID) === '1';
       const isT2 = String(p.teamID) === '2';
@@ -410,131 +414,92 @@ export default class SmartAssign {
 
       if (hasElo && (isT1 || isT2)) {
         let mu = 25.0;
-        if (eloTracker.eloCache && p.eosID && eloTracker.eloCache.has(p.eosID)) mu = eloTracker.eloCache.get(p.eosID).mu;
-        else if (eloTracker.eloMap && p.steamID && eloTracker.eloMap.has(p.steamID)) mu = eloTracker.eloMap.get(p.steamID);
-        
+        if (eloTracker.eloCache && p.eosID && eloTracker.eloCache.has(p.eosID))
+          mu = eloTracker.eloCache.get(p.eosID).mu;
+        else if (eloTracker.eloMap && p.steamID && eloTracker.eloMap.has(p.steamID))
+          mu = eloTracker.eloMap.get(p.steamID);
+
         const pwr = Math.pow(mu, EXPONENT);
         if (isT1) t1Power += pwr;
         else t2Power += pwr;
       }
     }
 
-    // 2. HARD POPULATION CAP (Highest Priority)
+    // 2. HARD POPULATION CAP
     const totalPop = t1Count + t2Count;
-    const highPopThreshold = this.options.highPopThreshold || 96;
+    const highPopThreshold = 96; // Enforce strict 1-player max imbalance at high pop
     const isRejoin = reconnectTeam === 1 || reconnectTeam === 2;
 
-    // Dynamic maxImbalance: Gradually tightens from 4 to 1 as server fills (Real-World Maintenance Focus).
     let baseMaxImbalance;
-    if (totalPop >= 95) {
-      baseMaxImbalance = 1;
-    } else if (totalPop >= 85) {
-      baseMaxImbalance = 2;
-    } else if (totalPop >= 70) {
-      baseMaxImbalance = 3;
-    } else {
-      baseMaxImbalance = 4;
-    }
+    if (totalPop >= 95) baseMaxImbalance = 1;
+    else if (totalPop >= 85) baseMaxImbalance = 2;
+    else if (totalPop >= 70) baseMaxImbalance = 3;
+    else baseMaxImbalance = 4;
 
-    // Rejoins get a significant grace to ensure they get back to their squad.
     let effectiveMaxImbalance = baseMaxImbalance;
     if (isRejoin) {
-      if (totalPop >= highPopThreshold) effectiveMaxImbalance = 2; // Allow 2 even when full
-      else effectiveMaxImbalance = baseMaxImbalance + 2; // +2 grace for non-full
+      if (totalPop >= highPopThreshold) effectiveMaxImbalance = 2;
+      else effectiveMaxImbalance = baseMaxImbalance + 2;
     }
 
     if (t1Count - t2Count >= effectiveMaxImbalance) return { targetTeam: 2, reason: 'Hard Population Cap' };
     if (t2Count - t1Count >= effectiveMaxImbalance) return { targetTeam: 1, reason: 'Hard Population Cap' };
 
-    // 3. RECONNECT PRIORITY
+    // 3. RECONNECT PRIORITY (Early Exit for Persistence)
     if (isRejoin) {
-      const wouldViolate = reconnectTeam === 1 
-        ? t1Count + 1 - t2Count > effectiveMaxImbalance 
-        : t2Count + 1 - t1Count > effectiveMaxImbalance;
-      
-      if (!wouldViolate) {
-        Logger.verbose('SmartAssign', 4, `[SmartAssign] Rejoin Priority: ${player.name} -> Team ${reconnectTeam} (Prev Team)`);
-        return { targetTeam: reconnectTeam, reason: 'Reconnect Priority' };
-      }
+      const wouldViolate =
+        reconnectTeam === 1
+          ? t1Count + 1 - t2Count > effectiveMaxImbalance
+          : t2Count + 1 - t1Count > effectiveMaxImbalance;
+
+      if (!wouldViolate) return { targetTeam: reconnectTeam, reason: 'Reconnect Priority' };
     }
 
     // 4. SKILL & PENALTY EVALUATION
     let playerMu = 25.0;
     if (hasElo) {
-      if (eloTracker.eloCache && player.eosID && eloTracker.eloCache.has(player.eosID)) playerMu = eloTracker.eloCache.get(player.eosID).mu;
-      else if (eloTracker.eloMap && player.steamID && eloTracker.eloMap.has(player.steamID)) playerMu = eloTracker.eloMap.get(player.steamID);
+      if (eloTracker.eloCache && player.eosID && eloTracker.eloCache.has(player.eosID))
+        playerMu = eloTracker.eloCache.get(player.eosID).mu;
+      else if (eloTracker.eloMap && player.steamID && eloTracker.eloMap.has(player.steamID))
+        playerMu = eloTracker.eloMap.get(player.steamID);
     }
     const playerPower = Math.pow(playerMu, EXPONENT);
 
     if (!hasElo) {
-      return { 
-        targetTeam: t1Count <= t2Count ? 1 : 2, 
-        reason: 'Population Balance (No Elo)' 
-      };
+      return { targetTeam: t1Count <= t2Count ? 1 : 2, reason: 'Population Balance (No Elo)' };
     }
 
-    // Unified Scoring (Logistic Win-Probability Model)
-    // Estimates the win chance for Team 1 and tries to keep it at 0.5.
+    // Logistic Win-Probability Model (v0.1.4 Hybrid Tuning: Scale 15)
     const avgT1 = t1Count > 0 ? t1Power / t1Count : 25.0;
     const avgT2 = t2Count > 0 ? t2Power / t2Count : 25.0;
 
     const newAvgT1 = (t1Power + playerPower) / (t1Count + 1);
     const newAvgT2 = (t2Power + playerPower) / (t2Count + 1);
 
-    // Logistic Win-Probability Scoring
-    const logisticScale = 20; 
+    const logisticScale = 15;
     const getWinProb = (a, b) => 1 / (1 + Math.pow(10, (b - a) / logisticScale));
 
-    const winProbIfT1 = getWinProb(newAvgT1, avgT2);
-    const winProbIfT2 = getWinProb(avgT1, newAvgT2);
+    const softPenalty = 0.06; // v0.1.4 Optimized linear weight
+    const scoreT1 =
+      Math.abs(getWinProb(newAvgT1, avgT2) - 0.5) + (t1Count > t2Count ? (t1Count - t2Count) * softPenalty : 0);
+    const scoreT2 = Math.abs(getWinProb(avgT1, newAvgT2) - 0.5) + ((t2Count > t1Count) ? (t2Count - t1Count) * softPenalty : 0);
 
-    let scoreT1 = Math.abs(winProbIfT1 - 0.5);
-    let scoreT2 = Math.abs(winProbIfT2 - 0.5);
-
-    // POPULATION PENALTY (Probability units)
-    const softPenalty = this.options.imbalanceSoftPenalty || 0.01; 
-    const penaltyT1 = (t1Count > t2Count) ? (t1Count - t2Count) * softPenalty : 0;
-    const penaltyT2 = (t2Count > t1Count) ? (t2Count - t1Count) * softPenalty : 0;
-    scoreT1 += penaltyT1;
-    scoreT2 += penaltyT2;
-
-    // Decision
     let targetTeam;
-    let subReason = '';
-    if (scoreT1 < scoreT2) {
-      targetTeam = 1;
-      subReason = 'Better Parity Score';
-    } else if (scoreT2 < scoreT1) {
-      targetTeam = 2;
-      subReason = 'Better Parity Score';
-    } else {
-      targetTeam = t1Count <= t2Count ? 1 : 2; 
-      subReason = 'Score Tie - Population Balance';
-    }
+    if (scoreT1 < scoreT2) targetTeam = 1;
+    else if (scoreT2 < scoreT1) targetTeam = 2;
+    else targetTeam = t1Count <= t2Count ? 1 : 2;
 
-    const reason = `Skill Balance (${subReason}: T1=${scoreT1.toFixed(3)}, T2=${scoreT2.toFixed(3)})`;
-
-    // Decision Logging (Verbose 4)
-    Logger.verbose('SmartAssign', 4, `[SmartAssign] Player: ${player.name} (${playerMu.toFixed(1)}Mu) | T1: ${t1Count}p, Power: ${t1Power.toFixed(0)} | T2: ${t2Count}p, Power: ${t2Power.toFixed(0)} | Scores: T1=${scoreT1.toFixed(3)}, T2=${scoreT2.toFixed(3)} -> Target: ${targetTeam}`);
+    const reason = `Skill Balance (Scale 15): T1=${scoreT1.toFixed(3)}, T2=${scoreT2.toFixed(3)}`;
 
     // 5. FINAL SAFETY CHECK
-    // Overriding the score-based choice if it would violate hard population limits.
-    const wouldViolate =
-      targetTeam === 1 ? t1Count + 1 - t2Count > effectiveMaxImbalance : t2Count + 1 - t1Count > effectiveMaxImbalance;
-
-    if (wouldViolate) {
-      const finalTeam = t1Count < t2Count ? 1 : 2;
-      return { 
-        targetTeam: finalTeam, 
-        reason: `Hard Population Limit Override (Skill preferred Team ${targetTeam} but would violate)` 
-      };
-    }
+    const wouldViolate = targetTeam === 1 ? t1Count + 1 - t2Count > effectiveMaxImbalance : t2Count + 1 - t1Count > effectiveMaxImbalance;
+    if (wouldViolate) return { targetTeam: t1Count < t2Count ? 1 : 2, reason: 'Hard Population Limit Override' };
 
     return { targetTeam, reason };
   }
 
   logEvent(eventType, player, extraData = {}) {
-    if (!this.options.logPath) return;
+    if (!this.options.logPath || this.options.enableEventLogging === false) return;
 
     const event = {
       timestamp: Date.now(),

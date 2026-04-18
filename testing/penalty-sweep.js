@@ -209,56 +209,6 @@ async function simulateScenario(server, mockEloTracker, match, eosToSteam, seede
         recordElo({ action: 'JOIN', player: newPlayer.name, team: newPlayer.teamID });
       }
     }
-  } else if (scenarioType === 'STABLE_HIGH_POP') {
-    const initialFill = pendingJoins.splice(0, 98);
-    for (const newPlayer of initialFill) {
-      server.players.push(newPlayer);
-      await server.emit('PLAYER_CONNECTED', { player: newPlayer });
-      recordElo({ action: 'FILL', player: newPlayer.name, team: newPlayer.teamID });
-    }
-
-    // High Population Stable State (500 iterations)
-    // No mass-exit, just regular churn.
-    for (let step = 0; step < 500; step++) {
-      const currentPop = server.players.length;
-      const r = seededRandom.next();
-      let action;
-
-      if (currentPop >= 100) action = 'LEAVE';
-      else if (currentPop < 94) action = 'JOIN';
-      else {
-        if (r < 0.45) action = 'LEAVE';
-        else if (r < 0.75 && disconnectedPlayers.length > 0) action = 'REJOIN';
-        else if (pendingJoins.length > 0) action = 'JOIN';
-        else action = 'LEAVE';
-      }
-
-      if (action === 'LEAVE') {
-        const leaveIdx = Math.floor(seededRandom.next() * server.players.length);
-        const leaver = server.players.splice(leaveIdx, 1)[0];
-        disconnectedPlayers.push(leaver);
-        await server.emit('UPDATED_PLAYER_INFORMATION', {});
-        await plugin.db.savePlayerDisconnect(leaver.steamID, leaver.teamID);
-        recordElo({ action: 'LEAVE', player: leaver.name, team: leaver.teamID });
-      } 
-      else if (action === 'REJOIN') {
-        const rejoinIdx = Math.floor(seededRandom.next() * disconnectedPlayers.length);
-        const rejoinder = disconnectedPlayers.splice(rejoinIdx, 1)[0];
-        const prevTeam = rejoinder.teamID;
-        rejoinder.teamID = 3;
-        server.players.push(rejoinder);
-        await server.emit('PLAYER_CONNECTED', { player: rejoinder });
-        rejoinAttempts++;
-        if (String(rejoinder.teamID) === String(prevTeam)) rejoinSuccesses++;
-        recordElo({ action: 'REJOIN', player: rejoinder.name, team: rejoinder.teamID });
-      } 
-      else if (action === 'JOIN' && pendingJoins.length > 0) {
-        const newPlayer = pendingJoins.shift();
-        server.players.push(newPlayer);
-        await server.emit('PLAYER_CONNECTED', { player: newPlayer });
-        recordElo({ action: 'JOIN', player: newPlayer.name, team: newPlayer.teamID });
-      }
-    }
   } else if (scenarioType === 'REALWORLD_CHURN') {
     const initialFill = pendingJoins.splice(0, 98);
     for (const newPlayer of initialFill) {
@@ -390,12 +340,13 @@ async function runUnifiedTests() {
   }
 
   const engineConfigs = [
-    { name: 'NAIVE BASELINE', Class: BaselineAssign, options: {} },
-    { name: 'LEGACY (v0.1.0)', Class: LegacyAssign, options: {} },
-    { name: 'SMART ASSIGN (Current)', Class: SmartAssign, options: { imbalanceSoftPenalty: 0.06 } }
+    { name: 'Penalty 0.04', Class: SmartAssign, options: { imbalanceSoftPenalty: 0.04 } },
+    { name: 'Penalty 0.05', Class: SmartAssign, options: { imbalanceSoftPenalty: 0.05 } },
+    { name: 'Penalty 0.06', Class: SmartAssign, options: { imbalanceSoftPenalty: 0.06 } },
+    { name: 'Penalty 0.08', Class: SmartAssign, options: { imbalanceSoftPenalty: 0.08 } }
   ];
 
-  const scenarios = ['LIFECYCLE', 'STABLE_HIGH_POP', 'REALWORLD_CHURN'];
+  const scenarios = ['REALWORLD_CHURN'];
 
   for (const scenario of scenarios) {
     console.log(`\n\n╔═══════════════════════════════════════════════════════════════╗`);
@@ -417,7 +368,7 @@ async function runUnifiedTests() {
         plugin.executor = new MockSASwapExecutor(server);
         
         // Capture logs for improved version only (to save memory)
-        if (engine.name.includes('SMART ASSIGN')) {
+        if (true) {
           plugin.logEvent = (type, player, data) => {
             if (type === 'ASSIGNMENT') server.eventLog.push(`[ALGO] ${player.name} -> T${data.targetTeam}: ${data.reason}`);
           };
@@ -426,7 +377,7 @@ async function runUnifiedTests() {
         await plugin.mount();
         const seededRandom = new SeededRandom(1337 + i); 
         // We only enable detailedLogging for the very first match of the Current version to generate the deep-dive
-        const isDeepDiveMatch = i === 0 && engine.name.includes('SMART ASSIGN');
+        const isDeepDiveMatch = i === 0 && true;
         results.push(await simulateScenario(server, mockEloTracker, matches[i], eosToSteam, seededRandom, plugin, scenario, isDeepDiveMatch));
         if ((i+1) % 10 === 0) process.stdout.write('■');
       }
@@ -451,7 +402,7 @@ async function runUnifiedTests() {
 
     // --- Drift Analysis ---
     console.log(`\n--- Average Elo Drift Over Time (${scenario}) ---`);
-    const driftLength = allResults['SMART ASSIGN (Current)'][0].eloHistory.length;
+    const driftLength = allResults['Penalty 0.05'][0].eloHistory.length;
     const avgDriftElo = [];
     const avgDriftSum = [];
     
@@ -459,7 +410,7 @@ async function runUnifiedTests() {
     const samplingPoints = 15;
     for (let i = 0; i < samplingPoints; i++) {
       const t = Math.min(driftLength - 1, Math.floor(i * (driftLength / (samplingPoints - 1))));
-      const validRuns = allResults['SMART ASSIGN (Current)'].filter(r => r.eloHistory[t]);
+      const validRuns = allResults['Penalty 0.05'].filter(r => r.eloHistory[t]);
       if (validRuns.length === 0) continue;
       
       const avgEloAtT = validRuns.reduce((s, r) => s + r.eloHistory[t].eloGap, 0) / validRuns.length;
@@ -472,7 +423,7 @@ async function runUnifiedTests() {
 
     // --- Deep-Dive Move-by-Move Report (First Match) ---
     if (scenario === 'REALWORLD_CHURN') {
-      const deepDiveMatch = allResults['SMART ASSIGN (Current)'][0];
+      const deepDiveMatch = allResults['Penalty 0.05'][0];
       console.log(`\n📊 DEEP-DIVE: Move-by-Move Delta Log (Match: ${deepDiveMatch.runId})`);
       console.log(`Step | Action       | Team | Elo Gap | Sum Gap | Pop (T1/T2)`);
       console.log(`-----|--------------|------|---------|---------|------------`);
@@ -486,7 +437,7 @@ async function runUnifiedTests() {
     // --- Worst-Case Analysis (Current Smart Assign) ---
     if (scenario === 'REALWORLD_CHURN') {
       console.log(`\n⚠️ TOP 5 WORST-CASE SCENARIOS (Current Smart Assign) ⚠️`);
-      const worst = [...allResults['SMART ASSIGN (Current)']].sort((a, b) => b.eloDiff - a.eloDiff).slice(0, 5);
+      const worst = [...allResults['Penalty 0.05']].sort((a, b) => b.eloDiff - a.eloDiff).slice(0, 5);
       worst.forEach((r, idx) => {
         console.log(`\n#${idx + 1} Match: ${r.runId} | Elo Diff: ${r.eloDiff.toFixed(3)} | Sum Diff: ${r.sumDiff.toFixed(1)}`);
         console.log(`    T1: ${r.t1End}p (${r.t1Elo.toFixed(2)} avg) | T2: ${r.t2End}p (${r.t2Elo.toFixed(2)} avg)`);
