@@ -1,3 +1,31 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║                      SA-DATABASE v0.1.7                       ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Persistent storage utility for the SmartAssign plugin.
+ * Handles reading and writing player reconnect memory and round state data
+ * to an SQLite/Sequelize database. Includes retry logic for SQLite locks
+ * to ensure stability in high-concurrency environments.
+ *
+ * ─── EXPORTS ─────────────────────────────────────────────────────
+ *
+ * SADatabase (default)
+ *   Key methods:
+ *     initDB()                          — Initializes models and syncs.
+ *     saveRoundStartTime(timestamp)     — Updates the current round's start time.
+ *     clearReconnectMemory()            — Wipes all disconnected player records.
+ *     savePlayerDisconnect(steamID, team) — Saves a player's team state.
+ *     getReconnectTeam(steamID)         — Retrieves a returning player's team.
+ *     cleanupOldData()                  — Prunes records older than 12 hours.
+ *
+ * Author:
+ * Discord: `real_slacker`
+ *
+ * ═══════════════════════════════════════════════════════════════
+ */
 import Sequelize from 'sequelize';
 import Logger from '../../core/logger.js';
 const { DataTypes } = Sequelize;

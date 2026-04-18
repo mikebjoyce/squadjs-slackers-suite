@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v0.1.4                   ║
+ * ║                      SMART ASSIGN PLUGIN                      ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -8,7 +8,7 @@
  * Handles custom Elo-based player auto-assignment and records player
  * lifecycle events. Overrides Squad's native team assignment to provide
  * competitive parity via Average-Elo balancing, reconnect memory,
- * and strict population equity rules.
+ * and strict population equity rules. Bypasses "Seed" layers natively.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
@@ -30,13 +30,13 @@
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
- * - Algorithm uses a Unified Scoring System:
- *     1. Hard Pop Cap: Highest priority; prevents imbalance beyond dynamic thresholds.
- *     2. Squared Average Elo Gap: Minimizes resulting team average differences.
- *     3. Soft Pop Penalty: penalizes score per player of imbalance.
- *     4. Reconnect Bonus: grants score bonus to a player's old team.
+ * - Algorithm uses an Integrated Symmetric Logistic Scoring System:
+ *     1. Hard Pop Cap: Prevents imbalance beyond dynamic thresholds.
+ *     2. Logistic Win-Probability: Calculates win probability shift (Scale: 13).
+ *     3. Soft Pop Penalty: Base penalty of 0.10 per player difference.
+ *     4. Reconnect Bonus: Grants up to a 3-player imbalance allowance.
  * - Strict 1-player max imbalance enforced at high population (96+).
- * - Event logs include JOIN, LEAVE, TEAM_CHANGE, and MOVE_FAILED.
+ * - Bypasses auto-assignment completely during specified ignored modes (Seed/Jensen).
  *
  * ─── CONFIGURATION ───────────────────────────────────────────────
  *
@@ -44,6 +44,7 @@
  * logPath: Path for JSONL event logging (default: './auto-assign-log.jsonl').
  * enableSmartAssign: Toggle auto-assignment logic (default: true).
  * enableEventLogging: Toggle JSONL event logging (default: true).
+ * ignoredGameModes: Array of modes to skip logic on (default: ['Seed', 'Jensen']).
  *
  * Author:
  * Discord: `real_slacker`
@@ -185,8 +186,8 @@ export default class SmartAssign {
       await this.db.saveRoundStartTime(now);
       this.currentRoundStartTime = now;
 
-      // If there are players already, treat them as joins to get them assigned (or silent populate if seeded?)
-      // Actually, if we just started, let's silent populate anyway so we don't spam 100 auto-assigns
+      // If players are already connected when the plugin starts, quietly track them
+      // to avoid triggering mass auto-assignment logic upon initialization.
       for (const p of this.server.players) {
         if (p.steamID) {
           this.knownPlayers.set(p.steamID, {
@@ -357,7 +358,7 @@ export default class SmartAssign {
       return;
     }
 
-    // SmartAssign Logic
+    // Evaluate ideal team assignment
     const reconnectTeam = await this.db.getReconnectTeam(player.steamID);
     const { targetTeam, reason } = this.evaluateTeamAssignment(player, reconnectTeam);
 
@@ -372,8 +373,7 @@ export default class SmartAssign {
     // Record the assignment in log
     this.logEvent('ASSIGNMENT', player, { targetTeam, reason, reconnectTeam });
 
-    // If squad/engine put them on the wrong team natively (or they are unassigned)
-    // we queue a move.
+    // If the player is currently unassigned or on the wrong team, queue a team change
     if (String(player.teamID) !== String(targetTeam)) {
       if (this.options.enableSmartAssign !== false) {
         this.executor.queueMove(player.steamID, targetTeam);
@@ -419,10 +419,11 @@ export default class SmartAssign {
     let t1Power = 0;
     let t2Power = 0;
 
+    // The exponent shapes how heavily top-tier players influence the team's overall power rating
     const EXPONENT = 1.10;
 
     for (const p of this.server.players) {
-      if (p.steamID === player.steamID) continue;
+      if (!p || p.steamID === player.steamID) continue;
 
       const isT1 = String(p.teamID) === '1';
       const isT2 = String(p.teamID) === '2';
@@ -445,7 +446,7 @@ export default class SmartAssign {
 
     // 2. HARD POPULATION CAP
     const totalPop = t1Count + t2Count;
-    const highPopThreshold = 96; // Enforce strict 1-player max imbalance at high pop
+    const highPopThreshold = 96;
     const isRejoin = reconnectTeam === 1 || reconnectTeam === 2;
 
     let baseMaxImbalance;
@@ -477,7 +478,7 @@ export default class SmartAssign {
       return { targetTeam: t1Count <= t2Count ? 1 : 2, reason: 'Population Balance (No Elo)' };
     }
 
-    // Logistic Win-Probability Model (v0.1.7: Integrated Symmetric Model)
+    // Logistic Win-Probability Model
     const avgT1 = t1Count > 0 ? t1Power / t1Count : 25.0;
     const avgT2 = t2Count > 0 ? t2Power / t2Count : 25.0;
 
@@ -487,7 +488,7 @@ export default class SmartAssign {
     const logisticScale = 13; // Balanced sensitivity
     const getWinProb = (a, b) => 1 / (1 + Math.pow(10, (b - a) / logisticScale));
 
-    const softPenalty = 0.06;
+    const softPenalty = 0.10;
     const rejoinBonus = 0.35; // Allow up to 3-player imbalance for rejoins
 
     // Evaluate resulting state if player joins T1

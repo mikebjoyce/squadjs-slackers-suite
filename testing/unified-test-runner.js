@@ -375,7 +375,7 @@ async function runUnifiedTests() {
   const engineConfigs = [
     { name: 'NAIVE BASELINE', Class: BaselineAssign, options: {} },
     { name: 'LEGACY (v0.1.0)', Class: LegacyAssign, options: {} },
-    { name: 'SMART ASSIGN (Current)', Class: SmartAssign, options: { imbalanceSoftPenalty: 0.06 } }
+    { name: 'SMART ASSIGN (Current)', Class: SmartAssign, options: { imbalanceSoftPenalty: 0.10 } }
   ];
 
   const scenarios = ['IGNORED_MODE', 'STABLE_HIGH_POP', 'REALWORLD_CHURN'];

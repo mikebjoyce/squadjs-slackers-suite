@@ -1,9 +1,39 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║                    SA-SWAP-EXECUTOR v0.1.7                    ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Reliable background queue for executing RCON team switches.
+ * Squad's RCON frequently fails to move players if they are still in a loading
+ * screen or during transition states like faction voting. This executor continuously
+ * retries the move command until the player is successfully placed on their target team.
+ *
+ * ─── EXPORTS ─────────────────────────────────────────────────────
+ *
+ * SASwapExecutor (default)
+ *   Key methods:
+ *     queueMove(steamID, targetTeamID)  — Adds a player to the swap queue.
+ *     isRecentSmartAssignMove()         — Checks if a player recently moved.
+ *     processRetries()                  — Loops through pending moves and retries RCON.
+ *     cleanup()                         — Stops the background monitoring loop.
+ *
+ * Author:
+ * Discord: `real_slacker`
+ *
+ * ═══════════════════════════════════════════════════════════════
+ */
 import Logger from '../../core/logger.js';
 
 export default class SASwapExecutor {
   constructor(server, options = {}) {
     this.server = server;
-    this.options = options;
+    this.options = Object.assign({
+      maxAttempts: 6,
+      retryIntervalMs: 500,
+      maxCompletionTimeMs: 15000
+    }, options);
     
     this.pendingPlayerMoves = new Map();
     this.recentlyCompletedMoves = new Map();
@@ -24,6 +54,8 @@ export default class SASwapExecutor {
   }
 
   queueMove(steamID, targetTeamID) {
+    if (!steamID || !targetTeamID) return;
+
     this.pendingPlayerMoves.set(steamID, {
       targetTeamID,
       attempts: 0,
@@ -66,7 +98,7 @@ export default class SASwapExecutor {
 
       for (const [steamID, moveData] of this.pendingPlayerMoves.entries()) {
         try {
-          if (now - moveData.startTime > (this.options.maxCompletionTimeMs || 3000)) {
+          if (now - moveData.startTime > this.options.maxCompletionTimeMs) {
             Logger.verbose('SmartAssign', 1, `[SwapExecutor] Move timeout for ${steamID}`);
             this.server.emit('SMART_ASSIGN_MOVE_FAILED', { steamID, reason: 'Timeout' });
             playersToRemove.push(steamID);
@@ -91,18 +123,19 @@ export default class SASwapExecutor {
           }
 
           moveData.attempts++;
-          const maxRconAttempts = this.options.maxAttempts || 6;
-
-          if (moveData.attempts <= maxRconAttempts) {
+          
+          if (moveData.attempts <= this.options.maxAttempts) {
             try {
               // Standard switchTeam uses AdminMovePlayerToTeam. Fallback to AdminForceTeamChange after 3 attempts.
-              if (moveData.attempts > 3) {
+              if (moveData.attempts > 3 && typeof this.server.rcon?.forceTeamChange === 'function') {
                 Logger.verbose('SmartAssign', 2, `[SwapExecutor] Using high-priority fallback for ${steamID} (Attempt ${moveData.attempts})`);
                 await this.server.rcon.forceTeamChange(steamID);
                 this.server.emit('SMART_ASSIGN_MOVE_RETRY', { steamID, attempt: moveData.attempts, method: 'forceTeamChange' });
-              } else {
+              } else if (typeof this.server.rcon?.switchTeam === 'function') {
                 await this.server.rcon.switchTeam(steamID, moveData.targetTeamID);
                 this.server.emit('SMART_ASSIGN_MOVE_RETRY', { steamID, attempt: moveData.attempts, method: 'switchTeam' });
+              } else {
+                Logger.verbose('SmartAssign', 1, `[SwapExecutor] RCON commands unavailable for ${steamID}.`);
               }
             } catch (err) {
               Logger.verbose('SmartAssign', 2, `[SwapExecutor] Move attempt ${moveData.attempts} failed for ${steamID}: ${err?.message || err}`);
