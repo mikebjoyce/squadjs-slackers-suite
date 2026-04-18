@@ -57,7 +57,7 @@ import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
 
 export default class SmartAssign {
-  static version = '0.1.4';
+  static version = '0.1.7';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
@@ -92,6 +92,12 @@ export default class SmartAssign {
         description: 'Path to JSONL file for player lifecycle events.',
         default: './auto-assign-log.jsonl',
         type: 'string'
+      },
+      ignoredGameModes: {
+        required: false,
+        description: 'Substrings for layer/gamemode names where SmartAssign should not alter teams.',
+        default: ['Seed', 'Jensen'],
+        type: 'array'
       }
     };
   }
@@ -339,6 +345,18 @@ export default class SmartAssign {
     Logger.verbose('SmartAssign', 2, `[JOIN] Player connected: ${player.name} (${player.steamID})`);
     this.logEvent('JOIN', player);
 
+    // Check if we are in an ignored layer/gamemode
+    const currentLayerName = this.server.currentLayer ? this.server.currentLayer.name.toLowerCase() : '';
+    const currentGamemode = this.server.currentLayer ? this.server.currentLayer.gamemode.toLowerCase() : '';
+    const ignoredModes = (this.options.ignoredGameModes || ['seed', 'jensen']).map(m => String(m).toLowerCase());
+    
+    const isIgnored = ignoredModes.some(m => currentLayerName.includes(m) || currentGamemode.includes(m));
+
+    if (isIgnored) {
+      Logger.verbose('SmartAssign', 2, `[SmartAssign] Ignored game mode detected. Skipping Elo-based assignment for ${player.name}.`);
+      return;
+    }
+
     // SmartAssign Logic
     const reconnectTeam = await this.db.getReconnectTeam(player.steamID);
     const { targetTeam, reason } = this.evaluateTeamAssignment(player, reconnectTeam);
@@ -445,17 +463,7 @@ export default class SmartAssign {
     if (t1Count - t2Count >= effectiveMaxImbalance) return { targetTeam: 2, reason: 'Hard Population Cap' };
     if (t2Count - t1Count >= effectiveMaxImbalance) return { targetTeam: 1, reason: 'Hard Population Cap' };
 
-    // 3. RECONNECT PRIORITY (Early Exit for Persistence)
-    if (isRejoin) {
-      const wouldViolate =
-        reconnectTeam === 1
-          ? t1Count + 1 - t2Count > effectiveMaxImbalance
-          : t2Count + 1 - t1Count > effectiveMaxImbalance;
-
-      if (!wouldViolate) return { targetTeam: reconnectTeam, reason: 'Reconnect Priority' };
-    }
-
-    // 4. SKILL & PENALTY EVALUATION
+    // 3. SKILL & PENALTY EVALUATION
     let playerMu = 25.0;
     if (hasElo) {
       if (eloTracker.eloCache && player.eosID && eloTracker.eloCache.has(player.eosID))
@@ -469,29 +477,39 @@ export default class SmartAssign {
       return { targetTeam: t1Count <= t2Count ? 1 : 2, reason: 'Population Balance (No Elo)' };
     }
 
-    // Logistic Win-Probability Model (v0.1.4 Hybrid Tuning: Scale 15)
+    // Logistic Win-Probability Model (v0.1.7: Integrated Symmetric Model)
     const avgT1 = t1Count > 0 ? t1Power / t1Count : 25.0;
     const avgT2 = t2Count > 0 ? t2Power / t2Count : 25.0;
 
     const newAvgT1 = (t1Power + playerPower) / (t1Count + 1);
     const newAvgT2 = (t2Power + playerPower) / (t2Count + 1);
 
-    const logisticScale = 15;
+    const logisticScale = 13; // Balanced sensitivity
     const getWinProb = (a, b) => 1 / (1 + Math.pow(10, (b - a) / logisticScale));
 
-    const softPenalty = 0.06; // v0.1.4 Optimized linear weight
-    const scoreT1 =
-      Math.abs(getWinProb(newAvgT1, avgT2) - 0.5) + (t1Count > t2Count ? (t1Count - t2Count) * softPenalty : 0);
-    const scoreT2 = Math.abs(getWinProb(avgT1, newAvgT2) - 0.5) + ((t2Count > t1Count) ? (t2Count - t1Count) * softPenalty : 0);
+    const softPenalty = 0.06;
+    const rejoinBonus = 0.35; // Allow up to 3-player imbalance for rejoins
+
+    // Evaluate resulting state if player joins T1
+    const imbalanceT1 = Math.abs((t1Count + 1) - t2Count);
+    const penT1 = imbalanceT1 > 1 ? Math.pow(imbalanceT1, 1.5) * softPenalty : imbalanceT1 * softPenalty;
+    let scoreT1 = Math.abs(getWinProb(newAvgT1, avgT2) - 0.5) + penT1;
+    if (reconnectTeam === 1) scoreT1 -= rejoinBonus;
+
+    // Evaluate resulting state if player joins T2
+    const imbalanceT2 = Math.abs(t1Count - (t2Count + 1));
+    const penT2 = imbalanceT2 > 1 ? Math.pow(imbalanceT2, 1.5) * softPenalty : imbalanceT2 * softPenalty;
+    let scoreT2 = Math.abs(getWinProb(avgT1, newAvgT2) - 0.5) + penT2;
+    if (reconnectTeam === 2) scoreT2 -= rejoinBonus;
 
     let targetTeam;
     if (scoreT1 < scoreT2) targetTeam = 1;
     else if (scoreT2 < scoreT1) targetTeam = 2;
     else targetTeam = t1Count <= t2Count ? 1 : 2;
 
-    const reason = `Skill Balance (Scale 15): T1=${scoreT1.toFixed(3)}, T2=${scoreT2.toFixed(3)}`;
+    const reason = `Skill Balance (Scale 13): T1=${scoreT1.toFixed(3)}, T2=${scoreT2.toFixed(3)}`;
 
-    // 5. FINAL SAFETY CHECK
+    // 4. FINAL SAFETY CHECK
     const wouldViolate = targetTeam === 1 ? t1Count + 1 - t2Count > effectiveMaxImbalance : t2Count + 1 - t1Count > effectiveMaxImbalance;
     if (wouldViolate) return { targetTeam: t1Count < t2Count ? 1 : 2, reason: 'Hard Population Limit Override' };
 

@@ -73,13 +73,9 @@ class EloTracker {
 }
 
 class MockSASwapExecutor {
-  constructor(server) { 
-    this.server = server; 
-    this.moveCount = 0;
-  }
+  constructor(server) { this.server = server; }
   isRecentSmartAssignMove(steamID, newTeamID) { return true; }
   queueMove(steamID, targetTeam) {
-    this.moveCount++;
     const p = this.server.players.find(p => p.steamID === steamID);
     if (p) p.teamID = targetTeam;
   }
@@ -119,15 +115,8 @@ class LegacyAssign extends SmartAssign {
 }
 
 // --- Simulation Logic ---
-async function simulateScenario(server, mockEloTracker, match, eosToSteam, seededRandom, plugin, scenarioType = 'IGNORED_MODE', detailedLogging = false) {
+async function simulateScenario(server, mockEloTracker, match, eosToSteam, seededRandom, plugin, scenarioType = 'LIFECYCLE', detailedLogging = false) {
   server.matchStartTime = new Date();
-  
-  if (scenarioType === 'IGNORED_MODE') {
-    server.currentLayer = { name: 'AlBasrah_Seed_v1', gamemode: 'Seed' };
-  } else {
-    server.currentLayer = { name: 'Mutaha_AAS_v1', gamemode: 'AAS' };
-  }
-  
   await server.emit('NEW_GAME');
   server.players = [];
   server.eventLog = [];
@@ -158,8 +147,7 @@ async function simulateScenario(server, mockEloTracker, match, eosToSteam, seede
     const data = mockEloTracker.buildRoundStartData();
     const eloGap = Math.abs(data.t1.avgMu - data.t2.avgMu);
     const sumGap = Math.abs(data.t1.sumMu - data.t2.sumMu);
-    const pop = data.t1.count + data.t2.count;
-    eloHistory.push({ eloGap, sumGap, pop });
+    eloHistory.push({ eloGap, sumGap });
     if (detailedLogging && moveInfo) {
       moveLog.push({
         step: moveLog.length,
@@ -174,12 +162,52 @@ async function simulateScenario(server, mockEloTracker, match, eosToSteam, seede
     }
   };
 
-  if (scenarioType === 'IGNORED_MODE') {
+  if (scenarioType === 'LIFECYCLE') {
     const initialSeed = pendingJoins.splice(0, 80);
     for (const newPlayer of initialSeed) {
       server.players.push(newPlayer);
       await server.emit('PLAYER_CONNECTED', { player: newPlayer });
-      recordElo({ action: 'JOIN', player: newPlayer.name, team: newPlayer.teamID });
+      recordElo({ action: 'SEED', player: newPlayer.name, team: newPlayer.teamID });
+    }
+
+    for (let step = 0; step < 200; step++) {
+      const currentPop = server.players.length;
+      let action = 'JOIN';
+      if (currentPop >= 100) action = 'LEAVE';
+      else {
+        const r = seededRandom.next();
+        if (r < 0.15 && currentPop > 20) action = 'LEAVE';
+        else if (r < 0.20 && disconnectedPlayers.length > 0) action = 'REJOIN'; // 5% Rejoin
+        else if (pendingJoins.length > 0) action = 'JOIN'; // 80% Join
+        else action = 'LEAVE';
+      }
+
+      if (action === 'LEAVE') {
+        if (server.players.length === 0) continue;
+        const leaveIdx = Math.floor(seededRandom.next() * server.players.length);
+        const leaver = server.players.splice(leaveIdx, 1)[0];
+        disconnectedPlayers.push(leaver);
+        await server.emit('UPDATED_PLAYER_INFORMATION', {});
+        await plugin.db.savePlayerDisconnect(leaver.steamID, leaver.teamID);
+        recordElo({ action: 'LEAVE', player: leaver.name, team: leaver.teamID });
+      } 
+      else if (action === 'REJOIN') {
+        const rejoinIdx = Math.floor(seededRandom.next() * disconnectedPlayers.length);
+        const rejoinder = disconnectedPlayers.splice(rejoinIdx, 1)[0];
+        const prevTeam = rejoinder.teamID;
+        rejoinder.teamID = 3;
+        server.players.push(rejoinder);
+        await server.emit('PLAYER_CONNECTED', { player: rejoinder });
+        rejoinAttempts++;
+        if (String(rejoinder.teamID) === String(prevTeam)) rejoinSuccesses++;
+        recordElo({ action: 'REJOIN', player: rejoinder.name, team: rejoinder.teamID });
+      } 
+      else if (action === 'JOIN') {
+        const newPlayer = pendingJoins.shift();
+        server.players.push(newPlayer);
+        await server.emit('PLAYER_CONNECTED', { player: newPlayer });
+        recordElo({ action: 'JOIN', player: newPlayer.name, team: newPlayer.teamID });
+      }
     }
   } else if (scenarioType === 'STABLE_HIGH_POP') {
     const initialFill = pendingJoins.splice(0, 98);
@@ -316,22 +344,11 @@ async function simulateScenario(server, mockEloTracker, match, eosToSteam, seede
 
   const { t1, t2 } = mockEloTracker.buildRoundStartData();
   
-  const fullPopStates = eloHistory.filter(h => h.pop >= 96);
-  const fullPopEloDiff = fullPopStates.length > 0 
-    ? fullPopStates.reduce((s, h) => s + h.eloGap, 0) / fullPopStates.length 
-    : Math.abs(t1.avgMu - t2.avgMu);
-  const fullPopSumDiff = fullPopStates.length > 0 
-    ? fullPopStates.reduce((s, h) => s + h.sumGap, 0) / fullPopStates.length 
-    : Math.abs(t1.sumMu - t2.sumMu);
-
   return { 
     popDiff: Math.abs(server.players.filter(p => p.teamID === 1).length - server.players.filter(p => p.teamID === 2).length), 
     eloDiff: Math.abs(t1.avgMu - t2.avgMu), 
     sumDiff: Math.abs(t1.sumMu - t2.sumMu),
-    fullPopEloDiff,
-    fullPopSumDiff,
     rejoinRate: rejoinAttempts > 0 ? rejoinSuccesses / rejoinAttempts : 1,
-    forcedMoves: plugin.executor.moveCount || 0,
     eloHistory,
     moveLog,
     t1End: server.players.filter(p => p.teamID === 1).length,
@@ -378,7 +395,7 @@ async function runUnifiedTests() {
     { name: 'SMART ASSIGN (Current)', Class: SmartAssign, options: { imbalanceSoftPenalty: 0.06 } }
   ];
 
-  const scenarios = ['IGNORED_MODE', 'STABLE_HIGH_POP', 'REALWORLD_CHURN'];
+  const scenarios = ['LIFECYCLE', 'STABLE_HIGH_POP', 'REALWORLD_CHURN'];
 
   for (const scenario of scenarios) {
     console.log(`\n\n╔═══════════════════════════════════════════════════════════════╗`);
@@ -419,18 +436,17 @@ async function runUnifiedTests() {
 
     // --- Metrics Comparison ---
     console.log(`\n--- Comparison Summary (${scenario}) ---`);
-    console.log(`Name                      | Full-Pop Elo | Full-Pop Sum | Pop Parity | Rejoin Rate | Forced Moves`);
-    console.log(`--------------------------|--------------|--------------|------------|-------------|-------------`);
+    console.log(`Name                      | Elo Diff | Sum Diff | Pop Parity | Rejoin Rate`);
+    console.log(`--------------------------|----------|----------|------------|------------`);
     
     for (const name of Object.keys(allResults)) {
       const res = allResults[name];
-      const avgElo = (res.reduce((s, r) => s + r.fullPopEloDiff, 0) / res.length).toFixed(3);
-      const avgSum = (res.reduce((s, r) => s + r.fullPopSumDiff, 0) / res.length).toFixed(1);
+      const avgElo = (res.reduce((s, r) => s + r.eloDiff, 0) / res.length).toFixed(3);
+      const avgSum = (res.reduce((s, r) => s + r.sumDiff, 0) / res.length).toFixed(1);
       const popP = (res.filter(r => r.popDiff <= 1).length / res.length * 100).toFixed(1);
       const rejoin = (res.reduce((s, r) => s + r.rejoinRate, 0) / res.length * 100).toFixed(2);
-      const forcedMoves = (res.reduce((s, r) => s + r.forcedMoves, 0) / res.length).toFixed(1);
       
-      console.log(`${name.padEnd(26)}| ${avgElo.padEnd(13)}| ${avgSum.padEnd(13)}| ${popP.padEnd(11)}%| ${rejoin.padEnd(11)}%| ${forcedMoves}`);
+      console.log(`${name.padEnd(26)}| ${avgElo.padEnd(9)}| ${avgSum.padEnd(9)}| ${popP.padEnd(11)}%| ${rejoin}%`);
     }
 
     // --- Drift Analysis ---
@@ -470,9 +486,9 @@ async function runUnifiedTests() {
     // --- Worst-Case Analysis (Current Smart Assign) ---
     if (scenario === 'REALWORLD_CHURN') {
       console.log(`\n⚠️ TOP 5 WORST-CASE SCENARIOS (Current Smart Assign) ⚠️`);
-      const worst = [...allResults['SMART ASSIGN (Current)']].sort((a, b) => b.fullPopEloDiff - a.fullPopEloDiff).slice(0, 5);
+      const worst = [...allResults['SMART ASSIGN (Current)']].sort((a, b) => b.eloDiff - a.eloDiff).slice(0, 5);
       worst.forEach((r, idx) => {
-        console.log(`\n#${idx + 1} Match: ${r.runId} | Full-Pop Elo Diff: ${r.fullPopEloDiff.toFixed(3)} | Full-Pop Sum Diff: ${r.fullPopSumDiff.toFixed(1)}`);
+        console.log(`\n#${idx + 1} Match: ${r.runId} | Elo Diff: ${r.eloDiff.toFixed(3)} | Sum Diff: ${r.sumDiff.toFixed(1)}`);
         console.log(`    T1: ${r.t1End}p (${r.t1Elo.toFixed(2)} avg) | T2: ${r.t2End}p (${r.t2Elo.toFixed(2)} avg)`);
         console.log(`    Recent Algo Decisions:`);
         r.eventLog.slice(-5).forEach(e => console.log(`      ${e}`));
