@@ -162,4 +162,37 @@ export default class SADatabase {
       return null;
     }
   }
+
+  async cleanupOldData() {
+    if (!this.ReconnectMemoryModel || !this.SmartAssignStateModel) return;
+
+    const twelveHoursAgo = Date.now() - 12 * 60 * 60 * 1000;
+    try {
+      await this._executeWithRetry(async () => {
+        return await this.sequelize.transaction(async (t) => {
+          // Prune reconnect memory
+          const prunedReconnects = await this.ReconnectMemoryModel.destroy({
+            where: {
+              disconnectTime: { [Sequelize.Op.lt]: twelveHoursAgo }
+            },
+            transaction: t
+          });
+
+          // Prune round start time if old
+          const state = await this.SmartAssignStateModel.findByPk(1, { transaction: t });
+          if (state && state.roundStartTime && Number(state.roundStartTime) < twelveHoursAgo) {
+            state.roundStartTime = null;
+            await state.save({ transaction: t });
+            Logger.verbose('SmartAssign', 1, '[DB] Reset stale round start time.');
+          }
+
+          if (prunedReconnects > 0) {
+            Logger.verbose('SmartAssign', 1, `[DB] Cleanup complete. Pruned ${prunedReconnects} old reconnect records.`);
+          }
+        });
+      });
+    } catch (err) {
+      Logger.verbose('SmartAssign', 1, `[DB] cleanupOldData failed: ${err.message}`);
+    }
+  }
 }

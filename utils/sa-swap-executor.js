@@ -84,6 +84,7 @@ export default class SASwapExecutor {
 
           if (String(player.teamID) === String(moveData.targetTeamID)) {
             Logger.verbose('SmartAssign', 4, `[SwapExecutor] Verified ${steamID} is now on team ${moveData.targetTeamID}`);
+            this.server.emit('SMART_ASSIGN_MOVE_SUCCESS', { steamID, teamID: moveData.targetTeamID });
             playersToRemove.push(steamID);
             this.recentlyCompletedMoves.set(steamID, { targetTeamID: moveData.targetTeamID, time: now });
             continue;
@@ -94,8 +95,15 @@ export default class SASwapExecutor {
 
           if (moveData.attempts <= maxRconAttempts) {
             try {
-              // Force switch to target team
-              await this.server.rcon.switchTeam(steamID, moveData.targetTeamID);
+              // Standard switchTeam uses AdminMovePlayerToTeam. Fallback to AdminForceTeamChange after 3 attempts.
+              if (moveData.attempts > 3) {
+                Logger.verbose('SmartAssign', 2, `[SwapExecutor] Using high-priority fallback for ${steamID} (Attempt ${moveData.attempts})`);
+                await this.server.rcon.forceTeamChange(steamID);
+                this.server.emit('SMART_ASSIGN_MOVE_RETRY', { steamID, attempt: moveData.attempts, method: 'forceTeamChange' });
+              } else {
+                await this.server.rcon.switchTeam(steamID, moveData.targetTeamID);
+                this.server.emit('SMART_ASSIGN_MOVE_RETRY', { steamID, attempt: moveData.attempts, method: 'switchTeam' });
+              }
             } catch (err) {
               Logger.verbose('SmartAssign', 2, `[SwapExecutor] Move attempt ${moveData.attempts} failed for ${steamID}: ${err?.message || err}`);
             }

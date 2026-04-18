@@ -6,7 +6,7 @@
 
 This plugin overrides Squad's native team assignment mechanics to provide smart, fair, and reliable team placements. It perfectly tracks player joins, disconnects, and team changes without relying on buggy game log events, providing highly accurate JSONL lifecycle logs. 
 
-When a player joins the server, the plugin uses a **Unified Scoring System** to ensure optimal team assignment, weighing competitive parity, player preference, and population equity on a single scale.
+When a player joins the server, the plugin uses a **Logistic Win-Probability Model** to ensure optimal team assignment, weighing competitive parity, player preference, and population equity on a single scale. This approach is optimized for **Real-World Maintenance**, where servers stay at 95+ players with constant churn.
 
 Additionally, it executes all team changes via a background retry-queue to ensure the swap applies successfully as soon as the engine allows it.
 
@@ -81,25 +81,26 @@ highPopThreshold      - (Optional) Total player count at which the plugin goes i
 
 ## How Assignment Works
 
-The plugin evaluates which team a player should join using a hierarchical decision process:
+SmartAssign uses a hierarchical decision process optimized for competitive parity and real-world stability:
 
-### 1. Strict Population Cap (Highest Priority)
-The plugin first checks the player counts of both teams. If the difference already meets or exceeds the `maxImbalance` limit, the player is immediately assigned to the smaller team.
-*   **High Population Override**: When total players >= `highPopThreshold` (default 96), the plugin enforces a strict **1-player max imbalance**.
+### 1. Hard Population Cap (Dynamic)
+The plugin first checks the player counts of both teams. It gradually tightens the population cap as the server fills to allow for better skill-balancing during seeding while ensuring perfect parity when full.
+- **Seeding (<70 players)**: Up to 4-player imbalance allowed.
+- **Mid-Pop (70-94 players)**: Tightens to 2-3 player difference.
+- **Maintenance (95+ players)**: **Strict 1-player parity enforced.**
 
 ### 2. Reconnect Memory & Grace (High Priority)
-If the hard population cap isn't triggered, the plugin checks if the player was previously on a team during the current round. 
-*   **Rejoin Grace**: Reconnecting players are given a **+1 to +2 player imbalance allowance** (compared to fresh joins). This ensures that players can almost always get back to their squads after a crash, even if their team has grown slightly larger in their absence.
-*   **Understandable Fullness**: This grace is reduced when the server is near the `highPopThreshold` to ensure the server still reaches a 50/50 split when full.
+Players rejoining within the same round are given a **+2 player imbalance allowance** (compared to fresh joins) to ensure they can get back to their squad and maintain team cohesion.
 
-### 3. Unified Scoring System (Elo-Aware)
-If no reconnect memory is found, the plugin calculates a "cost score" for each team to determine the best skill-based placement.
-*   **Squared Average Elo Gap (Non-Linear)**: The base score is the **squared difference** between the teams' average Elo ratings (using `Mu^1.05` non-linear scaling) if the player were to join that team. The squared error ensures that large skill gaps are penalized much more heavily than small ones.
-*   **Soft Population Penalty**: A penalty of **0.03 units** is added for every player a team is ahead, favoring the smaller side while allowing for skill-balancing within allowed margins.
+### 3. Logistic Win-Probability Scoring
+If no reconnect memory is found, the system estimates the "Win Probability" of both teams using a logistic curve.
+*   **Mu Scaling (Exponent 1.10)**: Player Elo (Mu) is weighted non-linearly to correctly value the disproportionate impact of high-skill "pro" players on team power.
+*   **50/50 Target**: It assigns the player to the team that brings the match closest to a theoretical 50/50 win chance.
+*   **Soft Population Penalty**: A small bias (0.01 probability units) favors the smaller team when skill gaps are negligible.
 
 ### 4. Final Safety Check & Fallback
-*   If the scoring system selects a team that would violate the hard population cap, the decision is overridden to maintain balance.
-*   If the `EloTracker` plugin is inactive, the system defaults to pure population balancing (favoring the smaller team).
+*   If the scoring system selects a team that would violate the hard population cap, the decision is overridden.
+*   If the `EloTracker` plugin is inactive, the system defaults to pure population balancing.
 
 ## Author
 

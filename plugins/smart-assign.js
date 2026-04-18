@@ -120,6 +120,8 @@ export default class SmartAssign {
     this.onPlayerConnected = this.onPlayerConnected.bind(this);
     this.onScrambleExecuted = this.onScrambleExecuted.bind(this);
     this.onMoveFailed = this.onMoveFailed.bind(this);
+    this.onMoveSuccess = this.onMoveSuccess.bind(this);
+    this.onMoveRetry = this.onMoveRetry.bind(this);
   }
 
   async mount() {
@@ -127,6 +129,12 @@ export default class SmartAssign {
 
     // Initialize DB
     const { roundStartTime: persistedStartTime } = await this.db.initDB();
+
+    // Perform initial DB cleanup and start periodic maintenance
+    await this.db.cleanupOldData();
+    this.cleanupInterval = setInterval(() => {
+      this.db.cleanupOldData();
+    }, 6 * 60 * 60 * 1000);
 
     // Check for restart recovery
     let serverRoundStart = this.server.matchStartTime ? this.server.matchStartTime.getTime() : null;
@@ -191,6 +199,8 @@ export default class SmartAssign {
     this.server.on('PLAYER_CONNECTED', this.onPlayerConnected);
     this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
     this.server.on('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
+    this.server.on('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
+    this.server.on('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
 
     this.ready = true;
     Logger.verbose('SmartAssign', 1, 'SmartAssign mounted successfully.');
@@ -198,12 +208,15 @@ export default class SmartAssign {
 
   async unmount() {
     this.ready = false;
+    if (this.cleanupInterval) clearInterval(this.cleanupInterval);
     this.server.removeListener('NEW_GAME', this.onNewGame);
     this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
     this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
     this.server.removeListener('PLAYER_CONNECTED', this.onPlayerConnected);
-    this.server.removeListener('TEAM_BALANCER_SCRAMRAMBLE_EXECUTED', this.onScrambleExecuted);
+    this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
     this.server.removeListener('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
+    this.server.removeListener('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
+    this.server.removeListener('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
     this.executor.cleanup();
     Logger.verbose('SmartAssign', 1, 'SmartAssign unmounted.');
   }
@@ -238,9 +251,29 @@ export default class SmartAssign {
   async onMoveFailed(data) {
     if (!this.ready) return;
     const { steamID, reason } = data;
-    const p = this.server.players.find(x => x.steamID === steamID) || { steamID, name: 'Unknown' };
+    const p = this.server.players.find((x) => x.steamID === steamID) || { steamID, name: 'Unknown' };
     Logger.verbose('SmartAssign', 1, `[SmartAssign] Abandoned move for ${p.name} (${steamID}) - ${reason}`);
     this.logEvent('MOVE_FAILED', p, { reason });
+  }
+
+  async onMoveSuccess(data) {
+    if (!this.ready) return;
+    const { steamID, teamID } = data;
+    const p = this.server.players.find((x) => x.steamID === steamID);
+    if (p) {
+      Logger.verbose('SmartAssign', 2, `[SmartAssign] Verified move success for ${p.name} (${steamID}) to Team ${teamID}`);
+      this.logEvent('MOVE_SUCCESS', p, { teamID });
+    }
+  }
+
+  async onMoveRetry(data) {
+    if (!this.ready) return;
+    const { steamID, attempt, method } = data;
+    const p = this.server.players.find((x) => x.steamID === steamID);
+    if (p) {
+      Logger.verbose('SmartAssign', 2, `[SmartAssign] Retrying move for ${p.name} (${steamID}) | Attempt: ${attempt} | Method: ${method}`);
+      this.logEvent('MOVE_RETRY', p, { attempt, method });
+    }
   }
 
   async onPlayerConnected(info) {
@@ -364,7 +397,7 @@ export default class SmartAssign {
     let t1Power = 0;
     let t2Power = 0;
 
-    const EXPONENT = 1.05; // Optimized for parity
+    const EXPONENT = 1.10; // Optimized weighting for top-tier players (Iteration 33)
 
     for (const p of this.server.players) {
       if (p.steamID === player.steamID) continue; 
@@ -391,15 +424,13 @@ export default class SmartAssign {
     const highPopThreshold = this.options.highPopThreshold || 96;
     const isRejoin = reconnectTeam === 1 || reconnectTeam === 2;
 
-    // Dynamic maxImbalance: Gradually tightens from 4 to 1 as server fills.
+    // Dynamic maxImbalance: Gradually tightens from 4 to 1 as server fills (Real-World Maintenance Focus).
     let baseMaxImbalance;
-    if (totalPop >= highPopThreshold) {
+    if (totalPop >= 95) {
       baseMaxImbalance = 1;
-    } else if (totalPop >= 94) {
-      baseMaxImbalance = 1; // Strict parity near full capacity
-    } else if (totalPop >= 88) {
+    } else if (totalPop >= 85) {
       baseMaxImbalance = 2;
-    } else if (totalPop >= 80) {
+    } else if (totalPop >= 70) {
       baseMaxImbalance = 3;
     } else {
       baseMaxImbalance = 4;
@@ -442,21 +473,26 @@ export default class SmartAssign {
       };
     }
 
-    // Unified Scoring (Squared Average-Gap Model)
+    // Unified Scoring (Logistic Win-Probability Model)
+    // Estimates the win chance for Team 1 and tries to keep it at 0.5.
     const avgT1 = t1Count > 0 ? t1Power / t1Count : 25.0;
     const avgT2 = t2Count > 0 ? t2Power / t2Count : 25.0;
 
     const newAvgT1 = (t1Power + playerPower) / (t1Count + 1);
     const newAvgT2 = (t2Power + playerPower) / (t2Count + 1);
 
-    const baseScoreT1 = Math.pow(newAvgT1 - avgT2, 2);
-    const baseScoreT2 = Math.pow(avgT1 - newAvgT2, 2);
+    // Logistic Win-Probability Scoring
+    const logisticScale = 20; 
+    const getWinProb = (a, b) => 1 / (1 + Math.pow(10, (b - a) / logisticScale));
 
-    let scoreT1 = baseScoreT1;
-    let scoreT2 = baseScoreT2;
+    const winProbIfT1 = getWinProb(newAvgT1, avgT2);
+    const winProbIfT2 = getWinProb(avgT1, newAvgT2);
 
-    // POPULATION PENALTY (Mu units squared)
-    const softPenalty = 0.03; 
+    let scoreT1 = Math.abs(winProbIfT1 - 0.5);
+    let scoreT2 = Math.abs(winProbIfT2 - 0.5);
+
+    // POPULATION PENALTY (Probability units)
+    const softPenalty = this.options.imbalanceSoftPenalty || 0.01; 
     const penaltyT1 = (t1Count > t2Count) ? (t1Count - t2Count) * softPenalty : 0;
     const penaltyT2 = (t2Count > t1Count) ? (t2Count - t1Count) * softPenalty : 0;
     scoreT1 += penaltyT1;
@@ -540,9 +576,10 @@ export default class SmartAssign {
       await fsPromises.appendFile(this.options.logPath, JSON.stringify(roundLog) + '\n', 'utf8');
       const tempPath = this.options.logPath + '.temp';
       await fsPromises.unlink(tempPath).catch(() => {});
+      // Only clear events if write was successful
       this.currentRoundEvents = [];
     } catch (err) {
-      Logger.verbose('SmartAssign', 1, `Failed to finalize round log: ${err.message}`);
+      Logger.verbose('SmartAssign', 1, `Failed to finalize round log: ${err.message}. Events retained in memory.`);
     }
   }
 
