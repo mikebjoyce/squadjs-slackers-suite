@@ -86,18 +86,18 @@ ignoredGameModes      - (Optional) Array of layer/gamemode substrings where auto
 SmartAssign uses a hierarchical decision process optimized for competitive parity and real-world stability:
 
 ### 1. Hard Population Cap (Dynamic)
-The plugin first checks the player counts of both teams. It gradually tightens the population cap as the server fills to allow for better skill-balancing when the server has fewer players, while ensuring perfect parity when full.
-- **Low-Pop (<70 players)**: Up to 4-player imbalance allowed.
-- **Mid-Pop (70-84 players)**: Tightens to 3-player difference.
-- **High-Pop (85-94 players)**: Tightens to 2-player difference.
+The plugin first checks the player counts of both teams. Because the Elo scoring logic natively creates a soft penalty for lopsided teams, the hard bounds act purely as a safety net:
+- **Low/Mid-Pop (< 95 players)**: Strict 2-player difference allowed.
 - **Full Server (95+ players)**: **Strict 1-player parity enforced.**
 
 ### 2. Reconnect Memory & Grace (High Priority)
-Players rejoining within the same round are given a **+2 player imbalance allowance** (compared to fresh joins) to ensure they can get back to their squad and maintain team cohesion.
+Players rejoining within the same round are granted an **additional +2 player imbalance allowance** on top of the base allowance to ensure they can get back to their squad and maintain team cohesion.
+- **Low/Mid-Pop (< 95 players)**: Up to **4-player difference allowed**.
+- **Full Server (95+ players)**: Hard capped back down to a **2-player difference**.
 
 ### 3. Team Scoring & Skill Balancing
 If no reconnect memory is found, the system evaluates which team the player should join based on skill distribution and population.
-*   **Skill Weighting**: Player Elo (Mu) is weighted non-linearly to correctly value the disproportionate impact of high-skill players on a team's overall capability.
+*   **Skill Weighting**: Player Elo (Mu) is weighted with a mild non-linear exponent (1.10) to correctly value the disproportionate impact of high-skill players on a team's overall capability without overvaluing individual outliers.
 *   **Balancing Target**: It assigns the player to the team that brings the match closest to an even skill split between both sides.
 *   **Internal Tuning**: Balances the desire for even skill distribution against strict population limits, ensuring that the algorithm doesn't create lopsided teams just to match Elo numbers.
 

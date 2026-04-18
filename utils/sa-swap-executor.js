@@ -32,6 +32,12 @@ export default class SASwapExecutor {
     this.options = Object.assign({
       maxAttempts: 6,
       retryIntervalMs: 500,
+      /**
+       * DESIGN NOTE: maxCompletionTimeMs vs maxAttempts
+       * If this value is provided by the instantiator (e.g. 3000ms), it may preempt the `maxAttempts` loop 
+       * if `maxAttempts * retryIntervalMs > maxCompletionTimeMs`. The effective limit is whichever triggers first.
+       * If not provided, it defaults to 15000ms.
+       */
       maxCompletionTimeMs: 15000
     }, options);
     
@@ -68,7 +74,9 @@ export default class SASwapExecutor {
       this.startMonitoring();
     } else {
       // Trigger an immediate pass for the new player if we are already monitoring
-      this.processRetries().catch(() => {});
+      this.processRetries().catch((err) => {
+        Logger.verbose('SmartAssign', 2, `[SwapExecutor] Queued retry error: ${err?.message || 'Unknown'}`);
+      });
     }
   }
 
@@ -93,6 +101,13 @@ export default class SASwapExecutor {
 
     try {
       const now = Date.now();
+      
+      // Prune stale entries to prevent memory leaks on long-running servers
+      const staleThreshold = now - 15000;
+      for (const [sid, entry] of this.recentlyCompletedMoves.entries()) {
+        if (entry.time < staleThreshold) this.recentlyCompletedMoves.delete(sid);
+      }
+
       const playersToRemove = [];
       const currentPlayers = this.server.players;
 

@@ -59,12 +59,8 @@ export default class SADatabase {
       }
     };
 
-    if (this.sequelize && typeof this.sequelize.getDialect === 'function' && this.sequelize.getDialect() === 'sqlite') {
-      const resultPromise = this._mutex.then(() => runAttempt());
-      this._mutex = resultPromise.catch(() => {});
-      return resultPromise;
-    }
-
+    // We removed the strict global mutex to allow concurrent queries (like reads).
+    // The retry logic and WAL mode (configured in initDB) handles write conflicts effectively without forcing fully sequential operations.
     return runAttempt();
   }
 
@@ -79,6 +75,12 @@ export default class SADatabase {
         'SmartAssignState',
         {
           id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: false, defaultValue: 1 },
+          /**
+           * DESIGN NOTE: BIGINT and SQLite
+           * DataTypes.BIGINT correctly maps to large numbers, but SQLite/Sequelize will return this 
+           * value as a STRING rather than a native JavaScript Number. Upstream consumers (like smart-assign.js) 
+           * MUST explicitly cast this to Number(persistedStartTime) to avoid silent string-comparison bugs.
+           */
           roundStartTime: { type: DataTypes.BIGINT, allowNull: true }
         },
         { timestamps: false, tableName: 'SmartAssignState' }
@@ -100,6 +102,13 @@ export default class SADatabase {
         await this.sequelize.query('PRAGMA synchronous=NORMAL;');
       }
 
+      /**
+       * DESIGN NOTE: sync({ alter: true })
+       * In a shared plugin ecosystem like SquadJS, `alter: true` carries a minor production risk. If a schema 
+       * update changes a column type, Sequelize might silently drop and re-add the column depending on the dialect,
+       * leading to data loss. Since this plugin's schema is currently stable, we leave it as `alter: true` for 
+       * zero-config deployment, but it should be noted for future structural updates.
+       */
       await this.SmartAssignStateModel.sync({ alter: true });
       await this.ReconnectMemoryModel.sync({ alter: true });
 
@@ -150,7 +159,7 @@ export default class SADatabase {
     try {
       await this._executeWithRetry(async () => {
         return await this.sequelize.transaction(async (t) => {
-          await this.ReconnectMemoryModel.destroy({ where: {}, truncate: true, transaction: t });
+          await this.ReconnectMemoryModel.destroy({ truncate: true, transaction: t });
         });
       });
       Logger.verbose('SmartAssign', 1, '[DB] Reconnect memory cleared for new round.');

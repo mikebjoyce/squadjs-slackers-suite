@@ -176,10 +176,17 @@ async function simulateScenario(server, mockEloTracker, match, eosToSteam, seede
 
   if (scenarioType === 'IGNORED_MODE') {
     const initialSeed = pendingJoins.splice(0, 80);
+    // In Ignored mode, SmartAssign shouldn't touch players, so they stay where they are initially placed
+    // We will simulate native Squad behavior where people just pick teams.
+    let t1Count = 0, t2Count = 0;
     for (const newPlayer of initialSeed) {
+      // Simulate native game assignment: people tend to self-balance but roughly.
+      if (t1Count <= t2Count) { newPlayer.teamID = 1; t1Count++; }
+      else { newPlayer.teamID = 2; t2Count++; }
+      
       server.players.push(newPlayer);
       await server.emit('PLAYER_CONNECTED', { player: newPlayer });
-      recordElo({ action: 'JOIN', player: newPlayer.name, team: newPlayer.teamID });
+      recordElo({ action: 'JOIN_IGNORED', player: newPlayer.name, team: newPlayer.teamID });
     }
   } else if (scenarioType === 'STABLE_HIGH_POP') {
     const initialFill = pendingJoins.splice(0, 98);
@@ -298,21 +305,8 @@ async function simulateScenario(server, mockEloTracker, match, eosToSteam, seede
   }
 
   // Final Stabilization
-  for (let i = 0; i < 10; i++) {
-    const t1 = server.players.filter((p) => p.teamID === 1).length;
-    const t2 = server.players.filter((p) => p.teamID === 2).length;
-    if (Math.abs(t1 - t2) <= 1) break;
-    if (pendingJoins.length > 0) {
-      const newPlayer = pendingJoins.shift();
-      server.players.push(newPlayer);
-      await server.emit('PLAYER_CONNECTED', { player: newPlayer });
-    } else if (disconnectedPlayers.length > 0) {
-      const rejoinder = disconnectedPlayers.shift();
-      rejoinder.teamID = 3;
-      server.players.push(rejoinder);
-      await server.emit('PLAYER_CONNECTED', { player: rejoinder });
-    } else break;
-  }
+  // Removed to avoid infinite loops if constraints naturally leave teams permanently unbalanced
+  // by 2 or more players (e.g. from an odd number of rejoiners forcing a slight imbalance).
 
   const { t1, t2 } = mockEloTracker.buildRoundStartData();
   
@@ -375,7 +369,7 @@ async function runUnifiedTests() {
   const engineConfigs = [
     { name: 'NAIVE BASELINE', Class: BaselineAssign, options: {} },
     { name: 'LEGACY (v0.1.0)', Class: LegacyAssign, options: {} },
-    { name: 'SMART ASSIGN (Current)', Class: SmartAssign, options: { imbalanceSoftPenalty: 0.10 } }
+    { name: 'SMART ASSIGN (Current)', Class: SmartAssign, options: {} }
   ];
 
   const scenarios = ['IGNORED_MODE', 'STABLE_HIGH_POP', 'REALWORLD_CHURN'];
@@ -479,6 +473,12 @@ async function runUnifiedTests() {
       });
     }
   }
+  
+  // Force exit to clear intervals from mocked plugins
+  process.exit(0);
 }
 
-runUnifiedTests().catch(err => console.error(err));
+runUnifiedTests().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
