@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                      SMART ASSIGN PLUGIN                      ║
+ * ║                  SMART ASSIGN PLUGIN v0.1.8                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -58,7 +58,7 @@ import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
 
 export default class SmartAssign {
-  static version = '0.1.7';
+  static version = '0.1.8';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
@@ -121,6 +121,8 @@ export default class SmartAssign {
     this.ready = false;
     this._logWriteQueue = Promise.resolve();
 
+    this.eloTracker = null;
+
     // State bindings
     this.onNewGame = this.onNewGame.bind(this);
     this.onRoundEnded = this.onRoundEnded.bind(this);
@@ -134,6 +136,8 @@ export default class SmartAssign {
 
   async mount() {
     Logger.verbose('SmartAssign', 1, 'Mounting SmartAssign plugin.');
+
+    this.eloTracker = this.server.plugins.find((p) => p.constructor.name === 'EloTracker') || null;
 
     // Initialize DB
     const { roundStartTime: persistedStartTime } = await this.db.initDB();
@@ -307,6 +311,7 @@ export default class SmartAssign {
 
     // Create a quick lookup set for current steamIDs to detect leaves efficiently
     const currentSteamIDs = new Set();
+    const batchPromises = [];
     
     // Check for JOINS and TEAM CHANGES directly against the server array
     for (const p of this.server.players) {
@@ -314,7 +319,7 @@ export default class SmartAssign {
       currentSteamIDs.add(p.steamID);
 
       if (!this.knownPlayers.has(p.steamID)) {
-        await this.handlePlayerJoin(p);
+        batchPromises.push(this.handlePlayerJoin(p));
       } else {
         const kp = this.knownPlayers.get(p.steamID);
         if (String(kp.teamID) !== String(p.teamID)) {
@@ -328,8 +333,9 @@ export default class SmartAssign {
             source = 'Team-Balancer';
           }
 
-          await this.handleTeamChange(p, kp.teamID, p.teamID, source);
+          const oldTeamID = kp.teamID;
           kp.teamID = p.teamID;
+          batchPromises.push(this.handleTeamChange(p, oldTeamID, p.teamID, source));
         }
         if (String(kp.squadID) !== String(p.squadID)) {
           kp.squadID = p.squadID;
@@ -343,8 +349,12 @@ export default class SmartAssign {
         // Delete from map FIRST to prevent re-entrancy loops if UPDATED_PLAYER_INFORMATION
         // fires again while handlePlayerLeave is awaiting the DB write.
         this.knownPlayers.delete(steamID);
-        await this.handlePlayerLeave(kp);
+        batchPromises.push(this.handlePlayerLeave(kp));
       }
+    }
+
+    if (batchPromises.length > 0) {
+      await Promise.all(batchPromises);
     }
   }
 
@@ -409,8 +419,9 @@ export default class SmartAssign {
     this.logEvent('LEAVE', player);
     
     // Save to reconnect memory if they were on a valid team
-    if (player.teamID === 1 || player.teamID === 2) {
-      await this.db.savePlayerDisconnect(player.steamID, player.teamID);
+    const tid = Number(player.teamID);
+    if (tid === 1 || tid === 2) {
+      await this.db.savePlayerDisconnect(player.steamID, tid);
     }
   }
 
@@ -431,7 +442,7 @@ export default class SmartAssign {
    * population equity, and player preference (reconnects).
    */
   evaluateTeamAssignment(player, reconnectTeam = null) {
-    const eloTracker = this.server.plugins.find((p) => p.constructor.name === 'EloTracker');
+    const eloTracker = this.eloTracker;
     const hasElo = eloTracker && eloTracker.ready;
 
     // 1. DATA COLLECTION
@@ -518,8 +529,8 @@ export default class SmartAssign {
      * without needing a convoluted total-power normalization factor.
      */
     // Logistic Win-Probability Model
-    const avgT1 = t1Count > 0 ? t1Power / t1Count : 25.0;
-    const avgT2 = t2Count > 0 ? t2Power / t2Count : 25.0;
+    const avgT1 = t1Count > 0 ? t1Power / t1Count : Math.pow(25.0, EXPONENT);
+    const avgT2 = t2Count > 0 ? t2Power / t2Count : Math.pow(25.0, EXPONENT);
 
     const newAvgT1 = (t1Power + playerPower) / (t1Count + 1);
     const newAvgT2 = (t2Power + playerPower) / (t2Count + 1);

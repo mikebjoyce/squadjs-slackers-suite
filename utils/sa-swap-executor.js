@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SA-SWAP-EXECUTOR v0.1.7                    ║
+ * ║                    SA-SWAP-EXECUTOR v0.1.8                    ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -27,6 +27,8 @@
 import Logger from '../../core/logger.js';
 
 export default class SASwapExecutor {
+  static RECENT_MOVE_WINDOW_MS = 15000;
+
   constructor(server, options = {}) {
     this.server = server;
     this.options = Object.assign({
@@ -53,7 +55,7 @@ export default class SASwapExecutor {
       if (String(move.targetTeamID) === String(newTeamID)) return true;
     }
     const recent = this.recentlyCompletedMoves.get(steamID);
-    if (recent && String(recent.targetTeamID) === String(newTeamID) && Date.now() - recent.time < 15000) {
+    if (recent && String(recent.targetTeamID) === String(newTeamID) && Date.now() - recent.time < SASwapExecutor.RECENT_MOVE_WINDOW_MS) {
       return true;
     }
     return false;
@@ -61,6 +63,7 @@ export default class SASwapExecutor {
 
   queueMove(steamID, targetTeamID) {
     if (!steamID || !targetTeamID) return;
+    if (this.pendingPlayerMoves.has(steamID)) return;
 
     this.pendingPlayerMoves.set(steamID, {
       targetTeamID,
@@ -103,7 +106,7 @@ export default class SASwapExecutor {
       const now = Date.now();
       
       // Prune stale entries to prevent memory leaks on long-running servers
-      const staleThreshold = now - 15000;
+      const staleThreshold = now - SASwapExecutor.RECENT_MOVE_WINDOW_MS;
       for (const [sid, entry] of this.recentlyCompletedMoves.entries()) {
         if (entry.time < staleThreshold) this.recentlyCompletedMoves.delete(sid);
       }
@@ -137,16 +140,10 @@ export default class SASwapExecutor {
             continue;
           }
 
-          moveData.attempts++;
-          
-          if (moveData.attempts <= this.options.maxAttempts) {
+          if (moveData.attempts < this.options.maxAttempts) {
+            moveData.attempts++;
             try {
-              // Standard switchTeam uses AdminMovePlayerToTeam. Fallback to AdminForceTeamChange after 3 attempts.
-              if (moveData.attempts > 3 && typeof this.server.rcon?.forceTeamChange === 'function') {
-                Logger.verbose('SmartAssign', 2, `[SwapExecutor] Using high-priority fallback for ${steamID} (Attempt ${moveData.attempts})`);
-                await this.server.rcon.forceTeamChange(steamID);
-                this.server.emit('SMART_ASSIGN_MOVE_RETRY', { steamID, attempt: moveData.attempts, method: 'forceTeamChange' });
-              } else if (typeof this.server.rcon?.switchTeam === 'function') {
+              if (typeof this.server.rcon?.switchTeam === 'function') {
                 await this.server.rcon.switchTeam(steamID, moveData.targetTeamID);
                 this.server.emit('SMART_ASSIGN_MOVE_RETRY', { steamID, attempt: moveData.attempts, method: 'switchTeam' });
               } else {

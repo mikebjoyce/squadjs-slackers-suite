@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                      SA-DATABASE v0.1.7                       ║
+ * ║                      SA-DATABASE v0.1.8                       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -139,12 +139,11 @@ export default class SADatabase {
     try {
       return await this._executeWithRetry(async () => {
         return await this.sequelize.transaction(async (t) => {
-          const record = await this.SmartAssignStateModel.findByPk(1, { transaction: t });
-          if (!record) return null;
-          
-          record.roundStartTime = timestamp;
-          await record.save({ transaction: t });
-          return record;
+          await this.SmartAssignStateModel.update(
+            { roundStartTime: timestamp },
+            { where: { id: 1 }, transaction: t }
+          );
+          return { roundStartTime: timestamp };
         });
       });
     } catch (err) {
@@ -169,7 +168,8 @@ export default class SADatabase {
   }
 
   async savePlayerDisconnect(steamID, teamID) {
-    if (!this.ReconnectMemoryModel || !steamID || !teamID) return;
+    if (!this.ReconnectMemoryModel || !steamID) return;
+    if (teamID !== 1 && teamID !== 2) return;
 
     try {
       await this._executeWithRetry(async () => {
