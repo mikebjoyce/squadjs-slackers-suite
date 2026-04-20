@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v0.2.1                   ║
+ * ║                  SMART ASSIGN PLUGIN v0.2.2                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
 
 export default class SmartAssign extends BasePlugin {
-  static version = '0.2.1';
+  static version = '0.2.2';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
@@ -127,7 +127,9 @@ export default class SmartAssign extends BasePlugin {
     this.currentRoundStartTime = null;
     this.ready = false;
     this.initialSyncComplete = false;
+    // Promise queue and in-memory batch array to optimise disk I/O when streaming logs
     this._logWriteQueue = Promise.resolve();
+    this._eventBatch = [];
 
     this.eloTracker = null;
     this._eloNotReadyWarned = false;
@@ -153,6 +155,11 @@ export default class SmartAssign extends BasePlugin {
     }
 
     this._ignoredModes = (this.options.ignoredGameModes || ['seed', 'jensen']).map(m => String(m).toLowerCase());
+
+    // Periodically flush the in-memory event batch to the temp file to reduce disk I/O
+    this._batchFlushTimer = setInterval(() => {
+      this._flushTempLog().catch(err => Logger.verbose('SmartAssign', 1, `Flush error: ${err.message}`));
+    }, 15000);
 
     // Initialize DB
     const { roundStartTime: persistedStartTime } = await this.db.initDB();
@@ -214,6 +221,7 @@ export default class SmartAssign extends BasePlugin {
   async unmount() {
     this.ready = false;
     if (this.cleanupInterval) clearInterval(this.cleanupInterval);
+    if (this._batchFlushTimer) clearInterval(this._batchFlushTimer);
     await this.finalizeRoundLog();
     this.server.removeListener('NEW_GAME', this.onNewGame);
     this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
@@ -562,7 +570,8 @@ export default class SmartAssign extends BasePlugin {
       const p = players[i];
       if (!p || p.steamID === player.steamID) continue;
 
-      // Ignore players currently pending a move since their future state is already in _pending
+      // Ignore players currently pending a move since their future state is already in _pending.
+      // This prevents double-counting and ensures team population/Elo projections are highly accurate.
       if (this._pendingPlayerMoves && this._pendingPlayerMoves.has(p.steamID)) continue;
 
       const teamID = String(p.teamID);
@@ -697,6 +706,7 @@ export default class SmartAssign extends BasePlugin {
   logEvent(eventType, player, extraData = {}) {
     if (!this.options.logPath || this.options.enableEventLogging === false) return;
 
+    // Dynamically inject the global team populations into every event for richer historical replay
     let t1 = 0;
     let t2 = 0;
     for (const p of this.server.players) {
@@ -718,17 +728,36 @@ export default class SmartAssign extends BasePlugin {
       t2
     };
 
-    // Incremental sequential write to temp file for stability/crash recovery
-    const tempPath = this.options.logPath + '.temp';
+    // Push to in-memory batch. Flush immediately if the threshold is reached to prevent memory bloat.
+    this._eventBatch.push(JSON.stringify(event) + '\n');
+    if (this._eventBatch.length >= 20) {
+      this._flushTempLog().catch(err => Logger.verbose('SmartAssign', 1, `Flush error: ${err.message}`));
+    }
+  }
+
+  /**
+   * Appends the in-memory batch of formatted events to the temporary .temp file.
+   * Chained via a Promise queue to prevent interleaved JSON lines from overlapping fs.appendFile calls.
+   */
+  async _flushTempLog() {
+    if (this._eventBatch.length === 0) return;
     
-    // Chain promises to prevent overlapping fs.appendFile which could cause interleaved JSON lines
+    const lines = this._eventBatch.join('');
+    this._eventBatch = [];
+    
+    const tempPath = this.options.logPath + '.temp';
     this._logWriteQueue = this._logWriteQueue.then(() => {
-      return fsPromises.appendFile(tempPath, JSON.stringify(event) + '\n', 'utf8')
+      return fsPromises.appendFile(tempPath, lines, 'utf8')
         .catch((err) => Logger.verbose('SmartAssign', 1, `Failed to write temp log: ${err.message}`));
     });
+    
+    return this._logWriteQueue;
   }
 
   async finalizeRoundLog() {
+    // Force flush any pending memory events
+    await this._flushTempLog();
+
     // Flush any in-flight writes before reading the temp file
     await this._logWriteQueue;
 
@@ -762,6 +791,10 @@ export default class SmartAssign extends BasePlugin {
     }
   }
 
+  /**
+   * Captures a `ROUND_SNAPSHOT` event of the entire connected player base at the start of a new round.
+   * Acts as a keyframe for historical log replay or data-analysis tools.
+   */
   async _ensureSnapshot() {
     if (this._snapshotTaken) return;
 

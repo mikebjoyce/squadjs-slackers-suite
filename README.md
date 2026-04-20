@@ -1,4 +1,4 @@
-# SmartAssign Plugin v0.2.1
+# SmartAssign Plugin v0.2.2
 
 **Elo-Aware Auto Assignment & Player Lifecycle Logger**
 
@@ -19,6 +19,7 @@ Additionally, it executes all team changes via a background retry-queue to ensur
 * **Elo-Aware Routing**: Integrates with the `EloTracker` plugin to dynamically route new players to the team that will most closely equalize the overall power of both sides.
 * **Reliable Swap Execution**: Squad's RCON can occasionally fail to move players (for example, during faction voting or other transition states). This plugin uses a dedicated background queue that retries failed team switches.
 * **Lifecycle Event Logging**: Dumps precise `JOIN`, `LEAVE`, and `TEAM_CHANGE` events (including whether a move was manual, executed by SmartAssign, or a TeamBalancer scramble) into an easily ingestible JSONL file, now tracking global team populations (`t1`, `t2`) on every event.
+* **High-Performance Logging**: Events are batched in-memory and flushed periodically to significantly reduce disk I/O overhead during massive player waves.
 * **Round Snapshots**: Automatically takes a snapshot of all currently connected players at the start of a new round, logging them as a `ROUND_SNAPSHOT` event for full historical tracking.
 * **Mode Ignorance**: Automatically bypasses auto-assignment logic during "Seed" or "Jensen" layers, allowing players to join freely and reducing administrative overhead.
 
