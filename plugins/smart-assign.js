@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v0.2.0                   ║
+ * ║                  SMART ASSIGN PLUGIN v0.2.1                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -9,6 +9,7 @@
  * lifecycle events. Overrides Squad's native team assignment to provide
  * competitive parity via Average-Elo balancing, reconnect memory,
  * and strict population equity rules. Bypasses "Seed" layers natively.
+ * Captures Round Snapshots and embedded global populations in events.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
@@ -37,6 +38,7 @@
  *     4. Reconnect Bonus: Grants an *additional* +2 player imbalance allowance on top of the base.
  * - Strict 1-player max imbalance enforced at high population (94+).
  * - Bypasses auto-assignment completely during specified ignored modes (Seed/Jensen).
+ * - Accuracy: Players with pending moves are ignored during team evaluation.
  *
  * ─── CONFIGURATION ───────────────────────────────────────────────
  *
@@ -60,7 +62,7 @@ import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
 
 export default class SmartAssign extends BasePlugin {
-  static version = '0.2.0';
+  static version = '0.2.1';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
@@ -116,6 +118,8 @@ export default class SmartAssign extends BasePlugin {
 
     this.knownPlayers = new Map();
     this._joiningPlayers = new Set();
+    this._sessionJoinTimes = new Map();
+    this._snapshotTaken = false;
     this._pendingAssignments = { 1: 0, 2: 0 };
     this._pendingMu = { 1: 0, 2: 0 };
     this._pendingPlayerMoves = new Map();
@@ -178,6 +182,7 @@ export default class SmartAssign extends BasePlugin {
         'Restart detected. Resuming round state.'
       );
       this.currentRoundStartTime = Number(persistedStartTime);
+      this._snapshotTaken = true; // Assume snapshot exists in temp log
       await this.loadTempEvents();
     } else {
       // New round or no data
@@ -190,6 +195,7 @@ export default class SmartAssign extends BasePlugin {
       const now = serverRoundStart || Date.now();
       await this.db.saveRoundStartTime(now);
       this.currentRoundStartTime = now;
+      this._snapshotTaken = false;
     }
 
     this.server.on('NEW_GAME', this.onNewGame);
@@ -233,6 +239,10 @@ export default class SmartAssign extends BasePlugin {
     const now = this.server.matchStartTime ? this.server.matchStartTime.getTime() : Date.now();
     await this.db.saveRoundStartTime(now);
     this.currentRoundStartTime = now;
+    this._snapshotTaken = false;
+
+    // Snapshot will be taken by the next event handler or the first player update.
+    await this._ensureSnapshot();
 
     // Clear known players so anyone connecting gets processed normally
     this.knownPlayers.clear();
@@ -248,6 +258,7 @@ export default class SmartAssign extends BasePlugin {
     if (!this.ready) return;
     Logger.verbose('SmartAssign', 1, 'ROUND_ENDED detected. Finalizing round log.');
     await this.finalizeRoundLog();
+    this._snapshotTaken = false;
   }
 
   async onScrambleExecuted() {
@@ -313,6 +324,9 @@ export default class SmartAssign extends BasePlugin {
 
   async onUpdatedPlayerInfo(info) {
     if (!this.ready) return;
+    
+    // Catch early map change or initial snapshot
+    await this._ensureSnapshot();
 
     if (!this.initialSyncComplete) {
       // SAFE-SYNC HANDSHAKE:
@@ -326,6 +340,9 @@ export default class SmartAssign extends BasePlugin {
             teamID: p.teamID,
             squadID: p.squadID
           });
+          if (!this._sessionJoinTimes.has(p.steamID)) {
+            this._sessionJoinTimes.set(p.steamID, Date.now());
+          }
         }
       }
       this.initialSyncComplete = true;
@@ -399,6 +416,8 @@ export default class SmartAssign extends BasePlugin {
   }
 
   async handlePlayerJoin(player) {
+    await this._ensureSnapshot();
+
     // 1. DOUBLE-JOIN RACE PROTECTION
     // Since PLAYER_CONNECTED and UPDATED_PLAYER_INFORMATION both trigger joins,
     // a synchronous set check is used before any await as a write-lock.
@@ -413,6 +432,10 @@ export default class SmartAssign extends BasePlugin {
         teamID: player.teamID,
         squadID: player.squadID
       });
+
+      if (!this._sessionJoinTimes.has(player.steamID)) {
+        this._sessionJoinTimes.set(player.steamID, Date.now());
+      }
 
       Logger.verbose('SmartAssign', 2, `[JOIN] Player connected: ${player.name} (${player.steamID})`);
       this.logEvent('JOIN', player);
@@ -448,12 +471,14 @@ export default class SmartAssign extends BasePlugin {
       const willExecuteMove = targetTeam !== null && String(player.teamID) !== String(targetTeam) && this.options.enableSmartAssign !== false;
 
       // Record the assignment in log with executed flag for passive mode distinction
-      this.logEvent('ASSIGNMENT', player, {
-        targetTeam,
-        reason,
-        reconnectTeam,
-        executed: willExecuteMove
-      });
+      if (this.options.enableSmartAssign !== false) {
+        this.logEvent('ASSIGNMENT', player, {
+          targetTeam,
+          reason,
+          reconnectTeam,
+          executed: willExecuteMove
+        });
+      }
 
       // If the player is currently on the wrong team, queue a team change
       if (targetTeam !== null && String(player.teamID) !== String(targetTeam)) {
@@ -478,8 +503,12 @@ export default class SmartAssign extends BasePlugin {
   }
 
   async handlePlayerLeave(player) {
+    await this._ensureSnapshot();
+
     Logger.verbose('SmartAssign', 2, `[LEAVE] Player disconnected: ${player.name} (${player.steamID}) from Team ${player.teamID}`);
     this.logEvent('LEAVE', player);
+    
+    this._sessionJoinTimes.delete(player.steamID);
     
     // Save to reconnect memory if they were on a valid team
     const tid = Number(player.teamID);
@@ -489,6 +518,8 @@ export default class SmartAssign extends BasePlugin {
   }
 
   async handleTeamChange(player, oldTeam, newTeam, source = 'Manual/Game') {
+    await this._ensureSnapshot();
+
     if (source === 'Smart-Assign') {
       Logger.verbose('SmartAssign', 2, `[TEAM_CHANGE] Player ${player.name} was moved to Team ${newTeam} by SmartAssign`);
     } else if (source === 'Team-Balancer') {
@@ -530,6 +561,9 @@ export default class SmartAssign extends BasePlugin {
     for (let i = 0; i < playerCount; i++) {
       const p = players[i];
       if (!p || p.steamID === player.steamID) continue;
+
+      // Ignore players currently pending a move since their future state is already in _pending
+      if (this._pendingPlayerMoves && this._pendingPlayerMoves.has(p.steamID)) continue;
 
       const teamID = String(p.teamID);
       if (teamID === '1') {
@@ -663,14 +697,25 @@ export default class SmartAssign extends BasePlugin {
   logEvent(eventType, player, extraData = {}) {
     if (!this.options.logPath || this.options.enableEventLogging === false) return;
 
+    let t1 = 0;
+    let t2 = 0;
+    for (const p of this.server.players) {
+      if (String(p.teamID) === '1') t1++;
+      else if (String(p.teamID) === '2') t2++;
+    }
+
     const event = {
       timestamp: Date.now(),
       eventType,
-      steamID: player.steamID,
-      name: player.name,
-      teamID: player.teamID,
-      squadID: player.squadID,
-      ...extraData
+      ...(player ? {
+        steamID: player.steamID,
+        name: player.name,
+        teamID: player.teamID,
+        squadID: player.squadID
+      } : {}),
+      ...extraData,
+      t1,
+      t2
     };
 
     // Incremental sequential write to temp file for stability/crash recovery
@@ -702,6 +747,7 @@ export default class SmartAssign extends BasePlugin {
       endTime: Date.now(),
       layerName: this.server.currentLayer ? this.server.currentLayer.name : 'Unknown',
       gamemode: this.server.currentLayer ? this.server.currentLayer.gamemode : 'Unknown',
+      smartAssignActive: this.options.enableSmartAssign !== false,
       events: this.currentRoundEvents
     };
 
@@ -714,6 +760,32 @@ export default class SmartAssign extends BasePlugin {
     } catch (err) {
       Logger.verbose('SmartAssign', 1, `Failed to finalize round log: ${err.message}. Events retained in memory.`);
     }
+  }
+
+  async _ensureSnapshot() {
+    if (this._snapshotTaken) return;
+
+    const currentLayerName = this.server.currentLayer ? this.server.currentLayer.name : 'Unknown';
+    if (currentLayerName === 'Unknown') return;
+
+    Logger.verbose('SmartAssign', 1, `Taking early round snapshot for layer: ${currentLayerName}`);
+
+    // If we have events in memory from a previous round that haven't been finalized, finalize them now.
+    // This happens if map detected change before onNewGame or onRoundEnded fired.
+    if (this.currentRoundEvents.length > 0) {
+      await this.finalizeRoundLog();
+    }
+
+    const now = Date.now();
+    const snapshotPlayers = this.server.players.filter(p => p && p.steamID).map(p => ({
+      name: p.name,
+      steamID: p.steamID,
+      teamID: p.teamID,
+      joinedServerAt: this._sessionJoinTimes.has(p.steamID) ? this._sessionJoinTimes.get(p.steamID) : now
+    }));
+
+    this.logEvent('ROUND_SNAPSHOT', null, { players: snapshotPlayers });
+    this._snapshotTaken = true;
   }
 
   async loadTempEvents() {

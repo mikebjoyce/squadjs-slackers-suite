@@ -386,7 +386,18 @@ async function simulateHistoricalMatch(match, engineConfig, seededRandom, logStr
     const p = event.player;
     const steamID = p ? p.eosID : event.steamID; // Use EOS as Steam for simplicity in test
 
-    if (event.type === 'JOIN') {
+    if (event.type === 'MOVE_SUCCESS') {
+      const playerObj = server.getPlayerBySteamID(event.steamID);
+      if (playerObj) {
+        playerObj.teamID = event.teamID;
+      }
+      await server.emit('SMART_ASSIGN_MOVE_SUCCESS', { steamID: event.steamID, teamID: event.teamID });
+      
+      // Also emit UPDATED_PLAYER_INFORMATION with delay, mimicking engine
+      setTimeout(async () => {
+        await server.emit('UPDATED_PLAYER_INFORMATION', {});
+      }, 0);
+    } else if (event.type === 'JOIN') {
       // 100 Player Server Cap Enforced
       if (server.players.length >= 100) {
         // Player sits in queue. Try again in 30 seconds of virtual time.
