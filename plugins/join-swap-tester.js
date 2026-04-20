@@ -121,23 +121,27 @@ export default class JoinSwapTester extends BasePlugin {
     const startingTeam = listPlayer ? Number(listPlayer.teamID) : 1;
     const targetTeam = startingTeam === 1 ? 2 : 1;
 
-    this.targetData = {
-       steamID: info.steamID || (listPlayer ? listPlayer.steamID : null),
-       name: player.name,
-       startingTeam: startingTeam,
-       targetTeam: targetTeam
-    };
+     this.targetData = {
+        steamID: info.steamID || (listPlayer ? listPlayer.steamID : null),
+        name: player.name,
+        startingTeam: startingTeam,
+        targetTeam: targetTeam
+     };
 
-    this.telemetry = {
-      startTime: Date.now(),
-      assignmentTime: Date.now(),
-      completionTime: 0,
-      realLeaveTime: 0,
-      rconLeaveTime: 0
-    };
+     if (!this.targetData.steamID) {
+       Logger.verbose('JoinSwapTester', 1, `[TELEMETRY] WARNING: steamID is null for ${player.name}. queueMove will be a no-op. Check log parser timing.`);
+     }
 
-    Logger.verbose('JoinSwapTester', 1, `[TELEMETRY] JOIN: ${player.name} connected. Starting Toggle Swap (${startingTeam} -> ${targetTeam})...`);
-    this.executor.queueMove(this.targetData.steamID, targetTeam);
+     this.telemetry = {
+       startTime: Date.now(),
+       assignmentTime: Date.now(),
+       completionTime: 0,
+       realLeaveTime: 0,
+       rconLeaveTime: 0
+     };
+
+     Logger.verbose('JoinSwapTester', 1, `[TELEMETRY] JOIN: ${player.name} connected. Starting Toggle Swap (${startingTeam} -> ${targetTeam})...`);
+     this.executor.queueMove(this.targetData.steamID, targetTeam);
   }
 
   async onUpdatedPlayerInfo() {
@@ -196,7 +200,9 @@ export default class JoinSwapTester extends BasePlugin {
     this.currentState = this.states.IDLE;
   }
 
-  _isTarget(data) {
-     return data.steamID === this.targetData.steamID || data.eosID === this.options.targetEOSID;
-  }
+   _isTarget(data) {
+      // Guard against null === null false match (prevents random move events from matching when steamID is missing)
+      if (!this.targetData.steamID && !data.steamID) return false;
+      return data.steamID === this.targetData.steamID || data.eosID === this.options.targetEOSID;
+   }
 }
