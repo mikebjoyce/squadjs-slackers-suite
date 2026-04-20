@@ -92,6 +92,7 @@ class MockSASwapExecutor {
     return this.recentMoves.get(steamID) === Number(newTeamID);
   }
   async queueMove(steamID, targetTeam) {
+    if (targetTeam === null) return;
     const p = this.server.players.find(p => p.steamID === steamID);
     if (!p) return;
 
@@ -108,7 +109,7 @@ class MockSASwapExecutor {
       return;
     }
 
-    if (p.teamID !== Number(targetTeam) && p.teamID !== 3) this.moveCount++;
+    if (p.teamID !== Number(targetTeam) && p.teamID !== null) this.moveCount++;
     p.teamID = Number(targetTeam);
     this.recentMoves.set(steamID, Number(targetTeam));
     // Emit immediately for simulation speed; the plugin logic is awaited in emit()
@@ -378,7 +379,7 @@ async function simulateHistoricalMatch(match, eloMap, engineConfig, seededRandom
       // This forces SmartAssign to actively execute an RCON move if its Elo or Rejoin 
       // logic demands a different team, accurately increasing the `forcedMoves` metric 
       // and proving its ability to fix native assignments.
-      let naturalTeam = 3;
+      let naturalTeam = null;
       const t1Count = server.players.filter(x => String(x.teamID) === '1').length;
       const t2Count = server.players.filter(x => String(x.teamID) === '2').length;
       
@@ -549,7 +550,7 @@ async function startREPL(eloMap, initialMatch = null) {
       const t1Count = server.players.filter(x => String(x.teamID) === '1').length;
       const t2Count = server.players.filter(x => String(x.teamID) === '2').length;
       
-      let naturalTeam = 3;
+      let naturalTeam = null;
       if (t1Count < MAX_TEAM_SIZE || t2Count < MAX_TEAM_SIZE) {
         naturalTeam = t1Count <= t2Count ? 1 : 2;
       }
@@ -589,7 +590,7 @@ async function startREPL(eloMap, initialMatch = null) {
         const t1Count = server.players.filter(x => String(x.teamID) === '1').length;
         const t2Count = server.players.filter(x => String(x.teamID) === '2').length;
         
-        let naturalTeam = 3;
+        let naturalTeam = null;
         if (t1Count < MAX_TEAM_SIZE || t2Count < MAX_TEAM_SIZE) {
           naturalTeam = t1Count <= t2Count ? 1 : 2;
         }

@@ -418,7 +418,7 @@ export default class SmartAssign {
         Logger.verbose('SmartAssign', 2, `[SmartAssign] Evaluated fresh join for ${player.name} -> Team ${targetTeam} (${reason})`);
       }
 
-      const willExecuteMove = String(player.teamID) !== String(targetTeam) && this.options.enableSmartAssign !== false;
+      const willExecuteMove = targetTeam !== null && String(player.teamID) !== String(targetTeam) && this.options.enableSmartAssign !== false;
 
       // Record the assignment in log with executed flag for passive mode distinction
       this.logEvent('ASSIGNMENT', player, {
@@ -428,8 +428,8 @@ export default class SmartAssign {
         executed: willExecuteMove
       });
 
-      // If the player is currently unassigned or on the wrong team, queue a team change
-      if (String(player.teamID) !== String(targetTeam)) {
+      // If the player is currently on the wrong team, queue a team change
+      if (targetTeam !== null && String(player.teamID) !== String(targetTeam)) {
         if (this.options.enableSmartAssign !== false) {
           this._pendingAssignments[targetTeam]++;
           const pendingPlayerMu = this._getMuFast(player);
@@ -538,7 +538,10 @@ export default class SmartAssign {
     if ((t2Count + 1) - t1Count > effectiveMaxImbalance) return { targetTeam: 1, reason: 'Hard Population Cap' };
 
     // 2.1 PHYSICAL SERVER CAP (50)
-    if (t1Count >= MAX_TEAM_SIZE && t2Count >= MAX_TEAM_SIZE) return { targetTeam: 3, reason: 'Server Full' };
+    // If both teams are maxed at 50, we return a fallback 'targetTeam: null' to prevent the plugin 
+    // from attempting to shove a 51st player onto a full team. The executor won't perform 
+    // any RCON moves and lets the game handle the player natively.
+    if (t1Count >= MAX_TEAM_SIZE && t2Count >= MAX_TEAM_SIZE) return { targetTeam: null, reason: 'Server Full' };
     if (t1Count >= MAX_TEAM_SIZE && t2Count < MAX_TEAM_SIZE) return { targetTeam: 2, reason: 'Team 1 Full' };
     if (t2Count >= MAX_TEAM_SIZE && t1Count < MAX_TEAM_SIZE) return { targetTeam: 1, reason: 'Team 2 Full' };
 
