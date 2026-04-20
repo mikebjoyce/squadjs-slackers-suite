@@ -111,8 +111,7 @@ export default class SmartAssign {
 
     this.db = new SADatabase(server, options, connectors);
     this.executor = new SASwapExecutor(server, {
-      maxAttempts: 8,
-      retryIntervalMs: 300,
+      retryIntervalMs: 150,
       maxCompletionTimeMs: 3000
     });
 

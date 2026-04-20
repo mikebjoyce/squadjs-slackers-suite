@@ -57,7 +57,7 @@ The algorithm calculates what the teams would look like if the new player joined
 ### Background Enforcer (The Retry Queue)
 Squad's server engine is notoriously buggy. Sometimes, if you tell the server to move a player while they are still on a loading screen, the server ignores the command. 
 
-To combat this, SmartAssign uses a background **Retry Queue**. If it decides a player needs to be on Team 2, but the game fails to move them, SmartAssign will keep retrying every few milliseconds (for up to 15 seconds) until it successfully places them on the right team. This guarantees that the algorithm's choices are actually respected by the game.
+To combat this, SmartAssign uses a background **Retry Queue**. If it decides a player needs to be on Team 2, but the game fails to move them, SmartAssign will keep retrying rapidly (every 150ms for up to 3 seconds) until it successfully places them on the right team. This guarantees that the algorithm's choices are actually respected by the game even if the engine is busy.
 
 ---
 

@@ -32,18 +32,14 @@ export default class SASwapExecutor {
   constructor(server, options = {}) {
     this.server = server;
     this.options = Object.assign({
-      maxAttempts: 8,
-      retryIntervalMs: 300,
+      retryIntervalMs: 150,
       /**
-       * DESIGN NOTE: maxCompletionTimeMs vs maxAttempts
-       * If this value is provided by the instantiator (e.g. 3000ms), it may preempt the `maxAttempts` loop 
-       * if `maxAttempts * retryIntervalMs > maxCompletionTimeMs`. The effective limit is whichever triggers first.
-       * If not provided, it defaults to 15000ms.
-       *
-       * CALIBRATION: 8 attempts @ 300ms = 2400ms. 
-       * This provides 600ms headroom for RCON latency within a 3000ms budget.
+       * DESIGN NOTE: Time-Bounded Retries
+       * We rely strictly on maxCompletionTimeMs rather than an arbitrary attempt limit
+       * to allow the executor to rapidly poll the engine as fast as the configured
+       * retry interval permits within the defined window.
        */
-      maxCompletionTimeMs: 15000
+      maxCompletionTimeMs: 3000
     }, options);
     
     this.pendingPlayerMoves = new Map();
@@ -143,22 +139,16 @@ export default class SASwapExecutor {
             continue;
           }
 
-          if (moveData.attempts < this.options.maxAttempts) {
-            moveData.attempts++;
-            try {
-              if (typeof this.server.rcon?.switchTeam === 'function') {
-                await this.server.rcon.switchTeam(steamID, moveData.targetTeamID);
-                this.server.emit('SMART_ASSIGN_MOVE_RETRY', { steamID, attempt: moveData.attempts, method: 'switchTeam' });
-              } else {
-                Logger.verbose('SmartAssign', 1, `[SwapExecutor] RCON commands unavailable for ${steamID}.`);
-              }
-            } catch (err) {
-              Logger.verbose('SmartAssign', 2, `[SwapExecutor] Move attempt ${moveData.attempts} failed for ${steamID}: ${err?.message || err}`);
+          moveData.attempts++;
+          try {
+            if (typeof this.server.rcon?.switchTeam === 'function') {
+              await this.server.rcon.switchTeam(steamID, moveData.targetTeamID);
+              this.server.emit('SMART_ASSIGN_MOVE_RETRY', { steamID, attempt: moveData.attempts, method: 'switchTeam' });
+            } else {
+              Logger.verbose('SmartAssign', 1, `[SwapExecutor] RCON commands unavailable for ${steamID}.`);
             }
-          } else {
-            Logger.verbose('SmartAssign', 1, `[SwapExecutor] Max attempts reached for ${steamID}`);
-            this.server.emit('SMART_ASSIGN_MOVE_FAILED', { steamID, reason: 'Max attempts reached' });
-            playersToRemove.push(steamID);
+          } catch (err) {
+            Logger.verbose('SmartAssign', 2, `[SwapExecutor] Move attempt ${moveData.attempts} failed for ${steamID}: ${err?.message || err}`);
           }
         } catch (err) {
           Logger.verbose('SmartAssign', 1, `[SwapExecutor] Error processing ${steamID}: ${err?.message || err}`);
