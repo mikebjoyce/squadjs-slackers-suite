@@ -204,6 +204,7 @@ export default class SmartAssign {
   async unmount() {
     this.ready = false;
     if (this.cleanupInterval) clearInterval(this.cleanupInterval);
+    await this.finalizeRoundLog();
     this.server.removeListener('NEW_GAME', this.onNewGame);
     this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
     this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
@@ -229,6 +230,7 @@ export default class SmartAssign {
 
     // Clear known players so anyone connecting gets processed normally
     this.knownPlayers.clear();
+    this._joiningPlayers.clear();
     this._pendingAssignments[1] = 0;
     this._pendingAssignments[2] = 0;
     this._pendingMu[1] = 0;
@@ -550,7 +552,6 @@ export default class SmartAssign {
     // This runs before Elo scoring so the guarantee is strong.
     if (isRejoin) {
       const rejoinTarget = reconnectTeam; // 1 or 2
-      const rejoinOpponent = rejoinTarget === 1 ? 2 : 1;
       const rejoinCount    = rejoinTarget === 1 ? t1Count : t2Count;
       const opponentCount  = rejoinTarget === 1 ? t2Count : t1Count;
       if ((rejoinCount + 1) - opponentCount <= effectiveMaxImbalance) {
@@ -618,18 +619,23 @@ export default class SmartAssign {
     if (!et) return 25.0;
 
     try {
-      // Prioritize internal maps to bypass getter overhead/logic
+      // Prioritize internal maps to bypass getter overhead/logic.
+      // WARNING: These paths couple directly to EloTracker internals. If those
+      // property names change, this silently degrades to the public getMu() fallback.
       if (et.eloCache && p.eosID) {
         const cached = et.eloCache.get(p.eosID);
         if (cached) return cached.mu;
+        Logger.verbose('SmartAssign', 3, `[_getMuFast] eloCache miss for eosID ${p.eosID}, falling through.`);
       }
       if (et.eloMap && p.steamID) {
         const mu = et.eloMap.get(p.steamID);
         if (mu !== undefined) return mu;
+        Logger.verbose('SmartAssign', 3, `[_getMuFast] eloMap miss for steamID ${p.steamID}, falling through.`);
       }
       // Fallback to official API
       return et.getMu(p);
     } catch (e) {
+      Logger.verbose('SmartAssign', 2, `[_getMuFast] getMu() threw for ${p.steamID}: ${e?.message}. Using default Mu.`);
       return 25.0;
     }
   }
