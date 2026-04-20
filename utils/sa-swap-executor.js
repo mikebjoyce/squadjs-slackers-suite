@@ -35,7 +35,7 @@ export default class SASwapExecutor {
       retryIntervalMs: 150,
       /**
        * DESIGN NOTE: Time-Bounded Retries
-       * We rely strictly on maxCompletionTimeMs rather than an arbitrary attempt limit
+       * The executor relies strictly on maxCompletionTimeMs rather than an arbitrary attempt limit
        * to allow the executor to rapidly poll the engine as fast as the configured
        * retry interval permits within the defined window.
        */
@@ -75,7 +75,7 @@ export default class SASwapExecutor {
     if (!this.retryTimer) {
       this.startMonitoring();
     } else {
-      // Trigger an immediate pass for the new player if we are already monitoring
+      // Trigger an immediate pass for the new player if monitoring is already active
       this.processRetries().catch((err) => {
         Logger.verbose('SmartAssign', 2, `[SwapExecutor] Queued retry error: ${err?.message || 'Unknown'}`);
       });
@@ -124,7 +124,7 @@ export default class SASwapExecutor {
 
           const player = currentPlayers.find((p) => p.steamID === steamID);
           if (!player) {
-            // Player disconnected before we could assign them
+            // Player disconnected before an assignment could be executed
             Logger.verbose('SmartAssign', 2, `[SwapExecutor] Player ${steamID} disconnected before move`);
             this.server.emit('SMART_ASSIGN_MOVE_FAILED', { steamID, reason: 'Disconnected' });
             playersToRemove.push(steamID);

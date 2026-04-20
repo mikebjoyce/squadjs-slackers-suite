@@ -293,7 +293,7 @@ export default class SmartAssign {
 
     if (!this.initialSyncComplete) {
       // SAFE-SYNC HANDSHAKE:
-      // On the first update tick after plugin mount, we populate knownPlayers 
+      // On the first update tick after plugin mount, knownPlayers is populated 
       // from the current server state without triggering any moves or assignments.
       for (const p of this.server.players) {
         if (p.steamID) {
@@ -314,13 +314,13 @@ export default class SmartAssign {
      * DESIGN NOTE: Omission of PLAYER_DISCONNECTED listener
      * In modern versions of Squad/SquadJS, the PLAYER_DISCONNECTED log parsing is entirely broken 
      * and fails to fire reliably. To prevent memory leaks and ensure disconnects are always caught, 
-     * we infer leaves strictly by delta-diffing the UPDATED_PLAYER_INFORMATION array.
+     * leaves are inferred strictly by delta-diffing the UPDATED_PLAYER_INFORMATION array.
      * 
      * DESIGN NOTE: Squad's Native Team Assignment
      * In Squad, players are immediately assigned to Team 1 or Team 2 by the game natively upon joining.
      * There is no 'unassigned' or 'Team 0' state for teams (unassigned only applies to squads).
-     * Therefore, we only need to listen for explicit team changes between 1 and 2, and we do not 
-     * need polling fallbacks for 'team-less' players.
+     * Therefore, it is only necessary to listen for explicit team changes between 1 and 2, and 
+     * polling fallbacks for 'team-less' players are not needed.
      */
 
     // Create a quick lookup set for current steamIDs to detect leaves efficiently
@@ -374,7 +374,7 @@ export default class SmartAssign {
   async handlePlayerJoin(player) {
     // 1. DOUBLE-JOIN RACE PROTECTION
     // Since PLAYER_CONNECTED and UPDATED_PLAYER_INFORMATION both trigger joins,
-    // we use a synchronous set check before any await as a write-lock.
+    // a synchronous set check is used before any await as a write-lock.
     if (this._joiningPlayers.has(player.steamID)) return;
     this._joiningPlayers.add(player.steamID);
 
@@ -390,7 +390,7 @@ export default class SmartAssign {
       Logger.verbose('SmartAssign', 2, `[JOIN] Player connected: ${player.name} (${player.steamID})`);
       this.logEvent('JOIN', player);
 
-      // Check if we are in an ignored layer/gamemode
+      // Check if the current layer/gamemode is ignored
       const currentLayerName = this.server.currentLayer ? this.server.currentLayer.name.toLowerCase() : '';
       const currentGamemode = this.server.currentLayer ? this.server.currentLayer.gamemode.toLowerCase() : '';
       const ignoredModes = (this.options.ignoredGameModes || ['seed', 'jensen']).map(m => String(m).toLowerCase());
@@ -539,7 +539,7 @@ export default class SmartAssign {
     if ((t2Count + 1) - t1Count > effectiveMaxImbalance) return { targetTeam: 1, reason: 'Hard Population Cap' };
 
     // 2.1 PHYSICAL SERVER CAP (50)
-    // If both teams are maxed at 50, we return a fallback 'targetTeam: null' to prevent the plugin 
+    // If both teams are maxed at 50, a fallback 'targetTeam: null' is returned to prevent the plugin 
     // from attempting to shove a 51st player onto a full team. The executor won't perform 
     // any RCON moves and lets the game handle the player natively.
     if (t1Count >= MAX_TEAM_SIZE && t2Count >= MAX_TEAM_SIZE) return { targetTeam: null, reason: 'Server Full' };

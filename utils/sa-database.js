@@ -59,7 +59,7 @@ export default class SADatabase {
       }
     };
 
-    // We removed the strict global mutex to allow concurrent queries (like reads).
+    // The strict global mutex was removed to allow concurrent queries (like reads).
     // The retry logic and WAL mode (configured in initDB) handles write conflicts effectively without forcing fully sequential operations.
     return runAttempt();
   }
@@ -106,7 +106,7 @@ export default class SADatabase {
        * DESIGN NOTE: sync({ alter: true })
        * In a shared plugin ecosystem like SquadJS, `alter: true` carries a minor production risk. If a schema 
        * update changes a column type, Sequelize might silently drop and re-add the column depending on the dialect,
-       * leading to data loss. Since this plugin's schema is currently stable, we leave it as `alter: true` for 
+       * leading to data loss. Since this plugin's schema is currently stable, it is left as `alter: true` for 
        * zero-config deployment, but it should be noted for future structural updates.
        */
       await this.SmartAssignStateModel.sync({ alter: true });

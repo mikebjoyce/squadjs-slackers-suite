@@ -121,8 +121,8 @@ class MockSASwapExecutor {
 }
 
 // MockRandomAssign is intentionally passive because standard Squad servers natively
-// place joining players on the team with the lowest population. We want the test
-// runner's "Baseline" to represent this exact vanilla behavior without any extra
+// place joining players on the team with the lowest population. The test
+// runner's "Baseline" represents this exact vanilla behavior without any extra
 // plugin intervention. 
 class MockRandomAssign {
   constructor(server) {
@@ -170,7 +170,7 @@ function inferPlayerEvents(match, seededRandom, targetInitialPop) {
       }
     } else {
       // Late joiners
-      // We want to simulate a highly populated server, so we queue them aggressively
+      // To simulate a highly populated server, players are queued aggressively
       // They will hit the 100-player queue limit natively handled in the simulation
       const startTime = Math.floor(seededRandom.next() * (duration / 4));
       events.push({ type: 'JOIN', time: startTime, player: p });
@@ -292,7 +292,7 @@ function generateProlongedTimeline(match, seededRandom) {
       events.push({ type: 'LEAVE', time: time + 180000 + 7200000, player: p });
     }
     
-    // Agreesively refill the server back to 100 to simulate a full queue
+    // Aggressively refill the server back to 100 to simulate a full queue
     while (currentPop < 100) {
       const newP = getNextPlayer();
       // Join instantly (1-5 seconds after someone leaves) to steal the slot
@@ -373,9 +373,9 @@ async function simulateHistoricalMatch(match, eloMap, engineConfig, seededRandom
 
       const reconnectTeam = await plugin.db.getReconnectTeam(steamID);
       
-      // Expected Behavior: We calculate the "Natural Team" exactly as standard Squad does:
+      // Expected Behavior: The "Natural Team" is calculated exactly as standard Squad does:
       // simply assigning to the team with the lowest population.
-      // We intentionally do NOT force the player onto their `reconnectTeam` natively. 
+      // The player is intentionally NOT forced onto their `reconnectTeam` natively. 
       // This forces SmartAssign to actively execute an RCON move if its Elo or Rejoin 
       // logic demands a different team, accurately increasing the `forcedMoves` metric 
       // and proving its ability to fix native assignments.
