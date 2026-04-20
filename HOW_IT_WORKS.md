@@ -28,6 +28,7 @@ Every time a player joins the server, SmartAssign runs them through a rapid deci
 The system strictly limits how lopsided teams can get based on how full the server is.
 * **Is the server at 94+ players?** Teams cannot be more than **1 player** apart.
 * **Is the server at 88-93 players?** Teams cannot be more than **2 players** apart.
+* **Is the server at 80-87 players?** Teams cannot be more than **3 players** apart.
 * **Are there less than 80 players?** Teams can drift up to **4 players** apart to allow for better skill balancing.
 * **Decision:** If putting the player on Team 1 violates these rules, **force them to Team 2.** Otherwise, move to Step 5.
 

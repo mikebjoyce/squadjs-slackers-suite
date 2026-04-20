@@ -89,13 +89,13 @@ SmartAssign uses a hierarchical decision process optimized for competitive parit
 
 ### 1. Hard Population Cap (Dynamic)
 The plugin first checks the player counts of both teams. Because the Elo scoring logic natively creates a soft penalty for lopsided teams, the hard bounds act purely as a safety net:
-- **Low/Mid-Pop (< 95 players)**: Strict 2-player difference allowed.
-- **Full Server (95+ players)**: **Strict 1-player parity enforced.**
+- **Low/Mid-Pop (< 94 players)**: Strict 2-player difference allowed.
+- **Full Server (94+ players)**: **Strict 1-player parity enforced.**
 
 ### 2. Reconnect Memory & Grace (High Priority)
 Players rejoining within the same round are granted an **additional +2 player imbalance allowance** on top of the base allowance to ensure they can get back to their squad and maintain team cohesion.
-- **Low/Mid-Pop (< 95 players)**: Up to **4-player difference allowed**.
-- **Full Server (95+ players)**: Hard capped back down to a **2-player difference**.
+- **Low/Mid-Pop (< 94 players)**: Up to **4-player difference allowed**.
+- **Full Server (94+ players)**: Hard capped back down to a **2-player difference**.
 
 ### 3. Team Scoring & Skill Balancing
 If no reconnect memory is found, the system evaluates which team the player should join based on skill distribution and population.

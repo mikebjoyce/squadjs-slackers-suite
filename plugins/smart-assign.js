@@ -15,7 +15,7 @@
  *
  * SmartAssign (default)
  *   Extends BasePlugin. Key methods:
- *     mount()                          — Initialises DB and lifecycle listeners.
+ *     mount()                          — Initializes DB and lifecycle listeners.
  *     unmount()                        — Removes listeners and cleans up executor.
  *     evaluateTeamAssignment(player)    — Core algorithm for team placement.
  *     logEvent(type, player, data)      — Records lifecycle events to JSONL.
@@ -54,12 +54,13 @@
  * ═══════════════════════════════════════════════════════════════
  */
 
-const MAX_TEAM_SIZE = 50;
 import { promises as fsPromises } from 'fs';
 import Logger from '../../core/logger.js';
 import BasePlugin from './base-plugin.js';
 import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
+
+const MAX_TEAM_SIZE = 50;
 
 export default class SmartAssign extends BasePlugin {
   static version = '0.2.2';
@@ -249,10 +250,15 @@ export default class SmartAssign extends BasePlugin {
     this.currentRoundStartTime = now;
     this._snapshotTaken = false;
 
-    // Snapshot will be taken by the next event handler or the first player update.
+    // NOTE: This call to _ensureSnapshot() is intentional. In SquadJS, the layer name 
+    // may be 'Unknown' during NEW_GAME, which causes the snapshot to safely abort 
+    // and wait for the first player update. However, if the layer is known, it takes 
+    // the snapshot immediately to catch it as early as possible.
     await this._ensureSnapshot();
 
-    // Clear known players so anyone connecting gets processed normally
+    // Clear known players so anyone connecting gets processed normally.
+    // NOTE: _sessionJoinTimes is explicitly NOT cleared here. It is designed 
+    // to persist across rounds to accurately track total server session length.
     this.knownPlayers.clear();
     this._joiningPlayers.clear();
     this._pendingAssignments[1] = 0;
@@ -449,8 +455,8 @@ export default class SmartAssign extends BasePlugin {
       this.logEvent('JOIN', player);
 
       // Check if the current layer/gamemode is ignored
-      const currentLayerName = this.server.currentLayer ? this.server.currentLayer.name.toLowerCase() : '';
-      const currentGamemode = this.server.currentLayer ? this.server.currentLayer.gamemode.toLowerCase() : '';
+      const currentLayerName = this.server.currentLayer && this.server.currentLayer.name ? String(this.server.currentLayer.name).toLowerCase() : '';
+      const currentGamemode = this.server.currentLayer && this.server.currentLayer.gamemode ? String(this.server.currentLayer.gamemode).toLowerCase() : '';
 
       const isIgnored = this._ignoredModes.some(m => currentLayerName.includes(m) || currentGamemode.includes(m));
 
@@ -814,6 +820,8 @@ export default class SmartAssign extends BasePlugin {
       name: p.name,
       steamID: p.steamID,
       teamID: p.teamID,
+      // joinedServerAt intentionally draws from the persistent _sessionJoinTimes Map 
+      // rather than the current round time to accurately track cross-round play sessions.
       joinedServerAt: this._sessionJoinTimes.has(p.steamID) ? this._sessionJoinTimes.get(p.steamID) : now
     }));
 
