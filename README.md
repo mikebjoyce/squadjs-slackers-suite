@@ -1,4 +1,4 @@
-# SmartAssign Plugin v0.1.8
+# SmartAssign Plugin v0.1.9
 
 **Elo-Aware Auto Assignment & Player Lifecycle Logger**
 
@@ -97,7 +97,7 @@ Players rejoining within the same round are granted an **additional +2 player im
 
 ### 3. Team Scoring & Skill Balancing
 If no reconnect memory is found, the system evaluates which team the player should join based on skill distribution and population.
-*   **Skill Weighting**: Player Elo (Mu) is weighted with a mild non-linear exponent (1.10) to correctly value the disproportionate impact of high-skill players on a team's overall capability without overvaluing individual outliers.
+*   **Mu Balancing**: The algorithm balances competitive parity by weighing the average skill gap (3.0x multiplier) against a dynamically scaled sum gap (1.5x multiplier).
 *   **Balancing Target**: It assigns the player to the team that brings the match closest to an even skill split between both sides.
 *   **Internal Tuning**: Balances the desire for even skill distribution against strict population limits, ensuring that the algorithm doesn't create lopsided teams just to match Elo numbers.
 

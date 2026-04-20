@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SA-SWAP-EXECUTOR v0.1.8                    ║
+ * ║                    SA-SWAP-EXECUTOR v0.1.9                    ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -32,13 +32,16 @@ export default class SASwapExecutor {
   constructor(server, options = {}) {
     this.server = server;
     this.options = Object.assign({
-      maxAttempts: 6,
-      retryIntervalMs: 500,
+      maxAttempts: 8,
+      retryIntervalMs: 300,
       /**
        * DESIGN NOTE: maxCompletionTimeMs vs maxAttempts
        * If this value is provided by the instantiator (e.g. 3000ms), it may preempt the `maxAttempts` loop 
        * if `maxAttempts * retryIntervalMs > maxCompletionTimeMs`. The effective limit is whichever triggers first.
        * If not provided, it defaults to 15000ms.
+       *
+       * CALIBRATION: 8 attempts @ 300ms = 2400ms. 
+       * This provides 600ms headroom for RCON latency within a 3000ms budget.
        */
       maxCompletionTimeMs: 15000
     }, options);

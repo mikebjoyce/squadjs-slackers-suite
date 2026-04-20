@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v0.1.8                   ║
+ * ║                  SMART ASSIGN PLUGIN v0.1.9                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -30,12 +30,12 @@
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
- * - Algorithm uses an Integrated Symmetric Logistic Scoring System:
+ * - Algorithm uses a Mu-based Unified Scoring System:
  *     1. Hard Pop Cap: Prevents imbalance beyond dynamic thresholds.
- *     2. Logistic Win-Probability: Calculates win probability shift (Scale: 13, Exponent: 1.10).
- *     3. Soft Pop Penalty: Non-linear penalty of 0.10 per player difference.
+ *     2. Mu Balancing: Weights the average skill gap (3.0x) against a dynamically scaled sum gap (1.5x) to handle diverse pop states.
+ *     3. Reconnect Bias: Applies a minor score reduction (0.25) toward previous team if returning.
  *     4. Reconnect Bonus: Grants an *additional* +2 player imbalance allowance on top of the base.
- * - Strict 1-player max imbalance enforced at high population (95+).
+ * - Strict 1-player max imbalance enforced at high population (94+).
  * - Bypasses auto-assignment completely during specified ignored modes (Seed/Jensen).
  *
  * ─── CONFIGURATION ───────────────────────────────────────────────
@@ -52,13 +52,14 @@
  * ═══════════════════════════════════════════════════════════════
  */
 
+const MAX_TEAM_SIZE = 50;
 import { promises as fsPromises } from 'fs';
 import Logger from '../../core/logger.js';
 import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
 
 export default class SmartAssign {
-  static version = '0.1.8';
+  static version = '0.1.9';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
@@ -110,15 +111,19 @@ export default class SmartAssign {
 
     this.db = new SADatabase(server, options, connectors);
     this.executor = new SASwapExecutor(server, {
-      maxAttempts: 6,
-      retryIntervalMs: 500,
+      maxAttempts: 8,
+      retryIntervalMs: 300,
       maxCompletionTimeMs: 3000
     });
 
     this.knownPlayers = new Map();
+    this._joiningPlayers = new Set();
+    this._pendingAssignments = { 1: 0, 2: 0 };
+    this._pendingMu = { 1: 0, 2: 0 };
     this.currentRoundEvents = [];
     this.currentRoundStartTime = null;
     this.ready = false;
+    this.initialSyncComplete = false;
     this._logWriteQueue = Promise.resolve();
 
     this.eloTracker = null;
@@ -138,6 +143,9 @@ export default class SmartAssign {
     Logger.verbose('SmartAssign', 1, 'Mounting SmartAssign plugin.');
 
     this.eloTracker = this.server.plugins.find((p) => p.constructor.name === 'EloTracker') || null;
+    if (this.eloTracker && typeof this.eloTracker.getMu !== 'function') {
+      Logger.verbose('SmartAssign', 1, '[SmartAssign] Warning: EloTracker found but getMu() is missing. Falling back to population-only/internal-props.');
+    }
 
     // Initialize DB
     const { roundStartTime: persistedStartTime } = await this.db.initDB();
@@ -160,25 +168,14 @@ export default class SmartAssign {
       serverRoundStart &&
       Math.abs(Number(persistedStartTime) - Number(serverRoundStart)) < threeHours
     ) {
-      // It's a resume. Populate known players silently so they don't trigger "JOIN" events
+      // It's a resume.
       Logger.verbose(
         'SmartAssign',
         1,
-        'Restart detected. Resuming round state and silent-populating known players.'
+        'Restart detected. Resuming round state.'
       );
       this.currentRoundStartTime = Number(persistedStartTime);
       await this.loadTempEvents();
-
-      for (const p of this.server.players) {
-        if (p.steamID) {
-          this.knownPlayers.set(p.steamID, {
-            steamID: p.steamID,
-            name: p.name,
-            teamID: p.teamID,
-            squadID: p.squadID
-          });
-        }
-      }
     } else {
       // New round or no data
       Logger.verbose('SmartAssign', 1, 'New round or no persisted state. Starting fresh.');
@@ -190,19 +187,6 @@ export default class SmartAssign {
       const now = serverRoundStart || Date.now();
       await this.db.saveRoundStartTime(now);
       this.currentRoundStartTime = now;
-
-      // If players are already connected when the plugin starts, quietly track them
-      // to avoid triggering mass auto-assignment logic upon initialization.
-      for (const p of this.server.players) {
-        if (p.steamID) {
-          this.knownPlayers.set(p.steamID, {
-            steamID: p.steamID,
-            name: p.name,
-            teamID: p.teamID,
-            squadID: p.squadID
-          });
-        }
-      }
     }
 
     this.server.on('NEW_GAME', this.onNewGame);
@@ -246,6 +230,10 @@ export default class SmartAssign {
 
     // Clear known players so anyone connecting gets processed normally
     this.knownPlayers.clear();
+    this._pendingAssignments[1] = 0;
+    this._pendingAssignments[2] = 0;
+    this._pendingMu[1] = 0;
+    this._pendingMu[2] = 0;
   }
 
   async onRoundEnded(info) {
@@ -302,21 +290,45 @@ export default class SmartAssign {
   async onUpdatedPlayerInfo(info) {
     if (!this.ready) return;
 
+    if (!this.initialSyncComplete) {
+      // SAFE-SYNC HANDSHAKE:
+      // On the first update tick after plugin mount, we populate knownPlayers 
+      // from the current server state without triggering any moves or assignments.
+      for (const p of this.server.players) {
+        if (p.steamID) {
+          this.knownPlayers.set(p.steamID, {
+            steamID: p.steamID,
+            name: p.name,
+            teamID: p.teamID,
+            squadID: p.squadID
+          });
+        }
+      }
+      this.initialSyncComplete = true;
+      Logger.verbose('SmartAssign', 1, `Safe-Sync handshake complete. Known players: ${this.knownPlayers.size}. Monitoring for changes.`);
+      return;
+    }
+
     /**
      * DESIGN NOTE: Omission of PLAYER_DISCONNECTED listener
      * In modern versions of Squad/SquadJS, the PLAYER_DISCONNECTED log parsing is entirely broken 
      * and fails to fire reliably. To prevent memory leaks and ensure disconnects are always caught, 
      * we infer leaves strictly by delta-diffing the UPDATED_PLAYER_INFORMATION array.
+     * 
+     * DESIGN NOTE: Squad's Native Team Assignment
+     * In Squad, players are immediately assigned to Team 1 or Team 2 by the game natively upon joining.
+     * There is no 'unassigned' or 'Team 0' state for teams (unassigned only applies to squads).
+     * Therefore, we only need to listen for explicit team changes between 1 and 2, and we do not 
+     * need polling fallbacks for 'team-less' players.
      */
 
     // Create a quick lookup set for current steamIDs to detect leaves efficiently
-    const currentSteamIDs = new Set();
+    const currentSteamIDs = new Set(this.server.players.map(p => p.steamID).filter(Boolean));
     const batchPromises = [];
-    
+
     // Check for JOINS and TEAM CHANGES directly against the server array
     for (const p of this.server.players) {
       if (!p.steamID) continue;
-      currentSteamIDs.add(p.steamID);
 
       if (!this.knownPlayers.has(p.steamID)) {
         batchPromises.push(this.handlePlayerJoin(p));
@@ -359,58 +371,98 @@ export default class SmartAssign {
   }
 
   async handlePlayerJoin(player) {
-    // Register to known players
-    this.knownPlayers.set(player.steamID, {
-      steamID: player.steamID,
-      name: player.name,
-      teamID: player.teamID,
-      squadID: player.squadID
-    });
+    // 1. DOUBLE-JOIN RACE PROTECTION
+    // Since PLAYER_CONNECTED and UPDATED_PLAYER_INFORMATION both trigger joins,
+    // we use a synchronous set check before any await as a write-lock.
+    if (this._joiningPlayers.has(player.steamID)) return;
+    this._joiningPlayers.add(player.steamID);
 
-    Logger.verbose('SmartAssign', 2, `[JOIN] Player connected: ${player.name} (${player.steamID})`);
-    this.logEvent('JOIN', player);
+    try {
+      // Register to known players
+      this.knownPlayers.set(player.steamID, {
+        steamID: player.steamID,
+        name: player.name,
+        teamID: player.teamID,
+        squadID: player.squadID
+      });
 
-    // Check if we are in an ignored layer/gamemode
-    const currentLayerName = this.server.currentLayer ? this.server.currentLayer.name.toLowerCase() : '';
-    const currentGamemode = this.server.currentLayer ? this.server.currentLayer.gamemode.toLowerCase() : '';
-    const ignoredModes = (this.options.ignoredGameModes || ['seed', 'jensen']).map(m => String(m).toLowerCase());
-    
-    const isIgnored = ignoredModes.some(m => currentLayerName.includes(m) || currentGamemode.includes(m));
+      Logger.verbose('SmartAssign', 2, `[JOIN] Player connected: ${player.name} (${player.steamID})`);
+      this.logEvent('JOIN', player);
 
-    if (isIgnored) {
-      Logger.verbose('SmartAssign', 2, `[SmartAssign] Ignored game mode detected. Skipping Elo-based assignment for ${player.name}.`);
-      return;
-    }
+      // Check if we are in an ignored layer/gamemode
+      const currentLayerName = this.server.currentLayer ? this.server.currentLayer.name.toLowerCase() : '';
+      const currentGamemode = this.server.currentLayer ? this.server.currentLayer.gamemode.toLowerCase() : '';
+      const ignoredModes = (this.options.ignoredGameModes || ['seed', 'jensen']).map(m => String(m).toLowerCase());
 
-    // Evaluate ideal team assignment
-    const reconnectTeam = await this.db.getReconnectTeam(player.steamID);
-    const { targetTeam, reason } = this.evaluateTeamAssignment(player, reconnectTeam);
+      const isIgnored = ignoredModes.some(m => currentLayerName.includes(m) || currentGamemode.includes(m));
 
-    if (reconnectTeam && reconnectTeam === targetTeam) {
-      Logger.verbose('SmartAssign', 2, `[SmartAssign] Applied reconnect memory for ${player.name} -> Team ${targetTeam} (${reason})`);
-    } else if (reconnectTeam && reconnectTeam !== targetTeam) {
-      Logger.verbose('SmartAssign', 2, `[SmartAssign] Ignored reconnect memory for ${player.name} (Previous: Team ${reconnectTeam}) -> Team ${targetTeam} (${reason})`);
-    } else {
-      Logger.verbose('SmartAssign', 2, `[SmartAssign] Evaluated fresh join for ${player.name} -> Team ${targetTeam} (${reason})`);
-    }
-
-    const willExecuteMove = String(player.teamID) !== String(targetTeam) && this.options.enableSmartAssign !== false;
-
-    // Record the assignment in log with executed flag for passive mode distinction
-    this.logEvent('ASSIGNMENT', player, { 
-      targetTeam, 
-      reason, 
-      reconnectTeam,
-      executed: willExecuteMove
-    });
-
-    // If the player is currently unassigned or on the wrong team, queue a team change
-    if (String(player.teamID) !== String(targetTeam)) {
-      if (this.options.enableSmartAssign !== false) {
-        this.executor.queueMove(player.steamID, targetTeam);
-      } else {
-        Logger.verbose('SmartAssign', 2, `[SmartAssign] Passive mode: skipping move for ${player.name} to Team ${targetTeam}`);
+      if (isIgnored) {
+        Logger.verbose('SmartAssign', 2, `[SmartAssign] Ignored game mode detected. Skipping Elo-based assignment for ${player.name}.`);
+        return;
       }
+
+      // Evaluate ideal team assignment
+      const reconnectTeam = await this.db.getReconnectTeam(player.steamID);
+
+      // 2. STALE-STATE BATCHING PROTECTION
+      // The increment happens post-evaluation. Because evaluateTeamAssignment() is synchronous,
+      // this completes before the next Promise.all continuation, ensuring the next concurrent
+      // join reads the updated count.
+      const { targetTeam, reason } = this.evaluateTeamAssignment(player, reconnectTeam);
+
+      if (reconnectTeam && reconnectTeam === targetTeam) {
+        Logger.verbose('SmartAssign', 2, `[SmartAssign] Applied reconnect memory for ${player.name} -> Team ${targetTeam} (${reason})`);
+      } else if (reconnectTeam && reconnectTeam !== targetTeam) {
+        Logger.verbose('SmartAssign', 2, `[SmartAssign] Ignored reconnect memory for ${player.name} (Previous: Team ${reconnectTeam}) -> Team ${targetTeam} (${reason})`);
+      } else {
+        Logger.verbose('SmartAssign', 2, `[SmartAssign] Evaluated fresh join for ${player.name} -> Team ${targetTeam} (${reason})`);
+      }
+
+      const willExecuteMove = String(player.teamID) !== String(targetTeam) && this.options.enableSmartAssign !== false;
+
+      // Record the assignment in log with executed flag for passive mode distinction
+      this.logEvent('ASSIGNMENT', player, {
+        targetTeam,
+        reason,
+        reconnectTeam,
+        executed: willExecuteMove
+      });
+
+      // If the player is currently unassigned or on the wrong team, queue a team change
+      if (String(player.teamID) !== String(targetTeam)) {
+        if (this.options.enableSmartAssign !== false) {
+          this._pendingAssignments[targetTeam]++;
+          const pendingPlayerMu = this._getMuFast(player);
+          this._pendingMu[targetTeam] += pendingPlayerMu;
+          
+          // Use a state variable for this specific player join instance
+          let cleanedUp = false;
+          
+          const cleanupPending = () => {
+            if (cleanedUp) return;
+            cleanedUp = true;
+            this._pendingAssignments[targetTeam] = Math.max(0, this._pendingAssignments[targetTeam] - 1);
+            this._pendingMu[targetTeam] = Math.max(0, this._pendingMu[targetTeam] - pendingPlayerMu);
+            this.server.removeListener('SMART_ASSIGN_MOVE_SUCCESS', successListener);
+            this.server.removeListener('SMART_ASSIGN_MOVE_FAILED', failureListener);
+            this.server.removeListener('NEW_GAME', gameResetListener);
+          };
+
+          const successListener = (d) => { if (d.steamID === player.steamID) cleanupPending(); };
+          const failureListener = (d) => { if (d.steamID === player.steamID) cleanupPending(); };
+          const gameResetListener = () => { cleanupPending(); };
+
+          this.server.on('SMART_ASSIGN_MOVE_SUCCESS', successListener);
+          this.server.on('SMART_ASSIGN_MOVE_FAILED', failureListener);
+          this.server.on('NEW_GAME', gameResetListener);
+
+          this.executor.queueMove(player.steamID, targetTeam);
+        } else {
+          Logger.verbose('SmartAssign', 2, `[SmartAssign] Passive mode: skipping move for ${player.name} to Team ${targetTeam}`);
+        }
+      }
+    } finally {
+      this._joiningPlayers.delete(player.steamID);
     }
   }
 
@@ -443,121 +495,102 @@ export default class SmartAssign {
    */
   evaluateTeamAssignment(player, reconnectTeam = null) {
     const eloTracker = this.eloTracker;
-    const hasElo = eloTracker && eloTracker.ready;
+    const hasElo = eloTracker && eloTracker.ready && typeof eloTracker.getMu === 'function';
 
-    // 1. DATA COLLECTION
-    let t1Count = 0;
-    let t2Count = 0;
-    let t1Power = 0;
-    let t2Power = 0;
+    // 1. DATA COLLECTION (Single Pass Optimization)
+    let t1Count = this._pendingAssignments[1] || 0;
+    let t2Count = this._pendingAssignments[2] || 0;
+    let t1Power = this._pendingMu[1] || 0;
+    let t2Power = this._pendingMu[2] || 0;
 
-    /**
-     * DESIGN NOTE: Linear Exponent (1.10)
-     * This is an intentional mild linearization. TrueSkill Mu represents a normal distribution. 
-     * Aggressively raising the exponent (e.g. 1.5 or 2.0) mathematically overvalues individual players 
-     * in a 50v50 game where teamwork heavily dilutes extreme solo-skill impact. 
-     * It is meant to be a mild nudge, not a massive multiplier.
-     */
-    const EXPONENT = 1.10;
+    const players = this.server.players;
+    const playerCount = players.length;
 
-    for (const p of this.server.players) {
+    for (let i = 0; i < playerCount; i++) {
+      const p = players[i];
       if (!p || p.steamID === player.steamID) continue;
 
-      const isT1 = String(p.teamID) === '1';
-      const isT2 = String(p.teamID) === '2';
-
-      if (isT1) t1Count++;
-      else if (isT2) t2Count++;
-
-      if (hasElo && (isT1 || isT2)) {
-        let mu = 25.0;
-        if (eloTracker.eloCache && p.eosID && eloTracker.eloCache.has(p.eosID))
-          mu = eloTracker.eloCache.get(p.eosID).mu;
-        else if (eloTracker.eloMap && p.steamID && eloTracker.eloMap.has(p.steamID))
-          mu = eloTracker.eloMap.get(p.steamID);
-
-        const pwr = Math.pow(mu, EXPONENT);
-        if (isT1) t1Power += pwr;
-        else t2Power += pwr;
+      const teamID = String(p.teamID);
+      if (teamID === '1') {
+        t1Count++;
+        if (hasElo) t1Power += this._getMuFast(p);
+      } else if (teamID === '2') {
+        t2Count++;
+        if (hasElo) t2Power += this._getMuFast(p);
       }
     }
 
     // 2. HARD POPULATION CAP
     const totalPop = t1Count + t2Count;
-    const highPopThreshold = 95; // Threshold unified for logical consistency
     const isRejoin = reconnectTeam === 1 || reconnectTeam === 2;
 
-    const baseMaxImbalance = totalPop >= highPopThreshold ? 1 : 2;
+    // Gradual Dynamic maxImbalance
+    let maxImbalance;
+    if (totalPop >= 94) maxImbalance = 1;
+    else if (totalPop >= 88) maxImbalance = 2;
+    else if (totalPop >= 80) maxImbalance = 3;
+    else maxImbalance = 4;
 
-    let effectiveMaxImbalance = baseMaxImbalance;
-    if (isRejoin) {
-      /**
-       * DESIGN NOTE: Reconnect Double-Weighting
-       * Reconnecting players receive a more relaxed hard-cap allowance (+2) AND a score bonus later.
-       * This is highly intentional. Protecting squad cohesion after client crashes is paramount to server health.
-       * Exhaustive simulation testing proves that aggressively returning players to their original teams 
-       * has a statistically negligible impact on final Elo parity.
-       */
-      if (totalPop >= highPopThreshold) effectiveMaxImbalance = 2;
-      else effectiveMaxImbalance = baseMaxImbalance + 2;
-    }
+    let effectiveMaxImbalance = maxImbalance;
+    if (isRejoin) effectiveMaxImbalance = Math.min(4, maxImbalance + (totalPop >= 90 ? 1 : 2));
 
-    // Future state check: if assigning to team 1 causes imbalance
     if ((t1Count + 1) - t2Count > effectiveMaxImbalance) return { targetTeam: 2, reason: 'Hard Population Cap' };
-    // Future state check: if assigning to team 2 causes imbalance
     if ((t2Count + 1) - t1Count > effectiveMaxImbalance) return { targetTeam: 1, reason: 'Hard Population Cap' };
 
+    // 2.1 PHYSICAL SERVER CAP (50)
+    if (t1Count >= MAX_TEAM_SIZE && t2Count >= MAX_TEAM_SIZE) return { targetTeam: 3, reason: 'Server Full' };
+    if (t1Count >= MAX_TEAM_SIZE && t2Count < MAX_TEAM_SIZE) return { targetTeam: 2, reason: 'Team 1 Full' };
+    if (t2Count >= MAX_TEAM_SIZE && t1Count < MAX_TEAM_SIZE) return { targetTeam: 1, reason: 'Team 2 Full' };
+
+    // 3.0 RECONNECT PRIORITY ROUTING
+    // If the player has reconnect memory and placing them on that team
+    // does not violate the hard population cap, honour it immediately.
+    // This runs before Elo scoring so the guarantee is strong.
+    if (isRejoin) {
+      const rejoinTarget = reconnectTeam; // 1 or 2
+      const rejoinOpponent = rejoinTarget === 1 ? 2 : 1;
+      const rejoinCount    = rejoinTarget === 1 ? t1Count : t2Count;
+      const opponentCount  = rejoinTarget === 1 ? t2Count : t1Count;
+      if ((rejoinCount + 1) - opponentCount <= effectiveMaxImbalance) {
+        return { targetTeam: rejoinTarget, reason: 'Reconnect Memory (Priority)' };
+      }
+      // Hard cap would be violated — fall through to Elo scoring.
+    }
+
     // 3. SKILL & PENALTY EVALUATION
-    let playerMu = 25.0;
-    if (hasElo) {
-      if (eloTracker.eloCache && player.eosID && eloTracker.eloCache.has(player.eosID))
-        playerMu = eloTracker.eloCache.get(player.eosID).mu;
-      else if (eloTracker.eloMap && player.steamID && eloTracker.eloMap.has(player.steamID))
-        playerMu = eloTracker.eloMap.get(player.steamID);
-    }
-    const playerPower = Math.pow(playerMu, EXPONENT);
-
     if (!hasElo) {
-      return { targetTeam: t1Count <= t2Count ? 1 : 2, reason: 'Population Balance (No Elo)' };
+      const targetTeam = t1Count <= t2Count ? 1 : 2;
+      return { targetTeam, reason: `Population Balance (No Elo) | T1:${t1Count} T2:${t2Count}` };
     }
 
-    /**
-     * DESIGN NOTE: Average Mu vs Total Power
-     * We intentionally use Average Mu for win-probability scoring because the strict Hard-Cap 
-     * population limits (enforced above) already restrict total player counts. In a game where 
-     * 40v40 is enforced natively by bounds, Average Mu perfectly scales the remaining skill gap 
-     * without needing a convoluted total-power normalization factor.
-     */
-    // Logistic Win-Probability Model
-    const avgT1 = t1Count > 0 ? t1Power / t1Count : Math.pow(25.0, EXPONENT);
-    const avgT2 = t2Count > 0 ? t2Power / t2Count : Math.pow(25.0, EXPONENT);
+    const playerMu = this._getMuFast(player);
+    const avgT1 = t1Count > 0 ? (t1Power / t1Count) : 25.0;
+    const avgT2 = t2Count > 0 ? (t2Power / t2Count) : 25.0;
 
-    const newAvgT1 = (t1Power + playerPower) / (t1Count + 1);
-    const newAvgT2 = (t2Power + playerPower) / (t2Count + 1);
+    const newAvgT1 = (t1Power + playerMu) / (t1Count + 1);
+    const newAvgT2 = (t2Power + playerMu) / (t2Count + 1);
 
-    /**
-     * DESIGN NOTE: Scale Calibration
-     * A logistic scale of 13 was calibrated via exhaustive deep-dive simulation testing against 
-     * massive historical match logs (REALWORLD_CHURN runs). It perfectly balances competitive 
-     * micro-adjustments without causing the algorithmic routing to spiral.
-     */
-    const logisticScale = 13; // Balanced sensitivity
-    const getWinProb = (a, b) => 1 / (1 + Math.pow(10, (b - a) / logisticScale));
+    // Dynamic scale: normalises sum gap relative to current server population so the
+    // term carries consistent weight whether the server has 20 or 100 players.
+    const dynamicScale = Math.max(1, (t1Count + t2Count + 1) * 2.5);
 
-    const softPenalty = 0.10;
-    const rejoinBonus = 0.35; // Allow up to 3-player imbalance for rejoins
+    const getScore = (newAvg1, avg2, newSum1, sum2) => {
+      const avgGap = Math.abs(newAvg1 - avg2);
+      const sumGap = Math.abs(newSum1 - sum2) / dynamicScale;
+      return (avgGap * 3.0) + (sumGap * 1.5);
+    };
 
-    // Evaluate resulting state if player joins T1
-    const imbalanceT1 = Math.abs((t1Count + 1) - t2Count);
-    const penT1 = Math.pow(imbalanceT1, 1.5) * softPenalty;
-    let scoreT1 = Math.abs(getWinProb(newAvgT1, avgT2) - 0.5) + penT1;
-    if (reconnectTeam === 1) scoreT1 -= rejoinBonus;
+    let scoreT1 = getScore(newAvgT1, avgT2, t1Power + playerMu, t2Power);
+    let scoreT2 = getScore(avgT1, newAvgT2, t1Power, t2Power + playerMu);
 
-    // Evaluate resulting state if player joins T2
-    const imbalanceT2 = Math.abs(t1Count - (t2Count + 1));
-    const penT2 = Math.pow(imbalanceT2, 1.5) * softPenalty;
-    let scoreT2 = Math.abs(getWinProb(avgT1, newAvgT2) - 0.5) + penT2;
-    if (reconnectTeam === 2) scoreT2 -= rejoinBonus;
+    // Rejoin bias: if reconnect priority was blocked by the hard pop cap and fell
+    // through here, apply a small score reduction toward the player's previous team.
+    // Not enough to override a meaningful Elo gap; only tips near-ties.
+    if (isRejoin) {
+      const REJOIN_BIAS = 0.25;
+      if (reconnectTeam === 1) scoreT1 = Math.max(0, scoreT1 - REJOIN_BIAS);
+      else if (reconnectTeam === 2) scoreT2 = Math.max(0, scoreT2 - REJOIN_BIAS);
+    }
 
     let targetTeam;
     if (scoreT1 < scoreT2) {
@@ -565,28 +598,38 @@ export default class SmartAssign {
     } else if (scoreT2 < scoreT1) {
       targetTeam = 2;
     } else {
-      // On exact ties, actively evaluate the incoming player's skill relative to the server average.
-      // Good players help carry the lower Elo team. New/bad players go to the higher Elo team to get carried.
-      const serverAvg = totalPop > 0 ? (t1Power + t2Power) / totalPop : 25.0;
-      
-      if (playerPower >= serverAvg) {
-        // Player is above average: send them to the team with the lowest average Elo
-        if (avgT1 <= avgT2) targetTeam = 1;
-        else targetTeam = 2;
-      } else {
-        // Player is below average: send them to the team with the highest average Elo
-        if (avgT1 >= avgT2) targetTeam = 1;
-        else targetTeam = 2;
-      }
+      // Simple population tie-breaker
+      targetTeam = t1Count <= t2Count ? 1 : 2;
     }
 
-    const reason = `Skill Balance (Scale 13): T1=${scoreT1.toFixed(3)}, T2=${scoreT2.toFixed(3)}`;
-
-    // 4. FINAL SAFETY CHECK
-    const wouldViolate = targetTeam === 1 ? t1Count + 1 - t2Count > effectiveMaxImbalance : t2Count + 1 - t1Count > effectiveMaxImbalance;
-    if (wouldViolate) return { targetTeam: t1Count < t2Count ? 1 : 2, reason: 'Hard Population Limit Override' };
+    const reason = `Skill Balance: T1=${scoreT1.toFixed(3)}, T2=${scoreT2.toFixed(3)} | Pop: ${t1Count}v${t2Count}`;
 
     return { targetTeam, reason };
+  }
+
+  /**
+   * Fast Mu retrieval bypassing heavy try/catch and redundant lookups.
+   * @private
+   */
+  _getMuFast(p) {
+    const et = this.eloTracker;
+    if (!et) return 25.0;
+
+    try {
+      // Prioritize internal maps to bypass getter overhead/logic
+      if (et.eloCache && p.eosID) {
+        const cached = et.eloCache.get(p.eosID);
+        if (cached) return cached.mu;
+      }
+      if (et.eloMap && p.steamID) {
+        const mu = et.eloMap.get(p.steamID);
+        if (mu !== undefined) return mu;
+      }
+      // Fallback to official API
+      return et.getMu(p);
+    } catch (e) {
+      return 25.0;
+    }
   }
 
   logEvent(eventType, player, extraData = {}) {
@@ -602,8 +645,6 @@ export default class SmartAssign {
       ...extraData
     };
 
-    this.currentRoundEvents.push(event);
-
     // Incremental sequential write to temp file for stability/crash recovery
     const tempPath = this.options.logPath + '.temp';
     
@@ -615,16 +656,15 @@ export default class SmartAssign {
   }
 
   async finalizeRoundLog() {
+    // Flush any in-flight writes before reading the temp file
+    await this._logWriteQueue;
+
+    // Always load from temp file to get the full round history
+    await this.loadTempEvents();
+    
     if (this.currentRoundEvents.length === 0) {
-      // Check if there's a temp file we can recover (e.g. after crash)
-      await this.loadTempEvents();
-      
-      // If we STILL have 0 events after attempting to load the temp log, gracefully abort.
-      // This prevents double-finalization writes on back-to-back ROUND_ENDED -> NEW_GAME events.
-      if (this.currentRoundEvents.length === 0) {
-        Logger.verbose('SmartAssign', 2, `Skipping log finalization: 0 events to write.`);
-        return;
-      }
+      Logger.verbose('SmartAssign', 2, `Skipping log finalization: 0 events to write.`);
+      return;
     }
 
     Logger.verbose('SmartAssign', 1, `Finalizing round log with ${this.currentRoundEvents.length} events.`);

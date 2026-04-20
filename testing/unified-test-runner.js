@@ -6,6 +6,8 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import SmartAssign from '../plugins/smart-assign.js';
 
+const MAX_TEAM_SIZE = 50;
+
 // --- Seeded Random ---
 class SeededRandom {
   constructor(seed = 12345) {
@@ -37,6 +39,8 @@ class MockServer {
     this.plugins = [];
     this.matchStartTime = new Date();
     this.listeners = new Map();
+    this.currentLayer = { name: 'Unknown', gamemode: 'Unknown' };
+    this.virtualTime = 0;
   }
   on(event, handler) {
     if (!this.listeners.has(event)) this.listeners.set(event, []);
@@ -50,6 +54,9 @@ class MockServer {
     if (!this.listeners.has(event)) return;
     for (const handler of this.listeners.get(event)) await handler(data);
   }
+  getPlayerBySteamID(steamID) {
+    return this.players.find(p => p.steamID === steamID);
+  }
 }
 
 class EloTracker {
@@ -58,12 +65,15 @@ class EloTracker {
     this.ready = true;
     this.eloMap = eloMap;
   }
+  getMu(player) {
+    return this.eloMap.get(player.steamID) || 25.0;
+  }
   buildRoundStartData() {
     let t1Mu = 0, t1Count = 0, t2Mu = 0, t2Count = 0;
     for (const p of this.server.players) {
       const mu = this.eloMap.get(p.steamID) || 25.0;
-      if (p.teamID === 1) { t1Mu += mu; t1Count++; }
-      else if (p.teamID === 2) { t2Mu += mu; t2Count++; }
+      if (String(p.teamID) === '1') { t1Mu += mu; t1Count++; }
+      else if (String(p.teamID) === '2') { t2Mu += mu; t2Count++; }
     }
     return {
       t1: { count: t1Count, avgMu: t1Count ? t1Mu / t1Count : 25.0, sumMu: t1Mu },
@@ -76,409 +86,801 @@ class MockSASwapExecutor {
   constructor(server) { 
     this.server = server; 
     this.moveCount = 0;
+    this.recentMoves = new Map();
   }
-  isRecentSmartAssignMove(steamID, newTeamID) { return true; }
-  queueMove(steamID, targetTeam) {
-    this.moveCount++;
+  isRecentSmartAssignMove(steamID, newTeamID) { 
+    return this.recentMoves.get(steamID) === Number(newTeamID);
+  }
+  async queueMove(steamID, targetTeam) {
     const p = this.server.players.find(p => p.steamID === steamID);
-    if (p) p.teamID = targetTeam;
+    if (!p) return;
+
+    const t1Count = this.server.players.filter(x => String(x.teamID) === '1').length;
+    const t2Count = this.server.players.filter(x => String(x.teamID) === '2').length;
+    
+    // Simulate RCON rejection if target team is physically full
+    if (Number(targetTeam) === 1 && t1Count >= MAX_TEAM_SIZE) {
+      await this.server.emit('SMART_ASSIGN_MOVE_FAILED', { steamID, reason: 'Team Full' });
+      return;
+    }
+    if (Number(targetTeam) === 2 && t2Count >= MAX_TEAM_SIZE) {
+      await this.server.emit('SMART_ASSIGN_MOVE_FAILED', { steamID, reason: 'Team Full' });
+      return;
+    }
+
+    if (p.teamID !== Number(targetTeam) && p.teamID !== 3) this.moveCount++;
+    p.teamID = Number(targetTeam);
+    this.recentMoves.set(steamID, Number(targetTeam));
+    // Emit immediately for simulation speed; the plugin logic is awaited in emit()
+    await this.server.emit('SMART_ASSIGN_MOVE_SUCCESS', { steamID, teamID: Number(targetTeam) });
   }
-  cleanup() {}
+  cleanup() {
+    this.recentMoves.clear();
+  }
 }
 
-// --- Specialized Assigner for Baseline Comparison ---
-class BaselineAssign extends SmartAssign {
-  evaluateTeamAssignment(player, reconnectTeam = null) {
-    let t1Count = 0, t2Count = 0;
-    for (const p of this.server.players) {
-      if (p.steamID === player.steamID) continue;
-      if (String(p.teamID) === '1') t1Count++;
-      else if (String(p.teamID) === '2') t2Count++;
-    }
-    return { targetTeam: t1Count <= t2Count ? 1 : 2, reason: 'Naive Population Balance' };
+// MockRandomAssign is intentionally passive because standard Squad servers natively
+// place joining players on the team with the lowest population. We want the test
+// runner's "Baseline" to represent this exact vanilla behavior without any extra
+// plugin intervention. 
+class MockRandomAssign {
+  constructor(server) {
+    this.server = server;
+    this.executor = { moveCount: 0, queueMove: async () => {} };
   }
+  async mount() {}
+  unmount() {}
 }
 
-// --- Legacy Assigner (v0.1.0 logic) ---
-class LegacyAssign extends SmartAssign {
-  evaluateTeamAssignment(player, reconnectTeam = null) {
-    const eloTracker = this.server.plugins.find((p) => p.constructor.name === 'EloTracker');
-    let t1Count = 0, t2Count = 0, t1Mu = 0, t2Mu = 0;
-    for (const p of this.server.players) {
-      if (p.steamID === player.steamID) continue;
-      if (String(p.teamID) === '1') { t1Count++; t1Mu += eloTracker.eloMap.get(p.steamID) || 25.0; }
-      else if (String(p.teamID) === '2') { t2Count++; t2Mu += eloTracker.eloMap.get(p.steamID) || 25.0; }
+// --- Data Utilities ---
+
+function inferPlayerEvents(match, seededRandom, targetInitialPop) {
+  const events = [];
+  const duration = match.roundDuration || 3600000;
+  
+  let initialPopCount = 0;
+
+  // Sort players to put the most active ones in the initial population
+  const sortedPlayers = [...match.players].sort((a, b) => b.participationRatio - a.participationRatio);
+
+  for (const p of sortedPlayers) {
+    const playTime = duration * p.participationRatio;
+    
+    let startAtZero = false;
+    if (initialPopCount < targetInitialPop) {
+      startAtZero = true;
+    } else if (p.participationRatio > 0.95 && targetInitialPop > 0) {
+      startAtZero = true;
     }
-    const playerMu = eloTracker.eloMap.get(player.steamID) || 25.0;
-    const avg1 = t1Count > 0 ? t1Mu / t1Count : 25.0;
-    const avg2 = t2Count > 0 ? t2Mu / t2Count : 25.0;
-    const score1 = Math.abs(((t1Mu + playerMu) / (t1Count + 1)) - avg2);
-    const score2 = Math.abs(avg1 - ((t2Mu + playerMu) / (t2Count + 1)));
-    return { targetTeam: score1 <= score2 ? 1 : 2, reason: 'Legacy Skill Balance' };
+
+    if (startAtZero) {
+      events.push({ type: 'JOIN', time: 0, player: p });
+      initialPopCount++;
+      
+      if (p.participationRatio <= 0.95) {
+        if (seededRandom.next() < 0.15 && playTime > 300000) { // Bumped crash rate slightly for more reconnects
+          const crashTime = playTime / 2;
+          events.push({ type: 'LEAVE', time: crashTime, player: p });
+          events.push({ type: 'JOIN', time: crashTime + 180000, player: p });
+          events.push({ type: 'LEAVE', time: playTime + 180000, player: p });
+        } else {
+          events.push({ type: 'LEAVE', time: playTime, player: p });
+        }
+      }
+    } else {
+      // Late joiners
+      // We want to simulate a highly populated server, so we queue them aggressively
+      // They will hit the 100-player queue limit natively handled in the simulation
+      const startTime = Math.floor(seededRandom.next() * (duration / 4));
+      events.push({ type: 'JOIN', time: startTime, player: p });
+      
+      if (seededRandom.next() < 0.15 && playTime > 300000) {
+        const crashTime = startTime + (playTime / 2);
+        events.push({ type: 'LEAVE', time: crashTime, player: p });
+        events.push({ type: 'JOIN', time: crashTime + 180000, player: p });
+      }
+    }
   }
+
+  return events.sort((a, b) => a.time - b.time || (a.type === 'LEAVE' ? -1 : 1));
+}
+
+function analyzeChurnStatistics(matches) {
+  let totalPlayers = 0;
+  let totalDuration = 0;
+  const ratios = [];
+
+  for (const m of matches) {
+    totalPlayers += m.players.length;
+    totalDuration += m.roundDuration || 0;
+    for (const p of m.players) ratios.push(p.participationRatio);
+  }
+
+  return {
+    avgPlayersPerMatch: totalPlayers / matches.length,
+    avgDuration: totalDuration / matches.length,
+    ratios: ratios.sort((a, b) => a - b)
+  };
+}
+
+function generateFakeMatch(stats, seededRandom, allBackupMus) {
+  const playerCount = Math.floor(stats.avgPlayersPerMatch * (0.8 + seededRandom.next() * 0.4));
+  const duration = stats.avgDuration * (0.9 + seededRandom.next() * 0.2);
+  const players = [];
+
+  for (let i = 0; i < playerCount; i++) {
+    // Pick a participation ratio from the real distribution
+    const ratio = stats.ratios[Math.floor(seededRandom.next() * stats.ratios.length)];
+    let mu = 25;
+    if (allBackupMus && allBackupMus.length > 0) {
+      mu = allBackupMus[Math.floor(seededRandom.next() * allBackupMus.length)];
+    } else {
+      mu = 20 + seededRandom.next() * 10;
+    }
+    players.push({
+      eosID: `FAKE_${i}`,
+      name: `FakePlayer_${i}`,
+      participationRatio: ratio,
+      muBefore: mu
+    });
+  }
+
+  return {
+    layerName: 'Generated Layer',
+    gameMode: 'Generated Mode',
+    roundDuration: duration,
+    players
+  };
+}
+
+function generateProlongedMatch(seededRandom, allBackupMus, durationHours = 10) {
+  return {
+    isProlonged: true,
+    layerName: `Constant Peak (${durationHours} hours)`,
+    gameMode: 'Prolonged Mode',
+    roundDuration: durationHours * 3600000,
+    players: [], // Generated dynamically
+    allBackupMus
+  };
+}
+
+function generateProlongedTimeline(match, seededRandom) {
+  const events = [];
+  const duration = match.roundDuration;
+  
+  let nextPlayerId = 0;
+  const getNextPlayer = () => {
+    const id = nextPlayerId++;
+    let mu = 25;
+    if (match.allBackupMus && match.allBackupMus.length > 0) {
+      mu = match.allBackupMus[Math.floor(seededRandom.next() * match.allBackupMus.length)];
+    } else {
+      mu = 20 + seededRandom.next() * 10;
+    }
+    return { eosID: `PROLONGED_${id}`, name: `PeakPlayer_${id}`, muBefore: mu };
+  };
+
+  // Start with 100 players at time 0
+  const activePlayers = new Set();
+  for (let i = 0; i < 100; i++) {
+    const p = getNextPlayer();
+    events.push({ type: 'JOIN', time: 0, player: p });
+    activePlayers.add(p);
+  }
+
+  let currentPop = 100;
+  for (let time = 60000; time < duration; time += 60000) {
+    // 10% chance per minute for someone to leave normally
+    if (seededRandom.next() < 0.1 && activePlayers.size > 0) {
+      const p = Array.from(activePlayers)[Math.floor(seededRandom.next() * activePlayers.size)];
+      activePlayers.delete(p);
+      events.push({ type: 'LEAVE', time, player: p });
+      currentPop--;
+    }
+    
+    // 5% chance per minute for someone to crash and rejoin 3 mins later
+    if (seededRandom.next() < 0.05 && activePlayers.size > 0) {
+      const p = Array.from(activePlayers)[Math.floor(seededRandom.next() * activePlayers.size)];
+      activePlayers.delete(p);
+      events.push({ type: 'LEAVE', time, player: p });
+      currentPop--;
+      
+      // They try to rejoin 3 mins later
+      events.push({ type: 'JOIN', time: time + 180000, player: p });
+      // Schedule their final departure 2 hours later so they don't pile up
+      events.push({ type: 'LEAVE', time: time + 180000 + 7200000, player: p });
+    }
+    
+    // Agreesively refill the server back to 100 to simulate a full queue
+    while (currentPop < 100) {
+      const newP = getNextPlayer();
+      // Join instantly (1-5 seconds after someone leaves) to steal the slot
+      events.push({ type: 'JOIN', time: time + 1000 + Math.floor(seededRandom.next() * 4000), player: newP });
+      activePlayers.add(newP);
+      currentPop++;
+    }
+  }
+
+  return events.sort((a, b) => a.time - b.time || (a.type === 'LEAVE' ? -1 : 1));
 }
 
 // --- Simulation Logic ---
-async function simulateScenario(server, mockEloTracker, match, eosToSteam, seededRandom, plugin, scenarioType = 'IGNORED_MODE', detailedLogging = false) {
-  server.matchStartTime = new Date();
+
+async function simulateHistoricalMatch(match, eloMap, engineConfig, seededRandom, logStream = null, targetInitialPop = 80) {
+  const server = new MockServer();
+  const mockEloTracker = new EloTracker(server, eloMap);
+  server.plugins.push(mockEloTracker);
+  server.currentLayer = { name: match.layerName, gamemode: match.gameMode };
+
+  const plugin = new engineConfig.Class(server, engineConfig.options);
+  plugin.db = new MockSADatabase();
+  plugin.executor = new MockSASwapExecutor(server);
   
-  if (scenarioType === 'IGNORED_MODE') {
-    server.currentLayer = { name: 'AlBasrah_Seed_v1', gamemode: 'Seed' };
-  } else {
-    server.currentLayer = { name: 'Mutaha_AAS_v1', gamemode: 'AAS' };
+  if (engineConfig.name.includes('SMART ASSIGN')) {
+    plugin.logEvent = (type, player, data) => {
+      if (type === 'ASSIGNMENT') {
+        server.eventLog.push(`[ALGO] ${player.name} -> T${data.targetTeam} (Executed: ${data.executed}): ${data.reason}`);
+      }
+    };
   }
-  
-  await server.emit('NEW_GAME');
-  server.players = [];
+
+  await plugin.mount();
   server.eventLog = [];
-  await plugin.db.clearReconnectMemory();
 
-  const shuffledPlayers = [...match.players].sort(() => seededRandom.next() - 0.5);
-  const pendingJoins = [];
-  
-  for (const originalPlayer of shuffledPlayers) {
-    const steamID = eosToSteam.get(originalPlayer.eosID) || originalPlayer.eosID;
-    pendingJoins.push({
-      steamID: steamID,
-      name: originalPlayer.name,
-      teamID: 3,
-      squadID: null,
-      mu: originalPlayer.muBefore || 25
-    });
-    if (originalPlayer.muBefore) mockEloTracker.eloMap.set(steamID, originalPlayer.muBefore);
-  }
-
-  const disconnectedPlayers = [];
-  let rejoinAttempts = 0;
-  let rejoinSuccesses = 0;
+  const timeline = match.isProlonged 
+    ? generateProlongedTimeline(match, seededRandom) 
+    : inferPlayerEvents(match, seededRandom, targetInitialPop);
   const eloHistory = [];
-  const moveLog = [];
+  let totalUnbalancedTime = 0;
+  let lastTimestamp = 0;
+  let rejoinOpportunities = 0;
+  let rejoinSuccesses = 0;
 
-  const recordElo = (moveInfo = null) => {
-    const data = mockEloTracker.buildRoundStartData();
-    const eloGap = Math.abs(data.t1.avgMu - data.t2.avgMu);
-    const sumGap = Math.abs(data.t1.sumMu - data.t2.sumMu);
-    const pop = data.t1.count + data.t2.count;
-    eloHistory.push({ eloGap, sumGap, pop });
-    if (detailedLogging && moveInfo) {
-      moveLog.push({
-        step: moveLog.length,
-        action: moveInfo.action,
-        player: moveInfo.player,
-        team: moveInfo.team,
-        eloGap: eloGap.toFixed(3),
-        sumGap: sumGap.toFixed(1),
-        t1Count: data.t1.count,
-        t2Count: data.t2.count
-      });
-    }
-  };
+  if (logStream && engineConfig.name.includes('SMART ASSIGN')) {
+    logStream.write(`================================================================================\n`);
+    const countStr = match.isProlonged ? 'Dynamic (Peak Capacity)' : match.players.length;
+    logStream.write(`MATCH START: ${match.layerName} | Players: ${countStr}\n`);
+    logStream.write(`================================================================================\n\n`);
+  }
+  
+  while (timeline.length > 0) {
+    const event = timeline.shift();
+    
+    // Ignore events that happen after the match ends
+    if (event.time > (match.roundDuration || 3600000)) continue;
 
-  if (scenarioType === 'IGNORED_MODE') {
-    const initialSeed = pendingJoins.splice(0, 80);
-    // In Ignored mode, SmartAssign shouldn't touch players, so they stay where they are initially placed
-    // We will simulate native Squad behavior where people just pick teams.
-    let t1Count = 0, t2Count = 0;
-    for (const newPlayer of initialSeed) {
-      // Simulate native game assignment: people tend to self-balance but roughly.
-      if (t1Count <= t2Count) { newPlayer.teamID = 1; t1Count++; }
-      else { newPlayer.teamID = 2; t2Count++; }
-      
-      server.players.push(newPlayer);
-      await server.emit('PLAYER_CONNECTED', { player: newPlayer });
-      recordElo({ action: 'JOIN_IGNORED', player: newPlayer.name, team: newPlayer.teamID });
-    }
-  } else if (scenarioType === 'STABLE_HIGH_POP') {
-    const initialFill = pendingJoins.splice(0, 98);
-    for (const newPlayer of initialFill) {
-      server.players.push(newPlayer);
-      await server.emit('PLAYER_CONNECTED', { player: newPlayer });
-      recordElo({ action: 'FILL', player: newPlayer.name, team: newPlayer.teamID });
+    const timeStep = event.time - lastTimestamp;
+    const currentData = mockEloTracker.buildRoundStartData();
+    if (Math.abs(currentData.t1.count - currentData.t2.count) > 1) {
+      totalUnbalancedTime += timeStep;
     }
 
-    // High Population Stable State (500 iterations)
-    // No mass-exit, just regular churn.
-    for (let step = 0; step < 500; step++) {
-      const currentPop = server.players.length;
-      const r = seededRandom.next();
-      let action;
+    server.virtualTime = event.time;
+    lastTimestamp = event.time;
+    const p = event.player;
+    const steamID = p.eosID; // Use EOS as Steam for simplicity in test
 
-      if (currentPop >= 100) action = 'LEAVE';
-      else if (currentPop < 94) action = 'JOIN';
-      else {
-        if (r < 0.45) action = 'LEAVE';
-        else if (r < 0.54 && disconnectedPlayers.length > 0) action = 'REJOIN'; // ~1/5 of remaining
-        else if (pendingJoins.length > 0) action = 'JOIN';
-        else action = 'LEAVE';
-      }
-
-      if (action === 'LEAVE') {
-        const leaveIdx = Math.floor(seededRandom.next() * server.players.length);
-        const leaver = server.players.splice(leaveIdx, 1)[0];
-        disconnectedPlayers.push(leaver);
-        await server.emit('UPDATED_PLAYER_INFORMATION', {});
-        await plugin.db.savePlayerDisconnect(leaver.steamID, leaver.teamID);
-        recordElo({ action: 'LEAVE', player: leaver.name, team: leaver.teamID });
-      } 
-      else if (action === 'REJOIN') {
-        const rejoinIdx = Math.floor(seededRandom.next() * disconnectedPlayers.length);
-        const rejoinder = disconnectedPlayers.splice(rejoinIdx, 1)[0];
-        const prevTeam = rejoinder.teamID;
-        rejoinder.teamID = 3;
-        server.players.push(rejoinder);
-        await server.emit('PLAYER_CONNECTED', { player: rejoinder });
-        rejoinAttempts++;
-        if (String(rejoinder.teamID) === String(prevTeam)) rejoinSuccesses++;
-        recordElo({ action: 'REJOIN', player: rejoinder.name, team: rejoinder.teamID });
-      } 
-      else if (action === 'JOIN' && pendingJoins.length > 0) {
-        const newPlayer = pendingJoins.shift();
-        server.players.push(newPlayer);
-        await server.emit('PLAYER_CONNECTED', { player: newPlayer });
-        recordElo({ action: 'JOIN', player: newPlayer.name, team: newPlayer.teamID });
-      }
-    }
-  } else if (scenarioType === 'REALWORLD_CHURN') {
-    const initialFill = pendingJoins.splice(0, 98);
-    for (const newPlayer of initialFill) {
-      server.players.push(newPlayer);
-      await server.emit('PLAYER_CONNECTED', { player: newPlayer });
-      recordElo({ action: 'FILL', player: newPlayer.name, team: newPlayer.teamID });
-    }
-
-    // High Population Prolonged Churn (1,000 iterations)
-    for (let step = 0; step < 1000; step++) {
-      const currentPop = server.players.length;
-      const r = seededRandom.next();
-      let action;
-
-      // Periodic Match Transition: 25+ people leave at step 500
-      if (step === 500) {
-        const leaveCount = 25 + Math.floor(seededRandom.next() * 10);
-        for (let i = 0; i < leaveCount; i++) {
-          if (server.players.length === 0) break;
-          const leaveIdx = Math.floor(seededRandom.next() * server.players.length);
-          const leaver = server.players.splice(leaveIdx, 1)[0];
-          disconnectedPlayers.push(leaver);
-          await server.emit('UPDATED_PLAYER_INFORMATION', {});
-          await plugin.db.savePlayerDisconnect(leaver.steamID, leaver.teamID);
-          recordElo({ action: 'MASS_LEAVE', player: leaver.name, team: leaver.teamID });
-        }
+    if (event.type === 'JOIN') {
+      // 100 Player Server Cap Enforced
+      if (server.players.length >= 100) {
+        // Player sits in queue. Try again in 30 seconds of virtual time.
+        event.time += 30000;
+        timeline.push(event);
+        timeline.sort((a, b) => a.time - b.time || (a.type === 'LEAVE' ? -1 : 1));
         continue;
       }
 
-      if (currentPop >= 100) action = 'LEAVE';
-      else if (currentPop < 85) action = 'JOIN';
-      else {
-        if (r < 0.4) action = 'LEAVE';
-        else if (r < 0.5 && disconnectedPlayers.length > 0) action = 'REJOIN'; // 1/5 of join probability
-        else if (pendingJoins.length > 0) action = 'JOIN';
-        else action = 'LEAVE';
+      const reconnectTeam = await plugin.db.getReconnectTeam(steamID);
+      
+      // Expected Behavior: We calculate the "Natural Team" exactly as standard Squad does:
+      // simply assigning to the team with the lowest population.
+      // We intentionally do NOT force the player onto their `reconnectTeam` natively. 
+      // This forces SmartAssign to actively execute an RCON move if its Elo or Rejoin 
+      // logic demands a different team, accurately increasing the `forcedMoves` metric 
+      // and proving its ability to fix native assignments.
+      let naturalTeam = 3;
+      const t1Count = server.players.filter(x => String(x.teamID) === '1').length;
+      const t2Count = server.players.filter(x => String(x.teamID) === '2').length;
+      
+      if (t1Count < MAX_TEAM_SIZE || t2Count < MAX_TEAM_SIZE) {
+        naturalTeam = t1Count <= t2Count ? 1 : 2;
       }
 
-      if (action === 'LEAVE') {
-        const leaveIdx = Math.floor(seededRandom.next() * server.players.length);
-        const leaver = server.players.splice(leaveIdx, 1)[0];
-        disconnectedPlayers.push(leaver);
+      const playerObj = {
+        steamID,
+        name: p.name,
+        teamID: naturalTeam,
+        squadID: null
+      };
+      
+      if (reconnectTeam) rejoinOpportunities++;
+
+      eloMap.set(steamID, Number(p.muBefore) || 25);
+      server.players.push(playerObj);
+
+      const preTickData = mockEloTracker.buildRoundStartData();
+      const preTickMoves = plugin.executor.moveCount || 0;
+      const initialEventLogCount = server.eventLog.length;
+
+      // Wait for move to settle
+      await server.emit('PLAYER_CONNECTED', { player: playerObj });
+      
+      // Manually trigger the UPDATED_PLAYER_INFORMATION which is what SmartAssign 
+      // uses to track current team state in modern SquadJS
+      await server.emit('UPDATED_PLAYER_INFORMATION', {});
+
+      if (reconnectTeam && playerObj.teamID === reconnectTeam) {
+        rejoinSuccesses++;
+      }
+
+      if (logStream && engineConfig.name.includes('SMART ASSIGN')) {
+        const postTickMoves = plugin.executor.moveCount;
+        const postData = mockEloTracker.buildRoundStartData();
+        const postGap = Math.abs(postData.t1.avgMu - postData.t2.avgMu);
+        const preGap = Math.abs(preTickData.t1.avgMu - preTickData.t2.avgMu);
+
+        let algoReason = "None (No Plugin Intervention)";
+        if (server.eventLog.length > initialEventLogCount) {
+          algoReason = server.eventLog[server.eventLog.length - 1];
+        }
+
+        const missedReconnect = reconnectTeam && playerObj.teamID !== reconnectTeam;
+        const moveExecuted = postTickMoves > preTickMoves;
+
+        if (moveExecuted || missedReconnect) {
+          logStream.write(`  [Time: ${server.virtualTime}ms] Event: ${p.name} (Elo: ${Number(p.muBefore || 25).toFixed(1)})\n`);
+          if (missedReconnect) {
+            logStream.write(`      *** MISSED RECONNECT *** (Expected: T${reconnectTeam}, Actual: T${playerObj.teamID})\n`);
+          }
+          if (moveExecuted) {
+            logStream.write(`      *** MOVE EXECUTED ***\n`);
+          }
+          logStream.write(`      Native Spawn: Team ${naturalTeam} | Reconnect Memory: ${reconnectTeam ? 'Team '+reconnectTeam : 'None'}\n`);
+          logStream.write(`      Logic: ${algoReason}\n`);
+          logStream.write(`      State: T1 Pop: ${postData.t1.count} | T2 Pop: ${postData.t2.count} | Avg Gap: ${postGap.toFixed(3)}\n\n`);
+        }
+      }
+    } else if (event.type === 'LEAVE') {
+      const idx = server.players.findIndex(x => x.steamID === steamID);
+      if (idx !== -1) {
+        const leaver = server.players.splice(idx, 1)[0];
+        await plugin.db.savePlayerDisconnect(steamID, leaver.teamID);
         await server.emit('UPDATED_PLAYER_INFORMATION', {});
-        await plugin.db.savePlayerDisconnect(leaver.steamID, leaver.teamID);
-        recordElo({ action: 'LEAVE', player: leaver.name, team: leaver.teamID });
-      } 
-      else if (action === 'REJOIN') {
-        const rejoinIdx = Math.floor(seededRandom.next() * disconnectedPlayers.length);
-        const rejoinder = disconnectedPlayers.splice(rejoinIdx, 1)[0];
-        const prevTeam = rejoinder.teamID;
-        rejoinder.teamID = 3;
-        server.players.push(rejoinder);
-        await server.emit('PLAYER_CONNECTED', { player: rejoinder });
-        rejoinAttempts++;
-        if (String(rejoinder.teamID) === String(prevTeam)) rejoinSuccesses++;
-        recordElo({ action: 'REJOIN', player: rejoinder.name, team: rejoinder.teamID });
-      } 
-      else if (action === 'JOIN' && pendingJoins.length > 0) {
-        const newPlayer = pendingJoins.shift();
-        server.players.push(newPlayer);
-        await server.emit('PLAYER_CONNECTED', { player: newPlayer });
-        recordElo({ action: 'JOIN', player: newPlayer.name, team: newPlayer.teamID });
       }
     }
+
+    // Record ELO gap after each event
+    const data = mockEloTracker.buildRoundStartData();
+    eloHistory.push({
+      time: server.virtualTime,
+      eloGap: Math.abs(data.t1.avgMu - data.t2.avgMu),
+      sumMuGap: Math.abs(data.t1.sumMu - data.t2.sumMu),
+      pop: data.t1.count + data.t2.count,
+      t1Count: data.t1.count,
+      t2Count: data.t2.count
+    });
   }
 
-  // Final Stabilization
-  // Removed to avoid infinite loops if constraints naturally leave teams permanently unbalanced
-  // by 2 or more players (e.g. from an odd number of rejoiners forcing a slight imbalance).
+  // Add final duration chunk
+  const finalDuration = (match.roundDuration || 3600000) - lastTimestamp;
+  const finalData = mockEloTracker.buildRoundStartData();
+  if (Math.abs(finalData.t1.count - finalData.t2.count) > 1) {
+    totalUnbalancedTime += Math.max(0, finalDuration);
+  }
 
-  const { t1, t2 } = mockEloTracker.buildRoundStartData();
+  // Calculate average gap only when both teams have players to avoid 0-population noise
+  const activeHistory = eloHistory.filter(h => h.t1Count > 0 && h.t2Count > 0);
+  const avgGap = activeHistory.length > 0 
+    ? activeHistory.reduce((acc, h) => acc + h.eloGap, 0) / activeHistory.length 
+    : 0;
   
-  const fullPopStates = eloHistory.filter(h => h.pop >= 96);
-  const fullPopEloDiff = fullPopStates.length > 0 
-    ? fullPopStates.reduce((s, h) => s + h.eloGap, 0) / fullPopStates.length 
-    : Math.abs(t1.avgMu - t2.avgMu);
-  const fullPopSumDiff = fullPopStates.length > 0 
-    ? fullPopStates.reduce((s, h) => s + h.sumGap, 0) / fullPopStates.length 
-    : Math.abs(t1.sumMu - t2.sumMu);
+  const avgSumGap = activeHistory.length > 0
+    ? activeHistory.reduce((acc, h) => acc + h.sumMuGap, 0) / activeHistory.length
+    : 0;
 
-  return { 
-    popDiff: Math.abs(server.players.filter(p => p.teamID === 1).length - server.players.filter(p => p.teamID === 2).length), 
-    eloDiff: Math.abs(t1.avgMu - t2.avgMu), 
-    sumDiff: Math.abs(t1.sumMu - t2.sumMu),
-    fullPopEloDiff,
-    fullPopSumDiff,
-    rejoinRate: rejoinAttempts > 0 ? rejoinSuccesses / rejoinAttempts : 1,
-    forcedMoves: plugin.executor.moveCount || 0,
+  if (logStream && engineConfig.name.includes('SMART ASSIGN')) {
+    logStream.write(`================================================================================\n`);
+    logStream.write(`MATCH END: ${match.layerName}\n`);
+    logStream.write(`Final Avg Gap: ${avgGap.toFixed(3)} | Total Moves: ${plugin.executor.moveCount}\n`);
+    logStream.write(`================================================================================\n\n\n`);
+  }
+
+  return {
+    name: engineConfig.name,
     eloHistory,
-    moveLog,
-    t1End: server.players.filter(p => p.teamID === 1).length,
-    t2End: server.players.filter(p => p.teamID === 2).length,
-    t1Elo: t1.avgMu,
-    t2Elo: t2.avgMu,
-    t1Sum: t1.sumMu,
-    t2Sum: t2.sumMu,
-    eventLog: server.eventLog,
-    runId: match.layerName || 'Unknown'
+    finalGap: eloHistory.length > 0 ? eloHistory[eloHistory.length - 1].eloGap : 0,
+    avgGap,
+    avgSumGap,
+    forcedMoves: plugin.executor.moveCount,
+    unbalancedPercent: (totalUnbalancedTime / (match.roundDuration || 3600000)) * 100,
+    rejoinRate: rejoinOpportunities > 0 ? (rejoinSuccesses / rejoinOpportunities) * 100 : null,
+    rejoinOpp: rejoinOpportunities,
+    rejoinSucc: rejoinSuccesses
   };
 }
 
-// --- Main Runner ---
-async function runUnifiedTests() {
-  console.log('🚀 Starting Expanded Unified SmartAssign Test Suite (Deep-Dive Edition)...\n');
+// --- REPL ---
 
-  const rebuiltPath = path.join(__dirname, 'tools', 'rebuilt.json');
-  const matchesPath = path.join(__dirname, 'tools', 'mergedFinal.jsonl');
+function formatPlayerList(players, eloMap) {
+  if (players.length === 0) return 'Empty';
+  const items = players.map(p => {
+    const elo = eloMap.get(p.steamID) || 25;
+    return `${p.name}(${elo.toFixed(1)})`;
+  });
   
-  const rebuiltData = JSON.parse(fs.readFileSync(rebuiltPath, 'utf8'));
-  const eloMap = new Map();
-  const eosToSteam = new Map();
-  for (const p of rebuiltData.players) {
-    if (p.steamID) {
-      eloMap.set(p.steamID, p.mu);
-      eosToSteam.set(p.eosID, p.steamID);
+  const lines = [];
+  for (let i = 0; i < items.length; i += 4) {
+    lines.push(items.slice(i, i + 4).join(', '));
+  }
+  return lines.map((line, idx) => (idx === 0 ? '' : '               ') + line).join('\n');
+}
+
+async function startREPL(eloMap, initialMatch = null) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: 'sjs-test > '
+  });
+
+  console.log('\n--- SmartAssign Interactive REPL (Strict 50v50) ---');
+  console.log('Commands: join <name> <elo>, leave <name>, time <ms>, status, help, exit\n');
+
+  const server = new MockServer();
+  const mockEloTracker = new EloTracker(server, eloMap);
+  server.plugins.push(mockEloTracker);
+  const plugin = new SmartAssign(server, { enableSmartAssign: true });
+  plugin.db = new MockSADatabase();
+  plugin.executor = new MockSASwapExecutor(server);
+
+  server.on('SMART_ASSIGN_MOVE_SUCCESS', (data) => {
+    const p = server.getPlayerBySteamID(data.steamID);
+    console.log(`[ALGO] Moving ${p?.name || data.steamID} to Team ${data.teamID}...`);
+  });
+
+  await plugin.mount();
+
+  if (initialMatch) {
+    console.log(`[REPL] Initializing state from: ${initialMatch.layerName} (${initialMatch.players.length} players)`);
+    for (const p of initialMatch.players) {
+      const steamID = p.eosID;
+      const elo = Number(p.muBefore) || 25.0;
+      eloMap.set(steamID, elo);
+
+      const t1Count = server.players.filter(x => String(x.teamID) === '1').length;
+      const t2Count = server.players.filter(x => String(x.teamID) === '2').length;
+      
+      let naturalTeam = 3;
+      if (t1Count < MAX_TEAM_SIZE || t2Count < MAX_TEAM_SIZE) {
+        naturalTeam = t1Count <= t2Count ? 1 : 2;
+      }
+
+      const playerObj = { steamID, name: p.name, teamID: naturalTeam, squadID: null };
+      server.players.push(playerObj);
+      await server.emit('PLAYER_CONNECTED', { player: playerObj });
     }
+    await server.emit('UPDATED_PLAYER_INFORMATION', {});
+    console.log(`[REPL] Population initialized. SmartAssign has processed initial placements.\n`);
+  }
+
+  rl.prompt();
+
+  rl.on('line', async (line) => {
+    const parts = line.trim().split(' ');
+    const cmd = parts[0].toLowerCase();
+
+    switch (cmd) {
+      case 'exit':
+        rl.close();
+        break;
+      case 'help':
+        console.log('Commands: join <name> <elo>, leave <name>, time <ms>, status, help, exit');
+        break;
+      case 'join': {
+        const name = parts[1] || 'Player_' + Math.floor(Math.random() * 1000);
+        const elo = parseFloat(parts[2]) || 25.0;
+        const steamID = 'STEAM_' + name;
+
+        if (server.players.find(p => p.steamID === steamID)) {
+          console.log(`[REPL] Player "${name}" is already in the server.`);
+          break;
+        }
+
+        // Determine Natural Team (Baseline behavior)
+        const t1Count = server.players.filter(x => String(x.teamID) === '1').length;
+        const t2Count = server.players.filter(x => String(x.teamID) === '2').length;
+        
+        let naturalTeam = 3;
+        if (t1Count < MAX_TEAM_SIZE || t2Count < MAX_TEAM_SIZE) {
+          naturalTeam = t1Count <= t2Count ? 1 : 2;
+        }
+
+        eloMap.set(steamID, elo);
+        const p = { steamID, name, teamID: naturalTeam, squadID: null };
+        server.players.push(p);
+
+        console.log(`[REPL] ${name} connecting with ${elo} ELO (Natural Team: ${naturalTeam})...`);
+        await server.emit('PLAYER_CONNECTED', { player: p });
+        await server.emit('UPDATED_PLAYER_INFORMATION', {});
+        break;
+      }
+      case 'leave': {
+        const name = parts[1];
+        const idx = server.players.findIndex(x => x.name === name || x.steamID === name);
+        if (idx !== -1) {
+          const p = server.players.splice(idx, 1)[0];
+          await plugin.db.savePlayerDisconnect(p.steamID, p.teamID);
+          console.log(`[REPL] ${p.name} disconnected.`);
+          await server.emit('UPDATED_PLAYER_INFORMATION', {});
+        } else {
+          console.log(`[REPL] Player "${name}" not found.`);
+        }
+        break;
+      }
+      case 'time': {
+        const inc = parseInt(parts[1]) || 1000;
+        server.virtualTime += inc;
+        console.log(`[REPL] Virtual Time advanced by ${inc}ms (Total: ${server.virtualTime}ms)`);
+        break;
+      }
+      case 'status': {
+        const data = mockEloTracker.buildRoundStartData();
+        const t1Players = server.players.filter(p => String(p.teamID) === '1');
+        const t2Players = server.players.filter(p => String(p.teamID) === '2');
+        const unassigned = server.players.filter(p => String(p.teamID) === '3');
+
+        console.log(`\nStatus (Time: ${server.virtualTime}):`);
+        console.log(`Team 1 [${data.t1.count}/${MAX_TEAM_SIZE}]: ${formatPlayerList(t1Players, eloMap)}`);
+        console.log(`       Avg Mu: ${data.t1.avgMu.toFixed(2)} | Sum Mu: ${data.t1.sumMu.toFixed(1)}`);
+        console.log(`Team 2 [${data.t2.count}/${MAX_TEAM_SIZE}]: ${formatPlayerList(t2Players, eloMap)}`);
+        console.log(`       Avg Mu: ${data.t2.avgMu.toFixed(2)} | Sum Mu: ${data.t2.sumMu.toFixed(1)}`);
+        if (unassigned.length) console.log(`Unassigned [${unassigned.length}]: ${formatPlayerList(unassigned, eloMap)}`);
+        console.log(`-------------------------------------------`);
+        console.log(`Avg Gap: ${Math.abs(data.t1.avgMu - data.t2.avgMu).toFixed(2)}`);
+        console.log(`Sum Gap: ${Math.abs(data.t1.sumMu - data.t2.sumMu).toFixed(2)}`);
+        console.log(`Moves Executed: ${plugin.executor.moveCount}\n`);
+        break;
+      }
+      default:
+        console.log(`Unknown command: ${cmd}`);
+    }
+    rl.prompt();
+  }).on('close', () => {
+    console.log('Exiting REPL...');
+    process.exit(0);
+  });
+}
+
+// --- Main Runner ---
+
+async function runTests() {
+  const logPath = path.join(__dirname, 'elo-match-log.jsonl');
+  if (!fs.existsSync(logPath)) {
+    console.error(`Log file not found at ${logPath}`);
+    process.exit(1);
   }
 
   const matches = [];
-  const fileStream = fs.createReadStream(matchesPath);
+  const fileStream = fs.createReadStream(logPath);
   const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
   for await (const line of rl) {
-    if (!line.trim()) continue;
-    const match = JSON.parse(line);
-    if (match.players.length >= 150) matches.push(match);
-    if (matches.length >= 150) break; 
+    if (line.trim()) matches.push(JSON.parse(line));
+  }
+
+  // Load Elo Backup
+  const eloBackupPath = path.join(__dirname, 'tools', 'elo-backup-2026-04-11T07-04-39-967Z.json');
+  const backupData = JSON.parse(fs.readFileSync(eloBackupPath, 'utf8'));
+  const backupEloMap = new Map();
+  const allBackupMus = [];
+  for (const p of backupData.players) {
+    if (p.eosID) backupEloMap.set(p.eosID, p.mu);
+    if (p.steamID) backupEloMap.set(p.steamID, p.mu);
+    allBackupMus.push(p.mu);
+  }
+
+  // Attach backup data to matches for historical run
+  for (const match of matches) {
+    for (const p of match.players) {
+      if (backupEloMap.has(p.eosID)) {
+        p.muBefore = backupEloMap.get(p.eosID);
+      } else if (backupEloMap.has(p.steamID)) {
+        p.muBefore = backupEloMap.get(p.steamID);
+      }
+    }
+  }
+
+  const eloMap = new Map();
+  const seededRandom = new SeededRandom(42);
+  const isExhaustive = process.argv.includes('--exhaustive');
+  let logStream = null;
+  if (isExhaustive) {
+    const outPath = path.join(__dirname, 'exhaustive-log.txt');
+    logStream = fs.createWriteStream(outPath);
+    console.log(`\n[!] Exhaustive mode enabled. Detailed move logs will be written to: ${outPath}\n`);
+  }
+
+  // If "--repl" is passed, start interactive mode
+  const replIdx = process.argv.indexOf('--repl');
+  if (replIdx !== -1) {
+    const matchIdx = parseInt(process.argv[replIdx + 1]);
+    const initialMatch = (!isNaN(matchIdx) && matches[matchIdx]) ? matches[matchIdx] : null;
+    await startREPL(eloMap, initialMatch);
+    return;
   }
 
   const engineConfigs = [
-    { name: 'NAIVE BASELINE', Class: BaselineAssign, options: {} },
-    { name: 'LEGACY (v0.1.0)', Class: LegacyAssign, options: {} },
-    { name: 'SMART ASSIGN (Current)', Class: SmartAssign, options: {} }
+    { name: 'BASELINE (Random)', Class: MockRandomAssign, options: {} },
+    { name: 'SMART ASSIGN (Current)', Class: SmartAssign, options: { enableSmartAssign: true } }
   ];
 
-  const scenarios = ['IGNORED_MODE', 'STABLE_HIGH_POP', 'REALWORLD_CHURN'];
+  const startScenarios = [
+    { label: 'Start: 0 Pop', pop: 0 },
+    { label: 'Start: 80 Pop', pop: 80 },
+    { label: 'Start: 95 Pop', pop: 95 }
+  ];
 
-  for (const scenario of scenarios) {
-    console.log(`\n\n╔═══════════════════════════════════════════════════════════════╗`);
-    console.log(`║ SCENARIO: ${scenario.padEnd(52)}║`);
-    console.log(`╚═══════════════════════════════════════════════════════════════╝`);
+  const globalStats = {};
+  for (const scenario of startScenarios) {
+    globalStats[scenario.label] = {};
+    engineConfigs.forEach(c => globalStats[scenario.label][c.name] = { 
+      avgGap: 0, sumGap: 0, moves: 0, unbalanced: 0, rejoinOpp: 0, rejoinSucc: 0, count: 0 
+    });
+  }
 
-    const allResults = {};
+  function updateStats(scenarioLabel, configName, result) {
+    const s = globalStats[scenarioLabel][configName];
+    s.avgGap += result.avgGap;
+    s.sumGap += result.avgSumGap;
+    s.moves += result.forcedMoves;
+    s.unbalanced += result.unbalancedPercent;
+    s.rejoinOpp += result.rejoinOpp;
+    s.rejoinSucc += result.rejoinSucc;
+    s.count++;
+  }
 
-    for (const engine of engineConfigs) {
-      process.stdout.write(`Testing ${engine.name.padEnd(25)} `);
-      const results = [];
-      
-      for (let i = 0; i < matches.length; i++) {
-        const server = new MockServer();
-        const mockEloTracker = new EloTracker(server, eloMap);
-        server.plugins.push(mockEloTracker);
-        const plugin = new engine.Class(server, engine.options);
-        plugin.db = new MockSADatabase();
-        plugin.executor = new MockSASwapExecutor(server);
-        
-        // Capture logs for improved version only (to save memory)
-        if (engine.name.includes('SMART ASSIGN')) {
-          plugin.logEvent = (type, player, data) => {
-            if (type === 'ASSIGNMENT') server.eventLog.push(`[ALGO] ${player.name} -> T${data.targetTeam}: ${data.reason}`);
-          };
-        }
-
-        await plugin.mount();
-        const seededRandom = new SeededRandom(1337 + i); 
-        // We only enable detailedLogging for the very first match of the Current version to generate the deep-dive
-        const isDeepDiveMatch = i === 0 && engine.name.includes('SMART ASSIGN');
-        results.push(await simulateScenario(server, mockEloTracker, matches[i], eosToSteam, seededRandom, plugin, scenario, isDeepDiveMatch));
-        if ((i+1) % 10 === 0) process.stdout.write('■');
+  function printSummary(label) {
+    console.log(`\n=== AGGREGATE SUMMARY: ${label} ===`);
+    for (const scenario of startScenarios) {
+      console.log(`\n[ ${scenario.label} ]`);
+      console.log(`${"Engine".padEnd(25)} | ${"Avg Gap".padStart(7)} | ${"Sum Gap".padStart(7)} | ${"Unbalanced".padStart(10)} | ${"Rejoin".padStart(6)} | ${"Avg Moves".padStart(9)}`);
+      console.log("-".repeat(81));
+      for (const [name, s] of Object.entries(globalStats[scenario.label])) {
+        if (s.count === 0) continue;
+        const n = s.count;
+        const rRateStr = s.rejoinOpp > 0 ? `${((s.rejoinSucc / s.rejoinOpp) * 100).toFixed(1)}% (${s.rejoinSucc}/${s.rejoinOpp})` : '--';
+        const avgGapStr = (s.avgGap/n).toFixed(3);
+        const sumGapStr = (s.sumGap/n).toFixed(1);
+        const unbalStr = `${(s.unbalanced/n).toFixed(1)}%`;
+        const movesStr = (s.moves/n).toFixed(1);
+        console.log(`${name.padEnd(25)} | ${avgGapStr.padStart(7)} | ${sumGapStr.padStart(7)} | ${unbalStr.padStart(10)} | ${rRateStr.padStart(6)} | ${movesStr.padStart(9)}`);
       }
-      allResults[engine.name] = results;
-      console.log(' DONE');
-    }
-
-    // --- Metrics Comparison ---
-    console.log(`\n--- Comparison Summary (${scenario}) ---`);
-    console.log(`Name                      | Full-Pop Elo | Full-Pop Sum | Pop Parity | Rejoin Rate | Forced Moves`);
-    console.log(`--------------------------|--------------|--------------|------------|-------------|-------------`);
-    
-    for (const name of Object.keys(allResults)) {
-      const res = allResults[name];
-      const avgElo = (res.reduce((s, r) => s + r.fullPopEloDiff, 0) / res.length).toFixed(3);
-      const avgSum = (res.reduce((s, r) => s + r.fullPopSumDiff, 0) / res.length).toFixed(1);
-      const popP = (res.filter(r => r.popDiff <= 1).length / res.length * 100).toFixed(1);
-      const rejoin = (res.reduce((s, r) => s + r.rejoinRate, 0) / res.length * 100).toFixed(2);
-      const forcedMoves = (res.reduce((s, r) => s + r.forcedMoves, 0) / res.length).toFixed(1);
-      
-      console.log(`${name.padEnd(26)}| ${avgElo.padEnd(13)}| ${avgSum.padEnd(13)}| ${popP.padEnd(11)}%| ${rejoin.padEnd(11)}%| ${forcedMoves}`);
-    }
-
-    // --- Drift Analysis ---
-    console.log(`\n--- Average Elo Drift Over Time (${scenario}) ---`);
-    const driftLength = allResults['SMART ASSIGN (Current)'][0].eloHistory.length;
-    const avgDriftElo = [];
-    const avgDriftSum = [];
-    
-    // We sample up to 15 points across the timeline for readability
-    const samplingPoints = 15;
-    for (let i = 0; i < samplingPoints; i++) {
-      const t = Math.min(driftLength - 1, Math.floor(i * (driftLength / (samplingPoints - 1))));
-      const validRuns = allResults['SMART ASSIGN (Current)'].filter(r => r.eloHistory[t]);
-      if (validRuns.length === 0) continue;
-      
-      const avgEloAtT = validRuns.reduce((s, r) => s + r.eloHistory[t].eloGap, 0) / validRuns.length;
-      const avgSumAtT = validRuns.reduce((s, r) => s + r.sumGapAtT || r.eloHistory[t].sumGap, 0) / validRuns.length;
-      avgDriftElo.push(avgEloAtT.toFixed(3));
-      avgDriftSum.push(avgSumAtT.toFixed(1));
-    }
-    console.log(`Avg Elo Gap Drift: [${avgDriftElo.join(' -> ')}]`);
-    console.log(`Avg Sum Gap Drift: [${avgDriftSum.join(' -> ')}]`);
-
-    // --- Deep-Dive Move-by-Move Report (First Match) ---
-    if (scenario === 'REALWORLD_CHURN') {
-      const deepDiveMatch = allResults['SMART ASSIGN (Current)'][0];
-      console.log(`\n📊 DEEP-DIVE: Move-by-Move Delta Log (Match: ${deepDiveMatch.runId})`);
-      console.log(`Step | Action       | Team | Elo Gap | Sum Gap | Pop (T1/T2)`);
-      console.log(`-----|--------------|------|---------|---------|------------`);
-      // Sample 30 moves across the 1000+ iteration timeline including the transition
-      const diveSamples = deepDiveMatch.moveLog.filter((m, i) => i % 40 === 0 || (i >= 495 && i <= 515));
-      diveSamples.forEach(m => {
-        console.log(`${String(m.step).padEnd(4)} | ${m.action.padEnd(12)} | T${m.team}  | ${m.eloGap}   | ${m.sumGap.padEnd(7)} | ${m.t1Count}/${m.t2Count}`);
-      });
-    }
-
-    // --- Worst-Case Analysis (Current Smart Assign) ---
-    if (scenario === 'REALWORLD_CHURN') {
-      console.log(`\n⚠️ TOP 5 WORST-CASE SCENARIOS (Current Smart Assign) ⚠️`);
-      const worst = [...allResults['SMART ASSIGN (Current)']].sort((a, b) => b.fullPopEloDiff - a.fullPopEloDiff).slice(0, 5);
-      worst.forEach((r, idx) => {
-        console.log(`\n#${idx + 1} Match: ${r.runId} | Full-Pop Elo Diff: ${r.fullPopEloDiff.toFixed(3)} | Full-Pop Sum Diff: ${r.fullPopSumDiff.toFixed(1)}`);
-        console.log(`    T1: ${r.t1End}p (${r.t1Elo.toFixed(2)} avg) | T2: ${r.t2End}p (${r.t2Elo.toFixed(2)} avg)`);
-        console.log(`    Recent Algo Decisions:`);
-        r.eventLog.slice(-5).forEach(e => console.log(`      ${e}`));
-      });
     }
   }
-  
-  // Force exit to clear intervals from mocked plugins
+
+  console.log(`\n🚀 Running simulation on ${matches.length} historical matches...\n`);
+
+  console.log('--- Historical Match Replays ---');
+  for (const scenario of startScenarios) {
+    console.log(`\nRunning Scenario: ${scenario.label}`);
+    for (const [idx, match] of matches.entries()) {
+      if (idx > 0 && idx % 50 === 0) console.log(`  ... processed ${idx}/${matches.length} matches ...`);
+      
+      const printDetails = idx < 1; // only print first match per scenario
+      if (printDetails) console.log(`  Match: ${match.layerName} (${match.players.length} players)`);
+      
+      for (const config of engineConfigs) {
+        const result = await simulateHistoricalMatch(match, eloMap, config, seededRandom, logStream, scenario.pop);
+        updateStats(scenario.label, config.name, result);
+        if (printDetails) {
+          const rRateStr = result.rejoinRate !== null ? `${result.rejoinRate.toFixed(1)}%` : '--';
+          console.log(`    ${result.name.padEnd(25)} | Avg Gap: ${result.avgGap.toFixed(3)} | Sum Gap: ${result.avgSumGap.toFixed(1)}`);
+          console.log(`    ${"".padEnd(25)} | Unbalanced: ${result.unbalancedPercent.toFixed(1)}% | Rejoin: ${rRateStr} | Moves: ${result.forcedMoves}`);
+        }
+      }
+    }
+  }
+  printSummary("HISTORICAL MATCHES");
+
+  // Reset stats for synthetic run
+  for (const scenario of startScenarios) {
+    engineConfigs.forEach(c => globalStats[scenario.label][c.name] = { avgGap: 0, sumGap: 0, moves: 0, unbalanced: 0, rejoinOpp: 0, rejoinSucc: 0, count: 0 });
+  }
+
+  console.log('\n--- Synthetic Match Generation (Pattern Based) ---');
+  const churnStats = analyzeChurnStatistics(matches);
+  for (const scenario of startScenarios) {
+    console.log(`\nRunning Scenario: ${scenario.label}`);
+    for (let i = 0; i < 20; i++) {
+      const fakeMatch = generateFakeMatch(churnStats, seededRandom, allBackupMus);
+      const printDetails = i < 1;
+      if (printDetails) console.log(`  Generated Match #${i+1} (${fakeMatch.players.length} players)`);
+      
+      for (const config of engineConfigs) {
+        const result = await simulateHistoricalMatch(fakeMatch, eloMap, config, seededRandom, logStream, scenario.pop);
+        updateStats(scenario.label, config.name, result);
+        if (printDetails) {
+          const rRateStr = result.rejoinRate !== null ? `${result.rejoinRate.toFixed(1)}%` : '--';
+          console.log(`    ${result.name.padEnd(25)} | Avg Gap: ${result.avgGap.toFixed(3)} | Sum Gap: ${result.avgSumGap.toFixed(1)}`);
+          console.log(`    ${"".padEnd(25)} | Unbalanced: ${result.unbalancedPercent.toFixed(1)}% | Rejoin: ${rRateStr} | Moves: ${result.forcedMoves}`);
+        }
+      }
+    }
+  }
+  printSummary("SYNTHETIC MATCHES");
+
+  // Reset stats for prolonged run
+  const peakScenario = "Constant Peak (95+)";
+  globalStats[peakScenario] = {};
+  engineConfigs.forEach(c => globalStats[peakScenario][c.name] = { avgGap: 0, sumGap: 0, moves: 0, unbalanced: 0, rejoinOpp: 0, rejoinSucc: 0, count: 0 });
+
+  console.log('\n--- Prolonged Peak Match Generation (10+ hours, 95-100 Pop) ---');
+  for (let i = 0; i < 5; i++) {
+    const prolongedMatch = generateProlongedMatch(seededRandom, allBackupMus, 10);
+    const printDetails = i < 1;
+    if (printDetails) console.log(`  Prolonged Match #${i+1} (Dynamic Population, ${Math.round(prolongedMatch.roundDuration/3600000)} hours)`);
+    
+    for (const config of engineConfigs) {
+      const result = await simulateHistoricalMatch(prolongedMatch, eloMap, config, seededRandom, logStream, 95);
+      updateStats(peakScenario, config.name, result);
+      if (printDetails) {
+        const rRateStr = result.rejoinRate !== null ? `${result.rejoinRate.toFixed(1)}%` : '--';
+        console.log(`    ${result.name.padEnd(25)} | Avg Gap: ${result.avgGap.toFixed(3)} | Sum Gap: ${result.avgSumGap.toFixed(1)}`);
+        console.log(`    ${"".padEnd(25)} | Unbalanced: ${result.unbalancedPercent.toFixed(1)}% | Rejoin: ${rRateStr} | Moves: ${result.forcedMoves}`);
+      }
+    }
+  }
+
+  console.log(`\n=== AGGREGATE SUMMARY: PROLONGED MATCHES ===`);
+  console.log(`\n[ ${peakScenario} ]`);
+  console.log(`${"Engine".padEnd(25)} | ${"Avg Gap".padStart(7)} | ${"Sum Gap".padStart(7)} | ${"Unbalanced".padStart(10)} | ${"Rejoin".padStart(6)} | ${"Avg Moves".padStart(9)}`);
+  console.log("-".repeat(81));
+  for (const [name, s] of Object.entries(globalStats[peakScenario])) {
+    const n = s.count || 1;
+    const rRateStr = s.rejoinOpp > 0 ? `${((s.rejoinSucc / s.rejoinOpp) * 100).toFixed(1)}% (${s.rejoinSucc}/${s.rejoinOpp})` : '--';
+    const avgGapStr = (s.avgGap/n).toFixed(3);
+    const sumGapStr = (s.sumGap/n).toFixed(1);
+    const unbalStr = `${(s.unbalanced/n).toFixed(1)}%`;
+    const movesStr = (s.moves/n).toFixed(1);
+    console.log(`${name.padEnd(25)} | ${avgGapStr.padStart(7)} | ${sumGapStr.padStart(7)} | ${unbalStr.padStart(10)} | ${rRateStr.padStart(6)} | ${movesStr.padStart(9)}`);
+  }
+
+  // --- 50-hour Ultra Prolonged Run ---
+  const ultraScenario = "Constant Peak (50+ hours)";
+  globalStats[ultraScenario] = {};
+  engineConfigs.forEach(c => globalStats[ultraScenario][c.name] = { avgGap: 0, sumGap: 0, moves: 0, unbalanced: 0, rejoinOpp: 0, rejoinSucc: 0, count: 0 });
+
+  console.log('\n--- Ultra Prolonged Peak Match Generation (50+ hours, 95-100 Pop) ---');
+  for (let i = 0; i < 2; i++) { // Run 2 matches of 50 hours each
+    const ultraMatch = generateProlongedMatch(seededRandom, allBackupMus, 50);
+    const printDetails = i < 1;
+    if (printDetails) console.log(`  Ultra Match #${i+1} (Dynamic Population, 50 hours)`);
+    
+    for (const config of engineConfigs) {
+      const result = await simulateHistoricalMatch(ultraMatch, eloMap, config, seededRandom, logStream, 95);
+      updateStats(ultraScenario, config.name, result);
+      if (printDetails) {
+        const rRateStr = result.rejoinRate !== null ? `${result.rejoinRate.toFixed(1)}%` : '--';
+        console.log(`    ${result.name.padEnd(25)} | Avg Gap: ${result.avgGap.toFixed(3)} | Sum Gap: ${result.avgSumGap.toFixed(1)}`);
+        console.log(`    ${"".padEnd(25)} | Unbalanced: ${result.unbalancedPercent.toFixed(1)}% | Rejoin: ${rRateStr} | Moves: ${result.forcedMoves}`);
+      }
+    }
+  }
+
+  console.log(`\n=== AGGREGATE SUMMARY: ULTRA PROLONGED MATCHES ===`);
+  console.log(`\n[ ${ultraScenario} ]`);
+  console.log(`${"Engine".padEnd(25)} | ${"Avg Gap".padStart(7)} | ${"Sum Gap".padStart(7)} | ${"Unbalanced".padStart(10)} | ${"Rejoin".padStart(6)} | ${"Avg Moves".padStart(9)}`);
+  console.log("-".repeat(81));
+  for (const [name, s] of Object.entries(globalStats[ultraScenario])) {
+    const n = s.count || 1;
+    const rRateStr = s.rejoinOpp > 0 ? `${((s.rejoinSucc / s.rejoinOpp) * 100).toFixed(1)}% (${s.rejoinSucc}/${s.rejoinOpp})` : '--';
+    const avgGapStr = (s.avgGap/n).toFixed(3);
+    const sumGapStr = (s.sumGap/n).toFixed(1);
+    const unbalStr = `${(s.unbalanced/n).toFixed(1)}%`;
+    const movesStr = (s.moves/n).toFixed(1);
+    console.log(`${name.padEnd(25)} | ${avgGapStr.padStart(7)} | ${sumGapStr.padStart(7)} | ${unbalStr.padStart(10)} | ${rRateStr.padStart(6)} | ${movesStr.padStart(9)}`);
+  }
+
+  console.log('\nSimulation complete. Use --repl for interactive testing.');
   process.exit(0);
 }
 
-runUnifiedTests().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+runTests().catch(console.error);
