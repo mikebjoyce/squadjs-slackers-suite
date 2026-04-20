@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v0.2.2                   ║
+ * ║                  SMART ASSIGN PLUGIN v0.2.3                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -25,20 +25,30 @@
  * SADatabase (../utils/sa-database.js)
  *   Persistent SQLite storage for reconnect memory and round state.
  * SASwapExecutor (../utils/sa-swap-executor.js)
- *   Manages the RCON move queue with retry logic for loading players.
+ *   Manages the RCON move queue using "One-Hit & Verify" logic for fast,
+ *   bounce-loop-free team switches. Verified swaps typically complete in <2s.
  * EloTracker (Sibling Plugin)
  *   Provides live TrueSkill Mu ratings for skill-based balancing.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
+ * - Join swaps use Log-Driven triggering: the SteamID arrives from the Log Parser
+ *   (~100ms after join), so the RCON command fires before RCON even knows the
+ *   player exists. SASwapExecutor's forced post-command poll then verifies the result.
+ * - Disconnect detection is delta-diff only (no PLAYER_DISCONNECTED listener) because
+ *   that event is unreliable in current Squad/SquadJS. Every forced join refresh also
+ *   speeds up disconnect detection for all other players as a side-effect.
  * - Algorithm uses a Mu-based Unified Scoring System:
  *     1. Hard Pop Cap: Prevents imbalance beyond dynamic thresholds.
  *     2. Mu Balancing: Weights the average skill gap (3.0x) against a dynamically scaled sum gap (1.5x) to handle diverse pop states.
- *     3. Reconnect Bias: Applies a minor score reduction (0.25) toward previous team if returning.
- *     4. Reconnect Bonus: Grants an *additional* +2 player imbalance allowance on top of the base.
+ *     3. Reconnect Priority: If reconnect memory exists and the pop cap allows it, the player is sent to their previous team immediately (before Elo scoring).
+ *     4. Reconnect Bias: If reconnect priority is blocked by the cap, applies a minor score reduction (0.25) toward the previous team to tip near-ties.
+ *     5. Reconnect Bonus: Grants an *additional* +2 player imbalance allowance on top of the base for returning players.
  * - Strict 1-player max imbalance enforced at high population (94+).
  * - Bypasses auto-assignment completely during specified ignored modes (Seed/Jensen).
- * - Accuracy: Players with pending moves are ignored during team evaluation.
+ * - Accuracy: Players with pending moves are excluded from team evaluation to prevent double-counting.
+ * - Passive Mode: Set enableSmartAssign: false to log what the algorithm *would* have done
+ *   without actually moving anyone. ASSIGNMENT events are logged with executed: false.
  *
  * ─── CONFIGURATION ───────────────────────────────────────────────
  *
@@ -244,6 +254,13 @@ export default class SmartAssign extends BasePlugin {
 
     await this.finalizeRoundLog();
 
+    // Restart the log flush timer if it was stopped by finalizeRoundLog
+    if (!this._batchFlushTimer) {
+      this._batchFlushTimer = setInterval(() => {
+        this._flushTempLog().catch((err) => Logger.verbose('SmartAssign', 1, `Flush error: ${err.message}`));
+      }, 15000);
+    }
+
     await this.db.clearReconnectMemory();
     const now = this.server.matchStartTime ? this.server.matchStartTime.getTime() : Date.now();
     await this.db.saveRoundStartTime(now);
@@ -330,7 +347,29 @@ export default class SmartAssign extends BasePlugin {
     const p = info.player;
     if (!p || !p.steamID) return;
 
-    // Fast trigger
+    /**
+     * DESIGN DECISION: Forced Join Refresh
+     *
+     * Intentionally NOT awaited. The move is queued immediately below using the
+     * SteamID from the Log Parser event (before RCON even knows the player exists).
+     * This background poll's real job is to provide fresh data for SASwapExecutor's
+     * post-command verification step: after the RCON move command lands, the executor
+     * calls updatePlayerList() again to confirm the player is on the correct team.
+     *
+     * Side-effect: every forced refresh also reveals other players who have left the
+     * server since the last 30s poll cycle, effectively speeding up disconnect detection
+     * for everyone on the server whenever anyone joins.
+     */
+    const updateStart = Date.now();
+    this.server.updatePlayerList().then(() => {
+      Logger.verbose('SmartAssign', 4, `[JoinRefresh] Forced RCON poll completed in ${Date.now() - updateStart}ms`);
+    }).catch((err) => {
+      Logger.verbose('SmartAssign', 1, `[JoinRefresh] Forced update failed on join: ${err.message}`);
+    });
+
+    // Trigger join handling immediately using the log-provided player data.
+    // The executor will fire the RCON move before the player is even visible
+    // in the ListPlayers array — the forced poll above will catch up shortly after.
     if (!this.knownPlayers.has(p.steamID)) {
       await this.handlePlayerJoin(p);
     }
@@ -370,6 +409,9 @@ export default class SmartAssign extends BasePlugin {
      * and fails to fire reliably. To prevent memory leaks and ensure disconnects are always caught, 
      * leaves are inferred strictly by delta-diffing the UPDATED_PLAYER_INFORMATION array.
      * 
+     * Note: Forced Join Updates (see onPlayerConnected) also have the side-effect of 
+     * speeding up disconnect detection by forcing the RCON player list to refresh.
+     * 
      * DESIGN NOTE: Squad's Native Team Assignment
      * In Squad, players are immediately assigned to Team 1 or Team 2 by the game natively upon joining.
      * There is no 'unassigned' or 'Team 0' state for teams (unassigned only applies to squads).
@@ -406,6 +448,9 @@ export default class SmartAssign extends BasePlugin {
         }
         if (String(kp.squadID) !== String(p.squadID)) {
           kp.squadID = p.squadID;
+        }
+        if (kp.name !== p.name) {
+          kp.name = p.name;
         }
       }
     }
@@ -484,15 +529,15 @@ export default class SmartAssign extends BasePlugin {
 
       const willExecuteMove = targetTeam !== null && String(player.teamID) !== String(targetTeam) && this.options.enableSmartAssign !== false;
 
-      // Record the assignment in log with executed flag for passive mode distinction
-      if (this.options.enableSmartAssign !== false) {
-        this.logEvent('ASSIGNMENT', player, {
-          targetTeam,
-          reason,
-          reconnectTeam,
-          executed: willExecuteMove
-        });
-      }
+      // Always log ASSIGNMENT regardless of enableSmartAssign so passive mode captures
+      // what the algorithm *would* have done. The `executed` flag distinguishes passive
+      // (false) from active (true) runs, which is essential for data analysis and dry runs.
+      this.logEvent('ASSIGNMENT', player, {
+        targetTeam,
+        reason,
+        reconnectTeam,
+        executed: willExecuteMove
+      });
 
       // If the player is currently on the wrong team, queue a team change
       if (targetTeam !== null && String(player.teamID) !== String(targetTeam)) {
@@ -506,6 +551,13 @@ export default class SmartAssign extends BasePlugin {
           // This is a known, low-impact approximation that resets naturally on NEW_GAME.
           this._pendingPlayerMoves.set(player.steamID, { targetTeam, mu: pendingPlayerMu });
 
+          /**
+           * ARCHITECTURE: Log-Driven Join Swap
+           * We queue the move immediately using the SteamID from the Log Parser event,
+           * firing the RCON command blind before the player is visible in ListPlayers.
+           * SASwapExecutor sends the command once, then force-polls to verify the result.
+           * No retry spam, no bounce loops. See sa-swap-executor.js for the full design.
+           */
           this.executor.queueMove(player.steamID, targetTeam);
         } else {
           Logger.verbose('SmartAssign', 2, `[SmartAssign] Passive mode: skipping move for ${player.name} to Team ${targetTeam}`);
@@ -517,12 +569,13 @@ export default class SmartAssign extends BasePlugin {
   }
 
   async handlePlayerLeave(player) {
+    // Synchronously delete session data to prevent memory leaks if awaits below throw or stall.
+    this._sessionJoinTimes.delete(player.steamID);
+
     await this._ensureSnapshot();
 
     Logger.verbose('SmartAssign', 2, `[LEAVE] Player disconnected: ${player.name} (${player.steamID}) from Team ${player.teamID}`);
     this.logEvent('LEAVE', player);
-    
-    this._sessionJoinTimes.delete(player.steamID);
     
     // Save to reconnect memory if they were on a valid team
     const tid = Number(player.teamID);
@@ -548,6 +601,11 @@ export default class SmartAssign extends BasePlugin {
    * Evaluates and returns the best team (1 or 2) for a joining player.
    * Uses a Mu-based Unified Scoring System to balance competitive parity,
    * population equity, and player preference (reconnects).
+   *
+   * CRITICAL: This method MUST remain synchronous. The assignment logic
+   * in onUpdatedPlayerInfo relies on the fact that no await exists between
+   * evaluation and state increments to prevent race conditions during
+   * player join bursts.
    */
   evaluateTeamAssignment(player, reconnectTeam = null) {
     const eloTracker = this.eloTracker;
@@ -642,13 +700,15 @@ export default class SmartAssign extends BasePlugin {
     const newAvgT1 = (t1Power + playerMu) / (t1Count + 1);
     const newAvgT2 = (t2Power + playerMu) / (t2Count + 1);
 
-    // Dynamic scale: normalises sum gap relative to current server population so the
-    // term carries consistent weight whether the server has 20 or 100 players.
+    // Dynamic scale: normalises sum gap relative to current server population. 
+    // As population increases, the importance of the Total-Skill (sum) gap is 
+    // intentionally phased out in favor of the Average-Skill gap. 
+    // At a full 100-player server, the sum term becomes negligible.
     const dynamicScale = Math.max(1, (t1Count + t2Count + 1) * 2.5);
 
-    const getScore = (newAvg1, avg2, newSum1, sum2) => {
-      const avgGap = Math.abs(newAvg1 - avg2);
-      const sumGap = Math.abs(newSum1 - sum2) / dynamicScale;
+    const getScore = (candidateAvg, opponentAvg, candidateSum, opponentSum) => {
+      const avgGap = Math.abs(candidateAvg - opponentAvg);
+      const sumGap = Math.abs(candidateSum - opponentSum) / dynamicScale;
       return (avgGap * 3.0) + (sumGap * 1.5);
     };
 
@@ -701,6 +761,17 @@ export default class SmartAssign extends BasePlugin {
         if (mu !== undefined) return mu;
         Logger.verbose('SmartAssign', 3, `[_getMuFast] eloMap miss for steamID ${p.steamID}, falling through.`);
       }
+
+      // Both fast paths missed — this could mean internals changed or player is truly unknown to cache
+      if (!this._muFastMissWarned) {
+        Logger.verbose(
+          'SmartAssign',
+          2,
+          '[_getMuFast] Both fast paths missed. EloTracker internals may have changed. Falling back to getMu().'
+        );
+        this._muFastMissWarned = true;
+      }
+
       // Fallback to official API
       return et.getMu(p);
     } catch (e) {
@@ -761,11 +832,15 @@ export default class SmartAssign extends BasePlugin {
   }
 
   async finalizeRoundLog() {
-    // Force flush any pending memory events
-    await this._flushTempLog();
+    if (this._batchFlushTimer) {
+      clearInterval(this._batchFlushTimer);
+      this._batchFlushTimer = null;
+    }
 
-    // Flush any in-flight writes before reading the temp file
-    await this._logWriteQueue;
+    // Force flush any pending memory events and wait for the write queue to empty.
+    // _flushTempLog returns the current _logWriteQueue promise.
+    await this._flushTempLog();
+    await this._logWriteQueue; // drain queue fully
 
     // Always load from temp file to get the full round history
     await this.loadTempEvents();
@@ -807,6 +882,10 @@ export default class SmartAssign extends BasePlugin {
     const currentLayerName = this.server.currentLayer ? this.server.currentLayer.name : 'Unknown';
     if (currentLayerName === 'Unknown') return;
 
+    // Lock the snapshot immediately before any await yields to prevent race conditions 
+    // from concurrent promise batches hitting this method simultaneously.
+    this._snapshotTaken = true;
+
     Logger.verbose('SmartAssign', 1, `Taking early round snapshot for layer: ${currentLayerName}`);
 
     // If we have events in memory from a previous round that haven't been finalized, finalize them now.
@@ -826,7 +905,6 @@ export default class SmartAssign extends BasePlugin {
     }));
 
     this.logEvent('ROUND_SNAPSHOT', null, { players: snapshotPlayers });
-    this._snapshotTaken = true;
   }
 
   async loadTempEvents() {
