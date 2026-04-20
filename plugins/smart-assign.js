@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v0.2.3                   ║
+ * ║                  SMART ASSIGN PLUGIN v0.2.4                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -47,8 +47,8 @@
  * - Strict 1-player max imbalance enforced at high population (94+).
  * - Bypasses auto-assignment completely during specified ignored modes (Seed/Jensen).
  * - Accuracy: Players with pending moves are excluded from team evaluation to prevent double-counting.
- * - Passive Mode: Set enableSmartAssign: false to log what the algorithm *would* have done
- *   without actually moving anyone. ASSIGNMENT events are logged with executed: false.
+ * - Passive Mode: Set enableSmartAssign: false to observe only real server events (JOIN, LEAVE,
+ *   TEAM_CHANGE). The algorithm does not run and no ASSIGNMENT events are logged.
  *
  * ─── CONFIGURATION ───────────────────────────────────────────────
  *
@@ -93,7 +93,7 @@ export default class SmartAssign extends BasePlugin {
       },
       enableSmartAssign: {
         required: false,
-        description: 'Whether to actually move players. If false, plugin runs in passive data-collection mode.',
+        description: 'If true, runs the assignment algorithm and moves players. If false, only logs real server events.',
         default: true,
         type: 'boolean'
       },
@@ -510,6 +510,12 @@ export default class SmartAssign extends BasePlugin {
         return;
       }
 
+      // Passive mode: skip algorithm and ASSIGNMENT logging entirely
+      if (this.options.enableSmartAssign === false) {
+        Logger.verbose('SmartAssign', 2, `[SmartAssign] Passive mode: algorithm skipped for ${player.name}.`);
+        return;
+      }
+
       // Evaluate ideal team assignment
       const reconnectTeam = await this.db.getReconnectTeam(player.steamID);
 
@@ -527,41 +533,33 @@ export default class SmartAssign extends BasePlugin {
         Logger.verbose('SmartAssign', 2, `[SmartAssign] Evaluated fresh join for ${player.name} -> Team ${targetTeam} (${reason})`);
       }
 
-      const willExecuteMove = targetTeam !== null && String(player.teamID) !== String(targetTeam) && this.options.enableSmartAssign !== false;
-
-      // Always log ASSIGNMENT regardless of enableSmartAssign so passive mode captures
-      // what the algorithm *would* have done. The `executed` flag distinguishes passive
-      // (false) from active (true) runs, which is essential for data analysis and dry runs.
+      // Log assignment decision
       this.logEvent('ASSIGNMENT', player, {
         targetTeam,
         reason,
         reconnectTeam,
-        executed: willExecuteMove
+        executed: true
       });
 
       // If the player is currently on the wrong team, queue a team change
       if (targetTeam !== null && String(player.teamID) !== String(targetTeam)) {
-        if (this.options.enableSmartAssign !== false) {
-          this._pendingAssignments[targetTeam]++;
-          const pendingPlayerMu = this._getMuFast(player);
-          this._pendingMu[targetTeam] += pendingPlayerMu;
-          
-          // NOTE: pendingPlayerMu is captured here and subtracted onMoveSuccess. If the player's 
-          // Elo changes during the brief execution window, _pendingMu may drift slightly.
-          // This is a known, low-impact approximation that resets naturally on NEW_GAME.
-          this._pendingPlayerMoves.set(player.steamID, { targetTeam, mu: pendingPlayerMu });
+        this._pendingAssignments[targetTeam]++;
+        const pendingPlayerMu = this._getMuFast(player);
+        this._pendingMu[targetTeam] += pendingPlayerMu;
+        
+        // NOTE: pendingPlayerMu is captured here and subtracted onMoveSuccess. If the player's 
+        // Elo changes during the brief execution window, _pendingMu may drift slightly.
+        // This is a known, low-impact approximation that resets naturally on NEW_GAME.
+        this._pendingPlayerMoves.set(player.steamID, { targetTeam, mu: pendingPlayerMu });
 
-          /**
-           * ARCHITECTURE: Log-Driven Join Swap
-           * We queue the move immediately using the SteamID from the Log Parser event,
-           * firing the RCON command blind before the player is visible in ListPlayers.
-           * SASwapExecutor sends the command once, then force-polls to verify the result.
-           * No retry spam, no bounce loops. See sa-swap-executor.js for the full design.
-           */
-          this.executor.queueMove(player.steamID, targetTeam);
-        } else {
-          Logger.verbose('SmartAssign', 2, `[SmartAssign] Passive mode: skipping move for ${player.name} to Team ${targetTeam}`);
-        }
+        /**
+         * ARCHITECTURE: Log-Driven Join Swap
+         * We queue the move immediately using the SteamID from the Log Parser event,
+         * firing the RCON command blind before the player is visible in ListPlayers.
+         * SASwapExecutor sends the command once, then force-polls to verify the result.
+         * No retry spam, no bounce loops. See sa-swap-executor.js for the full design.
+         */
+        this.executor.queueMove(player.steamID, targetTeam);
       }
     } finally {
       this._joiningPlayers.delete(player.steamID);

@@ -1,4 +1,4 @@
-# SmartAssign Plugin v0.2.3
+# SmartAssign Plugin v0.2.4
 
 **Elo-Aware Auto Assignment & Player Lifecycle Logger**
 
@@ -18,7 +18,7 @@ Disconnect detection works via delta-diff: every time any player joins and trigg
 * **Strict Population Balance**: Dynamically adjusts the allowed team population difference based on total player count, enforcing a strict 1-player max difference at high population.
 * **Reconnect Memory**: Stores player disconnect states in a persistent SQLite database. If a player crashes or disconnects, they are automatically placed back on their previous team upon reconnecting (with a +2 imbalance grace allowance).
 * **Elo-Aware Routing**: Integrates with the `EloTracker` plugin to route new players to the team that will most closely equalize the average skill of both sides.
-* **Passive / Dry-Run Mode**: Set `enableSmartAssign: false` to run the full algorithm without executing any RCON moves. All `ASSIGNMENT` events are still logged with `executed: false`, letting you validate the algorithm's decisions before going live.
+* **Passive Mode**: Set `enableSmartAssign: false` to observe real server events only (`JOIN`, `LEAVE`, `TEAM_CHANGE`). The assignment algorithm does not run, and no `ASSIGNMENT` events are logged—this mode is useful for monitoring server activity without any intervention.
 * **Lifecycle Event Logging**: Dumps precise `JOIN`, `LEAVE`, `TEAM_CHANGE`, `ASSIGNMENT`, `MOVE_SUCCESS`, and `MOVE_FAILED` events into an easily ingestible JSONL file, with global team populations (`t1`, `t2`) embedded on every event.
 * **High-Performance Logging**: Events are batched in-memory and flushed periodically to minimize disk I/O overhead during large player waves.
 * **Round Snapshots**: Automatically takes a full snapshot of connected players at the start of each round, logged as a `ROUND_SNAPSHOT` event for historical tracking and log replay.

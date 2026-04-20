@@ -40,7 +40,27 @@ If the player isn't a reconnect, and both teams have room for them, the algorith
 
 ---
 
+## Passive Mode
+
+Sometimes you want to observe how your server behaves without SmartAssign making any decisions. **Passive Mode** (`enableSmartAssign: false`) lets you do exactly that.
+
+In Passive Mode:
+* The plugin **does not** run the assignment algorithm for joining players
+* The plugin **does not** log `ASSIGNMENT` events
+* The plugin **only** logs real server events: `JOIN`, `LEAVE`, `TEAM_CHANGE`, `MOVE_SUCCESS`, `MOVE_FAILED`
+* All other features (reconnect memory, lifecycle logging, round snapshots) remain active
+
+This is useful for:
+* **Validating log formats** before going live
+* **Monitoring server activity** without any auto-assignment intervention
+* **Troubleshooting** by observing natural player behavior
+
+Simply set `enableSmartAssign: false` in your config to enable it.
+
+---
+
 ## Understanding The Core Rules
+
 
 ### Reconnect Memory & Grace Allowances
 Squad crashes happen. When they do, players shouldn't be punished by being auto-balanced to the enemy team, losing their squad, and abandoning their friends. 
