@@ -89,7 +89,10 @@ class MockSASwapExecutor {
     this.recentMoves = new Map();
   }
   isRecentSmartAssignMove(steamID, newTeamID) { 
-    return this.recentMoves.get(steamID) === Number(newTeamID);
+    const move = this.recentMoves.get(steamID);
+    if (!move) return false;
+    if (move.teamID !== Number(newTeamID)) return false;
+    return (this.server.virtualTime - move.time) <= 15000;
   }
   async queueMove(steamID, targetTeam) {
     if (targetTeam === null) return;
@@ -111,9 +114,20 @@ class MockSASwapExecutor {
 
     if (p.teamID !== Number(targetTeam) && p.teamID !== null) this.moveCount++;
     p.teamID = Number(targetTeam);
-    this.recentMoves.set(steamID, Number(targetTeam));
-    // Emit immediately for simulation speed; the plugin logic is awaited in emit()
-    await this.server.emit('SMART_ASSIGN_MOVE_SUCCESS', { steamID, teamID: Number(targetTeam) });
+    this.recentMoves.set(steamID, { teamID: Number(targetTeam), time: this.server.virtualTime });
+    
+    // Tie into the test runner's virtual timeline to simulate network/engine delay
+    if (this.server.timeline) {
+      this.server.timeline.push({ 
+        type: 'MOVE_SUCCESS', 
+        time: this.server.virtualTime + 1000, 
+        steamID, 
+        teamID: Number(targetTeam) 
+      });
+      this.server.timeline.sort((a, b) => a.time - b.time || (a.type === 'LEAVE' ? -1 : 1));
+    } else {
+      await this.server.emit('SMART_ASSIGN_MOVE_SUCCESS', { steamID, teamID: Number(targetTeam) });
+    }
   }
   cleanup() {
     this.recentMoves.clear();
@@ -307,9 +321,10 @@ function generateProlongedTimeline(match, seededRandom) {
 
 // --- Simulation Logic ---
 
-async function simulateHistoricalMatch(match, eloMap, engineConfig, seededRandom, logStream = null, targetInitialPop = 80) {
+async function simulateHistoricalMatch(match, engineConfig, seededRandom, logStream = null, targetInitialPop = 80) {
+  const localEloMap = new Map();
   const server = new MockServer();
-  const mockEloTracker = new EloTracker(server, eloMap);
+  const mockEloTracker = new EloTracker(server, localEloMap);
   server.plugins.push(mockEloTracker);
   server.currentLayer = { name: match.layerName, gamemode: match.gameMode };
 
@@ -331,8 +346,12 @@ async function simulateHistoricalMatch(match, eloMap, engineConfig, seededRandom
   const timeline = match.isProlonged 
     ? generateProlongedTimeline(match, seededRandom) 
     : inferPlayerEvents(match, seededRandom, targetInitialPop);
+  server.timeline = timeline;
   const eloHistory = [];
   let totalUnbalancedTime = 0;
+  let totalActiveTime = 0;
+  let totalTimeWeightedEloGap = 0;
+  let totalTimeWeightedSumGap = 0;
   let lastTimestamp = 0;
   let rejoinOpportunities = 0;
   let rejoinSuccesses = 0;
@@ -355,11 +374,17 @@ async function simulateHistoricalMatch(match, eloMap, engineConfig, seededRandom
     if (Math.abs(currentData.t1.count - currentData.t2.count) > 1) {
       totalUnbalancedTime += timeStep;
     }
+    
+    if (currentData.t1.count > 0 && currentData.t2.count > 0) {
+      totalActiveTime += timeStep;
+      totalTimeWeightedEloGap += Math.abs(currentData.t1.avgMu - currentData.t2.avgMu) * timeStep;
+      totalTimeWeightedSumGap += Math.abs(currentData.t1.sumMu - currentData.t2.sumMu) * timeStep;
+    }
 
     server.virtualTime = event.time;
     lastTimestamp = event.time;
     const p = event.player;
-    const steamID = p.eosID; // Use EOS as Steam for simplicity in test
+    const steamID = p ? p.eosID : event.steamID; // Use EOS as Steam for simplicity in test
 
     if (event.type === 'JOIN') {
       // 100 Player Server Cap Enforced
@@ -396,7 +421,7 @@ async function simulateHistoricalMatch(match, eloMap, engineConfig, seededRandom
       
       if (reconnectTeam) rejoinOpportunities++;
 
-      eloMap.set(steamID, Number(p.muBefore) || 25);
+      localEloMap.set(steamID, Number(p.muBefore) || 25);
       server.players.push(playerObj);
 
       const preTickData = mockEloTracker.buildRoundStartData();
@@ -444,8 +469,7 @@ async function simulateHistoricalMatch(match, eloMap, engineConfig, seededRandom
     } else if (event.type === 'LEAVE') {
       const idx = server.players.findIndex(x => x.steamID === steamID);
       if (idx !== -1) {
-        const leaver = server.players.splice(idx, 1)[0];
-        await plugin.db.savePlayerDisconnect(steamID, leaver.teamID);
+        server.players.splice(idx, 1);
         await server.emit('UPDATED_PLAYER_INFORMATION', {});
       }
     }
@@ -462,14 +486,7 @@ async function simulateHistoricalMatch(match, eloMap, engineConfig, seededRandom
     });
   }
 
-  // Add final duration chunk
-  const finalDuration = (match.roundDuration || 3600000) - lastTimestamp;
-  const finalData = mockEloTracker.buildRoundStartData();
-  if (Math.abs(finalData.t1.count - finalData.t2.count) > 1) {
-    totalUnbalancedTime += Math.max(0, finalDuration);
-  }
-
-  // Calculate average gap only when both teams have players to avoid 0-population noise
+  // Snapshot-based averaging (theoretical algorithm testing)
   const activeHistory = eloHistory.filter(h => h.t1Count > 0 && h.t2Count > 0);
   const avgGap = activeHistory.length > 0 
     ? activeHistory.reduce((acc, h) => acc + h.eloGap, 0) / activeHistory.length 
@@ -477,6 +494,10 @@ async function simulateHistoricalMatch(match, eloMap, engineConfig, seededRandom
   
   const avgSumGap = activeHistory.length > 0
     ? activeHistory.reduce((acc, h) => acc + h.sumMuGap, 0) / activeHistory.length
+    : 0;
+
+  const unbalancedPercent = activeHistory.length > 0
+    ? (activeHistory.filter(h => Math.abs(h.t1Count - h.t2Count) > 1).length / activeHistory.length) * 100
     : 0;
 
   if (logStream && engineConfig.name.includes('SMART ASSIGN')) {
@@ -493,7 +514,7 @@ async function simulateHistoricalMatch(match, eloMap, engineConfig, seededRandom
     avgGap,
     avgSumGap,
     forcedMoves: plugin.executor.moveCount,
-    unbalancedPercent: (totalUnbalancedTime / (match.roundDuration || 3600000)) * 100,
+    unbalancedPercent,
     rejoinRate: rejoinOpportunities > 0 ? (rejoinSuccesses / rejoinOpportunities) * 100 : null,
     rejoinOpp: rejoinOpportunities,
     rejoinSucc: rejoinSuccesses
@@ -609,7 +630,6 @@ async function startREPL(eloMap, initialMatch = null) {
         const idx = server.players.findIndex(x => x.name === name || x.steamID === name);
         if (idx !== -1) {
           const p = server.players.splice(idx, 1)[0];
-          await plugin.db.savePlayerDisconnect(p.steamID, p.teamID);
           console.log(`[REPL] ${p.name} disconnected.`);
           await server.emit('UPDATED_PLAYER_INFORMATION', {});
         } else {
@@ -653,7 +673,32 @@ async function startREPL(eloMap, initialMatch = null) {
 
 // --- Main Runner ---
 
+async function testLoadTempEventsCrashRecovery() {
+  const testLogPath = path.join(__dirname, 'test-crash-log.jsonl');
+  const tempPath = testLogPath + '.temp';
+  
+  const valid1 = JSON.stringify({ type: 'JOIN', name: 'Player1' });
+  const valid2 = JSON.stringify({ type: 'LEAVE', name: 'Player1' });
+  const malformed = '{"type": "JOIN", "name": "Playe';
+  
+  await fs.promises.writeFile(tempPath, valid1 + '\n' + valid2 + '\n' + malformed + '\n', 'utf8');
+  
+  const server = new MockServer();
+  const plugin = new SmartAssign(server, { logPath: testLogPath, enableEventLogging: true }, {});
+  
+  await plugin.loadTempEvents();
+  
+  if (plugin.currentRoundEvents.length !== 2) {
+    throw new Error(`Crash recovery failed: Expected 2 events, got ${plugin.currentRoundEvents.length}`);
+  }
+  
+  console.log('✅ loadTempEvents crash recovery test passed.');
+  await fs.promises.unlink(tempPath).catch(() => {});
+}
+
 async function runTests() {
+  await testLoadTempEventsCrashRecovery();
+
   const logPath = path.join(__dirname, 'elo-match-log.jsonl');
   if (!fs.existsSync(logPath)) {
     console.error(`Log file not found at ${logPath}`);
@@ -689,7 +734,7 @@ async function runTests() {
     }
   }
 
-  const eloMap = new Map();
+  const eloMap = new Map(); // Used strictly for REPL
   const seededRandom = new SeededRandom(42);
   const isExhaustive = process.argv.includes('--exhaustive');
   let logStream = null;
@@ -769,7 +814,7 @@ async function runTests() {
       if (printDetails) console.log(`  Match: ${match.layerName} (${match.players.length} players)`);
       
       for (const config of engineConfigs) {
-        const result = await simulateHistoricalMatch(match, eloMap, config, seededRandom, logStream, scenario.pop);
+        const result = await simulateHistoricalMatch(match, config, seededRandom, logStream, scenario.pop);
         updateStats(scenario.label, config.name, result);
         if (printDetails) {
           const rRateStr = result.rejoinRate !== null ? `${result.rejoinRate.toFixed(1)}%` : '--';
@@ -796,7 +841,7 @@ async function runTests() {
       if (printDetails) console.log(`  Generated Match #${i+1} (${fakeMatch.players.length} players)`);
       
       for (const config of engineConfigs) {
-        const result = await simulateHistoricalMatch(fakeMatch, eloMap, config, seededRandom, logStream, scenario.pop);
+        const result = await simulateHistoricalMatch(fakeMatch, config, seededRandom, logStream, scenario.pop);
         updateStats(scenario.label, config.name, result);
         if (printDetails) {
           const rRateStr = result.rejoinRate !== null ? `${result.rejoinRate.toFixed(1)}%` : '--';
@@ -820,7 +865,7 @@ async function runTests() {
     if (printDetails) console.log(`  Prolonged Match #${i+1} (Dynamic Population, ${Math.round(prolongedMatch.roundDuration/3600000)} hours)`);
     
     for (const config of engineConfigs) {
-      const result = await simulateHistoricalMatch(prolongedMatch, eloMap, config, seededRandom, logStream, 95);
+      const result = await simulateHistoricalMatch(prolongedMatch, config, seededRandom, logStream, 95);
       updateStats(peakScenario, config.name, result);
       if (printDetails) {
         const rRateStr = result.rejoinRate !== null ? `${result.rejoinRate.toFixed(1)}%` : '--';
@@ -856,7 +901,7 @@ async function runTests() {
     if (printDetails) console.log(`  Ultra Match #${i+1} (Dynamic Population, 50 hours)`);
     
     for (const config of engineConfigs) {
-      const result = await simulateHistoricalMatch(ultraMatch, eloMap, config, seededRandom, logStream, 95);
+      const result = await simulateHistoricalMatch(ultraMatch, config, seededRandom, logStream, 95);
       updateStats(ultraScenario, config.name, result);
       if (printDetails) {
         const rRateStr = result.rejoinRate !== null ? `${result.rejoinRate.toFixed(1)}%` : '--';

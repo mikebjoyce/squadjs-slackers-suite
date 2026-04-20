@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v0.1.9                   ║
+ * ║                  SMART ASSIGN PLUGIN v0.2.0                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -55,11 +55,12 @@
 const MAX_TEAM_SIZE = 50;
 import { promises as fsPromises } from 'fs';
 import Logger from '../../core/logger.js';
+import BasePlugin from './base-plugin.js';
 import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
 
-export default class SmartAssign {
-  static version = '0.1.9';
+export default class SmartAssign extends BasePlugin {
+  static version = '0.2.0';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
@@ -105,9 +106,7 @@ export default class SmartAssign {
   }
 
   constructor(server, options, connectors) {
-    this.server = server;
-    this.options = options;
-    this.connectors = connectors;
+    super(server, options, connectors);
 
     this.db = new SADatabase(server, options, connectors);
     this.executor = new SASwapExecutor(server, {
@@ -119,6 +118,7 @@ export default class SmartAssign {
     this._joiningPlayers = new Set();
     this._pendingAssignments = { 1: 0, 2: 0 };
     this._pendingMu = { 1: 0, 2: 0 };
+    this._pendingPlayerMoves = new Map();
     this.currentRoundEvents = [];
     this.currentRoundStartTime = null;
     this.ready = false;
@@ -126,6 +126,7 @@ export default class SmartAssign {
     this._logWriteQueue = Promise.resolve();
 
     this.eloTracker = null;
+    this._eloNotReadyWarned = false;
 
     // State bindings
     this.onNewGame = this.onNewGame.bind(this);
@@ -139,12 +140,15 @@ export default class SmartAssign {
   }
 
   async mount() {
+    await super.mount();
     Logger.verbose('SmartAssign', 1, 'Mounting SmartAssign plugin.');
 
     this.eloTracker = this.server.plugins.find((p) => p.constructor.name === 'EloTracker') || null;
     if (this.eloTracker && typeof this.eloTracker.getMu !== 'function') {
       Logger.verbose('SmartAssign', 1, '[SmartAssign] Warning: EloTracker found but getMu() is missing. Falling back to population-only/internal-props.');
     }
+
+    this._ignoredModes = (this.options.ignoredGameModes || ['seed', 'jensen']).map(m => String(m).toLowerCase());
 
     // Initialize DB
     const { roundStartTime: persistedStartTime } = await this.db.initDB();
@@ -213,8 +217,10 @@ export default class SmartAssign {
     this.server.removeListener('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
     this.server.removeListener('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
     this.server.removeListener('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
+    this._pendingPlayerMoves.clear();
     this.executor.cleanup();
     Logger.verbose('SmartAssign', 1, 'SmartAssign unmounted.');
+    await super.unmount();
   }
 
   async onNewGame(info) {
@@ -235,6 +241,7 @@ export default class SmartAssign {
     this._pendingAssignments[2] = 0;
     this._pendingMu[1] = 0;
     this._pendingMu[2] = 0;
+    this._pendingPlayerMoves.clear();
   }
 
   async onRoundEnded(info) {
@@ -252,6 +259,14 @@ export default class SmartAssign {
   async onMoveFailed(data) {
     if (!this.ready) return;
     const { steamID, reason } = data;
+
+    if (this._pendingPlayerMoves.has(steamID)) {
+      const move = this._pendingPlayerMoves.get(steamID);
+      this._pendingAssignments[move.targetTeam] = Math.max(0, this._pendingAssignments[move.targetTeam] - 1);
+      this._pendingMu[move.targetTeam] = Math.max(0, this._pendingMu[move.targetTeam] - move.mu);
+      this._pendingPlayerMoves.delete(steamID);
+    }
+
     const p = this.server.players.find((x) => x.steamID === steamID) || { steamID, name: 'Unknown' };
     Logger.verbose('SmartAssign', 1, `[SmartAssign] Abandoned move for ${p.name} (${steamID}) - ${reason}`);
     this.logEvent('MOVE_FAILED', p, { reason });
@@ -260,6 +275,14 @@ export default class SmartAssign {
   async onMoveSuccess(data) {
     if (!this.ready) return;
     const { steamID, teamID } = data;
+
+    if (this._pendingPlayerMoves.has(steamID)) {
+      const move = this._pendingPlayerMoves.get(steamID);
+      this._pendingAssignments[move.targetTeam] = Math.max(0, this._pendingAssignments[move.targetTeam] - 1);
+      this._pendingMu[move.targetTeam] = Math.max(0, this._pendingMu[move.targetTeam] - move.mu);
+      this._pendingPlayerMoves.delete(steamID);
+    }
+
     const p = this.server.players.find((x) => x.steamID === steamID);
     if (p) {
       Logger.verbose('SmartAssign', 2, `[SmartAssign] Verified move success for ${p.name} (${steamID}) to Team ${teamID}`);
@@ -367,7 +390,11 @@ export default class SmartAssign {
     }
 
     if (batchPromises.length > 0) {
-      await Promise.all(batchPromises);
+      await Promise.all(
+        batchPromises.map(p => p.catch(err => {
+          Logger.verbose('SmartAssign', 1, `[Batch] Handler error: ${err?.message}`);
+        }))
+      );
     }
   }
 
@@ -393,9 +420,8 @@ export default class SmartAssign {
       // Check if the current layer/gamemode is ignored
       const currentLayerName = this.server.currentLayer ? this.server.currentLayer.name.toLowerCase() : '';
       const currentGamemode = this.server.currentLayer ? this.server.currentLayer.gamemode.toLowerCase() : '';
-      const ignoredModes = (this.options.ignoredGameModes || ['seed', 'jensen']).map(m => String(m).toLowerCase());
 
-      const isIgnored = ignoredModes.some(m => currentLayerName.includes(m) || currentGamemode.includes(m));
+      const isIgnored = this._ignoredModes.some(m => currentLayerName.includes(m) || currentGamemode.includes(m));
 
       if (isIgnored) {
         Logger.verbose('SmartAssign', 2, `[SmartAssign] Ignored game mode detected. Skipping Elo-based assignment for ${player.name}.`);
@@ -406,9 +432,9 @@ export default class SmartAssign {
       const reconnectTeam = await this.db.getReconnectTeam(player.steamID);
 
       // 2. STALE-STATE BATCHING PROTECTION
-      // The increment happens post-evaluation. Because evaluateTeamAssignment() is synchronous,
-      // this completes before the next Promise.all continuation, ensuring the next concurrent
-      // join reads the updated count.
+      // JS single-threaded guarantee: once getReconnectTeam() resolves, execution
+      // runs synchronously through evaluate + increment before yielding again.
+      // Concurrent joins are safe because no await exists between evaluate and increment.
       const { targetTeam, reason } = this.evaluateTeamAssignment(player, reconnectTeam);
 
       if (reconnectTeam && reconnectTeam === targetTeam) {
@@ -436,26 +462,10 @@ export default class SmartAssign {
           const pendingPlayerMu = this._getMuFast(player);
           this._pendingMu[targetTeam] += pendingPlayerMu;
           
-          // Use a state variable for this specific player join instance
-          let cleanedUp = false;
-          
-          const cleanupPending = () => {
-            if (cleanedUp) return;
-            cleanedUp = true;
-            this._pendingAssignments[targetTeam] = Math.max(0, this._pendingAssignments[targetTeam] - 1);
-            this._pendingMu[targetTeam] = Math.max(0, this._pendingMu[targetTeam] - pendingPlayerMu);
-            this.server.removeListener('SMART_ASSIGN_MOVE_SUCCESS', successListener);
-            this.server.removeListener('SMART_ASSIGN_MOVE_FAILED', failureListener);
-            this.server.removeListener('NEW_GAME', gameResetListener);
-          };
-
-          const successListener = (d) => { if (d.steamID === player.steamID) cleanupPending(); };
-          const failureListener = (d) => { if (d.steamID === player.steamID) cleanupPending(); };
-          const gameResetListener = () => { cleanupPending(); };
-
-          this.server.on('SMART_ASSIGN_MOVE_SUCCESS', successListener);
-          this.server.on('SMART_ASSIGN_MOVE_FAILED', failureListener);
-          this.server.on('NEW_GAME', gameResetListener);
+          // NOTE: pendingPlayerMu is captured here and subtracted onMoveSuccess. If the player's 
+          // Elo changes during the brief execution window, _pendingMu may drift slightly.
+          // This is a known, low-impact approximation that resets naturally on NEW_GAME.
+          this._pendingPlayerMoves.set(player.steamID, { targetTeam, mu: pendingPlayerMu });
 
           this.executor.queueMove(player.steamID, targetTeam);
         } else {
@@ -497,6 +507,16 @@ export default class SmartAssign {
   evaluateTeamAssignment(player, reconnectTeam = null) {
     const eloTracker = this.eloTracker;
     const hasElo = eloTracker && eloTracker.ready && typeof eloTracker.getMu === 'function';
+
+    if (eloTracker && !eloTracker.ready) {
+      if (!this._eloNotReadyWarned) {
+        Logger.verbose('SmartAssign', 1, '[SmartAssign] EloTracker present but not ready — falling back to population-only routing.');
+        this._eloNotReadyWarned = true;
+      }
+    } else if (eloTracker && eloTracker.ready && this._eloNotReadyWarned) {
+      // Reset the flag once it becomes ready again
+      this._eloNotReadyWarned = false;
+    }
 
     // 1. DATA COLLECTION (Single Pass Optimization)
     let t1Count = this._pendingAssignments[1] || 0;
@@ -701,14 +721,25 @@ export default class SmartAssign {
     try {
       const data = await fsPromises.readFile(tempPath, 'utf8');
       const lines = data.trim().split('\n');
-      this.currentRoundEvents = lines.filter((l) => l.trim()).map((l) => JSON.parse(l));
+      this.currentRoundEvents = lines
+        .filter((l) => l.trim())
+        .reduce((acc, l) => {
+          try {
+            acc.push(JSON.parse(l));
+          } catch {
+            Logger.verbose('SmartAssign', 1, '[Log] Skipped malformed temp line.');
+          }
+          return acc;
+        }, []);
       Logger.verbose(
         'SmartAssign',
         1,
         `Loaded ${this.currentRoundEvents.length} events from temp log.`
       );
     } catch (err) {
-      // File might not exist, which is fine
+      if (err.code !== 'ENOENT') {
+        Logger.verbose('SmartAssign', 1, `[Log] Failed to load temp events: ${err.message}`);
+      }
     }
   }
 }

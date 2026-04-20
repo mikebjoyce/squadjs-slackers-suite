@@ -4,3 +4,4 @@ testing/tools/mergedFinal.jsonl
 /testing/tools
 *.jsonl
 *.txt
+plugins/base-plugin.js
