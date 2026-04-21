@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                      SA-DATABASE v0.2.5                       ║
+ * ║                      SA-DATABASE v0.2.7                       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -153,20 +153,20 @@ export default class SADatabase {
     }
   }
 
-  async clearReconnectMemory() {
-    if (!this.ReconnectMemoryModel) return;
-    
-    try {
-      await this._executeWithRetry(async () => {
-        return await this.sequelize.transaction(async (t) => {
-          await this.ReconnectMemoryModel.destroy({ truncate: true, transaction: t });
-        });
-      });
-      Logger.verbose('SmartAssign', 1, '[DB] Reconnect memory cleared for new round.');
-    } catch (err) {
-      Logger.verbose('SmartAssign', 1, `[DB] clearReconnectMemory failed: ${err.message}`);
-    }
-  }
+   async clearReconnectMemory() {
+     if (!this.ReconnectMemoryModel) return;
+     
+     try {
+       await this._executeWithRetry(async () => {
+         return await this.sequelize.transaction(async (t) => {
+           await this.ReconnectMemoryModel.destroy({ truncate: true, transaction: t });
+         });
+       });
+       Logger.verbose('SmartAssign', 2, '[DB] Reconnect memory cleared for new round.');
+     } catch (err) {
+       Logger.verbose('SmartAssign', 1, `[DB] clearReconnectMemory failed: ${err.message}`);
+     }
+   }
 
   async savePlayerDisconnect(steamID, teamID) {
     if (!this.ReconnectMemoryModel || !steamID) return;
@@ -234,17 +234,17 @@ export default class SADatabase {
              transaction: t
            });
 
-           // Prune round start time if old
-           const state = await this.SmartAssignStateModel.findByPk(1, { transaction: t });
-           if (state && state.roundStartTime && Number(state.roundStartTime) < twelveHoursAgo) {
-             state.roundStartTime = null;
-             await state.save({ transaction: t });
-             Logger.verbose('SmartAssign', 1, '[DB] Reset stale round start time.');
-           }
+            // Prune round start time if old
+            const state = await this.SmartAssignStateModel.findByPk(1, { transaction: t });
+            if (state && state.roundStartTime && Number(state.roundStartTime) < twelveHoursAgo) {
+              state.roundStartTime = null;
+              await state.save({ transaction: t });
+              Logger.verbose('SmartAssign', 2, '[DB] Reset stale round start time.');
+            }
 
-           if (prunedReconnects > 0) {
-             Logger.verbose('SmartAssign', 1, `[DB] Cleanup complete. Pruned ${prunedReconnects} old reconnect records.`);
-           }
+            if (prunedReconnects > 0) {
+              Logger.verbose('SmartAssign', 2, `[DB] Cleanup complete. Pruned ${prunedReconnects} old reconnect records.`);
+            }
          });
        });
      } catch (err) {
