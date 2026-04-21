@@ -1,14 +1,31 @@
 /**
- * JOIN-SWAP-TESTER MINIMALIST CONFIG:
- * 
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║                  JOIN-SWAP-TESTER v1.1.0                     ║
+ * ║                 TESTING/DIAGNOSTICS ONLY - NOT FOR PRODUCTION ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Full-lifecycle telemetry plugin for profiling join-swap timing and
+ * disconnect detection. Targets a specific player and logs detailed
+ * performance metrics for SmartAssign validation.
+ *
+ * ⚠️  WARNING: This file is located in testing/ and is intended for
+ *     development and diagnostic use only. Do NOT deploy to production.
+ *
+ * ─── MINIMALIST CONFIG ────────────────────────────────────────────
+ *
  * {
  *   "plugin": "JoinSwapTester",
- *   "enabled": true
+ *   "enabled": true,
+ *   "targetEOSID": "player-eos-id-here"
  * }
+ *
+ * ═══════════════════════════════════════════════════════════════
  */
 
 import Logger from '../../core/logger.js';
-import BasePlugin from './base-plugin.js';
+import BasePlugin from '../plugins/base-plugin.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
 
 export default class JoinSwapTester extends BasePlugin {

@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                      SA-DATABASE v0.2.4                       ║
+ * ║                      SA-DATABASE v0.2.5                       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -19,6 +19,7 @@
  *     clearReconnectMemory()            — Wipes all disconnected player records.
  *     savePlayerDisconnect(steamID, team) — Saves a player's team state.
  *     getReconnectTeam(steamID)         — Retrieves a returning player's team.
+ *     getAllReconnectMemory()           — Bulk loads all reconnect records into a Map (for crash recovery).
  *     cleanupOldData()                  — Prunes records older than 12 hours.
  *
  * Author:
@@ -200,36 +201,54 @@ export default class SADatabase {
     }
   }
 
-  async cleanupOldData() {
-    if (!this.ReconnectMemoryModel || !this.SmartAssignStateModel) return;
+   async getAllReconnectMemory() {
+     if (!this.ReconnectMemoryModel) return new Map();
 
-    const twelveHoursAgo = Date.now() - 12 * 60 * 60 * 1000;
-    try {
-      await this._executeWithRetry(async () => {
-        return await this.sequelize.transaction(async (t) => {
-          // Prune reconnect memory
-          const prunedReconnects = await this.ReconnectMemoryModel.destroy({
-            where: {
-              disconnectTime: { [Sequelize.Op.lt]: twelveHoursAgo }
-            },
-            transaction: t
-          });
+     try {
+       return await this._executeWithRetry(async () => {
+         const records = await this.ReconnectMemoryModel.findAll();
+         const reconnectMap = new Map();
+         for (const record of records) {
+           reconnectMap.set(record.steamID, record.teamID);
+         }
+         return reconnectMap;
+       });
+     } catch (err) {
+       Logger.verbose('SmartAssign', 1, `[DB] getAllReconnectMemory failed: ${err.message}`);
+       return new Map();
+     }
+   }
 
-          // Prune round start time if old
-          const state = await this.SmartAssignStateModel.findByPk(1, { transaction: t });
-          if (state && state.roundStartTime && Number(state.roundStartTime) < twelveHoursAgo) {
-            state.roundStartTime = null;
-            await state.save({ transaction: t });
-            Logger.verbose('SmartAssign', 1, '[DB] Reset stale round start time.');
-          }
+   async cleanupOldData() {
+     if (!this.ReconnectMemoryModel || !this.SmartAssignStateModel) return;
 
-          if (prunedReconnects > 0) {
-            Logger.verbose('SmartAssign', 1, `[DB] Cleanup complete. Pruned ${prunedReconnects} old reconnect records.`);
-          }
-        });
-      });
-    } catch (err) {
-      Logger.verbose('SmartAssign', 1, `[DB] cleanupOldData failed: ${err.message}`);
-    }
-  }
+     const twelveHoursAgo = Date.now() - 12 * 60 * 60 * 1000;
+     try {
+       await this._executeWithRetry(async () => {
+         return await this.sequelize.transaction(async (t) => {
+           // Prune reconnect memory
+           const prunedReconnects = await this.ReconnectMemoryModel.destroy({
+             where: {
+               disconnectTime: { [Sequelize.Op.lt]: twelveHoursAgo }
+             },
+             transaction: t
+           });
+
+           // Prune round start time if old
+           const state = await this.SmartAssignStateModel.findByPk(1, { transaction: t });
+           if (state && state.roundStartTime && Number(state.roundStartTime) < twelveHoursAgo) {
+             state.roundStartTime = null;
+             await state.save({ transaction: t });
+             Logger.verbose('SmartAssign', 1, '[DB] Reset stale round start time.');
+           }
+
+           if (prunedReconnects > 0) {
+             Logger.verbose('SmartAssign', 1, `[DB] Cleanup complete. Pruned ${prunedReconnects} old reconnect records.`);
+           }
+         });
+       });
+     } catch (err) {
+       Logger.verbose('SmartAssign', 1, `[DB] cleanupOldData failed: ${err.message}`);
+     }
+   }
 }

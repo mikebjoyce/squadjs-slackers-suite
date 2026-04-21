@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v0.2.4                   ║
+ * ║                  SMART ASSIGN PLUGIN v0.2.5                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -41,7 +41,7 @@
  * - Algorithm uses a Mu-based Unified Scoring System:
  *     1. Hard Pop Cap: Prevents imbalance beyond dynamic thresholds.
  *     2. Mu Balancing: Weights the average skill gap (3.0x) against a dynamically scaled sum gap (1.5x) to handle diverse pop states.
- *     3. Reconnect Priority: If reconnect memory exists and the pop cap allows it, the player is sent to their previous team immediately (before Elo scoring).
+ *     3. Reconnect Priority: Hot-path reconnect memory lives in-memory (_reconnectMemory Map) for synchronous lookups. If the player has a reconnect record and the pop cap allows it, they're sent to their previous team immediately (before Elo scoring). On disconnect, the Map is updated synchronously and the DB is written async (fire-and-forget) for crash recovery.
  *     4. Reconnect Bias: If reconnect priority is blocked by the cap, applies a minor score reduction (0.25) toward the previous team to tip near-ties.
  *     5. Reconnect Bonus: Grants an *additional* +2 player imbalance allowance on top of the base for returning players.
  * - Strict 1-player max imbalance enforced at high population (94+).
@@ -123,7 +123,7 @@ export default class SmartAssign extends BasePlugin {
 
     this.db = new SADatabase(server, options, connectors);
     this.executor = new SASwapExecutor(server, {
-      retryIntervalMs: 150,
+      retryIntervalMs: 50,
       maxCompletionTimeMs: 3000
     });
 
@@ -141,6 +141,23 @@ export default class SmartAssign extends BasePlugin {
     // Promise queue and in-memory batch array to optimise disk I/O when streaming logs
     this._logWriteQueue = Promise.resolve();
     this._eventBatch = [];
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // OPTIMIZATION: In-Memory Reconnect Memory Map
+    // 
+    // Purpose: Replace the synchronous await-on-DB bottleneck for reconnect lookups
+    //          with a fast in-memory Map that reads from player history.
+    // 
+    // Architecture:
+    //   - Stored in-memory during the round (_reconnectMemory Map)
+    //   - Written to DB asynchronously (fire-and-forget) on disconnect
+    //   - Synced back from DB on crash recovery via getAllReconnectMemory()
+    //   - Cleared on NEW_GAME alongside DB clear
+    // 
+    // Impact: The join-swap pipeline no longer awaits a DB read. The only I/O
+    //         on join is now evaluateTeamAssignment() + queueMove(), both synchronous.
+    // ═══════════════════════════════════════════════════════════════════════════
+    this._reconnectMemory = new Map();
 
     this.eloTracker = null;
     this._eloNotReadyWarned = false;
@@ -202,6 +219,13 @@ export default class SmartAssign extends BasePlugin {
       this.currentRoundStartTime = Number(persistedStartTime);
       this._snapshotTaken = true; // Assume snapshot exists in temp log
       await this.loadTempEvents();
+      
+      // ─ CRASH RECOVERY: Hydrate in-memory reconnect memory from DB
+      // On crash recovery, we resume the same round, so the reconnect memory
+      // that was persisted to the DB during the crashed session is still valid.
+      // Load it into memory to avoid awaiting DB reads during subsequent joins.
+      this._reconnectMemory = await this.db.getAllReconnectMemory();
+      Logger.verbose('SmartAssign', 1, `Hydrated ${this._reconnectMemory.size} reconnect records on restart.`);
     } else {
       // New round or no data
       Logger.verbose('SmartAssign', 1, 'New round or no persisted state. Starting fresh.');
@@ -283,6 +307,10 @@ export default class SmartAssign extends BasePlugin {
     this._pendingMu[1] = 0;
     this._pendingMu[2] = 0;
     this._pendingPlayerMoves.clear();
+    
+    // Clear in-memory reconnect memory alongside DB clear (synchronized in onNewGame above)
+    // This ensures the new round starts fresh with no reconnect history.
+    this._reconnectMemory.clear();
   }
 
   async onRoundEnded(info) {
@@ -517,43 +545,32 @@ export default class SmartAssign extends BasePlugin {
        }
 
        // ═══════════════════════════════════════════════════════════════════════════
-       // TIMING INSTRUMENTATION FOR TASK 1: ELO CALCULATION LATENCY TESTING
-       // Purpose: Measure the duration of each phase in the join-swap pipeline to
-       //          ensure the full sequence completes under the 3-second hard timeout.
+       // OPTIMIZATION: Fast In-Memory Reconnect Lookup
        // 
-       // Phases Tracked:
-       //   1. getReconnectTeam() — SQLite read (potential bottleneck under lock contention)
-       //   2. evaluateTeamAssignment() — synchronous O(n) loop + Elo scoring (should be <1ms)
-       //   3. queueMove() to executor — queue insertion (negligible overhead)
-       // 
-       // Usage: Enable via verbosity level 3-4 in logs to see per-join phase times.
-       //        This helps validate that the algorithm completes fast enough to meet
-       //        the <3s verified swap guarantee on live servers under real load.
-       // 
-       // Maintainability Note: This instrumentation is designed to be easily toggled
-       //        (set _enableTimingInstrumentation or remove these Logger calls).
-       //        The actual timings do not block or slow down execution.
+       // After adding in-memory reconnect memory, the getReconnectTeam() call is now
+       // just a synchronous Map lookup instead of an async DB read. This removes the
+       // last await from the join-swap pipeline.
        // ═══════════════════════════════════════════════════════════════════════════
 
        const phaseStartTime = Date.now();
        const timemarks = {};
 
-       // Evaluate ideal team assignment
+       // Evaluate ideal team assignment — read reconnect memory synchronously from Map
        const reconnectTeamStart = Date.now();
-       const reconnectTeam = await this.db.getReconnectTeam(player.steamID);
+       const reconnectTeam = this._reconnectMemory.get(player.steamID) || null;
        timemarks.reconnectTeamMs = Date.now() - reconnectTeamStart;
 
        // 2. STALE-STATE BATCHING PROTECTION
-       // JS single-threaded guarantee: once getReconnectTeam() resolves, execution
-       // runs synchronously through evaluate + increment before yielding again.
-       // Concurrent joins are safe because no await exists between evaluate and increment.
+       // JS single-threaded guarantee: once reconnect memory lookup resolves (synchronously),
+       // execution runs synchronously through evaluate + increment before yielding again.
+       // Concurrent joins are safe because no await exists between reconnect lookup and increment.
        const evalStart = Date.now();
        const { targetTeam, reason } = this.evaluateTeamAssignment(player, reconnectTeam);
        timemarks.evaluateMs = Date.now() - evalStart;
        timemarks.totalPipelineMs = Date.now() - phaseStartTime;
 
        // Log timing details at verbosity 3 for detailed performance monitoring
-       Logger.verbose('SmartAssign', 3, `[TIMING] ${player.name} join pipeline: reconnect=${timemarks.reconnectTeamMs}ms, evaluate=${timemarks.evaluateMs}ms, total=${timemarks.totalPipelineMs}ms`);
+       Logger.verbose('SmartAssign', 3, `[TIMING] ${player.name} join pipeline: reconnect=${timemarks.reconnectTeamMs}ms (in-memory), evaluate=${timemarks.evaluateMs}ms, total=${timemarks.totalPipelineMs}ms`);
 
       if (reconnectTeam && reconnectTeam === targetTeam) {
         Logger.verbose('SmartAssign', 2, `[SmartAssign] Applied reconnect memory for ${player.name} -> Team ${targetTeam} (${reason})`);
@@ -608,6 +625,10 @@ export default class SmartAssign extends BasePlugin {
     // Save to reconnect memory if they were on a valid team
     const tid = Number(player.teamID);
     if (tid === 1 || tid === 2) {
+      // ─ OPTIMIZATION: Write to both in-memory Map and DB
+      // In-memory write is immediate (synchronous), providing fast lookups on rejoin.
+      // DB write is fire-and-forget asynchronous so it doesn't block the event pipeline.
+      this._reconnectMemory.set(player.steamID, tid);
       await this.db.savePlayerDisconnect(player.steamID, tid);
     }
   }

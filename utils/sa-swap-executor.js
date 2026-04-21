@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SA-SWAP-EXECUTOR v0.2.4                    ║
+ * ║                    SA-SWAP-EXECUTOR v0.2.5                    ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -69,28 +69,30 @@ export default class SASwapExecutor {
     return false;
   }
 
-  queueMove(steamID, targetTeamID) {
-    if (!steamID || !targetTeamID) return;
-    if (this.pendingPlayerMoves.has(steamID)) return;
+   queueMove(steamID, targetTeamID) {
+     if (!steamID || !targetTeamID) return;
+     if (this.pendingPlayerMoves.has(steamID)) return;
 
-    this.pendingPlayerMoves.set(steamID, {
-      targetTeamID,
-      attempts: 0,
-      commandSent: false,       // Tracks whether an RCON command has been sent (reserved for diagnostics).
-      awaitingVerification: false, // State lock: true while we wait for the post-command updatePlayerList() to resolve.
-      startTime: Date.now()
-    });
+     this.pendingPlayerMoves.set(steamID, {
+       targetTeamID,
+       attempts: 0,
+       commandSent: false,       // Tracks whether an RCON command has been sent (reserved for diagnostics).
+       awaitingVerification: false, // State lock: true while we wait for the post-command updatePlayerList() to resolve.
+       startTime: Date.now()
+     });
 
-    Logger.verbose('SmartAssign', 4, `[SwapExecutor] Queued move for ${steamID} -> ${targetTeamID}`);
+     Logger.verbose('SmartAssign', 4, `[SwapExecutor] Queued move for ${steamID} -> ${targetTeamID}`);
 
-    if (!this.retryTimer) {
-      this.startMonitoring();
-    } else {
-      this.processRetries().catch((err) => {
-        Logger.verbose('SmartAssign', 2, `[SwapExecutor] Retry error: ${err?.message}`);
-      });
-    }
-  }
+     if (!this.retryTimer) {
+       this.startMonitoring();
+     }
+     
+     // Fire the first RCON command immediately instead of waiting for the first timer tick.
+     // This eliminates the 0-150ms initial delay, reducing the join-swap window significantly.
+     this.processRetries().catch((err) => {
+       Logger.verbose('SmartAssign', 2, `[SwapExecutor] First-fire error: ${err?.message}`);
+     });
+   }
 
   startMonitoring() {
     this.retryTimer = setInterval(() => {
@@ -162,9 +164,6 @@ export default class SASwapExecutor {
                 continue;
              }
           }
-
-          // Rate limit retries to 1s
-          if (moveData.attempts > 0 && now - moveData.lastCommandTime < 1000) continue;
 
           moveData.attempts++;
           moveData.lastCommandTime = now;
