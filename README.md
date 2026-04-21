@@ -64,12 +64,16 @@ Add this to your `config.json` inside the `plugins` array.
 ```
 squad-server/
 ├── plugins/
-│   ├── smart-assign.js
-│   └── join-swap-tester.js   ← optional diagnostic tool
+│   └── smart-assign.js
 ├── utils/
 │   ├── sa-database.js
 │   └── sa-swap-executor.js
+├── testing/                    ← Optional: diagnostic tools only
+│   ├── join-swap-tester.js
+│   └── unified-test-runner.js
 ```
+
+⚠️ **IMPORTANT**: Do NOT deploy the `testing/` folder to production servers. The `testing/` directory contains diagnostic and simulation tools intended only for development and validation. Production deployments should include only the `plugins/` and `utils/` directories.
 
 ---
 
