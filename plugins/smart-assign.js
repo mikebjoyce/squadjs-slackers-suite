@@ -302,6 +302,7 @@ export default class SmartAssign extends BasePlugin {
     // to persist across rounds to accurately track total server session length.
     this.knownPlayers.clear();
     this._joiningPlayers.clear();
+    this.initialSyncComplete = false;
     this._pendingAssignments[1] = 0;
     this._pendingAssignments[2] = 0;
     this._pendingMu[1] = 0;
