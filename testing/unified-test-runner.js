@@ -57,6 +57,10 @@ class MockServer {
   getPlayerBySteamID(steamID) {
     return this.players.find(p => p.steamID === steamID);
   }
+  async updatePlayerList() {
+    // No-op stub: in production this forces an RCON poll. 
+    // In tests, player list is managed directly by the simulation.
+  }
 }
 
 class EloTracker {
