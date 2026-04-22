@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v0.2.7                   ║
+ * ║                  SMART ASSIGN PLUGIN v0.2.8                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -510,7 +510,7 @@ export default class SmartAssign extends BasePlugin {
     for (const p of this.server.players) {
       if (!p.steamID) continue;
 
-      if (!this.knownPlayers.has(p.steamID)) {
+      if (!this.knownPlayers.has(p.steamID) && !this._joiningPlayers.has(p.steamID)) {
         batchPromises.push(this.handlePlayerJoin(p));
       } else {
         const kp = this.knownPlayers.get(p.steamID);
@@ -996,19 +996,41 @@ export default class SmartAssign extends BasePlugin {
     * round is still being finalized. The snapshot must always represent the state at true round start,
     * not at server staging.
     */
-   async _ensureSnapshot() {
-     // Guard: Do not snapshot during the between-rounds window (after ROUND_ENDED, before NEW_GAME).
-     // This prevents capturing false snapshots with new layer names while the previous round finalizes.
-     if (this._betweenRounds) return;
-     
-     if (this._snapshotTaken) return;
+    async _ensureSnapshot() {
+      // Guard: Do not snapshot during the between-rounds window (after ROUND_ENDED, before NEW_GAME).
+      // This prevents capturing false snapshots with new layer names while the previous round finalizes.
+      if (this._betweenRounds) return;
+      
+      if (this._snapshotTaken) return;
 
-     const currentLayerName = this.server.currentLayer ? this.server.currentLayer.name : 'Unknown';
-     if (currentLayerName === 'Unknown') return;
+      const currentLayerName = this.server.currentLayer ? this.server.currentLayer.name : 'Unknown';
+      if (currentLayerName === 'Unknown') return;
 
-    // Lock the snapshot immediately before any await yields to prevent race conditions 
-    // from concurrent promise batches hitting this method simultaneously.
-    this._snapshotTaken = true;
+      // ═══════════════════════════════════════════════════════════════════════════════════════════
+      // CRITICAL TIMING GUARD: Defer snapshot if RCON team data is not yet stable
+      //
+      // When NEW_GAME fires, the round has just transitioned. However, Squad's RCON ListPlayers
+      // output may still reflect the transitional state where all players have teamID=null before
+      // the server assigns them to teams for the new round. If we snapshot at this exact moment,
+      // we capture ~93 players with null teams, which corrupts the ROUND_SNAPSHOT record.
+      //
+      // This guard mirrors the safe-sync handshake in onUpdatedPlayerInfo: we defer snapshot
+      // completion until at least one real team assignment (1 or 2) is visible in RCON data.
+      // The snapshot will then fire on the next UPDATED_PLAYER_INFORMATION tick when RCON has
+      // refreshed with real team data (typically 5–30s after round start), ensuring accuracy.
+      //
+      // ─ Root Cause: Race condition between NEW_GAME event and RCON refresh cycle
+      // ─ Impact: Prevents null-team snapshots; sacrifice is minor timing delay (one RCON poll)
+      // ═══════════════════════════════════════════════════════════════════════════════════════════
+      const hasRealTeams = this.server.players.some(p => p.teamID === 1 || p.teamID === 2);
+      if (!hasRealTeams) {
+        Logger.verbose('SmartAssign', 3, `Snapshot deferred: RCON team data not yet stable for layer ${currentLayerName}. Will retry on next UPDATED_PLAYER_INFORMATION tick.`);
+        return;
+      }
+
+     // Lock the snapshot immediately before any await yields to prevent race conditions 
+     // from concurrent promise batches hitting this method simultaneously.
+     this._snapshotTaken = true;
     
     // Cache the layer name for use in finalizeRoundLog()
     // This ensures we record the correct layer even if it becomes 'Unknown' during round transition
