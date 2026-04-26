@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v0.2.8                   ║
+ * ║                  SMART ASSIGN PLUGIN v0.2.9                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -133,6 +133,7 @@ export default class SmartAssign extends BasePlugin {
     this._snapshotTaken = false;
     this._betweenRounds = false;
     this.currentLayerName = null;
+    this.currentGamemode = null;
     this._pendingAssignments = { 1: 0, 2: 0 };
     this._pendingMu = { 1: 0, 2: 0 };
     this._pendingPlayerMoves = new Map();
@@ -143,6 +144,18 @@ export default class SmartAssign extends BasePlugin {
     // Promise queue and in-memory batch array to optimise disk I/O when streaming logs
     this._logWriteQueue = Promise.resolve();
     this._eventBatch = [];
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // OPTIMIZATION: Debounced Forced RCON Poll
+    //
+    // Purpose: Prevent burst joins from triggering multiple overlapping updatePlayerList() calls.
+    //          Instead, coalesce rapid joins into a single poll with a 250ms debounce window.
+    //
+    // Impact: When 5–10 players join within 200ms (common post-round rush), we fire one poll
+    //         instead of 5–10, while still maintaining the full side-effect benefit (disconnect
+    //         detection speedup) and the primary benefit (fresh data for executor verification).
+    // ═══════════════════════════════════════════════════════════════════════════
+    this._pendingPlayerListUpdate = null;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // OPTIMIZATION: In-Memory Reconnect Memory Map
@@ -160,6 +173,20 @@ export default class SmartAssign extends BasePlugin {
     //         on join is now evaluateTeamAssignment() + queueMove(), both synchronous.
     // ═══════════════════════════════════════════════════════════════════════════
     this._reconnectMemory = new Map();
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DEFERRED SNAPSHOT MECHANISM
+    //
+    // Purpose: Flag set at NEW_GAME to trigger snapshot on next UPDATED_PLAYER_INFORMATION
+    //          tick when RCON has stabilized (≥90% team resolution ratio).
+    //
+    // Workflow:
+    //   1. NEW_GAME sets _snapshotPendingSince = Date.now()
+    //   2. onUpdatedPlayerInfo checks ratio gate on each tick
+    //   3. Once ratio >= 90%, snapshot fires and flag is cleared
+    //   4. ROUND_ENDED clears it preemptively for round transition safety
+    // ═══════════════════════════════════════════════════════════════════════════
+    this._snapshotPendingSince = null;
 
     this.eloTracker = null;
     this._eloNotReadyWarned = false;
@@ -209,8 +236,8 @@ export default class SmartAssign extends BasePlugin {
     const threeHours = 3 * 60 * 60 * 1000;
     if (
       persistedStartTime &&
-      serverRoundStart &&
-      Math.abs(Number(persistedStartTime) - Number(serverRoundStart)) < threeHours
+      (!serverRoundStart ||
+      Math.abs(Number(persistedStartTime) - Number(serverRoundStart)) < threeHours)
     ) {
       // It's a resume.
       Logger.verbose(
@@ -259,6 +286,7 @@ export default class SmartAssign extends BasePlugin {
     this.ready = false;
     if (this.cleanupInterval) clearInterval(this.cleanupInterval);
     if (this._batchFlushTimer) clearInterval(this._batchFlushTimer);
+    if (this._pendingPlayerListUpdate) clearTimeout(this._pendingPlayerListUpdate);
     await this.finalizeRoundLog();
     this.server.removeListener('NEW_GAME', this.onNewGame);
     this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
@@ -271,13 +299,53 @@ export default class SmartAssign extends BasePlugin {
     this._pendingPlayerMoves.clear();
     this.executor.cleanup();
     Logger.verbose('SmartAssign', 1, 'SmartAssign unmounted.');
-    await super.unmount();
-  }
+     await super.unmount();
+   }
 
+   /**
+    * PRIVATE: Debounced forced player list update.
+    * 
+    * Debounces rapid consecutive calls into a single 250ms-delayed updatePlayerList() poll.
+    * If another call arrives within the 250ms window, the timer resets (standard debounce).
+    * 
+    * Scheduled from onPlayerConnected to refresh RCON state after a join event fires,
+    * providing fresh data for SASwapExecutor's post-command verification step.
+    */
+   _schedulePlayerListUpdate() {
+     if (this._pendingPlayerListUpdate) {
+       clearTimeout(this._pendingPlayerListUpdate);
+     }
+     Logger.verbose('SmartAssign', 3, '[Debounce] Scheduled/rescheduled player list update for 250ms window.');
+     this._pendingPlayerListUpdate = setTimeout(async () => {
+       this._pendingPlayerListUpdate = null;
+       try {
+         await this.server.updatePlayerList();
+       } catch (err) {
+         Logger.verbose('SmartAssign', 1, `[SmartAssign] Debounced player list update failed: ${err.message}`);
+       }
+     }, 250);
+   }
+
+   // ═══════════════════════════════════════════════════════════════════════════════════
+   // EVENT: NEW_GAME (Round Start)
+ REPLACE
+
+  //
+  // Fired when a new round begins (after map load, after staging phase completes).
+  // Primary responsibilities:
+  //   1. Finalize the previous round's log BEFORE updating startTime (Bug 3 fix)
+  //   2. Clear all per-round state (known players, pending assignments, etc.)
+  //   3. Set _snapshotPendingSince flag to defer snapshot until RCON stabilizes (Bug 1 fix)
+  //   4. Clear the between-rounds suppression flag
+  // ═══════════════════════════════════════════════════════════════════════════════════
   async onNewGame(info) {
     if (!this.ready) return;
-    Logger.verbose('SmartAssign', 1, 'NEW_GAME detected. Finalizing previous round log.');
+    Logger.verbose('SmartAssign', 1, 'NEW_GAME detected. Finalizing previous round log with current startTime.');
 
+    // CRITICAL TIMING: Finalize the previous round's log BEFORE updating currentRoundStartTime.
+    // This ensures the finalized JSONL line captures the previous round's correct startTime.
+    // After finalization completes, we then update currentRoundStartTime for the new round.
+    // (Bug 3 fix: was using server.matchStartTime which predates finalization)
     await this.finalizeRoundLog();
 
     // Restart the log flush timer if it was stopped by finalizeRoundLog
@@ -287,8 +355,14 @@ export default class SmartAssign extends BasePlugin {
       }, 15000);
     }
 
+    // Clear any pending debounced player list update
+    if (this._pendingPlayerListUpdate) {
+      clearTimeout(this._pendingPlayerListUpdate);
+      this._pendingPlayerListUpdate = null;
+    }
+
     await this.db.clearReconnectMemory();
-    const now = this.server.matchStartTime ? this.server.matchStartTime.getTime() : Date.now();
+    const now = Date.now();
     await this.db.saveRoundStartTime(now);
     this.currentRoundStartTime = now;
     this._snapshotTaken = false;
@@ -310,30 +384,51 @@ export default class SmartAssign extends BasePlugin {
     this._reconnectMemory.clear();
     
     // ═════════════════════════════════════════════════════════════════════════════════════
-    // CRITICAL TIMING: Clear the between-rounds flag BEFORE calling _ensureSnapshot().
+    // CRITICAL TIMING: Clear the between-rounds flag BEFORE setting the snapshot pending flag.
     // 
     // The between-rounds window spans: ROUND_ENDED → staging phase → NEW_GAME.
-    // During this window, the map changes and the layer name updates. If _ensureSnapshot()
-    // were called while _betweenRounds is still true, the guard would prevent the snapshot
-    // from firing. By clearing the flag here (before _ensureSnapshot()), we ensure the
-    // snapshot captures the new round with the correct layer name.
+    // During this window, the map changes and the layer name updates. By clearing the flag
+    // here (before the snapshot), we ensure the snapshot can fire and captures the new round 
+    // with the correct layer name.
     // ═════════════════════════════════════════════════════════════════════════════════════
     this._betweenRounds = false;
 
-    // NOTE: This call to _ensureSnapshot() is intentional. In SquadJS, the layer name 
-    // may be 'Unknown' during NEW_GAME, which causes the snapshot to safely abort 
-    // and wait for the first player update. However, if the layer is known, it takes 
-    // the snapshot immediately to catch it as early as possible.
-    await this._ensureSnapshot();
-
+    // ═════════════════════════════════════════════════════════════════════════════════════
+    // ROUND START SNAPSHOT: Defer snapshot until RCON stabilizes (Bug 1 fix)
+    //
+    // Instead of forcing an immediate updatePlayerList() + snapshot (which fires during
+    // unstable RCON state), we set a pending flag here. The snapshot will fire on the next
+    // UPDATED_PLAYER_INFORMATION tick once the 90% resolution ratio gate passes.
+    //
+    // This ensures we capture a representative, fully-resolved player state instead of
+    // a transient one with many null team assignments.
+    // ═════════════════════════════════════════════════════════════════════════════════════
+    this._snapshotPendingSince = Date.now();
+    Logger.verbose('SmartAssign', 2, '[NewGame] Pending snapshot flag set. Awaiting ≥90% team resolution from RCON.');
+    
+    // Reset layer name cache so snapshot captures the new round's layer
     this.currentLayerName = null;
+    this.currentGamemode = null;
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════════════
+  // EVENT: ROUND_ENDED (Round Finalization)
+  //
+  // Fired when the round ends (before map change, before staging phase).
+  // Primary responsibilities:
+  //   1. Clear snapshot flag to discard any unfired pending snapshot
+  //   2. Set between-rounds flag to suppress player events during map transition
+  // ═══════════════════════════════════════════════════════════════════════════════════
   async onRoundEnded(info) {
     if (!this.ready) return;
-    Logger.verbose('SmartAssign', 1, 'ROUND_ENDED detected. Finalizing round log.');
-    await this.finalizeRoundLog();
+    Logger.verbose('SmartAssign', 1, 'ROUND_ENDED detected. Between-rounds window started.');
+    
     this._snapshotTaken = false;
+    
+    // Discard any unfired pending snapshot from this round to prevent accidental 
+    // captures of stale data during round transitions.
+    this._snapshotPendingSince = null;
+    Logger.verbose('SmartAssign', 3, '[RoundEnded] Cleared snapshot pending flag. Any unfired snapshot deferred to next round.');
     
     // ═════════════════════════════════════════════════════════════════════════════════════
     // BETWEEN-ROUNDS WINDOW: Set flag to suppress player events.
@@ -351,8 +446,14 @@ export default class SmartAssign extends BasePlugin {
     // to true here, we ensure:
     //   - _ensureSnapshot() guards itself and doesn't take a premature snapshot with the new layer name
     //   - Events are marked with betweenRounds=true for proper historical attribution
+    // 
+    // CRITICAL: We do NOT finalize the round log here. Instead, we let between-rounds events
+    // accumulate into currentRoundEvents alongside any remaining round events. The finalization
+    // happens in onNewGame() BEFORE updating currentRoundStartTime, ensuring the previous
+    // round's JSONL line captures the correct startTime and includes all between-rounds events.
     // ═════════════════════════════════════════════════════════════════════════════════════
     this._betweenRounds = true;
+    Logger.verbose('SmartAssign', 3, '[RoundEnded] Set _betweenRounds=true to suppress events during map transition.');
   }
 
   async onScrambleExecuted() {
@@ -395,15 +496,15 @@ export default class SmartAssign extends BasePlugin {
     }
   }
 
-   async onMoveRetry(data) {
-     if (!this.ready) return;
-     const { steamID, attempt, method } = data;
-     const p = this.server.players.find((x) => x.steamID === steamID);
-     if (p) {
-       Logger.verbose('SmartAssign', 3, `[SmartAssign] Retrying move for ${p.name} (${steamID}) | Attempt: ${attempt} | Method: ${method}`);
-       this.logEvent('MOVE_RETRY', p, { attempt, method }, this._betweenRounds);
-     }
-   }
+  async onMoveRetry(data) {
+    if (!this.ready) return;
+    const { steamID, attempt, method } = data;
+    const p = this.server.players.find((x) => x.steamID === steamID);
+    if (p) {
+      Logger.verbose('SmartAssign', 3, `[SmartAssign] Retrying move for ${p.name} (${steamID}) | Attempt: ${attempt} | Method: ${method}`);
+      this.logEvent('MOVE_RETRY', p, { attempt, method }, this._betweenRounds);
+    }
+  }
 
   async onPlayerConnected(info) {
     if (!this.ready) return;
@@ -411,7 +512,7 @@ export default class SmartAssign extends BasePlugin {
     if (!p || !p.steamID) return;
 
     /**
-     * DESIGN DECISION: Forced Join Refresh
+     * DESIGN DECISION: Debounced Forced Join Refresh
      *
      * Intentionally NOT awaited. The move is queued immediately below using the
      * SteamID from the Log Parser event (before RCON even knows the player exists).
@@ -422,26 +523,79 @@ export default class SmartAssign extends BasePlugin {
      * Side-effect: every forced refresh also reveals other players who have left the
      * server since the last 30s poll cycle, effectively speeding up disconnect detection
      * for everyone on the server whenever anyone joins.
+     *
+     * OPTIMIZATION: The poll is debounced with a 250ms window to coalesce burst joins
+     * (5-10 players within 200ms) into a single poll instead of many overlapping calls.
+     * This preserves all benefits while reducing RCON load during post-round rushes.
      */
-    const updateStart = Date.now();
-    this.server.updatePlayerList().then(() => {
-      Logger.verbose('SmartAssign', 4, `[JoinRefresh] Forced RCON poll completed in ${Date.now() - updateStart}ms`);
-    }).catch((err) => {
-      Logger.verbose('SmartAssign', 1, `[JoinRefresh] Forced update failed on join: ${err.message}`);
-    });
+    this._schedulePlayerListUpdate();
 
     // Trigger join handling immediately using the log-provided player data.
     // The executor will fire the RCON move before the player is even visible
-    // in the ListPlayers array — the forced poll above will catch up shortly after.
+    // in the ListPlayers array — the debounced poll above will catch up shortly after.
     if (!this.knownPlayers.has(p.steamID)) {
       await this.handlePlayerJoin(p);
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════════════
+  // EVENT: UPDATED_PLAYER_INFORMATION (Player Data Sync)
+  //
+  // Fired periodically (roughly every 30s in Squad) as RCON pushes updated player lists.
+  // Primary responsibilities:
+  //   1. Check 90% ratio gate if snapshot pending (Bug 1 fix deferred trigger)
+  //   2. Detect and handle player joins/leaves via delta-diff
+  //   3. Detect and attribute team changes
+  //   4. Early map change detection via snapshot lock
+  // ═══════════════════════════════════════════════════════════════════════════════════
   async onUpdatedPlayerInfo(info) {
     if (!this.ready) return;
     
-    // Catch early map change or initial snapshot
+    // ═════════════════════════════════════════════════════════════════════════════════════
+    // ROUND START SNAPSHOT: ≥90% Resolution Ratio Gate (Bug 1 fix)
+    //
+    // When NEW_GAME fires, _snapshotPendingSince is set as a deferred trigger. On each
+    // UPDATED_PLAYER_INFORMATION tick, we check whether RCON has resolved ≥90% of player
+    // team assignments (i.e. ≥90% have a real teamID of 1 or 2, not null). The 90% threshold
+    // tolerates the rare persistently-unresolved RCON record without deferring indefinitely.
+    //
+    // Once the gate passes, we immediately take the snapshot and clear the pending flag.
+    // All other change-monitoring is suppressed until the snapshot fires to ensure
+    // we capture a stable, fully-representative state.
+    // ═════════════════════════════════════════════════════════════════════════════════════
+    if (!this._snapshotTaken && this._snapshotPendingSince !== null) {
+      const players = this.server.players;
+      const withRealTeam = players.filter(p => p.teamID === 1 || p.teamID === 2).length;
+      const ratio = players.length > 0 ? withRealTeam / players.length : 0;
+      const timePendingMs = Date.now() - this._snapshotPendingSince;
+
+      if (ratio >= 0.90) {
+        // ≥90% resolved and not in the between-rounds suppression window — take snapshot now.
+        // Guard _betweenRounds BEFORE clearing the pending flag: if _ensureSnapshot() returns
+        // early due to the between-rounds guard, the flag would be consumed with no snapshot taken.
+        // NEW_GAME will re-set the flag, so recovery happens, but the snapshot for the short
+        // round is silently lost. Check the window first to prevent premature consumption.
+        if (!this._betweenRounds) {
+          Logger.verbose('SmartAssign', 2,
+            `[Snapshot] Threshold met: ${Math.round(ratio * 100)}% resolved (${withRealTeam}/${players.length}). Capturing now after ${timePendingMs}ms.`
+          );
+          this._snapshotPendingSince = null;
+          await this._ensureSnapshot();
+          return; // Exit early; don't process changes until snapshot is locked
+        } else {
+          Logger.verbose('SmartAssign', 3,
+            `[Snapshot] Threshold met (${Math.round(ratio * 100)}%) but _betweenRounds=true. Deferring capture until next round.`
+          );
+        }
+      } else {
+        Logger.verbose('SmartAssign', 4,
+          `[Snapshot] Waiting: ${Math.round(ratio * 100)}% resolved (${withRealTeam}/${players.length}). Threshold is 90%. Pending for ${timePendingMs}ms.`
+        );
+        return; // Defer all other processing until RCON stabilises
+      }
+    }
+
+    // Catch early map change (only if snapshot already taken or no pending snapshot)
     await this._ensureSnapshot();
 
     if (!this.initialSyncComplete) {
@@ -476,13 +630,13 @@ export default class SmartAssign extends BasePlugin {
         }
       }
       
-       // Only mark safe-sync complete when we've confirmed RCON has real team data
-       if (hasRealTeams) {
-         this.initialSyncComplete = true;
-         Logger.verbose('SmartAssign', 1, `Safe-Sync handshake complete. Known players: ${this.knownPlayers.size}. Monitoring for changes.`);
-       } else {
-         Logger.verbose('SmartAssign', 3, `Safe-Sync deferred: RCON data not yet stable (players without real teams). Will retry next tick.`);
-       }
+      // Only mark safe-sync complete when we've confirmed RCON has real team data
+      if (hasRealTeams) {
+        this.initialSyncComplete = true;
+        Logger.verbose('SmartAssign', 1, `Safe-Sync handshake complete. Known players: ${this.knownPlayers.size}. Monitoring for changes.`);
+      } else {
+        Logger.verbose('SmartAssign', 3, `Safe-Sync deferred: RCON data not yet stable (players without real teams). Will retry next tick.`);
+      }
       return;
     }
 
@@ -565,83 +719,81 @@ export default class SmartAssign extends BasePlugin {
     }
   }
 
-   async handlePlayerJoin(player) {
-     await this._ensureSnapshot();
+  async handlePlayerJoin(player) {
+    // 1. DOUBLE-JOIN RACE PROTECTION
+    // Since PLAYER_CONNECTED and UPDATED_PLAYER_INFORMATION both trigger joins,
+    // a synchronous set check is used before any await as a write-lock.
+    if (this._joiningPlayers.has(player.steamID)) return;
+    this._joiningPlayers.add(player.steamID);
 
-     // 1. DOUBLE-JOIN RACE PROTECTION
-     // Since PLAYER_CONNECTED and UPDATED_PLAYER_INFORMATION both trigger joins,
-     // a synchronous set check is used before any await as a write-lock.
-     if (this._joiningPlayers.has(player.steamID)) return;
-     this._joiningPlayers.add(player.steamID);
+    try {
+      // Register to known players
+      this.knownPlayers.set(player.steamID, {
+        steamID: player.steamID,
+        name: player.name,
+        teamID: player.teamID,
+        squadID: player.squadID
+      });
 
-     try {
-       // Register to known players
-       this.knownPlayers.set(player.steamID, {
-         steamID: player.steamID,
-         name: player.name,
-         teamID: player.teamID,
-         squadID: player.squadID
-       });
+      if (!this._sessionJoinTimes.has(player.steamID)) {
+        this._sessionJoinTimes.set(player.steamID, Date.now());
+      }
 
-       if (!this._sessionJoinTimes.has(player.steamID)) {
-         this._sessionJoinTimes.set(player.steamID, Date.now());
-       }
+      Logger.verbose('SmartAssign', 3, `[JOIN] Player connected: ${player.name} (${player.steamID})`);
+      this.logEvent('JOIN', player, {}, this._betweenRounds);
 
-        Logger.verbose('SmartAssign', 3, `[JOIN] Player connected: ${player.name} (${player.steamID})`);
-        this.logEvent('JOIN', player, {}, this._betweenRounds);
+      // Check if the current layer/gamemode is ignored
+      const currentLayerName = this.server.currentLayer && this.server.currentLayer.name ? String(this.server.currentLayer.name).toLowerCase() : '';
+      const currentGamemode = this.server.currentLayer && this.server.currentLayer.gamemode ? String(this.server.currentLayer.gamemode).toLowerCase() : '';
 
-       // Check if the current layer/gamemode is ignored
-       const currentLayerName = this.server.currentLayer && this.server.currentLayer.name ? String(this.server.currentLayer.name).toLowerCase() : '';
-       const currentGamemode = this.server.currentLayer && this.server.currentLayer.gamemode ? String(this.server.currentLayer.gamemode).toLowerCase() : '';
+      const isIgnored = this._ignoredModes.some(m => currentLayerName.includes(m) || currentGamemode.includes(m));
 
-       const isIgnored = this._ignoredModes.some(m => currentLayerName.includes(m) || currentGamemode.includes(m));
+      if (isIgnored) {
+        Logger.verbose('SmartAssign', 3, `[SmartAssign] Ignored game mode detected. Skipping Elo-based assignment for ${player.name}.`);
+        return;
+      }
 
-       if (isIgnored) {
-         Logger.verbose('SmartAssign', 3, `[SmartAssign] Ignored game mode detected. Skipping Elo-based assignment for ${player.name}.`);
-         return;
-       }
+      // Passive mode: skip algorithm and ASSIGNMENT logging entirely
+      if (this.options.enableSmartAssign === false) {
+        Logger.verbose('SmartAssign', 3, `[SmartAssign] Passive mode: algorithm skipped for ${player.name}.`);
+        return;
+      }
 
-       // Passive mode: skip algorithm and ASSIGNMENT logging entirely
-       if (this.options.enableSmartAssign === false) {
-         Logger.verbose('SmartAssign', 3, `[SmartAssign] Passive mode: algorithm skipped for ${player.name}.`);
-         return;
-       }
+      // ═══════════════════════════════════════════════════════════════════════════
+      // OPTIMIZATION: Fast In-Memory Reconnect Lookup
+      // 
+      // After adding in-memory reconnect memory, the reconnect lookup is now
+      // just a synchronous Map lookup instead of an async DB read. This removes the
+      // last await from the join-swap pipeline.
+      // ═══════════════════════════════════════════════════════════════════════════
 
-       // ═══════════════════════════════════════════════════════════════════════════
-       // OPTIMIZATION: Fast In-Memory Reconnect Lookup
-       // 
-       // After adding in-memory reconnect memory, the getReconnectTeam() call is now
-       // just a synchronous Map lookup instead of an async DB read. This removes the
-       // last await from the join-swap pipeline.
-       // ═══════════════════════════════════════════════════════════════════════════
+      const phaseStartTime = Date.now();
+      const timemarks = {};
 
-       const phaseStartTime = Date.now();
-       const timemarks = {};
+      // Evaluate ideal team assignment — read reconnect memory synchronously from Map
+      const reconnectTeamStart = Date.now();
+      const reconnectTeam = this._reconnectMemory.get(player.steamID) || null;
+      timemarks.reconnectTeamMs = Date.now() - reconnectTeamStart;
 
-       // Evaluate ideal team assignment — read reconnect memory synchronously from Map
-       const reconnectTeamStart = Date.now();
-       const reconnectTeam = this._reconnectMemory.get(player.steamID) || null;
-       timemarks.reconnectTeamMs = Date.now() - reconnectTeamStart;
+      // 2. STALE-STATE BATCHING PROTECTION
+      // JS single-threaded guarantee: once reconnect memory lookup resolves (synchronously),
+      // execution runs synchronously through evaluate + increment before yielding again.
+      // Concurrent joins are safe because no await exists between reconnect lookup and increment.
+      const evalStart = Date.now();
+      const { targetTeam, reason } = this.evaluateTeamAssignment(player, reconnectTeam);
+      timemarks.evaluateMs = Date.now() - evalStart;
+      timemarks.totalPipelineMs = Date.now() - phaseStartTime;
 
-       // 2. STALE-STATE BATCHING PROTECTION
-       // JS single-threaded guarantee: once reconnect memory lookup resolves (synchronously),
-       // execution runs synchronously through evaluate + increment before yielding again.
-       // Concurrent joins are safe because no await exists between reconnect lookup and increment.
-       const evalStart = Date.now();
-       const { targetTeam, reason } = this.evaluateTeamAssignment(player, reconnectTeam);
-       timemarks.evaluateMs = Date.now() - evalStart;
-       timemarks.totalPipelineMs = Date.now() - phaseStartTime;
+      // Log timing details at verbosity 3 for detailed performance monitoring
+      Logger.verbose('SmartAssign', 3, `[TIMING] ${player.name} join pipeline: reconnect=${timemarks.reconnectTeamMs}ms (in-memory), evaluate=${timemarks.evaluateMs}ms, total=${timemarks.totalPipelineMs}ms`);
 
-       // Log timing details at verbosity 3 for detailed performance monitoring
-       Logger.verbose('SmartAssign', 3, `[TIMING] ${player.name} join pipeline: reconnect=${timemarks.reconnectTeamMs}ms (in-memory), evaluate=${timemarks.evaluateMs}ms, total=${timemarks.totalPipelineMs}ms`);
-
-       if (reconnectTeam && reconnectTeam === targetTeam) {
-         Logger.verbose('SmartAssign', 3, `[SmartAssign] Applied reconnect memory for ${player.name} -> Team ${targetTeam} (${reason})`);
-       } else if (reconnectTeam && reconnectTeam !== targetTeam) {
-         Logger.verbose('SmartAssign', 3, `[SmartAssign] Ignored reconnect memory for ${player.name} (Previous: Team ${reconnectTeam}) -> Team ${targetTeam} (${reason})`);
-       } else {
-         Logger.verbose('SmartAssign', 3, `[SmartAssign] Evaluated fresh join for ${player.name} -> Team ${targetTeam} (${reason})`);
-       }
+      if (reconnectTeam && reconnectTeam === targetTeam) {
+        Logger.verbose('SmartAssign', 3, `[SmartAssign] Applied reconnect memory for ${player.name} -> Team ${targetTeam} (${reason})`);
+      } else if (reconnectTeam && reconnectTeam !== targetTeam) {
+        Logger.verbose('SmartAssign', 3, `[SmartAssign] Ignored reconnect memory for ${player.name} (Previous: Team ${reconnectTeam}) -> Team ${targetTeam} (${reason})`);
+      } else {
+        Logger.verbose('SmartAssign', 3, `[SmartAssign] Evaluated fresh join for ${player.name} -> Team ${targetTeam} (${reason})`);
+      }
 
       // Log assignment decision
       this.logEvent('ASSIGNMENT', player, {
@@ -676,14 +828,12 @@ export default class SmartAssign extends BasePlugin {
     }
   }
 
-   async handlePlayerLeave(player) {
-     // Synchronously delete session data to prevent memory leaks if awaits below throw or stall.
-     this._sessionJoinTimes.delete(player.steamID);
+  async handlePlayerLeave(player) {
+    // Synchronously delete session data to prevent memory leaks if awaits below throw or stall.
+    this._sessionJoinTimes.delete(player.steamID);
 
-     await this._ensureSnapshot();
-
-     Logger.verbose('SmartAssign', 3, `[LEAVE] Player disconnected: ${player.name} (${player.steamID}) from Team ${player.teamID}`);
-     this.logEvent('LEAVE', player, {}, this._betweenRounds);
+    Logger.verbose('SmartAssign', 3, `[LEAVE] Player disconnected: ${player.name} (${player.steamID}) from Team ${player.teamID}`);
+    this.logEvent('LEAVE', player, {}, this._betweenRounds);
     
     // Save to reconnect memory if they were on a valid team
     const tid = Number(player.teamID);
@@ -697,8 +847,6 @@ export default class SmartAssign extends BasePlugin {
   }
 
   async handleTeamChange(player, oldTeam, newTeam, source = 'Manual/Game') {
-    await this._ensureSnapshot();
-
     if (source === 'Smart-Assign') {
       Logger.verbose('SmartAssign', 2, `[TEAM_CHANGE] Player ${player.name} was moved to Team ${newTeam} by SmartAssign`);
     } else if (source === 'Team-Balancer') {
@@ -958,10 +1106,10 @@ export default class SmartAssign extends BasePlugin {
     // Always load from temp file to get the full round history
     await this.loadTempEvents();
     
-     if (this.currentRoundEvents.length === 0) {
-       Logger.verbose('SmartAssign', 3, `Skipping log finalization: 0 events to write.`);
-       return;
-     }
+    if (this.currentRoundEvents.length === 0) {
+      Logger.verbose('SmartAssign', 3, `Skipping log finalization: 0 events to write.`);
+      return;
+    }
 
     Logger.verbose('SmartAssign', 1, `Finalizing round log with ${this.currentRoundEvents.length} events.`);
 
@@ -969,7 +1117,7 @@ export default class SmartAssign extends BasePlugin {
       startTime: this.currentRoundStartTime || Date.now(),
       endTime: Date.now(),
       layerName: this.currentLayerName || (this.server.currentLayer ? this.server.currentLayer.name : 'Unknown'),
-      gamemode: this.server.currentLayer ? this.server.currentLayer.gamemode : 'Unknown',
+      gamemode: this.currentGamemode || (this.server.currentLayer ? this.server.currentLayer.gamemode : 'Unknown'),
       smartAssignActive: this.options.enableSmartAssign !== false,
       events: this.currentRoundEvents
     };
@@ -985,58 +1133,49 @@ export default class SmartAssign extends BasePlugin {
     }
   }
 
-   /**
-    * Captures a `ROUND_SNAPSHOT` event of the entire connected player base at the start of a new round.
-    * Acts as a keyframe for historical log replay or data-analysis tools.
-    *
-    * CRITICAL TIMING: This method must only fire when a new round actually begins (NEW_GAME event).
-    * The _betweenRounds guard below prevents premature snapshots during the staging phase
-    * (after ROUND_ENDED but before NEW_GAME). During this window, map changes and layer name updates
-    * may occur, which would incorrectly capture a snapshot with the new layer name while the previous
-    * round is still being finalized. The snapshot must always represent the state at true round start,
-    * not at server staging.
-    */
-    async _ensureSnapshot() {
-      // Guard: Do not snapshot during the between-rounds window (after ROUND_ENDED, before NEW_GAME).
-      // This prevents capturing false snapshots with new layer names while the previous round finalizes.
-      if (this._betweenRounds) return;
-      
-      if (this._snapshotTaken) return;
+  /**
+   * Captures a `ROUND_SNAPSHOT` event of the entire connected player base at the start of a new round.
+   * Acts as a keyframe for historical log replay or data-analysis tools.
+   *
+   * CRITICAL TIMING: This method must only fire when a new round actually begins (NEW_GAME event).
+   * The _betweenRounds guard below prevents premature snapshots during the staging phase
+   * (after ROUND_ENDED but before NEW_GAME). During this window, map changes and layer name updates
+   * may occur, which would incorrectly capture a snapshot with the new layer name while the previous
+   * round is still being finalized. The snapshot must always represent the state at true round start,
+   * not at server staging.
+   */
+  async _ensureSnapshot() {
+    // Guard: Do not snapshot during the between-rounds window (after ROUND_ENDED, before NEW_GAME).
+    // This prevents capturing false snapshots with new layer names while the previous round finalizes.
+    if (this._betweenRounds) return;
+    
+    if (this._snapshotTaken) return;
 
-      const currentLayerName = this.server.currentLayer ? this.server.currentLayer.name : 'Unknown';
-      if (currentLayerName === 'Unknown') return;
+    const currentLayerName = this.server.currentLayer ? this.server.currentLayer.name : 'Unknown';
+    if (currentLayerName === 'Unknown') {
+      Logger.verbose('SmartAssign', 3, '[Snapshot] Layer name still Unknown. Deferring snapshot.');
+      return;
+    }
 
-      // ═══════════════════════════════════════════════════════════════════════════════════════════
-      // CRITICAL TIMING GUARD: Defer snapshot if RCON team data is not yet stable
-      //
-      // When NEW_GAME fires, the round has just transitioned. However, Squad's RCON ListPlayers
-      // output may still reflect the transitional state where all players have teamID=null before
-      // the server assigns them to teams for the new round. If we snapshot at this exact moment,
-      // we capture ~93 players with null teams, which corrupts the ROUND_SNAPSHOT record.
-      //
-      // This guard mirrors the safe-sync handshake in onUpdatedPlayerInfo: we defer snapshot
-      // completion until at least one real team assignment (1 or 2) is visible in RCON data.
-      // The snapshot will then fire on the next UPDATED_PLAYER_INFORMATION tick when RCON has
-      // refreshed with real team data (typically 5–30s after round start), ensuring accuracy.
-      //
-      // ─ Root Cause: Race condition between NEW_GAME event and RCON refresh cycle
-      // ─ Impact: Prevents null-team snapshots; sacrifice is minor timing delay (one RCON poll)
-      // ═══════════════════════════════════════════════════════════════════════════════════════════
-      const hasRealTeams = this.server.players.some(p => p.teamID === 1 || p.teamID === 2);
-      if (!hasRealTeams) {
-        Logger.verbose('SmartAssign', 3, `Snapshot deferred: RCON team data not yet stable for layer ${currentLayerName}. Will retry on next UPDATED_PLAYER_INFORMATION tick.`);
-        return;
-      }
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+    // SNAPSHOT CAPTURE: The ≥90% resolution ratio gate in onUpdatedPlayerInfo() has already
+    // validated that most players have real team assignments. Proceed directly to capture.
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+    Logger.verbose('SmartAssign', 2, `[Snapshot] Capturing: ${this.server.players.length} players on layer '${currentLayerName}'.`);
 
-     // Lock the snapshot immediately before any await yields to prevent race conditions 
-     // from concurrent promise batches hitting this method simultaneously.
-     this._snapshotTaken = true;
+    // Lock the snapshot immediately before any await yields to prevent race conditions 
+    // from concurrent promise batches hitting this method simultaneously.
+    this._snapshotTaken = true;
     
     // Cache the layer name for use in finalizeRoundLog()
     // This ensures we record the correct layer even if it becomes 'Unknown' during round transition
     this.currentLayerName = currentLayerName;
 
-    Logger.verbose('SmartAssign', 1, `Taking early round snapshot for layer: ${currentLayerName}`);
+    // Cache the gamemode for use in finalizeRoundLog()
+    // This ensures we record the correct gamemode even if it changes during round transition
+    this.currentGamemode = this.server.currentLayer ? this.server.currentLayer.gamemode : 'Unknown';
+
+    Logger.verbose('SmartAssign', 3, `[Snapshot] Locked. Recording ${this.server.players.length} connected players and ${this.currentRoundEvents.length} current events.`);
 
     // If we have events in memory from a previous round that haven't been finalized, finalize them now.
     // This happens if map detected change before onNewGame or onRoundEnded fired.
