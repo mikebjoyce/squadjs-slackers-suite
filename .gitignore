@@ -5,3 +5,4 @@ testing/tools/mergedFinal.jsonl
 *.jsonl
 *.txt
 plugins/base-plugin.js
+/reports

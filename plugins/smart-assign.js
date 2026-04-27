@@ -64,11 +64,12 @@
  * ═══════════════════════════════════════════════════════════════
  */
 
-import { promises as fsPromises } from 'fs';
 import Logger from '../../core/logger.js';
 import BasePlugin from './base-plugin.js';
 import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
+import SAEventLogger from '../utils/sa-event-logger.js';
+import { evaluateTeamAssignment, getMuFast } from '../utils/sa-team-evaluator.js';
 
 const MAX_TEAM_SIZE = 50;
 
@@ -126,6 +127,7 @@ export default class SmartAssign extends BasePlugin {
       retryIntervalMs: 50,
       maxCompletionTimeMs: 3000
     });
+    this.eventLogger = new SAEventLogger(options);
 
     this.knownPlayers = new Map();
     this._joiningPlayers = new Set();
@@ -137,13 +139,9 @@ export default class SmartAssign extends BasePlugin {
     this._pendingAssignments = { 1: 0, 2: 0 };
     this._pendingMu = { 1: 0, 2: 0 };
     this._pendingPlayerMoves = new Map();
-    this.currentRoundEvents = [];
     this.currentRoundStartTime = null;
     this.ready = false;
     this.initialSyncComplete = false;
-    // Promise queue and in-memory batch array to optimise disk I/O when streaming logs
-    this._logWriteQueue = Promise.resolve();
-    this._eventBatch = [];
 
     // ═══════════════════════════════════════════════════════════════════════════
     // OPTIMIZATION: Debounced Forced RCON Poll
@@ -223,11 +221,6 @@ export default class SmartAssign extends BasePlugin {
 
     this._ignoredModes = (this.options.ignoredGameModes || ['seed', 'jensen']).map(m => String(m).toLowerCase());
 
-    // Periodically flush the in-memory event batch to the temp file to reduce disk I/O
-    this._batchFlushTimer = setInterval(() => {
-      this._flushTempLog().catch(err => Logger.verbose('SmartAssign', 1, `Flush error: ${err.message}`));
-    }, 15000);
-
     // Initialize DB
     const { roundStartTime: persistedStartTime } = await this.db.initDB();
 
@@ -255,11 +248,10 @@ export default class SmartAssign extends BasePlugin {
         1,
         'Restart detected. Resuming round state.'
       );
-      this.currentRoundStartTime = Number(persistedStartTime);
-      this._snapshotTaken = true; // Assume snapshot exists in temp log
-      await this.loadTempEvents();
-      
-      // ─ CRASH RECOVERY: Hydrate in-memory reconnect memory from DB
+       this.currentRoundStartTime = Number(persistedStartTime);
+       this._snapshotTaken = true; // Assume snapshot exists in temp log
+       
+       // ─ CRASH RECOVERY: Hydrate in-memory reconnect memory from DB
       // On crash recovery, we resume the same round, so the reconnect memory
       // that was persisted to the DB during the crashed session is still valid.
       // Load it into memory to avoid awaiting DB reads during subsequent joins.
@@ -295,8 +287,8 @@ export default class SmartAssign extends BasePlugin {
   async unmount() {
     this.ready = false;
     if (this.cleanupInterval) clearInterval(this.cleanupInterval);
-    if (this._batchFlushTimer) clearInterval(this._batchFlushTimer);
     if (this._pendingPlayerListUpdate) clearTimeout(this._pendingPlayerListUpdate);
+    this.eventLogger.cleanup();
     await this.finalizeRoundLog();
     this.server.removeListener('NEW_GAME', this.onNewGame);
     this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
@@ -358,12 +350,8 @@ export default class SmartAssign extends BasePlugin {
     // (Bug 3 fix: was using server.matchStartTime which predates finalization)
     await this.finalizeRoundLog();
 
-    // Restart the log flush timer if it was stopped by finalizeRoundLog
-    if (!this._batchFlushTimer) {
-      this._batchFlushTimer = setInterval(() => {
-        this._flushTempLog().catch((err) => Logger.verbose('SmartAssign', 1, `Flush error: ${err.message}`));
-      }, 15000);
-    }
+     // Restart the logger's batch flush timer after finalization
+     this.eventLogger._startBatchFlushTimer();
 
     // Clear any pending debounced player list update
     if (this._pendingPlayerListUpdate) {
@@ -817,11 +805,11 @@ export default class SmartAssign extends BasePlugin {
         executed: true
       }, this._betweenRounds);
 
-      // If the player is currently on the wrong team, queue a team change
-      if (targetTeam !== null && String(player.teamID) !== String(targetTeam)) {
-        this._pendingAssignments[targetTeam]++;
-        const pendingPlayerMu = this._getMuFast(player);
-        this._pendingMu[targetTeam] += pendingPlayerMu;
+       // If the player is currently on the wrong team, queue a team change
+       if (targetTeam !== null && String(player.teamID) !== String(targetTeam)) {
+         this._pendingAssignments[targetTeam]++;
+         const pendingPlayerMu = getMuFast(player, this.eloTracker, { eloNotReadyWarned: this._eloNotReadyWarned, muFastMissWarned: this._muFastMissWarned });
+         this._pendingMu[targetTeam] += pendingPlayerMu;
         
         // NOTE: pendingPlayerMu is captured here and subtracted onMoveSuccess. If the player's 
         // Elo changes during the brief execution window, _pendingMu may drift slightly.
@@ -872,368 +860,33 @@ export default class SmartAssign extends BasePlugin {
   }
 
   /**
-   * Evaluates and returns the best team (1 or 2) for a joining player.
-   * Uses a Mu-based Unified Scoring System to balance competitive parity,
-   * population equity, and player preference (reconnects).
-   *
-   * CRITICAL: This method MUST remain synchronous. The assignment logic
-   * in onUpdatedPlayerInfo relies on the fact that no await exists between
-   * evaluation and state increments to prevent race conditions during
-   * player join bursts.
+   * Delegates to SATeamEvaluator pure function.
+   * Wraps the context object and calls the extracted evaluator.
    */
   evaluateTeamAssignment(player, reconnectTeam = null) {
-    const eloTracker = this.eloTracker;
-    const hasElo = eloTracker && eloTracker.ready && typeof eloTracker.getMu === 'function';
-
-    if (eloTracker && !eloTracker.ready) {
-      if (!this._eloNotReadyWarned) {
-        Logger.verbose('SmartAssign', 1, '[SmartAssign] EloTracker present but not ready — falling back to population-only routing.');
-        this._eloNotReadyWarned = true;
-      }
-    } else if (eloTracker && eloTracker.ready && this._eloNotReadyWarned) {
-      // Reset the flag once it becomes ready again
-      this._eloNotReadyWarned = false;
-    }
-
-    // 1. DATA COLLECTION (Single Pass Optimization)
-    let t1Count = this._pendingAssignments[1] || 0;
-    let t2Count = this._pendingAssignments[2] || 0;
-    let t1Power = this._pendingMu[1] || 0;
-    let t2Power = this._pendingMu[2] || 0;
-
-    const players = this.server.players;
-    const playerCount = players.length;
-
-    for (let i = 0; i < playerCount; i++) {
-      const p = players[i];
-      if (!p || p.steamID === player.steamID) continue;
-
-      // Ignore players currently pending a move since their future state is already in _pending.
-      // This prevents double-counting and ensures team population/Elo projections are highly accurate.
-      if (this._pendingPlayerMoves && this._pendingPlayerMoves.has(p.steamID)) continue;
-
-      const teamID = String(p.teamID);
-      if (teamID === '1') {
-        t1Count++;
-        if (hasElo) t1Power += this._getMuFast(p);
-      } else if (teamID === '2') {
-        t2Count++;
-        if (hasElo) t2Power += this._getMuFast(p);
-      }
-    }
-
-    // 2. HARD POPULATION CAP
-    const totalPop = t1Count + t2Count;
-    const isRejoin = reconnectTeam === 1 || reconnectTeam === 2;
-
-    // Gradual Dynamic maxImbalance
-    let maxImbalance;
-    if (totalPop >= 94) maxImbalance = 1;
-    else if (totalPop >= 88) maxImbalance = 2;
-    else if (totalPop >= 80) maxImbalance = 3;
-    else maxImbalance = 4;
-
-    let effectiveMaxImbalance = maxImbalance;
-    if (isRejoin) effectiveMaxImbalance = Math.min(4, maxImbalance + (totalPop >= 90 ? 1 : 2));
-
-    if ((t1Count + 1) - t2Count > effectiveMaxImbalance) return { targetTeam: 2, reason: 'Hard Population Cap' };
-    if ((t2Count + 1) - t1Count > effectiveMaxImbalance) return { targetTeam: 1, reason: 'Hard Population Cap' };
-
-    // 2.1 PHYSICAL SERVER CAP (50)
-    // If both teams are maxed at 50, a fallback 'targetTeam: null' is returned to prevent the plugin 
-    // from attempting to shove a 51st player onto a full team. The executor won't perform 
-    // any RCON moves and lets the game handle the player natively.
-    if (t1Count >= MAX_TEAM_SIZE && t2Count >= MAX_TEAM_SIZE) return { targetTeam: null, reason: 'Server Full' };
-    if (t1Count >= MAX_TEAM_SIZE && t2Count < MAX_TEAM_SIZE) return { targetTeam: 2, reason: 'Team 1 Full' };
-    if (t2Count >= MAX_TEAM_SIZE && t1Count < MAX_TEAM_SIZE) return { targetTeam: 1, reason: 'Team 2 Full' };
-
-    // 3.0 RECONNECT PRIORITY ROUTING
-    // If the player has reconnect memory and placing them on that team
-    // does not violate the hard population cap, honour it immediately.
-    // This runs before Elo scoring so the guarantee is strong.
-    if (isRejoin) {
-      const rejoinTarget = reconnectTeam; // 1 or 2
-      const rejoinCount    = rejoinTarget === 1 ? t1Count : t2Count;
-      const opponentCount  = rejoinTarget === 1 ? t2Count : t1Count;
-      if ((rejoinCount + 1) - opponentCount <= effectiveMaxImbalance) {
-        return { targetTeam: rejoinTarget, reason: 'Reconnect Memory (Priority)' };
-      }
-      // Hard cap would be violated — fall through to Elo scoring.
-    }
-
-    // 3. SKILL & PENALTY EVALUATION
-    if (!hasElo) {
-      const targetTeam = t1Count <= t2Count ? 1 : 2;
-      return { targetTeam, reason: `Population Balance (No Elo) | T1:${t1Count} T2:${t2Count}` };
-    }
-
-    const playerMu = this._getMuFast(player);
-    const avgT1 = t1Count > 0 ? (t1Power / t1Count) : 25.0;
-    const avgT2 = t2Count > 0 ? (t2Power / t2Count) : 25.0;
-
-    const newAvgT1 = (t1Power + playerMu) / (t1Count + 1);
-    const newAvgT2 = (t2Power + playerMu) / (t2Count + 1);
-
-    // Dynamic scale: normalises sum gap relative to current server population. 
-    // As population increases, the importance of the Total-Skill (sum) gap is 
-    // intentionally phased out in favor of the Average-Skill gap. 
-    // At a full 100-player server, the sum term becomes negligible.
-    const dynamicScale = Math.max(1, (t1Count + t2Count + 1) * 2.5);
-
-    const getScore = (candidateAvg, opponentAvg, candidateSum, opponentSum) => {
-      const avgGap = Math.abs(candidateAvg - opponentAvg);
-      const sumGap = Math.abs(candidateSum - opponentSum) / dynamicScale;
-      return (avgGap * 3.0) + (sumGap * 1.5);
-    };
-
-    let scoreT1 = getScore(newAvgT1, avgT2, t1Power + playerMu, t2Power);
-    let scoreT2 = getScore(avgT1, newAvgT2, t1Power, t2Power + playerMu);
-
-    // Rejoin bias: if reconnect priority was blocked by the hard pop cap and fell
-    // through here, apply a small score reduction toward the player's previous team.
-    // Not enough to override a meaningful Elo gap; only tips near-ties.
-    if (isRejoin) {
-      const REJOIN_BIAS = 0.25;
-      if (reconnectTeam === 1) scoreT1 = Math.max(0, scoreT1 - REJOIN_BIAS);
-      else if (reconnectTeam === 2) scoreT2 = Math.max(0, scoreT2 - REJOIN_BIAS);
-    }
-
-    let targetTeam;
-    if (scoreT1 < scoreT2) {
-      targetTeam = 1;
-    } else if (scoreT2 < scoreT1) {
-      targetTeam = 2;
-    } else {
-      // Simple population tie-breaker
-      targetTeam = t1Count <= t2Count ? 1 : 2;
-    }
-
-    const reason = `Skill Balance: T1=${scoreT1.toFixed(3)}, T2=${scoreT2.toFixed(3)} | Pop: ${t1Count}v${t2Count}`;
-
-    return { targetTeam, reason };
-  }
-
-  /**
-   * Fast Mu retrieval bypassing heavy try/catch and redundant lookups.
-   * @private
-   */
-  _getMuFast(p) {
-    const et = this.eloTracker;
-    if (!et) return 25.0;
-
-    try {
-      // Prioritize internal maps to bypass getter overhead/logic.
-      // WARNING: These paths couple directly to EloTracker internals. If those
-      // property names change, this silently degrades to the public getMu() fallback.
-      if (et.eloCache && p.eosID) {
-        const cached = et.eloCache.get(p.eosID);
-        if (cached) return cached.mu;
-        Logger.verbose('SmartAssign', 3, `[_getMuFast] eloCache miss for eosID ${p.eosID}, falling through.`);
-      }
-      if (et.eloMap && p.steamID) {
-        const mu = et.eloMap.get(p.steamID);
-        if (mu !== undefined) return mu;
-        Logger.verbose('SmartAssign', 3, `[_getMuFast] eloMap miss for steamID ${p.steamID}, falling through.`);
-      }
-
-      // Both fast paths missed — this could mean internals changed or player is truly unknown to cache
-      if (!this._muFastMissWarned) {
-        Logger.verbose(
-          'SmartAssign',
-          2,
-          '[_getMuFast] Both fast paths missed. EloTracker internals may have changed. Falling back to getMu().'
-        );
-        this._muFastMissWarned = true;
-      }
-
-      // Fallback to official API
-      return et.getMu(p);
-    } catch (e) {
-      Logger.verbose('SmartAssign', 2, `[_getMuFast] getMu() threw for ${p.steamID}: ${e?.message}. Using default Mu.`);
-      return 25.0;
-    }
-  }
-
-  logEvent(eventType, player, extraData = {}, betweenRounds = false) {
-    if (!this.options.logPath || this.options.enableEventLogging === false) return;
-
-    // Dynamically inject the global team populations into every event for richer historical replay
-    let t1 = 0;
-    let t2 = 0;
-    for (const p of this.server.players) {
-      if (String(p.teamID) === '1') t1++;
-      else if (String(p.teamID) === '2') t2++;
-    }
-
-    const event = {
-      timestamp: Date.now(),
-      eventType,
-      ...(player ? {
-        steamID: player.steamID,
-        name: player.name,
-        teamID: player.teamID,
-        squadID: player.squadID
-      } : {}),
-      ...extraData,
-      betweenRounds,
-      t1,
-      t2
-    };
-
-    // Push to in-memory batch. Flush immediately if the threshold is reached to prevent memory bloat.
-    this._eventBatch.push(JSON.stringify(event) + '\n');
-    if (this._eventBatch.length >= 20) {
-      this._flushTempLog().catch(err => Logger.verbose('SmartAssign', 1, `Flush error: ${err.message}`));
-    }
-  }
-
-  /**
-   * Appends the in-memory batch of formatted events to the temporary .temp file.
-   * Chained via a Promise queue to prevent interleaved JSON lines from overlapping fs.appendFile calls.
-   */
-  async _flushTempLog() {
-    if (this._eventBatch.length === 0) return;
-    
-    const lines = this._eventBatch.join('');
-    this._eventBatch = [];
-    
-    const tempPath = this.options.logPath + '.temp';
-    this._logWriteQueue = this._logWriteQueue.then(() => {
-      return fsPromises.appendFile(tempPath, lines, 'utf8')
-        .catch((err) => Logger.verbose('SmartAssign', 1, `Failed to write temp log: ${err.message}`));
+    return evaluateTeamAssignment(player, this.server, {
+      reconnectTeam,
+      pendingAssignments: this._pendingAssignments,
+      pendingMu: this._pendingMu,
+      pendingPlayerMoves: this._pendingPlayerMoves,
+      eloTracker: this.eloTracker,
+      ignoredModes: this._ignoredModes,
+      warnFlags: { eloNotReadyWarned: this._eloNotReadyWarned, muFastMissWarned: this._muFastMissWarned }
     });
-    
-    return this._logWriteQueue;
-  }
-
-  async finalizeRoundLog() {
-    if (this._batchFlushTimer) {
-      clearInterval(this._batchFlushTimer);
-      this._batchFlushTimer = null;
-    }
-
-    // Force flush any pending memory events and wait for the write queue to empty.
-    // _flushTempLog returns the current _logWriteQueue promise.
-    await this._flushTempLog();
-    await this._logWriteQueue; // drain queue fully
-
-    // Always load from temp file to get the full round history
-    await this.loadTempEvents();
-    
-    if (this.currentRoundEvents.length === 0) {
-      Logger.verbose('SmartAssign', 3, `Skipping log finalization: 0 events to write.`);
-      return;
-    }
-
-    Logger.verbose('SmartAssign', 1, `Finalizing round log with ${this.currentRoundEvents.length} events.`);
-
-    const roundLog = {
-      startTime: this.currentRoundStartTime || Date.now(),
-      endTime: Date.now(),
-      layerName: this.currentLayerName || (this.server.currentLayer ? this.server.currentLayer.name : 'Unknown'),
-      gamemode: this.currentGamemode || (this.server.currentLayer ? this.server.currentLayer.gamemode : 'Unknown'),
-      smartAssignActive: this.options.enableSmartAssign !== false,
-      events: this.currentRoundEvents
-    };
-
-    try {
-      await fsPromises.appendFile(this.options.logPath, JSON.stringify(roundLog) + '\n', 'utf8');
-      const tempPath = this.options.logPath + '.temp';
-      await fsPromises.unlink(tempPath).catch(() => {});
-      // Only clear events if write was successful
-      this.currentRoundEvents = [];
-    } catch (err) {
-      Logger.verbose('SmartAssign', 1, `Failed to finalize round log: ${err.message}. Events retained in memory.`);
-    }
   }
 
   /**
-   * Captures a `ROUND_SNAPSHOT` event of the entire connected player base at the start of a new round.
-   * Acts as a keyframe for historical log replay or data-analysis tools.
-   *
-   * CRITICAL TIMING: This method must only fire when a new round actually begins (NEW_GAME event).
-   * The _betweenRounds guard below prevents premature snapshots during the staging phase
-   * (after ROUND_ENDED but before NEW_GAME). During this window, map changes and layer name updates
-   * may occur, which would incorrectly capture a snapshot with the new layer name while the previous
-   * round is still being finalized. The snapshot must always represent the state at true round start,
-   * not at server staging.
+   * Delegates to SAEventLogger and SATeamEvaluator.
    */
-  async _ensureSnapshot() {
-    // Guard: Do not snapshot during the between-rounds window (after ROUND_ENDED, before NEW_GAME).
-    // This prevents capturing false snapshots with new layer names while the previous round finalizes.
-    if (this._betweenRounds) return;
-    
-    if (this._snapshotTaken) return;
-
-    const currentLayerName = this.server.currentLayer ? this.server.currentLayer.name : 'Unknown';
-    if (currentLayerName === 'Unknown') {
-      Logger.verbose('SmartAssign', 3, '[Snapshot] Layer name still Unknown. Deferring snapshot.');
-      return;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════════════════════
-    // SNAPSHOT CAPTURE: The ≥90% resolution ratio gate in onUpdatedPlayerInfo() has already
-    // validated that most players have real team assignments. Proceed directly to capture.
-    // ═══════════════════════════════════════════════════════════════════════════════════════════
-    Logger.verbose('SmartAssign', 2, `[Snapshot] Capturing: ${this.server.players.length} players on layer '${currentLayerName}'.`);
-
-    // Lock the snapshot immediately before any await yields to prevent race conditions 
-    // from concurrent promise batches hitting this method simultaneously.
-    this._snapshotTaken = true;
-    
-    // Cache the layer name for use in finalizeRoundLog()
-    // This ensures we record the correct layer even if it becomes 'Unknown' during round transition
-    this.currentLayerName = currentLayerName;
-
-    // Cache the gamemode for use in finalizeRoundLog()
-    // This ensures we record the correct gamemode even if it changes during round transition
-    this.currentGamemode = this.server.currentLayer ? this.server.currentLayer.gamemode : 'Unknown';
-
-    Logger.verbose('SmartAssign', 3, `[Snapshot] Locked. Recording ${this.server.players.length} connected players and ${this.currentRoundEvents.length} current events.`);
-
-    // If we have events in memory from a previous round that haven't been finalized, finalize them now.
-    // This happens if map detected change before onNewGame or onRoundEnded fired.
-    if (this.currentRoundEvents.length > 0) {
-      await this.finalizeRoundLog();
-    }
-
-    const now = Date.now();
-    const snapshotPlayers = this.server.players.filter(p => p && p.steamID).map(p => ({
-      name: p.name,
-      steamID: p.steamID,
-      teamID: p.teamID,
-      // joinedServerAt intentionally draws from the persistent _sessionJoinTimes Map 
-      // rather than the current round time to accurately track cross-round play sessions.
-      joinedServerAt: this._sessionJoinTimes.has(p.steamID) ? this._sessionJoinTimes.get(p.steamID) : now
-    }));
-
-    this.logEvent('ROUND_SNAPSHOT', null, { players: snapshotPlayers }, this._betweenRounds);
+  logEvent(eventType, player, extraData = {}, betweenRounds = false) {
+    this.eventLogger.logEvent(eventType, player, extraData, betweenRounds, this.server.players);
   }
 
-  async loadTempEvents() {
-    const tempPath = this.options.logPath + '.temp';
-    try {
-      const data = await fsPromises.readFile(tempPath, 'utf8');
-      const lines = data.trim().split('\n');
-      this.currentRoundEvents = lines
-        .filter((l) => l.trim())
-        .reduce((acc, l) => {
-          try {
-            acc.push(JSON.parse(l));
-          } catch {
-            Logger.verbose('SmartAssign', 1, '[Log] Skipped malformed temp line.');
-          }
-          return acc;
-        }, []);
-      Logger.verbose(
-        'SmartAssign',
-        1,
-        `Loaded ${this.currentRoundEvents.length} events from temp log.`
-      );
-    } catch (err) {
-      if (err.code !== 'ENOENT') {
-        Logger.verbose('SmartAssign', 1, `[Log] Failed to load temp events: ${err.message}`);
-      }
-    }
+  /**
+   * Delegates to SAEventLogger.
+   */
+  async finalizeRoundLog() {
+    await this.eventLogger.finalizeRoundLog(this.currentRoundStartTime, this.currentLayerName, this.currentGamemode, this.options.enableSmartAssign !== false);
   }
-}
+
+ }
