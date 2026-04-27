@@ -73,7 +73,7 @@ import SASwapExecutor from '../utils/sa-swap-executor.js';
 const MAX_TEAM_SIZE = 50;
 
 export default class SmartAssign extends BasePlugin {
-  static version = '0.2.2';
+  static version = '0.3.0';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
@@ -190,6 +190,16 @@ export default class SmartAssign extends BasePlugin {
 
     this.eloTracker = null;
     this._eloNotReadyWarned = false;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // JOIN/LEAVE TIMING CORRECTION
+    //
+    // Purpose: Track when JOINs occur so that LEAVEs discovered during JOIN-triggered
+    //          RCON polls can be backdated to appear before the JOIN in event logs.
+    //          This corrects the temporal mismatch where late LEAVE detection makes
+    //          a LEAVE appear to occur after a JOIN that happened after the leave.
+    // ═══════════════════════════════════════════════════════════════════════════
+    this._currentJoinTimestamp = null;  // Timestamp of the most recent join event
 
     // State bindings
     this.onNewGame = this.onNewGame.bind(this);
@@ -527,7 +537,11 @@ export default class SmartAssign extends BasePlugin {
      * OPTIMIZATION: The poll is debounced with a 250ms window to coalesce burst joins
      * (5-10 players within 200ms) into a single poll instead of many overlapping calls.
      * This preserves all benefits while reducing RCON load during post-round rushes.
+     *
+     * JOIN/LEAVE TIMING: Track this join timestamp so that any LEAVEs discovered in the
+     * subsequent RCON poll can be backdated to appear before this JOIN in the event log.
      */
+    this._currentJoinTimestamp = Date.now();
     this._schedulePlayerListUpdate();
 
     // Trigger join handling immediately using the log-provided player data.

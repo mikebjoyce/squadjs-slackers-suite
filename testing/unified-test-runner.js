@@ -30,6 +30,7 @@ class MockSADatabase {
   async clearReconnectMemory() { this.reconnectMemory.clear(); }
   async savePlayerDisconnect(steamID, teamID) { this.reconnectMemory.set(steamID, { teamID, time: Date.now() }); }
   async getReconnectTeam(steamID) { return this.reconnectMemory.get(steamID)?.teamID || null; }
+  async getAllReconnectMemory() { return new Map(this.reconnectMemory); }
   async cleanupOldData() {}
 }
 
