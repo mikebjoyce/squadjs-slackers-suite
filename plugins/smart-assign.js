@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v0.2.9                   ║
+ * ║                  SMART ASSIGN PLUGIN v0.3.0                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -142,6 +142,7 @@ export default class SmartAssign extends BasePlugin {
     this.currentRoundStartTime = null;
     this.ready = false;
     this.initialSyncComplete = false;
+    this._isFinalizingRound = false;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // OPTIMIZATION: Debounced Forced RCON Poll
@@ -172,22 +173,37 @@ export default class SmartAssign extends BasePlugin {
     // ═══════════════════════════════════════════════════════════════════════════
     this._reconnectMemory = new Map();
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // DEFERRED SNAPSHOT MECHANISM
-    //
-    // Purpose: Flag set at NEW_GAME to trigger snapshot on next UPDATED_PLAYER_INFORMATION
-    //          tick when RCON has stabilized (≥90% team resolution ratio).
-    //
-    // Workflow:
-    //   1. NEW_GAME sets _snapshotPendingSince = Date.now()
-    //   2. onUpdatedPlayerInfo checks ratio gate on each tick
-    //   3. Once ratio >= 90%, snapshot fires and flag is cleared
-    //   4. ROUND_ENDED clears it preemptively for round transition safety
-    // ═══════════════════════════════════════════════════════════════════════════
-    this._snapshotPendingSince = null;
+     // ═══════════════════════════════════════════════════════════════════════════
+     // DEFERRED SNAPSHOT MECHANISM
+     //
+     // Purpose: Flag set at NEW_GAME to trigger snapshot on next UPDATED_PLAYER_INFORMATION
+     //          tick when RCON has stabilized (≥90% team resolution ratio).
+     //
+     // Workflow:
+     //   1. NEW_GAME sets _snapshotPendingSince = Date.now()
+     //   2. onUpdatedPlayerInfo checks ratio gate on each tick
+     //   3. Once ratio >= 90%, snapshot fires and flag is cleared
+     //   4. ROUND_ENDED clears it preemptively for round transition safety
+     // ═══════════════════════════════════════════════════════════════════════════
+     this._snapshotPendingSince = null;
 
-    this.eloTracker = null;
-    this._eloNotReadyWarned = false;
+     // ═══════════════════════════════════════════════════════════════════════════
+     // SNAPSHOT PATCH MECHANISM
+     //
+     // Purpose: Track players with unresolved teamID at snapshot time and emit
+     //          SNAPSHOT_PATCH events when their teams resolve on subsequent polls.
+     //
+     // Workflow:
+     //   1. _ensureSnapshot() collects players with teamID !== 1 and !== 2
+     //   2. onUpdatedPlayerInfo() attempts up to 3 polls to resolve them
+     //   3. On successful resolution, SNAPSHOT_PATCH event is emitted
+     //   4. onNewGame() clears state for new round
+     // ═══════════════════════════════════════════════════════════════════════════
+     this._pendingSnapshotPatches = new Set();
+     this._snapshotPatchAttempts = 0;
+
+     this.eloTracker = null;
+     this._eloNotReadyWarned = false;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // JOIN/LEAVE TIMING CORRECTION
@@ -380,6 +396,15 @@ export default class SmartAssign extends BasePlugin {
     // Clear in-memory reconnect memory alongside DB clear (synchronized in onNewGame above)
     // This ensures the new round starts fresh with no reconnect history.
     this._reconnectMemory.clear();
+    
+    // ═════════════════════════════════════════════════════════════════════════════════════
+    // SNAPSHOT PATCH STATE RESET: Clear pending patches and attempt counter
+    //
+    // On each new round, reset the snapshot patch tracking state so that a fresh round
+    // can correctly identify and resolve any newly-unresolved players at snapshot time.
+    // ═════════════════════════════════════════════════════════════════════════════════════
+    this._pendingSnapshotPatches = new Set();
+    this._snapshotPatchAttempts = 0;
     
     // ═════════════════════════════════════════════════════════════════════════════════════
     // CRITICAL TIMING: Clear the between-rounds flag BEFORE setting the snapshot pending flag.
@@ -719,6 +744,43 @@ export default class SmartAssign extends BasePlugin {
         }))
       );
     }
+
+    // ═════════════════════════════════════════════════════════════════════════════════════
+    // SNAPSHOT PATCH RESOLUTION: Emit patches for newly-resolved players
+    //
+    // After all join/leave/team-change handling, check if any previously-unresolved snapshot
+    // players now have a valid teamID. For each resolved player, emit a SNAPSHOT_PATCH event
+    // and remove them from the pending set. Continue attempts up to 3 RCON polls (~90 seconds)
+    // before giving up to allow for network propagation delays.
+    // ═════════════════════════════════════════════════════════════════════════════════════
+    if (this._pendingSnapshotPatches.size > 0) {
+      this._snapshotPatchAttempts++;
+
+      for (const steamID of [...this._pendingSnapshotPatches]) {
+        const p = this.server.players.find(p => p.steamID === steamID);
+        const tid = p ? Number(p.teamID) : null;
+
+        if (tid === 1 || tid === 2) {
+          this.logEvent(
+            'SNAPSHOT_PATCH',
+            p,
+            { resolvedTeamID: tid, patchAttempt: this._snapshotPatchAttempts },
+            false
+          );
+          this._pendingSnapshotPatches.delete(steamID);
+          Logger.verbose('SmartAssign', 3, `[Snapshot] Patched ${steamID} → team ${tid}`);
+        } else if (!p) {
+          // Player left before resolving — drop silently
+          this._pendingSnapshotPatches.delete(steamID);
+        }
+      }
+
+      // Give up after 3 polls (~90 seconds)
+      if (this._snapshotPatchAttempts >= 3 && this._pendingSnapshotPatches.size > 0) {
+        Logger.verbose('SmartAssign', 1, `[Snapshot] Giving up on ${this._pendingSnapshotPatches.size} unresolved players after 3 polls.`);
+        this._pendingSnapshotPatches.clear();
+      }
+    }
   }
 
   async handlePlayerJoin(player) {
@@ -882,11 +944,94 @@ export default class SmartAssign extends BasePlugin {
     this.eventLogger.logEvent(eventType, player, extraData, betweenRounds, this.server.players);
   }
 
-  /**
-   * Delegates to SAEventLogger.
-   */
-  async finalizeRoundLog() {
-    await this.eventLogger.finalizeRoundLog(this.currentRoundStartTime, this.currentLayerName, this.currentGamemode, this.options.enableSmartAssign !== false);
-  }
+   /**
+    * Delegates to SAEventLogger with concurrency guard.
+    * Prevents concurrent finalization calls from reading/writing the same temp log file.
+    */
+   async finalizeRoundLog() {
+     if (this._isFinalizingRound) {
+       Logger.verbose('SmartAssign', 2, '[Finalize] Concurrent finalization blocked — already in progress.');
+       return;
+     }
+     this._isFinalizingRound = true;
+     try {
+       await this.eventLogger.finalizeRoundLog(
+         this.currentRoundStartTime,
+         this.currentLayerName,
+         this.currentGamemode,
+         this.options.enableSmartAssign !== false
+       );
+     } finally {
+       this._isFinalizingRound = false;
+     }
+   }
 
- }
+   /**
+    * ROUND SNAPSHOT: Captures current player state and logs it to the event stream.
+    *
+    * Purpose: Create a point-in-time record of all active players, their team assignments,
+    *          and their session join times at the moment this round snapshot is taken.
+    *          This snapshot anchors all subsequent player lifecycle events (joins, leaves,
+    *          team changes) for accurate historical reconstruction and testing purposes.
+    *
+    * Workflow:
+    *   1. Check if snapshot already taken (idempotent guard)
+    *   2. Check if in between-rounds window (return early if so)
+    *   3. Capture all connected players with steamIDs
+    *   4. Log ROUND_SNAPSHOT event with player state array
+    *   5. Set _snapshotTaken flag and mark completion in logs
+    *
+    * Timing:
+    *   - Called from onUpdatedPlayerInfo() once 90% team resolution gate passes
+    *   - Also called opportunistically at each UPDATED_PLAYER_INFORMATION tick
+    *     after snapshot is already taken (for early map change detection)
+    *   - Guards ensure it's truly idempotent: second call is instant no-op
+    *
+    * Data Captured:
+    *   - name: Player's display name
+    *   - steamID: Steam account ID (unique identifier)
+    *   - teamID: Current team assignment (1 or 2)
+    *   - joinedServerAt: Session join timestamp (from _sessionJoinTimes Map)
+    */
+   async _ensureSnapshot() {
+     // Guard 1: Already taken (idempotent)
+     if (this._snapshotTaken) return;
+     
+     // Guard 2: Between-rounds suppression window
+     if (this._betweenRounds) return;
+
+     this._snapshotTaken = true;
+
+     const snapshotPlayers = this.server.players
+       .filter(p => p.steamID)
+       .map(p => ({
+         name: p.name,
+         steamID: p.steamID,
+         teamID: p.teamID,
+         joinedServerAt: this._sessionJoinTimes.get(p.steamID) || Date.now()
+       }));
+
+     this.logEvent('ROUND_SNAPSHOT', null, { players: snapshotPlayers }, false);
+     Logger.verbose('SmartAssign', 2, `[Snapshot] Round snapshot captured with ${snapshotPlayers.length} players.`);
+
+     // ═════════════════════════════════════════════════════════════════════════════════════
+     // SNAPSHOT PATCH COLLECTION: Identify players with unresolved teamID
+     //
+     // After the snapshot is logged, scan the player list for anyone with an invalid teamID
+     // (null or not 1 or 2). These players are mid-RCON-load and need to be tracked.
+     // On the next few UPDATED_PLAYER_INFORMATION ticks, we'll check for their resolution
+     // and emit SNAPSHOT_PATCH events when they're assigned real teams.
+     // ═════════════════════════════════════════════════════════════════════════════════════
+     this._pendingSnapshotPatches = new Set();
+     for (const p of this.server.players) {
+       const tid = Number(p.teamID);
+       if (tid !== 1 && tid !== 2) {
+         this._pendingSnapshotPatches.add(p.steamID);
+       }
+     }
+     if (this._pendingSnapshotPatches.size > 0) {
+       Logger.verbose('SmartAssign', 2, `[Snapshot] ${this._pendingSnapshotPatches.size} players pending team resolution.`);
+     }
+   }
+
+  }
