@@ -955,12 +955,12 @@ export default class SmartAssign extends BasePlugin {
      }
      this._isFinalizingRound = true;
      try {
-       await this.eventLogger.finalizeRoundLog(
-         this.currentRoundStartTime,
-         this.currentLayerName,
-         this.currentGamemode,
-         this.options.enableSmartAssign !== false
-       );
+        await this.eventLogger.finalizeRoundLog(
+          this.currentRoundStartTime,
+          this.currentLayerName || (this.server.currentLayer ? this.server.currentLayer.name : null),
+          this.currentGamemode  || (this.server.currentLayer ? this.server.currentLayer.gamemode : null),
+          this.options.enableSmartAssign !== false
+        );
      } finally {
        this._isFinalizingRound = false;
      }
@@ -1011,7 +1011,11 @@ export default class SmartAssign extends BasePlugin {
          joinedServerAt: this._sessionJoinTimes.get(p.steamID) || Date.now()
        }));
 
-     this.logEvent('ROUND_SNAPSHOT', null, { players: snapshotPlayers }, false);
+      // Cache layer identity at snapshot time — protects against finalization reading next round's layer
+      this.currentLayerName = this.server.currentLayer ? this.server.currentLayer.name : null;
+      this.currentGamemode  = this.server.currentLayer ? this.server.currentLayer.gamemode : null;
+
+      this.logEvent('ROUND_SNAPSHOT', null, { players: snapshotPlayers }, false);
      Logger.verbose('SmartAssign', 2, `[Snapshot] Round snapshot captured with ${snapshotPlayers.length} players.`);
 
      // ═════════════════════════════════════════════════════════════════════════════════════
