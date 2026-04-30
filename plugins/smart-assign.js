@@ -133,7 +133,11 @@ export default class SmartAssign extends BasePlugin {
     this._joiningPlayers = new Set();
     this._sessionJoinTimes = new Map();
     this._snapshotTaken = false;
-    this.phase = 'active'; // 'active' | 'game_end' | 'resolving'
+     this.phase = 'active'; // 'active' | 'game_end' | 'resolving'
+                             // NOTE: 'resolving' is an internal staging sub-state (null-teamID window after NEW_GAME).
+                             // It represents early staging before teams stabilize, and is layered atop the reference's
+                             // 'active' phase. The two externally-observable phases are 'active' (includes staging + live)
+                             // and 'game_end' (maps to 'between_rounds' in the dev reference).
     this.currentLayerName = null;
     this.currentGamemode = null;
     this._pendingAssignments = { 1: 0, 2: 0 };
@@ -442,19 +446,25 @@ export default class SmartAssign extends BasePlugin {
   //   2. Guard against reading stale layer data during game_end phase
   //   3. Ensure snapshot and finalization use the correct cached layer identity
   // ═══════════════════════════════════════════════════════════════════════════════════
-  async onUpdatedLayerInfo() {
-    if (!this.ready) return;
-    const name = this.server.currentLayer?.name || null;
-    const mode = this.server.currentLayer?.gamemode || null;
-    
-    // Only update if we have real data and are NOT in game_end phase
-    // (don't overwrite with stale data during game_end/resolving transitions)
-    if (name && this.phase !== 'game_end') {
-      this.currentLayerName = name;
-      this.currentGamemode = mode;
-      Logger.verbose('SmartAssign', 3, `[Layer] Updated layer cache: ${name} (${mode})`);
-    }
-  }
+   async onUpdatedLayerInfo() {
+     if (!this.ready) return;
+     const name = this.server.currentLayer?.name || null;
+     const mode = this.server.currentLayer?.gamemode || null;
+     
+     // Cache the layer identity from the RCON polling system (UPDATED_LAYER_INFORMATION).
+     // This is preferred over the log-parsed LAYER_CHANGED event because RCON polling is
+     // the authoritative source of truth per the dev reference (§2.5, §5).
+     // 
+     // Only update if we have real data and are NOT in game_end phase.
+     // Layer updates ARE intentionally allowed during 'resolving' phase so the new round's
+     // layer name can be captured from UPDATED_LAYER_INFORMATION polling.
+     // (Stale layer data only occurs during game_end; 'resolving' needs fresh layer identity for snapshot.)
+     if (name && this.phase !== 'game_end') {
+       this.currentLayerName = name;
+       this.currentGamemode = mode;
+       Logger.verbose('SmartAssign', 3, `[Layer] Updated layer cache: ${name} (${mode})`);
+     }
+   }
 
   async onScrambleExecuted() {
     if (!this.ready) return;
@@ -842,15 +852,18 @@ export default class SmartAssign extends BasePlugin {
     Logger.verbose('SmartAssign', 3, `[LEAVE] Player disconnected: ${player.name} (${player.steamID}) from Team ${player.teamID}`);
     this.logEvent('LEAVE', player, {}, this.phase !== 'active');
     
-    // Save to reconnect memory if they were on a valid team
-    const tid = Number(player.teamID);
-    if (tid === 1 || tid === 2) {
-      // ─ OPTIMIZATION: Write to both in-memory Map and DB
-      // In-memory write is immediate (synchronous), providing fast lookups on rejoin.
-      // DB write is fire-and-forget asynchronous so it doesn't block the event pipeline.
-      this._reconnectMemory.set(player.steamID, tid);
-      await this.db.savePlayerDisconnect(player.steamID, tid);
-    }
+     // Save to reconnect memory if they were on a valid team
+     const tid = Number(player.teamID);
+     if (tid === 1 || tid === 2) {
+       // ─ OPTIMIZATION: Write to both in-memory Map and DB
+       // In-memory write is immediate (synchronous), providing fast lookups on rejoin.
+       // DB write is awaited to ensure ordering: the LEAVE event is logged before this
+       // function returns, guaranteeing the database reflects the disconnect before the
+       // next UPDATED_PLAYER_INFORMATION cycle. This prevents race conditions where a 
+       // rejoining player finds stale/missing reconnect records.
+       this._reconnectMemory.set(player.steamID, tid);
+       await this.db.savePlayerDisconnect(player.steamID, tid);
+     }
   }
 
   async handleTeamChange(player, oldTeam, newTeam, source = 'Manual/Game') {
