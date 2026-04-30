@@ -186,15 +186,16 @@ export default class SmartAssign extends BasePlugin {
     // ═══════════════════════════════════════════════════════════════════════════
     this._currentJoinTimestamp = null;  // Timestamp of the most recent join event
 
-    // State bindings
-    this.onNewGame = this.onNewGame.bind(this);
-    this.onRoundEnded = this.onRoundEnded.bind(this);
-    this.onUpdatedPlayerInfo = this.onUpdatedPlayerInfo.bind(this);
-    this.onPlayerConnected = this.onPlayerConnected.bind(this);
-    this.onScrambleExecuted = this.onScrambleExecuted.bind(this);
-    this.onMoveFailed = this.onMoveFailed.bind(this);
-    this.onMoveSuccess = this.onMoveSuccess.bind(this);
-    this.onMoveRetry = this.onMoveRetry.bind(this);
+     // State bindings
+     this.onNewGame = this.onNewGame.bind(this);
+     this.onRoundEnded = this.onRoundEnded.bind(this);
+     this.onUpdatedPlayerInfo = this.onUpdatedPlayerInfo.bind(this);
+     this.onUpdatedLayerInfo = this.onUpdatedLayerInfo.bind(this);
+     this.onPlayerConnected = this.onPlayerConnected.bind(this);
+     this.onScrambleExecuted = this.onScrambleExecuted.bind(this);
+     this.onMoveFailed = this.onMoveFailed.bind(this);
+     this.onMoveSuccess = this.onMoveSuccess.bind(this);
+     this.onMoveRetry = this.onMoveRetry.bind(this);
   }
 
   async mount() {
@@ -261,6 +262,7 @@ export default class SmartAssign extends BasePlugin {
     this.server.on('NEW_GAME', this.onNewGame);
     this.server.on('ROUND_ENDED', this.onRoundEnded);
     this.server.on('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
+    this.server.on('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo);
     this.server.on('PLAYER_CONNECTED', this.onPlayerConnected);
     this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
     this.server.on('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
@@ -280,6 +282,7 @@ export default class SmartAssign extends BasePlugin {
     this.server.removeListener('NEW_GAME', this.onNewGame);
     this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
     this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
+    this.server.removeListener('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo);
     this.server.removeListener('PLAYER_CONNECTED', this.onPlayerConnected);
     this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
     this.server.removeListener('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
@@ -425,6 +428,32 @@ export default class SmartAssign extends BasePlugin {
     // ═════════════════════════════════════════════════════════════════════════════════════
     this.phase = 'game_end';
     Logger.verbose('SmartAssign', 2, '[Phase] ROUND_ENDED: switched to game_end phase to suppress assignments during end-game.');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════════
+  // EVENT: UPDATED_LAYER_INFORMATION (Layer/Gamemode Sync)
+  //
+  // Fired independently of UPDATED_PLAYER_INFORMATION when the layer/gamemode data changes.
+  // This listener maintains currentLayerName and currentGamemode as the source of truth,
+  // separate from player information polling cycles.
+  //
+  // Primary responsibilities:
+  //   1. Track the current layer name as the reliable, independently-updated source
+  //   2. Guard against reading stale layer data during game_end phase
+  //   3. Ensure snapshot and finalization use the correct cached layer identity
+  // ═══════════════════════════════════════════════════════════════════════════════════
+  async onUpdatedLayerInfo() {
+    if (!this.ready) return;
+    const name = this.server.currentLayer?.name || null;
+    const mode = this.server.currentLayer?.gamemode || null;
+    
+    // Only update if we have real data and are NOT in game_end phase
+    // (don't overwrite with stale data during game_end/resolving transitions)
+    if (name && this.phase !== 'game_end') {
+      this.currentLayerName = name;
+      this.currentGamemode = mode;
+      Logger.verbose('SmartAssign', 3, `[Layer] Updated layer cache: ${name} (${mode})`);
+    }
   }
 
   async onScrambleExecuted() {
@@ -861,6 +890,10 @@ export default class SmartAssign extends BasePlugin {
    /**
     * Delegates to SAEventLogger with concurrency guard.
     * Prevents concurrent finalization calls from reading/writing the same temp log file.
+    * 
+    * CRITICAL: Uses only cached layer identity (currentLayerName/currentGamemode).
+    * Never reads from server.currentLayer as a fallback — that could be stale from the previous round.
+    * The layer listener maintains these caches independently, so they're reliable sources of truth.
     */
    async finalizeRoundLog() {
      if (this._isFinalizingRound) {
@@ -871,8 +904,8 @@ export default class SmartAssign extends BasePlugin {
      try {
         await this.eventLogger.finalizeRoundLog(
           this.currentRoundStartTime,
-          this.currentLayerName || (this.server.currentLayer ? this.server.currentLayer.name : null),
-          this.currentGamemode  || (this.server.currentLayer ? this.server.currentLayer.gamemode : null),
+          this.currentLayerName || 'Unknown',
+          this.currentGamemode || 'Unknown',
           this.options.enableSmartAssign !== false
         );
      } finally {
@@ -922,9 +955,9 @@ export default class SmartAssign extends BasePlugin {
          joinedServerAt: this._sessionJoinTimes.get(p.steamID) || Date.now()
        }));
 
-      // Cache layer identity at snapshot time — protects against finalization reading next round's layer
-      this.currentLayerName = this.server.currentLayer ? this.server.currentLayer.name : null;
-      this.currentGamemode  = this.server.currentLayer ? this.server.currentLayer.gamemode : null;
+      // Layer identity is now maintained continuously by onUpdatedLayerInfo listener.
+      // No need to re-read it here — it's already cached with the correct value
+      // from the independent UPDATED_LAYER_INFORMATION polling cycle.
 
       this.logEvent('ROUND_SNAPSHOT', null, { players: snapshotPlayers }, false);
      Logger.verbose('SmartAssign', 2, `[Snapshot] Round snapshot captured with ${snapshotPlayers.length} players.`);
