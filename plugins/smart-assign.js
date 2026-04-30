@@ -803,19 +803,53 @@ export default class SmartAssign extends BasePlugin {
         this._sessionJoinTimes.set(player.steamID, Date.now());
       }
 
-      Logger.verbose('SmartAssign', 3, `[JOIN] Player connected: ${player.name} (${player.steamID})`);
-      this.logEvent('JOIN', player, {}, this._betweenRounds);
+       Logger.verbose('SmartAssign', 3, `[JOIN] Player connected: ${player.name} (${player.steamID})`);
+       this.logEvent('JOIN', player, {}, this._betweenRounds);
 
-      // Check if the current layer/gamemode is ignored
-      const currentLayerName = this.server.currentLayer && this.server.currentLayer.name ? String(this.server.currentLayer.name).toLowerCase() : '';
-      const currentGamemode = this.server.currentLayer && this.server.currentLayer.gamemode ? String(this.server.currentLayer.gamemode).toLowerCase() : '';
+       // ═══════════════════════════════════════════════════════════════════════════
+       // NULL-TEAMID GUARD: Defer assignment until RCON snapshot resolution completes
+       //
+       // PROBLEM:
+       //   During the round transition (NEW_GAME event), RCON briefly contains players
+       //   with teamID=null as teams are being re-established. This null state is transient
+       //   (~max 14 seconds) but creates a data accuracy issue: null-teamID players are
+       //   invisible to the population counter, causing team size estimates to be off by
+       //   the number of pending nulls (typically 2–4 players).
+       //
+       // CONSEQUENCE IF NOT GUARDED:
+       //   If we evaluate team assignments while nulls are pending, we route new joins
+       //   based on stale population counts. Example: if 3 nulls are about to resolve to
+       //   Team 2, but the counter sees them as 0, we might over-load Team 2 beyond the
+       //   intended imbalance threshold.
+       //
+       // SOLUTION:
+       //   While _pendingSnapshotPatches is non-empty (indicating unresolved nulls),
+       //   skip smart assignment and let Squad's native random assignment handle joins.
+       //   This is safe because:
+       //     - The null window is brief (~14 seconds max per test data)
+       //     - It only affects joins during that specific window
+       //     - After nulls resolve, normal assignment resumes immediately
+       //
+       // LIFECYCLE:
+       //   - _pendingSnapshotPatches populated at snapshot time (NEW_GAME + ~10s)
+       //   - Cleared on each UPDATED_PLAYER_INFORMATION tick as nulls resolve
+       //   - Fully cleared within ~14 seconds or after 3 poll attempts
+       // ═══════════════════════════════════════════════════════════════════════════
+       if (this._pendingSnapshotPatches.size > 0) {
+         Logger.verbose('SmartAssign', 2, `[SmartAssign] Null-teamID resolution pending (${this._pendingSnapshotPatches.size} players unresolved). Skipping assignment for ${player.name}; using native Squad assignment instead.`);
+         return;
+       }
 
-      const isIgnored = this._ignoredModes.some(m => currentLayerName.includes(m) || currentGamemode.includes(m));
+       // Check if the current layer/gamemode is ignored
+       const currentLayerName = this.server.currentLayer && this.server.currentLayer.name ? String(this.server.currentLayer.name).toLowerCase() : '';
+       const currentGamemode = this.server.currentLayer && this.server.currentLayer.gamemode ? String(this.server.currentLayer.gamemode).toLowerCase() : '';
 
-      if (isIgnored) {
-        Logger.verbose('SmartAssign', 3, `[SmartAssign] Ignored game mode detected. Skipping Elo-based assignment for ${player.name}.`);
-        return;
-      }
+       const isIgnored = this._ignoredModes.some(m => currentLayerName.includes(m) || currentGamemode.includes(m));
+
+       if (isIgnored) {
+         Logger.verbose('SmartAssign', 3, `[SmartAssign] Ignored game mode detected. Skipping Elo-based assignment for ${player.name}.`);
+         return;
+       }
 
       // Passive mode: skip algorithm and ASSIGNMENT logging entirely
       if (this.options.enableSmartAssign === false) {
