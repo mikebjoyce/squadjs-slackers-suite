@@ -562,11 +562,36 @@ export default class SmartAssign extends BasePlugin {
   //   3. Detect and attribute team changes
   //   4. Early map change detection via snapshot lock
   // ═══════════════════════════════════════════════════════════════════════════════════
-  async onUpdatedPlayerInfo(info) {
-    if (!this.ready) return;
-    
-    // ═════════════════════════════════════════════════════════════════════════════════════
-    // RESOLVING PHASE: Wait for 100% team resolution before enabling assignment
+   async onUpdatedPlayerInfo(info) {
+     if (!this.ready) return;
+     
+     // ═════════════════════════════════════════════════════════════════════════════════════
+     // DEBOUNCE CANCELLATION: Clear pending player list update
+     //
+     // Design Rationale:
+     // onPlayerConnected schedules a debounced updatePlayerList() to coalesce burst joins.
+     // However, UPDATED_PLAYER_INFORMATION firing means the natural ~30s RCON polling cycle
+     // has already called updatePlayerList() and provided fresh data. The scheduled debounce
+     // timer (if still pending) is now redundant and should be cancelled to avoid wasting RCON calls.
+     //
+     // Safety: This is a no-op optimization:
+     //   - If debounce hasn't fired yet: we cancel it (saves a redundant RCON call)
+     //   - If debounce already fired: _pendingPlayerListUpdate is null (no-op)
+     //   - If debounce fires *after* this check due to timing: it fires the call (natural polling was slow)
+     //
+     // Independent Path: SASwapExecutor's post-command verification is NOT dependent on this
+     // debounce — it calls updatePlayerList() directly in processRetries() within its own
+     // state-locked verification loop. This debounce is purely a join-detection optimization.
+     // ═════════════════════════════════════════════════════════════════════════════════════
+     if (this._pendingPlayerListUpdate) {
+       clearTimeout(this._pendingPlayerListUpdate);
+       this._pendingPlayerListUpdate = null;
+       Logger.verbose('SmartAssign', 3, '[Debounce] Cancelled pending player list update — UPDATED_PLAYER_INFORMATION cycle already refreshed data.');
+     }
+     
+     // ═════════════════════════════════════════════════════════════════════════════════════
+     // RESOLVING PHASE: Wait for 100% team resolution before enabling assignment
+
     //
     // When phase is 'resolving' (set by NEW_GAME), we wait until every player has a real
     // teamID (1 or 2, not null). This prevents the null-teamID window (~30s after NEW_GAME)

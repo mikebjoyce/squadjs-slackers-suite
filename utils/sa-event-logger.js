@@ -82,7 +82,7 @@ export default class SAEventLogger {
     }
 
     const event = {
-      timestamp: Date.now(),
+      ts: Date.now(),
       eventType,
       ...(player ? {
         steamID: player.steamID,
