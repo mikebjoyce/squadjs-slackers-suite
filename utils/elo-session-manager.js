@@ -78,22 +78,26 @@ export default class EloSessionManager {
       const { eosID, name, steamID, teamID } = player;
       currentPlayerIDs.add(eosID);
 
-      if (!this.sessions.has(eosID)) {
-        // Condition: eosID in currentPlayers, not in session map
-        // Action: Open new segment
-        const newSegment = {
-          teamID: teamID,
-          joinTime: timestamp,
-          leaveTime: null
-        };
+       if (!this.sessions.has(eosID)) {
+         // Condition: eosID in currentPlayers, not in session map
+         // Action: Open new segment
+         // NOTE (null-teamID transient): teamID may be null if RCON hasn't resolved team 
+         // assignment yet (especially at NEW_GAME transition; see 
+         // SQUADJS_PLUGIN_DEV_REFERENCE.md Section 3). A null segment will be created here 
+         // and later closed when teamID resolves to 1 or 2. This is expected behaviour.
+         const newSegment = {
+           teamID: teamID,
+           joinTime: timestamp,
+           leaveTime: null
+         };
 
-        this.sessions.set(eosID, {
-          eosID,
-          name,
-          steamID,
-          segments: [newSegment],
-          activeSegment: newSegment
-        });
+         this.sessions.set(eosID, {
+           eosID,
+           name,
+           steamID,
+           segments: [newSegment],
+           activeSegment: newSegment
+         });
       } else {
         const session = this.sessions.get(eosID);
 
@@ -112,19 +116,24 @@ export default class EloSessionManager {
           };
           session.segments.push(newSegment);
           session.activeSegment = newSegment;
-        } else if (session.activeSegment.teamID !== teamID) {
-          // Action: Team changed -> Close active segment, open new segment
-          session.activeSegment.leaveTime = timestamp;
+         } else if (session.activeSegment.teamID !== teamID) {
+           // Action: Team changed -> Close active segment, open new segment
+           // NOTE (null-teamID transient): This branch also fires when teamID transitions 
+           // from null → 1/2 (the expected null-teamID resolution case). The null segment 
+           // is closed and a valid segment opened. Any time the player spent in the null state 
+           // (~30–35s at NEW_GAME) contributes nothing to participationRatio and is effectively 
+           // discarded. This is acceptable given the negligible impact (<1% of round duration).
+           session.activeSegment.leaveTime = timestamp;
 
-          const newSegment = {
-            teamID: teamID,
-            joinTime: timestamp,
-            leaveTime: null
-          };
+           const newSegment = {
+             teamID: teamID,
+             joinTime: timestamp,
+             leaveTime: null
+           };
 
-          session.segments.push(newSegment);
-          session.activeSegment = newSegment;  // set current
-        }
+           session.segments.push(newSegment);
+           session.activeSegment = newSegment;  // set current
+         }
         // Condition: Team unchanged -> No action
       }
     }
@@ -174,14 +183,16 @@ export default class EloSessionManager {
         }
       }
 
-      // Edge case guard: If player recorded absolutely 0 time on either team,
-      // they are in a bugged state (e.g. fully unassigned the entire match).
-      if (timeOnTeam1 === 0 && timeOnTeam2 === 0) {
-        // We log it and skip pushing them to the participants array.
-        // In the rare event someone triggers this, they shouldn't receive a rating update anyway.
-        // NOTE: Since the caller will use a minParticipationRatio filter, this is just a clean-up guard.
-        continue;
-      }
+       // Edge case guard: If player recorded absolutely 0 time on either team,
+       // they are in a bugged state (e.g. fully unassigned the entire match).
+       // This commonly happens for players who were in a null-teamID segment that resolved,
+       // and then disconnected before opening a valid segment (i.e. left during the map load screen).
+       if (timeOnTeam1 === 0 && timeOnTeam2 === 0) {
+         // We log it and skip pushing them to the participants array.
+         // In the rare event someone triggers this, they shouldn't receive a rating update anyway.
+         // NOTE: Since the caller will use a minParticipationRatio filter, this is just a clean-up guard.
+         continue;
+       }
 
       // Determine assigned team (most time played)
       // Default to team 1 if equal

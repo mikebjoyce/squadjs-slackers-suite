@@ -417,22 +417,32 @@ export default class EloTracker extends BasePlugin {
     return true;
   }
 
-  async onNewGame(data) {
-    if (!this.ready) return;
+   async onNewGame(data) {
+     if (!this.ready) return;
 
-    Logger.verbose('EloTracker', 1, 'NEW_GAME event received. Starting new session.');
+     Logger.verbose('EloTracker', 1, 'NEW_GAME event received. Starting new session.');
 
-    if (data && data.layer) {
-      await this.resolveLayerInfo(data.layer, 'onNewGame');
-    }
+     if (data && data.layer) {
+       await this.resolveLayerInfo(data.layer, 'onNewGame');
+     }
 
-    const now = Date.now();
-    this.session.startRound(now);
-    await this.db.saveRoundStartTime(now);
-    this.lastRoundSnapshot = null;
-    this.eloCache.clear();
-    this._roundStartEmbedPending = Date.now();
-  }
+     const now = Date.now();
+     this.session.startRound(now);
+     await this.db.saveRoundStartTime(now);
+     this.lastRoundSnapshot = null;
+     this.eloCache.clear();
+     this._roundStartEmbedPending = Date.now();
+
+     // NOTE (null-teamID transient): SquadJS RCON polling may return players with 
+     // teamID === null immediately after NEW_GAME fires (see SQUADJS_PLUGIN_DEV_REFERENCE.md, 
+     // Section 3). At full-server scale (93–99 players), the ENTIRE roster can be null-teamID 
+     // for up to ~35 seconds as players load into the new map. The session manager will record 
+     // these null-teamID states as initial segments; when teamID resolves, a "team switch" is 
+     // detected and a new segment is opened. This means players' null-teamID wait time (~30–35s) 
+     // contributes nothing to their timeOnTeam1 or timeOnTeam2, and thus does not factor into 
+     // participationRatio. This is expected behaviour and harmless — the impact is <1% of a 
+     // typical round. All tracking resumes normally once teamIDs resolve.
+   }
 
   /**
    * Periodic update for player info.
