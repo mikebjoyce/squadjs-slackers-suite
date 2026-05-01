@@ -799,6 +799,7 @@ export default class EloTracker extends BasePlugin {
     }
 
     const matchRecord = {
+      ts: roundEndTime,
       matchId: roundEndTime.toString(),
       endedAt: roundEndTime,
       layerName: layerName,

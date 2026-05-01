@@ -142,7 +142,7 @@ async function main() {
 
   // Build output in backup schema
   const output = {
-    exportedAt:  new Date().toISOString(),
+    exportedAt:  Date.now(),
     playerCount: players.size,
     params: {
       MU_DEFAULT: EloCalculator.MU_DEFAULT,
