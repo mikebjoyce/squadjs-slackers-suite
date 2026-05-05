@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import SmartAssign from '../plugins/smart-assign.js';
+import { extractRawPrefix, buildPlayerTagCache } from '../utils/sa-clan-grouper.js';
 
 const MAX_TEAM_SIZE = 50;
 
@@ -341,6 +342,9 @@ async function simulateHistoricalMatch(match, engineConfig, seededRandom, logStr
     plugin.logEvent = (type, player, data) => {
       if (type === 'ASSIGNMENT') {
         server.eventLog.push(`[ALGO] ${player.name} -> T${data.targetTeam} (Executed: ${data.executed}): ${data.reason}`);
+        if (data.reason === 'Clan Grouping') {
+          clanCaused++;
+        }
       }
     };
   }
@@ -348,7 +352,15 @@ async function simulateHistoricalMatch(match, engineConfig, seededRandom, logStr
   await plugin.mount();
   server.eventLog = [];
 
-  const timeline = match.isProlonged 
+  // Clan coherence tracking initialization
+  const playerTagCache = match.isProlonged
+    ? new Map()
+    : buildPlayerTagCache(match.players, { caseSensitive: false });
+  let clanApplicable = 0;
+  let clanCoherent = 0;
+  let clanCaused = 0;
+
+  const timeline = match.isProlonged
     ? generateProlongedTimeline(match, seededRandom) 
     : inferPlayerEvents(match, seededRandom, targetInitialPop);
   server.timeline = timeline;
@@ -428,12 +440,13 @@ async function simulateHistoricalMatch(match, engineConfig, seededRandom, logStr
         naturalTeam = t1Count <= t2Count ? 1 : 2;
       }
 
-      const playerObj = {
-        steamID,
-        name: p.name,
-        teamID: naturalTeam,
-        squadID: null
-      };
+       const playerObj = {
+         steamID,
+         eosID: steamID,
+         name: p.name,
+         teamID: naturalTeam,
+         squadID: null
+       };
       
       if (reconnectTeam) rejoinOpportunities++;
 
@@ -453,6 +466,28 @@ async function simulateHistoricalMatch(match, engineConfig, seededRandom, logStr
 
       if (reconnectTeam && playerObj.teamID === reconnectTeam) {
         rejoinSuccesses++;
+      }
+
+      // Clan coherence tracking
+      const rawTag = extractRawPrefix(p.name);
+      const normTag = rawTag ? rawTag.replace(/[^a-zA-Z0-9]/g, '').toUpperCase() : null;
+      playerTagCache.set(steamID, normTag);
+      
+      if (normTag) {
+        let t1Clan = 0, t2Clan = 0;
+        for (const sp of server.players) {
+          if (sp.steamID === steamID) continue;
+          const spTag = playerTagCache.get(sp.steamID);
+          if (spTag && spTag === normTag) {
+            if (String(sp.teamID) === '1') t1Clan++;
+            else if (String(sp.teamID) === '2') t2Clan++;
+          }
+        }
+        if ((t1Clan >= 1 && t2Clan === 0) || (t2Clan >= 1 && t1Clan === 0)) {
+          clanApplicable++;
+          const clanTeam = t1Clan > 0 ? 1 : 2;
+          if (String(playerObj.teamID) === String(clanTeam)) clanCoherent++;
+        }
       }
 
       if (logStream && engineConfig.name.includes('SMART ASSIGN')) {
@@ -533,7 +568,11 @@ async function simulateHistoricalMatch(match, engineConfig, seededRandom, logStr
     unbalancedPercent,
     rejoinRate: rejoinOpportunities > 0 ? (rejoinSuccesses / rejoinOpportunities) * 100 : null,
     rejoinOpp: rejoinOpportunities,
-    rejoinSucc: rejoinSuccesses
+    rejoinSucc: rejoinSuccesses,
+    clanApplicable,
+    clanCoherent,
+    clanCaused,
+    clanCoherence: clanApplicable > 0 ? clanCoherent / clanApplicable : null
   };
 }
 
@@ -697,7 +736,13 @@ async function testLoadTempEventsCrashRecovery() {
 async function runTests() {
   // await testLoadTempEventsCrashRecovery(); // Skipped
 
-  const logPath = path.join(__dirname, 'elo-match-log.jsonl');
+   // Support both positional argument (process.argv[2]) and hardcoded default
+   let logPath = path.join(__dirname, 'data', 'elo-match-log.jsonl');
+  if (process.argv[2] && !process.argv[2].startsWith('--')) {
+    logPath = path.isAbsolute(process.argv[2])
+      ? process.argv[2]
+      : path.join(process.cwd(), process.argv[2]);
+  }
   if (!fs.existsSync(logPath)) {
     console.error(`Log file not found at ${logPath}`);
     process.exit(1);
@@ -710,8 +755,8 @@ async function runTests() {
     if (line.trim()) matches.push(JSON.parse(line));
   }
 
-  // Load Elo Backup
-  const eloBackupPath = path.join(__dirname, 'tools', 'elo-backup-2026-04-11T07-04-39-967Z.json');
+   // Load Elo Backup
+   const eloBackupPath = path.join(__dirname, 'data', 'elo-backup-2026-04-11T07-04-39-967Z.json');
   const backupData = JSON.parse(fs.readFileSync(eloBackupPath, 'utf8'));
   const backupEloMap = new Map();
   const allBackupMus = [];
@@ -763,42 +808,47 @@ async function runTests() {
   ];
 
   const globalStats = {};
-  for (const scenario of startScenarios) {
-    globalStats[scenario.label] = {};
-    engineConfigs.forEach(c => globalStats[scenario.label][c.name] = { 
-      avgGap: 0, sumGap: 0, moves: 0, unbalanced: 0, rejoinOpp: 0, rejoinSucc: 0, count: 0 
-    });
-  }
+   for (const scenario of startScenarios) {
+     globalStats[scenario.label] = {};
+      engineConfigs.forEach(c => globalStats[scenario.label][c.name] = { 
+        avgGap: 0, sumGap: 0, moves: 0, unbalanced: 0, rejoinOpp: 0, rejoinSucc: 0, clanApplicable: 0, clanCoherent: 0, clanCaused: 0, count: 0 
+      });
+   }
 
-  function updateStats(scenarioLabel, configName, result) {
-    const s = globalStats[scenarioLabel][configName];
-    s.avgGap += result.avgGap;
-    s.sumGap += result.avgSumGap;
-    s.moves += result.forcedMoves;
-    s.unbalanced += result.unbalancedPercent;
-    s.rejoinOpp += result.rejoinOpp;
-    s.rejoinSucc += result.rejoinSucc;
-    s.count++;
-  }
+   function updateStats(scenarioLabel, configName, result) {
+     const s = globalStats[scenarioLabel][configName];
+     s.avgGap += result.avgGap;
+     s.sumGap += result.avgSumGap;
+     s.moves += result.forcedMoves;
+     s.unbalanced += result.unbalancedPercent;
+     s.rejoinOpp += result.rejoinOpp;
+     s.rejoinSucc += result.rejoinSucc;
+     s.clanApplicable += result.clanApplicable || 0;
+     s.clanCoherent += result.clanCoherent || 0;
+     s.clanCaused += result.clanCaused || 0;
+     s.count++;
+   }
 
-  function printSummary(label) {
-    console.log(`\n=== AGGREGATE SUMMARY: ${label} ===`);
-    for (const scenario of startScenarios) {
-      console.log(`\n[ ${scenario.label} ]`);
-      console.log(`${"Engine".padEnd(25)} | ${"Avg Gap".padStart(7)} | ${"Sum Gap".padStart(7)} | ${"Unbalanced".padStart(10)} | ${"Rejoin".padStart(6)} | ${"Avg Moves".padStart(9)}`);
-      console.log("-".repeat(81));
-      for (const [name, s] of Object.entries(globalStats[scenario.label])) {
-        if (s.count === 0) continue;
-        const n = s.count;
-        const rRateStr = s.rejoinOpp > 0 ? `${((s.rejoinSucc / s.rejoinOpp) * 100).toFixed(1)}% (${s.rejoinSucc}/${s.rejoinOpp})` : '--';
-        const avgGapStr = (s.avgGap/n).toFixed(3);
-        const sumGapStr = (s.sumGap/n).toFixed(1);
-        const unbalStr = `${(s.unbalanced/n).toFixed(1)}%`;
-        const movesStr = (s.moves/n).toFixed(1);
-        console.log(`${name.padEnd(25)} | ${avgGapStr.padStart(7)} | ${sumGapStr.padStart(7)} | ${unbalStr.padStart(10)} | ${rRateStr.padStart(6)} | ${movesStr.padStart(9)}`);
+    function printSummary(label) {
+      console.log(`\n=== AGGREGATE SUMMARY: ${label} ===`);
+      for (const scenario of startScenarios) {
+        console.log(`\n[ ${scenario.label} ]`);
+        console.log(`${"Engine".padEnd(25)} | ${"Avg Gap".padStart(7)} | ${"Sum Gap".padStart(7)} | ${"Unbalanced".padStart(10)} | ${"Rejoin".padStart(6)} | ${"Avg Moves".padStart(9)} | ${"Clan Coh.".padStart(10)} | ${"Clan Caused".padStart(11)}`);
+        console.log("-".repeat(114));
+        for (const [name, s] of Object.entries(globalStats[scenario.label])) {
+          if (s.count === 0) continue;
+          const n = s.count;
+          const rRateStr = s.rejoinOpp > 0 ? `${((s.rejoinSucc / s.rejoinOpp) * 100).toFixed(1)}% (${s.rejoinSucc}/${s.rejoinOpp})` : '--';
+          const avgGapStr = (s.avgGap/n).toFixed(3);
+          const sumGapStr = (s.sumGap/n).toFixed(1);
+          const unbalStr = `${(s.unbalanced/n).toFixed(1)}%`;
+          const movesStr = (s.moves/n).toFixed(1);
+          const clanStr = s.clanApplicable > 0 ? `${((s.clanCoherent / s.clanApplicable) * 100).toFixed(1)}% (${s.clanCoherent}/${s.clanApplicable})` : '--';
+          const clanCausedStr = s.clanCaused > 0 ? `${s.clanCaused}` : '--';
+          console.log(`${name.padEnd(25)} | ${avgGapStr.padStart(7)} | ${sumGapStr.padStart(7)} | ${unbalStr.padStart(10)} | ${rRateStr.padStart(6)} | ${movesStr.padStart(9)} | ${clanStr.padStart(10)} | ${clanCausedStr.padStart(11)}`);
+        }
       }
     }
-  }
 
   console.log(`\n🚀 Running simulation on ${matches.length} historical matches...\n`);
 
@@ -811,23 +861,24 @@ async function runTests() {
       const printDetails = idx < 1; // only print first match per scenario
       if (printDetails) console.log(`  Match: ${match.layerName} (${match.players.length} players)`);
       
-      for (const config of engineConfigs) {
-        const result = await simulateHistoricalMatch(match, config, seededRandom, logStream, scenario.pop);
-        updateStats(scenario.label, config.name, result);
-        if (printDetails) {
-          const rRateStr = result.rejoinRate !== null ? `${result.rejoinRate.toFixed(1)}%` : '--';
-          console.log(`    ${result.name.padEnd(25)} | Avg Gap: ${result.avgGap.toFixed(3)} | Sum Gap: ${result.avgSumGap.toFixed(1)}`);
-          console.log(`    ${"".padEnd(25)} | Unbalanced: ${result.unbalancedPercent.toFixed(1)}% | Rejoin: ${rRateStr} | Moves: ${result.forcedMoves}`);
-        }
-      }
+       for (const config of engineConfigs) {
+         const result = await simulateHistoricalMatch(match, config, seededRandom, logStream, scenario.pop);
+         updateStats(scenario.label, config.name, result);
+         if (printDetails) {
+           const rRateStr = result.rejoinRate !== null ? `${result.rejoinRate.toFixed(1)}%` : '--';
+           const clanStr = result.clanCoherence !== null ? `${(result.clanCoherence * 100).toFixed(1)}% (${result.clanCoherent}/${result.clanApplicable})` : '--';
+           console.log(`    ${result.name.padEnd(25)} | Avg Gap: ${result.avgGap.toFixed(3)} | Sum Gap: ${result.avgSumGap.toFixed(1)}`);
+           console.log(`    ${"".padEnd(25)} | Unbalanced: ${result.unbalancedPercent.toFixed(1)}% | Rejoin: ${rRateStr} | Moves: ${result.forcedMoves} | Clan: ${clanStr}`);
+         }
+       }
     }
   }
   printSummary("HISTORICAL MATCHES");
 
-  // Reset stats for synthetic run
-  for (const scenario of startScenarios) {
-    engineConfigs.forEach(c => globalStats[scenario.label][c.name] = { avgGap: 0, sumGap: 0, moves: 0, unbalanced: 0, rejoinOpp: 0, rejoinSucc: 0, count: 0 });
-  }
+   // Reset stats for synthetic run
+   for (const scenario of startScenarios) {
+     engineConfigs.forEach(c => globalStats[scenario.label][c.name] = { avgGap: 0, sumGap: 0, moves: 0, unbalanced: 0, rejoinOpp: 0, rejoinSucc: 0, clanApplicable: 0, clanCoherent: 0, count: 0 });
+   }
 
   console.log('\n--- Synthetic Match Generation (Pattern Based) ---');
   const churnStats = analyzeChurnStatistics(matches);
@@ -851,10 +902,10 @@ async function runTests() {
   }
   printSummary("SYNTHETIC MATCHES");
 
-  // Reset stats for prolonged run
-  const peakScenario = "Constant Peak (95+)";
-  globalStats[peakScenario] = {};
-  engineConfigs.forEach(c => globalStats[peakScenario][c.name] = { avgGap: 0, sumGap: 0, moves: 0, unbalanced: 0, rejoinOpp: 0, rejoinSucc: 0, count: 0 });
+   // Reset stats for prolonged run
+   const peakScenario = "Constant Peak (95+)";
+   globalStats[peakScenario] = {};
+   engineConfigs.forEach(c => globalStats[peakScenario][c.name] = { avgGap: 0, sumGap: 0, moves: 0, unbalanced: 0, rejoinOpp: 0, rejoinSucc: 0, clanApplicable: 0, clanCoherent: 0, count: 0 });
 
   console.log('\n--- Prolonged Peak Match Generation (10+ hours, 95-100 Pop) ---');
   for (let i = 0; i < 5; i++) {
@@ -873,24 +924,25 @@ async function runTests() {
     }
   }
 
-  console.log(`\n=== AGGREGATE SUMMARY: PROLONGED MATCHES ===`);
-  console.log(`\n[ ${peakScenario} ]`);
-  console.log(`${"Engine".padEnd(25)} | ${"Avg Gap".padStart(7)} | ${"Sum Gap".padStart(7)} | ${"Unbalanced".padStart(10)} | ${"Rejoin".padStart(6)} | ${"Avg Moves".padStart(9)}`);
-  console.log("-".repeat(81));
-  for (const [name, s] of Object.entries(globalStats[peakScenario])) {
-    const n = s.count || 1;
-    const rRateStr = s.rejoinOpp > 0 ? `${((s.rejoinSucc / s.rejoinOpp) * 100).toFixed(1)}% (${s.rejoinSucc}/${s.rejoinOpp})` : '--';
-    const avgGapStr = (s.avgGap/n).toFixed(3);
-    const sumGapStr = (s.sumGap/n).toFixed(1);
-    const unbalStr = `${(s.unbalanced/n).toFixed(1)}%`;
-    const movesStr = (s.moves/n).toFixed(1);
-    console.log(`${name.padEnd(25)} | ${avgGapStr.padStart(7)} | ${sumGapStr.padStart(7)} | ${unbalStr.padStart(10)} | ${rRateStr.padStart(6)} | ${movesStr.padStart(9)}`);
-  }
+   console.log(`\n=== AGGREGATE SUMMARY: PROLONGED MATCHES ===`);
+   console.log(`\n[ ${peakScenario} ]`);
+   console.log(`${"Engine".padEnd(25)} | ${"Avg Gap".padStart(7)} | ${"Sum Gap".padStart(7)} | ${"Unbalanced".padStart(10)} | ${"Rejoin".padStart(6)} | ${"Avg Moves".padStart(9)} | ${"Clan Coh.".padStart(10)}`);
+   console.log("-".repeat(101));
+   for (const [name, s] of Object.entries(globalStats[peakScenario])) {
+     const n = s.count || 1;
+     const rRateStr = s.rejoinOpp > 0 ? `${((s.rejoinSucc / s.rejoinOpp) * 100).toFixed(1)}% (${s.rejoinSucc}/${s.rejoinOpp})` : '--';
+     const avgGapStr = (s.avgGap/n).toFixed(3);
+     const sumGapStr = (s.sumGap/n).toFixed(1);
+     const unbalStr = `${(s.unbalanced/n).toFixed(1)}%`;
+     const movesStr = (s.moves/n).toFixed(1);
+     const clanStr = s.clanApplicable > 0 ? `${((s.clanCoherent / s.clanApplicable) * 100).toFixed(1)}% (${s.clanCoherent}/${s.clanApplicable})` : '--';
+     console.log(`${name.padEnd(25)} | ${avgGapStr.padStart(7)} | ${sumGapStr.padStart(7)} | ${unbalStr.padStart(10)} | ${rRateStr.padStart(6)} | ${movesStr.padStart(9)} | ${clanStr.padStart(10)}`);
+   }
 
-  // --- 50-hour Ultra Prolonged Run ---
-  const ultraScenario = "Constant Peak (50+ hours)";
-  globalStats[ultraScenario] = {};
-  engineConfigs.forEach(c => globalStats[ultraScenario][c.name] = { avgGap: 0, sumGap: 0, moves: 0, unbalanced: 0, rejoinOpp: 0, rejoinSucc: 0, count: 0 });
+   // --- 50-hour Ultra Prolonged Run ---
+   const ultraScenario = "Constant Peak (50+ hours)";
+   globalStats[ultraScenario] = {};
+   engineConfigs.forEach(c => globalStats[ultraScenario][c.name] = { avgGap: 0, sumGap: 0, moves: 0, unbalanced: 0, rejoinOpp: 0, rejoinSucc: 0, clanApplicable: 0, clanCoherent: 0, count: 0 });
 
   console.log('\n--- Ultra Prolonged Peak Match Generation (50+ hours, 95-100 Pop) ---');
   for (let i = 0; i < 2; i++) { // Run 2 matches of 50 hours each
@@ -909,19 +961,20 @@ async function runTests() {
     }
   }
 
-  console.log(`\n=== AGGREGATE SUMMARY: ULTRA PROLONGED MATCHES ===`);
-  console.log(`\n[ ${ultraScenario} ]`);
-  console.log(`${"Engine".padEnd(25)} | ${"Avg Gap".padStart(7)} | ${"Sum Gap".padStart(7)} | ${"Unbalanced".padStart(10)} | ${"Rejoin".padStart(6)} | ${"Avg Moves".padStart(9)}`);
-  console.log("-".repeat(81));
-  for (const [name, s] of Object.entries(globalStats[ultraScenario])) {
-    const n = s.count || 1;
-    const rRateStr = s.rejoinOpp > 0 ? `${((s.rejoinSucc / s.rejoinOpp) * 100).toFixed(1)}% (${s.rejoinSucc}/${s.rejoinOpp})` : '--';
-    const avgGapStr = (s.avgGap/n).toFixed(3);
-    const sumGapStr = (s.sumGap/n).toFixed(1);
-    const unbalStr = `${(s.unbalanced/n).toFixed(1)}%`;
-    const movesStr = (s.moves/n).toFixed(1);
-    console.log(`${name.padEnd(25)} | ${avgGapStr.padStart(7)} | ${sumGapStr.padStart(7)} | ${unbalStr.padStart(10)} | ${rRateStr.padStart(6)} | ${movesStr.padStart(9)}`);
-  }
+   console.log(`\n=== AGGREGATE SUMMARY: ULTRA PROLONGED MATCHES ===`);
+   console.log(`\n[ ${ultraScenario} ]`);
+   console.log(`${"Engine".padEnd(25)} | ${"Avg Gap".padStart(7)} | ${"Sum Gap".padStart(7)} | ${"Unbalanced".padStart(10)} | ${"Rejoin".padStart(6)} | ${"Avg Moves".padStart(9)} | ${"Clan Coh.".padStart(10)}`);
+   console.log("-".repeat(101));
+   for (const [name, s] of Object.entries(globalStats[ultraScenario])) {
+     const n = s.count || 1;
+     const rRateStr = s.rejoinOpp > 0 ? `${((s.rejoinSucc / s.rejoinOpp) * 100).toFixed(1)}% (${s.rejoinSucc}/${s.rejoinOpp})` : '--';
+     const avgGapStr = (s.avgGap/n).toFixed(3);
+     const sumGapStr = (s.sumGap/n).toFixed(1);
+     const unbalStr = `${(s.unbalanced/n).toFixed(1)}%`;
+     const movesStr = (s.moves/n).toFixed(1);
+     const clanStr = s.clanApplicable > 0 ? `${((s.clanCoherent / s.clanApplicable) * 100).toFixed(1)}% (${s.clanCoherent}/${s.clanApplicable})` : '--';
+     console.log(`${name.padEnd(25)} | ${avgGapStr.padStart(7)} | ${sumGapStr.padStart(7)} | ${unbalStr.padStart(10)} | ${rRateStr.padStart(6)} | ${movesStr.padStart(9)} | ${clanStr.padStart(10)}`);
+   }
 
   console.log('\nSimulation complete. Use --repl for interactive testing.');
   process.exit(0);

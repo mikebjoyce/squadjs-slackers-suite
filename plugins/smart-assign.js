@@ -40,10 +40,12 @@
  *   speeds up disconnect detection for all other players as a side-effect.
  * - Algorithm uses a Mu-based Unified Scoring System:
  *     1. Hard Pop Cap: Prevents imbalance beyond dynamic thresholds.
- *     2. Mu Balancing: Weights the average skill gap (3.0x) against a dynamically scaled sum gap (1.5x) to handle diverse pop states.
+ *     2. Physical Server Cap: Hard limit (50 players per team).
  *     3. Reconnect Priority: Hot-path reconnect memory lives in-memory (_reconnectMemory Map) for synchronous lookups. If the player has a reconnect record and the pop cap allows it, they're sent to their previous team immediately (before Elo scoring). On disconnect, the Map is updated synchronously and the DB is written async (fire-and-forget) for crash recovery.
- *     4. Reconnect Bias: If reconnect priority is blocked by the cap, applies a minor score reduction (0.25) toward the previous team to tip near-ties.
- *     5. Reconnect Bonus: Grants an *additional* +2 player imbalance allowance on top of the base for returning players.
+ *     4. Clan Grouping: If a player is in a clan and ALL clan mates are on one team, route the player there (provided pop cap allows). Uses lightweight _playerTagCache for fast tag lookups.
+ *     5. Elo Balancing: Weights the average skill gap (3.0x) against a dynamically scaled sum gap (1.5x) to handle diverse pop states.
+ *     6. Reconnect Bias: If reconnect priority is blocked by the cap, applies a minor score reduction (0.25) toward the previous team to tip near-ties.
+ *     7. Reconnect Bonus: Grants an *additional* +2 player imbalance allowance on top of the base for returning players.
  * - Strict 1-player max imbalance enforced at high population (94+).
  * - Bypasses auto-assignment completely during specified ignored modes (Seed/Jensen).
  * - Accuracy: Players with pending moves are excluded from team evaluation to prevent double-counting.
@@ -70,6 +72,7 @@ import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
 import SAEventLogger from '../utils/sa-event-logger.js';
 import { evaluateTeamAssignment, getMuFast } from '../utils/sa-team-evaluator.js';
+import { buildPlayerTagCache, extractRawPrefix } from '../utils/sa-clan-grouper.js';
 
 const MAX_TEAM_SIZE = 50;
 
@@ -115,6 +118,24 @@ export default class SmartAssign extends BasePlugin {
         description: 'Substrings for layer/gamemode names where SmartAssign should not alter teams.',
         default: ['Seed', 'Jensen'],
         type: 'array'
+      },
+      enableClanGrouping: {
+        required: false,
+        description: 'If true, players in clans will be kept together on the same team if all clan mates are on one team.',
+        default: true,
+        type: 'boolean'
+      },
+      clanGroupMinSize: {
+        required: false,
+        description: 'Minimum number of players to consider a group as a clan (default: 2).',
+        default: 2,
+        type: 'number'
+      },
+      clanGroupCaseSensitive: {
+        required: false,
+        description: 'If false, clan tags are case-insensitive and diacritics/gamer-character lookalikes are normalized (default: false).',
+        default: false,
+        type: 'boolean'
       }
     };
   }
@@ -181,6 +202,23 @@ export default class SmartAssign extends BasePlugin {
 
      this.eloTracker = null;
      this._eloNotReadyWarned = false;
+
+     // ═══════════════════════════════════════════════════════════════════════════
+     // CLAN GROUPING: Player Tag Cache
+     //
+     // Purpose: Maintain a lightweight per-player tag cache for fast clan lookup.
+     //          Built once per round at snapshot time, updated incrementally on joins/leaves.
+     //
+     // Architecture:
+     //   - Stored in-memory during the round (_playerTagCache Map)
+     //   - Maps eosID -> normalized clan tag (or null)
+     //   - Used at join time to identify clan mates
+     //   - Rebuilt at snapshot time alongside team resolution
+     //   - Cleared on NEW_GAME alongside other round state
+     //
+     // Impact: Reduces per-join computation cost by caching tag extraction results.
+     // ═══════════════════════════════════════════════════════════════════════════
+     this._playerTagCache = new Map();
 
     // ═══════════════════════════════════════════════════════════════════════════
     // JOIN/LEAVE TIMING CORRECTION
@@ -374,6 +412,9 @@ export default class SmartAssign extends BasePlugin {
     // Clear in-memory reconnect memory alongside DB clear (synchronized in onNewGame above)
     // This ensures the new round starts fresh with no reconnect history.
     this._reconnectMemory.clear();
+    
+    // Clear player tag cache so it gets rebuilt at snapshot time
+    this._playerTagCache.clear();
     
     // ═════════════════════════════════════════════════════════════════════════════════════
     // RESOLVING PHASE: Set phase to wait for 100% team resolution before enabling assignment.
@@ -808,6 +849,19 @@ export default class SmartAssign extends BasePlugin {
         this._sessionJoinTimes.set(player.steamID, Date.now());
       }
 
+      // ═══════════════════════════════════════════════════════════════════════════
+      // CLAN GROUPING: Incrementally update player tag cache on join
+      //
+      // The tag cache is built once per round at snapshot time. However, players
+      // joining after snapshot also need tags in the cache so clan grouping can work.
+      // This incremental update ensures late joiners are clan-groupable.
+      // ═══════════════════════════════════════════════════════════════════════════
+      if (this.options.enableClanGrouping && player.eosID) {
+        const raw = extractRawPrefix(player.name);
+        const tag = raw ? (this.options.clanGroupCaseSensitive ? raw : raw.replace(/[^a-zA-Z0-9]/g, '').toUpperCase()) : null;
+        this._playerTagCache.set(player.eosID, tag);
+      }
+
        Logger.verbose('SmartAssign', 3, `[JOIN] Player connected: ${player.name} (${player.steamID})`);
        this.logEvent('JOIN', player, {}, this.phase !== 'active');
 
@@ -920,6 +974,11 @@ export default class SmartAssign extends BasePlugin {
     Logger.verbose('SmartAssign', 3, `[LEAVE] Player disconnected: ${player.name} (${player.steamID}) from Team ${player.teamID}`);
     this.logEvent('LEAVE', player, {}, this.phase !== 'active');
     
+    // Remove from clan tag cache
+    if (player.eosID && this._playerTagCache.has(player.eosID)) {
+      this._playerTagCache.delete(player.eosID);
+    }
+    
      // Save to reconnect memory if they were on a valid team
      const tid = Number(player.teamID);
      if (tid === 1 || tid === 2) {
@@ -957,6 +1016,11 @@ export default class SmartAssign extends BasePlugin {
       pendingPlayerMoves: this._pendingPlayerMoves,
       eloTracker: this.eloTracker,
       ignoredModes: this._ignoredModes,
+      playerTagCache: this.options.enableClanGrouping ? this._playerTagCache : null,
+      clanGroupOptions: {
+        minSize: this.options.clanGroupMinSize || 2,
+        caseSensitive: this.options.clanGroupCaseSensitive || false
+      },
       warnFlags: { eloNotReadyWarned: this._eloNotReadyWarned, muFastMissWarned: this._muFastMissWarned }
     });
   }
@@ -1042,6 +1106,19 @@ export default class SmartAssign extends BasePlugin {
       // Layer identity is now maintained continuously by onUpdatedLayerInfo listener.
       // No need to re-read it here — it's already cached with the correct value
       // from the independent UPDATED_LAYER_INFORMATION polling cycle.
+
+      // ═════════════════════════════════════════════════════════════════════════════════════
+      // BUILD CLAN TAG CACHE AT SNAPSHOT TIME
+      //
+      // Once all players have resolved to real teams, build the lightweight per-player tag cache
+      // that will be used for fast clan lookups during the round. This happens exactly once per round.
+      // ═════════════════════════════════════════════════════════════════════════════════════
+      if (this.options.enableClanGrouping) {
+        this._playerTagCache = buildPlayerTagCache(this.server.players, {
+          caseSensitive: this.options.clanGroupCaseSensitive || false
+        });
+        Logger.verbose('SmartAssign', 2, `[Clan] Built player tag cache with ${this._playerTagCache.size} entries at snapshot time.`);
+      }
 
       this.logEvent('ROUND_SNAPSHOT', null, { players: snapshotPlayers }, false);
      Logger.verbose('SmartAssign', 2, `[Snapshot] Round snapshot captured with ${snapshotPlayers.length} players.`);

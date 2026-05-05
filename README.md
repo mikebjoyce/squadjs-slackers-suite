@@ -17,6 +17,7 @@ Disconnect detection works via delta-diff: every time any player joins and trigg
 * **Sub-2s Verified Join Swaps**: Uses Log-Driven triggering + One-Hit & Verify to move players within ~1s of joining, verified against a fresh RCON poll.
 * **Strict Population Balance**: Dynamically adjusts the allowed team population difference based on total player count, enforcing a strict 1-player max difference at high population.
 * **Reconnect Memory**: Player disconnect states are stored in a fast in-memory Map for instant lookups on rejoin. The database serves as a crash-recovery backing store, written asynchronously on disconnect and re-hydrated into memory when the plugin restarts within the same round. If a player crashes or disconnects, they are automatically placed back on their previous team upon reconnecting (with a +2 imbalance grace allowance).
+* **Clan Grouping**: Detects clan tags in player names (supports 5 detection strategies: brackets, separators, spaces, ALL-CAPS, and bare prefixes) and keeps clan members together on the same team when joining. If all clan mates are on one team and population caps allow, the joining player is routed to that team. Uses case-insensitive matching with Unicode normalization and Levenshtein edit-distance merging for typo tolerance.
 * **Elo-Aware Routing**: Integrates with the `EloTracker` plugin to route new players to the team that will most closely equalize the average skill of both sides.
 * **Passive Mode**: Set `enableSmartAssign: false` to observe real server events only (`JOIN`, `LEAVE`, `TEAM_CHANGE`). The assignment algorithm does not run, and no `ASSIGNMENT` events are logged—this mode is useful for monitoring server activity without any intervention.
 * **Lifecycle Event Logging**: Dumps precise `JOIN`, `LEAVE`, `TEAM_CHANGE`, `ASSIGNMENT`, `MOVE_SUCCESS`, and `MOVE_FAILED` events into an easily ingestible JSONL file, with global team populations (`t1`, `t2`) embedded on every event.
@@ -96,27 +97,27 @@ SmartAssign uses a hierarchical decision process optimised for competitive parit
 
 ### 1. Hard Population Cap (Dynamic)
 
-The hard cap is a safety net that prevents extreme imbalance regardless of the Elo scoring outcome:
+The hard cap is a safety net that prevents extreme imbalance regardless of the Elo scoring outcome. The following values are optimized winners from parameter tuning against historical match data:
 
 | Server Population | Max Allowed Difference |
 |---|---|
-| < 80 players | 4 players |
-| 80–87 players | 3 players |
-| 88–93 players | 2 players |
-| 94+ players | **1 player (strict parity)** |
+| < 82 players | 4 players |
+| 82–89 players | 3 players |
+| 90–95 players | 2 players |
+| 96+ players | **1 player (strict parity)** |
 
 ### 2. Reconnect Memory (High Priority)
 
-If the joining player has a record in the reconnect database from the current round, they are routed directly back to their previous team — **before** Elo scoring is evaluated. Reconnecting players are granted an additional +1 or +2 imbalance grace allowance on top of the base to allow them back to their squad.
+If the joining player has a record in the reconnect database from the current round, they are routed directly back to their previous team — **before** Elo scoring is evaluated. Reconnecting players are granted an additional **+1 imbalance grace allowance** on top of the base to allow them back to their squad.
 
 If the reconnect target would violate the hard cap even with the grace allowance, the player falls through to Elo scoring with a small bias toward their previous team.
 
 ### 3. Elo Scoring & Skill Balancing
 
-If no reconnect memory applies, the algorithm evaluates both teams with a **Mu-based Unified Scoring System**:
+If no reconnect memory applies, the algorithm evaluates both teams with a **Mu-based Unified Scoring System** using tuned weights:
 
-- **Average Gap (3.0×)**: Measures how much the average skill of the two teams would diverge after placing the player on each side.
-- **Sum Gap (1.5× / dynamic)**: Measures the total skill gap, scaled down as population grows (at full 100-player servers, the sum term becomes negligible and average gap dominates).
+- **Average Gap (1.0×)**: Measures how much the average skill of the two teams would diverge after placing the player on each side.
+- **Sum Gap (1.5× / log scale)**: Measures the total skill gap, scaled down using logarithmic growth as population increases. This logarithmic scaling provides stronger sum influence at high populations compared to linear scaling.
 
 The player is assigned to whichever team produces the lower combined score — i.e., the placement that brings the match closest to a balanced skill split.
 

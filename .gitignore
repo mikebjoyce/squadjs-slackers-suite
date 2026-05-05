@@ -1,8 +1,25 @@
-testing/test-output.txt
-testing/tools/rebuilt.json
-testing/tools/mergedFinal.jsonl
-/testing/tools
-*.jsonl
-*.txt
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+
+# Environment variables
+.env
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+.cache/
 plugins/base-plugin.js
-/reports
+testing/SMARTASSIGN_OPTIMIZER_DESIGN.md
+/testing/data

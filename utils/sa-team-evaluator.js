@@ -17,6 +17,19 @@
  * getMuFast(player, eloTracker, warnFlags)
  *   — Retrieves player Mu rating from cache or API, with fallback
  *
+ * ─── CLAN GROUPING ────────────────────────────────────────────────
+ *
+ * SmartAssign can now group clan members on join to keep them together,
+ * provided it doesn't violate hard population caps or size parity.
+ * This is step 3.5 in the priority hierarchy:
+ *
+ *   1. Hard Pop Cap → forced team or both-ok
+ *   2. Physical Server Cap → forced team or both-ok
+ *   3.0 Reconnect Priority → previous team if cap allows
+ *   3.5 Clan Grouping [NEW] → clan team if ALL mates there and cap allows
+ *   4. Elo Scoring → best skill-balanced team
+ *   5. Population tie-break → smaller team
+ *
  * ─── DESIGN NOTES ─────────────────────────────────────────────────
  *
  * All functions are pure (deterministic, no side effects).
@@ -34,6 +47,7 @@
  */
 
 import Logger from '../../core/logger.js';
+import { getClanTeamForPlayer } from './sa-clan-grouper.js';
 
 const MAX_TEAM_SIZE = 50;
 
@@ -52,6 +66,8 @@ const MAX_TEAM_SIZE = 50;
  *     pendingPlayerMoves: Map<steamID, ...>,
  *     eloTracker: EloTracker | null,
  *     ignoredModes: string[],               // Lowercase gamemode substrings to skip
+ *     playerTagCache: Map<eosID, tag|null>, // Clan tag cache (optional)
+ *     clanGroupOptions: { minSize, caseSensitive }, // Clan grouping options
  *     warnFlags: { eloNotReadyWarned: boolean, muFastMissWarned: boolean }
  *   }
  * @returns {object} { targetTeam: 1|2|null, reason: string }
@@ -64,6 +80,8 @@ export function evaluateTeamAssignment(player, server, context) {
     pendingPlayerMoves = new Map(),
     eloTracker = null,
     ignoredModes = [],
+    playerTagCache = null,
+    clanGroupOptions = { minSize: 2, caseSensitive: false },
     warnFlags = { eloNotReadyWarned: false, muFastMissWarned: false }
   } = context;
 
@@ -120,19 +138,19 @@ export function evaluateTeamAssignment(player, server, context) {
     }
   }
 
-  // 2. HARD POPULATION CAP
-  const totalPop = t1Count + t2Count;
-  const isRejoin = reconnectTeam === 1 || reconnectTeam === 2;
+   // 2. HARD POPULATION CAP
+   const totalPop = t1Count + t2Count;
+   const isRejoin = reconnectTeam === 1 || reconnectTeam === 2;
 
-  // Gradual Dynamic maxImbalance
-  let maxImbalance;
-  if (totalPop >= 94) maxImbalance = 1;
-  else if (totalPop >= 88) maxImbalance = 2;
-  else if (totalPop >= 80) maxImbalance = 3;
-  else maxImbalance = 4;
+   // Gradual Dynamic maxImbalance (tuned winner parameters)
+   let maxImbalance;
+   if (totalPop >= 96) maxImbalance = 1;
+   else if (totalPop >= 90) maxImbalance = 2;
+   else if (totalPop >= 82) maxImbalance = 3;
+   else maxImbalance = 4;
 
-  let effectiveMaxImbalance = maxImbalance;
-  if (isRejoin) effectiveMaxImbalance = Math.min(4, maxImbalance + (totalPop >= 90 ? 1 : 2));
+   let effectiveMaxImbalance = maxImbalance;
+   if (isRejoin) effectiveMaxImbalance = Math.min(4, maxImbalance + 1);
 
   if ((t1Count + 1) - t2Count > effectiveMaxImbalance) return { targetTeam: 2, reason: 'Hard Population Cap' };
   if ((t2Count + 1) - t1Count > effectiveMaxImbalance) return { targetTeam: 1, reason: 'Hard Population Cap' };
@@ -152,27 +170,48 @@ export function evaluateTeamAssignment(player, server, context) {
     }
   }
 
+   // 3.5 CLAN GROUPING ROUTING
+   // If player is in a clan and ALL clan mates are on one team (not split),
+   // route the player there provided the population cap still allows it.
+   if (playerTagCache) {
+     const clanTeam = getClanTeamForPlayer(player, playerTagCache, server.players, clanGroupOptions);
+     if (clanTeam) {
+       const clanCount = clanTeam === 1 ? t1Count : t2Count;
+       const opponentCount = clanTeam === 1 ? t2Count : t1Count;
+        // Check that adding this player to the clan team doesn't violate the population cap
+        // Grant clan grouping the same extra imbalance allowance as reconnect gets
+        const effectiveClanImbalance = Math.min(4, maxImbalance + 1);
+       if ((clanCount + 1) - opponentCount <= effectiveClanImbalance) {
+        Logger.verbose('SmartAssign', 3, `[Clan Grouping] Routing ${player.name} to Team ${clanTeam} (all clan mates on that team)`);
+        return { targetTeam: clanTeam, reason: 'Clan Grouping' };
+      } else {
+        Logger.verbose('SmartAssign', 3, `[Clan Grouping] Clan team ${clanTeam} would violate pop cap for ${player.name}. Falling through to Elo.`);
+      }
+    }
+  }
+
   // 3. SKILL & PENALTY EVALUATION
   if (!hasElo) {
     const targetTeam = t1Count <= t2Count ? 1 : 2;
     return { targetTeam, reason: `Population Balance (No Elo) | T1:${t1Count} T2:${t2Count}` };
   }
 
-  const playerMu = getMuFast(player, eloTracker, warnFlags);
-  const avgT1 = t1Count > 0 ? (t1Power / t1Count) : 25.0;
-  const avgT2 = t2Count > 0 ? (t2Power / t2Count) : 25.0;
+   const playerMu = getMuFast(player, eloTracker, warnFlags);
+   const avgT1 = t1Count > 0 ? (t1Power / t1Count) : 25.0;
+   const avgT2 = t2Count > 0 ? (t2Power / t2Count) : 25.0;
 
-  const newAvgT1 = (t1Power + playerMu) / (t1Count + 1);
-  const newAvgT2 = (t2Power + playerMu) / (t2Count + 1);
+   const newAvgT1 = (t1Power + playerMu) / (t1Count + 1);
+   const newAvgT2 = (t2Power + playerMu) / (t2Count + 1);
 
-  // Dynamic scale: normalizes sum gap relative to current server population.
-  const dynamicScale = Math.max(1, (t1Count + t2Count + 1) * 2.5);
+   // Dynamic scale: normalizes sum gap relative to current server population.
+   // Tuned winner uses log scale: slower growth = stronger sum influence at high pop
+   const dynamicScale = Math.max(1, Math.log(t1Count + t2Count + 2) * 2.5);
 
-  const getScore = (candidateAvg, opponentAvg, candidateSum, opponentSum) => {
-    const avgGap = Math.abs(candidateAvg - opponentAvg);
-    const sumGap = Math.abs(candidateSum - opponentSum) / dynamicScale;
-    return (avgGap * 3.0) + (sumGap * 1.5);
-  };
+   const getScore = (candidateAvg, opponentAvg, candidateSum, opponentSum) => {
+     const avgGap = Math.abs(candidateAvg - opponentAvg);
+     const sumGap = Math.abs(candidateSum - opponentSum) / dynamicScale;
+     return (avgGap * 1.0) + (sumGap * 1.5);
+   };
 
   let scoreT1 = getScore(newAvgT1, avgT2, t1Power + playerMu, t2Power);
   let scoreT2 = getScore(avgT1, newAvgT2, t1Power, t2Power + playerMu);
