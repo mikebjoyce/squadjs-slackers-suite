@@ -134,12 +134,14 @@ export default class SmartAssign extends BasePlugin {
     this._sessionJoinTimes = new Map();
     this._snapshotTaken = false;
      this.phase = 'active'; // 'active' | 'game_end' | 'resolving'
-                             // NOTE: 'resolving' is an internal staging sub-state (null-teamID window after NEW_GAME).
-                             // It represents early staging before teams stabilize, and is layered atop the reference's
-                             // 'active' phase. The two externally-observable phases are 'active' (includes staging + live)
-                             // and 'game_end' (maps to 'between_rounds' in the dev reference).
-    this.currentLayerName = null;
-    this.currentGamemode = null;
+                              // NOTE: 'resolving' is an internal staging sub-state (null-teamID window after NEW_GAME).
+                              // It represents early staging before teams stabilize, and is layered atop the reference's
+                              // 'active' phase. The two externally-observable phases are 'active' (includes staging + live)
+                              // and 'game_end' (maps to 'between_rounds' in the dev reference).
+     this.currentLayerName = null;
+     this.currentGamemode = null;
+     this.previousRoundLayerName = null;  // Captured at ROUND_ENDED for reliable finalization
+     this.previousRoundGamemode = null;   // Captured at ROUND_ENDED for reliable finalization
     this._pendingAssignments = { 1: 0, 2: 0 };
     this._pendingMu = { 1: 0, 2: 0 };
     this._pendingPlayerMoves = new Map();
@@ -409,6 +411,25 @@ export default class SmartAssign extends BasePlugin {
     this._snapshotTaken = false;
     
     // ═════════════════════════════════════════════════════════════════════════════════════
+    // CAPTURE LAYER IDENTITY FOR FINALIZATION
+    //
+    // CRITICAL FIX: Save the current round's layer identity NOW, at ROUND_ENDED time,
+    // BEFORE NEW_GAME fires and clears the cache. This ensures that when finalizeRoundLog()
+    // is called from onNewGame(), we have the ENDING round's layer name, not the NEW round's.
+    //
+    // Timeline:
+    //   1. ROUND_ENDED fires → capture layer identity → store in previousRound* variables
+    //   2. NEW_GAME fires → clear currentLayerName cache → call finalizeRoundLog()
+    //   3. finalizeRoundLog() uses previousRound* (captured at step 1) for the log
+    //   4. UPDATED_LAYER_INFORMATION populates currentLayerName with NEW round's layer
+    //
+    // This timing fix prevents the race condition where layer data was null/Unknown.
+    // ═════════════════════════════════════════════════════════════════════════════════════
+    this.previousRoundLayerName = this.currentLayerName;
+    this.previousRoundGamemode = this.currentGamemode;
+    Logger.verbose('SmartAssign', 2, `[Layer] Captured layer at ROUND_ENDED: ${this.previousRoundLayerName || 'Unknown'} (${this.previousRoundGamemode || 'Unknown'})`);
+    
+    // ═════════════════════════════════════════════════════════════════════════════════════
     // GAME_END PHASE: Set phase to suppress player assignments.
     //
     // When ROUND_ENDED fires, the round has just ended in-game. However, several things
@@ -463,6 +484,28 @@ export default class SmartAssign extends BasePlugin {
        this.currentLayerName = name;
        this.currentGamemode = mode;
        Logger.verbose('SmartAssign', 3, `[Layer] Updated layer cache: ${name} (${mode})`);
+     }
+     
+     // ═════════════════════════════════════════════════════════════════════════════════════
+     // RESTART RECOVERY BACKFILL: Recover layer name during mid-round restart scenarios
+     //
+     // When the server restarts mid-round during RCON recovery, this sequence can occur:
+     //   1. Server restarts → SquadJS reconnects, plugin mounts
+     //   2. server.currentLayer is null during RCON recovery
+     //   3. ROUND_ENDED fires while layer data is still unavailable
+     //   4. onRoundEnded captures previousRoundLayerName = null (because currentLayerName is null)
+     //   5. UPDATED_LAYER_INFORMATION now arrives with real layer data (recovery complete)
+     //   6. NEW_GAME fires → finalizeRoundLog() uses previousRoundLayerName (still null) → writes 'Unknown'
+     //
+     // This backfill catches step 5: if we're in game_end phase (after ROUND_ENDED) and 
+     // previousRoundLayerName is still null (layer wasn't available when ROUND_ENDED fired),
+     // we now populate it with the freshly-arrived layer data so finalizeRoundLog() gets
+     // the correct layer name instead of 'Unknown'.
+     // ═════════════════════════════════════════════════════════════════════════════════════
+     if (name && this.phase === 'game_end' && !this.previousRoundLayerName) {
+       this.previousRoundLayerName = name;
+       this.previousRoundGamemode = mode;
+       Logger.verbose('SmartAssign', 2, `[Layer] Backfilled previousRoundLayerName during recovery: ${name} (${mode})`);
      }
    }
 
@@ -925,31 +968,34 @@ export default class SmartAssign extends BasePlugin {
     this.eventLogger.logEvent(eventType, player, extraData, betweenRounds, this.server.players);
   }
 
-   /**
-    * Delegates to SAEventLogger with concurrency guard.
-    * Prevents concurrent finalization calls from reading/writing the same temp log file.
-    * 
-    * CRITICAL: Uses only cached layer identity (currentLayerName/currentGamemode).
-    * Never reads from server.currentLayer as a fallback — that could be stale from the previous round.
-    * The layer listener maintains these caches independently, so they're reliable sources of truth.
-    */
-   async finalizeRoundLog() {
-     if (this._isFinalizingRound) {
-       Logger.verbose('SmartAssign', 2, '[Finalize] Concurrent finalization blocked — already in progress.');
-       return;
-     }
-     this._isFinalizingRound = true;
-     try {
-        await this.eventLogger.finalizeRoundLog(
-          this.currentRoundStartTime,
-          this.currentLayerName || 'Unknown',
-          this.currentGamemode || 'Unknown',
-          this.options.enableSmartAssign !== false
-        );
-     } finally {
-       this._isFinalizingRound = false;
-     }
-   }
+    /**
+     * Delegates to SAEventLogger with concurrency guard.
+     * Prevents concurrent finalization calls from reading/writing the same temp log file.
+     * 
+     * CRITICAL FIX: Uses previousRoundLayerName/previousRoundGamemode, NOT currentLayerName.
+     * These are captured at ROUND_ENDED, ensuring they reflect the ENDING round's layer identity,
+     * not the NEW round's (which hasn't arrived via UPDATED_LAYER_INFORMATION yet).
+     * 
+     * This fixes the race condition where finalizeRoundLog was called with null/Unknown
+     * because NEW_GAME cleared the cache before UPDATED_LAYER_INFORMATION populated new data.
+     */
+    async finalizeRoundLog() {
+      if (this._isFinalizingRound) {
+        Logger.verbose('SmartAssign', 2, '[Finalize] Concurrent finalization blocked — already in progress.');
+        return;
+      }
+      this._isFinalizingRound = true;
+      try {
+         await this.eventLogger.finalizeRoundLog(
+           this.currentRoundStartTime,
+           this.previousRoundLayerName || 'Unknown',
+           this.previousRoundGamemode || 'Unknown',
+           this.options.enableSmartAssign !== false
+         );
+      } finally {
+        this._isFinalizingRound = false;
+      }
+    }
 
    /**
     * ROUND SNAPSHOT: Captures current player state and logs it to the event stream.
