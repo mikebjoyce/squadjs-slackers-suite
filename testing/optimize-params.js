@@ -25,7 +25,7 @@
 
 import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
-import { extractRawPrefix } from '../../utils/sa-clan-grouper.js';
+import { extractRawPrefix } from '../utils/sa-clan-grouper.js';
 
 const MAX_TEAM_SIZE = 50;
 const DEFAULT_MU = 25.0;
