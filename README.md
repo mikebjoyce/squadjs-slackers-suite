@@ -82,7 +82,7 @@ squad-server/
 
 ```text
 Core Settings:
-database              - (Required) A valid Sequelize connector (e.g. "sqlite") for reconnect memory storage.
+database              - (Required) A valid Sequelize connector name (e.g. "sqlite", "mysql", "postgres") for reconnect memory storage.
 logPath               - (Optional) File path for JSONL lifecycle logs. Defaults to './auto-assign-log.jsonl'.
 enableSmartAssign     - (Optional) Defaults to true. Set false for passive/dry-run mode (logs only, no moves).
 enableEventLogging    - (Optional) Defaults to true. Toggles JSONL lifecycle logging entirely.

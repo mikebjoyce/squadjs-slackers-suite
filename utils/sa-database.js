@@ -7,7 +7,8 @@
  *
  * Persistent storage utility for the SmartAssign plugin.
  * Handles reading and writing player reconnect memory and round state data
- * to an SQLite/Sequelize database. Includes retry logic for SQLite locks
+ * to a Sequelize database (SQLite, MySQL, PostgreSQL, etc.).
+ * Includes retry logic for database locks and SQLite-specific mutex serialization
  * to ensure stability in high-concurrency environments.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
@@ -60,8 +61,14 @@ export default class SADatabase {
       }
     };
 
-    // The strict global mutex was removed to allow concurrent queries (like reads).
-    // The retry logic and WAL mode (configured in initDB) handles write conflicts effectively without forcing fully sequential operations.
+    // SQLite-only: Use a promise-chain mutex to serialize writes and prevent lock contention.
+    // MySQL/PostgreSQL use native connection pooling; Sequelize transactions handle concurrency.
+    if (this.sequelize && this.sequelize.getDialect() === 'sqlite') {
+      const resultPromise = this._mutex.then(() => runAttempt());
+      this._mutex = resultPromise.catch(() => {});
+      return resultPromise;
+    }
+
     return runAttempt();
   }
 

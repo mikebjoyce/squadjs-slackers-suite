@@ -23,7 +23,8 @@
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
  * SADatabase (../utils/sa-database.js)
- *   Persistent SQLite storage for reconnect memory and round state.
+ *   Sequelize-based persistence layer supporting any SQL database
+ *   (SQLite, MySQL, PostgreSQL, etc.) for reconnect memory and round state.
  * SASwapExecutor (../utils/sa-swap-executor.js)
  *   Manages the RCON move queue using "One-Hit & Verify" logic for fast,
  *   bounce-loop-free team switches. Verified swaps typically complete in <2s.
@@ -92,7 +93,7 @@ export default class SmartAssign extends BasePlugin {
       database: {
         required: true,
         connector: 'sequelize',
-        description: 'Sequelize/SQLite connector.',
+        description: 'Sequelize connector name (SQLite, MySQL, PostgreSQL, etc.). Defaults to "sqlite".',
         default: 'sqlite'
       },
       enableSmartAssign: {
