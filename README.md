@@ -18,7 +18,7 @@ Designed for Squad servers to surface skill data, reward consistent players, and
 * **Match Health Metrics:** Live tracking of skill balance, regular player parity, and Top 15 player averages to assess team fairness.
 * **Discord Integration:** Full-featured Discord bot interface for player lookups, leaderboards, and account linking.
 * **In-Game Commands:** Players can check their own rating and view the leaderboard directly from the in-game chat.
-* **Persistent Storage:** SQLite-backed storage via Sequelize. Round history, player stats, and plugin state survive server restarts.
+* **Persistent Storage:** Multi-database support via Sequelize (SQLite, MySQL, PostgreSQL, etc.). Round history, player stats, and plugin state survive server restarts.
 * **Provisional Ratings:** Players are marked provisional until they reach a configurable minimum round count.
 * **Backup & Restore:** Full player stat export to JSON and restore via Discord file attachment.
 
@@ -76,6 +76,22 @@ Add the following to your `config.json`:
     "dialect": "sqlite",
     "storage": "squad-server.sqlite"
   },
+  "mysql": {
+    "dialect": "mysql",
+    "host": "localhost",
+    "port": 3306,
+    "username": "squad",
+    "password": "password",
+    "database": "squad_db"
+  },
+  "postgres": {
+    "dialect": "postgres",
+    "host": "localhost",
+    "port": 5432,
+    "username": "squad",
+    "password": "password",
+    "database": "squad_db"
+  },
   "discord": {
     "connector": "discord",
     "token": "YOUR_BOT_TOKEN"
@@ -101,6 +117,8 @@ Add the following to your `config.json`:
   }
 ]
 ```
+
+**Database Options:** The `"database"` option should match a connector name from above. Use `"sqlite"` for file-based storage (default), `"mysql"` for MySQL, or `"postgres"` for PostgreSQL. Any Sequelize-compatible backend is supported.
 
 ### 2. File Placement
 

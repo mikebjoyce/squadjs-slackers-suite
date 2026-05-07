@@ -1,13 +1,14 @@
-/**
- * ╔═══════════════════════════════════════════════════════════════╗
- * ║                         ELO DATABASE                          ║
- * ╚═══════════════════════════════════════════════════════════════╝
- *
- * ─── PURPOSE ─────────────────────────────────────────────────────
- *
- * SQLite persistence layer for the EloTracker plugin. Manages player
- * stats, round history, leaderboard queries, and plugin state using
- * the Sequelize ORM injected via the connectors argument.
+ /**
+  * ╔═══════════════════════════════════════════════════════════════╗
+  * ║                         ELO DATABASE                          ║
+  * ╚═══════════════════════════════════════════════════════════════╝
+  *
+  * ─── PURPOSE ─────────────────────────────────────────────────────
+  *
+  * Sequelize-based persistence layer for the EloTracker plugin, supporting
+  * any SQL database (SQLite, MySQL, PostgreSQL, etc.). Manages player
+  * stats, round history, leaderboard queries, and plugin state using
+  * the Sequelize ORM injected via the connectors argument.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
@@ -30,20 +31,22 @@
  *   Leaderboard and rank calculation methods internally apply a
  *   "Competitive Skill Rank" (CSR) formula (μ - 3.0σ) instead of raw Mu.
  *
- * ─── DEPENDENCIES ────────────────────────────────────────────────
+  * ─── DEPENDENCIES ────────────────────────────────────────────────
+  *
+  * sequelize (Sequelize)
+  *   ORM for any SQL backend. Injected dynamically via connectors[options.database]
+  *   (default: 'sqlite'). Not instantiated internally. All three models are
+  *   defined and synced in initDB().
+  * Logger (../../core/logger.js)
+  *   Verbose error logging on all caught DB exceptions.
  *
- * sequelize (Sequelize)
- *   ORM for SQLite. Injected via connectors.sqlite — not instantiated
- *   internally. All three models are defined and synced in initDB().
- * Logger (../../core/logger.js)
- *   Verbose error logging on all caught DB exceptions.
- *
- * ─── NOTES ───────────────────────────────────────────────────────
- *
- * - All operations go through _executeWithRetry() — retries up to 5×
- *   on SQLITE_BUSY with 200ms + random jitter backoff.
- * - A promise-chain mutex is attached to the Sequelize instance to
- *   serialise writes and prevent concurrent lock contention.
+  * ─── NOTES ───────────────────────────────────────────────────────
+  *
+  * - All operations go through _executeWithRetry() — retries up to 5×
+  *   on SQLITE_BUSY or database lock errors, with 200ms + random jitter backoff.
+  * - A promise-chain mutex is attached to the Sequelize instance (SQLite only)
+  *   to serialise writes and prevent concurrent lock contention. MySQL/Postgres
+  *   rely on native connection pooling.
  * - bulkIncrementPlayerStats() INCREMENTS wins, losses, and roundsPlayed.
  *   All other fields are overwritten. Do not pass cumulative totals.
  * - Models are stored on this.models and may be referenced externally
@@ -67,7 +70,8 @@ export default class EloDatabase {
   constructor(server, options, connectors) {
     this.server = server;
     this.options = options;
-    this.sequelize = connectors?.sqlite;
+    // Respect the "database" option; fall back to 'sqlite' if unspecified
+    this.sequelize = connectors && connectors[options?.database ?? 'sqlite'];
     this.models = {};
   }
 
@@ -105,11 +109,11 @@ export default class EloDatabase {
     return runAttempt();
   }
 
-  async initDB() {
-    if (!this.sequelize) {
-      Logger.verbose('EloTracker', 1, '[DB] SQLite connector not available.');
-      return { roundStartTime: null };
-    }
+   async initDB() {
+     if (!this.sequelize) {
+       Logger.verbose('EloTracker', 1, '[DB] No sequelize connector available.');
+       return { roundStartTime: null };
+     }
 
     try {
       this.models.PluginState = this.sequelize.define(
@@ -212,15 +216,18 @@ export default class EloDatabase {
         { timestamps: false }
       );
 
-      await this._executeWithRetry(async () => {
-        // Enforce WAL mode to prevent SQLITE_BUSY deadlocks in high-concurrency environments (e.g. DBLog + EloTracker writing simultaneously)
-        await this.sequelize.query('PRAGMA journal_mode=WAL;');
-        await this.sequelize.query('PRAGMA synchronous=NORMAL;');
-        
-        await this.models.PluginState.sync({ alter: true });
-        await this.models.PlayerStats.sync({ alter: true });
-        await this.models.RoundHistory.sync({ alter: true });
-      });
+       await this._executeWithRetry(async () => {
+         // SQLite-only: PRAGMA commands are not supported on MySQL/Postgres
+         if (this.sequelize.getDialect() === 'sqlite') {
+           // Enforce WAL mode to prevent SQLITE_BUSY deadlocks in high-concurrency environments (e.g. DBLog + EloTracker writing simultaneously)
+           await this.sequelize.query('PRAGMA journal_mode=WAL;');
+           await this.sequelize.query('PRAGMA synchronous=NORMAL;');
+         }
+         
+         await this.models.PluginState.sync({ alter: true });
+         await this.models.PlayerStats.sync({ alter: true });
+         await this.models.RoundHistory.sync({ alter: true });
+       });
 
       const state = await this._executeWithRetry(async () => {
         return await this.sequelize.transaction(async (t) => {

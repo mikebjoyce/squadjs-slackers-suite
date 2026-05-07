@@ -22,13 +22,13 @@
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
- * BasePlugin (./base-plugin.js)
- *   SquadJS base class providing server, options, and connectors.
- * Logger (../../core/logger.js)
- *   Verbose logging throughout all event handlers.
- * EloDatabase (../utils/elo-database.js)
- *   SQLite persistence for player stats, round history, and plugin state.
- * EloSessionManager (../utils/elo-session-manager.js)
+  * BasePlugin (./base-plugin.js)
+  *   SquadJS base class providing server, options, and connectors.
+  * Logger (../../core/logger.js)
+  *   Verbose logging throughout all event handlers.
+  * EloDatabase (../utils/elo-database.js)
+  *   Multi-database persistence layer (SQLite, MySQL, PostgreSQL, etc.) for player stats, round history, and plugin state.
+  * EloSessionManager (../utils/elo-session-manager.js)
  *   In-memory session tracker for player team segments and participation.
  * EloCalculator (../utils/elo-calculator.js)
  *   TrueSkill math module for computing per-player mu/sigma deltas.
@@ -146,7 +146,7 @@ export default class EloTracker extends BasePlugin {
   static version = '1.2.3';
 
   static get description() {
-    return 'A SquadJS plugin that tracks player participation across rounds, computes individual ELO ratings using a TrueSkill-based algorithm, and persists all data via SQLite.';
+    return 'A SquadJS plugin that tracks player participation across rounds, computes individual ELO ratings using a TrueSkill-based algorithm, and persists all data via Sequelize-compatible databases (SQLite, MySQL, PostgreSQL, etc.).';
   }
 
   static get defaultEnabled() {
@@ -158,7 +158,7 @@ export default class EloTracker extends BasePlugin {
       database: {
         required: true,
         connector: 'sequelize',
-        description: 'Sequelize/SQLite connector.',
+        description: 'Sequelize connector supporting SQLite, MySQL, PostgreSQL, and other SQL databases.',
         default: 'sqlite'
       },
       eloLogPath: { required: false, default: './elo-match-log.jsonl', type: 'string' },
