@@ -187,7 +187,11 @@ export default class Switch extends DiscordBasePlugin {
             try {
                 return await this.options.database.transaction(logicFn);
             } catch (err) {
-                const isLocked = err.message && (err.message.includes('SQLITE_BUSY') || err.message.includes('database is locked'));
+                const isLocked = err.message && (
+                    err.message.includes('SQLITE_BUSY') ||
+                    err.message.includes('database is locked') ||
+                    err.name === 'SequelizeTimeoutError'
+                );
                 if (isLocked && i < maxRetries - 1) {
                     await delay(Math.random() * 500 + 200);
                 } else {

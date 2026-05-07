@@ -4,11 +4,12 @@
 
 ## Overview
 
-Manages player team-change requests with cooldown enforcement and admin restrictions. Survives server restarts via SQLite database. Responds to team scrambles by locking all players from switching.
+Manages player team-change requests with cooldown enforcement and admin restrictions. Survives server restarts via any Sequelize-compatible database (SQLite, MySQL, PostgreSQL, etc.). Responds to team scrambles by locking all players from switching.
 
 ## Features
 
-* **Persistent cooldowns** — stored in SQLite, survive restarts
+* **Persistent cooldowns** — stored in configured database, survive restarts
+* **Multi-database support** — works with SQLite, MySQL, PostgreSQL, and any Sequelize-compatible backend
 * **Scramble lockout** — blocks all players from switching for configurable duration after scramble
 * **Admin controls** — in-game chat and Discord
 
