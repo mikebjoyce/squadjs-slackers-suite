@@ -201,21 +201,19 @@ export default class SmartAssign extends BasePlugin {
      // ═══════════════════════════════════════════════════════════════════════════
      this._reconnectMemory = new Map();
 
-      this.eloTracker = null;
-      this._eloNotReadyWarned = false;
-      this._muFastMissWarned = false;
+       this.eloTracker = null;
 
-      // ═══════════════════════════════════════════════════════════════════════════
-      // WARN FLAGS: Persistent object for passing by reference
-      //
-      // Purpose: Allow getMuFast() and evaluateTeamAssignment() to mutate warning
-      //          flags that persist across calls, so warnings fire only once per session.
-      //
-      // Why needed: Original code created new objects on each call, disconnecting the
-      //           assignment flag mutations from the plugin's state. This caused the
-      //           "Both fast paths missed" warning to fire on every player join.
-      // ═══════════════════════════════════════════════════════════════════════════
-      this._warnFlags = { eloNotReadyWarned: false, muFastMissWarned: false };
+       // ═══════════════════════════════════════════════════════════════════════════
+       // WARN FLAGS: Persistent object for passing by reference
+       //
+       // Purpose: Allow evaluateTeamAssignment() and getMu() to mutate warning
+       //          flags that persist across calls, so warnings fire only once per session.
+       //
+       // Why needed: Flags need to be passed by reference into pure functions so
+       //           mutations persist in plugin state. This allows warnings to fire
+       //           only once per session instead of on every player join.
+       // ═══════════════════════════════════════════════════════════════════════════
+       this._warnFlags = { eloNotReadyWarned: false };
 
       // ═══════════════════════════════════════════════════════════════════════════
       // CLAN GROUPING: Player Tag Cache
@@ -1095,8 +1093,8 @@ export default class SmartAssign extends BasePlugin {
    * Delegates to SATeamEvaluator pure function.
    * Wraps the context object and calls the extracted evaluator.
    * 
-   * CRITICAL: Passes this._warnFlags by reference so mutations in getMuFast()
-   * persist across calls. This allows warning flags to fire only once per session,
+   * CRITICAL: Passes this._warnFlags by reference so mutations in evaluateTeamAssignment()
+   * and getMu() persist across calls. This allows warning flags to fire only once per session,
    * not on every player join.
    */
   evaluateTeamAssignment(player, reconnectTeam = null) {
