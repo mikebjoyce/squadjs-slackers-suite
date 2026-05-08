@@ -315,18 +315,32 @@ export default class SmartAssign extends BasePlugin {
       this._snapshotTaken = false;
     }
 
-    this.server.on('NEW_GAME', this.onNewGame);
-    this.server.on('ROUND_ENDED', this.onRoundEnded);
-    this.server.on('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
-    this.server.on('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo);
-    this.server.on('PLAYER_CONNECTED', this.onPlayerConnected);
-    this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
-    this.server.on('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
-    this.server.on('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
-    this.server.on('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
+     this.server.on('NEW_GAME', this.onNewGame);
+     this.server.on('ROUND_ENDED', this.onRoundEnded);
+     this.server.on('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
+     this.server.on('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo);
+     this.server.on('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated);
+     this.server.on('PLAYER_CONNECTED', this.onPlayerConnected);
+     this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
+     this.server.on('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
+     this.server.on('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
+     this.server.on('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
 
-    this.ready = true;
-    Logger.verbose('SmartAssign', 1, 'SmartAssign mounted successfully.');
+     // ═══════════════════════════════════════════════════════════════════════════════════
+     // LAYER INFO BOOTSTRAP: Initialize layer caches from server state at mount time
+     //
+     // Purpose: Prevent null layer info during early rounds or RCON reconnects
+     // by bootstrapping currentLayerName/currentGamemode from the current server state.
+     // This matches the approach used by TeamBalancer and EloTracker plugins.
+     // ═══════════════════════════════════════════════════════════════════════════════════
+     if (this.server.currentLayer?.name) {
+       this.currentLayerName = this.server.currentLayer.name;
+       this.currentGamemode  = this.server.currentLayer.gamemode || null;
+       Logger.verbose('SmartAssign', 1, `[Layer] Bootstrapped from server.currentLayer at mount: ${this.currentLayerName} (${this.currentGamemode})`);
+     }
+
+     this.ready = true;
+     Logger.verbose('SmartAssign', 1, 'SmartAssign mounted successfully.');
   }
 
   async unmount() {
@@ -522,10 +536,10 @@ export default class SmartAssign extends BasePlugin {
   // ═══════════════════════════════════════════════════════════════════════════════════
    async onUpdatedLayerInfo() {
      if (!this.ready) return;
-     const name = this.server.currentLayer?.name || null;
-     const mode = this.server.currentLayer?.gamemode || null;
-     
-     // Cache the layer identity from the RCON polling system (UPDATED_LAYER_INFORMATION).
+      const name = this.server.currentLayer?.name || null;
+      const mode = this.server.currentLayer?.gamemode || null;
+      
+      // Cache the layer identity from the RCON polling system (UPDATED_LAYER_INFORMATION).
      // This is preferred over the log-parsed LAYER_CHANGED event because RCON polling is
      // the authoritative source of truth per the dev reference (§2.5, §5).
      // 
@@ -562,11 +576,98 @@ export default class SmartAssign extends BasePlugin {
      }
    }
 
-  async onScrambleExecuted() {
-    if (!this.ready) return;
-    Logger.verbose('SmartAssign', 1, 'TeamBalancer Scramble detected. Marking team changes as Team-Balancer source for the next 20 seconds.');
-    this.scrambleEndTime = Date.now() + 20000;
-  }
+   /**
+    * HELPER: Infer game mode from layer name.
+    * Checks for common mode substrings like 'seed', 'jensen', 'invasion', etc.
+    * Falls back to 'Unknown' if no inference is possible.
+    */
+   inferGameMode(layerName) {
+     if (!layerName) return 'Unknown';
+     const name = layerName.toLowerCase();
+     if (name.includes('seed')) return 'Seed';
+     if (name.includes('jensen')) return 'Jensen';
+     if (name.includes('invasion')) return 'Invasion';
+     return 'Unknown';
+   }
+
+   /**
+    * HELPER: Resolve layer info from various sources.
+    * Handles null, Promise, string, and object layer data.
+    * Infers gamemode from layer name if needed.
+    * Matches the pattern used by TeamBalancer and EloTracker plugins.
+    */
+   async resolveLayerInfo(layerData, source = 'Unknown') {
+     let layer = layerData;
+
+     // Handle Promise
+     if (layer instanceof Promise) {
+       try {
+         layer = await layer;
+       } catch (err) {
+         Logger.verbose('SmartAssign', 1, `[${source}] Failed to resolve layer promise: ${err.message}`);
+         layer = null;
+       }
+     }
+
+     // Check for null/undefined
+     if (!layer) {
+       Logger.verbose('SmartAssign', 3, `[${source}] Layer object is completely null or undefined.`);
+       return false;
+     }
+
+     let gamemode = 'Unknown';
+     let name = 'Unknown';
+
+     // Handle string
+     if (typeof layer === 'string') {
+       name = layer;
+       gamemode = this.inferGameMode(name);
+       Logger.verbose('SmartAssign', 4, `[${source}] Layer is a string ("${layer}"), inferred gamemode: ${gamemode}.`);
+     }
+     // Handle object
+     else if (typeof layer === 'object') {
+       name = layer.name || layer.layer || 'Unknown';
+       gamemode = layer.gamemode || this.inferGameMode(name);
+       if (gamemode === 'Unknown' || name === 'Unknown') {
+         Logger.verbose('SmartAssign', 4, `[${source}] Layer object missing properties: ${JSON.stringify(layer)}`);
+       }
+     }
+
+     // Update cache
+     this.currentLayerName = name;
+     this.currentGamemode = gamemode;
+     Logger.verbose('SmartAssign', 4, `[${source}] Layer info updated: ${gamemode} / ${name}`);
+     return true;
+   }
+
+   /**
+    * EVENT: UPDATED_SERVER_INFORMATION (Secondary Layer Resolution Path)
+    * 
+    * Fired independently when server info updates (including currentLayer).
+    * Provides a backup resolution path if UPDATED_LAYER_INFORMATION misses the layer change.
+    * Matches the pattern used by TeamBalancer and EloTracker plugins.
+    */
+   async onServerInfoUpdated(info) {
+     if (!this.ready) return;
+     try {
+       if (info && info.currentLayer) {
+         const incomingName = typeof info.currentLayer === 'string'
+           ? info.currentLayer
+           : info.currentLayer?.name;
+         
+         Logger.verbose('SmartAssign', 4, `[onServerInfoUpdated] Received layer info: ${incomingName}`);
+         await this.resolveLayerInfo(info.currentLayer, 'onServerInfoUpdated');
+       }
+     } catch (err) {
+       Logger.verbose('SmartAssign', 1, `[onServerInfoUpdated] Error resolving layer: ${err?.message}`);
+     }
+   }
+
+   async onScrambleExecuted() {
+     if (!this.ready) return;
+     Logger.verbose('SmartAssign', 1, 'TeamBalancer Scramble detected. Marking team changes as Team-Balancer source for the next 20 seconds.');
+     this.scrambleEndTime = Date.now() + 20000;
+   }
 
   async onMoveFailed(data) {
     if (!this.ready) return;
@@ -916,10 +1017,17 @@ export default class SmartAssign extends BasePlugin {
        }
 
        // Check if the current layer/gamemode is ignored
-       const currentLayerName = this.server.currentLayer && this.server.currentLayer.name ? String(this.server.currentLayer.name).toLowerCase() : '';
-       const currentGamemode = this.server.currentLayer && this.server.currentLayer.gamemode ? String(this.server.currentLayer.gamemode).toLowerCase() : '';
-
-       const isIgnored = this._ignoredModes.some(m => currentLayerName.includes(m) || currentGamemode.includes(m));
+       // Use cached layer/gamemode (maintained by UPDATED_LAYER_INFORMATION listener) as primary source.
+       // Falls back to live server.currentLayer only if cache is empty (early startup edge case).
+       const cachedLayer = (this.currentLayerName || '').toLowerCase();
+       const cachedMode  = (this.currentGamemode  || '').toLowerCase();
+       const liveLayer   = this.server.currentLayer?.name    ? String(this.server.currentLayer.name).toLowerCase()    : '';
+       const liveMode    = this.server.currentLayer?.gamemode ? String(this.server.currentLayer.gamemode).toLowerCase() : '';
+       
+       const checkLayer = cachedLayer || liveLayer;
+       const checkMode  = cachedMode  || liveMode;
+       
+       const isIgnored = this._ignoredModes.some(m => checkLayer.includes(m) || checkMode.includes(m));
 
        if (isIgnored) {
          Logger.verbose('SmartAssign', 3, `[SmartAssign] Ignored game mode detected. Skipping Elo-based assignment for ${player.name}.`);
@@ -935,8 +1043,16 @@ export default class SmartAssign extends BasePlugin {
        // ═══════════════════════════════════════════════════════════════════════════
         // OPTIMIZATION: Mu Pre-Warming + Fast In-Memory Reconnect Lookup
         // 
-        // The joining player's Mu is fetched BEFORE the critical sync section.
-        // This ensures that all getMu() calls during evaluation are cache hits (instant).
+        // BACKGROUND: Why pre-warm?
+        //   The joining player's Mu is fetched BEFORE the critical sync section.
+        //   This call reads from EloTracker's internal cache first (instant), or from the DB (1-5ms).
+        //   The result is stored in EloTracker's eloCache Map.
+        //   Later, evaluateTeamAssignment() calls getMu() again, which is now a cache HIT (instant).
+        //   
+        //   We log the pre-warm result to verify the EloTracker lookup succeeded.
+        //   If the value is 25.0 (the default), it indicates a cache miss fallback (new player or DB lookup failed).
+        //   Any other value (e.g., 28.43) confirms a real Mu was retrieved.
+        //
         // Reconnect lookup and assignment evaluation remain synchronous to prevent
         // concurrent-join race conditions on _pendingAssignments.
         // ═══════════════════════════════════════════════════════════════════════════
@@ -946,10 +1062,12 @@ export default class SmartAssign extends BasePlugin {
 
         // Pre-warm the joining player's Mu into EloTracker cache (cache miss = 1–5ms DB lookup)
         const preWarmStart = Date.now();
+        let preWarmMu = null;
         if (this.eloTracker?.ready) {
-          await this.eloTracker.getMu(player);
+          preWarmMu = await this.eloTracker.getMu(player);
         }
         timemarks.preWarmMs = Date.now() - preWarmStart;
+        timemarks.preWarmMu = preWarmMu;
 
         // Read reconnect memory synchronously from Map
         const reconnectTeamStart = Date.now();
@@ -970,8 +1088,8 @@ export default class SmartAssign extends BasePlugin {
        const playerTag = debugInfo?.playerTag || 'null';
        const clanTeam = debugInfo?.clanTeam || 'none';
 
-        // Log timing details with clan info at verbosity 3 for detailed performance monitoring
-        Logger.verbose('SmartAssign', 3, `[TIMING] ${player.name} join pipeline: tag=${playerTag}, clanTeam=${clanTeam} | preWarm=${timemarks.preWarmMs}ms, reconnect=${timemarks.reconnectTeamMs}ms (in-memory), evaluate=${timemarks.evaluateMs}ms, total=${timemarks.totalPipelineMs}ms`);
+        // Log timing details with clan info and resolved Mu at verbosity 3 for detailed performance monitoring
+        Logger.verbose('SmartAssign', 3, `[TIMING] ${player.name} join pipeline: tag=${playerTag}, clanTeam=${clanTeam}, mu=${timemarks.preWarmMu?.toFixed(2) ?? 'N/A'} | preWarm=${timemarks.preWarmMs}ms, reconnect=${timemarks.reconnectTeamMs}ms (in-memory), evaluate=${timemarks.evaluateMs}ms, total=${timemarks.totalPipelineMs}ms`);
 
       if (reconnectTeam && reconnectTeam === targetTeam) {
         Logger.verbose('SmartAssign', 3, `[SmartAssign] Applied reconnect memory for ${player.name} -> Team ${targetTeam} (${reason})`);
