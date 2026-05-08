@@ -197,6 +197,10 @@ export function evaluateTeamAssignment(player, server, context) {
   }
 
    const playerMu = getMuFast(player, eloTracker, warnFlags);
+   // EMPTY TEAM DEFAULT: When a team has no players, avgT1/avgT2 is set to 25.0 (TrueSkill default Mu)
+   // rather than 0. This prevents division-by-zero and represents a "neutral skill baseline".
+   // As a side effect, penalty scores will be non-zero even at 0v0 or 2v0 population — this is intentional
+   // and correct behavior; the routing decision itself is not affected by the magnitude.
    const avgT1 = t1Count > 0 ? (t1Power / t1Count) : 25.0;
    const avgT2 = t2Count > 0 ? (t2Power / t2Count) : 25.0;
 
@@ -207,6 +211,11 @@ export function evaluateTeamAssignment(player, server, context) {
    // Tuned winner uses log scale: slower growth = stronger sum influence at high pop
    const dynamicScale = Math.max(1, Math.log(t1Count + t2Count + 2) * 2.5);
 
+   // SCORING FUNCTION: Computes an imbalance penalty for placing the joining player on the candidate team.
+   // Combines two gap metrics with empirically-tuned weights:
+   //   - avgGap (weight 1.0x): Per-player skill fairness — difference in average skill between teams after placement
+   //   - sumGap (weight 1.5x): Absolute power delta — difference in total skill, normalized by dynamic population scale
+   // Lower score = better balance = preferable team. The algorithm always picks the team with the lower score.
    const getScore = (candidateAvg, opponentAvg, candidateSum, opponentSum) => {
      const avgGap = Math.abs(candidateAvg - opponentAvg);
      const sumGap = Math.abs(candidateSum - opponentSum) / dynamicScale;
@@ -224,17 +233,22 @@ export function evaluateTeamAssignment(player, server, context) {
     else if (reconnectTeam === 2) scoreT2 = Math.max(0, scoreT2 - REJOIN_BIAS);
   }
 
-  let targetTeam;
-  if (scoreT1 < scoreT2) {
-    targetTeam = 1;
-  } else if (scoreT2 < scoreT1) {
-    targetTeam = 2;
-  } else {
-    // Simple population tie-breaker
-    targetTeam = t1Count <= t2Count ? 1 : 2;
-  }
+   let targetTeam;
+   if (scoreT1 < scoreT2) {
+     targetTeam = 1;
+   } else if (scoreT2 < scoreT1) {
+     targetTeam = 2;
+   } else {
+     // Simple population tie-breaker
+     targetTeam = t1Count <= t2Count ? 1 : 2;
+   }
 
-  const reason = `Skill Balance: T1=${scoreT1.toFixed(3)}, T2=${scoreT2.toFixed(3)} | Pop: ${t1Count}v${t2Count}`;
+   // NOTE: T1/T2 in the reason string are IMBALANCE PENALTY SCORES, not Mu ratings or team skill summaries.
+   // Lower score = better balance. The algorithm assigns to the team with the lower score.
+   // At very low population these scores can appear large/non-zero even for empty teams
+   // because the empty-team average defaults to 25.0 (see avgT1/avgT2 defaults above).
+   // This is intentional and correct behavior — the routing decision is not affected by the magnitude.
+   const reason = `Skill Balance: T1=${scoreT1.toFixed(3)}, T2=${scoreT2.toFixed(3)} | Pop: ${t1Count}v${t2Count}`;
 
   return { targetTeam, reason };
 }
