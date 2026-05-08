@@ -56,7 +56,10 @@ Add this to your `config.json` inside the `plugins` array.
   "database": "sqlite",
   "logPath": "./smart-assign-log.jsonl",
   "enableSmartAssign": true,
-  "enableEventLogging": true
+  "enableEventLogging": true,
+  "enableClanGrouping": true,
+  "clanGroupMinSize": 2,
+  "clanGroupCaseSensitive": false
 }
 ```
 
@@ -68,10 +71,14 @@ squad-server/
 │   └── smart-assign.js
 ├── utils/
 │   ├── sa-database.js
-│   └── sa-swap-executor.js
+│   ├── sa-swap-executor.js
+│   ├── sa-event-logger.js
+│   ├── sa-team-evaluator.js
+│   └── sa-clan-grouper.js
 ├── testing/                    ← Optional: diagnostic tools only
 │   ├── join-swap-tester.js
-│   └── unified-test-runner.js
+│   ├── unified-test-runner.js
+│   └── optimize-params.js
 ```
 
 ⚠️ **IMPORTANT**: Do NOT deploy the `testing/` folder to production servers. The `testing/` directory contains diagnostic and simulation tools intended only for development and validation. Production deployments should include only the `plugins/` and `utils/` directories.
@@ -80,14 +87,16 @@ squad-server/
 
 ## Configuration Options
 
-```text
-Core Settings:
-database              - (Required) A valid Sequelize connector name (e.g. "sqlite", "mysql", "postgres") for reconnect memory storage.
-logPath               - (Optional) File path for JSONL lifecycle logs. Defaults to './auto-assign-log.jsonl'.
-enableSmartAssign     - (Optional) Defaults to true. Set false for passive/dry-run mode (logs only, no moves).
-enableEventLogging    - (Optional) Defaults to true. Toggles JSONL lifecycle logging entirely.
-ignoredGameModes      - (Optional) Array of layer/gamemode substrings to skip. Defaults to ['Seed', 'Jensen'].
-```
+| Option | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `database` | string | ✅ Yes | `"sqlite"` | A valid Sequelize connector name (e.g. `"sqlite"`, `"mysql"`, `"postgres"`) for reconnect memory storage. |
+| `enableSmartAssign` | boolean | ❌ No | `true` | If true, runs the assignment algorithm and moves players. If false, only logs real server events (passive mode). |
+| `enableEventLogging` | boolean | ❌ No | `true` | Toggle the JSONL lifecycle event logging output entirely. |
+| `logPath` | string | ❌ No | `"./auto-assign-log.jsonl"` | File path for JSONL player lifecycle events. |
+| `ignoredGameModes` | array | ❌ No | `["Seed", "Jensen"]` | Array of layer/gamemode substrings where SmartAssign should not alter teams. |
+| `enableClanGrouping` | boolean | ❌ No | `true` | If true, players in clans will be kept together on the same team if all clan mates are on one team. |
+| `clanGroupMinSize` | number | ❌ No | `2` | Minimum number of players to consider a group as a clan for grouping purposes. |
+| `clanGroupCaseSensitive` | boolean | ❌ No | `false` | If false, clan tags are case-insensitive and diacritics/gamer-character lookalikes are normalized. |
 
 ---
 
@@ -108,11 +117,17 @@ The hard cap is a safety net that prevents extreme imbalance regardless of the E
 
 ### 2. Reconnect Memory (High Priority)
 
-If the joining player has a record in the reconnect database from the current round, they are routed directly back to their previous team — **before** Elo scoring is evaluated. Reconnecting players are granted an additional **+1 imbalance grace allowance** on top of the base to allow them back to their squad.
+If the joining player has a record in the reconnect database from the current round, they are routed directly back to their previous team — **before** Clan Grouping or Elo scoring is evaluated. Reconnecting players are granted an additional **+2 imbalance grace allowance** on top of the base to allow them back to their squad.
 
-If the reconnect target would violate the hard cap even with the grace allowance, the player falls through to Elo scoring with a small bias toward their previous team.
+If the reconnect target would violate the hard cap even with the grace allowance, the player falls through to Clan Grouping and Elo scoring with a small bias toward their previous team.
 
-### 3. Elo Scoring & Skill Balancing
+### 3. Clan Grouping (High Priority)
+
+If the joining player is part of a clan and **all** their clan mates are currently on the same team, the player is routed to that team — provided the population cap allows it. Clan members are granted the same **+2 imbalance grace allowance** as reconnecting players to keep squads together.
+
+If the clan target would violate the hard cap even with the grace allowance, the player falls through to Elo scoring. If clan mates are split across both teams, this step is skipped.
+
+### 4. Elo Scoring & Skill Balancing
 
 If no reconnect memory applies, the algorithm evaluates both teams with a **Mu-based Unified Scoring System** using tuned weights:
 
@@ -121,7 +136,7 @@ If no reconnect memory applies, the algorithm evaluates both teams with a **Mu-b
 
 The player is assigned to whichever team produces the lower combined score — i.e., the placement that brings the match closest to a balanced skill split.
 
-### 4. Fallback
+### 5. Fallback
 
 - If `EloTracker` is unavailable, the algorithm falls back to pure population balancing (smaller team wins).
 - If both teams are at the 50-player physical cap, the move is skipped and the game handles placement natively.
