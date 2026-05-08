@@ -863,18 +863,40 @@ export default class SmartAssign extends BasePlugin {
         this._sessionJoinTimes.set(player.steamID, Date.now());
       }
 
-      // ═══════════════════════════════════════════════════════════════════════════
-      // CLAN GROUPING: Incrementally update player tag cache on join
-      //
-      // The tag cache is built once per round at snapshot time. However, players
-      // joining after snapshot also need tags in the cache so clan grouping can work.
-      // This incremental update ensures late joiners are clan-groupable.
-      // ═══════════════════════════════════════════════════════════════════════════
-      if (this.options.enableClanGrouping && player.eosID) {
-        const raw = extractRawPrefix(player.name);
-        const tag = raw ? (this.options.clanGroupCaseSensitive ? raw : raw.replace(/[^a-zA-Z0-9]/g, '').toUpperCase()) : null;
-        this._playerTagCache.set(player.eosID, tag);
-      }
+       // ═══════════════════════════════════════════════════════════════════════════
+       // CLAN GROUPING: Incrementally update player tag cache on join
+       //
+       // The tag cache is built once per round at snapshot time. However, players
+       // joining after snapshot also need tags in the cache so clan grouping can work.
+       // This incremental update ensures late joiners are clan-groupable.
+       //
+       // TAG RESOLUTION PRIORITY:
+       //   1. Live name (from log parser) — may have tag if resolved early
+       //   2. EloTracker DB (historical name) — for returning players with tag from last round
+       //   3. null — new player or no tag found (falls back to Elo/pop routing)
+       // ═══════════════════════════════════════════════════════════════════════════
+       if (this.options.enableClanGrouping && player.eosID) {
+         // Try extraction from live name first
+         const raw = extractRawPrefix(player.name);
+         let tag = raw ? (this.options.clanGroupCaseSensitive ? raw : raw.replace(/[^a-zA-Z0-9]/g, '').toUpperCase()) : null;
+         
+         // If no tag found in live name and EloTracker is available, query DB as fallback
+         if (!tag && this.eloTracker && this.eloTracker.db) {
+           this._queryEloDBForTag(player.eosID)
+             .then((dbTag) => {
+               if (dbTag) {
+                 this._playerTagCache.set(player.eosID, dbTag);
+                 Logger.verbose('SmartAssign', 3, `[Clan] Tag resolved from EloTracker DB for ${player.name}: "${dbTag}"`);
+               }
+             })
+             .catch((err) => {
+               Logger.verbose('SmartAssign', 3, `[Clan] EloTracker DB fallback failed for ${player.eosID}: ${err?.message}`);
+             });
+         }
+         
+         // Set cache immediately with live result (or null if no fallback pending)
+         this._playerTagCache.set(player.eosID, tag);
+       }
 
        Logger.verbose('SmartAssign', 3, `[JOIN] Player connected: ${player.name} (${player.steamID})`);
        this.logEvent('JOIN', player, {}, this.phase !== 'active');
@@ -1016,6 +1038,42 @@ export default class SmartAssign extends BasePlugin {
       Logger.verbose('SmartAssign', 2, `[TEAM_CHANGE] Player ${player.name} changed from Team ${oldTeam} to Team ${newTeam} (${source})`);
     }
     this.logEvent('TEAM_CHANGE', player, { oldTeam, newTeam, source }, this.phase !== 'active');
+  }
+
+  /**
+   * Asynchronously queries the EloTracker database for a player's historical name.
+   * Extracts and normalizes the clan tag from the stored name.
+   * 
+   * Purpose: Provide a fallback tag source for clan grouping when the live name
+   *          hasn't resolved yet (late tag arrival). For returning players with
+   *          previous round records, their tag-resolved name is already in the DB.
+   * 
+   * @param {string} eosID - Player's EOS ID
+   * @returns {Promise<string|null>} Normalized tag or null if not found/no tag
+   */
+  async _queryEloDBForTag(eosID) {
+    try {
+      const playerStats = await this.eloTracker.db.getPlayerStats(eosID);
+      
+      if (!playerStats || !playerStats.name) {
+        return null;
+      }
+
+      const raw = extractRawPrefix(playerStats.name);
+      if (!raw) {
+        return null;
+      }
+
+      // Apply the same normalization as live name path
+      const tag = this.options.clanGroupCaseSensitive
+        ? raw
+        : raw.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+      
+      return tag || null;
+    } catch (err) {
+      Logger.verbose('SmartAssign', 3, `[Clan] EloTracker DB query error for ${eosID}: ${err?.message}`);
+      return null;
+    }
   }
 
   /**
