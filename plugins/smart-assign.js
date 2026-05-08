@@ -942,25 +942,30 @@ export default class SmartAssign extends BasePlugin {
       // last await from the join-swap pipeline.
       // ═══════════════════════════════════════════════════════════════════════════
 
-      const phaseStartTime = Date.now();
-      const timemarks = {};
+       const phaseStartTime = Date.now();
+       const timemarks = {};
 
-      // Evaluate ideal team assignment — read reconnect memory synchronously from Map
-      const reconnectTeamStart = Date.now();
-      const reconnectTeam = this._reconnectMemory.get(player.steamID) || null;
-      timemarks.reconnectTeamMs = Date.now() - reconnectTeamStart;
+       // Evaluate ideal team assignment — read reconnect memory synchronously from Map
+       const reconnectTeamStart = Date.now();
+       const reconnectTeam = this._reconnectMemory.get(player.steamID) || null;
+       timemarks.reconnectTeamMs = Date.now() - reconnectTeamStart;
 
-      // 2. STALE-STATE BATCHING PROTECTION
-      // JS single-threaded guarantee: once reconnect memory lookup resolves (synchronously),
-      // execution runs synchronously through evaluate + increment before yielding again.
-      // Concurrent joins are safe because no await exists between reconnect lookup and increment.
-      const evalStart = Date.now();
-      const { targetTeam, reason } = this.evaluateTeamAssignment(player, reconnectTeam);
-      timemarks.evaluateMs = Date.now() - evalStart;
-      timemarks.totalPipelineMs = Date.now() - phaseStartTime;
+       // 2. STALE-STATE BATCHING PROTECTION
+       // JS single-threaded guarantee: once reconnect memory lookup resolves (synchronously),
+       // execution runs synchronously through evaluate + increment before yielding again.
+       // Concurrent joins are safe because no await exists between reconnect lookup and increment.
+       const evalStart = Date.now();
+       const evalResult = this.evaluateTeamAssignment(player, reconnectTeam);
+       const { targetTeam, reason, debugInfo } = evalResult;
+       timemarks.evaluateMs = Date.now() - evalStart;
+       timemarks.totalPipelineMs = Date.now() - phaseStartTime;
 
-      // Log timing details at verbosity 3 for detailed performance monitoring
-      Logger.verbose('SmartAssign', 3, `[TIMING] ${player.name} join pipeline: reconnect=${timemarks.reconnectTeamMs}ms (in-memory), evaluate=${timemarks.evaluateMs}ms, total=${timemarks.totalPipelineMs}ms`);
+       // Extract clan debug info
+       const playerTag = debugInfo?.playerTag || 'null';
+       const clanTeam = debugInfo?.clanTeam || 'none';
+
+       // Log timing details with clan info at verbosity 3 for detailed performance monitoring
+       Logger.verbose('SmartAssign', 3, `[TIMING] ${player.name} join pipeline: tag=${playerTag}, clanTeam=${clanTeam} | reconnect=${timemarks.reconnectTeamMs}ms (in-memory), evaluate=${timemarks.evaluateMs}ms, total=${timemarks.totalPipelineMs}ms`);
 
       if (reconnectTeam && reconnectTeam === targetTeam) {
         Logger.verbose('SmartAssign', 3, `[SmartAssign] Applied reconnect memory for ${player.name} -> Team ${targetTeam} (${reason})`);
@@ -1056,11 +1061,13 @@ export default class SmartAssign extends BasePlugin {
       const playerStats = await this.eloTracker.db.getPlayerStats(eosID);
       
       if (!playerStats || !playerStats.name) {
+        Logger.verbose('SmartAssign', 3, `[Clan] No EloTracker record found for eosID ${eosID}`);
         return null;
       }
 
       const raw = extractRawPrefix(playerStats.name);
       if (!raw) {
+        Logger.verbose('SmartAssign', 3, `[Clan] EloTracker record found for eosID ${eosID}, but no tag extractable from name: "${playerStats.name}"`);
         return null;
       }
 

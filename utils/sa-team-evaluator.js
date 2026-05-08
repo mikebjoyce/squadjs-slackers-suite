@@ -170,25 +170,28 @@ export function evaluateTeamAssignment(player, server, context) {
     }
   }
 
-   // 3.5 CLAN GROUPING ROUTING
-   // If player is in a clan and ALL clan mates are on one team (not split),
-   // route the player there provided the population cap still allows it.
-   if (playerTagCache) {
-     const clanTeam = getClanTeamForPlayer(player, playerTagCache, server.players, clanGroupOptions);
-     if (clanTeam) {
-       const clanCount = clanTeam === 1 ? t1Count : t2Count;
-       const opponentCount = clanTeam === 1 ? t2Count : t1Count;
-        // Check that adding this player to the clan team doesn't violate the population cap
-        // Grant clan grouping the same extra imbalance allowance as reconnect gets
-        const effectiveClanImbalance = Math.min(4, maxImbalance + 1);
-       if ((clanCount + 1) - opponentCount <= effectiveClanImbalance) {
-        Logger.verbose('SmartAssign', 3, `[Clan Grouping] Routing ${player.name} to Team ${clanTeam} (all clan mates on that team)`);
-        return { targetTeam: clanTeam, reason: 'Clan Grouping' };
-      } else {
-        Logger.verbose('SmartAssign', 3, `[Clan Grouping] Clan team ${clanTeam} would violate pop cap for ${player.name}. Falling through to Elo.`);
-      }
-    }
-  }
+    // 3.5 CLAN GROUPING ROUTING
+    // If player is in a clan and ALL clan mates are on one team (not split),
+    // route the player there provided the population cap still allows it.
+    let debugClanTeam = null;
+    if (playerTagCache) {
+      const clanTeam = getClanTeamForPlayer(player, playerTagCache, server.players, clanGroupOptions);
+      debugClanTeam = clanTeam; // Track for debugging
+      if (clanTeam) {
+        const clanCount = clanTeam === 1 ? t1Count : t2Count;
+        const opponentCount = clanTeam === 1 ? t2Count : t1Count;
+         // Check that adding this player to the clan team doesn't violate the population cap
+         // Grant clan grouping the same extra imbalance allowance as reconnect gets
+         const effectiveClanImbalance = Math.min(4, maxImbalance + 1);
+        if ((clanCount + 1) - opponentCount <= effectiveClanImbalance) {
+         Logger.verbose('SmartAssign', 3, `[Clan Grouping] Routing ${player.name} to Team ${clanTeam} (all clan mates on that team)`);
+         return { targetTeam: clanTeam, reason: 'Clan Grouping', debugInfo: { playerTag: playerTagCache.get(player.eosID), clanTeam } };
+       } else {
+         debugClanTeam = 'blocked';
+         Logger.verbose('SmartAssign', 3, `[Clan Grouping] Clan team ${clanTeam} would violate pop cap for ${player.name}. Falling through to Elo.`);
+       }
+     }
+   }
 
   // 3. SKILL & PENALTY EVALUATION
   if (!hasElo) {
@@ -250,7 +253,11 @@ export function evaluateTeamAssignment(player, server, context) {
    // This is intentional and correct behavior — the routing decision is not affected by the magnitude.
    const reason = `Skill Balance: T1=${scoreT1.toFixed(3)}, T2=${scoreT2.toFixed(3)} | Pop: ${t1Count}v${t2Count}`;
 
-  return { targetTeam, reason };
+  // Always include debug info about clan status for logging
+  const playerTag = playerTagCache ? playerTagCache.get(player.eosID) : null;
+  const debugInfo = { playerTag, clanTeam: debugClanTeam };
+
+  return { targetTeam, reason, debugInfo };
 }
 
 /**
