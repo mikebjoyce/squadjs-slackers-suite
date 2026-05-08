@@ -201,11 +201,24 @@ export default class SmartAssign extends BasePlugin {
      // ═══════════════════════════════════════════════════════════════════════════
      this._reconnectMemory = new Map();
 
-     this.eloTracker = null;
-     this._eloNotReadyWarned = false;
+      this.eloTracker = null;
+      this._eloNotReadyWarned = false;
+      this._muFastMissWarned = false;
 
-     // ═══════════════════════════════════════════════════════════════════════════
-     // CLAN GROUPING: Player Tag Cache
+      // ═══════════════════════════════════════════════════════════════════════════
+      // WARN FLAGS: Persistent object for passing by reference
+      //
+      // Purpose: Allow getMuFast() and evaluateTeamAssignment() to mutate warning
+      //          flags that persist across calls, so warnings fire only once per session.
+      //
+      // Why needed: Original code created new objects on each call, disconnecting the
+      //           assignment flag mutations from the plugin's state. This caused the
+      //           "Both fast paths missed" warning to fire on every player join.
+      // ═══════════════════════════════════════════════════════════════════════════
+      this._warnFlags = { eloNotReadyWarned: false, muFastMissWarned: false };
+
+      // ═══════════════════════════════════════════════════════════════════════════
+      // CLAN GROUPING: Player Tag Cache
      //
      // Purpose: Maintain a lightweight per-player tag cache for fast clan lookup.
      //          Built once per round at snapshot time, updated incrementally on joins/leaves.
@@ -1008,6 +1021,10 @@ export default class SmartAssign extends BasePlugin {
   /**
    * Delegates to SATeamEvaluator pure function.
    * Wraps the context object and calls the extracted evaluator.
+   * 
+   * CRITICAL: Passes this._warnFlags by reference so mutations in getMuFast()
+   * persist across calls. This allows warning flags to fire only once per session,
+   * not on every player join.
    */
   evaluateTeamAssignment(player, reconnectTeam = null) {
     return evaluateTeamAssignment(player, this.server, {
@@ -1022,7 +1039,7 @@ export default class SmartAssign extends BasePlugin {
         minSize: this.options.clanGroupMinSize || 2,
         caseSensitive: this.options.clanGroupCaseSensitive || false
       },
-      warnFlags: { eloNotReadyWarned: this._eloNotReadyWarned, muFastMissWarned: this._muFastMissWarned }
+      warnFlags: this._warnFlags
     });
   }
 

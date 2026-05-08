@@ -258,7 +258,7 @@ export function getMuFast(player, eloTracker = null, warnFlags = {}) {
     if (eloTracker.eloCache && player.eosID) {
       const cached = eloTracker.eloCache.get(player.eosID);
       if (cached) return cached.mu;
-      Logger.verbose('SmartAssign', 3, `[getMuFast] eloCache miss for eosID ${player.eosID}, falling through.`);
+      Logger.verbose('SmartAssign', 4, `[getMuFast] eloCache miss for eosID ${player.eosID}, falling through.`);
     }
     if (eloTracker.eloMap && player.steamID) {
       const mu = eloTracker.eloMap.get(player.steamID);
