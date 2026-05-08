@@ -11,11 +11,11 @@
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
- * evaluateTeamAssignment(player, server, context)
+ * evaluateTeamAssignment(player, server, context) [async]
  *   — Core algorithm that returns { targetTeam, reason }
  *
- * getMuFast(player, eloTracker, warnFlags)
- *   — Retrieves player Mu rating from cache or API, with fallback
+ * getMu(player, eloTracker)
+ *   — Retrieves player Mu rating, with fallback to default (async)
  *
  * ─── CLAN GROUPING ────────────────────────────────────────────────
  *
@@ -68,22 +68,22 @@ const MAX_TEAM_SIZE = 50;
  *     ignoredModes: string[],               // Lowercase gamemode substrings to skip
  *     playerTagCache: Map<eosID, tag|null>, // Clan tag cache (optional)
  *     clanGroupOptions: { minSize, caseSensitive }, // Clan grouping options
- *     warnFlags: { eloNotReadyWarned: boolean, muFastMissWarned: boolean }
+ *     warnFlags: { eloNotReadyWarned: boolean }
  *   }
- * @returns {object} { targetTeam: 1|2|null, reason: string }
+ * @returns {Promise<object>} { targetTeam: 1|2|null, reason: string }
  */
-export function evaluateTeamAssignment(player, server, context) {
-  const {
-    reconnectTeam = null,
-    pendingAssignments = { 1: 0, 2: 0 },
-    pendingMu = { 1: 0, 2: 0 },
-    pendingPlayerMoves = new Map(),
-    eloTracker = null,
-    ignoredModes = [],
-    playerTagCache = null,
-    clanGroupOptions = { minSize: 2, caseSensitive: false },
-    warnFlags = { eloNotReadyWarned: false, muFastMissWarned: false }
-  } = context;
+export async function evaluateTeamAssignment(player, server, context) {
+   const {
+     reconnectTeam = null,
+     pendingAssignments = { 1: 0, 2: 0 },
+     pendingMu = { 1: 0, 2: 0 },
+     pendingPlayerMoves = new Map(),
+     eloTracker = null,
+     ignoredModes = [],
+     playerTagCache = null,
+     clanGroupOptions = { minSize: 2, caseSensitive: false },
+     warnFlags = { eloNotReadyWarned: false }
+   } = context;
 
   // Check if current layer/gamemode is ignored
   const currentLayerName = server.currentLayer && server.currentLayer.name
@@ -128,14 +128,14 @@ export function evaluateTeamAssignment(player, server, context) {
     // Ignore players currently pending a move since their future state is already in _pending.
     if (pendingPlayerMoves && pendingPlayerMoves.has(p.steamID)) continue;
 
-    const teamID = String(p.teamID);
-    if (teamID === '1') {
-      t1Count++;
-      if (hasElo) t1Power += getMuFast(p, eloTracker, warnFlags);
-    } else if (teamID === '2') {
-      t2Count++;
-      if (hasElo) t2Power += getMuFast(p, eloTracker, warnFlags);
-    }
+     const teamID = String(p.teamID);
+     if (teamID === '1') {
+       t1Count++;
+       if (hasElo) t1Power += await getMu(p, eloTracker);
+     } else if (teamID === '2') {
+       t2Count++;
+       if (hasElo) t2Power += await getMu(p, eloTracker);
+     }
   }
 
    // 2. HARD POPULATION CAP
@@ -199,8 +199,8 @@ export function evaluateTeamAssignment(player, server, context) {
     return { targetTeam, reason: `Population Balance (No Elo) | T1:${t1Count} T2:${t2Count}` };
   }
 
-   const playerMu = getMuFast(player, eloTracker, warnFlags);
-   // EMPTY TEAM DEFAULT: When a team has no players, avgT1/avgT2 is set to 25.0 (TrueSkill default Mu)
+    const playerMu = await getMu(player, eloTracker);
+    // EMPTY TEAM DEFAULT: When a team has no players, avgT1/avgT2 is set to 25.0 (TrueSkill default Mu)
    // rather than 0. This prevents division-by-zero and represents a "neutral skill baseline".
    // As a side effect, penalty scores will be non-zero even at 0v0 or 2v0 population — this is intentional
    // and correct behavior; the routing decision itself is not affected by the magnitude.
@@ -261,46 +261,20 @@ export function evaluateTeamAssignment(player, server, context) {
 }
 
 /**
- * Fast Mu retrieval bypassing heavy try/catch and redundant lookups.
- * Attempts to use EloTracker's internal caches before falling back to the public API.
+ * Retrieves player Mu rating from EloTracker with default fallback.
+ * Delegates to EloTracker's async getMu() which handles cache-first + DB lookup.
  *
  * @param {object} player - Player object with steamID, eosID, etc.
  * @param {object} eloTracker - EloTracker plugin instance
- * @param {object} warnFlags - Object with { muFastMissWarned: boolean } to track warnings
- * @returns {number} Mu rating (default 25.0)
+ * @returns {Promise<number>} Mu rating (default 25.0 if no record found or error)
  */
-export function getMuFast(player, eloTracker = null, warnFlags = {}) {
+export async function getMu(player, eloTracker = null) {
   if (!eloTracker) return 25.0;
 
   try {
-    // Prioritize internal maps to bypass getter overhead/logic.
-    // WARNING: These paths couple directly to EloTracker internals. If those
-    // property names change, this silently degrades to the public getMu() fallback.
-    if (eloTracker.eloCache && player.eosID) {
-      const cached = eloTracker.eloCache.get(player.eosID);
-      if (cached) return cached.mu;
-      Logger.verbose('SmartAssign', 4, `[getMuFast] eloCache miss for eosID ${player.eosID}, falling through.`);
-    }
-    if (eloTracker.eloMap && player.steamID) {
-      const mu = eloTracker.eloMap.get(player.steamID);
-      if (mu !== undefined) return mu;
-      Logger.verbose('SmartAssign', 3, `[getMuFast] eloMap miss for steamID ${player.steamID}, falling through.`);
-    }
-
-    // Both fast paths missed
-    if (!warnFlags.muFastMissWarned) {
-      Logger.verbose(
-        'SmartAssign',
-        2,
-        '[getMuFast] Both fast paths missed. EloTracker internals may have changed. Falling back to getMu().'
-      );
-      warnFlags.muFastMissWarned = true;
-    }
-
-    // Fallback to official API
-    return eloTracker.getMu(player);
+    return await eloTracker.getMu(player);
   } catch (e) {
-    Logger.verbose('SmartAssign', 2, `[getMuFast] getMu() threw for ${player.steamID}: ${e?.message}. Using default Mu.`);
+    Logger.verbose('SmartAssign', 2, `[getMu] eloTracker.getMu() threw for ${player.steamID}: ${e?.message}. Using default Mu.`);
     return 25.0;
   }
 }

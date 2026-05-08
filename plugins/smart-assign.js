@@ -72,7 +72,7 @@ import BasePlugin from './base-plugin.js';
 import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
 import SAEventLogger from '../utils/sa-event-logger.js';
-import { evaluateTeamAssignment, getMuFast } from '../utils/sa-team-evaluator.js';
+import { evaluateTeamAssignment, getMu } from '../utils/sa-team-evaluator.js';
 import { buildPlayerTagCache, extractRawPrefix } from '../utils/sa-clan-grouper.js';
 
 const MAX_TEAM_SIZE = 50;
@@ -934,28 +934,36 @@ export default class SmartAssign extends BasePlugin {
         return;
       }
 
-      // ═══════════════════════════════════════════════════════════════════════════
-      // OPTIMIZATION: Fast In-Memory Reconnect Lookup
-      // 
-      // After adding in-memory reconnect memory, the reconnect lookup is now
-      // just a synchronous Map lookup instead of an async DB read. This removes the
-      // last await from the join-swap pipeline.
-      // ═══════════════════════════════════════════════════════════════════════════
+       // ═══════════════════════════════════════════════════════════════════════════
+        // OPTIMIZATION: Mu Pre-Warming + Fast In-Memory Reconnect Lookup
+        // 
+        // The joining player's Mu is fetched BEFORE the critical sync section.
+        // This ensures that all getMu() calls during evaluation are cache hits (instant).
+        // Reconnect lookup and assignment evaluation remain synchronous to prevent
+        // concurrent-join race conditions on _pendingAssignments.
+        // ═══════════════════════════════════════════════════════════════════════════
 
-       const phaseStartTime = Date.now();
-       const timemarks = {};
+        const phaseStartTime = Date.now();
+        const timemarks = {};
 
-       // Evaluate ideal team assignment — read reconnect memory synchronously from Map
-       const reconnectTeamStart = Date.now();
-       const reconnectTeam = this._reconnectMemory.get(player.steamID) || null;
-       timemarks.reconnectTeamMs = Date.now() - reconnectTeamStart;
+        // Pre-warm the joining player's Mu into EloTracker cache (cache miss = 1–5ms DB lookup)
+        const preWarmStart = Date.now();
+        if (this.eloTracker?.ready) {
+          await this.eloTracker.getMu(player);
+        }
+        timemarks.preWarmMs = Date.now() - preWarmStart;
 
-       // 2. STALE-STATE BATCHING PROTECTION
-       // JS single-threaded guarantee: once reconnect memory lookup resolves (synchronously),
-       // execution runs synchronously through evaluate + increment before yielding again.
-       // Concurrent joins are safe because no await exists between reconnect lookup and increment.
-       const evalStart = Date.now();
-       const evalResult = this.evaluateTeamAssignment(player, reconnectTeam);
+        // Read reconnect memory synchronously from Map
+        const reconnectTeamStart = Date.now();
+        const reconnectTeam = this._reconnectMemory.get(player.steamID) || null;
+        timemarks.reconnectTeamMs = Date.now() - reconnectTeamStart;
+
+        // 2. STALE-STATE BATCHING PROTECTION
+        // JS single-threaded guarantee: once reconnect memory lookup resolves (synchronously),
+        // execution runs synchronously through evaluate + increment before yielding again.
+        // Concurrent joins are safe because no await exists between reconnect lookup and increment.
+        const evalStart = Date.now();
+        const evalResult = await this.evaluateTeamAssignment(player, reconnectTeam);
        const { targetTeam, reason, debugInfo } = evalResult;
        timemarks.evaluateMs = Date.now() - evalStart;
        timemarks.totalPipelineMs = Date.now() - phaseStartTime;
@@ -964,8 +972,8 @@ export default class SmartAssign extends BasePlugin {
        const playerTag = debugInfo?.playerTag || 'null';
        const clanTeam = debugInfo?.clanTeam || 'none';
 
-       // Log timing details with clan info at verbosity 3 for detailed performance monitoring
-       Logger.verbose('SmartAssign', 3, `[TIMING] ${player.name} join pipeline: tag=${playerTag}, clanTeam=${clanTeam} | reconnect=${timemarks.reconnectTeamMs}ms (in-memory), evaluate=${timemarks.evaluateMs}ms, total=${timemarks.totalPipelineMs}ms`);
+        // Log timing details with clan info at verbosity 3 for detailed performance monitoring
+        Logger.verbose('SmartAssign', 3, `[TIMING] ${player.name} join pipeline: tag=${playerTag}, clanTeam=${clanTeam} | preWarm=${timemarks.preWarmMs}ms, reconnect=${timemarks.reconnectTeamMs}ms (in-memory), evaluate=${timemarks.evaluateMs}ms, total=${timemarks.totalPipelineMs}ms`);
 
       if (reconnectTeam && reconnectTeam === targetTeam) {
         Logger.verbose('SmartAssign', 3, `[SmartAssign] Applied reconnect memory for ${player.name} -> Team ${targetTeam} (${reason})`);
@@ -983,11 +991,11 @@ export default class SmartAssign extends BasePlugin {
         executed: true
       }, this.phase !== 'active');
 
-       // If the player is currently on the wrong team, queue a team change
-       if (targetTeam !== null && String(player.teamID) !== String(targetTeam)) {
-         this._pendingAssignments[targetTeam]++;
-         const pendingPlayerMu = getMuFast(player, this.eloTracker, { eloNotReadyWarned: this._eloNotReadyWarned, muFastMissWarned: this._muFastMissWarned });
-         this._pendingMu[targetTeam] += pendingPlayerMu;
+        // If the player is currently on the wrong team, queue a team change
+        if (targetTeam !== null && String(player.teamID) !== String(targetTeam)) {
+          this._pendingAssignments[targetTeam]++;
+          const pendingPlayerMu = await getMu(player, this.eloTracker);
+          this._pendingMu[targetTeam] += pendingPlayerMu;
         
         // NOTE: pendingPlayerMu is captured here and subtracted onMoveSuccess. If the player's 
         // Elo changes during the brief execution window, _pendingMu may drift slightly.
