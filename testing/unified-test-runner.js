@@ -1,3 +1,50 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║            UNIFIED-TEST-RUNNER (SmartAssign) v1.0.0           ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Comprehensive test harness for SmartAssign's assignment algorithm.
+ * Replays historical match events (JOIN, LEAVE, TEAM_CHANGE) against
+ * both a baseline (vanilla Squad) and the SmartAssign plugin, measuring
+ * Elo balance, forced moves, reconnect success rates, and clan coherence.
+ *
+ * Supports three replay scenarios:
+ *   - Historical matches (from JSONL event logs with real player data)
+ *   - Synthetic matches (pattern-based generation from churn statistics)
+ *   - Prolonged peak matches (10-50+ hour simulations at 95-100 population)
+ *
+ * ─── USAGE ─────────────────────────────────────────────────────
+ *
+ * node unified-test-runner.js <log.jsonl> [--elo <backup.json>] [--exhaustive] [--repl [match_idx]]
+ *
+ *   <log.jsonl>           Event log from sa-event-logger.js (historical matches)
+ *   --elo <backup.json>   Load real Mu values from EloTracker backup (optional)
+ *   --exhaustive          Enable verbose per-join logging for all events
+ *   --repl [match_idx]    Start interactive REPL (optional: initialize from match_idx)
+ *
+ * ─── EXPORTS ─────────────────────────────────────────────────────
+ *
+ * simulateHistoricalMatch(match, engineConfig, seededRandom, logStream, targetInitialPop)
+ *   — Simulates a match against an engine (Baseline or SmartAssign).
+ *     Returns metrics: avgGap, avgSumGap, forcedMoves, rejoinRate, clanCoherence, etc.
+ *
+ * startREPL(eloMap, initialMatch)
+ *   — Interactive command-line prompt for manual testing and debugging.
+ *
+ * ─── DEV-ONLY WARNING ─────────────────────────────────────────────
+ *
+ * This file is intended for development, testing, and algorithm validation only.
+ * It is NOT intended for production deployment. Do not include testing/
+ * in production SquadJS installations.
+ *
+ * Author:
+ * Discord: `real_slacker`
+ *
+ * ═══════════════════════════════════════════════════════════════
+ */
+
 import fs from 'fs';
 import readline from 'readline';
 import path from 'path';

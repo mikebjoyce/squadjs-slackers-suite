@@ -1,12 +1,12 @@
-# SmartAssign Plugin v0.3.0
+# SmartAssign Plugin v1.0.0
 
 **Elo-Aware Auto Assignment & Player Lifecycle Logger**
 
 ## Overview
 
-This plugin overrides Squad's native team assignment mechanics to provide smart, fair, and fast team placements. When a player connects, the plugin evaluates the current Elo distribution and population difference between both teams and assigns the player to whichever team produces the most balanced match. All team changes are executed via a background swap queue that achieves verified swaps in under 2 seconds.
+This plugin overrides Squad's native team assignment mechanics to provide smart, fair, and fast team placements. When a player connects, the plugin evaluates the current Elo distribution and population difference between both teams and assigns the player to whichever team produces the most balanced match. All team changes are executed via RCON using a One-Hit & Verify approach, with a hard 3-second timeout ensuring predictable behavior.
 
-The core timing challenge — Squad's RCON player list only refreshes every ~30 seconds — is solved by triggering the RCON move command directly from the Log Parser event (which fires within ~100ms of join), and then force-polling the player list after the command lands to verify the result. This approach consistently achieves verified join-swaps in 1–2 seconds.
+The core timing challenge — Squad's RCON player list only refreshes every ~30 seconds — is solved by triggering the RCON move command directly from the Log Parser event (which fires within ~100ms of join), and then force-polling the player list after the command lands to verify the result. This approach typically achieves verified join-swaps in 1–2 seconds, with a hard 3-second completion guarantee.
 
 Disconnect detection works via delta-diff: every time any player joins and triggers a forced RCON refresh, the player list is compared against the known state, which catches departures from other players as a side-effect — effectively solving disconnect lag without relying on the unreliable `PLAYER_DISCONNECTED` log event.
 
@@ -16,7 +16,7 @@ Disconnect detection works via delta-diff: every time any player joins and trigg
 
 * **Sub-2s Verified Join Swaps**: Uses Log-Driven triggering + One-Hit & Verify to move players within ~1s of joining, verified against a fresh RCON poll.
 * **Strict Population Balance**: Dynamically adjusts the allowed team population difference based on total player count, enforcing a strict 1-player max difference at high population.
-* **Reconnect Memory**: Player disconnect states are stored in a fast in-memory Map for instant lookups on rejoin. The database serves as a crash-recovery backing store, written asynchronously on disconnect and re-hydrated into memory when the plugin restarts within the same round. If a player crashes or disconnects, they are automatically placed back on their previous team upon reconnecting (with a +2 imbalance grace allowance).
+* **Reconnect Memory**: Player disconnect states are stored in a fast in-memory Map for instant lookups on rejoin. The database serves as a crash-recovery backing store, written asynchronously on disconnect and re-hydrated into memory when the plugin restarts within the same round. If a player crashes or disconnects, they are automatically placed back on their previous team upon reconnecting (with a +1 imbalance grace allowance).
 * **Clan Grouping**: Detects clan tags in player names (supports 5 detection strategies: brackets, separators, spaces, ALL-CAPS, and bare prefixes) and keeps clan members together on the same team when joining. If all clan mates are on one team and population caps allow, the joining player is routed to that team. Uses case-insensitive matching with Unicode normalization and Levenshtein edit-distance merging for typo tolerance.
 * **Elo-Aware Routing**: Integrates with the `EloTracker` plugin to route new players to the team that will most closely equalize the average skill of both sides.
 * **Passive Mode**: Set `enableSmartAssign: false` to observe real server events only (`JOIN`, `LEAVE`, `TEAM_CHANGE`). The assignment algorithm does not run, and no `ASSIGNMENT` events are logged—this mode is useful for monitoring server activity without any intervention.
@@ -76,6 +76,7 @@ squad-server/
 │   ├── sa-team-evaluator.js
 │   └── sa-clan-grouper.js
 ├── testing/                    ← Optional: diagnostic tools only
+│   ├── clan-tag-timing-tester.js
 │   ├── join-swap-tester.js
 │   ├── unified-test-runner.js
 │   └── optimize-params.js
@@ -89,7 +90,7 @@ squad-server/
 
 | Option | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `database` | string | ✅ Yes | `"sqlite"` | A valid Sequelize connector name (e.g. `"sqlite"`, `"mysql"`, `"postgres"`) for reconnect memory storage. |
+| `database` | string | ❌ No | `"sqlite"` | A valid Sequelize connector name (e.g. `"sqlite"`, `"mysql"`, `"postgres"`) for reconnect memory storage. |
 | `enableSmartAssign` | boolean | ❌ No | `true` | If true, runs the assignment algorithm and moves players. If false, only logs real server events (passive mode). |
 | `enableEventLogging` | boolean | ❌ No | `true` | Toggle the JSONL lifecycle event logging output entirely. |
 | `logPath` | string | ❌ No | `"./auto-assign-log.jsonl"` | File path for JSONL player lifecycle events. |
@@ -115,42 +116,50 @@ The hard cap is a safety net that prevents extreme imbalance regardless of the E
 | 90–95 players | 2 players |
 | 96+ players | **1 player (strict parity)** |
 
-### 2. Reconnect Memory (High Priority)
+### 2. Physical Server Cap (Hard Limit)
 
-If the joining player has a record in the reconnect database from the current round, they are routed directly back to their previous team — **before** Clan Grouping or Elo scoring is evaluated. Reconnecting players are granted an additional **+2 imbalance grace allowance** on top of the base to allow them back to their squad.
+A hard cap preventing any single team from exceeding 50 players. If both teams reach 50, the server is considered full and the plugin returns no assignment (Squad's native join handling takes over). This prevents the server state from becoming unrecoverable.
+
+### 3. Reconnect Memory (High Priority)
+
+If the joining player has a record in the reconnect database from the current round, they are routed directly back to their previous team — **before** Clan Grouping or Elo scoring is evaluated. Reconnecting players are granted an additional **+1 imbalance grace allowance** on top of the base to allow them back to their squad.
 
 If the reconnect target would violate the hard cap even with the grace allowance, the player falls through to Clan Grouping and Elo scoring with a small bias toward their previous team.
 
-### 3. Clan Grouping (High Priority)
+### 3.5. Clan Grouping (High Priority)
 
-If the joining player is part of a clan and **all** their clan mates are currently on the same team, the player is routed to that team — provided the population cap allows it. Clan members are granted the same **+2 imbalance grace allowance** as reconnecting players to keep squads together.
+If the joining player is part of a clan and **all** their clan mates are currently on the same team, the player is routed to that team — provided the population cap allows it. Clan members are granted the same **+1 imbalance grace allowance** as reconnecting players to keep squads together.
 
 If the clan target would violate the hard cap even with the grace allowance, the player falls through to Elo scoring. If clan mates are split across both teams, this step is skipped.
 
 ### 4. Elo Scoring & Skill Balancing
 
-If no reconnect memory applies, the algorithm evaluates both teams with a **Mu-based Unified Scoring System** using tuned weights:
+If neither reconnect memory nor clan grouping routes the player, the algorithm evaluates both teams with a **Mu-based Unified Scoring System** using tuned weights:
 
 - **Average Gap (1.0×)**: Measures how much the average skill of the two teams would diverge after placing the player on each side.
 - **Sum Gap (1.5× / log scale)**: Measures the total skill gap, scaled down using logarithmic growth as population increases. This logarithmic scaling provides stronger sum influence at high populations compared to linear scaling.
 
 The player is assigned to whichever team produces the lower combined score — i.e., the placement that brings the match closest to a balanced skill split.
 
+If the reconnect target would violate the hard cap, reconnecting players receive a **0.25-point score reduction** (reconnect bias) toward their previous team to tip near-ties in their favor, allowing them a chance to rejoin their squad even when the cap blocks direct placement.
+
 ### 5. Fallback
 
 - If `EloTracker` is unavailable, the algorithm falls back to pure population balancing (smaller team wins).
-- If both teams are at the 50-player physical cap, the move is skipped and the game handles placement natively.
+- If both teams are at the 50-player physical cap, the plugin returns no assignment (server is full — joins are handled natively by the game engine).
 
 ---
 
 ## Diagnostic Tool: JoinSwapTester
 
-`join-swap-tester.js` is a development/telemetry plugin included in this repo. It targets a specific player by EOSID and runs a full lifecycle profile:
+⚠️ **DEV-ONLY WARNING**: `join-swap-tester.js` is a development diagnostic plugin intended for testing and validation only. Do not deploy to production servers.
+
+It targets a specific player by EOSID and runs a full lifecycle profile:
 
 - On join: immediately swaps them to the opposite team and reports the total verified swap time.
 - On disconnect: reports the RCON detection delay and whether the engine-level `UNetConnection::Close` log was captured.
 
-It was used to prove the 1s verified swap and to validate disconnect detection behaviour. It is safe to leave deployed alongside SmartAssign for ongoing telemetry.
+It was used to prove the 1s verified swap and to validate disconnect detection behaviour.
 
 ```json
 {

@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║               CLAN-TAG-TIMING-TESTER v0.1.0                  ║
+ * ║               CLAN-TAG-TIMING-TESTER v1.0.0                  ║
  * ║                 TESTING/DIAGNOSTICS ONLY - NOT FOR PRODUCTION ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *

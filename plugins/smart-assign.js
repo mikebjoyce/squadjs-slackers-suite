@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v0.3.0                   ║
+ * ║                  SMART ASSIGN PLUGIN v1.0.0                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -15,10 +15,10 @@
  *
  * SmartAssign (default)
  *   Extends BasePlugin. Key methods:
- *     mount()                          — Initializes DB and lifecycle listeners.
- *     unmount()                        — Removes listeners and cleans up executor.
- *     evaluateTeamAssignment(player)    — Core algorithm for team placement.
- *     logEvent(type, player, data)      — Records lifecycle events to JSONL.
+ *     mount()                             — Initializes DB and lifecycle listeners.
+ *     unmount()                           — Removes all listeners and cleans up executor.
+ *     evaluateTeamAssignment(player, reconnectTeam) — Thin wrapper; builds context and delegates to SATeamEvaluator.
+ *     logEvent(eventType, player, extraData, betweenRounds, serverPlayers) — Records lifecycle events to JSONL with embedded team populations.
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
@@ -43,11 +43,11 @@
  *     1. Hard Pop Cap: Prevents imbalance beyond dynamic thresholds.
  *     2. Physical Server Cap: Hard limit (50 players per team).
  *     3. Reconnect Priority: Hot-path reconnect memory lives in-memory (_reconnectMemory Map) for synchronous lookups. If the player has a reconnect record and the pop cap allows it, they're sent to their previous team immediately (before Elo scoring). On disconnect, the Map is updated synchronously and the DB is written async (fire-and-forget) for crash recovery.
- *     4. Clan Grouping: If a player is in a clan and ALL clan mates are on one team, route the player there (provided pop cap allows). Uses lightweight _playerTagCache for fast tag lookups.
- *     5. Elo Balancing: Weights the average skill gap (3.0x) against a dynamically scaled sum gap (1.5x) to handle diverse pop states.
- *     6. Reconnect Bias: If reconnect priority is blocked by the cap, applies a minor score reduction (0.25) toward the previous team to tip near-ties.
- *     7. Reconnect Bonus: Grants an *additional* +2 player imbalance allowance on top of the base for returning players.
- * - Strict 1-player max imbalance enforced at high population (94+).
+ *     3.5. Clan Grouping: If a player is in a clan and ALL clan mates are on one team, route the player there (provided pop cap allows). Uses lightweight _playerTagCache for fast tag lookups.
+ *     4. Elo Balancing: Weights the average skill gap (1.0x) against a dynamically scaled sum gap (1.5x log scale) to handle diverse pop states.
+ *     5. Reconnect Bias: If reconnect priority is blocked by the cap, applies a minor score reduction (0.25) toward the previous team to tip near-ties.
+ *     6. Reconnect Bonus: Grants an *additional* +1 player imbalance allowance on top of the base for returning players (clan grouping gets the same).
+ * - Strict 1-player max imbalance enforced at high population (96+).
  * - Bypasses auto-assignment completely during specified ignored modes (Seed/Jensen).
  * - Accuracy: Players with pending moves are excluded from team evaluation to prevent double-counting.
  * - Passive Mode: Set enableSmartAssign: false to observe only real server events (JOIN, LEAVE,
@@ -60,6 +60,9 @@
  * enableSmartAssign: Toggle auto-assignment logic (default: true).
  * enableEventLogging: Toggle JSONL event logging (default: true).
  * ignoredGameModes: Array of modes to skip logic on (default: ['Seed', 'Jensen']).
+ * enableClanGrouping: Toggle clan-mate grouping logic (default: true).
+ * clanGroupMinSize: Minimum clan size for grouping (default: 2).
+ * clanGroupCaseSensitive: Case-sensitive clan tag matching (default: false).
  *
  * Author:
  * Discord: `real_slacker`
@@ -78,7 +81,7 @@ import { buildPlayerTagCache, extractRawPrefix } from '../utils/sa-clan-grouper.
 const MAX_TEAM_SIZE = 50;
 
 export default class SmartAssign extends BasePlugin {
-  static version = '0.3.0';
+  static version = '1.0.0';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
@@ -184,21 +187,22 @@ export default class SmartAssign extends BasePlugin {
     // ═══════════════════════════════════════════════════════════════════════════
      this._pendingPlayerListUpdate = null;
 
-     // ═══════════════════════════════════════════════════════════════════════════
-     // OPTIMIZATION: In-Memory Reconnect Memory Map
-     // 
-     // Purpose: Replace the synchronous await-on-DB bottleneck for reconnect lookups
-     //          with a fast in-memory Map that reads from player history.
-     // 
-     // Architecture:
-     //   - Stored in-memory during the round (_reconnectMemory Map)
-     //   - Written to DB asynchronously (fire-and-forget) on disconnect
-     //   - Synced back from DB on crash recovery via getAllReconnectMemory()
-     //   - Cleared on NEW_GAME alongside DB clear
-     // 
-     // Impact: The join-swap pipeline no longer awaits a DB read. The only I/O
-     //         on join is now evaluateTeamAssignment() + queueMove(), both synchronous.
-     // ═══════════════════════════════════════════════════════════════════════════
+      // ═══════════════════════════════════════════════════════════════════════════
+      // OPTIMIZATION: In-Memory Reconnect Memory Map
+      // 
+      // Purpose: Replace the synchronous await-on-DB bottleneck for reconnect lookups
+      //          with a fast in-memory Map that reads from player history.
+      // 
+      // Architecture:
+      //   - Stored in-memory during the round (_reconnectMemory Map)
+      //   - Written to DB asynchronously (fire-and-forget) on disconnect
+      //   - Synced back from DB on crash recovery via getAllReconnectMemory()
+      //   - Cleared on NEW_GAME alongside DB clear
+      // 
+      // Impact: The join-swap pipeline no longer awaits a DB read on the reconnect lookup.
+      //         Note: evaluateTeamAssignment() is async (awaits getMu() calls inside the evaluator).
+      //         queueMove() is synchronous (just enqueues the move).
+      // ═══════════════════════════════════════════════════════════════════════════
      this._reconnectMemory = new Map();
 
        this.eloTracker = null;
@@ -247,6 +251,7 @@ export default class SmartAssign extends BasePlugin {
      this.onRoundEnded = this.onRoundEnded.bind(this);
      this.onUpdatedPlayerInfo = this.onUpdatedPlayerInfo.bind(this);
      this.onUpdatedLayerInfo = this.onUpdatedLayerInfo.bind(this);
+     this.onServerInfoUpdated = this.onServerInfoUpdated.bind(this);
      this.onPlayerConnected = this.onPlayerConnected.bind(this);
      this.onScrambleExecuted = this.onScrambleExecuted.bind(this);
      this.onMoveFailed = this.onMoveFailed.bind(this);
@@ -353,6 +358,7 @@ export default class SmartAssign extends BasePlugin {
     this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
     this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
     this.server.removeListener('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo);
+    this.server.removeListener('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated);
     this.server.removeListener('PLAYER_CONNECTED', this.onPlayerConnected);
     this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
     this.server.removeListener('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);

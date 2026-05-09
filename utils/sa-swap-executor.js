@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SA-SWAP-EXECUTOR v0.2.9                    ║
+ * ║                    SA-SWAP-EXECUTOR v1.0.0                    ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -73,13 +73,13 @@ export default class SASwapExecutor {
      if (!steamID || !targetTeamID) return;
      if (this.pendingPlayerMoves.has(steamID)) return;
 
-     this.pendingPlayerMoves.set(steamID, {
-       targetTeamID,
-       attempts: 0,
-       commandSent: false,       // Tracks whether an RCON command has been sent (reserved for diagnostics).
-       awaitingVerification: false, // State lock: true while we wait for the post-command updatePlayerList() to resolve.
-       startTime: Date.now()
-     });
+      this.pendingPlayerMoves.set(steamID, {
+        targetTeamID,
+        attempts: 0,
+        commandSent: false,       // Tracks whether an RCON command has been sent (gates PRE-CHECK: prevents re-firing after command sent).
+        awaitingVerification: false, // State lock: true while we wait for the post-command updatePlayerList() to resolve.
+        startTime: Date.now()
+      });
 
      Logger.verbose('SmartAssign', 4, `[SwapExecutor] Queued move for ${steamID} -> ${targetTeamID}`);
 
@@ -173,14 +173,16 @@ export default class SASwapExecutor {
             moveData.commandSent = true;
             moveData.awaitingVerification = true;
             
-            // NOTE: This event fires on every command attempt including the first.
-            // The name 'RETRY' is a legacy label; treat it as 'COMMAND_SENT'.
-            this.server.emit('SMART_ASSIGN_MOVE_RETRY', { 
-              steamID, 
-              attempt: moveData.attempts, 
-              method: 'Await-Verification',
-              response: response 
-            });
+             // NOTE: This event fires on every command attempt including the first.
+             // Event name: SMART_ASSIGN_MOVE_RETRY (legacy label, now aliased as COMMAND_SENT for clarity).
+             // For public API consumers: treat this as a "command sent" event, not a retry indicator.
+             // The event name will be deprecated in a future version in favor of SMART_ASSIGN_COMMAND_SENT.
+             this.server.emit('SMART_ASSIGN_MOVE_RETRY', { 
+               steamID, 
+               attempt: moveData.attempts, 
+               method: 'Await-Verification',
+               response: response 
+             });
           }
         } catch (err) {
           Logger.verbose('SmartAssign', 1, `[SwapExecutor] Error processing ${steamID}: ${err?.message}`);

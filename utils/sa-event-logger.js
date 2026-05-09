@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SA-EVENT-LOGGER v0.3.0                     ║
+ * ║                    SA-EVENT-LOGGER v1.0.0                     ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -13,8 +13,8 @@
  *
  * SAEventLogger (default)
  *   Key methods:
- *     logEvent(eventType, player, extraData, betweenRounds)
- *       — Batches an event into memory
+ *     logEvent(eventType, player, extraData, betweenRounds, serverPlayers = [])
+ *       — Batches an event into memory. serverPlayers is used to populate t1/t2 population counts embedded in the event.
  *     _flushTempLog()
  *       — Appends in-memory batch to temp file
  *     finalizeRoundLog(roundStartTime, layerName, gamemode, smartAssignActive)

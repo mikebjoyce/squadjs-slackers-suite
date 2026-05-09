@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                   SA-TEAM-EVALUATOR v0.3.0                    ║
+ * ║                   SA-TEAM-EVALUATOR v1.0.0                    ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -25,9 +25,9 @@
  *
  *   1. Hard Pop Cap → forced team or both-ok
  *   2. Physical Server Cap → forced team or both-ok
- *   3.0 Reconnect Priority → previous team if cap allows
- *   3.5 Clan Grouping [NEW] → clan team if ALL mates there and cap allows
- *   4. Elo Scoring → best skill-balanced team
+  *   3.0 Reconnect Priority → previous team if cap allows
+  *   3.5 Clan Grouping → clan team if ALL mates there and cap allows
+  *   4. Elo Scoring → best skill-balanced team
  *   5. Population tie-break → smaller team
  *
  * ─── DESIGN NOTES ─────────────────────────────────────────────────

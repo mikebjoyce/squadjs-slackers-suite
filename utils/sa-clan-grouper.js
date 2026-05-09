@@ -1,13 +1,14 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║               SA CLAN GROUPER UTILITY v0.1.0                  ║
+ * ║               SA CLAN GROUPER UTILITY v1.0.0                  ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Extracts clan tag groups from raw player data and provides utilities
- * for clan-aware team assignment. Ported from TeamBalancer's clan grouping
- * logic and adapted for SmartAssign's join-time evaluation.
+  * Extracts clan tag groups from raw player data and provides utilities
+  * for clan-aware team assignment. This clan grouping logic is shared with
+  * TeamBalancer and EloTracker, providing consistent tag detection and grouping
+  * strategies across SquadJS plugins.
  *
  * Pure logic — no external dependencies beyond Logger. Importable from
  * both the plugin and unit tests.
