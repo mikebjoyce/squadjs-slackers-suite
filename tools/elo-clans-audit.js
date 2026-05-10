@@ -11,62 +11,8 @@
  */
 
 import { readFileSync, writeFileSync } from 'fs';
+import { extractRawPrefix, normalizeTag } from '../utils/elo-clan-grouping.js';
 
-const BRACKET_PAIRS = [
-  ['\\[', '\\]'], ['\\(', '\\)'], ['【', '】'], ['「', '」'], ['『', '』'], ['《', '》'],
-  ['╔', '╗'], ['├', '┤'], ['↾', '↿'], ['╬', '╬'], ['✦', '✦'], ['⟦', '⟧'], ['╟', '╢'],
-  ['\\|', '\\|'], ['=', '='], ['<', '>'], ['\\{', '\\}']
-];
-
-const NON_ASCII_MAP = {
-  'ƒ': 'f', 'И': 'n', '丹': 'a', '匚': 'c', 'н': 'h', '尺': 'r', 'λ': 'a', 'ν': 'v', 'є': 'e',
-  '†': 't', 'Ð': 'd', 'ø': 'o', 'ß': 'ss', 'ค': 'a', 'г': 'r', 'ς': 'c', 'ɦ': 'h', 'м': 'm',
-  'я': 'r', 'ċ': 'c'
-};
-
-function extractRawPrefix(name) {
-  // 1. Match 2+ space separator (common in Squad names) - prioritize this as it's very specific
-  const spaceRegex = /^\s*(.{1,10}?)\s{2,}/;
-  let match = name.match(spaceRegex);
-  if (match) return match[1].trim();
-
-  // 2. Match bracketed tags at the start (allow mismatched pairs like {TAG) or [TAG})
-  const bracketRegex = /^\s*([\[\(【「『《╔├↾╬✦⟦╟|=<\{~\*].+?[\]\)】」』》╗┤↿╬✦⟧╢|=<~\*\}])/;
-  match = name.match(bracketRegex);
-  if (match) return match[1].trim();
-
-  // 3. Match separator-based tags: TAG // Name, TAG | Name, TAG - Name, TAG : Name, TAG † Name, TAG ™ Name, TAG ✯ Name, TAG :( Name
-  const sepRegex = /^\s*(.{1,10}?)\s*(?:\/\/|\||-|:|\:\(|\:\)|†|\u2020|™|✯|~|\*)\s+/;
-  match = name.match(sepRegex);
-  if (match) {
-    return match[1].trim();
-  }
-  
-  // 4. Match single trailing space for very short all-caps tags (e.g. "KM Lookout")
-  // Only match 2-4 chars, all caps, followed by a single space, then a capital letter
-  const shortTagRegex = /^\s*([A-Z0-9]{2,4})\s+[A-Z]/;
-  match = name.match(shortTagRegex);
-  if (match) return match[1].trim();
-
-  return null;
-}
-
-function normalizeTag(raw) {
-  if (!raw) return null;
-
-  // Handle accents (e.g. Café -> Cafe)
-  let norm = raw.normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '');
-
-  // Replace gamer characters (e.g. 丹 -> a)
-  for (const [key, val] of Object.entries(NON_ASCII_MAP)) {
-    norm = norm.replace(new RegExp(key, 'gi'), val);
-  }
-
-  // Strip all non-alphanumeric and uppercase
-  norm = norm.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-  return norm || null;
-}
 
 const args = process.argv.slice(2);
 const dbPath = args[0] || 'tools/rebuilt.json';

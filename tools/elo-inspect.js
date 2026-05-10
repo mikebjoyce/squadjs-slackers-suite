@@ -19,10 +19,10 @@
  *   exit / quit           Exit
  */
 
-import { createReadStream } from 'fs';
 import { readFileSync } from 'fs';
 import * as readline from 'readline';
 import EloCalculator from '../utils/elo-calculator.js';
+import { extractRawPrefix, normalizeTag } from '../utils/elo-clan-grouping.js';
 
 // ─── Constants (mirror elo-discord.js) ───────────────────────────────────────
 
@@ -30,18 +30,6 @@ const SIGMA_MULTIPLIER = 3;
 const MIN_ROUNDS_RANKED = 10;
 const LEADERBOARD_SIZE = 25;
 const LOCAL_NEIGHBORHOOD = 9;
-
-const BRACKET_PAIRS = [
-  ['\\[', '\\]'], ['\\(', '\\)'], ['【', '】'], ['「', '」'], ['『', '』'], ['《', '》'],
-  ['╔', '╗'], ['├', '┤'], ['↾', '↿'], ['╬', '╬'], ['✦', '✦'], ['⟦', '⟧'], ['╟', '╢'],
-  ['\\|', '\\|'], ['=', '='], ['<', '>'], ['\\{', '\\}']
-];
-
-const NON_ASCII_MAP = {
-  'ƒ': 'f', 'И': 'n', '丹': 'a', '匚': 'c', 'н': 'h', '尺': 'r', 'λ': 'a', 'ν': 'v', 'є': 'e',
-  '†': 't', 'Ð': 'd', 'ø': 'o', 'ß': 'ss', 'ค': 'a', 'г': 'r', 'ς': 'c', 'ɦ': 'h', 'м': 'm',
-  'я': 'r', 'ċ': 'c'
-};
 
 // ─── Load DB ─────────────────────────────────────────────────────────────────
 
@@ -115,43 +103,6 @@ function findPlayer(db, query) {
   return hit ?? null;
 }
 
-function extractRawPrefix(name) {
-  // 1. Match 2+ space separator (common in Squad names) - prioritize this as it's very specific
-  const spaceRegex = /^\s*(.{1,10}?)\s{2,}/;
-  let match = name.match(spaceRegex);
-  if (match) return match[1].trim();
-
-  // 2. Match bracketed tags at the start (allow mismatched pairs like {TAG) or [TAG})
-  const bracketRegex = /^\s*([\[\(【「『《╔├↾╬✦⟦╟|=<\{~\*].+?[\]\)】」』》╗┤↿╬✦⟧╢|=<~\*\}])/;
-  match = name.match(bracketRegex);
-  if (match) return match[1].trim();
-
-  // 3. Match separator-based tags: TAG // Name, TAG | Name, TAG - Name, TAG : Name, TAG † Name, TAG ✯ Name, TAG :( Name
-  const sepRegex = /^\s*(.{1,10}?)\s*(?:\/\/|\||-|:|\:\(|\:\)|†|\u2020|™|✯|~|\*)\s+/;
-  match = name.match(sepRegex);
-  if (match) {
-    return match[1].trim();
-  }
-
-  return null;
-}
-
-function normalizeTag(raw) {
-  if (!raw) return null;
-
-  // Handle accents (e.g. Café -> Cafe)
-  let norm = raw.normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '');
-
-  // Replace gamer characters (e.g. 丹 -> a)
-  for (const [key, val] of Object.entries(NON_ASCII_MAP)) {
-    norm = norm.replace(new RegExp(key, 'gi'), val);
-  }
-
-  // Strip all non-alphanumeric and uppercase
-  norm = norm.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-  return norm || null;
-}
 
 function rankOf(board, player) {
   const idx = board.findIndex(p => p.eosID === player.eosID);
@@ -306,7 +257,7 @@ function cmdClan(query, db, dbPrev) {
     console.log(r(`  Invalid clan tag query.`));
     return;
   }
-  
+
   // Find all players with a matching normalized clan tag
   const members = db.filter(p => {
     const raw = extractRawPrefix(p.name);
@@ -439,7 +390,7 @@ function cmdClans(db, arg) {
     const csrStr = c.avgCsr === -999 ? d('  n/a') : b(c.avgCsr.toFixed(1).padStart(5));
     const membersStr = `${c.members.length} members`.padEnd(12);
     const wrStr = `${c.wr.toFixed(1)}% WR`.padStart(8);
-    
+
     console.log(`  ${y(rankStr)} ${c.displayTag.padEnd(20)} ${csrStr} CSR  ${d(membersStr)} ${d(wrStr)}`);
   });
   console.log();
@@ -727,7 +678,7 @@ function cmdRound(targetId, db, mlog) {
   const muLeadTeam = t1.avgMu >= t2.avgMu ? 1 : 2;
   const top15LeadTeam = t1.top15Mu >= t2.top15Mu ? 1 : 2;
   const vetAdv = t1.tierStats.rCount === t2.tierStats.rCount ? 'Tie' : `Team ${t1.tierStats.rCount > t2.tierStats.rCount ? 1 : 2}`;
-  
+
   const totalRegs = t1.tierStats.rCount + t2.tierStats.rCount;
   const leadRegs = Math.max(t1.tierStats.rCount, t2.tierStats.rCount);
   const t1Share = totalRegs > 0 ? Math.round((t1.tierStats.rCount / totalRegs) * 100) : 0;
@@ -746,7 +697,7 @@ function cmdRound(targetId, db, mlog) {
   console.log(`  Players:   ${b(matchPlayers.length)}`);
   console.log();
   console.log(b('  Match Health'));
-  
+
   const muColor = muDelta < 1.0 ? g : (muDelta <= 2.5 ? y : r);
   const top15Color = top15Delta < 1.0 ? g : (top15Delta <= 2.5 ? y : r);
   const regColor = leadShare > 65 ? r : (leadShare > 55 ? y : g);
@@ -776,7 +727,7 @@ function cmdRound(targetId, db, mlog) {
   console.log(row(fmtMu(t1.avgMu), 'Team Avg', fmtMu(t2.avgMu)));
   console.log(row(fmtMu(t1.avgRegMu), 'Regs Avg', fmtMu(t2.avgRegMu)));
   console.log(row(fmtMu(t1.top15Mu), 'Top 15 Avg', fmtMu(t2.top15Mu)));
-  console.log(d('   -----------------------------------')); 
+  console.log(d('   -----------------------------------'));
   console.log(row(fmtPct(t1.veterancy), 'Veterancy', fmtPct(t2.veterancy)));
 
   console.log();
@@ -788,7 +739,7 @@ function cmdRound(targetId, db, mlog) {
   console.log();
 
   console.log(b('  Rating Spread (Regulars)'));
-  
+
   const printSpread = (summary, teamName) => {
     console.log(`  ${c(teamName)}`);
     if (summary.spreadSnapshot.length === 0) {

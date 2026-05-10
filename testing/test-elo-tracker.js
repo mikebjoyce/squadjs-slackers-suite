@@ -25,6 +25,7 @@ export default async function runTrackerTests(runTest) {
   // Helper to create mock DB
   const createMockDb = () => ({
     initDB: async () => ({ roundStartTime: null }),
+    pruneStaleEntries: async () => ({ tier1: 0, tier2: 0 }),
     saveRoundStartTime: async () => {},
     getPlayerStatsBatch: async (ids) => {
       const map = new Map();
