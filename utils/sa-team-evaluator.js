@@ -1,21 +1,25 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                   SA-TEAM-EVALUATOR v1.0.0                    ║
+ * ║                   SA-TEAM-EVALUATOR v2.0.0                    ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
  * Pure functional module for team assignment scoring and evaluation.
  * No side effects, no state ownership. All state is passed as arguments.
- * Provides the core Elo-based Unified Scoring System for competitive balance.
+ * Provides a 3-metric Composite Scoring System aligned with TeamBalancer's
+ * algorithm for competitive balance:
+ *   - Mean ELO difference
+ *   - Top-15 ELO difference (high-skill parity)
+ *   - Veteran parity (experience distribution)
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * evaluateTeamAssignment(player, server, context) [async]
  *   — Core algorithm that returns { targetTeam, reason }
  *
- * getMu(player, eloTracker)
- *   — Retrieves player Mu rating, with fallback to default (async)
+ * getRating(player, eloTracker) [async]
+ *   — Retrieves player { mu, roundsPlayed } with fallback to defaults
  *
  * ─── CLAN GROUPING ────────────────────────────────────────────────
  *
@@ -25,9 +29,9 @@
  *
  *   1. Hard Pop Cap → forced team or both-ok
  *   2. Physical Server Cap → forced team or both-ok
-  *   3.0 Reconnect Priority → previous team if cap allows
-  *   3.5 Clan Grouping → clan team if ALL mates there and cap allows
-  *   4. Elo Scoring → best skill-balanced team
+ *   3.0 Reconnect Priority → previous team if cap allows
+ *   3.5 Clan Grouping → clan team if ALL mates there and cap allows
+ *   4. Composite Skill Balance → best 3-metric score
  *   5. Population tie-break → smaller team
  *
  * ─── DESIGN NOTES ─────────────────────────────────────────────────
@@ -50,11 +54,12 @@ import Logger from '../../core/logger.js';
 import { getClanTeamForPlayer } from './sa-clan-grouper.js';
 
 const MAX_TEAM_SIZE = 50;
+const REGULAR_MIN_ROUNDS = 10;  // Veteran threshold
 
 /**
  * Evaluates and returns the best team (1 or 2) for a joining player.
- * Uses a Mu-based Unified Scoring System to balance competitive parity,
- * population equity, and player preference (reconnects).
+ * Uses a 3-metric Composite Scoring System to balance skill, veterancy,
+ * and population equity.
  *
  * @param {object} player - Player object with steamID, name, teamID, eosID, etc.
  * @param {object} server - Server object with .players array
@@ -63,6 +68,7 @@ const MAX_TEAM_SIZE = 50;
  *     reconnectTeam: number|null,           // 1, 2, or null if no reconnect
  *     pendingAssignments: { 1: number, 2: number },
  *     pendingMu: { 1: number, 2: number },
+ *     pendingVeterans: { 1: number, 2: number }, // NEW: veteran count per team
  *     pendingPlayerMoves: Map<steamID, ...>,
  *     eloTracker: EloTracker | null,
  *     ignoredModes: string[],               // Lowercase gamemode substrings to skip
@@ -77,6 +83,7 @@ export async function evaluateTeamAssignment(player, server, context) {
      reconnectTeam = null,
      pendingAssignments = { 1: 0, 2: 0 },
      pendingMu = { 1: 0, 2: 0 },
+     pendingVeterans = { 1: 0, 2: 0 },
      pendingPlayerMoves = new Map(),
      eloTracker = null,
      ignoredModes = [],
@@ -101,7 +108,7 @@ export async function evaluateTeamAssignment(player, server, context) {
     return { targetTeam: null, reason: 'Ignored Gamemode' };
   }
 
-  const hasElo = eloTracker && eloTracker.ready && typeof eloTracker.getMu === 'function';
+  const hasElo = eloTracker && eloTracker.ready && typeof eloTracker.getRating === 'function';
 
   if (eloTracker && !eloTracker.ready) {
     if (!warnFlags.eloNotReadyWarned) {
@@ -117,6 +124,12 @@ export async function evaluateTeamAssignment(player, server, context) {
   let t2Count = pendingAssignments[2] || 0;
   let t1Power = pendingMu[1] || 0;
   let t2Power = pendingMu[2] || 0;
+  let t1Veterans = pendingVeterans[1] || 0;
+  let t2Veterans = pendingVeterans[2] || 0;
+
+  // Arrays to store individual Mu values for top-15 calculation
+  let t1Mus = [];
+  let t2Mus = [];
 
   const players = server.players;
   const playerCount = players.length;
@@ -131,10 +144,24 @@ export async function evaluateTeamAssignment(player, server, context) {
      const teamID = String(p.teamID);
      if (teamID === '1') {
        t1Count++;
-       if (hasElo) t1Power += await getMu(p, eloTracker);
+       if (hasElo) {
+         const rating = await getRating(p, eloTracker);
+         t1Power += rating.mu;
+         t1Mus.push(rating.mu);
+         if (rating.roundsPlayed >= REGULAR_MIN_ROUNDS) {
+           t1Veterans++;
+         }
+       }
      } else if (teamID === '2') {
        t2Count++;
-       if (hasElo) t2Power += await getMu(p, eloTracker);
+       if (hasElo) {
+         const rating = await getRating(p, eloTracker);
+         t2Power += rating.mu;
+         t2Mus.push(rating.mu);
+         if (rating.roundsPlayed >= REGULAR_MIN_ROUNDS) {
+           t2Veterans++;
+         }
+       }
      }
   }
 
@@ -188,93 +215,145 @@ export async function evaluateTeamAssignment(player, server, context) {
          return { targetTeam: clanTeam, reason: 'Clan Grouping', debugInfo: { playerTag: playerTagCache.get(player.eosID), clanTeam } };
        } else {
          debugClanTeam = 'blocked';
-         Logger.verbose('SmartAssign', 3, `[Clan Grouping] Clan team ${clanTeam} would violate pop cap for ${player.name}. Falling through to Elo.`);
+         Logger.verbose('SmartAssign', 3, `[Clan Grouping] Clan team ${clanTeam} would violate pop cap for ${player.name}. Falling through to composite skill balance.`);
        }
      }
    }
 
-  // 3. SKILL & PENALTY EVALUATION
+  // 3. SKILL & COMPOSITE BALANCE EVALUATION
   if (!hasElo) {
     const targetTeam = t1Count <= t2Count ? 1 : 2;
     return { targetTeam, reason: `Population Balance (No Elo) | T1:${t1Count} T2:${t2Count}` };
   }
 
-    const playerMu = await getMu(player, eloTracker);
-    // EMPTY TEAM DEFAULT: When a team has no players, avgT1/avgT2 is set to 25.0 (TrueSkill default Mu)
-   // rather than 0. This prevents division-by-zero and represents a "neutral skill baseline".
-   // As a side effect, penalty scores will be non-zero even at 0v0 or 2v0 population — this is intentional
-   // and correct behavior; the routing decision itself is not affected by the magnitude.
-   const avgT1 = t1Count > 0 ? (t1Power / t1Count) : 25.0;
-   const avgT2 = t2Count > 0 ? (t2Power / t2Count) : 25.0;
+    const playerRating = await getRating(player, eloTracker);
+    const playerMu = playerRating.mu;
+    const playerIsVeteran = playerRating.roundsPlayed >= REGULAR_MIN_ROUNDS;
 
-   const newAvgT1 = (t1Power + playerMu) / (t1Count + 1);
-   const newAvgT2 = (t2Power + playerMu) / (t2Count + 1);
+    // Default: When a team has no players, avgT1/avgT2 is set to 25.0 (TrueSkill default Mu)
+    // rather than 0. This prevents division-by-zero and represents a "neutral skill baseline".
+    const avgT1 = t1Count > 0 ? (t1Power / t1Count) : 25.0;
+    const avgT2 = t2Count > 0 ? (t2Power / t2Count) : 25.0;
 
-   // Dynamic scale: normalizes sum gap relative to current server population.
-   // Tuned winner uses log scale: slower growth = stronger sum influence at high pop
-   const dynamicScale = Math.max(1, Math.log(t1Count + t2Count + 2) * 2.5);
+    const newAvgT1 = (t1Power + playerMu) / (t1Count + 1);
+    const newAvgT2 = (t2Power + playerMu) / (t2Count + 1);
 
-   // SCORING FUNCTION: Computes an imbalance penalty for placing the joining player on the candidate team.
-   // Combines two gap metrics with empirically-tuned weights:
-   //   - avgGap (weight 1.0x): Per-player skill fairness — difference in average skill between teams after placement
-   //   - sumGap (weight 1.5x): Absolute power delta — difference in total skill, normalized by dynamic population scale
-   // Lower score = better balance = preferable team. The algorithm always picks the team with the lower score.
-   const getScore = (candidateAvg, opponentAvg, candidateSum, opponentSum) => {
-     const avgGap = Math.abs(candidateAvg - opponentAvg);
-     const sumGap = Math.abs(candidateSum - opponentSum) / dynamicScale;
-     return (avgGap * 1.0) + (sumGap * 1.5);
-   };
+    // Build Mu arrays for both teams AFTER adding player
+    const candidateMusT1 = [...t1Mus, playerMu];
+    const candidateMusT2 = [...t2Mus, playerMu];
 
-  let scoreT1 = getScore(newAvgT1, avgT2, t1Power + playerMu, t2Power);
-  let scoreT2 = getScore(avgT1, newAvgT2, t1Power, t2Power + playerMu);
+    // SCORING FUNCTION: 3-metric composite system aligned with TeamBalancer
+    // Metrics:
+    //   1. meanDiff (weight 0.6x): Average Mu difference between teams
+    //   2. top15Diff (weight 0.4x): Top-15 average Mu difference
+    //   3. veteranPenalty (fixed 300x): Ratio imbalance of experienced players
+    const getScore = (candidateMus, opponentMus, candidateVets, opponentVets, candidateCount, opponentCount) => {
+      // Metric 1: Mean ELO difference
+      const getMean = (mus) => mus.length > 0 ? mus.reduce((a, b) => a + b, 0) / mus.length : 25.0;
+      const meanT1 = getMean(candidateMus);
+      const meanT2 = getMean(opponentMus);
+      const meanDiff = Math.abs(meanT1 - meanT2);
 
-  // Rejoin bias: if reconnect priority was blocked by hard pop cap, apply a small score reduction
-  // toward the player's previous team. Only tips near-ties.
-  if (isRejoin) {
-    const REJOIN_BIAS = 0.25;
-    if (reconnectTeam === 1) scoreT1 = Math.max(0, scoreT1 - REJOIN_BIAS);
-    else if (reconnectTeam === 2) scoreT2 = Math.max(0, scoreT2 - REJOIN_BIAS);
-  }
+      // Metric 2: Top-15 ELO difference (or all if fewer than 15 per side)
+      const getTop15Avg = (mus) => {
+        if (mus.length === 0) return 25.0;
+        const sorted = [...mus].sort((a, b) => b - a);
+        const slice = sorted.slice(0, 15);
+        return slice.reduce((a, b) => a + b, 0) / slice.length;
+      };
+      const top15T1 = getTop15Avg(candidateMus);
+      const top15T2 = getTop15Avg(opponentMus);
+      const top15Diff = Math.abs(top15T1 - top15T2);
 
-   let targetTeam;
-   if (scoreT1 < scoreT2) {
-     targetTeam = 1;
-   } else if (scoreT2 < scoreT1) {
-     targetTeam = 2;
-   } else {
-     // Simple population tie-breaker
-     targetTeam = t1Count <= t2Count ? 1 : 2;
-   }
+      // Composite ELO penalty (matches TeamBalancer exactly)
+      const compositeDiff = 0.6 * meanDiff + 0.4 * top15Diff;
+      const eloBalancePenalty = getPenalty(compositeDiff);
 
-   // NOTE: T1/T2 in the reason string are IMBALANCE PENALTY SCORES, not Mu ratings or team skill summaries.
-   // Lower score = better balance. The algorithm assigns to the team with the lower score.
-   // At very low population these scores can appear large/non-zero even for empty teams
-   // because the empty-team average defaults to 25.0 (see avgT1/avgT2 defaults above).
-   // This is intentional and correct behavior — the routing decision is not affected by the magnitude.
-   const reason = `Skill Balance: T1=${scoreT1.toFixed(3)}, T2=${scoreT2.toFixed(3)} | Pop: ${t1Count}v${t2Count}`;
+      // Metric 3: Veteran parity penalty
+      const vet1Ratio = candidateCount > 0 ? candidateVets / candidateCount : 0;
+      const vet2Ratio = opponentCount > 0 ? opponentVets / opponentCount : 0;
+      const veteranPenalty = Math.abs(vet1Ratio - vet2Ratio) * 300;
 
-  // Always include debug info about clan status for logging
-  const playerTag = playerTagCache ? playerTagCache.get(player.eosID) : null;
-  const debugInfo = { playerTag, clanTeam: debugClanTeam };
+      return eloBalancePenalty + veteranPenalty;
+    };
 
-  return { targetTeam, reason, debugInfo };
+    // Non-linear penalty curve (matches TeamBalancer)
+    const getPenalty = (diff) => {
+      if (diff <= 0.1) return diff * 20;
+      if (diff <= 0.3) return 2.0 + (diff - 0.1) * 40;
+      if (diff <= 0.6) return 10.0 + (diff - 0.3) * 80;
+      return 34.0 + (diff - 0.6) * 150;
+    };
+
+    // Calculate scores for both placements
+    const scoreT1 = getScore(candidateMusT1, t2Mus, t1Veterans + (playerIsVeteran ? 1 : 0), t2Veterans, t1Count + 1, t2Count);
+    const scoreT2 = getScore(t1Mus, candidateMusT2, t1Veterans, t2Veterans + (playerIsVeteran ? 1 : 0), t1Count, t2Count + 1);
+
+    // Rejoin bias: if reconnect priority was blocked by hard pop cap, apply a small score reduction
+    // toward the player's previous team. Only tips near-ties.
+    let scoreT1Biased = scoreT1;
+    let scoreT2Biased = scoreT2;
+    if (isRejoin) {
+      const REJOIN_BIAS = 0.25;
+      if (reconnectTeam === 1) scoreT1Biased = Math.max(0, scoreT1 - REJOIN_BIAS);
+      else if (reconnectTeam === 2) scoreT2Biased = Math.max(0, scoreT2 - REJOIN_BIAS);
+    }
+
+    let targetTeam;
+    if (scoreT1Biased < scoreT2Biased) {
+      targetTeam = 1;
+    } else if (scoreT2Biased < scoreT1Biased) {
+      targetTeam = 2;
+    } else {
+      // Simple population tie-breaker
+      targetTeam = t1Count <= t2Count ? 1 : 2;
+    }
+
+    // Build detailed reason string with 3 metrics
+    const meanT1 = getMean(candidateMusT1);
+    const meanT2 = getMean(t2Mus);
+    const top15T1 = getTop15Avg(candidateMusT1);
+    const top15T2 = getTop15Avg(t2Mus);
+    const vet1Ratio = (t1Count + 1) > 0 ? (t1Veterans + (playerIsVeteran && targetTeam === 1 ? 1 : 0)) / (t1Count + 1) : 0;
+    const vet2Ratio = (t2Count) > 0 ? (t2Veterans + (playerIsVeteran && targetTeam === 2 ? 1 : 0)) / (t2Count) : 0;
+
+    const reason = `Composite: Mean=${meanDiff.toFixed(2)} Top15=${top15Diff.toFixed(2)} VetRatio=${Math.abs(vet1Ratio - vet2Ratio).toFixed(3)} | Scores: T1=${scoreT1Biased.toFixed(2)} T2=${scoreT2Biased.toFixed(2)} | Pop: ${t1Count}v${t2Count}`;
+
+    // Helper functions for reason string
+    function getMean(mus) {
+      return mus.length > 0 ? mus.reduce((a, b) => a + b, 0) / mus.length : 25.0;
+    }
+    function getTop15Avg(mus) {
+      if (mus.length === 0) return 25.0;
+      const sorted = [...mus].sort((a, b) => b - a);
+      const slice = sorted.slice(0, 15);
+      return slice.reduce((a, b) => a + b, 0) / slice.length;
+    }
+    const meanDiff = Math.abs(getMean(candidateMusT1) - getMean(t2Mus));
+    const top15Diff = Math.abs(getTop15Avg(candidateMusT1) - getTop15Avg(t2Mus));
+
+    // Always include debug info about clan status for logging
+    const playerTag = playerTagCache ? playerTagCache.get(player.eosID) : null;
+    const debugInfo = { playerTag, clanTeam: debugClanTeam };
+
+    return { targetTeam, reason, debugInfo };
 }
 
 /**
- * Retrieves player Mu rating from EloTracker with default fallback.
- * Delegates to EloTracker's async getMu() which handles cache-first + DB lookup.
+ * Retrieves player rating (mu and roundsPlayed) from EloTracker with fallback defaults.
+ * Delegates to EloTracker's async getRating() which handles cache-first + DB lookup.
  *
  * @param {object} player - Player object with steamID, eosID, etc.
  * @param {object} eloTracker - EloTracker plugin instance
- * @returns {Promise<number>} Mu rating (default 25.0 if no record found or error)
+ * @returns {Promise<object>} { mu, roundsPlayed } — both with defaults if not found
  */
-export async function getMu(player, eloTracker = null) {
-  if (!eloTracker) return 25.0;
+export async function getRating(player, eloTracker = null) {
+  if (!eloTracker) return { mu: 25.0, roundsPlayed: 0 };
 
   try {
-    return await eloTracker.getMu(player);
+    return await eloTracker.getRating(player);
   } catch (e) {
-    Logger.verbose('SmartAssign', 2, `[getMu] eloTracker.getMu() threw for ${player.steamID}: ${e?.message}. Using default Mu.`);
-    return 25.0;
+    Logger.verbose('SmartAssign', 2, `[getRating] eloTracker.getRating() threw for ${player.steamID}: ${e?.message}. Using defaults.`);
+    return { mu: 25.0, roundsPlayed: 0 };
   }
 }

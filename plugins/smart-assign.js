@@ -75,7 +75,7 @@ import BasePlugin from './base-plugin.js';
 import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
 import SAEventLogger from '../utils/sa-event-logger.js';
-import { evaluateTeamAssignment, getMu } from '../utils/sa-team-evaluator.js';
+import { evaluateTeamAssignment, getRating } from '../utils/sa-team-evaluator.js';
 import { buildPlayerTagCache, extractRawPrefix } from '../utils/sa-clan-grouper.js';
 
 const MAX_TEAM_SIZE = 50;
@@ -169,6 +169,7 @@ export default class SmartAssign extends BasePlugin {
      this.previousRoundGamemode = null;   // Captured at ROUND_ENDED for reliable finalization
     this._pendingAssignments = { 1: 0, 2: 0 };
     this._pendingMu = { 1: 0, 2: 0 };
+    this._pendingVeterans = { 1: 0, 2: 0 };
     this._pendingPlayerMoves = new Map();
     this.currentRoundStartTime = null;
     this.ready = false;
@@ -439,6 +440,8 @@ export default class SmartAssign extends BasePlugin {
     this._pendingAssignments[2] = 0;
     this._pendingMu[1] = 0;
     this._pendingMu[2] = 0;
+    this._pendingVeterans[1] = 0;
+    this._pendingVeterans[2] = 0;
     this._pendingPlayerMoves.clear();
     
     // Clear in-memory reconnect memory alongside DB clear (synchronized in onNewGame above)
@@ -582,19 +585,23 @@ export default class SmartAssign extends BasePlugin {
      }
    }
 
-   /**
-    * HELPER: Infer game mode from layer name.
-    * Checks for common mode substrings like 'seed', 'jensen', 'invasion', etc.
-    * Falls back to 'Unknown' if no inference is possible.
-    */
-   inferGameMode(layerName) {
-     if (!layerName) return 'Unknown';
-     const name = layerName.toLowerCase();
-     if (name.includes('seed')) return 'Seed';
-     if (name.includes('jensen')) return 'Jensen';
-     if (name.includes('invasion')) return 'Invasion';
-     return 'Unknown';
-   }
+    /**
+     * HELPER: Infer game mode from layer name.
+     * Checks for common mode substrings like 'seed', 'jensen', 'invasion', 'raas', 'aas', 'tc', 'skirmish'.
+     * Falls back to 'Unknown' if no inference is possible.
+     */
+    inferGameMode(layerName) {
+      if (!layerName) return 'Unknown';
+      const name = layerName.toLowerCase();
+      if (name.includes('seed')) return 'Seed';
+      if (name.includes('jensen')) return 'Jensen';
+      if (name.includes('invasion')) return 'Invasion';
+      if (name.includes('raas')) return 'RAAS';
+      if (name.includes('aas')) return 'AAS';
+      if (name.includes('_tc_')) return 'TC';
+      if (name.includes('skirmish')) return 'Skirmish';
+      return 'Unknown';
+    }
 
    /**
     * HELPER: Resolve layer info from various sources.
@@ -683,6 +690,9 @@ export default class SmartAssign extends BasePlugin {
       const move = this._pendingPlayerMoves.get(steamID);
       this._pendingAssignments[move.targetTeam] = Math.max(0, this._pendingAssignments[move.targetTeam] - 1);
       this._pendingMu[move.targetTeam] = Math.max(0, this._pendingMu[move.targetTeam] - move.mu);
+      if (move.isVeteran) {
+        this._pendingVeterans[move.targetTeam] = Math.max(0, this._pendingVeterans[move.targetTeam] - 1);
+      }
       this._pendingPlayerMoves.delete(steamID);
     }
 
@@ -699,6 +709,9 @@ export default class SmartAssign extends BasePlugin {
       const move = this._pendingPlayerMoves.get(steamID);
       this._pendingAssignments[move.targetTeam] = Math.max(0, this._pendingAssignments[move.targetTeam] - 1);
       this._pendingMu[move.targetTeam] = Math.max(0, this._pendingMu[move.targetTeam] - move.mu);
+      if (move.isVeteran) {
+        this._pendingVeterans[move.targetTeam] = Math.max(0, this._pendingVeterans[move.targetTeam] - 1);
+      }
       this._pendingPlayerMoves.delete(steamID);
     }
 
@@ -1066,14 +1079,14 @@ export default class SmartAssign extends BasePlugin {
         const phaseStartTime = Date.now();
         const timemarks = {};
 
-        // Pre-warm the joining player's Mu into EloTracker cache (cache miss = 1–5ms DB lookup)
+        // Pre-warm the joining player's full rating into EloTracker cache (cache miss = 1–5ms DB lookup)
         const preWarmStart = Date.now();
-        let preWarmMu = null;
+        let preWarmRating = { mu: 25.0, roundsPlayed: 0 };
         if (this.eloTracker?.ready) {
-          preWarmMu = await this.eloTracker.getMu(player);
+          preWarmRating = await this.eloTracker.getRating(player);
         }
         timemarks.preWarmMs = Date.now() - preWarmStart;
-        timemarks.preWarmMu = preWarmMu;
+        timemarks.preWarmMu = preWarmRating.mu;
 
         // Read reconnect memory synchronously from Map
         const reconnectTeamStart = Date.now();
@@ -1116,13 +1129,19 @@ export default class SmartAssign extends BasePlugin {
         // If the player is currently on the wrong team, queue a team change
         if (targetTeam !== null && String(player.teamID) !== String(targetTeam)) {
           this._pendingAssignments[targetTeam]++;
-          const pendingPlayerMu = await getMu(player, this.eloTracker);
+          const pendingPlayerMu = (await getRating(player, this.eloTracker)).mu;
           this._pendingMu[targetTeam] += pendingPlayerMu;
+        
+        // Check if this player is a veteran (based on pre-warmed rating)
+        const isVeteran = preWarmRating.roundsPlayed >= 10;
+        if (isVeteran) {
+          this._pendingVeterans[targetTeam]++;
+        }
         
         // NOTE: pendingPlayerMu is captured here and subtracted onMoveSuccess. If the player's 
         // Elo changes during the brief execution window, _pendingMu may drift slightly.
         // This is a known, low-impact approximation that resets naturally on NEW_GAME.
-        this._pendingPlayerMoves.set(player.steamID, { targetTeam, mu: pendingPlayerMu });
+        this._pendingPlayerMoves.set(player.steamID, { targetTeam, mu: pendingPlayerMu, isVeteran });
 
         /**
          * ARCHITECTURE: Log-Driven Join Swap
@@ -1226,6 +1245,7 @@ export default class SmartAssign extends BasePlugin {
       reconnectTeam,
       pendingAssignments: this._pendingAssignments,
       pendingMu: this._pendingMu,
+      pendingVeterans: this._pendingVeterans,
       pendingPlayerMoves: this._pendingPlayerMoves,
       eloTracker: this.eloTracker,
       ignoredModes: this._ignoredModes,
