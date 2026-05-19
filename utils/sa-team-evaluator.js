@@ -309,16 +309,6 @@ export async function evaluateTeamAssignment(player, server, context) {
       targetTeam = t1Count <= t2Count ? 1 : 2;
     }
 
-    // Build detailed reason string with 3 metrics
-    const meanT1 = getMean(candidateMusT1);
-    const meanT2 = getMean(t2Mus);
-    const top15T1 = getTop15Avg(candidateMusT1);
-    const top15T2 = getTop15Avg(t2Mus);
-    const vet1Ratio = (t1Count + 1) > 0 ? (t1Veterans + (playerIsVeteran && targetTeam === 1 ? 1 : 0)) / (t1Count + 1) : 0;
-    const vet2Ratio = (t2Count) > 0 ? (t2Veterans + (playerIsVeteran && targetTeam === 2 ? 1 : 0)) / (t2Count) : 0;
-
-    const reason = `Composite: Mean=${meanDiff.toFixed(2)} Top15=${top15Diff.toFixed(2)} VetRatio=${Math.abs(vet1Ratio - vet2Ratio).toFixed(3)} | Scores: T1=${scoreT1Biased.toFixed(2)} T2=${scoreT2Biased.toFixed(2)} | Pop: ${t1Count}v${t2Count}`;
-
     // Helper functions for reason string
     function getMean(mus) {
       return mus.length > 0 ? mus.reduce((a, b) => a + b, 0) / mus.length : 25.0;
@@ -329,8 +319,18 @@ export async function evaluateTeamAssignment(player, server, context) {
       const slice = sorted.slice(0, 15);
       return slice.reduce((a, b) => a + b, 0) / slice.length;
     }
+
+    // Build detailed reason string with 3 metrics
+    const meanT1 = getMean(candidateMusT1);
+    const meanT2 = getMean(t2Mus);
+    const top15T1 = getTop15Avg(candidateMusT1);
+    const top15T2 = getTop15Avg(t2Mus);
     const meanDiff = Math.abs(getMean(candidateMusT1) - getMean(t2Mus));
     const top15Diff = Math.abs(getTop15Avg(candidateMusT1) - getTop15Avg(t2Mus));
+    const vet1Ratio = (t1Count + 1) > 0 ? (t1Veterans + (playerIsVeteran && targetTeam === 1 ? 1 : 0)) / (t1Count + 1) : 0;
+    const vet2Ratio = (t2Count) > 0 ? (t2Veterans + (playerIsVeteran && targetTeam === 2 ? 1 : 0)) / (t2Count) : 0;
+
+    const reason = `Composite: Mean=${meanDiff.toFixed(2)} Top15=${top15Diff.toFixed(2)} VetRatio=${Math.abs(vet1Ratio - vet2Ratio).toFixed(3)} | Scores: T1=${scoreT1Biased.toFixed(2)} T2=${scoreT2Biased.toFixed(2)} | Pop: ${t1Count}v${t2Count}`;
 
     // Always include debug info about clan status for logging
     const playerTag = playerTagCache ? playerTagCache.get(player.eosID) : null;
