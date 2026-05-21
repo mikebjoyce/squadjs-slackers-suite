@@ -87,6 +87,7 @@
  * Core:
  *   database                   - Sequelize/SQLite connector for persistent storage.
  *   enablePublicIngameCommands - Enable/disable public !elo in-game commands.
+ *   enableDatabaseLogging      - If true, logs round outcome data to database tables (default: false).
  *   eloLogPath                 - Path to JSONL file for round outcome history.
  *
  * ELO Algorithm:
@@ -120,6 +121,7 @@
  *   "roundStartEmbedDelayMs": 180000,
  *   "ignoredGameModes": ["Seed", "Jensen"],
  *   "enablePublicIngameCommands": true,
+ *   "enableDatabaseLogging": false,
  *   "discordClient": "discord",
  *   "discordAdminChannelID": "",
  *   "discordPublicChannelID": "",
@@ -143,7 +145,7 @@ import { EloDiscord } from '../utils/elo-discord.js';
 import EloCommands from '../utils/elo-commands.js';
 
 export default class EloTracker extends BasePlugin {
-  static version = '1.2.3';
+  static version = '1.3.0';
 
   static get description() {
     return 'A SquadJS plugin that tracks player participation across rounds, computes individual ELO ratings using a TrueSkill-based algorithm, and persists all data via Sequelize-compatible databases (SQLite, MySQL, PostgreSQL, etc.).';
@@ -177,10 +179,16 @@ export default class EloTracker extends BasePlugin {
       discordAdminChannelID: { required: false, default: '', type: 'string' },
       discordPublicChannelID: { required: false, default: '', type: 'string' },
       discordReportChannelID: { required: false, default: '', type: 'string' },
-      discordAdminRoleIDs: { required: false, default: [], type: 'array' },
-      discordAdminRoleID: { required: false, default: '', type: 'string' }
-    };
-  }
+       discordAdminRoleIDs: { required: false, default: [], type: 'array' },
+       discordAdminRoleID: { required: false, default: '', type: 'string' },
+       enableDatabaseLogging: {
+         required: false,
+         description: 'If true, mirrors round outcome data into database tables for querying (default: false).',
+         default: false,
+         type: 'boolean'
+       }
+     };
+   }
 
   constructor(server, options, connectors) {
     super(server, options, connectors);
@@ -784,9 +792,10 @@ export default class EloTracker extends BasePlugin {
     const team2Summary = processTeam(team2Eligible, team2Updates, team2IsWinner, team1IsWinner);
 
     // --- DB writes ---
+    let roundRecord = null;
     try {
       await this.db.bulkIncrementPlayerStats(dbUpdates);
-      await this.db.insertRoundHistory({
+      roundRecord = await this.db.insertRoundHistory({
         layerName: layerName,
         winningTeamID,
         ticketDiff: ticketDiff,
@@ -855,6 +864,40 @@ export default class EloTracker extends BasePlugin {
       ]
     };
     this._appendMatchLog(matchRecord).catch(err => Logger.verbose('EloTracker', 1, `Failed to append match log: ${err.message}`));
+
+    // Fire-and-forget database insert if enabled and roundRecord was created
+    if (this.options.enableDatabaseLogging && roundRecord && roundRecord.id) {
+      // Compute matchId and roundStartTime from session state
+      const roundStartTime = this.session.roundStartTime;
+      let matchId = null;
+      if (roundStartTime !== null && roundStartTime !== undefined) {
+        matchId = Math.floor(roundStartTime / 1000).toString(36).slice(-8);
+      } else {
+        Logger.verbose('EloTracker', 2, '[DB] Warning: session.roundStartTime is null — matchId will be null. Cross-plugin joins will not be possible for this round.');
+      }
+
+      const playerRows = matchRecord.players.map(p => ({
+        matchId: matchId,
+        roundStartTime: roundStartTime,
+        roundHistoryId: roundRecord.id,
+        eosID: p.eosID,
+        steamID: p.steamID || null,
+        name: p.name,
+        teamID: p.teamID,
+        participationRatio: p.participationRatio,
+        muBefore: p.muBefore,
+        sigmaBefore: p.sigmaBefore,
+        rawDeltaMu: p.rawDeltaMu,
+        rawDeltaSigma: p.rawDeltaSigma,
+        scaledDeltaMu: p.scaledDeltaMu,
+        scaledDeltaSigma: p.scaledDeltaSigma,
+        muAfter: p.muAfter,
+        sigmaAfter: p.sigmaAfter
+      }));
+      this.db.insertRoundPlayers(roundRecord.id, roundEndTime, playerRows).catch(err =>
+        Logger.verbose('EloTracker', 1, `[onRoundEnded] Database player insert failed: ${err.message}`)
+      );
+    }
 
     const calculationDuration = Date.now() - calculationStartTime;
 

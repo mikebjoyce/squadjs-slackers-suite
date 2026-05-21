@@ -84,6 +84,7 @@ export default class EloDatabase {
           const isLocked = err.message && (
             err.message.includes('SQLITE_BUSY') ||
             err.message.includes('database is locked') ||
+            err.message.includes('Lock wait timeout exceeded') ||
             err.name === 'SequelizeTimeoutError'
           );
           if (isLocked && i < attempts - 1) {
@@ -177,7 +178,7 @@ export default class EloDatabase {
             allowNull: true
           }
         },
-        { timestamps: false }
+        { timestamps: false, charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' }
       );
 
       this.models.RoundHistory = this.sequelize.define(
@@ -216,18 +217,96 @@ export default class EloDatabase {
         { timestamps: false }
       );
 
+       // Define Elo_RoundPlayers for optional database logging (opt-in via enableDatabaseLogging)
+       this.models.RoundPlayers = this.sequelize.define(
+         'Elo_RoundPlayers',
+         {
+           id: {
+             type: Sequelize.INTEGER,
+             primaryKey: true,
+             autoIncrement: true
+           },
+           matchId: {
+             type: Sequelize.STRING(20),
+             allowNull: true
+           },
+           roundStartTime: {
+             type: Sequelize.BIGINT,
+             allowNull: true
+           },
+           roundHistoryId: {
+             type: Sequelize.INTEGER,
+             allowNull: false
+           },
+           eosID: {
+             type: Sequelize.STRING,
+             allowNull: false
+           },
+           steamID: {
+             type: Sequelize.STRING,
+             allowNull: true
+           },
+           name: {
+             type: Sequelize.STRING,
+             allowNull: true
+           },
+           teamID: {
+             type: Sequelize.INTEGER,
+             allowNull: false
+           },
+           participationRatio: {
+             type: Sequelize.FLOAT,
+             allowNull: false
+           },
+           muBefore: {
+             type: Sequelize.FLOAT,
+             allowNull: false
+           },
+           sigmaBefore: {
+             type: Sequelize.FLOAT,
+             allowNull: false
+           },
+           rawDeltaMu: {
+             type: Sequelize.FLOAT,
+             allowNull: false
+           },
+           rawDeltaSigma: {
+             type: Sequelize.FLOAT,
+             allowNull: false
+           },
+           scaledDeltaMu: {
+             type: Sequelize.FLOAT,
+             allowNull: false
+           },
+           scaledDeltaSigma: {
+             type: Sequelize.FLOAT,
+             allowNull: false
+           },
+           muAfter: {
+             type: Sequelize.FLOAT,
+             allowNull: false
+           },
+           sigmaAfter: {
+             type: Sequelize.FLOAT,
+             allowNull: false
+           }
+         },
+         { timestamps: false, tableName: 'Elo_RoundPlayers', charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' }
+       );
+
        await this._executeWithRetry(async () => {
-         // SQLite-only: PRAGMA commands are not supported on MySQL/Postgres
-         if (this.sequelize.getDialect() === 'sqlite') {
-           // Enforce WAL mode to prevent SQLITE_BUSY deadlocks in high-concurrency environments (e.g. DBLog + EloTracker writing simultaneously)
-           await this.sequelize.query('PRAGMA journal_mode=WAL;');
-           await this.sequelize.query('PRAGMA synchronous=NORMAL;');
-         }
-         
-         await this.models.PluginState.sync({ alter: true });
-         await this.models.PlayerStats.sync({ alter: true });
-         await this.models.RoundHistory.sync({ alter: true });
-       });
+          // SQLite-only: PRAGMA commands are not supported on MySQL/Postgres
+          if (this.sequelize.getDialect() === 'sqlite') {
+            // Enforce WAL mode to prevent SQLITE_BUSY deadlocks in high-concurrency environments (e.g. DBLog + EloTracker writing simultaneously)
+            await this.sequelize.query('PRAGMA journal_mode=WAL;');
+            await this.sequelize.query('PRAGMA synchronous=NORMAL;');
+          }
+          
+          await this.models.PluginState.sync({ alter: true });
+          await this.models.PlayerStats.sync({ alter: true });
+          await this.models.RoundHistory.sync({ alter: true });
+          await this.models.RoundPlayers.sync({ alter: true });
+        });
 
       const state = await this._executeWithRetry(async () => {
         return await this.sequelize.transaction(async (t) => {
@@ -501,27 +580,39 @@ export default class EloDatabase {
     }
   }
 
-  async importPlayerStats(records) {
-    if (!this.sequelize) return null;
-    try {
-      return await this._executeWithRetry(async () => {
-        return await this.sequelize.transaction(async (t) => {
-          for (const record of records) {
-            const { eosID, ...fields } = record;
-            const existing = await this.models.PlayerStats.findOne({ where: { eosID }, transaction: t });
-            if (existing) {
-              await existing.update(fields, { transaction: t });
-            } else {
-              await this.models.PlayerStats.create(record, { transaction: t });
-            }
-          }
-        });
-      });
-    } catch (error) {
-      Logger.verbose('EloTracker', 1, `[DB] Error importing stats: ${error.message}`);
-      return null;
-    }
-  }
+   async importPlayerStats(records) {
+     if (!this.sequelize) return null;
+     const CHUNK_SIZE = 500;
+     try {
+       for (let i = 0; i < records.length; i += CHUNK_SIZE) {
+         const chunk = records.slice(i, i + CHUNK_SIZE);
+         await this._executeWithRetry(async () => {
+           return await this.sequelize.transaction(async (t) => {
+             // Use bulkCreate with updateOnDuplicate for efficient upsert operations.
+             // This will insert new records or update existing ones based on eosID.
+             await this.models.PlayerStats.bulkCreate(chunk, {
+               updateOnDuplicate: [
+                 'steamID',
+                 'discordID',
+                 'name',
+                 'mu',
+                 'sigma',
+                 'wins',
+                 'losses',
+                 'roundsPlayed',
+                 'lastSeen'
+               ],
+               transaction: t
+             });
+           });
+         });
+       }
+       return true;
+     } catch (error) {
+       Logger.verbose('EloTracker', 1, `[DB] Error importing stats: ${error.message}`);
+       return null;
+     }
+   }
 
   async pruneStaleEntries(minRoundsForLeaderboard) {
     if (!this.sequelize) return { tier1: 0, tier2: 0 };
@@ -552,6 +643,30 @@ export default class EloDatabase {
     } catch (error) {
       Logger.verbose('EloTracker', 1, `[DB] Error pruning stale entries: ${error.message}`);
       return { tier1: 0, tier2: 0 };
+    }
+  }
+
+  async insertRoundPlayers(roundHistoryId, endedAt, playerRows) {
+    if (!this.sequelize || !this.models.RoundPlayers) {
+      Logger.verbose('EloTracker', 1, '[DB] insertRoundPlayers called before initDB.');
+      return null;
+    }
+
+    try {
+      return await this._executeWithRetry(async () => {
+        return await this.sequelize.transaction(async (t) => {
+          // Bulk create player records
+          if (playerRows && playerRows.length > 0) {
+            await this.models.RoundPlayers.bulkCreate(playerRows, { transaction: t });
+          }
+
+          Logger.verbose('EloTracker', 4, `[DB] Inserted ${playerRows ? playerRows.length : 0} player records for round ${roundHistoryId}`);
+          return { roundHistoryId, playerCount: playerRows ? playerRows.length : 0 };
+        });
+      });
+    } catch (error) {
+      Logger.verbose('EloTracker', 1, `[DB] insertRoundPlayers failed: ${error.message}`);
+      return null;
     }
   }
 }

@@ -1,4 +1,4 @@
-# EloTracker Plugin v1.2.3
+# EloTracker Plugin v1.3.0
 
 **SquadJS Plugin for Skill-Based Player Rating**
 
@@ -21,6 +21,7 @@ Designed for Squad servers to surface skill data, reward consistent players, and
 * **Persistent Storage:** Multi-database support via Sequelize (SQLite, MySQL, PostgreSQL, etc.). Round history, player stats, and plugin state survive server restarts.
 * **Provisional Ratings:** Players are marked provisional until they reach a configurable minimum round count.
 * **Backup & Restore:** Full player stat export to JSON and restore via Discord file attachment.
+* **Database Logging:** Optional logging of round outcome data into database tables for querying and cross-plugin integration.
 
 ---
 
@@ -113,7 +114,8 @@ Add the following to your `config.json`:
     "minRoundsForLeaderboard": 10,
     "roundStartEmbedDelayMs": 180000,
     "ignoredGameModes": ["Seed", "Jensen"],
-    "enablePublicIngameCommands": true
+    "enablePublicIngameCommands": true,
+    "enableDatabaseLogging": false
   }
 ]
 ```

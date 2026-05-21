@@ -758,15 +758,16 @@ export const EloDiscord = {
               typeof p.roundsPlayed === 'number'
             );
             
-            if (!isValidSchema) {
-              await message.reply('Invalid backup format: one or more players have a malformed schema.');
-              return;
-            }
-            
-            await this.db.importPlayerStats(json.players);
-            await EloDiscord.sendDiscordMessage(message.channel, {
-              embeds: [EloDiscord.buildAdminConfirmEmbed('Restore Complete', `Restored ${json.players.length} players from backup.`)]
-            });
+             if (!isValidSchema) {
+               await message.reply('Invalid backup format: one or more players have a malformed schema.');
+               return;
+             }
+             
+             await message.reply(`⏳ Restoring ${json.players.length} players... This may take a moment.`);
+             await this.db.importPlayerStats(json.players);
+             await EloDiscord.sendDiscordMessage(message.channel, {
+               embeds: [EloDiscord.buildAdminConfirmEmbed('Restore Complete', `Restored ${json.players.length} players from backup.`)]
+             });
           } catch (err) {
             await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildErrorEmbed('Restore', err)] });
           }

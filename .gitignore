@@ -1,7 +1,5 @@
 *.jsonl
 *.json
-tools/clan-audit.txt
-SQUADJS_EVENT_ARCHITECTURE.md
 
 # Docker / local env
 /.env
