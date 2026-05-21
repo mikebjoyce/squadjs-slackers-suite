@@ -1,4 +1,4 @@
-# SmartAssign Plugin v1.0.0
+# SmartAssign Plugin v1.1.0
 
 **Elo-Aware Auto Assignment & Player Lifecycle Logger**
 
@@ -59,7 +59,8 @@ Add this to your `config.json` inside the `plugins` array.
   "enableEventLogging": true,
   "enableClanGrouping": true,
   "clanGroupMinSize": 2,
-  "clanGroupCaseSensitive": false
+  "clanGroupCaseSensitive": false,
+  "enableDatabaseLogging": false
 }
 ```
 
@@ -98,6 +99,7 @@ squad-server/
 | `enableClanGrouping` | boolean | ❌ No | `true` | If true, players in clans will be kept together on the same team if all clan mates are on one team. |
 | `clanGroupMinSize` | number | ❌ No | `2` | Minimum number of players to consider a group as a clan for grouping purposes. |
 | `clanGroupCaseSensitive` | boolean | ❌ No | `false` | If false, clan tags are case-insensitive and diacritics/gamer-character lookalikes are normalized. |
+| `enableDatabaseLogging` | boolean | ❌ No | `false` | If true, mirrors JSONL event data into database tables for querying. |
 
 ---
 

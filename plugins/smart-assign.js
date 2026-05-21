@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v1.0.0                   ║
+ * ║                  SMART ASSIGN PLUGIN v1.1.0                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -63,6 +63,7 @@
  * enableClanGrouping: Toggle clan-mate grouping logic (default: true).
  * clanGroupMinSize: Minimum clan size for grouping (default: 2).
  * clanGroupCaseSensitive: Case-sensitive clan tag matching (default: false).
+ * enableDatabaseLogging: If true, mirrors JSONL event data into database tables for querying (default: false).
  *
  * Author:
  * Discord: `real_slacker`
@@ -81,7 +82,7 @@ import { buildPlayerTagCache, extractRawPrefix } from '../utils/sa-clan-grouper.
 const MAX_TEAM_SIZE = 50;
 
 export default class SmartAssign extends BasePlugin {
-  static version = '1.0.0';
+  static version = '1.1.0';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
@@ -140,6 +141,12 @@ export default class SmartAssign extends BasePlugin {
         description: 'If false, clan tags are case-insensitive and diacritics/gamer-character lookalikes are normalized (default: false).',
         default: false,
         type: 'boolean'
+      },
+      enableDatabaseLogging: {
+        required: false,
+        description: 'If true, mirrors JSONL event data into database tables for querying (default: false).',
+        default: false,
+        type: 'boolean'
       }
     };
   }
@@ -152,7 +159,7 @@ export default class SmartAssign extends BasePlugin {
       retryIntervalMs: 50,
       maxCompletionTimeMs: 3000
     });
-    this.eventLogger = new SAEventLogger(options);
+    this.eventLogger = new SAEventLogger(options, this.db);
 
     this.knownPlayers = new Map();
     this._joiningPlayers = new Set();
@@ -1281,14 +1288,15 @@ export default class SmartAssign extends BasePlugin {
         Logger.verbose('SmartAssign', 2, '[Finalize] Concurrent finalization blocked — already in progress.');
         return;
       }
-      this._isFinalizingRound = true;
-      try {
-         await this.eventLogger.finalizeRoundLog(
-           this.currentRoundStartTime,
-           this.previousRoundLayerName || 'Unknown',
-           this.previousRoundGamemode || 'Unknown',
-           this.options.enableSmartAssign !== false
-         );
+       this._isFinalizingRound = true;
+       try {
+          await this.eventLogger.finalizeRoundLog(
+            this.currentRoundStartTime,
+            this.previousRoundLayerName || 'Unknown',
+            this.previousRoundGamemode || 'Unknown',
+            this.options.enableSmartAssign !== false,
+            this.server.matchStartTime?.getTime() ?? null
+          );
       } finally {
         this._isFinalizingRound = false;
       }

@@ -39,9 +39,11 @@ import { promises as fsPromises } from 'fs';
 import Logger from '../../core/logger.js';
 
 export default class SAEventLogger {
-  constructor(options = {}) {
+  constructor(options = {}, db = null) {
     this.logPath = options.logPath || './auto-assign-log.jsonl';
     this.enableEventLogging = options.enableEventLogging !== false;
+    this.db = db;
+    this.enableDatabaseLogging = options.enableDatabaseLogging === true;
 
     this._logWriteQueue = Promise.resolve();
     this._eventBatch = [];
@@ -126,16 +128,17 @@ export default class SAEventLogger {
     return this._logWriteQueue;
   }
 
-  /**
-   * Finalizes a round's events from the temp file into the main JSONL log.
-   * Loads all accumulated events, wraps them in a round record, and appends to the main log.
-   *
-   * @param {number} roundStartTime - Unix timestamp when round started
-   * @param {string} layerName - Name of the map/layer
-   * @param {string} gamemode - Gamemode of the round
-   * @param {boolean} smartAssignActive - Whether SmartAssign was actively assigning
-   */
-  async finalizeRoundLog(roundStartTime, layerName, gamemode, smartAssignActive) {
+   /**
+    * Finalizes a round's events from the temp file into the main JSONL log.
+    * Loads all accumulated events, wraps them in a round record, and appends to the main log.
+    *
+    * @param {number} roundStartTime - Unix timestamp when round started
+    * @param {string} layerName - Name of the map/layer
+    * @param {string} gamemode - Gamemode of the round
+    * @param {boolean} smartAssignActive - Whether SmartAssign was actively assigning
+    * @param {number} matchStartTime - Unix timestamp of match start (for cross-plugin matchId derivation)
+    */
+   async finalizeRoundLog(roundStartTime, layerName, gamemode, smartAssignActive, matchStartTime = null) {
     if (this._batchFlushTimer) {
       clearInterval(this._batchFlushTimer);
       this._batchFlushTimer = null;
@@ -155,9 +158,18 @@ export default class SAEventLogger {
 
     Logger.verbose('SmartAssign', 1, `[EventLogger] Finalizing round log with ${events.length} events.`);
 
+    // Compute matchId from matchStartTime if provided
+    let matchId = null;
+    if (matchStartTime !== null && matchStartTime !== undefined) {
+      matchId = Math.floor(matchStartTime / 1000).toString(36).slice(-8);
+    } else {
+      Logger.verbose('SmartAssign', 2, '[DB] Warning: matchStartTime is null — matchId will be null. Cross-plugin joins will not be possible for this round.');
+    }
+
     const roundLog = {
       startTime: roundStartTime || Date.now(),
       endTime: Date.now(),
+      matchId: matchId,
       layerName: layerName || 'Unknown',
       gamemode: gamemode || 'Unknown',
       smartAssignActive: smartAssignActive !== false,
@@ -169,6 +181,13 @@ export default class SAEventLogger {
       const tempPath = this.logPath + '.temp';
       await fsPromises.unlink(tempPath).catch(() => {});
       Logger.verbose('SmartAssign', 2, '[EventLogger] Round log finalized successfully.');
+
+      // Fire-and-forget database insert if enabled
+      if (this.enableDatabaseLogging && this.db) {
+        this.db.insertRoundWithEvents(roundLog).catch(err =>
+          Logger.verbose('SmartAssign', 1, `[EventLogger] Database insert failed: ${err.message}`)
+        );
+      }
     } catch (err) {
       Logger.verbose('SmartAssign', 1, `[EventLogger] Failed to finalize round log: ${err.message}. Events retained in temp log.`);
     }

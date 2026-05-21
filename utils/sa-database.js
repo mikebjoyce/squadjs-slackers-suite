@@ -40,26 +40,27 @@ export default class SADatabase {
     this._mutex = Promise.resolve();
   }
 
-  async _executeWithRetry(logicFn, attempts = 5) {
-    const runAttempt = async () => {
-      for (let i = 1; i <= attempts; i++) {
-        try {
-          return await logicFn();
-        } catch (err) {
-          const isLocked = err.message && (
-            err.message.includes('SQLITE_BUSY') || 
-            err.message.includes('database is locked') ||
-            err.name === 'SequelizeTimeoutError'
-          );
-          if (isLocked && i < attempts) {
-            const jitter = Math.random() * 500;
-            await new Promise(resolve => setTimeout(resolve, 200 + jitter));
-          } else {
-            throw err;
-          }
-        }
-      }
-    };
+   async _executeWithRetry(logicFn, attempts = 5) {
+     const runAttempt = async () => {
+       for (let i = 1; i <= attempts; i++) {
+         try {
+           return await logicFn();
+         } catch (err) {
+           const isLocked = err.message && (
+             err.message.includes('SQLITE_BUSY') || 
+             err.message.includes('database is locked') ||
+             err.message.includes('Lock wait timeout exceeded') ||
+             err.name === 'SequelizeTimeoutError'
+           );
+           if (isLocked && i < attempts) {
+             const jitter = Math.random() * 500;
+             await new Promise(resolve => setTimeout(resolve, 200 + jitter));
+           } else {
+             throw err;
+           }
+         }
+       }
+     };
 
     // SQLite-only: Use a promise-chain mutex to serialize writes and prevent lock contention.
     // MySQL/PostgreSQL use native connection pooling; Sequelize transactions handle concurrency.
@@ -117,10 +118,48 @@ export default class SADatabase {
        * leading to data loss. Since this plugin's schema is currently stable, it is left as `alter: true` for 
        * zero-config deployment, but it should be noted for future structural updates.
        */
-      await this.SmartAssignStateModel.sync({ alter: true });
-      await this.ReconnectMemoryModel.sync({ alter: true });
+       await this.SmartAssignStateModel.sync({ alter: true });
+       await this.ReconnectMemoryModel.sync({ alter: true });
 
-      return await this._executeWithRetry(async () => {
+       // Define SARoundSummaryModel for optional database logging (opt-in via enableDatabaseLogging)
+        this.SARoundSummaryModel = this.sequelize.define(
+          'SA_RoundSummary',
+          {
+            id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+            matchId: { type: DataTypes.STRING(20), allowNull: true },
+            startTime: { type: DataTypes.BIGINT, allowNull: false },
+            endTime: { type: DataTypes.BIGINT, allowNull: false },
+            layerName: { type: DataTypes.STRING(255), allowNull: true },
+            gamemode: { type: DataTypes.STRING(100), allowNull: true },
+            smartAssignActive: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false }
+          },
+          { timestamps: false, tableName: 'SA_RoundSummary' }
+        );
+
+       // Define SAPlayerEventModel for optional database logging (opt-in via enableDatabaseLogging)
+        this.SAPlayerEventModel = this.sequelize.define(
+          'SA_PlayerEvent',
+          {
+            id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+            roundId: { type: DataTypes.INTEGER, allowNull: false },
+            ts: { type: DataTypes.BIGINT, allowNull: false },
+            eventType: { type: DataTypes.STRING(50), allowNull: false },
+            steamID: { type: DataTypes.STRING(50), allowNull: true },
+            name: { type: DataTypes.STRING(255), allowNull: true },
+            teamID: { type: DataTypes.INTEGER, allowNull: true },
+            squadID: { type: DataTypes.INTEGER, allowNull: true },
+            betweenRounds: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+            t1: { type: DataTypes.INTEGER, allowNull: true },
+            t2: { type: DataTypes.INTEGER, allowNull: true },
+            extraData: { type: DataTypes.JSON, allowNull: true }
+          },
+          { timestamps: false, tableName: 'SA_PlayerEvent', charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' }
+        );
+
+       await this.SARoundSummaryModel.sync({ alter: true });
+       await this.SAPlayerEventModel.sync({ alter: true });
+
+       return await this._executeWithRetry(async () => {
         return await this.sequelize.transaction(async (t) => {
           const [record] = await this.SmartAssignStateModel.findOrCreate({
             where: { id: 1 },
@@ -256,6 +295,63 @@ export default class SADatabase {
        });
      } catch (err) {
        Logger.verbose('SmartAssign', 1, `[DB] cleanupOldData failed: ${err.message}`);
+     }
+   }
+
+   async insertRoundWithEvents(roundLog) {
+     if (!this.SARoundSummaryModel || !this.SAPlayerEventModel) {
+       Logger.verbose('SmartAssign', 1, '[DB] insertRoundWithEvents called before initDB.');
+       return null;
+     }
+
+     try {
+       return await this._executeWithRetry(async () => {
+         return await this.sequelize.transaction(async (t) => {
+           // Create round summary record
+           const roundRecord = await this.SARoundSummaryModel.create({
+             matchId: roundLog.matchId ?? null,
+             startTime: roundLog.startTime,
+             endTime: roundLog.endTime,
+             layerName: roundLog.layerName,
+             gamemode: roundLog.gamemode,
+             smartAssignActive: roundLog.smartAssignActive
+           }, { transaction: t });
+
+           // Bulk create player events
+           if (roundLog.events && roundLog.events.length > 0) {
+             const eventRecords = roundLog.events.map(event => ({
+               roundId: roundRecord.id,
+               ts: event.ts,
+               eventType: event.eventType,
+               steamID: event.steamID || null,
+               name: event.name || null,
+               teamID: event.teamID || null,
+               squadID: event.squadID || null,
+               betweenRounds: event.betweenRounds || false,
+               t1: event.t1 || null,
+               t2: event.t2 || null,
+               extraData: JSON.stringify({
+                 reason: event.reason,
+                 targetTeam: event.targetTeam,
+                 oldTeam: event.oldTeam,
+                 newTeam: event.newTeam,
+                 source: event.source,
+                 attempt: event.attempt,
+                 method: event.method,
+                 players: event.players
+               })
+             }));
+
+             await this.SAPlayerEventModel.bulkCreate(eventRecords, { transaction: t });
+           }
+
+           Logger.verbose('SmartAssign', 4, `[DB] Round logged: ${roundLog.layerName} (${roundLog.gamemode}) with ${roundLog.events ? roundLog.events.length : 0} events`);
+           return roundRecord.toJSON();
+         });
+       });
+     } catch (err) {
+       Logger.verbose('SmartAssign', 1, `[DB] insertRoundWithEvents failed: ${err.message}`);
+       return null;
      }
    }
 }
