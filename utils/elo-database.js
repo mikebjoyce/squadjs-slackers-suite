@@ -302,10 +302,10 @@ export default class EloDatabase {
             await this.sequelize.query('PRAGMA synchronous=NORMAL;');
           }
           
-          await this.models.PluginState.sync({ alter: true });
-          await this.models.PlayerStats.sync({ alter: true });
-          await this.models.RoundHistory.sync({ alter: true });
-          await this.models.RoundPlayers.sync({ alter: true });
+           await this.models.PluginState.sync();
+           await this.models.PlayerStats.sync();
+           await this.models.RoundHistory.sync();
+           await this.models.RoundPlayers.sync();
         });
 
       const state = await this._executeWithRetry(async () => {
