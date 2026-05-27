@@ -438,7 +438,7 @@ export const EloDiscord = {
   buildClansLeaderboardEmbed(clanList, limit, minMembers) {
     const lines = clanList.slice(0, limit).map((c, i) => {
       const rankStr = (i + 1).toString().padStart(2);
-      const tagStr = c.displayTag.padEnd(16).substring(0, 16);
+      const tagStr = c.displayTag.padEnd(10).substring(0, 10);
       const csrStr = c.avgCsr === -999 ? 'n/a'.padStart(5) : c.avgCsr.toFixed(1).padStart(5);
       const membersStr = `${c.members.length}m`.padStart(4);
       const wrStr = `${c.wr.toFixed(0)}%`.padStart(4);
@@ -446,7 +446,7 @@ export const EloDiscord = {
       return `#${rankStr} ${tagStr} ${csrStr} CSR ${membersStr} ${wrStr}`;
     });
 
-    const header = ' #  Clan Tag         Rating    Size  WR\n' + '---------------------------------------';
+    const header = ' #  Clan Tag   Rating    Size   WR\n' + '----------------------------------';
     const body = lines.length > 0 ? lines.join('\n') : 'No clans meet the requirements.';
 
     return {
