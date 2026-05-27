@@ -102,7 +102,7 @@ const EloCommands = {
           }
           const lines = players.map((p, i) => {
             const consRating = p.mu - (EloCalculator.SIGMA_MULTIPLIER * p.sigma);
-            return `#${i + 1} ${p.name} — ${consRating.toFixed(1)} (${p.wins}W/${p.losses}L)`;
+            return `#${(i + 1).toString().padStart(2, ' ')} ${p.name.trim()}: ${consRating.toFixed(1)} ${p.wins}W/${p.losses}L`;
           });
           return await this.respond(player, ['=== ELO Leaderboard ===', ...lines].join('\n'));
         } catch (err) {
@@ -123,7 +123,7 @@ const EloCommands = {
         let rankLine;
         const consRating = record.mu - (EloCalculator.SIGMA_MULTIPLIER * record.sigma);
         if (record.roundsPlayed < minRounds) {
-          rankLine = `Rank: Provisional — ${record.roundsPlayed}/${minRounds} rounds`;
+          rankLine = `Rank: Provisional (${record.roundsPlayed}/${minRounds} rounds)`;
         } else {
           const rank = await this.db.getPlayerRank(consRating, minRounds);
           const total = await this.db.getTotalPlayers();

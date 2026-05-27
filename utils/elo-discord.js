@@ -357,9 +357,9 @@ export const EloDiscord = {
     if (localLeaderboard && localLeaderboard.length > 0) {
       const localLines = localLeaderboard.map(p => {
         const pConsRating = p.mu - (EloCalculator.SIGMA_MULTIPLIER * p.sigma);
-        const line = `#${p.actualRank} ${p.name} — ${pConsRating.toFixed(1)} (${p.wins}W/${p.losses}L)`;
+        const line = `#${p.actualRank.toString().padStart(2, ' ')} ${p.name.trim()}: ${pConsRating.toFixed(1)} ${p.wins}W/${p.losses}L`;
         if (p.eosID === player.eosID) {
-          return `${line}  <<`;
+          return `${line} <<`;
         }
         return line;
       });
@@ -384,9 +384,9 @@ export const EloDiscord = {
       const currentRank = startRank + i;
       const paddedRank = currentRank.toString().padStart(2, ' ');
       const consRating = p.mu - (EloCalculator.SIGMA_MULTIPLIER * p.sigma);
-      const line = `#${paddedRank} ${p.name} — ${consRating.toFixed(1)} (${p.wins}W/${p.losses}L)`;
+      const line = `#${paddedRank} ${p.name.trim()}: ${consRating.toFixed(1)} ${p.wins}W/${p.losses}L`;
       if (targetRank && currentRank === targetRank) {
-        return `${line}  <<`;
+        return `${line} <<`;
       }
       return line;
     });
