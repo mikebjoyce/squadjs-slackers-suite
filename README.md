@@ -17,7 +17,7 @@ Disconnect detection works via delta-diff: every time any player joins and trigg
 * **Sub-2s Verified Join Swaps**: Uses Log-Driven triggering + One-Hit & Verify to move players within ~1s of joining, verified against a fresh RCON poll.
 * **Strict Population Balance**: Dynamically adjusts the allowed team population difference based on total player count, enforcing a strict 1-player max difference at high population.
 * **Reconnect Memory**: Player disconnect states are stored in a fast in-memory Map for instant lookups on rejoin. The database serves as a crash-recovery backing store, written asynchronously on disconnect and re-hydrated into memory when the plugin restarts within the same round. If a player crashes or disconnects, they are automatically placed back on their previous team upon reconnecting (with a +1 imbalance grace allowance).
-* **Clan Grouping**: Detects clan tags in player names (supports 5 detection strategies: brackets, separators, spaces, ALL-CAPS, and bare prefixes) and keeps clan members together on the same team when joining. If all clan mates are on one team and population caps allow, the joining player is routed to that team. Uses case-insensitive matching with Unicode normalization and Levenshtein edit-distance merging for typo tolerance.
+* **Clan Grouping**: Detects clan tags in player names (supports 5 detection strategies: brackets, separators, spaces, ALL-CAPS, and bare prefixes) and keeps clan members together on the same team when joining. If all clan mates are on one team and population caps allow, the joining player is routed to that team. Uses case-insensitive matching with Unicode normalization and Levenshtein edit-distance merging.
 * **Elo-Aware Routing**: Integrates with the `EloTracker` plugin to route new players to the team that will most closely equalize the average skill of both sides.
 * **Passive Mode**: Set `enableSmartAssign: false` to observe real server events only (`JOIN`, `LEAVE`, `TEAM_CHANGE`). The assignment algorithm does not run, and no `ASSIGNMENT` events are logged—this mode is useful for monitoring server activity without any intervention.
 * **Lifecycle Event Logging**: Dumps precise `JOIN`, `LEAVE`, `TEAM_CHANGE`, `ASSIGNMENT`, `MOVE_SUCCESS`, and `MOVE_FAILED` events into an easily ingestible JSONL file, with global team populations (`t1`, `t2`) embedded on every event.
@@ -48,6 +48,22 @@ Add this to your `config.json` inside the `plugins` array.
     "dialect": "sqlite",
     "storage": "squad-server.sqlite"
   }
+  //"mysql": {
+  //  "dialect": "mysql",
+  //  "host": "localhost",
+  //  "port": 3306,
+  //  "username": "squad",
+  //  "password": "password",
+  //  "database": "squad_db"
+  //}
+  //"postgres": {
+  //  "dialect": "postgres",
+  //  "host": "localhost",
+  //  "port": 5432,
+  //  "username": "squad",
+  //  "password": "password",
+  //  "database": "squad_db"
+  //}
 },
 
 {
@@ -63,6 +79,9 @@ Add this to your `config.json` inside the `plugins` array.
   "enableDatabaseLogging": false
 }
 ```
+
+**Database Options:** The `"database"` option should match a connector name from above. Use `"sqlite"` for file-based storage (default), `"mysql"` for MySQL, or `"postgres"` for PostgreSQL. Any Sequelize-compatible backend is supported.
+
 
 **File Placement**: Move the project files into your SquadJS directory's squad-server folder.
 
@@ -136,12 +155,15 @@ If the clan target would violate the hard cap even with the grace allowance, the
 
 ### 4. Elo Scoring & Skill Balancing
 
-If neither reconnect memory nor clan grouping routes the player, the algorithm evaluates both teams with a **Mu-based Unified Scoring System** using tuned weights:
+If neither reconnect memory nor clan grouping routes the player, the algorithm evaluates both teams with a **3-Metric Composite Scoring System** aligned with TeamBalancer:
 
-- **Average Gap (1.0×)**: Measures how much the average skill of the two teams would diverge after placing the player on each side.
-- **Sum Gap (1.5× / log scale)**: Measures the total skill gap, scaled down using logarithmic growth as population increases. This logarithmic scaling provides stronger sum influence at high populations compared to linear scaling.
+1. **Mean ELO Difference (0.6× weight)**: Calculates the average skill (Mu) of each team and measures the absolute difference. This ensures overall team skill parity.
+2. **Top-15 ELO Difference (0.4× weight)**: Calculates the average skill of the 15 highest-rated players on each team and measures the absolute difference. This ensures high-skill player parity and prevents stacking.
+3. **Veteran Parity Penalty (300× multiplier)**: Calculates the ratio of veteran players (10+ rounds) on each team and penalizes ratio imbalance to ensure experience distribution.
 
-The player is assigned to whichever team produces the lower combined score — i.e., the placement that brings the match closest to a balanced skill split.
+These metrics are combined as: `compositeELO = 0.6 × meanDiff + 0.4 × top15Diff`, then passed through a non-linear penalty curve that scales penalties more aggressively for larger differences. The veteran penalty is added independently.
+
+The player is assigned to whichever team produces the lower combined penalty score — i.e., the placement that brings the match closest to a balanced skill and experience split.
 
 If the reconnect target would violate the hard cap, reconnecting players receive a **0.25-point score reduction** (reconnect bias) toward their previous team to tip near-ties in their favor, allowing them a chance to rejoin their squad even when the cap blocks direct placement.
 

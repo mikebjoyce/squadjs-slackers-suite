@@ -39,12 +39,12 @@
  * - Disconnect detection is delta-diff only (no PLAYER_DISCONNECTED listener) because
  *   that event is unreliable in current Squad/SquadJS. Every forced join refresh also
  *   speeds up disconnect detection for all other players as a side-effect.
- * - Algorithm uses a Mu-based Unified Scoring System:
+ * - Algorithm uses a 3-Metric Composite Scoring System aligned with TeamBalancer:
  *     1. Hard Pop Cap: Prevents imbalance beyond dynamic thresholds.
  *     2. Physical Server Cap: Hard limit (50 players per team).
  *     3. Reconnect Priority: Hot-path reconnect memory lives in-memory (_reconnectMemory Map) for synchronous lookups. If the player has a reconnect record and the pop cap allows it, they're sent to their previous team immediately (before Elo scoring). On disconnect, the Map is updated synchronously and the DB is written async (fire-and-forget) for crash recovery.
  *     3.5. Clan Grouping: If a player is in a clan and ALL clan mates are on one team, route the player there (provided pop cap allows). Uses lightweight _playerTagCache for fast tag lookups.
- *     4. Elo Balancing: Weights the average skill gap (1.0x) against a dynamically scaled sum gap (1.5x log scale) to handle diverse pop states.
+ *     4. Elo Balancing: Combines three metrics—Mean ELO difference (0.6x), Top-15 ELO difference (0.4x), and Veteran Parity Penalty (300x)—passed through a non-linear penalty curve to find the team placement with the lowest combined score.
  *     5. Reconnect Bias: If reconnect priority is blocked by the cap, applies a minor score reduction (0.25) toward the previous team to tip near-ties.
  *     6. Reconnect Bonus: Grants an *additional* +1 player imbalance allowance on top of the base for returning players (clan grouping gets the same).
  * - Strict 1-player max imbalance enforced at high population (96+).
