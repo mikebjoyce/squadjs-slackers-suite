@@ -200,26 +200,6 @@ A player's rating change is scaled by their time in the round:
 - **Sorting:** Ranked by **Competitive Skill Rank (CSR) (μ - 3.0σ)**. This ensures that leaderboard scores require both high skill and low uncertainty, encouraging active play.
 - **Provisional:** Players below the threshold are visible but unranked.
 
----
-
-## ⚠️ Critical Notes
-
-### deltaSigma Direction
-
-The `deltaSigma` returned by the calculator is a **reduction value**, applied as:
-
-```
-newSigma = sigma - deltaSigma
-```
-
-This is intentional. **Do not change this to addition.**
-
-### bulkIncrementPlayerStats Is Incremental
-
-`bulkIncrementPlayerStats()` **adds** to existing `wins`, `losses`, and `roundsPlayed` counts. It does **not** overwrite them. Do not pass cumulative totals — pass only the delta for the current round.
-
----
-
 ## Author
 
 **Slacker**
