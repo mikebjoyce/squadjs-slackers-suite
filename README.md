@@ -77,22 +77,22 @@ Add the following to your `config.json`:
     "dialect": "sqlite",
     "storage": "squad-server.sqlite"
   },
-  "mysql": {
-    "dialect": "mysql",
-    "host": "localhost",
-    "port": 3306,
-    "username": "squad",
-    "password": "password",
-    "database": "squad_db"
-  },
-  "postgres": {
-    "dialect": "postgres",
-    "host": "localhost",
-    "port": 5432,
-    "username": "squad",
-    "password": "password",
-    "database": "squad_db"
-  },
+  //"mysql": {
+  //  "dialect": "mysql",
+  //  "host": "localhost",
+  //  "port": 3306,
+  //  "username": "squad",
+  //  "password": "password",
+  //  "database": "squad_db"
+  //},
+  //"postgres": {
+  //  "dialect": "postgres",
+  //  "host": "localhost",
+  //  "port": 5432,
+  //  "username": "squad",
+  //  "password": "password",
+  //  "database": "squad_db"
+  //},
   "discord": {
     "connector": "discord",
     "token": "YOUR_BOT_TOKEN"
