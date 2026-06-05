@@ -134,6 +134,9 @@ export default class Switch extends DiscordBasePlugin {
         this.recentDoubleSwitches = [];
         this.recentDisconnections = {};
         this._knownConnectedPlayers = new Map();
+        this._switchedOnJoin = new Set();
+        this._nullTeamIDWindowActive = false;
+        this._nullTeamIDWindowTimeout = null;
 
         this.models = {};
 
@@ -218,6 +221,7 @@ export default class Switch extends DiscordBasePlugin {
         this.server.on('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
         this.server.on('ROUND_ENDED', this.onRoundEnded)
         this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
+        this.server.on('NEW_GAME', this.onNewGame.bind(this));
         if (this.options.discordClient) {
             this.options.discordClient.on('message', this.onDiscordMessage);
         }
@@ -425,6 +429,13 @@ export default class Switch extends DiscordBasePlugin {
                     return;
             }
         } else {
+            // Issue 7: Gate !switch commands during null-teamID window (per §3 of reference doc)
+            if (this._nullTeamIDWindowActive) {
+                this.warn(steamID, 'Server is transitioning between rounds. Team assignments are still resolving. Please try again in a moment.');
+                this.verbose(1, `[Switch] Denied ${playerName}: Null-teamID window active.`);
+                return;
+            }
+
             await this.server.updateSquadList();
             await this.server.updatePlayerList();
             const availableSwitchSlots = this.getSwitchSlotsPerTeam(teamID);
@@ -524,11 +535,11 @@ export default class Switch extends DiscordBasePlugin {
     async onRoundEnded(dt) {
         await this.cleanup();
         await this.doSwitchMatchend();
-        // Clear trackers to prevent cross-match exploits
+        // Clear trackers to prevent cross-match exploits (but keep _knownConnectedPlayers for continuity)
         this.recentDisconnections = {};
-        this._knownConnectedPlayers.clear();
-        for (let p of this.server.players)
-            p.teamID = p.teamID == 1 ? 2 : 1;
+        this._switchedOnJoin.clear();
+        // Do NOT clear _knownConnectedPlayers — keep state across rounds per §5 resilient pattern
+        // Do NOT manually flip teamID — trust UPDATED_PLAYER_INFORMATION + PLAYER_TEAM_CHANGE
     }
 
     getTeamBalanceDifference() {
@@ -569,15 +580,60 @@ export default class Switch extends DiscordBasePlugin {
     async onUpdatedPlayerInfo(info) {
         if (!this.server.players) return;
         
+        // Skip processing if null-teamID window is active (per §3 of reference doc)
+        if (this._nullTeamIDWindowActive) {
+            const anyNull = this.server.players.some(p => p.teamID === null);
+            if (anyNull) return; // Still in transition, skip this poll
+            // Window is over, clear flag and proceed
+            this._nullTeamIDWindowActive = false;
+            clearTimeout(this._nullTeamIDWindowTimeout);
+        }
+        
         const currentSteamIDs = new Set(this.server.players.map(p => p.steamID).filter(Boolean));
         
-        // Add new players to known map
+        // Add new players to known map & perform first-seen registration (Issue 1b)
         for (const p of this.server.players) {
             if (p.steamID && !this._knownConnectedPlayers.has(p.steamID)) {
+                // NEW PLAYER DETECTED — perform first-seen registration
+                const now = Date.now();
+                if (!this.playersConnectionTime[p.steamID]) {
+                    this.playersConnectionTime[p.steamID] = now;
+                    // Persist to DB
+                    try {
+                        await this.safeTransaction(async (t) => {
+                            await this.models.PlayerCooldowns.upsert({
+                                steamID: p.steamID,
+                                playerName: p.name,
+                                firstSeenTimestamp: new Date(now)
+                            }, { transaction: t });
+                        });
+                    } catch (err) {
+                        this.verbose(1, `Failed to persist join time for ${p.name} (detected via UPDATED_PLAYER_INFORMATION): ${err.message}`);
+                    }
+                    
+                    // Mark that we've triggered switchToPreDisconnectionTeam for this player
+                    if (!this._switchedOnJoin.has(p.steamID)) {
+                        this._switchedOnJoin.add(p.steamID);
+                        // Trigger switchToPreDisconnectionTeam if applicable
+                        if (this.options.switchToOldTeamAfterRejoin) {
+                            const preDisconnectionData = this.recentDisconnections[p.steamID];
+                            if (preDisconnectionData) {
+                                // Schedule it for later to avoid race with onPlayerConnected
+                                setTimeout(() => {
+                                    this.switchToPreDisconnectionTeam({ player: p });
+                                }, 100);
+                            }
+                        }
+                    }
+                }
                 this._knownConnectedPlayers.set(p.steamID, { teamID: p.teamID, name: p.name });
             } else if (p.steamID) {
-                // Keep team up to date for accurate disconnect records
-                this._knownConnectedPlayers.get(p.steamID).teamID = p.teamID;
+                // UPDATE — only update teamID if it's NOT null (per §3, skip null-teamID updates)
+                const existing = this._knownConnectedPlayers.get(p.steamID);
+                if (p.teamID !== null) {
+                    existing.teamID = p.teamID;
+                    existing.name = p.name;
+                }
             }
         }
 
@@ -610,6 +666,14 @@ export default class Switch extends DiscordBasePlugin {
 
         this.verbose(1, `Player connected ${playerName}`);
         const now = Date.now();
+
+        // Issue 5: Guard against double-registration if onUpdatedPlayerInfo already processed
+        // onUpdatedPlayerInfo may have already registered this player and called switchToPreDisconnectionTeam
+        const alreadyRegistered = this.playersConnectionTime[steamID] && this._switchedOnJoin.has(steamID);
+        if (alreadyRegistered) {
+            this.verbose(1, `[Rejoin] ${playerName} already registered via UPDATED_PLAYER_INFORMATION, skipping double-registration.`);
+            return;
+        }
 
         // Check for exploit-resistant rejoin logic
         const preDisconnectionData = this.recentDisconnections[steamID];
@@ -649,7 +713,11 @@ export default class Switch extends DiscordBasePlugin {
             }
         }
 
-        this.switchToPreDisconnectionTeam(info);
+        // Mark that we've handled switchToPreDisconnectionTeam for this player
+        if (!this._switchedOnJoin.has(steamID)) {
+            this._switchedOnJoin.add(steamID);
+            this.switchToPreDisconnectionTeam(info);
+        }
     }
 
     async switchToPreDisconnectionTeam(info) {
@@ -790,13 +858,27 @@ export default class Switch extends DiscordBasePlugin {
         return this.server.rcon.execute(`AdminForceTeamChange ${steamID}`);
     }
 
+    onNewGame() {
+        // Issue 6: Set null-teamID window flag at NEW_GAME (per §3 of reference doc)
+        this._nullTeamIDWindowActive = true;
+        clearTimeout(this._nullTeamIDWindowTimeout);
+        // Set safety fallback: clear flag after 60 seconds if not cleared by UPDATED_PLAYER_INFORMATION
+        this._nullTeamIDWindowTimeout = setTimeout(() => {
+            this._nullTeamIDWindowActive = false;
+            this.verbose(1, '[NEW_GAME] Null-teamID window safety timeout triggered.');
+        }, 60_000);
+        this.verbose(1, '[NEW_GAME] Null-teamID window opened (players may have null teamID for up to 30s).');
+    }
+
     async unmount() {
         this.server.removeListener('CHAT_MESSAGE', this.onChatMessage);
         this.server.removeListener('PLAYER_CONNECTED', this.onPlayerConnected);
         this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
         this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
         this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
+        this.server.removeListener('NEW_GAME', this.onNewGame.bind(this));
         if (this.options.discordClient) this.options.discordClient.removeListener('message', this.onDiscordMessage);
+        clearTimeout(this._nullTeamIDWindowTimeout);
         this.verbose(1, 'Switch plugin was un-mounted.');
     }
 
