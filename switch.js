@@ -617,28 +617,28 @@ export default class Switch extends DiscordBasePlugin {
         return this._liberalModes.some(m => checkLayer.includes(m) || checkMode.includes(m));
     }
 
-    /**
-     * UPDATED: getSwitchSlotsPerTeam with optional cap parameter.
-     * If effectiveCap is provided, uses it instead of maxUnbalancedSlots.
-     * Also respects the 50v50 ceiling: never lets a team exceed 50 players.
-     */
-    getSwitchSlotsPerTeam(teamID, effectiveCap = null) {
-        const balanceDifference = this.getTeamBalanceDifference();
-        const cap = effectiveCap !== null ? effectiveCap : this.options.maxUnbalancedSlots;
-        let slots = cap - (teamID == 1 ? -balanceDifference : balanceDifference);
+     /**
+      * UPDATED: getSwitchSlotsPerTeam with optional cap parameter.
+      * If effectiveCap is provided, uses it instead of maxUnbalancedSlots.
+      * Also respects the 50v50 ceiling: never lets a team exceed 50 players.
+      */
+     getSwitchSlotsPerTeam(teamID, effectiveCap = null) {
+         const balanceDifference = this.getTeamBalanceDifference();
+         const cap = effectiveCap !== null ? effectiveCap : this.options.maxUnbalancedSlots;
+         let slots = cap - (teamID == 1 ? -balanceDifference : balanceDifference);
 
-        // Apply 50v50 ceiling: if receiving team would exceed 50, clamp slots to prevent it
-        let teamPlayerCount = [null, 0, 0];
-        for (let p of this.server.players)
-            teamPlayerCount[+p.teamID]++;
+         // Apply 50v50 ceiling: if receiving team would exceed 50, clamp slots to prevent it
+         let teamPlayerCount = [null, 0, 0];
+         for (let p of this.server.players)
+             teamPlayerCount[+p.teamID]++;
 
-        const receivingTeamSize = teamPlayerCount[teamID] || 0;
-        if (receivingTeamSize + slots > 50) {
-            slots = Math.max(0, 50 - receivingTeamSize);
-        }
+         const receivingTeamSize = teamPlayerCount[teamID == 1 ? 2 : 1] || 0;
+         if (receivingTeamSize + slots > 50) {
+             slots = Math.max(0, 50 - receivingTeamSize);
+         }
 
-        return slots;
-    }
+         return slots;
+     }
 
     /**
      * EVENT: UPDATED_LAYER_INFORMATION (Layer Sync)
