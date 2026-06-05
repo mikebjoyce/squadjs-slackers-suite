@@ -137,6 +137,7 @@ export default class Switch extends DiscordBasePlugin {
         this._switchedOnJoin = new Set();
         this._nullTeamIDWindowActive = false;
         this._nullTeamIDWindowTimeout = null;
+        this._pendingSwitchSources = new Map(); // Map<steamID, { source, time }>
 
         this.models = {};
 
@@ -277,7 +278,7 @@ export default class Switch extends DiscordBasePlugin {
                     this.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
                     pl = this.getPlayerByUsernameOrSteamID(steamID, commandSplit.splice(1).join(' '))
                     if (pl) {
-                        this.switchPlayer(pl.steamID).catch(err => {
+                        this._taggedSwitchPlayer(pl.steamID, 'Admin-Force').catch(err => {
                             this.verbose(1, `Admin switch now failed: ${err.message}`);
                         });
                     }
@@ -474,11 +475,11 @@ export default class Switch extends DiscordBasePlugin {
                 return;
             }
 
-            let switchSuccess = false;
-            try {
-                await this.switchPlayer(steamID);
-                switchSuccess = true;
-            } catch (err) {
+             let switchSuccess = false;
+             try {
+                 await this._taggedSwitchPlayer(steamID, 'Player-Self');
+                 switchSuccess = true;
+             } catch (err) {
                 if (err.message && (err.message.toLowerCase().includes('timeout') || err.message.toLowerCase().includes('timed out'))) {
                     this.verbose(1, `[Switch] RCON timeout for ${playerName}, verifying switch status...`);
                     await delay(3000);
@@ -515,22 +516,22 @@ export default class Switch extends DiscordBasePlugin {
         }
     }
 
-    async doSwitchMatchend() {
-        const players = await this.models.Endmatch.findAll();
-        if (players.length == 0) return;
-        players.forEach((pl) => {
-            this.warn(pl.steamID, 'Match End: You will be switched in 15 seconds.');
-        });
-        await delay(15 * 1000);
-        await Promise.all(players.map(async (pl) => {
-            await this.switchPlayer(pl.steamID);
-            return await this.models.Endmatch.destroy({
-                where: {
-                    id: pl.id
-                }
-            });
-        }));
-    }
+     async doSwitchMatchend() {
+         const players = await this.models.Endmatch.findAll();
+         if (players.length == 0) return;
+         players.forEach((pl) => {
+             this.warn(pl.steamID, 'Match End: You will be switched in 15 seconds.');
+         });
+         await delay(15 * 1000);
+         await Promise.all(players.map(async (pl) => {
+             await this._taggedSwitchPlayer(pl.steamID, 'Admin-Force');
+             return await this.models.Endmatch.destroy({
+                 where: {
+                     id: pl.id
+                 }
+             });
+         }));
+     }
 
     async onRoundEnded(dt) {
         await this.cleanup();
@@ -736,62 +737,62 @@ export default class Switch extends DiscordBasePlugin {
 
         if (Date.now() - preDisconnectionData.time > 60 * 60 * 1000) return;
 
-        if (needSwitch) {
-            setTimeout(() => {
-                this.switchPlayer(steamID).catch(err => {
-                    this.verbose(1, `Error auto-switching ${playerName} to old team: ${err.message}`);
-                });
-            }, 5000)
-        }
+         if (needSwitch) {
+             setTimeout(() => {
+                 this._taggedSwitchPlayer(steamID, 'Switch-Rejoin').catch(err => {
+                     this.verbose(1, `Error auto-switching ${playerName} to old team: ${err.message}`);
+                 });
+             }, 5000)
+         }
     }
 
-    async doubleSwitchPlayer(steamID, forced = false, senderSteamID) {
-        const recentSwitch = this.recentDoubleSwitches.find(e => e.steamID == steamID);
-        const cooldownHoursLeft = (Date.now() - +recentSwitch?.datetime) / (60 * 60 * 1000);
+     async doubleSwitchPlayer(steamID, forced = false, senderSteamID) {
+         const recentSwitch = this.recentDoubleSwitches.find(e => e.steamID == steamID);
+         const cooldownHoursLeft = (Date.now() - +recentSwitch?.datetime) / (60 * 60 * 1000);
 
-        if (!forced) {
-            const joinSeconds = await this.getSecondsFromJoin(steamID);
-            if (joinSeconds / 60 > this.options.doubleSwitchEnabledMinutes && this.getSecondsFromMatchStart() / 60 > this.options.doubleSwitchEnabledMinutes) {
-                this.warn(steamID, `Time Limit: Double switch allowed only in first ${this.options.doubleSwitchEnabledMinutes}m of join/match.`);
-                return;
-            }
+         if (!forced) {
+             const joinSeconds = await this.getSecondsFromJoin(steamID);
+             if (joinSeconds / 60 > this.options.doubleSwitchEnabledMinutes && this.getSecondsFromMatchStart() / 60 > this.options.doubleSwitchEnabledMinutes) {
+                 this.warn(steamID, `Time Limit: Double switch allowed only in first ${this.options.doubleSwitchEnabledMinutes}m of join/match.`);
+                 return;
+             }
 
-            if (recentSwitch && cooldownHoursLeft < this.options.doubleSwitchCooldownHours) {
-                this.warn(steamID, `Cooldown: Double switch used recently. Wait ${this.options.doubleSwitchCooldownHours}h.`);
-                return;
-            }
+             if (recentSwitch && cooldownHoursLeft < this.options.doubleSwitchCooldownHours) {
+                 this.warn(steamID, `Cooldown: Double switch used recently. Wait ${this.options.doubleSwitchCooldownHours}h.`);
+                 return;
+             }
 
-            if (recentSwitch)
-                recentSwitch.datetime = new Date();
-            else
-                this.recentDoubleSwitches.push({ steamID: steamID, datetime: new Date() });
-        }
+             if (recentSwitch)
+                 recentSwitch.datetime = new Date();
+             else
+                 this.recentDoubleSwitches.push({ steamID: steamID, datetime: new Date() });
+         }
 
-        try {
-            await this.server.rcon.execute(`AdminForceTeamChange ${steamID}`);
-            await delay(this.options.doubleSwitchDelaySeconds * 1000);
-            await this.server.rcon.execute(`AdminForceTeamChange ${steamID}`);
+         try {
+             await this._taggedSwitchPlayer(steamID, 'Switch-Double-Swap');
+             await delay(this.options.doubleSwitchDelaySeconds * 1000);
+             await this._taggedSwitchPlayer(steamID, 'Switch-Double-Swap');
 
-            if (forced && senderSteamID) this.warn(senderSteamID, `Player has been double-switched.`);
-        } catch (err) {
-            this.verbose(1, `Double switch failed for ${steamID}: ${err.message}`);
-            if (forced && senderSteamID) {
-                this.warn(senderSteamID, `Double switch failed: ${err.message}`);
-            }
-        }
-    }
+             if (forced && senderSteamID) this.warn(senderSteamID, `Player has been double-switched.`);
+         } catch (err) {
+             this.verbose(1, `Double switch failed for ${steamID}: ${err.message}`);
+             if (forced && senderSteamID) {
+                 this.warn(senderSteamID, `Double switch failed: ${err.message}`);
+             }
+         }
+     }
 
-    async switchSquad(number, team) {
-        const players = this.getPlayersFromSquad(number, team);
-        if (!players) return;
-        for (let p of players) {
-            try {
-                await this.switchPlayer(p.steamID);
-            } catch (err) {
-                this.verbose(1, `Failed to switch squad member ${p.name}: ${err.message}`);
-            }
-        }
-    }
+     async switchSquad(number, team) {
+         const players = this.getPlayersFromSquad(number, team);
+         if (!players) return;
+         for (let p of players) {
+             try {
+                 await this._taggedSwitchPlayer(p.steamID, 'Admin-Force');
+             } catch (err) {
+                 this.verbose(1, `Failed to switch squad member ${p.name}: ${err.message}`);
+             }
+         }
+     }
 
     getPlayersFromSquad(number, team) {
         let team_id = null;
@@ -806,28 +807,28 @@ export default class Switch extends DiscordBasePlugin {
         return this.server.players.filter((p) => p.teamID == team_id && p.squadID == number)
     }
 
-    async doubleSwitchSquad(number, team) {
-        const players = this.getPlayersFromSquad(number, team);
-        if (!players) return;
-        
-        for (let p of players) {
-            try {
-                await this.switchPlayer(p.steamID);
-            } catch (err) {
-                this.verbose(1, `First double-switch hop failed for ${p.name}: ${err.message}`);
-            }
-        }
-        
-        await delay(this.options.doubleSwitchDelaySeconds * 1000);
-        
-        for (let p of players) {
-            try {
-                await this.switchPlayer(p.steamID);
-            } catch (err) {
-                this.verbose(1, `Second double-switch hop failed for ${p.name}: ${err.message}`);
-            }
-        }
-    }
+     async doubleSwitchSquad(number, team) {
+         const players = this.getPlayersFromSquad(number, team);
+         if (!players) return;
+         
+         for (let p of players) {
+             try {
+                 await this._taggedSwitchPlayer(p.steamID, 'Switch-Double-Swap');
+             } catch (err) {
+                 this.verbose(1, `First double-switch hop failed for ${p.name}: ${err.message}`);
+             }
+         }
+         
+         await delay(this.options.doubleSwitchDelaySeconds * 1000);
+         
+         for (let p of players) {
+             try {
+                 await this._taggedSwitchPlayer(p.steamID, 'Switch-Double-Swap');
+             } catch (err) {
+                 this.verbose(1, `Second double-switch hop failed for ${p.name}: ${err.message}`);
+             }
+         }
+     }
 
     async addSquadToMatchendSwitches(number, team) {
         const players = this.getPlayersFromSquad(number, team);
@@ -852,6 +853,42 @@ export default class Switch extends DiscordBasePlugin {
         if (firstPlayer) return firstPlayer.teamID;
 
         return null;
+    }
+
+    /**
+     * Records the source of a player switch and schedules event emission after RCON execution.
+     * Automatically computes the target team (opposite of current team).
+     * Sources: 'Player-Self', 'Admin-Force', 'Switch-Double-Swap', 'Switch-Rejoin'
+     */
+    async _taggedSwitchPlayer(steamID, source) {
+        // Compute target team (opposite of current)
+        const player = this.server.players.find(p => p.steamID === steamID);
+        const currentTeam = player?.teamID;
+        const targetTeam = currentTeam === 1 ? 2 : currentTeam === 2 ? 1 : null;
+        
+        // Store the pending switch source with a 15-second TTL
+        this._pendingSwitchSources.set(steamID, { source, targetTeam, time: Date.now() });
+        
+        try {
+            const result = await this.server.rcon.execute(`AdminForceTeamChange ${steamID}`);
+            
+            // After RCON succeeds, emit the event immediately
+            const entry = this._pendingSwitchSources.get(steamID);
+            if (entry && entry.targetTeam) {
+                this.server.emit('SWITCH_PLUGIN_PLAYER_MOVED', {
+                    steamID,
+                    targetTeam: entry.targetTeam,
+                    source: entry.source
+                });
+            }
+            this._pendingSwitchSources.delete(steamID);
+            
+            return result;
+        } catch (err) {
+            // On error, remove the pending entry
+            this._pendingSwitchSources.delete(steamID);
+            throw err;
+        }
     }
 
     switchPlayer(steamID) {
