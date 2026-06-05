@@ -999,17 +999,17 @@ export default class Switch extends DiscordBasePlugin {
         const targetTeam = currentTeam === 1 ? 2 : currentTeam === 2 ? 1 : null;
         
         // Store the pending switch source with a 15-second TTL
-        this._pendingSwitchSources.set(steamID, { source, targetTeam, time: Date.now() });
+        this._pendingSwitchSources.set(steamID, { source, targetTeamID: targetTeam, time: Date.now() });
         
         try {
             const result = await this.server.rcon.execute(`AdminForceTeamChange ${steamID}`);
             
             // After RCON succeeds, emit the event immediately
             const entry = this._pendingSwitchSources.get(steamID);
-            if (entry && entry.targetTeam) {
+            if (entry && entry.targetTeamID) {
                 this.server.emit('SWITCH_PLUGIN_PLAYER_MOVED', {
                     steamID,
-                    targetTeam: entry.targetTeam,
+                    targetTeamID: entry.targetTeamID,
                     source: entry.source
                 });
             }
