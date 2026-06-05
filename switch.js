@@ -68,7 +68,7 @@ export default class Switch extends DiscordBasePlugin {
             },
             doubleSwitchEnabledMinutes: {
                 required: false,
-                description: "Time in minutes in which the switch will be enabled after match start or player join",
+                description: "Time in minutes in which a double switch will be enabled after match start or player join",
                 default: 5
             },
             maxUnbalancedSlots: {
@@ -104,8 +104,8 @@ export default class Switch extends DiscordBasePlugin {
         super(server, options, connectors);
 
         this.onChatMessage = this.onChatMessage.bind(this);
-        this.onPlayerDisconnected = this.onPlayerDisconnected.bind(this);
         this.onPlayerConnected = this.onPlayerConnected.bind(this);
+        this.onUpdatedPlayerInfo = this.onUpdatedPlayerInfo.bind(this);
         this.switchPlayer = this.switchPlayer.bind(this);
         this.getPlayersByUsername = this.getPlayersByUsername.bind(this);
         this.getPlayerBySteamID = this.getPlayerBySteamID.bind(this);
@@ -120,7 +120,7 @@ export default class Switch extends DiscordBasePlugin {
         this.getSwitchSlotsPerTeam = this.getSwitchSlotsPerTeam.bind(this);
         this.onRoundEnded = this.onRoundEnded.bind(this);
         this.addPlayerToMatchendSwitches = this.addPlayerToMatchendSwitches.bind(this);
-        this.doSwitcMatchend = this.doSwitcMatchend.bind(this);
+        this.doSwitchMatchend = this.doSwitchMatchend.bind(this);
         this.cleanup = this.cleanup.bind(this);
         this.onScrambleExecuted = this.onScrambleExecuted.bind(this);
         this.checkPlayer = this.checkPlayer.bind(this);
@@ -129,10 +129,11 @@ export default class Switch extends DiscordBasePlugin {
         this.safeTransaction = this.safeTransaction.bind(this);
         this.safeDiscordReply = this.safeDiscordReply.bind(this);
 
-        this.playersConnectionTime = [];
+        this.playersConnectionTime = {};
         this.recentSwitches = [];
         this.recentDoubleSwitches = [];
-        this.recentDisconnections = [];
+        this.recentDisconnections = {};
+        this._knownConnectedPlayers = new Map();
 
         this.models = {};
 
@@ -213,8 +214,8 @@ export default class Switch extends DiscordBasePlugin {
     async mount() {
         await this.models.PlayerCooldowns.sync({ alter: true });
         this.server.on('CHAT_MESSAGE', this.onChatMessage);
-        this.server.on('PLAYER_DISCONNECTED', this.onPlayerDisconnected);
         this.server.on('PLAYER_CONNECTED', this.onPlayerConnected);
+        this.server.on('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
         this.server.on('ROUND_ENDED', this.onRoundEnded)
         this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
         if (this.options.discordClient) {
@@ -271,7 +272,11 @@ export default class Switch extends DiscordBasePlugin {
                     }
                     this.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
                     pl = this.getPlayerByUsernameOrSteamID(steamID, commandSplit.splice(1).join(' '))
-                    if (pl) this.switchPlayer(pl.steamID);
+                    if (pl) {
+                        this.switchPlayer(pl.steamID).catch(err => {
+                            this.verbose(1, `Admin switch now failed: ${err.message}`);
+                        });
+                    }
                     break;
                 case 'double':
                     if (!isAdmin) {
@@ -280,7 +285,9 @@ export default class Switch extends DiscordBasePlugin {
                     }
                     this.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
                     pl = this.getPlayerByUsernameOrSteamID(steamID, commandSplit.splice(1).join(' '))
-                    if (pl) this.doubleSwitchPlayer(pl.steamID, true);
+                    if (pl) {
+                        await this.doubleSwitchPlayer(pl.steamID, true);
+                    }
                     break;
                 case 'squad':
                     if (!isAdmin) {
@@ -321,7 +328,7 @@ export default class Switch extends DiscordBasePlugin {
                     this.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
                     await this.server.updateSquadList();
                     await this.server.updatePlayerList();
-                    this.doubleSwitchSquad(+commandSplit[ 1 ], commandSplit[ 2 ]);
+                    await this.doubleSwitchSquad(+commandSplit[ 1 ], commandSplit[ 2 ]);
                     break;
                 case "matchendsquad":
                     if (!isAdmin) {
@@ -341,7 +348,7 @@ export default class Switch extends DiscordBasePlugin {
                     }
                     this.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
                     this.warn(steamID, 'Triggering match-end switch sequence...');
-                    await this.doSwitcMatchend();
+                    await this.doSwitchMatchend();
                     this.warn(steamID, 'Match-end switch sequence complete.');
                     break;
                 case "test":
@@ -497,7 +504,7 @@ export default class Switch extends DiscordBasePlugin {
         }
     }
 
-    async doSwitcMatchend() {
+    async doSwitchMatchend() {
         const players = await this.models.Endmatch.findAll();
         if (players.length == 0) return;
         players.forEach((pl) => {
@@ -505,7 +512,7 @@ export default class Switch extends DiscordBasePlugin {
         });
         await delay(15 * 1000);
         await Promise.all(players.map(async (pl) => {
-            this.switchPlayer(pl.steamID);
+            await this.switchPlayer(pl.steamID);
             return await this.models.Endmatch.destroy({
                 where: {
                     id: pl.id
@@ -516,7 +523,10 @@ export default class Switch extends DiscordBasePlugin {
 
     async onRoundEnded(dt) {
         await this.cleanup();
-        this.doSwitcMatchend();
+        await this.doSwitchMatchend();
+        // Clear trackers to prevent cross-match exploits
+        this.recentDisconnections = {};
+        this._knownConnectedPlayers.clear();
         for (let p of this.server.players)
             p.teamID = p.teamID == 1 ? 2 : 1;
     }
@@ -556,46 +566,90 @@ export default class Switch extends DiscordBasePlugin {
         return (Date.now() - +this.server.layerHistory[ 0 ].time) / 1000 || 0;
     }
 
+    async onUpdatedPlayerInfo(info) {
+        if (!this.server.players) return;
+        
+        const currentSteamIDs = new Set(this.server.players.map(p => p.steamID).filter(Boolean));
+        
+        // Add new players to known map
+        for (const p of this.server.players) {
+            if (p.steamID && !this._knownConnectedPlayers.has(p.steamID)) {
+                this._knownConnectedPlayers.set(p.steamID, { teamID: p.teamID, name: p.name });
+            } else if (p.steamID) {
+                // Keep team up to date for accurate disconnect records
+                this._knownConnectedPlayers.get(p.steamID).teamID = p.teamID;
+            }
+        }
+
+        // Detect leaves
+        for (const [steamID, data] of this._knownConnectedPlayers.entries()) {
+            if (!currentSteamIDs.has(steamID)) {
+                this._knownConnectedPlayers.delete(steamID);
+                this.handlePlayerLeave(steamID, data.teamID, data.name);
+            }
+        }
+    }
+
+    handlePlayerLeave(steamID, teamID, playerName) {
+        this.verbose(1, `Player disconnected ${playerName}`);
+        this.recentDisconnections[steamID] = { teamID: teamID, time: new Date() };
+        
+        const cutoff = Date.now() - (20 * 60 * 1000); // 20-minute retention
+        for (const key in this.recentDisconnections) {
+            if (this.recentDisconnections[key].time.getTime() < cutoff) delete this.recentDisconnections[key];
+        }
+        this.recentDoubleSwitches = this.recentDoubleSwitches.filter(p => p.steamID != steamID);
+    }
+
     async onPlayerConnected(info) {
-        const steamID = info.player?.steamID;
-        const playerName = info.player?.name;
+        if (!info?.player?.steamID) return; // Early return guard
+        
+        const steamID = info.player.steamID;
+        const playerName = info.player.name;
+        const teamID = info.player.teamID;
 
         this.verbose(1, `Player connected ${playerName}`);
         const now = Date.now();
 
-        // Always update memory
-        this.playersConnectionTime[steamID] = now;
+        // Check for exploit-resistant rejoin logic
+        const preDisconnectionData = this.recentDisconnections[steamID];
+        const disconnectionValid = preDisconnectionData && (Date.now() - preDisconnectionData.time.getTime()) < (20 * 60 * 1000);
 
-        // Update DB so Discord !switch check matches in-game reality
-        try {
-            await this.safeTransaction(async (t) => {
-                await this.models.PlayerCooldowns.upsert({
-                    steamID,
-                    playerName,
-                    firstSeenTimestamp: new Date(now)
-                }, { transaction: t });
-            });
-        } catch (err) {
-            this.verbose(1, `Failed to persist join time: ${err.message}`);
+        if (disconnectionValid) {
+            // Retain join time across any short-term disconnection, regardless of team assignment
+            if (!this.playersConnectionTime[steamID]) {
+                try {
+                    const record = await this.models.PlayerCooldowns.findByPk(steamID);
+                    if (record && record.firstSeenTimestamp) {
+                        this.playersConnectionTime[steamID] = new Date(record.firstSeenTimestamp).getTime();
+                        this.verbose(1, `[Rejoin] ${playerName} retained join time from pre-disconnection.`);
+                    } else {
+                        this.playersConnectionTime[steamID] = now;
+                    }
+                } catch (err) {
+                    this.verbose(1, `Failed to hydrate join time for ${playerName}: ${err.message}`);
+                    this.playersConnectionTime[steamID] = now;
+                }
+            }
+            // Do NOT overwrite firstSeenTimestamp in the database here
+        } else {
+            // Reset join time (completely new session or 20 minutes expired)
+            this.playersConnectionTime[steamID] = now;
+            
+            try {
+                await this.safeTransaction(async (t) => {
+                    await this.models.PlayerCooldowns.upsert({
+                        steamID,
+                        playerName,
+                        firstSeenTimestamp: new Date(now)
+                    }, { transaction: t });
+                });
+            } catch (err) {
+                this.verbose(1, `Failed to persist join time for ${playerName}: ${err.message}`);
+            }
         }
 
         this.switchToPreDisconnectionTeam(info);
-    }
-
-    async onPlayerDisconnected(info) {
-        this.verbose(1, `Player disconnected ${info.player?.name}`);
-
-        const steamID = info.player?.steamID;
-        const teamID = info.player?.teamID;
-
-        this.recentDisconnections[ steamID ] = { teamID: teamID, time: new Date() };
-
-        const cutoff = Date.now() - (60 * 60 * 1000);
-        for (const key in this.recentDisconnections) {
-            if (this.recentDisconnections[key].time.getTime() < cutoff) delete this.recentDisconnections[key];
-        }
-
-        this.recentDoubleSwitches = this.recentDoubleSwitches.filter(p => p.steamID != steamID);
     }
 
     async switchToPreDisconnectionTeam(info) {
@@ -616,7 +670,9 @@ export default class Switch extends DiscordBasePlugin {
 
         if (needSwitch) {
             setTimeout(() => {
-                this.switchPlayer(steamID);
+                this.switchPlayer(steamID).catch(err => {
+                    this.verbose(1, `Error auto-switching ${playerName} to old team: ${err.message}`);
+                });
             }, 5000)
         }
     }
@@ -657,11 +713,16 @@ export default class Switch extends DiscordBasePlugin {
         }
     }
 
-    switchSquad(number, team) {
+    async switchSquad(number, team) {
         const players = this.getPlayersFromSquad(number, team);
         if (!players) return;
-        for (let p of players)
-            this.switchPlayer(p.steamID);
+        for (let p of players) {
+            try {
+                await this.switchPlayer(p.steamID);
+            } catch (err) {
+                this.verbose(1, `Failed to switch squad member ${p.name}: ${err.message}`);
+            }
+        }
     }
 
     getPlayersFromSquad(number, team) {
@@ -680,9 +741,24 @@ export default class Switch extends DiscordBasePlugin {
     async doubleSwitchSquad(number, team) {
         const players = this.getPlayersFromSquad(number, team);
         if (!players) return;
-        for (let p of players) this.switchPlayer(p.steamID);
+        
+        for (let p of players) {
+            try {
+                await this.switchPlayer(p.steamID);
+            } catch (err) {
+                this.verbose(1, `First double-switch hop failed for ${p.name}: ${err.message}`);
+            }
+        }
+        
         await delay(this.options.doubleSwitchDelaySeconds * 1000);
-        for (let p of players) this.switchPlayer(p.steamID);
+        
+        for (let p of players) {
+            try {
+                await this.switchPlayer(p.steamID);
+            } catch (err) {
+                this.verbose(1, `Second double-switch hop failed for ${p.name}: ${err.message}`);
+            }
+        }
     }
 
     async addSquadToMatchendSwitches(number, team) {
@@ -716,8 +792,8 @@ export default class Switch extends DiscordBasePlugin {
 
     async unmount() {
         this.server.removeListener('CHAT_MESSAGE', this.onChatMessage);
-        this.server.removeListener('PLAYER_DISCONNECTED', this.onPlayerDisconnected);
         this.server.removeListener('PLAYER_CONNECTED', this.onPlayerConnected);
+        this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
         this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
         this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
         if (this.options.discordClient) this.options.discordClient.removeListener('message', this.onDiscordMessage);
@@ -797,8 +873,8 @@ export default class Switch extends DiscordBasePlugin {
 
             for (const steamID in this.recentDisconnections) {
                 if (!currentSteamIDs.includes(steamID)) {
-                    // Optional: only delete if they've been gone a long time
-                    if (Date.now() - this.recentDisconnections[steamID].time > 60 * 60 * 1000) {
+                    // Only delete if they've been gone beyond 20-minute retention
+                    if (Date.now() - this.recentDisconnections[steamID].time > 20 * 60 * 1000) {
                         delete this.recentDisconnections[steamID];
                     }
                 }
