@@ -96,6 +96,18 @@ export default class Switch extends DiscordBasePlugin {
                 required: false,
                 description: "Duration in minutes to block switching after a scramble.",
                 default: 20
+            },
+            liberalSwitchGameModes: {
+                required: false,
+                description: "Substrings for layer/gamemode names where switching rules are relaxed (no time/cooldown limits).",
+                default: ['Seed', 'Jensen'],
+                type: 'array'
+            },
+            liberalSwitchMaxUnbalancedSlots: {
+                required: false,
+                description: "Balance cap during liberal modes (e.g., Seed/Jensen). Allows more permissive switching up to a ceiling of 50v50.",
+                default: 6,
+                type: 'number'
             }
         };
     }
@@ -138,6 +150,11 @@ export default class Switch extends DiscordBasePlugin {
         this._nullTeamIDWindowActive = false;
         this._nullTeamIDWindowTimeout = null;
         this._pendingSwitchSources = new Map(); // Map<steamID, { source, time }>
+
+        // Layer tracking for liberal mode detection
+        this.currentLayerName = null;
+        this.currentGamemode = null;
+        this._liberalModes = [];
 
         this.models = {};
 
@@ -217,12 +234,25 @@ export default class Switch extends DiscordBasePlugin {
 
     async mount() {
         await this.models.PlayerCooldowns.sync({ alter: true });
+
+        // Initialize liberal mode substring list (lowercased for comparison)
+        this._liberalModes = (this.options.liberalSwitchGameModes || ['Seed', 'Jensen']).map(m => String(m).toLowerCase());
+
+        // Bootstrap layer info from server state at mount time
+        if (this.server.currentLayer?.name) {
+            this.currentLayerName = this.server.currentLayer.name;
+            this.currentGamemode = this.server.currentLayer.gamemode || null;
+            this.verbose(1, `[Layer] Bootstrapped from server.currentLayer at mount: ${this.currentLayerName} (${this.currentGamemode})`);
+        }
+
         this.server.on('CHAT_MESSAGE', this.onChatMessage);
         this.server.on('PLAYER_CONNECTED', this.onPlayerConnected);
         this.server.on('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
         this.server.on('ROUND_ENDED', this.onRoundEnded)
         this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
         this.server.on('NEW_GAME', this.onNewGame.bind(this));
+        this.server.on('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo.bind(this));
+        this.server.on('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated.bind(this));
         if (this.options.discordClient) {
             this.options.discordClient.on('message', this.onDiscordMessage);
         }
@@ -439,12 +469,21 @@ export default class Switch extends DiscordBasePlugin {
 
             await this.server.updateSquadList();
             await this.server.updatePlayerList();
-            const availableSwitchSlots = this.getSwitchSlotsPerTeam(teamID);
+
+            // Detect liberal mode
+            const isLiberal = this.isLiberalMode();
+            const effectiveCap = isLiberal ? this.options.liberalSwitchMaxUnbalancedSlots : null;
+            const availableSwitchSlots = this.getSwitchSlotsPerTeam(teamID, effectiveCap);
+
             this.verbose(1, playerName, 'requested a switch');
             this.verbose(1, `Team (${teamID}) balance difference:`, availableSwitchSlots);
+            if (isLiberal) {
+                this.verbose(1, `[Liberal Mode] ${playerName} - relaxed switch restrictions active (Seed/Jensen).`);
+            }
 
             const cooldownData = await this.models.PlayerCooldowns.findByPk(steamID);
 
+            // Scramble lockdown is ALWAYS enforced, regardless of mode
             if (cooldownData && cooldownData.scrambleLockdownExpiry && new Date() < cooldownData.scrambleLockdownExpiry) {
                 const remaining = Math.ceil((cooldownData.scrambleLockdownExpiry - Date.now()) / 60000);
                 this.warn(steamID, `Scramble Lock: Cannot switch for ${remaining}m.`);
@@ -452,23 +491,29 @@ export default class Switch extends DiscordBasePlugin {
                 return;
             }
 
-            // Logic check updated for persistent join time
-            if (connectionSeconds / 60 > this.options.switchEnabledMinutes && this.getSecondsFromMatchStart() / 60 > this.options.switchEnabledMinutes) {
-                this.warn(steamID, `Time Limit: Switch allowed only in first ${this.options.switchEnabledMinutes}m of join/match.`);
-                this.verbose(1, `[Switch] Denied ${playerName}: Match time limit exceeded.`);
-                return;
+            // Time window check - SKIPPED in liberal mode
+            if (!isLiberal) {
+                if (connectionSeconds / 60 > this.options.switchEnabledMinutes && this.getSecondsFromMatchStart() / 60 > this.options.switchEnabledMinutes) {
+                    this.warn(steamID, `Time Limit: Switch allowed only in first ${this.options.switchEnabledMinutes}m of join/match.`);
+                    this.verbose(1, `[Switch] Denied ${playerName}: Match time limit exceeded.`);
+                    return;
+                }
             }
 
-            const cooldownDuration = this.options.switchCooldownMinutes > 0 ? this.options.switchCooldownMinutes * 60 * 1000 : this.options.switchCooldownHours * 60 * 60 * 1000;
+            // Cooldown check - SKIPPED in liberal mode
+            if (!isLiberal) {
+                const cooldownDuration = this.options.switchCooldownMinutes > 0 ? this.options.switchCooldownMinutes * 60 * 1000 : this.options.switchCooldownHours * 60 * 60 * 1000;
 
-            if (cooldownData && cooldownData.lastSwitchTimestamp &&
-                (Date.now() - new Date(cooldownData.lastSwitchTimestamp).getTime()) < cooldownDuration) {
-                const remaining = Math.ceil((cooldownDuration - (Date.now() - new Date(cooldownData.lastSwitchTimestamp).getTime())) / 60000);
-                this.warn(steamID, `Cooldown: Please wait ${remaining}m.`);
-                this.verbose(1, `[Switch] Denied ${playerName}: Cooldown active.`);
-                return;
+                if (cooldownData && cooldownData.lastSwitchTimestamp &&
+                    (Date.now() - new Date(cooldownData.lastSwitchTimestamp).getTime()) < cooldownDuration) {
+                    const remaining = Math.ceil((cooldownDuration - (Date.now() - new Date(cooldownData.lastSwitchTimestamp).getTime())) / 60000);
+                    this.warn(steamID, `Cooldown: Please wait ${remaining}m.`);
+                    this.verbose(1, `[Switch] Denied ${playerName}: Cooldown active.`);
+                    return;
+                }
             }
 
+            // Balance check (applies to both modes, but uses different cap)
             if (availableSwitchSlots <= 0) {
                 this.warn(steamID, `Balance Limit: Teams would become too unbalanced.`);
                 this.verbose(1, `[Switch] Denied ${playerName}: Teams unbalanced.`);
@@ -500,12 +545,16 @@ export default class Switch extends DiscordBasePlugin {
             }
 
             if (switchSuccess) {
-                try {
-                    await this.safeTransaction(async (t) => {
-                        await this.models.PlayerCooldowns.upsert({ steamID, playerName, lastSwitchTimestamp: new Date() }, { transaction: t });
-                    });
-                } catch (dbErr) {
-                    this.verbose(1, `[Switch] Database update failed: ${dbErr.message}`);
+                // In liberal mode, don't write cooldown timestamp (no cooldown enforcement)
+                // In normal mode, write cooldown timestamp for next switch throttling
+                if (!isLiberal) {
+                    try {
+                        await this.safeTransaction(async (t) => {
+                            await this.models.PlayerCooldowns.upsert({ steamID, playerName, lastSwitchTimestamp: new Date() }, { transaction: t });
+                        });
+                    } catch (dbErr) {
+                        this.verbose(1, `[Switch] Database update failed: ${dbErr.message}`);
+                    }
                 }
                 
                 this.verbose(1, `[Switch] Executed for ${playerName}.`);
@@ -553,9 +602,76 @@ export default class Switch extends DiscordBasePlugin {
         return balanceDiff;
     }
 
-    getSwitchSlotsPerTeam(teamID) {
+    /**
+     * HELPER: Detect if we're in a liberal switching mode (Seed/Jensen).
+     * Checks both cached layer name and gamemode against the liberal modes list.
+     */
+    isLiberalMode() {
+        const checkLayer = (this.currentLayerName || '').toLowerCase();
+        const checkMode = (this.currentGamemode || '').toLowerCase();
+        return this._liberalModes.some(m => checkLayer.includes(m) || checkMode.includes(m));
+    }
+
+    /**
+     * UPDATED: getSwitchSlotsPerTeam with optional cap parameter.
+     * If effectiveCap is provided, uses it instead of maxUnbalancedSlots.
+     * Also respects the 50v50 ceiling: never lets a team exceed 50 players.
+     */
+    getSwitchSlotsPerTeam(teamID, effectiveCap = null) {
         const balanceDifference = this.getTeamBalanceDifference();
-        return (this.options.maxUnbalancedSlots) - (teamID == 1 ? -balanceDifference : balanceDifference);
+        const cap = effectiveCap !== null ? effectiveCap : this.options.maxUnbalancedSlots;
+        let slots = cap - (teamID == 1 ? -balanceDifference : balanceDifference);
+
+        // Apply 50v50 ceiling: if receiving team would exceed 50, clamp slots to prevent it
+        let teamPlayerCount = [null, 0, 0];
+        for (let p of this.server.players)
+            teamPlayerCount[+p.teamID]++;
+
+        const receivingTeamSize = teamPlayerCount[teamID] || 0;
+        if (receivingTeamSize + slots > 50) {
+            slots = Math.max(0, 50 - receivingTeamSize);
+        }
+
+        return slots;
+    }
+
+    /**
+     * EVENT: UPDATED_LAYER_INFORMATION (Layer Sync)
+     * Maintains currentLayerName and currentGamemode for liberal mode detection.
+     */
+    async onUpdatedLayerInfo() {
+        const name = this.server.currentLayer?.name || null;
+        const mode = this.server.currentLayer?.gamemode || null;
+
+        if (name) {
+            this.currentLayerName = name;
+            this.currentGamemode = mode;
+            this.verbose(1, `[Layer] Updated layer cache: ${name} (${mode})`);
+        }
+    }
+
+    /**
+     * EVENT: UPDATED_SERVER_INFORMATION (Secondary Layer Resolution)
+     * Provides a backup path if UPDATED_LAYER_INFORMATION misses the update.
+     */
+    async onServerInfoUpdated(info) {
+        try {
+            if (info && info.currentLayer) {
+                const incomingName = typeof info.currentLayer === 'string'
+                    ? info.currentLayer
+                    : info.currentLayer?.name;
+
+                if (incomingName) {
+                    this.currentLayerName = incomingName;
+                    if (typeof info.currentLayer === 'object' && info.currentLayer.gamemode) {
+                        this.currentGamemode = info.currentLayer.gamemode;
+                    }
+                    this.verbose(1, `[Layer] Updated from server info: ${incomingName}`);
+                }
+            }
+        } catch (err) {
+            this.verbose(1, `[onServerInfoUpdated] Error resolving layer: ${err?.message}`);
+        }
     }
 
     async getSecondsFromJoin(steamID) {
@@ -904,6 +1020,11 @@ export default class Switch extends DiscordBasePlugin {
             this._nullTeamIDWindowActive = false;
             this.verbose(1, '[NEW_GAME] Null-teamID window safety timeout triggered.');
         }, 60_000);
+        
+        // Clear layer cache for new round (will be populated by UPDATED_LAYER_INFORMATION)
+        this.currentLayerName = null;
+        this.currentGamemode = null;
+        
         this.verbose(1, '[NEW_GAME] Null-teamID window opened (players may have null teamID for up to 30s).');
     }
 
@@ -914,6 +1035,8 @@ export default class Switch extends DiscordBasePlugin {
         this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
         this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
         this.server.removeListener('NEW_GAME', this.onNewGame.bind(this));
+        this.server.removeListener('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo.bind(this));
+        this.server.removeListener('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated.bind(this));
         if (this.options.discordClient) this.options.discordClient.removeListener('message', this.onDiscordMessage);
         clearTimeout(this._nullTeamIDWindowTimeout);
         this.verbose(1, 'Switch plugin was un-mounted.');
