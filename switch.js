@@ -398,7 +398,12 @@ export default class Switch extends DiscordBasePlugin {
                     if (isAdmin) {
                         this.warn(steamID, "--- Admin Controls --- \n Player: now, double, matchend, check, clear \n Squad: squad, doublesquad, matchendsquad");
                     } else {
-                        this.warn(steamID, `Usage: !switch | Status: Available first ${this.options.switchEnabledMinutes} mins of match/join.`);
+                        const liberalMode = this.isLiberalMode();
+                        if (liberalMode) {
+                            this.warn(steamID, `Usage: !switch | Seed/Jensen mode active: no time or cooldown limits. Switch freely (balance rules still apply).`);
+                        } else {
+                            this.warn(steamID, `Usage: !switch | Available first ${this.options.switchEnabledMinutes} mins of match/join.`);
+                        }
                     }
                     break;
                 case "check":
