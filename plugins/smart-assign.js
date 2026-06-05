@@ -161,27 +161,28 @@ export default class SmartAssign extends BasePlugin {
     });
     this.eventLogger = new SAEventLogger(options, this.db);
 
-    this.knownPlayers = new Map();
-    this._joiningPlayers = new Set();
-    this._sessionJoinTimes = new Map();
-    this._snapshotTaken = false;
-     this.phase = 'active'; // 'active' | 'game_end' | 'resolving'
+     this.knownPlayers = new Map();
+     this._joiningPlayers = new Set();
+     this._sessionJoinTimes = new Map();
+     this._snapshotTaken = false;
+      this.phase = 'active'; // 'active' | 'game_end' | 'resolving'
                               // NOTE: 'resolving' is an internal staging sub-state (null-teamID window after NEW_GAME).
                               // It represents early staging before teams stabilize, and is layered atop the reference's
                               // 'active' phase. The two externally-observable phases are 'active' (includes staging + live)
                               // and 'game_end' (maps to 'between_rounds' in the dev reference).
-     this.currentLayerName = null;
-     this.currentGamemode = null;
-     this.previousRoundLayerName = null;  // Captured at ROUND_ENDED for reliable finalization
-     this.previousRoundGamemode = null;   // Captured at ROUND_ENDED for reliable finalization
-    this._pendingAssignments = { 1: 0, 2: 0 };
-    this._pendingMu = { 1: 0, 2: 0 };
-    this._pendingVeterans = { 1: 0, 2: 0 };
-    this._pendingPlayerMoves = new Map();
-    this.currentRoundStartTime = null;
-    this.ready = false;
-    this.initialSyncComplete = false;
-    this._isFinalizingRound = false;
+      this.currentLayerName = null;
+      this.currentGamemode = null;
+      this.previousRoundLayerName = null;  // Captured at ROUND_ENDED for reliable finalization
+      this.previousRoundGamemode = null;   // Captured at ROUND_ENDED for reliable finalization
+     this._pendingAssignments = { 1: 0, 2: 0 };
+     this._pendingMu = { 1: 0, 2: 0 };
+     this._pendingVeterans = { 1: 0, 2: 0 };
+     this._pendingPlayerMoves = new Map();
+     this.currentRoundStartTime = null;
+     this.ready = false;
+     this.initialSyncComplete = false;
+     this._isFinalizingRound = false;
+     this._externalMoveMap = new Map(); // Map<steamID, { source, targetTeamID, time }> for per-player attribution
 
     // ═══════════════════════════════════════════════════════════════════════════
     // OPTIMIZATION: Debounced Forced RCON Poll
@@ -328,16 +329,18 @@ export default class SmartAssign extends BasePlugin {
       this._snapshotTaken = false;
     }
 
-     this.server.on('NEW_GAME', this.onNewGame);
-     this.server.on('ROUND_ENDED', this.onRoundEnded);
-     this.server.on('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
-     this.server.on('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo);
-     this.server.on('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated);
-     this.server.on('PLAYER_CONNECTED', this.onPlayerConnected);
-     this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
-     this.server.on('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
-     this.server.on('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
-     this.server.on('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
+      this.server.on('NEW_GAME', this.onNewGame);
+      this.server.on('ROUND_ENDED', this.onRoundEnded);
+      this.server.on('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
+      this.server.on('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo);
+      this.server.on('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated);
+      this.server.on('PLAYER_CONNECTED', this.onPlayerConnected);
+      this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
+      this.server.on('TEAM_BALANCER_PLAYER_MOVED', this.onExternalPlayerMoved);
+      this.server.on('SWITCH_PLUGIN_PLAYER_MOVED', this.onExternalPlayerMoved);
+      this.server.on('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
+      this.server.on('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
+      this.server.on('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
 
      // ═══════════════════════════════════════════════════════════════════════════════════
      // LAYER INFO BOOTSTRAP: Initialize layer caches from server state at mount time
@@ -362,16 +365,18 @@ export default class SmartAssign extends BasePlugin {
     if (this._pendingPlayerListUpdate) clearTimeout(this._pendingPlayerListUpdate);
     this.eventLogger.cleanup();
     await this.finalizeRoundLog();
-    this.server.removeListener('NEW_GAME', this.onNewGame);
-    this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
-    this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
-    this.server.removeListener('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo);
-    this.server.removeListener('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated);
-    this.server.removeListener('PLAYER_CONNECTED', this.onPlayerConnected);
-    this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
-    this.server.removeListener('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
-    this.server.removeListener('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
-    this.server.removeListener('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
+     this.server.removeListener('NEW_GAME', this.onNewGame);
+     this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
+     this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
+     this.server.removeListener('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo);
+     this.server.removeListener('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated);
+     this.server.removeListener('PLAYER_CONNECTED', this.onPlayerConnected);
+     this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
+     this.server.removeListener('TEAM_BALANCER_PLAYER_MOVED', this.onExternalPlayerMoved);
+     this.server.removeListener('SWITCH_PLUGIN_PLAYER_MOVED', this.onExternalPlayerMoved);
+     this.server.removeListener('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
+     this.server.removeListener('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
+     this.server.removeListener('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
     this._pendingPlayerMoves.clear();
     this.executor.cleanup();
     Logger.verbose('SmartAssign', 1, 'SmartAssign unmounted.');
@@ -685,8 +690,15 @@ export default class SmartAssign extends BasePlugin {
 
    async onScrambleExecuted() {
      if (!this.ready) return;
-     Logger.verbose('SmartAssign', 1, 'TeamBalancer Scramble detected. Marking team changes as Team-Balancer source for the next 20 seconds.');
-     this.scrambleEndTime = Date.now() + 20000;
+     Logger.verbose('SmartAssign', 1, 'TeamBalancer Scramble detected. Scramble moves will be recorded via TEAM_BALANCER_PLAYER_MOVED events.');
+   }
+
+   async onExternalPlayerMoved(data) {
+     if (!this.ready) return;
+     const { steamID, targetTeamID, source } = data;
+     // Record the external move source for per-player attribution
+     this._externalMoveMap.set(steamID, { source, targetTeamID, time: Date.now() });
+     Logger.verbose('SmartAssign', 3, `[ExternalMove] Recorded ${source} move for ${steamID} -> Team ${targetTeamID}`);
    }
 
   async onMoveFailed(data) {
@@ -924,21 +936,27 @@ export default class SmartAssign extends BasePlugin {
           // In both cases, silently update tracked state without firing an event.
           if (kp.teamID === null || kp.teamID === undefined || p.teamID === null || p.teamID === undefined) {
             kp.teamID = p.teamID; // Silent state update only
-          } else {
-            let source = 'Manual/Game';
-            
-            // Smart-Assign moves take precedence over the Scramble Window to prevent mis-attribution
-            // if an auto-assigned reconnect happens to land exactly during a Team-Balancer scramble event.
-            if (this.executor.isRecentSmartAssignMove(p.steamID, p.teamID)) {
-              source = 'Smart-Assign';
-            } else if (this.scrambleEndTime && Date.now() < this.scrambleEndTime) {
-              source = 'Team-Balancer';
-            }
+           } else {
+             let source = 'Manual/Game';
+             
+             // Smart-Assign moves take precedence to prevent mis-attribution if an auto-assigned reconnect 
+             // happens to land exactly during an external move event window.
+             if (this.executor.isRecentSmartAssignMove(p.steamID, p.teamID)) {
+               source = 'Smart-Assign';
+             } else if (this._externalMoveMap.has(p.steamID)) {
+               // Check for per-player external move attribution (Team-Balancer or Switch plugin)
+               const externalMove = this._externalMoveMap.get(p.steamID);
+               if (externalMove && externalMove.targetTeamID === p.teamID) {
+                 source = externalMove.source;
+                 // Consume the move to prevent re-attribution on subsequent team changes
+                 this._externalMoveMap.delete(p.steamID);
+               }
+             }
 
-            const oldTeamID = kp.teamID;
-            kp.teamID = p.teamID;
-            batchPromises.push(this.handleTeamChange(p, oldTeamID, p.teamID, source));
-          }
+             const oldTeamID = kp.teamID;
+             kp.teamID = p.teamID;
+             batchPromises.push(this.handleTeamChange(p, oldTeamID, p.teamID, source));
+           }
         }
         if (String(kp.squadID) !== String(p.squadID)) {
           kp.squadID = p.squadID;
