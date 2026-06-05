@@ -996,7 +996,8 @@ export default class Switch extends DiscordBasePlugin {
         // Compute target team (opposite of current)
         const player = this.server.players.find(p => p.steamID === steamID);
         const currentTeam = player?.teamID;
-        const targetTeam = currentTeam === 1 ? 2 : currentTeam === 2 ? 1 : null;
+        const currentTeamNum = Number(currentTeam);
+        const targetTeam = currentTeamNum === 1 ? 2 : currentTeamNum === 2 ? 1 : null;
         
         // Store the pending switch source with a 15-second TTL
         this._pendingSwitchSources.set(steamID, { source, targetTeamID: targetTeam, time: Date.now() });
