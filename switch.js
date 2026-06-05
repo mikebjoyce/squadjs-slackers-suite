@@ -480,8 +480,19 @@ export default class Switch extends DiscordBasePlugin {
             const effectiveCap = isLiberal ? this.options.liberalSwitchMaxUnbalancedSlots : null;
             const availableSwitchSlots = this.getSwitchSlotsPerTeam(teamID, effectiveCap);
 
+            // Enhanced logging: show current team and target team
+            const targetTeam = teamID === 1 ? 2 : 1;
+            let teamPlayerCount = [null, 0, 0];
+            for (let p of this.server.players) {
+                teamPlayerCount[+p.teamID]++;
+            }
+            const balanceDiff = teamPlayerCount[1] - teamPlayerCount[2];
+            const effectiveMaxSlots = effectiveCap !== null ? effectiveCap : this.options.maxUnbalancedSlots;
+
             this.verbose(1, playerName, 'requested a switch');
-            this.verbose(1, `Team (${teamID}) balance difference:`, availableSwitchSlots);
+            this.verbose(1, `[Current Team] ${playerName} is on Team ${teamID}, switching to Team ${targetTeam}`);
+            this.verbose(1, `[Team Counts] Team 1: ${teamPlayerCount[1]} | Team 2: ${teamPlayerCount[2]} | Balance Diff: ${balanceDiff}`);
+            this.verbose(1, `[Switch Slots] Max Unbalance Cap: ${effectiveMaxSlots} | Available Slots: ${availableSwitchSlots}`);
             if (isLiberal) {
                 this.verbose(1, `[Liberal Mode] ${playerName} - relaxed switch restrictions active (Seed/Jensen).`);
             }
