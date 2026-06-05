@@ -943,11 +943,11 @@ export default class SmartAssign extends BasePlugin {
              // happens to land exactly during an external move event window.
              if (this.executor.isRecentSmartAssignMove(p.steamID, p.teamID)) {
                source = 'Smart-Assign';
-             } else if (this._externalMoveMap.has(p.steamID)) {
-               // Check for per-player external move attribution (Team-Balancer or Switch plugin)
-               const externalMove = this._externalMoveMap.get(p.steamID);
-               if (externalMove && externalMove.targetTeamID === p.teamID) {
-                 source = externalMove.source;
+              } else if (this._externalMoveMap.has(p.steamID)) {
+                // Check for per-player external move attribution (Team-Balancer or Switch plugin)
+                const externalMove = this._externalMoveMap.get(p.steamID);
+                if (externalMove && String(externalMove.targetTeamID) === String(p.teamID)) {
+                  source = externalMove.source;
                  // Consume the move to prevent re-attribution on subsequent team changes
                  this._externalMoveMap.delete(p.steamID);
                }
