@@ -149,7 +149,6 @@ export default class Switch extends DiscordBasePlugin {
         this._switchedOnJoin = new Set();
         this._nullTeamIDWindowActive = false;
         this._nullTeamIDWindowTimeout = null;
-        this._pendingSwitchSources = new Map(); // Map<steamID, { source, time }>
 
         // Layer tracking for liberal mode detection
         this.currentLayerName = null;
@@ -988,38 +987,57 @@ export default class Switch extends DiscordBasePlugin {
     }
 
     /**
-     * Records the source of a player switch and schedules event emission after RCON execution.
+     * Records the source of a player switch and emits attribution event BEFORE RCON execution.
      * Automatically computes the target team (opposite of current team).
      * Sources: 'Player-Self', 'Admin-Force', 'Switch-Double-Swap', 'Switch-Rejoin'
+     * 
+     * CRITICAL: Event is emitted BEFORE RCON fires to ensure SmartAssign's _externalMoveMap
+     * is populated before UPDATED_PLAYER_INFORMATION polling detects the team change.
      */
     async _taggedSwitchPlayer(steamID, source) {
+        const executionTimestamp = Date.now();
+        
         // Compute target team (opposite of current)
         const player = this.server.players.find(p => p.steamID === steamID);
+        if (!player) {
+          this.verbose(1, `[Switch] WARNING: Player with steamID ${steamID} not found in server.players for source=${source}`);
+          return null;
+        }
+        
         const currentTeam = player?.teamID;
         const currentTeamNum = Number(currentTeam);
         const targetTeam = currentTeamNum === 1 ? 2 : currentTeamNum === 2 ? 1 : null;
         
-        // Store the pending switch source with a 15-second TTL
-        this._pendingSwitchSources.set(steamID, { source, targetTeamID: targetTeam, time: Date.now() });
+        this.verbose(2, `[Switch] EXECUTING: player=${player.name} (${steamID}), source=${source}, currentTeam=${currentTeam}, targetTeam=${targetTeam}, timestamp=${executionTimestamp}`);
+        
+        // Guard against null team ID
+        if (targetTeam === null) {
+          this.verbose(1, `[Switch] ERROR: Cannot switch player ${player.name} - currentTeam is null or invalid (value=${currentTeam})`);
+          return null;
+        }
+        
+        // ═════════════════════════════════════════════════════════════════════════════
+        // EMIT BEFORE RCON: Attribution event must reach SmartAssign's _externalMoveMap
+        // BEFORE the team change is detected by UPDATED_PLAYER_INFORMATION polling.
+        // ═════════════════════════════════════════════════════════════════════════════
+        this.verbose(1, `[Attribution] SWITCH emitting PLAYER_MOVED_BY_PLUGIN: player=${player.name} (${steamID}), sourceTeam=${currentTeam}, targetTeam=${targetTeam}, source='${source}'`);
+        this.server.emit('PLAYER_MOVED_BY_PLUGIN', {
+            eosID: player.eosID,
+            steamID,
+            name: player.name,
+            sourceTeamID: currentTeam,
+            targetTeamID: targetTeam,
+            source: source,
+            timestamp: executionTimestamp
+        });
+        this.verbose(2, `[Switch] EVENT EMITTED: PLAYER_MOVED_BY_PLUGIN registered for attribution (TTL=30s)`);
         
         try {
             const result = await this.server.rcon.execute(`AdminForceTeamChange ${steamID}`);
-            
-            // After RCON succeeds, emit the event immediately
-            const entry = this._pendingSwitchSources.get(steamID);
-            if (entry && entry.targetTeamID) {
-                this.server.emit('SWITCH_PLUGIN_PLAYER_MOVED', {
-                    steamID,
-                    targetTeamID: entry.targetTeamID,
-                    source: entry.source
-                });
-            }
-            this._pendingSwitchSources.delete(steamID);
-            
+            this.verbose(3, `[Switch] RCON SUCCESS: AdminForceTeamChange returned for ${steamID}`);
             return result;
         } catch (err) {
-            // On error, remove the pending entry
-            this._pendingSwitchSources.delete(steamID);
+            this.verbose(1, `[Switch] ERROR: AdminForceTeamChange failed for ${player.name} (${steamID}): ${err.message}`);
             throw err;
         }
     }
