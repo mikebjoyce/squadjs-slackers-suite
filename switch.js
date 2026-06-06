@@ -108,6 +108,24 @@ export default class Switch extends DiscordBasePlugin {
                 description: "Balance cap during liberal modes (e.g., Seed/Jensen). Allows more permissive switching up to a ceiling of 50v50.",
                 default: 6,
                 type: 'number'
+            },
+            dynamicBalanceTolerance: {
+                required: false,
+                description: "Enable interpolated extra imbalance tolerance when server is below full capacity (default: off). Scales from floor to 98 players.",
+                default: false,
+                type: 'boolean'
+            },
+            dynamicBalancePlayerFloor: {
+                required: false,
+                description: "Total player count at which maximum extra tolerance kicks in (default 90). Below this, full extra slots apply.",
+                default: 90,
+                type: 'number'
+            },
+            dynamicBalanceExtraSlots: {
+                required: false,
+                description: "Additional allowed imbalance slots at the floor player count (default 2). Linearly interpolated between floor and 98 players.",
+                default: 2,
+                type: 'number'
             }
         };
     }
@@ -627,14 +645,49 @@ export default class Switch extends DiscordBasePlugin {
         return this._liberalModes.some(m => checkLayer.includes(m) || checkMode.includes(m));
     }
 
+    /**
+     * HELPER: Compute dynamic extra tolerance slots based on current player count.
+     * Interpolates linearly between floor (full extra slots) and 98 players (no extra slots).
+     * Uses Math.round for smooth transitions.
+     */
+    getDynamicExtraSlots() {
+        if (!this.options.dynamicBalanceTolerance) return 0;
+
+        const UPPER_BOUND = 98;
+        const floor = this.options.dynamicBalancePlayerFloor;
+        const extra = this.options.dynamicBalanceExtraSlots;
+
+        let totalPlayers = 0;
+        for (let p of this.server.players) totalPlayers++;
+
+        // At or above upper bound: no extra tolerance
+        if (totalPlayers >= UPPER_BOUND) return 0;
+        
+        // At or below floor: full extra tolerance
+        if (totalPlayers <= floor) return extra;
+        
+        // Between floor and upper bound: linearly interpolate with Math.round
+        const interpolated = extra * (UPPER_BOUND - totalPlayers) / (UPPER_BOUND - floor);
+        return Math.round(interpolated);
+    }
+
      /**
       * UPDATED: getSwitchSlotsPerTeam with optional cap parameter.
       * If effectiveCap is provided, uses it instead of maxUnbalancedSlots.
+      * Applies dynamic balance tolerance if enabled (interpolated extra slots).
       * Also respects the 50v50 ceiling: never lets a team exceed 50 players.
       */
      getSwitchSlotsPerTeam(teamID, effectiveCap = null) {
          const balanceDifference = this.getTeamBalanceDifference();
-         const cap = effectiveCap !== null ? effectiveCap : this.options.maxUnbalancedSlots;
+         let cap = effectiveCap !== null ? effectiveCap : this.options.maxUnbalancedSlots;
+         
+         // Apply dynamic extra tolerance if enabled
+         const dynamicExtra = this.getDynamicExtraSlots();
+         if (dynamicExtra > 0) {
+             cap += dynamicExtra;
+             this.verbose(2, `[Dynamic Balance] Total players: ${this.server.players.length} | Extra slots: +${dynamicExtra} | Effective cap: ${cap}`);
+         }
+         
          let slots = cap - (teamID == 1 ? -balanceDifference : balanceDifference);
 
          // Apply 50v50 ceiling: if receiving team would exceed 50, clamp slots to prevent it
