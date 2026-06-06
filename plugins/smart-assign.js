@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v1.1.0                   ║
+ * ║                  SMART ASSIGN PLUGIN v1.1.1                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -82,7 +82,7 @@ import { buildPlayerTagCache, extractRawPrefix } from '../utils/sa-clan-grouper.
 const MAX_TEAM_SIZE = 50;
 
 export default class SmartAssign extends BasePlugin {
-  static version = '1.1.0';
+  static version = '1.1.1';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
@@ -263,6 +263,7 @@ export default class SmartAssign extends BasePlugin {
      this.onServerInfoUpdated = this.onServerInfoUpdated.bind(this);
      this.onPlayerConnected = this.onPlayerConnected.bind(this);
      this.onScrambleExecuted = this.onScrambleExecuted.bind(this);
+     this.onExternalPlayerMoved = this.onExternalPlayerMoved.bind(this);
      this.onMoveFailed = this.onMoveFailed.bind(this);
      this.onMoveSuccess = this.onMoveSuccess.bind(this);
      this.onMoveRetry = this.onMoveRetry.bind(this);
@@ -336,8 +337,7 @@ export default class SmartAssign extends BasePlugin {
       this.server.on('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated);
       this.server.on('PLAYER_CONNECTED', this.onPlayerConnected);
       this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
-      this.server.on('TEAM_BALANCER_PLAYER_MOVED', this.onExternalPlayerMoved);
-      this.server.on('SWITCH_PLUGIN_PLAYER_MOVED', this.onExternalPlayerMoved);
+      this.server.on('PLAYER_MOVED_BY_PLUGIN', this.onExternalPlayerMoved);
       this.server.on('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
       this.server.on('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
       this.server.on('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
@@ -372,8 +372,7 @@ export default class SmartAssign extends BasePlugin {
      this.server.removeListener('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated);
      this.server.removeListener('PLAYER_CONNECTED', this.onPlayerConnected);
      this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
-     this.server.removeListener('TEAM_BALANCER_PLAYER_MOVED', this.onExternalPlayerMoved);
-     this.server.removeListener('SWITCH_PLUGIN_PLAYER_MOVED', this.onExternalPlayerMoved);
+     this.server.removeListener('PLAYER_MOVED_BY_PLUGIN', this.onExternalPlayerMoved);
      this.server.removeListener('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
      this.server.removeListener('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
      this.server.removeListener('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
@@ -688,18 +687,54 @@ export default class SmartAssign extends BasePlugin {
      }
    }
 
-   async onScrambleExecuted() {
-     if (!this.ready) return;
-     Logger.verbose('SmartAssign', 1, 'TeamBalancer Scramble detected. Scramble moves will be recorded via TEAM_BALANCER_PLAYER_MOVED events.');
-   }
+    async onScrambleExecuted() {
+      if (!this.ready) return;
+      Logger.verbose('SmartAssign', 1, 'TeamBalancer Scramble detected. Scramble moves will be recorded via PLAYER_MOVED_BY_PLUGIN events.');
+    }
 
-   async onExternalPlayerMoved(data) {
-     if (!this.ready) return;
-     const { steamID, targetTeamID, source } = data;
-     // Record the external move source for per-player attribution
-     this._externalMoveMap.set(steamID, { source, targetTeamID, time: Date.now() });
-     Logger.verbose('SmartAssign', 3, `[ExternalMove] Recorded ${source} move for ${steamID} -> Team ${targetTeamID}`);
-   }
+    async onExternalPlayerMoved(data) {
+      if (!this.ready) return;
+      const { eosID, steamID, name, sourceTeamID, targetTeamID } = data;
+      const source = data.source || (data.event || 'Unknown');
+      const recordedTime = Date.now();
+      
+      // Normalize steamID lookup (prefer steamID as primary key, fall back to eosID)
+      // CRITICAL: Use steamID as primary key because onUpdatedPlayerInfo looks up by p.steamID
+      const playerIdentifier = steamID || eosID;
+      if (!playerIdentifier) {
+        Logger.verbose('SmartAssign', 1, `[ExternalMove] WARNING: Received PLAYER_MOVED_BY_PLUGIN event with no eosID or steamID. Data: ${JSON.stringify(data)}`);
+        return;
+      }
+      
+      Logger.verbose('SmartAssign', 1, `[Attribution] RECEIVED PLAYER_MOVED_BY_PLUGIN: source=${source}, player=${name || playerIdentifier}, sourceTeam=${sourceTeamID}, targetTeam=${targetTeamID}, key=${playerIdentifier}`);
+      
+      // Record the external move with TTL for attribution window (30 seconds)
+      this._externalMoveMap.set(playerIdentifier, { 
+        eosID, 
+        steamID, 
+        name,
+        source, 
+        sourceTeamID,
+        targetTeamID, 
+        timestamp: recordedTime,
+        ttlExpiry: recordedTime + (30 * 1000) // 30 second TTL
+      });
+      
+      Logger.verbose('SmartAssign', 3, `[ExternalMove] RECORDED: ${playerIdentifier} -> stored with 30s TTL expiry at ${new Date(recordedTime + 30000).toISOString()}`);
+      
+      // Clean up expired entries from _externalMoveMap (every time an external move is recorded)
+      let expiredCount = 0;
+      for (const [key, value] of this._externalMoveMap.entries()) {
+        if (value.ttlExpiry && Date.now() > value.ttlExpiry) {
+          Logger.verbose('SmartAssign', 4, `[ExternalMove] EXPIRED: Removing stale entry for ${key} (TTL expired at ${new Date(value.ttlExpiry).toISOString()})`);
+          this._externalMoveMap.delete(key);
+          expiredCount++;
+        }
+      }
+      if (expiredCount > 0) {
+        Logger.verbose('SmartAssign', 3, `[ExternalMove] Cleaned up ${expiredCount} expired entries. Map now has ${this._externalMoveMap.size} active entries.`);
+      }
+    }
 
   async onMoveFailed(data) {
     if (!this.ready) return;
@@ -938,21 +973,59 @@ export default class SmartAssign extends BasePlugin {
             kp.teamID = p.teamID; // Silent state update only
            } else {
              let source = 'Manual/Game';
+             let attributionReason = 'Default (Manual/Game)';
+             
+             // ═══════════════════════════════════════════════════════════════════════════
+             // ATTRIBUTION DECISION LOGGING
+             // 
+             // Decision Tree:
+             //   1. isRecentSmartAssignMove() — did SmartAssign execute this move recently?
+             //   2. _externalMoveMap lookup — did Team-Balancer or Switch emit event for this player?
+             //   3. Default to Manual/Game — no attribution source found
+             // ═══════════════════════════════════════════════════════════════════════════
+             
+             const isSmartAssignMove = this.executor.isRecentSmartAssignMove(p.steamID, p.teamID);
+             Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${p.steamID}): isRecentSmartAssignMove=${isSmartAssignMove}`);
              
              // Smart-Assign moves take precedence to prevent mis-attribution if an auto-assigned reconnect 
              // happens to land exactly during an external move event window.
-             if (this.executor.isRecentSmartAssignMove(p.steamID, p.teamID)) {
+             if (isSmartAssignMove) {
                source = 'Smart-Assign';
-              } else if (this._externalMoveMap.has(p.steamID)) {
+               attributionReason = 'isRecentSmartAssignMove() = true';
+              } else {
                 // Check for per-player external move attribution (Team-Balancer or Switch plugin)
-                const externalMove = this._externalMoveMap.get(p.steamID);
-                if (externalMove && String(externalMove.targetTeamID) === String(p.teamID)) {
-                  source = externalMove.source;
-                 // Consume the move to prevent re-attribution on subsequent team changes
-                 this._externalMoveMap.delete(p.steamID);
-               }
-             }
+                const hasExternalMove = this._externalMoveMap.has(p.steamID);
+                Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${p.steamID}): _externalMoveMap.has=${hasExternalMove}, mapSize=${this._externalMoveMap.size}`);
+                
+                if (hasExternalMove) {
+                  const externalMove = this._externalMoveMap.get(p.steamID);
+                  Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${p.steamID}): externalMove event found: source=${externalMove.source}, sourceTeam=${externalMove.sourceTeamID}, targetTeam=${externalMove.targetTeamID}, timestamp=${new Date(externalMove.timestamp).toISOString()}, ttlExpiry=${new Date(externalMove.ttlExpiry).toISOString()}`);
+                  
+                  const isExpired = externalMove.ttlExpiry && Date.now() > externalMove.ttlExpiry;
+                  const isTargetMatch = String(externalMove.targetTeamID) === String(p.teamID);
+                  Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${p.steamID}): isExpired=${isExpired}, isTargetMatch=${isTargetMatch}`);
+                  
+                  if (externalMove && isTargetMatch && !isExpired) {
+                    source = externalMove.source;
+                    attributionReason = `externalMoveMap match: source=${externalMove.source}, targetTeam=${externalMove.targetTeamID}`;
+                    // Consume the move to prevent re-attribution on subsequent team changes
+                    this._externalMoveMap.delete(p.steamID);
+                    Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${p.steamID}): CONSUMED external move entry from map (now size=${this._externalMoveMap.size})`);
+                  } else if (isExpired) {
+                    attributionReason = 'externalMoveMap entry expired (TTL exceeded)';
+                    this._externalMoveMap.delete(p.steamID);
+                    Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${p.steamID}): Removed expired external move entry (was expired at ${new Date(externalMove.ttlExpiry).toISOString()})`);
+                  } else if (!isTargetMatch) {
+                    attributionReason = `externalMoveMap target mismatch: expected ${externalMove.targetTeamID}, got ${p.teamID}`;
+                    Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${p.steamID}): Target team mismatch, ignoring external move`);
+                  }
+                } else {
+                  attributionReason = 'No externalMoveMap entry found';
+                }
+              }
 
+             Logger.verbose('SmartAssign', 2, `[Attribution] ${p.name} (${p.steamID}): DECISION: source=${source}, reason=${attributionReason}`);
+             
              const oldTeamID = kp.teamID;
              kp.teamID = p.teamID;
              batchPromises.push(this.handleTeamChange(p, oldTeamID, p.teamID, source));

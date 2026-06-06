@@ -1,4 +1,4 @@
-# SmartAssign Plugin v1.1.0
+# SmartAssign Plugin v1.1.1
 
 **Elo-Aware Auto Assignment & Player Lifecycle Logger**
 
