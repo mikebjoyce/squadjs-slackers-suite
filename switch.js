@@ -177,9 +177,14 @@ export default class Switch extends DiscordBasePlugin {
         });
 
         this.createModel('PlayerCooldowns', {
+            eosID: {
+                type: DataTypes.STRING,
+                primaryKey: true,
+                allowNull: false
+            },
             steamID: {
                 type: DataTypes.STRING,
-                primaryKey: true
+                allowNull: true
             },
             playerName: {
                 type: DataTypes.STRING,
@@ -233,7 +238,7 @@ export default class Switch extends DiscordBasePlugin {
     }
 
     async mount() {
-        await this.models.PlayerCooldowns.sync({ alter: true });
+        await this.models.PlayerCooldowns.sync({ force: true });
 
         // Initialize liberal mode substring list (lowercased for comparison)
         this._liberalModes = (this.options.liberalSwitchGameModes || ['Seed', 'Jensen']).map(m => String(m).toLowerCase());
@@ -264,7 +269,7 @@ export default class Switch extends DiscordBasePlugin {
         }
         await super.prepareToMount();
         await this.models.Endmatch.sync();
-        await this.models.PlayerCooldowns.sync({ alter: true });
+        await this.models.PlayerCooldowns.sync({ force: true });
     }
 
     createModel(name, schema) {
@@ -444,7 +449,7 @@ export default class Switch extends DiscordBasePlugin {
                             return;
                         }
                         await this.safeTransaction(async (t) => {
-                            await this.models.PlayerCooldowns.destroy({ where: { steamID: result.steamID }, transaction: t });
+                            await this.models.PlayerCooldowns.destroy({ where: { eosID: result.eosID }, transaction: t });
                         });
                         this.warn(steamID, `Cleared cooldowns for ${result.playerName || result.steamID}`);
                     }
@@ -497,14 +502,35 @@ export default class Switch extends DiscordBasePlugin {
                 this.verbose(1, `[Liberal Mode] ${playerName} - relaxed switch restrictions active (Seed/Jensen).`);
             }
 
-            const cooldownData = await this.models.PlayerCooldowns.findByPk(steamID);
+             const eosID = info.player?.eosID;
+             if (!eosID) {
+                 this.verbose(1, `[PlayerCooldowns] Missing eosID for player ${playerName}, skipping switch validation`);
+                 return;
+             }
+             const cooldownData = await this.models.PlayerCooldowns.findByPk(eosID);
+             this.verbose(2, `[SCRAMBLE_CHECK] Fetched cooldown data for ${playerName} (${eosID}): ${JSON.stringify(cooldownData)}`);
 
             // Scramble lockdown is ALWAYS enforced, regardless of mode
+            if (cooldownData) {
+                this.verbose(2, `[SCRAMBLE_CHECK] cooldownData exists: ${cooldownData !== null}`);
+                this.verbose(2, `[SCRAMBLE_CHECK] scrambleLockdownExpiry: ${cooldownData.scrambleLockdownExpiry}`);
+                this.verbose(2, `[SCRAMBLE_CHECK] scrambleLockdownExpiry type: ${typeof cooldownData.scrambleLockdownExpiry}`);
+                if (cooldownData.scrambleLockdownExpiry) {
+                    const expiryDate = new Date(cooldownData.scrambleLockdownExpiry);
+                    const now = new Date();
+                    this.verbose(2, `[SCRAMBLE_CHECK] Expiry Date: ${expiryDate.toISOString()} | Now: ${now.toISOString()} | Expired? ${now >= expiryDate}`);
+                }
+            } else {
+                this.verbose(2, `[SCRAMBLE_CHECK] No cooldown data found for ${playerName} (${eosID})`);
+            }
+
             if (cooldownData && cooldownData.scrambleLockdownExpiry && new Date() < cooldownData.scrambleLockdownExpiry) {
                 const remaining = Math.ceil((cooldownData.scrambleLockdownExpiry - Date.now()) / 60000);
                 this.warn(steamID, `Scramble Lock: Cannot switch for ${remaining}m.`);
-                this.verbose(1, `[Switch] Denied ${playerName}: Scramble lockdown active.`);
+                this.verbose(1, `[SCRAMBLE_CHECK] ❌ DENIED ${playerName}: Scramble lockdown active - ${remaining}m remaining.`);
                 return;
+            } else {
+                this.verbose(2, `[SCRAMBLE_CHECK] ✅ PASSED: No active scramble lockdown for ${playerName}`);
             }
 
             // Time window check - SKIPPED in liberal mode
@@ -565,9 +591,14 @@ export default class Switch extends DiscordBasePlugin {
                 // In normal mode, write cooldown timestamp for next switch throttling
                 if (!isLiberal) {
                     try {
-                        await this.safeTransaction(async (t) => {
-                            await this.models.PlayerCooldowns.upsert({ steamID, playerName, lastSwitchTimestamp: new Date() }, { transaction: t });
-                        });
+                        const eosID = info.player?.eosID;
+                        if (!eosID) {
+                            this.verbose(1, `[PlayerCooldowns] Missing eosID for player ${playerName}, skipping cooldown write`);
+                        } else {
+                            await this.safeTransaction(async (t) => {
+                                await this.models.PlayerCooldowns.upsert({ eosID, steamID, playerName, lastSwitchTimestamp: new Date() }, { transaction: t });
+                            });
+                        }
                     } catch (dbErr) {
                         this.verbose(1, `[Switch] Database update failed: ${dbErr.message}`);
                     }
@@ -695,10 +726,14 @@ export default class Switch extends DiscordBasePlugin {
         let joinTime = this.playersConnectionTime[steamID];
 
         // 2. Check DB if memory is empty (e.g. after restart)
+        // Note: This method receives only steamID, so we search by steamID field
         if (!joinTime) {
-            const record = await this.models.PlayerCooldowns.findByPk(steamID);
-            if (record && record.firstSeenTimestamp) {
-                joinTime = new Date(record.firstSeenTimestamp).getTime();
+            const records = await this.models.PlayerCooldowns.findAll({
+                where: { steamID: steamID },
+                limit: 1
+            });
+            if (records.length > 0 && records[0].firstSeenTimestamp) {
+                joinTime = new Date(records[0].firstSeenTimestamp).getTime();
                 this.playersConnectionTime[steamID] = joinTime; // Hydrate memory
             }
         }
@@ -733,13 +768,19 @@ export default class Switch extends DiscordBasePlugin {
                     this.playersConnectionTime[p.steamID] = now;
                     // Persist to DB
                     try {
-                        await this.safeTransaction(async (t) => {
-                            await this.models.PlayerCooldowns.upsert({
-                                steamID: p.steamID,
-                                playerName: p.name,
-                                firstSeenTimestamp: new Date(now)
-                            }, { transaction: t });
-                        });
+                        const eosID = p.eosID;
+                        if (!eosID) {
+                            this.verbose(1, `[PlayerCooldowns] Missing eosID for player ${p.name}, skipping DB write`);
+                        } else {
+                            await this.safeTransaction(async (t) => {
+                                await this.models.PlayerCooldowns.upsert({
+                                    eosID: eosID,
+                                    steamID: p.steamID,
+                                    playerName: p.name,
+                                    firstSeenTimestamp: new Date(now)
+                                }, { transaction: t });
+                            });
+                        }
                     } catch (err) {
                         this.verbose(1, `Failed to persist join time for ${p.name} (detected via UPDATED_PLAYER_INFORMATION): ${err.message}`);
                     }
@@ -816,9 +857,12 @@ export default class Switch extends DiscordBasePlugin {
             // Retain join time across any short-term disconnection, regardless of team assignment
             if (!this.playersConnectionTime[steamID]) {
                 try {
-                    const record = await this.models.PlayerCooldowns.findByPk(steamID);
-                    if (record && record.firstSeenTimestamp) {
-                        this.playersConnectionTime[steamID] = new Date(record.firstSeenTimestamp).getTime();
+                    const records = await this.models.PlayerCooldowns.findAll({
+                        where: { steamID: steamID },
+                        limit: 1
+                    });
+                    if (records.length > 0 && records[0].firstSeenTimestamp) {
+                        this.playersConnectionTime[steamID] = new Date(records[0].firstSeenTimestamp).getTime();
                         this.verbose(1, `[Rejoin] ${playerName} retained join time from pre-disconnection.`);
                     } else {
                         this.playersConnectionTime[steamID] = now;
@@ -834,13 +878,19 @@ export default class Switch extends DiscordBasePlugin {
             this.playersConnectionTime[steamID] = now;
             
             try {
-                await this.safeTransaction(async (t) => {
-                    await this.models.PlayerCooldowns.upsert({
-                        steamID,
-                        playerName,
-                        firstSeenTimestamp: new Date(now)
-                    }, { transaction: t });
-                });
+                const eosID = info.player?.eosID;
+                if (!eosID) {
+                    this.verbose(1, `[PlayerCooldowns] Missing eosID for player ${playerName}, skipping DB write`);
+                } else {
+                    await this.safeTransaction(async (t) => {
+                        await this.models.PlayerCooldowns.upsert({
+                            eosID,
+                            steamID,
+                            playerName,
+                            firstSeenTimestamp: new Date(now)
+                        }, { transaction: t });
+                    });
+                }
             } catch (err) {
                 this.verbose(1, `Failed to persist join time for ${playerName}: ${err.message}`);
             }
@@ -1159,29 +1209,75 @@ export default class Switch extends DiscordBasePlugin {
 
     async onScrambleExecuted(data) {
         const { affectedPlayers } = data;
-        if (!affectedPlayers || affectedPlayers.length === 0) return;
+        this.verbose(1, `[SCRAMBLE_EVENT] onScrambleExecuted called with data: ${JSON.stringify(data)}`);
+        
+        if (!affectedPlayers || affectedPlayers.length === 0) {
+            this.verbose(1, `[SCRAMBLE_EVENT] WARNING: affectedPlayers is empty or undefined!`);
+            return;
+        }
+
+        this.verbose(1, `[SCRAMBLE_EVENT] Processing ${affectedPlayers.length} affected players for lockdown`);
+        affectedPlayers.forEach((p, i) => {
+            const steamID = typeof p === 'string' ? p : p.steamID;
+            const name = typeof p === 'object' ? p.name : 'Unknown';
+            this.verbose(2, `  [${i}] steamID=${steamID}, name=${name}`);
+        });
 
         const lockdownDuration = this.options.scrambleLockdownDurationMinutes * 60 * 1000;
         const expiry = new Date(Date.now() + lockdownDuration);
+        this.verbose(1, `[SCRAMBLE_EVENT] Lockdown duration: ${this.options.scrambleLockdownDurationMinutes}min | Expiry: ${expiry.toISOString()}`);
 
-        const records = affectedPlayers.map(p => {
-            if (typeof p === 'string') return { steamID: p, scrambleLockdownExpiry: expiry };
-            return { steamID: p.steamID, playerName: p.name, scrambleLockdownExpiry: expiry };
-        });
+         const records = affectedPlayers
+             .filter(p => {
+                 if (typeof p === 'string') return true;
+                 if (!p.eosID) {
+                     this.verbose(1, `[SCRAMBLE_EVENT] Skipping player ${p.name} — missing eosID`);
+                     return false;
+                 }
+                 return true;
+             })
+             .map(p => {
+                 if (typeof p === 'string') return { steamID: p, scrambleLockdownExpiry: expiry };
+                 return { eosID: p.eosID, steamID: p.steamID ?? null, playerName: p.name, scrambleLockdownExpiry: expiry };
+             });
+
+        this.verbose(2, `[SCRAMBLE_EVENT] Created ${records.length} lockdown records for DB write`);
 
         try {
+            this.verbose(1, `[SCRAMBLE_EVENT] Starting DB transaction to write scramble locks...`);
             await this.safeTransaction(async (t) => {
                 const chunkSize = 10;
                 for (let i = 0; i < records.length; i += chunkSize) {
-                    await this.models.PlayerCooldowns.bulkCreate(records.slice(i, i + chunkSize), {
-                        updateOnDuplicate: ['scrambleLockdownExpiry', 'playerName'],
+                    const chunk = records.slice(i, i + chunkSize);
+                    this.verbose(2, `[SCRAMBLE_EVENT] Writing chunk ${Math.floor(i / chunkSize) + 1}/${Math.ceil(records.length / chunkSize)} (${chunk.length} records)`);
+                    await this.models.PlayerCooldowns.bulkCreate(chunk, {
+                        updateOnDuplicate: ['scrambleLockdownExpiry', 'playerName', 'steamID'],
                         transaction: t
                     });
                 }
             });
-            this.verbose(1, `Switch lockdown active for ${records.length} players until ${expiry.toISOString()}.`);
+            this.verbose(1, `[SCRAMBLE_EVENT] ✅ SUCCESS: Switch lockdown active for ${records.length} players until ${expiry.toISOString()}.`);
+
+            // Send Discord notification
+            try {
+                const embed = {
+                    title: '🌪️ Scramble Lockdown Initiated',
+                    color: 0xff9800,
+                    description: `${affectedPlayers.length} players have been locked from switching for the next ${this.options.scrambleLockdownDurationMinutes} minutes.`,
+                    fields: [
+                        { name: 'Lockdown Duration', value: `${this.options.scrambleLockdownDurationMinutes} minutes`, inline: true },
+                        { name: 'Expires At', value: `<t:${Math.floor(expiry.getTime() / 1000)}:R>`, inline: true },
+                        { name: 'Players Affected', value: String(affectedPlayers.length), inline: true }
+                    ],
+                    timestamp: new Date().toISOString()
+                };
+                await this.sendDiscordMessage({ channel: this.discordChannel, embed });
+            } catch (discordErr) {
+                this.verbose(1, `[SCRAMBLE_EVENT] Warning: Failed to send Discord notification: ${discordErr.message}`);
+            }
         } catch (err) {
-            this.verbose(1, `Error updating scramble lockdown: ${err.message}`);
+            this.verbose(1, `[SCRAMBLE_EVENT] ❌ ERROR updating scramble lockdown: ${err.message}`);
+            this.verbose(1, `[SCRAMBLE_EVENT] Stack trace: ${err.stack}`);
         }
     }
 
@@ -1344,7 +1440,7 @@ export default class Switch extends DiscordBasePlugin {
                 return;
             }
             await this.safeTransaction(async (t) => {
-                await this.models.PlayerCooldowns.destroy({ where: { steamID: result.steamID }, transaction: t });
+                await this.models.PlayerCooldowns.destroy({ where: { eosID: result.eosID }, transaction: t });
             });
             await this.safeDiscordReply(message, `✅ Cleared cooldowns for **${result.playerName || result.steamID}**.`);
         } else if (subCommand === 'clearall') {
