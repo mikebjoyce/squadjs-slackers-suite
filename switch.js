@@ -238,7 +238,7 @@ export default class Switch extends DiscordBasePlugin {
     }
 
     async mount() {
-        await this.models.PlayerCooldowns.sync({ force: true });
+        await this.models.PlayerCooldowns.sync({ alter: true });
 
         // Initialize liberal mode substring list (lowercased for comparison)
         this._liberalModes = (this.options.liberalSwitchGameModes || ['Seed', 'Jensen']).map(m => String(m).toLowerCase());
@@ -269,7 +269,7 @@ export default class Switch extends DiscordBasePlugin {
         }
         await super.prepareToMount();
         await this.models.Endmatch.sync();
-        await this.models.PlayerCooldowns.sync({ force: true });
+        await this.models.PlayerCooldowns.sync({ alter: true });
     }
 
     createModel(name, schema) {
@@ -293,7 +293,7 @@ export default class Switch extends DiscordBasePlugin {
             if ((typeof this.options.commandPrefix === 'string' && !message.startsWith(this.options.commandPrefix)) || (typeof this.options.commandPrefix === 'object' && this.options.commandPrefix.length >= 1 && !this.options.commandPrefix.find(c => message.startsWith(c.toLowerCase())))) return;
 
             // Updated join time to be async
-            const connectionSeconds = await this.getSecondsFromJoin(steamID);
+            const connectionSeconds = await this.getSecondsFromJoin(info.player?.eosID);
             const connectionLog = connectionSeconds > 0 ? `${connectionSeconds.toFixed(1)}s` : "0s (New Join/Plugin Reload)";
             this.verbose(1, `${playerName}:\n > Connection: ${connectionLog}\n > Match Start: ${this.getSecondsFromMatchStart().toFixed(1)}s`);
             this.verbose(1, `[Command] Player ${playerName} sent: ${info.message}`);
@@ -721,20 +721,20 @@ export default class Switch extends DiscordBasePlugin {
         }
     }
 
-    async getSecondsFromJoin(steamID) {
+    async getSecondsFromJoin(eosID) {
         // 1. Check in-memory first
-        let joinTime = this.playersConnectionTime[steamID];
+        let joinTime = this.playersConnectionTime[eosID];
 
         // 2. Check DB if memory is empty (e.g. after restart)
-        // Note: This method receives only steamID, so we search by steamID field
+        // Note: This method receives eosID and queries by eosID field
         if (!joinTime) {
             const records = await this.models.PlayerCooldowns.findAll({
-                where: { steamID: steamID },
+                where: { eosID: eosID },
                 limit: 1
             });
             if (records.length > 0 && records[0].firstSeenTimestamp) {
                 joinTime = new Date(records[0].firstSeenTimestamp).getTime();
-                this.playersConnectionTime[steamID] = joinTime; // Hydrate memory
+                this.playersConnectionTime[eosID] = joinTime; // Hydrate memory
             }
         }
 
@@ -764,8 +764,13 @@ export default class Switch extends DiscordBasePlugin {
             if (p.steamID && !this._knownConnectedPlayers.has(p.steamID)) {
                 // NEW PLAYER DETECTED — perform first-seen registration
                 const now = Date.now();
-                if (!this.playersConnectionTime[p.steamID]) {
-                    this.playersConnectionTime[p.steamID] = now;
+                const eosID = p.eosID;
+                if (!eosID) {
+                    this.verbose(1, `[PlayerCooldowns] Missing eosID for player ${p.name}, skipping join time registration`);
+                    continue;
+                }
+                if (!this.playersConnectionTime[eosID]) {
+                    this.playersConnectionTime[eosID] = now;
                     // Persist to DB
                     try {
                         const eosID = p.eosID;
@@ -835,6 +840,7 @@ export default class Switch extends DiscordBasePlugin {
         if (!info?.player?.steamID) return; // Early return guard
         
         const steamID = info.player.steamID;
+        const eosID = info.player?.eosID;
         const playerName = info.player.name;
         const teamID = info.player.teamID;
 
@@ -843,7 +849,7 @@ export default class Switch extends DiscordBasePlugin {
 
         // Issue 5: Guard against double-registration if onUpdatedPlayerInfo already processed
         // onUpdatedPlayerInfo may have already registered this player and called switchToPreDisconnectionTeam
-        const alreadyRegistered = this.playersConnectionTime[steamID] && this._switchedOnJoin.has(steamID);
+        const alreadyRegistered = this.playersConnectionTime[eosID] && this._switchedOnJoin.has(steamID);
         if (alreadyRegistered) {
             this.verbose(1, `[Rejoin] ${playerName} already registered via UPDATED_PLAYER_INFORMATION, skipping double-registration.`);
             return;
@@ -855,27 +861,34 @@ export default class Switch extends DiscordBasePlugin {
 
         if (disconnectionValid) {
             // Retain join time across any short-term disconnection, regardless of team assignment
-            if (!this.playersConnectionTime[steamID]) {
+            const eosID = info.player?.eosID;
+            if (!eosID) {
+                this.verbose(1, `[Rejoin] Missing eosID for player ${playerName}, resetting join time`);
+                this.playersConnectionTime[eosID] = now;
+            } else if (!this.playersConnectionTime[eosID]) {
                 try {
                     const records = await this.models.PlayerCooldowns.findAll({
-                        where: { steamID: steamID },
+                        where: { eosID: eosID },
                         limit: 1
                     });
                     if (records.length > 0 && records[0].firstSeenTimestamp) {
-                        this.playersConnectionTime[steamID] = new Date(records[0].firstSeenTimestamp).getTime();
+                        this.playersConnectionTime[eosID] = new Date(records[0].firstSeenTimestamp).getTime();
                         this.verbose(1, `[Rejoin] ${playerName} retained join time from pre-disconnection.`);
                     } else {
-                        this.playersConnectionTime[steamID] = now;
+                        this.playersConnectionTime[eosID] = now;
                     }
                 } catch (err) {
                     this.verbose(1, `Failed to hydrate join time for ${playerName}: ${err.message}`);
-                    this.playersConnectionTime[steamID] = now;
+                    this.playersConnectionTime[eosID] = now;
                 }
             }
             // Do NOT overwrite firstSeenTimestamp in the database here
         } else {
             // Reset join time (completely new session or 20 minutes expired)
-            this.playersConnectionTime[steamID] = now;
+            const eosID = info.player?.eosID;
+            if (eosID) {
+                this.playersConnectionTime[eosID] = now;
+            }
             
             try {
                 const eosID = info.player?.eosID;
@@ -928,12 +941,15 @@ export default class Switch extends DiscordBasePlugin {
          }
     }
 
-     async doubleSwitchPlayer(steamID, forced = false, senderSteamID) {
-         const recentSwitch = this.recentDoubleSwitches.find(e => e.steamID == steamID);
-         const cooldownHoursLeft = (Date.now() - +recentSwitch?.datetime) / (60 * 60 * 1000);
+      async doubleSwitchPlayer(steamID, forced = false, senderSteamID) {
+          const playerObj = this.server.players.find(p => p.steamID === steamID);
+          const eosID = playerObj?.eosID;
 
-         if (!forced) {
-             const joinSeconds = await this.getSecondsFromJoin(steamID);
+          const recentSwitch = this.recentDoubleSwitches.find(e => e.steamID == steamID);
+          const cooldownHoursLeft = (Date.now() - +recentSwitch?.datetime) / (60 * 60 * 1000);
+
+          if (!forced) {
+              const joinSeconds = await this.getSecondsFromJoin(eosID);
              if (joinSeconds / 60 > this.options.doubleSwitchEnabledMinutes && this.getSecondsFromMatchStart() / 60 > this.options.doubleSwitchEnabledMinutes) {
                  this.warn(steamID, `Time Limit: Double switch allowed only in first ${this.options.doubleSwitchEnabledMinutes}m of join/match.`);
                  return;
@@ -1171,14 +1187,14 @@ export default class Switch extends DiscordBasePlugin {
                 });
             });
 
-            const currentSteamIDs = this.server.players.map(p => p.steamID);
-    
-            for (const steamID in this.playersConnectionTime) {
-                if (!currentSteamIDs.includes(steamID)) {
-                    delete this.playersConnectionTime[steamID];
+            const currentEosIDs = new Set(this.server.players.map(p => p.eosID).filter(Boolean));
+            for (const eosID in this.playersConnectionTime) {
+                if (!currentEosIDs.has(eosID)) {
+                    delete this.playersConnectionTime[eosID];
                 }
             }
 
+            const currentSteamIDs = this.server.players.map(p => p.steamID);
             for (const steamID in this.recentDisconnections) {
                 if (!currentSteamIDs.includes(steamID)) {
                     // Only delete if they've been gone beyond 20-minute retention
@@ -1218,9 +1234,7 @@ export default class Switch extends DiscordBasePlugin {
 
         this.verbose(1, `[SCRAMBLE_EVENT] Processing ${affectedPlayers.length} affected players for lockdown`);
         affectedPlayers.forEach((p, i) => {
-            const steamID = typeof p === 'string' ? p : p.steamID;
-            const name = typeof p === 'object' ? p.name : 'Unknown';
-            this.verbose(2, `  [${i}] steamID=${steamID}, name=${name}`);
+            this.verbose(2, `  [${i}] steamID=${p.steamID}, name=${p.name}`);
         });
 
         const lockdownDuration = this.options.scrambleLockdownDurationMinutes * 60 * 1000;
@@ -1229,7 +1243,6 @@ export default class Switch extends DiscordBasePlugin {
 
          const records = affectedPlayers
              .filter(p => {
-                 if (typeof p === 'string') return true;
                  if (!p.eosID) {
                      this.verbose(1, `[SCRAMBLE_EVENT] Skipping player ${p.name} — missing eosID`);
                      return false;
@@ -1237,7 +1250,6 @@ export default class Switch extends DiscordBasePlugin {
                  return true;
              })
              .map(p => {
-                 if (typeof p === 'string') return { steamID: p, scrambleLockdownExpiry: expiry };
                  return { eosID: p.eosID, steamID: p.steamID ?? null, playerName: p.name, scrambleLockdownExpiry: expiry };
              });
 
