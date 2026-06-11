@@ -719,28 +719,33 @@ export default class Switch extends DiscordBasePlugin {
       */
      getSwitchSlotsPerTeam(teamID, effectiveCap = null) {
          const balanceDifference = this.getTeamBalanceDifference();
+
          let cap = effectiveCap !== null ? effectiveCap : this.options.maxUnbalancedSlots;
-         
-         // Apply dynamic extra tolerance if enabled
+
          const dynamicExtra = this.getDynamicExtraSlots();
          if (dynamicExtra > 0) {
              cap += dynamicExtra;
-             this.verbose(2, `[Dynamic Balance] Total players: ${this.server.players.length} | Extra slots: +${dynamicExtra} | Effective cap: ${cap}`);
+             this.verbose(2, `[Dynamic Balance] Extra slots: +${dynamicExtra} | Effective cap: ${cap}`);
          }
-         
-         let slots = cap - (teamID == 1 ? -balanceDifference : balanceDifference);
 
-         // Apply 50v50 ceiling: if receiving team would exceed 50, clamp slots to prevent it
+         // Simulate post-switch diff: moving one player swings diff by 2
+         const postSwitchDiff = teamID === 1
+             ? balanceDifference - 2
+             : balanceDifference + 2;
+
+         if (Math.abs(postSwitchDiff) > cap) {
+             return 0;
+         }
+
+         // 50v50 ceiling: receiving team must not exceed 50
          let teamPlayerCount = [null, 0, 0];
          for (let p of this.server.players)
              teamPlayerCount[+p.teamID]++;
 
-         const receivingTeamSize = teamPlayerCount[teamID == 1 ? 2 : 1] || 0;
-         if (receivingTeamSize + slots > 50) {
-             slots = Math.max(0, 50 - receivingTeamSize);
-         }
+         const receivingTeam = teamID === 1 ? 2 : 1;
+         if ((teamPlayerCount[receivingTeam] || 0) >= 50) return 0;
 
-         return slots;
+         return 1;
      }
 
     async _checkSwitchEligibility(player) {
@@ -914,6 +919,22 @@ export default class Switch extends DiscordBasePlugin {
                 await this._taggedSwitchPlayer(p1.steamID, 'Player-Queue');
                 await this._taggedSwitchPlayer(p2.steamID, 'Player-Queue');
 
+                if (!this.isLiberalMode()) {
+                    const now = new Date();
+                    for (const p of [p1, p2]) {
+                        try {
+                            await this.safeTransaction(async (t) => {
+                                await this.models.PlayerCooldowns.upsert(
+                                    { eosID: p.eosID, steamID: p.steamID, playerName: p.playerName, lastSwitchTimestamp: now },
+                                    { transaction: t }
+                                );
+                            });
+                        } catch (dbErr) {
+                            this.verbose(1, `[Queue] Cooldown write failed for ${p.playerName}: ${dbErr.message}`);
+                        }
+                    }
+                }
+
                 this.verbose(1, `[Queue] Swapped pair: ${p1.playerName} (T1) <-> ${p2.playerName} (T2)`);
             }
 
@@ -946,6 +967,20 @@ export default class Switch extends DiscordBasePlugin {
 
                     this.warn(entry.steamID, '[Switch Queue]\nA slot opened up.\nSwitching you now.');
                     await this._taggedSwitchPlayer(entry.steamID, 'Player-Queue');
+
+                    if (!this.isLiberalMode()) {
+                        try {
+                            await this.safeTransaction(async (t) => {
+                                await this.models.PlayerCooldowns.upsert(
+                                    { eosID: entry.eosID, steamID: entry.steamID, playerName: entry.playerName, lastSwitchTimestamp: new Date() },
+                                    { transaction: t }
+                                );
+                            });
+                        } catch (dbErr) {
+                            this.verbose(1, `[Queue] Cooldown write failed for ${entry.playerName}: ${dbErr.message}`);
+                        }
+                    }
+
                     this.verbose(1, `[Queue] Solo switch fired for ${entry.playerName} (T${entry.teamID})`);
 
                     // Limit to one solo switch per tick to maintain balance stability.
