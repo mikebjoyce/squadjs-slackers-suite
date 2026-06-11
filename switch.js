@@ -163,7 +163,9 @@ export default class Switch extends DiscordBasePlugin {
         this.recentSwitches = [];
         this.recentDoubleSwitches = [];
         this.recentDisconnections = {};
-        this._knownConnectedPlayers = new Map();
+        this._knownConnectedPlayers = new Map(); // eosID → { teamID, name, steamID }
+        this._switchQueue = new Map();      // eosID → { eosID, steamID, playerName, teamID, queuedAt, warnInterval }
+        this._lastTeamSnapshot = null;      // { t1: number, t2: number } — previous poll's team counts for stability check
         this._switchedOnJoin = new Set();
         this._nullTeamIDWindowActive = false;
         this._nullTeamIDWindowTimeout = null;
@@ -482,15 +484,58 @@ export default class Switch extends DiscordBasePlugin {
                     });
                     this.warn(steamID, "All player cooldowns cleared.");
                     break;
+                case 'cancel':
+                    if (this._switchQueue.has(info.player?.eosID)) {
+                        const entry = this._switchQueue.get(info.player.eosID);
+                        clearInterval(entry.warnInterval);
+                        this._switchQueue.delete(info.player.eosID);
+                        this.warn(steamID, '[Switch Queue]\nRemoved from queue.');
+                        this.verbose(1, `[Queue] ${playerName} cancelled — left the queue.`);
+                    } else {
+                        this.warn(steamID, '[Switch Queue]\nYou are not currently in the switch queue.');
+                    }
+                    break;
                 default:
                     await this.warn(steamID, `Unknown subcommand: "${subCommand}"`);
                     return;
             }
         } else {
-            // Issue 7: Gate !switch commands during null-teamID window (per §3 of reference doc)
             if (this._nullTeamIDWindowActive) {
-                this.warn(steamID, 'Server is transitioning between rounds. Team assignments are still resolving. Please try again in a moment.');
-                this.verbose(1, `[Switch] Denied ${playerName}: Null-teamID window active.`);
+                const eosID = info.player?.eosID;
+                if (!eosID) return;
+
+                const isLiberal = this.isLiberalMode();
+                const cooldownData = await this.models.PlayerCooldowns.findByPk(eosID);
+
+                // Scramble lockdown is ALWAYS enforced, regardless of mode
+                if (cooldownData && cooldownData.scrambleLockdownExpiry && new Date() < cooldownData.scrambleLockdownExpiry) {
+                    const remaining = Math.ceil((cooldownData.scrambleLockdownExpiry - Date.now()) / 60000);
+                    this.warn(steamID, `Scramble Lock: Cannot switch for ${remaining}m.`);
+                    this.verbose(1, `[Queue] Denied ${playerName} during transition: Scramble lockdown active.`);
+                    return;
+                }
+
+                if (!isLiberal) {
+                    // Time window check
+                    if (connectionSeconds / 60 > this.options.switchEnabledMinutes && this.getSecondsFromMatchStart() / 60 > this.options.switchEnabledMinutes) {
+                        this.warn(steamID, `Time Limit: Switch allowed only in first ${this.options.switchEnabledMinutes}m of join/match.`);
+                        this.verbose(1, `[Queue] Denied ${playerName} during transition: Match time limit exceeded.`);
+                        return;
+                    }
+
+                    // Cooldown check
+                    const cooldownDuration = this.options.switchCooldownMinutes > 0 ? this.options.switchCooldownMinutes * 60 * 1000 : this.options.switchCooldownHours * 60 * 60 * 1000;
+
+                    if (cooldownData && cooldownData.lastSwitchTimestamp &&
+                        (Date.now() - new Date(cooldownData.lastSwitchTimestamp).getTime()) < cooldownDuration) {
+                        const remaining = Math.ceil((cooldownDuration - (Date.now() - new Date(cooldownData.lastSwitchTimestamp).getTime())) / 60000);
+                        this.warn(steamID, `Cooldown: Please wait ${remaining}m.`);
+                        this.verbose(1, `[Queue] Denied ${playerName} during transition: Cooldown active.`);
+                        return;
+                    }
+                }
+
+                this._enqueuePlayer(info.player, 'Server is mid-transition — team assignments are still resolving.');
                 return;
             }
 
@@ -572,10 +617,8 @@ export default class Switch extends DiscordBasePlugin {
                 }
             }
 
-            // Balance check (applies to both modes, but uses different cap)
             if (availableSwitchSlots <= 0) {
-                this.warn(steamID, `Balance Limit: Teams would become too unbalanced.`);
-                this.verbose(1, `[Switch] Denied ${playerName}: Teams unbalanced.`);
+                this._enqueuePlayer(info.player, 'Teams are currently full on that side.');
                 return;
             }
 
@@ -647,6 +690,13 @@ export default class Switch extends DiscordBasePlugin {
      }
 
     async onRoundEnded(dt) {
+        // Clear switch queue — all time windows are now void
+        for (const entry of this._switchQueue.values()) {
+            clearInterval(entry.warnInterval);
+        }
+        this._switchQueue.clear();
+        this._lastTeamSnapshot = null;
+        this.verbose(1, '[Queue] Switch queue cleared on round end.');
         await this.cleanup();
         await this.doSwitchMatchend();
         // Clear trackers to prevent cross-match exploits (but keep _knownConnectedPlayers for continuity)
@@ -734,6 +784,182 @@ export default class Switch extends DiscordBasePlugin {
          return slots;
      }
 
+    _enqueuePlayer(player, reason) {
+        const { eosID, steamID, name: playerName, teamID } = player;
+
+        if (!eosID || !teamID) {
+            this.verbose(1, `[Queue] Cannot enqueue ${playerName}: missing eosID or teamID.`);
+            return;
+        }
+
+        const windowMs = this.options.switchEnabledMinutes * 60 * 1000;
+
+        if (this._switchQueue.has(eosID)) {
+            const existing = this._switchQueue.get(eosID);
+            const elapsed = Date.now() - existing.queuedAt;
+            const remaining = ((windowMs - elapsed) / 60000).toFixed(1);
+            const targetTeam = existing.teamID === 1 ? 2 : 1;
+            this.warn(steamID,
+                `[Switch Queue]\nYou are already in the queue.\n~${remaining}m remaining | Team ${existing.teamID} → Team ${targetTeam}\nType !switch cancel to leave.`
+            );
+            return;
+        }
+
+        const queuedAt = Date.now();
+
+        const warnInterval = setInterval(() => {
+            const entry = this._switchQueue.get(eosID);
+            if (!entry) { clearInterval(warnInterval); return; }
+
+            const elapsed = Date.now() - entry.queuedAt;
+            const remaining = ((windowMs - elapsed) / 60000).toFixed(1);
+
+            const sameTeam = [...this._switchQueue.values()]
+                .filter(e => e.teamID === entry.teamID)
+                .sort((a, b) => a.queuedAt - b.queuedAt);
+            const pos = sameTeam.findIndex(e => e.eosID === eosID) + 1;
+            const targetTeam = entry.teamID === 1 ? 2 : 1;
+
+            this.warn(entry.steamID,
+                `[Switch Queue]\nPosition ${pos} in the queue.\n~${remaining}m remaining | Team ${entry.teamID} → Team ${targetTeam}\nType !switch cancel to leave.`
+            );
+        }, 30_000); // Changed from 60_000 to 30_000 for 30-second warnings
+
+        // Compute enqueue position within same-team candidates
+        const sameTeamAtEnqueue = [...this._switchQueue.values()]
+            .filter(e => e.teamID === teamID);
+        const enqueuePos = sameTeamAtEnqueue.length + 1; // +1 because entry not yet added to map
+        const targetTeam = teamID === 1 ? 2 : 1;
+        const remainingAtEnqueue = (windowMs / 60000).toFixed(1);
+
+        this._switchQueue.set(eosID, { eosID, steamID, playerName, teamID, queuedAt, warnInterval });
+
+        this.warn(steamID,
+            `[Switch Queue]\nAdded to position ${enqueuePos} in the queue.\n~${remainingAtEnqueue}m remaining | Team ${teamID} → Team ${targetTeam}\n${reason}\nType !switch cancel to leave.`
+        );
+        this.verbose(1, `[Queue] ${playerName} (T${teamID}) enqueued at position ${enqueuePos}. Queue size: ${this._switchQueue.size}`);
+    }
+
+    async _processQueue() {
+        try {
+            const windowMs = this.options.switchEnabledMinutes * 60 * 1000;
+            const now = Date.now();
+
+            // STEP 1 — EXPIRE: remove players whose time window has closed
+            for (const [eosID, entry] of this._switchQueue.entries()) {
+                if ((now - entry.queuedAt) >= windowMs) {
+                    clearInterval(entry.warnInterval);
+                    this._switchQueue.delete(eosID);
+                    this.warn(entry.steamID, '[Switch Queue]\nTime window expired.\nRemoved from queue.');
+                    this.verbose(1, `[Queue] ${entry.playerName} expired and removed from queue.`);
+                }
+            }
+
+            // STEP 2 — STABILITY CHECK (solo only): compute current team counts
+            // Pair trades are exempt — net team counts are preserved by a swap.
+            // Solo switches only fire when two consecutive UPDATED_PLAYER_INFORMATION polls
+            // show identical team counts, indicating SmartAssign's in-flight moves have settled.
+            let t1 = 0, t2 = 0;
+            for (const p of this.server.players) {
+                if (p.teamID === 1) t1++;
+                else if (p.teamID === 2) t2++;
+                // null teamID players excluded intentionally
+            }
+            const prevSnapshot = this._lastTeamSnapshot;
+            const stable = prevSnapshot !== null
+                && prevSnapshot.t1 === t1
+                && prevSnapshot.t2 === t2;
+            this._lastTeamSnapshot = { t1, t2 };
+
+            // STEP 3 — PAIR MATCHING: exempt from stability check
+            // Match oldest T1 candidate with oldest T2 candidate, FIFO.
+            const t1Candidates = [...this._switchQueue.values()]
+                .filter(e => e.teamID === 1)
+                .sort((a, b) => a.queuedAt - b.queuedAt);
+            const t2Candidates = [...this._switchQueue.values()]
+                .filter(e => e.teamID === 2)
+                .sort((a, b) => a.queuedAt - b.queuedAt);
+
+            const pairCount = Math.min(t1Candidates.length, t2Candidates.length);
+
+            for (let i = 0; i < pairCount; i++) {
+                const p1 = t1Candidates[i];
+                const p2 = t2Candidates[i];
+
+                // Stale-team guard: verify each player's current team still matches their queue entry
+                const live1 = this.server.players.find(p => p.eosID === p1.eosID);
+                const live2 = this.server.players.find(p => p.eosID === p2.eosID);
+
+                if (!live1 || live1.teamID !== p1.teamID) {
+                    clearInterval(p1.warnInterval);
+                    this._switchQueue.delete(p1.eosID);
+                    this.verbose(1, `[Queue] ${p1.playerName} team changed externally — removed from queue.`);
+                    continue;
+                }
+                if (!live2 || live2.teamID !== p2.teamID) {
+                    clearInterval(p2.warnInterval);
+                    this._switchQueue.delete(p2.eosID);
+                    this.verbose(1, `[Queue] ${p2.playerName} team changed externally — removed from queue.`);
+                    continue;
+                }
+
+                // Remove BEFORE firing switches
+                clearInterval(p1.warnInterval);
+                this._switchQueue.delete(p1.eosID);
+                clearInterval(p2.warnInterval);
+                this._switchQueue.delete(p2.eosID);
+
+                this.warn(p1.steamID, '[Switch Queue]\nSwap partner found.\nSwitching you now.');
+                this.warn(p2.steamID, '[Switch Queue]\nSwap partner found.\nSwitching you now.');
+
+                await this._taggedSwitchPlayer(p1.steamID, 'Player-Queue');
+                await this._taggedSwitchPlayer(p2.steamID, 'Player-Queue');
+
+                this.verbose(1, `[Queue] Swapped pair: ${p1.playerName} (T1) <-> ${p2.playerName} (T2)`);
+            }
+
+            // STEP 4 — SOLO BALANCE CHECK: only fires when team counts are stable
+            if (!stable) {
+                this.verbose(2, `[Queue] Team counts changed (${prevSnapshot?.t1 ?? '?'}v${prevSnapshot?.t2 ?? '?'} → ${t1}v${t2}) — skipping solo processing this tick.`);
+                return;
+            }
+
+            const remaining = [...this._switchQueue.values()]
+                .sort((a, b) => a.queuedAt - b.queuedAt);
+
+            const isLiberal = this.isLiberalMode();
+            const effectiveCap = isLiberal ? this.options.liberalSwitchMaxUnbalancedSlots : null;
+
+            for (const entry of remaining) {
+                // Stale-team guard
+                const live = this.server.players.find(p => p.eosID === entry.eosID);
+                if (!live || live.teamID !== entry.teamID) {
+                    clearInterval(entry.warnInterval);
+                    this._switchQueue.delete(entry.eosID);
+                    this.verbose(1, `[Queue] ${entry.playerName} team changed externally — removed from queue.`);
+                    continue;
+                }
+
+                const slots = this.getSwitchSlotsPerTeam(entry.teamID, effectiveCap);
+                if (slots > 0) {
+                    clearInterval(entry.warnInterval);
+                    this._switchQueue.delete(entry.eosID);
+
+                    this.warn(entry.steamID, '[Switch Queue]\nA slot opened up.\nSwitching you now.');
+                    await this._taggedSwitchPlayer(entry.steamID, 'Player-Queue');
+                    this.verbose(1, `[Queue] Solo switch fired for ${entry.playerName} (T${entry.teamID})`);
+
+                    // Limit to one solo switch per tick to maintain balance stability.
+                    break;
+                }
+                // else: leave in queue, will retry next tick
+            }
+
+        } catch (err) {
+            this.verbose(1, `[Queue] _processQueue error: ${err.message}`);
+        }
+    }
+
     /**
      * EVENT: UPDATED_LAYER_INFORMATION (Layer Sync)
      * Maintains currentLayerName and currentGamemode for liberal mode detection.
@@ -809,47 +1035,33 @@ export default class Switch extends DiscordBasePlugin {
             clearTimeout(this._nullTeamIDWindowTimeout);
         }
         
-        const currentSteamIDs = new Set(this.server.players.map(p => p.steamID).filter(Boolean));
-        
-        // Add new players to known map & perform first-seen registration (Issue 1b)
+        const currentEosIDs = new Set(this.server.players.map(p => p.eosID).filter(Boolean));
+
         for (const p of this.server.players) {
-            if (p.steamID && !this._knownConnectedPlayers.has(p.steamID)) {
+            if (!p.eosID) continue;
+            if (!this._knownConnectedPlayers.has(p.eosID)) {
                 // NEW PLAYER DETECTED — perform first-seen registration
                 const now = Date.now();
-                const eosID = p.eosID;
-                if (!eosID) {
-                    this.verbose(1, `[PlayerCooldowns] Missing eosID for player ${p.name}, skipping join time registration`);
-                    continue;
-                }
-                if (!this.playersConnectionTime[eosID]) {
-                    this.playersConnectionTime[eosID] = now;
-                    // Persist to DB
+                if (!this.playersConnectionTime[p.eosID]) {
+                    this.playersConnectionTime[p.eosID] = now;
                     try {
-                        const eosID = p.eosID;
-                        if (!eosID) {
-                            this.verbose(1, `[PlayerCooldowns] Missing eosID for player ${p.name}, skipping DB write`);
-                        } else {
-                            await this.safeTransaction(async (t) => {
-                                await this.models.PlayerCooldowns.upsert({
-                                    eosID: eosID,
-                                    steamID: p.steamID,
-                                    playerName: p.name,
-                                    firstSeenTimestamp: new Date(now)
-                                }, { transaction: t });
-                            });
-                        }
+                        await this.safeTransaction(async (t) => {
+                            await this.models.PlayerCooldowns.upsert({
+                                eosID: p.eosID,
+                                steamID: p.steamID,
+                                playerName: p.name,
+                                firstSeenTimestamp: new Date(now)
+                            }, { transaction: t });
+                        });
                     } catch (err) {
                         this.verbose(1, `Failed to persist join time for ${p.name} (detected via UPDATED_PLAYER_INFORMATION): ${err.message}`);
                     }
-                    
-                    // Mark that we've triggered switchToPreDisconnectionTeam for this player
-                    if (!this._switchedOnJoin.has(p.steamID)) {
-                        this._switchedOnJoin.add(p.steamID);
-                        // Trigger switchToPreDisconnectionTeam if applicable
+
+                    if (!this._switchedOnJoin.has(p.eosID)) {
+                        this._switchedOnJoin.add(p.eosID);
                         if (this.options.switchToOldTeamAfterRejoin) {
                             const preDisconnectionData = this.recentDisconnections[p.steamID];
                             if (preDisconnectionData) {
-                                // Schedule it for later to avoid race with onPlayerConnected
                                 setTimeout(() => {
                                     this.switchToPreDisconnectionTeam({ player: p });
                                 }, 100);
@@ -857,10 +1069,10 @@ export default class Switch extends DiscordBasePlugin {
                         }
                     }
                 }
-                this._knownConnectedPlayers.set(p.steamID, { teamID: p.teamID, name: p.name });
-            } else if (p.steamID) {
+                this._knownConnectedPlayers.set(p.eosID, { teamID: p.teamID, name: p.name, steamID: p.steamID });
+            } else {
                 // UPDATE — only update teamID if it's NOT null (per §3, skip null-teamID updates)
-                const existing = this._knownConnectedPlayers.get(p.steamID);
+                const existing = this._knownConnectedPlayers.get(p.eosID);
                 if (p.teamID !== null) {
                     existing.teamID = p.teamID;
                     existing.name = p.name;
@@ -869,15 +1081,25 @@ export default class Switch extends DiscordBasePlugin {
         }
 
         // Detect leaves
-        for (const [steamID, data] of this._knownConnectedPlayers.entries()) {
-            if (!currentSteamIDs.has(steamID)) {
-                this._knownConnectedPlayers.delete(steamID);
-                this.handlePlayerLeave(steamID, data.teamID, data.name);
+        for (const [eosID, data] of this._knownConnectedPlayers.entries()) {
+            if (!currentEosIDs.has(eosID)) {
+                this._knownConnectedPlayers.delete(eosID);
+                this.handlePlayerLeave(eosID, data.teamID, data.name, data.steamID);
             }
+        }
+
+        if (!this._nullTeamIDWindowActive) {
+            await this._processQueue();
         }
     }
 
-    handlePlayerLeave(steamID, teamID, playerName) {
+    handlePlayerLeave(eosID, teamID, playerName, steamID) {
+        if (this._switchQueue.has(eosID)) {
+            const entry = this._switchQueue.get(eosID);
+            clearInterval(entry.warnInterval);
+            this._switchQueue.delete(eosID);
+            this.verbose(1, `[Queue] ${playerName} disconnected — removed from queue.`);
+        }
         this.verbose(1, `Player disconnected ${playerName}`);
         this.recentDisconnections[steamID] = { teamID: teamID, time: new Date() };
         
@@ -901,7 +1123,7 @@ export default class Switch extends DiscordBasePlugin {
 
         // Issue 5: Guard against double-registration if onUpdatedPlayerInfo already processed
         // onUpdatedPlayerInfo may have already registered this player and called switchToPreDisconnectionTeam
-        const alreadyRegistered = this.playersConnectionTime[eosID] && this._switchedOnJoin.has(steamID);
+        const alreadyRegistered = this.playersConnectionTime[eosID] && this._switchedOnJoin.has(eosID);
         if (alreadyRegistered) {
             this.verbose(1, `[Rejoin] ${playerName} already registered via UPDATED_PLAYER_INFORMATION, skipping double-registration.`);
             return;
@@ -962,8 +1184,8 @@ export default class Switch extends DiscordBasePlugin {
         }
 
         // Mark that we've handled switchToPreDisconnectionTeam for this player
-        if (!this._switchedOnJoin.has(steamID)) {
-            this._switchedOnJoin.add(steamID);
+        if (!this._switchedOnJoin.has(eosID)) {
+            this._switchedOnJoin.add(eosID);
             this.switchToPreDisconnectionTeam(info);
         }
     }
@@ -1193,6 +1415,10 @@ export default class Switch extends DiscordBasePlugin {
         this.server.removeListener('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated.bind(this));
         if (this.options.discordClient) this.options.discordClient.removeListener('message', this.onDiscordMessage);
         clearTimeout(this._nullTeamIDWindowTimeout);
+        for (const entry of this._switchQueue.values()) {
+            clearInterval(entry.warnInterval);
+        }
+        this._switchQueue.clear();
         this.verbose(1, 'Switch plugin was un-mounted.');
     }
 
