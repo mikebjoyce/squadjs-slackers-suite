@@ -158,6 +158,7 @@ export default class Switch extends DiscordBasePlugin {
         this.getDiagnosticInfo = this.getDiagnosticInfo.bind(this);
         this.safeTransaction = this.safeTransaction.bind(this);
         this.safeDiscordReply = this.safeDiscordReply.bind(this);
+        this._checkSwitchEligibility = this._checkSwitchEligibility.bind(this);
 
         this.playersConnectionTime = {};
         this.recentSwitches = [];
@@ -504,35 +505,19 @@ export default class Switch extends DiscordBasePlugin {
                 const eosID = info.player?.eosID;
                 if (!eosID) return;
 
-                const isLiberal = this.isLiberalMode();
-                const cooldownData = await this.models.PlayerCooldowns.findByPk(eosID);
-
-                // Scramble lockdown is ALWAYS enforced, regardless of mode
-                if (cooldownData && cooldownData.scrambleLockdownExpiry && new Date() < cooldownData.scrambleLockdownExpiry) {
-                    const remaining = Math.ceil((cooldownData.scrambleLockdownExpiry - Date.now()) / 60000);
-                    this.warn(steamID, `Scramble Lock: Cannot switch for ${remaining}m.`);
-                    this.verbose(1, `[Queue] Denied ${playerName} during transition: Scramble lockdown active.`);
-                    return;
-                }
-
-                if (!isLiberal) {
-                    // Time window check
-                    if (connectionSeconds / 60 > this.options.switchEnabledMinutes && this.getSecondsFromMatchStart() / 60 > this.options.switchEnabledMinutes) {
+                const eligibility = await this._checkSwitchEligibility(info.player);
+                if (!eligibility.eligible) {
+                    if (eligibility.reason === 'scramble_lock') {
+                        this.warn(steamID, `Scramble Lock: Cannot switch for ${eligibility.remaining}m.`);
+                        this.verbose(1, `[Queue] Denied ${playerName} during transition: Scramble lockdown active.`);
+                    } else if (eligibility.reason === 'time_window') {
                         this.warn(steamID, `Time Limit: Switch allowed only in first ${this.options.switchEnabledMinutes}m of join/match.`);
                         this.verbose(1, `[Queue] Denied ${playerName} during transition: Match time limit exceeded.`);
-                        return;
-                    }
-
-                    // Cooldown check
-                    const cooldownDuration = this.options.switchCooldownMinutes > 0 ? this.options.switchCooldownMinutes * 60 * 1000 : this.options.switchCooldownHours * 60 * 60 * 1000;
-
-                    if (cooldownData && cooldownData.lastSwitchTimestamp &&
-                        (Date.now() - new Date(cooldownData.lastSwitchTimestamp).getTime()) < cooldownDuration) {
-                        const remaining = Math.ceil((cooldownDuration - (Date.now() - new Date(cooldownData.lastSwitchTimestamp).getTime())) / 60000);
-                        this.warn(steamID, `Cooldown: Please wait ${remaining}m.`);
+                    } else if (eligibility.reason === 'cooldown') {
+                        this.warn(steamID, `Cooldown: Please wait ${eligibility.remaining}m.`);
                         this.verbose(1, `[Queue] Denied ${playerName} during transition: Cooldown active.`);
-                        return;
                     }
+                    return;
                 }
 
                 this._enqueuePlayer(info.player, 'Server is mid-transition — team assignments are still resolving.');
@@ -569,52 +554,26 @@ export default class Switch extends DiscordBasePlugin {
                  this.verbose(1, `[PlayerCooldowns] Missing eosID for player ${playerName}, skipping switch validation`);
                  return;
              }
-             const cooldownData = await this.models.PlayerCooldowns.findByPk(eosID);
-             this.verbose(2, `[SCRAMBLE_CHECK] Fetched cooldown data for ${playerName} (${eosID}): ${JSON.stringify(cooldownData)}`);
 
-            // Scramble lockdown is ALWAYS enforced, regardless of mode
-            if (cooldownData) {
-                this.verbose(2, `[SCRAMBLE_CHECK] cooldownData exists: ${cooldownData !== null}`);
-                this.verbose(2, `[SCRAMBLE_CHECK] scrambleLockdownExpiry: ${cooldownData.scrambleLockdownExpiry}`);
-                this.verbose(2, `[SCRAMBLE_CHECK] scrambleLockdownExpiry type: ${typeof cooldownData.scrambleLockdownExpiry}`);
-                if (cooldownData.scrambleLockdownExpiry) {
-                    const expiryDate = new Date(cooldownData.scrambleLockdownExpiry);
-                    const now = new Date();
-                    this.verbose(2, `[SCRAMBLE_CHECK] Expiry Date: ${expiryDate.toISOString()} | Now: ${now.toISOString()} | Expired? ${now >= expiryDate}`);
-                }
-            } else {
-                this.verbose(2, `[SCRAMBLE_CHECK] No cooldown data found for ${playerName} (${eosID})`);
-            }
-
-            if (cooldownData && cooldownData.scrambleLockdownExpiry && new Date() < cooldownData.scrambleLockdownExpiry) {
-                const remaining = Math.ceil((cooldownData.scrambleLockdownExpiry - Date.now()) / 60000);
-                this.warn(steamID, `Scramble Lock: Cannot switch for ${remaining}m.`);
-                this.verbose(1, `[SCRAMBLE_CHECK] ❌ DENIED ${playerName}: Scramble lockdown active - ${remaining}m remaining.`);
-                return;
-            } else {
-                this.verbose(2, `[SCRAMBLE_CHECK] ✅ PASSED: No active scramble lockdown for ${playerName}`);
-            }
-
-            // Time window check - SKIPPED in liberal mode
-            if (!isLiberal) {
-                if (connectionSeconds / 60 > this.options.switchEnabledMinutes && this.getSecondsFromMatchStart() / 60 > this.options.switchEnabledMinutes) {
+            const eligibility = await this._checkSwitchEligibility(info.player);
+            if (!eligibility.eligible) {
+                if (eligibility.reason === 'scramble_lock') {
+                    this.warn(steamID, `Scramble Lock: Cannot switch for ${eligibility.remaining}m.`);
+                    this.verbose(1, `[Switch] Denied ${playerName}: Scramble lockdown active.`);
+                } else if (eligibility.reason === 'time_window') {
                     this.warn(steamID, `Time Limit: Switch allowed only in first ${this.options.switchEnabledMinutes}m of join/match.`);
                     this.verbose(1, `[Switch] Denied ${playerName}: Match time limit exceeded.`);
-                    return;
+                } else if (eligibility.reason === 'cooldown') {
+                    this.warn(steamID, `Cooldown: Please wait ${eligibility.remaining}m.`);
+                    this.verbose(1, `[Switch] Denied ${playerName}: Cooldown active.`);
                 }
+                return;
             }
 
-            // Cooldown check - SKIPPED in liberal mode
-            if (!isLiberal) {
-                const cooldownDuration = this.options.switchCooldownMinutes > 0 ? this.options.switchCooldownMinutes * 60 * 1000 : this.options.switchCooldownHours * 60 * 60 * 1000;
-
-                if (cooldownData && cooldownData.lastSwitchTimestamp &&
-                    (Date.now() - new Date(cooldownData.lastSwitchTimestamp).getTime()) < cooldownDuration) {
-                    const remaining = Math.ceil((cooldownDuration - (Date.now() - new Date(cooldownData.lastSwitchTimestamp).getTime())) / 60000);
-                    this.warn(steamID, `Cooldown: Please wait ${remaining}m.`);
-                    this.verbose(1, `[Switch] Denied ${playerName}: Cooldown active.`);
-                    return;
-                }
+            const queueSameTeam = [...this._switchQueue.values()].filter(e => e.teamID === teamID).length;
+            if (queueSameTeam > 0) {
+                this._enqueuePlayer(info.player, 'Other players are already waiting in the queue.');
+                return;
             }
 
             if (availableSwitchSlots <= 0) {
@@ -783,6 +742,46 @@ export default class Switch extends DiscordBasePlugin {
 
          return slots;
      }
+
+    async _checkSwitchEligibility(player) {
+        const eosID = player?.eosID;
+        if (!eosID) return { eligible: false, reason: 'missing_eos' };
+
+        const cooldownData = await this.models.PlayerCooldowns.findByPk(eosID);
+        const now = Date.now();
+
+        // Scramble lock check (Always enforced)
+        if (cooldownData && cooldownData.scrambleLockdownExpiry && new Date(cooldownData.scrambleLockdownExpiry).getTime() > now) {
+            const remaining = Math.ceil((new Date(cooldownData.scrambleLockdownExpiry).getTime() - now) / 60000);
+            return { eligible: false, reason: 'scramble_lock', remaining };
+        }
+
+        if (!this.isLiberalMode()) {
+            const connectionSeconds = await this.getSecondsFromJoin(eosID);
+            const matchSeconds = this.getSecondsFromMatchStart();
+            const limit = this.options.switchEnabledMinutes;
+
+            // Time window check
+            if (connectionSeconds / 60 > limit && matchSeconds / 60 > limit) {
+                return { eligible: false, reason: 'time_window' };
+            }
+
+            // Cooldown check
+            const cooldownDuration = this.options.switchCooldownMinutes > 0
+                ? this.options.switchCooldownMinutes * 60 * 1000
+                : this.options.switchCooldownHours * 60 * 60 * 1000;
+
+            if (cooldownData && cooldownData.lastSwitchTimestamp) {
+                const lastSwitchTime = new Date(cooldownData.lastSwitchTimestamp).getTime();
+                if (now - lastSwitchTime < cooldownDuration) {
+                    const remaining = Math.ceil((cooldownDuration - (now - lastSwitchTime)) / 60000);
+                    return { eligible: false, reason: 'cooldown', remaining };
+                }
+            }
+        }
+
+        return { eligible: true };
+    }
 
     _enqueuePlayer(player, reason) {
         const { eosID, steamID, name: playerName, teamID } = player;
