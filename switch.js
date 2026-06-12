@@ -320,8 +320,8 @@ export default class Switch extends DiscordBasePlugin {
             // Updated join time to be async
             const connectionSeconds = await this.getSecondsFromJoin(info.player?.eosID);
             const connectionLog = connectionSeconds > 0 ? `${connectionSeconds.toFixed(1)}s` : "0s (New Join/Plugin Reload)";
-            this.verbose(1, `${playerName}:\n > Connection: ${connectionLog}\n > Match Start: ${this.getSecondsFromMatchStart().toFixed(1)}s`);
-            this.verbose(1, `[Command] Player ${playerName} sent: ${info.message}`);
+            this.verbose(2, `${playerName}:\n > Connection: ${connectionLog}\n > Match Start: ${this.getSecondsFromMatchStart().toFixed(1)}s`);
+            this.verbose(2, `[Command] Player ${playerName} sent: ${info.message}`);
 
             const commandSplit = message.substring(commandPrefixInUse.length).trim().split(' ').filter(Boolean);
             const subCommand = commandSplit[ 0 ];
@@ -546,12 +546,11 @@ export default class Switch extends DiscordBasePlugin {
             const balanceDiff = teamPlayerCount[1] - teamPlayerCount[2];
             const effectiveMaxSlots = effectiveCap !== null ? effectiveCap : this.options.maxUnbalancedSlots;
 
-            this.verbose(1, playerName, 'requested a switch');
-            this.verbose(1, `[Current Team] ${playerName} is on Team ${teamID}, switching to Team ${targetTeam}`);
-            this.verbose(1, `[Team Counts] Team 1: ${teamPlayerCount[1]} | Team 2: ${teamPlayerCount[2]} | Balance Diff: ${balanceDiff}`);
-            this.verbose(1, `[Switch Slots] Max Unbalance Cap: ${effectiveMaxSlots} | Available Slots: ${availableSwitchSlots}`);
+            this.verbose(2, `[Switch Request] ${playerName} (T${teamID} -> T${targetTeam})`);
+            this.verbose(2, `[Team Counts] Team 1: ${teamPlayerCount[1]} | Team 2: ${teamPlayerCount[2]} | Balance Diff: ${balanceDiff}`);
+            this.verbose(2, `[Switch Slots] Max Unbalance Cap: ${effectiveMaxSlots} | Available Slots: ${availableSwitchSlots}`);
             if (isLiberal) {
-                this.verbose(1, `[Liberal Mode] ${playerName} - relaxed switch restrictions active (Seed/Jensen).`);
+                this.verbose(2, `[Liberal Mode] ${playerName} - relaxed switch restrictions active (Seed/Jensen).`);
             }
 
              const eosID = info.player?.eosID;
@@ -666,7 +665,7 @@ export default class Switch extends DiscordBasePlugin {
         }
         this._switchQueue.clear();
         this._lastTeamSnapshot = null;
-        this.verbose(1, '[Queue] Switch queue cleared on round end.');
+        this.verbose(2, '[Queue] Switch queue cleared on round end.');
         await this.cleanup();
         await this.doSwitchMatchend();
         // Clear trackers to prevent cross-match exploits (but keep _knownConnectedPlayers for continuity)
@@ -682,7 +681,7 @@ export default class Switch extends DiscordBasePlugin {
             teamPlayerCount[ +p.teamID ]++;
         const balanceDiff = teamPlayerCount[ 1 ] - teamPlayerCount[ 2 ];
 
-        this.verbose(1, `Balance diff: ${balanceDiff}`, teamPlayerCount);
+        this.verbose(2, `Balance diff: ${balanceDiff}`, teamPlayerCount);
         return balanceDiff;
     }
 
@@ -870,7 +869,7 @@ export default class Switch extends DiscordBasePlugin {
                     clearInterval(entry.warnInterval);
                     this._switchQueue.delete(eosID);
                     this.warn(entry.steamID, '[Switch Queue]\nTime window expired.\nRemoved from queue.');
-                    this.verbose(1, `[Queue] ${entry.playerName} expired and removed from queue.`);
+                    this.verbose(2, `[Queue] ${entry.playerName} expired and removed from queue.`);
                 }
             }
 
@@ -1020,7 +1019,7 @@ export default class Switch extends DiscordBasePlugin {
         if (name) {
             this.currentLayerName = name;
             this.currentGamemode = mode;
-            this.verbose(1, `[Layer] Updated layer cache: ${name} (${mode})`);
+            this.verbose(2, `[Layer] Updated layer cache: ${name} (${mode})`);
         }
     }
 
@@ -1075,7 +1074,7 @@ export default class Switch extends DiscordBasePlugin {
                     if (typeof info.currentLayer === 'object' && info.currentLayer.gamemode) {
                         this.currentGamemode = info.currentLayer.gamemode;
                     }
-                    this.verbose(1, `[Layer] Updated from server info: ${incomingName}`);
+                    this.verbose(2, `[Layer] Updated from server info: ${incomingName}`);
                 }
             }
         } catch (err) {
@@ -1155,7 +1154,6 @@ export default class Switch extends DiscordBasePlugin {
                 }
                 this._knownConnectedPlayers.set(p.eosID, { teamID: p.teamID, name: p.name, steamID: p.steamID });
             } else {
-                // UPDATE — only update teamID if it's NOT null (per §3, skip null-teamID updates)
                 const existing = this._knownConnectedPlayers.get(p.eosID);
                 if (p.teamID !== null) {
                     existing.teamID = p.teamID;
@@ -1182,9 +1180,9 @@ export default class Switch extends DiscordBasePlugin {
             const entry = this._switchQueue.get(eosID);
             clearInterval(entry.warnInterval);
             this._switchQueue.delete(eosID);
-            this.verbose(1, `[Queue] ${playerName} disconnected — removed from queue.`);
+            this.verbose(2, `[Queue] ${playerName} disconnected — removed from queue.`);
         }
-        this.verbose(1, `Player disconnected ${playerName}`);
+        this.verbose(2, `Player disconnected ${playerName}`);
         this.recentDisconnections[steamID] = { teamID: teamID, time: new Date() };
         
         const cutoff = Date.now() - (20 * 60 * 1000); // 20-minute retention
@@ -1202,7 +1200,7 @@ export default class Switch extends DiscordBasePlugin {
         const playerName = info.player.name;
         const teamID = info.player.teamID;
 
-        this.verbose(1, `Player connected ${playerName}`);
+        this.verbose(2, `Player connected ${playerName}`);
         const now = Date.now();
 
         // Issue 5: Guard against double-registration if onUpdatedPlayerInfo already processed
@@ -1231,12 +1229,12 @@ export default class Switch extends DiscordBasePlugin {
                     });
                     if (records.length > 0 && records[0].firstSeenTimestamp) {
                         this.playersConnectionTime[eosID] = new Date(records[0].firstSeenTimestamp).getTime();
-                        this.verbose(1, `[Rejoin] ${playerName} retained join time from pre-disconnection.`);
+                        this.verbose(2, `[Rejoin] ${playerName} retained join time from pre-disconnection.`);
                     } else {
                         this.playersConnectionTime[eosID] = now;
                     }
                 } catch (err) {
-                    this.verbose(1, `Failed to hydrate join time for ${playerName}: ${err.message}`);
+                    this.verbose(2, `Failed to hydrate join time for ${playerName}: ${err.message}`);
                     this.playersConnectionTime[eosID] = now;
                 }
             }
@@ -1286,7 +1284,7 @@ export default class Switch extends DiscordBasePlugin {
         if (!preDisconnectionData) return;
 
         const needSwitch = teamID != preDisconnectionData.teamID;
-        this.verbose(1, `${playerName}: Switching to old team: ${needSwitch}`);
+        this.verbose(2, `${playerName}: Switching to old team: ${needSwitch}`);
 
         if (Date.now() - preDisconnectionData.time > 60 * 60 * 1000) return;
 
@@ -1613,21 +1611,21 @@ export default class Switch extends DiscordBasePlugin {
 
     async onScrambleExecuted(data) {
         const { affectedPlayers } = data;
-        this.verbose(1, `[SCRAMBLE_EVENT] onScrambleExecuted called with data: ${JSON.stringify(data)}`);
+        this.verbose(2, `[SCRAMBLE_EVENT] onScrambleExecuted called with data: ${JSON.stringify(data)}`);
         
         if (!affectedPlayers || affectedPlayers.length === 0) {
             this.verbose(1, `[SCRAMBLE_EVENT] WARNING: affectedPlayers is empty or undefined!`);
             return;
         }
 
-        this.verbose(1, `[SCRAMBLE_EVENT] Processing ${affectedPlayers.length} affected players for lockdown`);
+        this.verbose(2, `[SCRAMBLE_EVENT] Processing ${affectedPlayers.length} affected players for lockdown`);
         affectedPlayers.forEach((p, i) => {
             this.verbose(2, `  [${i}] steamID=${p.steamID}, name=${p.name}`);
         });
 
         const lockdownDuration = this.options.scrambleLockdownDurationMinutes * 60 * 1000;
         const expiry = new Date(Date.now() + lockdownDuration);
-        this.verbose(1, `[SCRAMBLE_EVENT] Lockdown duration: ${this.options.scrambleLockdownDurationMinutes}min | Expiry: ${expiry.toISOString()}`);
+        this.verbose(2, `[SCRAMBLE_EVENT] Lockdown duration: ${this.options.scrambleLockdownDurationMinutes}min | Expiry: ${expiry.toISOString()}`);
 
          const records = affectedPlayers
              .filter(p => {
@@ -1641,10 +1639,10 @@ export default class Switch extends DiscordBasePlugin {
                  return { eosID: p.eosID, steamID: p.steamID ?? null, playerName: p.name, scrambleLockdownExpiry: expiry };
              });
 
-        this.verbose(2, `[SCRAMBLE_EVENT] Created ${records.length} lockdown records for DB write`);
+        this.verbose(3, `[SCRAMBLE_EVENT] Created ${records.length} lockdown records for DB write`);
 
         try {
-            this.verbose(1, `[SCRAMBLE_EVENT] Starting DB transaction to write scramble locks...`);
+            this.verbose(2, `[SCRAMBLE_EVENT] Starting DB transaction to write scramble locks...`);
             await this.safeTransaction(async (t) => {
                 const chunkSize = 10;
                 for (let i = 0; i < records.length; i += chunkSize) {
