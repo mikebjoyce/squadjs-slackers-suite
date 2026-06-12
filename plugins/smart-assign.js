@@ -708,7 +708,7 @@ export default class SmartAssign extends BasePlugin {
       
       Logger.verbose('SmartAssign', 1, `[Attribution] RECEIVED PLAYER_MOVED_BY_PLUGIN: source=${source}, player=${name || playerIdentifier}, sourceTeam=${sourceTeamID}, targetTeam=${targetTeamID}, key=${playerIdentifier}`);
       
-      // Record the external move with TTL for attribution window (30 seconds)
+      // Record the external move with TTL for attribution window (90 seconds)
       this._externalMoveMap.set(playerIdentifier, { 
         eosID, 
         steamID, 
@@ -717,10 +717,10 @@ export default class SmartAssign extends BasePlugin {
         sourceTeamID,
         targetTeamID, 
         timestamp: recordedTime,
-        ttlExpiry: recordedTime + (30 * 1000) // 30 second TTL
+        ttlExpiry: recordedTime + (90 * 1000) // 90 second TTL
       });
       
-      Logger.verbose('SmartAssign', 3, `[ExternalMove] RECORDED: ${playerIdentifier} -> stored with 30s TTL expiry at ${new Date(recordedTime + 30000).toISOString()}`);
+      Logger.verbose('SmartAssign', 3, `[ExternalMove] RECORDED: ${playerIdentifier} -> stored with 90s TTL expiry at ${new Date(recordedTime + 90000).toISOString()}`);
       
       // Clean up expired entries from _externalMoveMap (every time an external move is recorded)
       let expiredCount = 0;
@@ -1060,11 +1060,19 @@ export default class SmartAssign extends BasePlugin {
   }
 
   async handlePlayerJoin(player) {
+    const lockKey = player.eosID || player.steamID;
+    if (!lockKey) {
+      Logger.verbose('SmartAssign', 1, `[SmartAssign] Cannot process join for ${player.name} - missing eosID/steamID.`);
+      return;
+    }
+
     // 1. DOUBLE-JOIN RACE PROTECTION
     // Since PLAYER_CONNECTED and UPDATED_PLAYER_INFORMATION both trigger joins,
     // a synchronous set check is used before any await as a write-lock.
-    if (this._joiningPlayers.has(player.steamID)) return;
-    this._joiningPlayers.add(player.steamID);
+    if (this._joiningPlayers.has(lockKey)) return;
+    this._joiningPlayers.add(lockKey);
+
+    this.server.emit('SMART_ASSIGN_EVAL_START', { eosID: player.eosID, steamID: player.steamID });
 
     try {
       // Register to known players
@@ -1251,7 +1259,8 @@ export default class SmartAssign extends BasePlugin {
         this.executor.queueMove(player.steamID, targetTeam);
       }
     } finally {
-      this._joiningPlayers.delete(player.steamID);
+      this._joiningPlayers.delete(lockKey);
+      this.server.emit('SMART_ASSIGN_EVAL_END', { eosID: player.eosID, steamID: player.steamID });
     }
   }
 
