@@ -159,6 +159,8 @@ export default class Switch extends DiscordBasePlugin {
         this.safeTransaction = this.safeTransaction.bind(this);
         this.safeDiscordReply = this.safeDiscordReply.bind(this);
         this._checkSwitchEligibility = this._checkSwitchEligibility.bind(this);
+        this.onSAEvalStart = this.onSAEvalStart.bind(this);
+        this.onSAEvalEnd = this.onSAEvalEnd.bind(this);
 
         this.playersConnectionTime = {};
         this.recentSwitches = [];
@@ -170,6 +172,7 @@ export default class Switch extends DiscordBasePlugin {
         this._switchedOnJoin = new Set();
         this._nullTeamIDWindowActive = false;
         this._nullTeamIDWindowTimeout = null;
+        this._saEvalLocks = new Map();
 
         // Layer tracking for liberal mode detection
         this.currentLayerName = null;
@@ -278,6 +281,8 @@ export default class Switch extends DiscordBasePlugin {
         this.server.on('NEW_GAME', this.onNewGame.bind(this));
         this.server.on('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo.bind(this));
         this.server.on('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated.bind(this));
+        this.server.on('SMART_ASSIGN_EVAL_START', this.onSAEvalStart);
+        this.server.on('SMART_ASSIGN_EVAL_END', this.onSAEvalEnd);
         if (this.options.discordClient) {
             this.options.discordClient.on('message', this.onDiscordMessage);
         }
@@ -570,6 +575,12 @@ export default class Switch extends DiscordBasePlugin {
                 return;
             }
 
+            if (this.isSABalancingActive) {
+                this.warn(steamID, '[Switch Queue]\nServer is currently balancing joins.\nYou have been added to the queue.');
+                this._enqueuePlayer(info.player, 'Server balancing in progress.');
+                return;
+            }
+
             const queueSameTeam = [...this._switchQueue.values()].filter(e => e.teamID === teamID).length;
             if (queueSameTeam > 0) {
                 this._enqueuePlayer(info.player, 'Other players are already waiting in the queue.');
@@ -846,6 +857,10 @@ export default class Switch extends DiscordBasePlugin {
 
     async _processQueue() {
         try {
+            if (this.isSABalancingActive) {
+                this.verbose(2, `[Queue] Processing suspended — SmartAssign is currently evaluating joins.`);
+                return;
+            }
             const windowMs = this.options.switchEnabledMinutes * 60 * 1000;
             const now = Date.now();
 
@@ -1006,6 +1021,41 @@ export default class Switch extends DiscordBasePlugin {
             this.currentLayerName = name;
             this.currentGamemode = mode;
             this.verbose(1, `[Layer] Updated layer cache: ${name} (${mode})`);
+        }
+    }
+
+    get isSABalancingActive() {
+        return this._saEvalLocks.size > 0;
+    }
+
+    onSAEvalStart(data) {
+        const key = data.eosID || data.steamID;
+        if (!key) return;
+
+        // Clear existing timeout to prevent memory leaks if events overlap
+        if (this._saEvalLocks.has(key)) {
+            clearTimeout(this._saEvalLocks.get(key));
+        }
+
+        // 3-second TTL fallback.
+        // This matches SmartAssign's target completion window for RCON moves.
+        // Shortening this ensures the Switch queue isn't locked indefinitely if an END event is missed.
+        const timeout = setTimeout(() => {
+            if (this._saEvalLocks.has(key)) {
+                this._saEvalLocks.delete(key);
+                this.verbose(1, `[Switch Lock] Fallback TTL (3s) expired; dropping lock for ${key}`);
+            }
+        }, 3000);
+
+        this._saEvalLocks.set(key, timeout);
+    }
+
+    onSAEvalEnd(data) {
+        const key = data.eosID || data.steamID;
+        if (this._saEvalLocks.has(key)) {
+            clearTimeout(this._saEvalLocks.get(key));
+            this._saEvalLocks.delete(key);
+            this.verbose(2, `[Switch Lock] Lock released for ${key}`);
         }
     }
 
@@ -1447,12 +1497,18 @@ export default class Switch extends DiscordBasePlugin {
         this.server.removeListener('NEW_GAME', this.onNewGame.bind(this));
         this.server.removeListener('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo.bind(this));
         this.server.removeListener('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated.bind(this));
+        this.server.removeListener('SMART_ASSIGN_EVAL_START', this.onSAEvalStart);
+        this.server.removeListener('SMART_ASSIGN_EVAL_END', this.onSAEvalEnd);
         if (this.options.discordClient) this.options.discordClient.removeListener('message', this.onDiscordMessage);
         clearTimeout(this._nullTeamIDWindowTimeout);
         for (const entry of this._switchQueue.values()) {
             clearInterval(entry.warnInterval);
         }
         this._switchQueue.clear();
+        for (const timeout of this._saEvalLocks.values()) {
+            clearTimeout(timeout);
+        }
+        this._saEvalLocks.clear();
         this.verbose(1, 'Switch plugin was un-mounted.');
     }
 
