@@ -1,12 +1,18 @@
 /**
- * Shared clans service for Slacker's Squad Services (S³).
+ * ClansService — Extracts and groups player clan tags from names, with caching and team-assignment helpers.
+ * Part of Slacker's Squad Services (S³).
  *
- * Stage 1 scope:
- * - Centralize clan-tag extraction/grouping logic used across TB/SA/Elo.
- * - Expose pure utility APIs for later consumer modules.
- * - Keep behavior parity with the most complete reference implementation
- *   (SA/TB), including ignoreList support + tag-cache helpers.
- * - Optionally merge near-miss tags via Levenshtein distance (Elo parity gap noted).
+ * Scope:
+ * - Extracts clan tags from player names using multiple regex patterns.
+ * - Groups players by clan tag with configurable size limits and Levenshtein merge.
+ * - Provides player tag cache and clan team lookup for join-time decisions.
+ *
+ * Build order: 4 (depends on: verboseLogger; consumed by: <planned, not yet wired>)
+ * Design ref: DesignDocs/slackers-squad-services-design.md §7
+ *
+ * @example
+ * // not yet invoked — representative call shape for future consumers
+ * svc.services.clans.extractClanGroups([{name: '[TAG] P1', eosID: '1'}, {name: 'TAG P2', eosID: '2'}]);
  */
 export default class ClansService {
   constructor({

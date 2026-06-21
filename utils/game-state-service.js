@@ -1,14 +1,20 @@
 /**
- * Shared game state service for Slacker's Squad Services (S³).
+ * GameState — Centralizes round phase tracking and layer/gamemode resolution.
+ * Part of Slacker's Squad Services (S³).
  *
- * Stage 1 scope:
- * - Centralize round phase tracking (STAGING -> LIVE -> ENDGAME)
- * - Keep SA-style "resolving" as an internal STAGING sub-state
- * - Infer ENDGAME sub-states: scoreboard -> layerVote -> factionVoteTeam1 -> factionVoteTeam2 -> waiting
- * - Share inferGameMode/resolveLayerInfo behavior with parity to TB/Elo/SA/Switch
- * - Provide ignored-game-mode matching utility (default Seed/Jensen in callers)
- * - Persist/recover state via dbService/Sequelize connector for restart resilience
- * - Validate recovered state against round age + authoritative layer updates
+ * Scope:
+ * - Tracks round phases (STAGING → LIVE → ENDGAME) with resolving sub-state during STAGING
+ * - Infers and resolves layer information (gamemode from layer name)
+ * - Manages ENDGAME sub-state progression via timer-based voting state machine
+ * - Provides parameterized ignored-mode substring matching utility
+ * - Persists/recovers state for restart resilience with round-age validation
+ *
+ * Build order: 3 (depends on: parent, server, verboseLogger, ignoredGameModes; consumed by: factions; <planned, not yet wired> TB, SA, Switch, Elo)
+ * Design ref: DesignDocs/slackers-squad-services-design.md §5
+ *
+ * @example
+ * // inside factions-service handleUpdatedPlayerInfo, gates team abbreviation polling in LIVE phase
+ * this.gameState.isLive(); // true if round is in LIVE phase
  */
 
 // Round flow notes for future reference:

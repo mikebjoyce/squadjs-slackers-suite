@@ -1,13 +1,19 @@
 /**
- * Shared players service for Slacker's Squad Services (S³).
+ * PlayersService — centralized player registry with move attribution and priority-based locking.
+ * Part of Slacker's Squad Services (S³).
  *
- * Stage 1 scope:
- * - Centralize player registry diffing via UPDATED_PLAYER_INFORMATION
- * - Emit S3-prefixed lifecycle events (join/leave/team-change)
- * - Own per-player move attribution intent map (default 90s TTL)
- * - Provide priority-based per-player + global locking helpers
+ * Scope:
+ * - Centralize player registry diffing via UPDATED_PLAYER_INFORMATION lifecycle events
+ * - Own per-player move attribution with TTL-based consumption before team change emission
+ * - Provide priority-based per-player and global locking for TeamBalancer, SmartAssign, Switch coordination
  * - Provide minimal reconnect memory persistence (db-backed when available)
- * - Lock priority: TeamBalancer > SmartAssign > Switch
+ *
+ * Build order: 6 (depends on: parent, server, verboseLogger; consumed by: <planned, not yet wired>)
+ * Design ref: DesignDocs/slackers-squad-services-design.md §4
+ *
+ * @example
+ * // Inside handleUpdatedPlayerInfo, on every UPDATED_PLAYER_INFORMATION tick:
+ * this.services.players.handleUpdatedPlayerInfo(data);
  */
 
 // Round flow notes for future reference:

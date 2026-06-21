@@ -7,13 +7,20 @@ import PlayersService from '../utils/players-service.js';
 import ServerConfigService from '../utils/server-config-service.js';
 
 /**
- * Shared services plugin for Slacker's Squad Services (S³).
+ * SlackersSquadServices — Composes and mounts shared player lifecycle, game state, faction, clan, and persistence services for consumption by TeamBalancer, SmartAssign, Switch, and EloTracker plugins.
+ * Part of Slacker's Squad Services (S³).
  *
- * Stage 1 status:
- * - Provides connector/config contracts (Discord + database + shared service options)
- * - Composes and mounts gameState, factions, clans, db, and players services
- * - Provides serverConfig service for parsing Squad server configuration files
- * - Exposes a single lifecycle-managed service container for later migration wiring
+ * Scope:
+ * - Composes gameState, factions, clans, db, and players services as a lifecycle-managed container
+ * - Provides serverConfig service for parsing Squad server configuration files at mount time
+ * - Delegates server events (NEW_GAME, ROUND_ENDED, UPDATED_LAYER_INFORMATION, etc.) to subscribed services
+ *
+ * Build order: 1 (depends on: server, options, connectors; consumed by: <planned, not yet wired> TB, SA, Switch, Elo)
+ * Design ref: DesignDocs/slackers-squad-services-design.md §3
+ *
+ * @example
+ * // not yet invoked — representative call shape for future consumers
+ * svc.services.gameState.isLive(); // Check if round is in LIVE phase
  */
 export default class SlackersSquadServices extends BasePlugin {
   static get description() {

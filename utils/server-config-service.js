@@ -1,10 +1,19 @@
 /**
- * Shared server config service for Slacker's Squad Services (S³).
+ * ServerConfigService — parses Squad server configuration files and caches key values for runtime access.
+ * Part of Slacker's Squad Services (S³).
  *
- * Stage 1 scope:
- * - Parse Squad server configuration files at mount time
- * - Cache key values for runtime access
+ * Scope:
+ * - Parse Squad server configuration files (Server.cfg, VoteConfig.cfg) at mount time
+ * - Cache key server settings (AllowTeamChanges, MaxPlayers, TimeBetweenMatches, voting durations)
  * - Provide fallback defaults when files are unavailable
+ *
+ * Build order: 6 (depends on: verboseLogger, configPath; consumed by: <planned, not yet wired>)
+ * Design ref: DesignDocs/slackers-squad-services-design.md §<planned, not yet wired>
+ *
+ * @example
+ * const svc = new ServerConfigService({ configPath: './SquadGame/ServerConfig/' });
+ * await svc.mount();
+ * svc.getAllowTeamChanges();
  */
 
 import { readFileSync, existsSync } from 'node:fs';

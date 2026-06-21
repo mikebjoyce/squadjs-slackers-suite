@@ -6,6 +6,10 @@
  * - Provide shared team-name lookup helpers for callers
  * - Keep resolution gated to LIVE phase via gameState service
  * - SA/Elo confirmed to use numeric teamID only (no name resolution yet)
+ *
+ * @example
+ * // not yet invoked — representative call shape for future consumers
+ * svc.services.factions.getTeamName(1); // Returns "Team 1" or cached abbreviation
  */
 export default class FactionsService {
   constructor({

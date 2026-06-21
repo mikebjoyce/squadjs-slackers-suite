@@ -7,6 +7,10 @@
  * - Enforce SQLite WAL pragmas once per connector
  * - Provide lightweight migration runner (no sync({ alter: true }))
  * - Standardize connector resolution for S³ services + later plugin migrations
+ *
+ * @example
+ * // not yet invoked — representative call shape for future consumers
+ * svc.services.db.defineModel('PlayerStats', { kills: { type: DataTypes.INTEGER } });
  */
 export default class DBService {
   constructor({
