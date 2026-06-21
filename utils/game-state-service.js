@@ -4,6 +4,7 @@
  * Stage 1 scope:
  * - Centralize round phase tracking (STAGING -> LIVE -> ENDGAME)
  * - Keep SA-style "resolving" as an internal STAGING sub-state
+ * - Infer ENDGAME sub-states: scoreboard -> layerVote -> factionVoteTeam1 -> factionVoteTeam2 -> waiting
  * - Share inferGameMode/resolveLayerInfo behavior with parity to TB/Elo/SA/Switch
  * - Provide ignored-game-mode matching utility (default Seed/Jensen in callers)
  * - Persist/recover state via dbService/Sequelize connector for restart resilience
@@ -50,9 +51,13 @@ export default class GameStateService {
     this.lastKnownGoodLayer = null;
 
     this._stagingLiveTimer = null;
+    this._endgameTimer = null;
     this._isMounted = false;
     this.GameStateModel = null;
     this._recoveredStateActive = false;
+    // ENDGAME sub-state: 'scoreboard' | 'layerVote' | 'factionVoteTeam1' | 'factionVoteTeam2' | null
+    // Note: ENDGAME sub-states are NOT persisted. Recovering into ENDGAME is dangerous and warns.
+    this.endgameSubState = null;
 
     this.listeners = {
       handleNewGame: this.handleNewGame.bind(this),
@@ -88,6 +93,7 @@ export default class GameStateService {
     if (!this._isMounted) return;
 
     this._clearStagingLiveTimer();
+    this._clearEndgameTimer();
     this._isMounted = false;
     this.verboseLogger(2, '[GameState] Unmounted.');
   }
@@ -184,6 +190,8 @@ export default class GameStateService {
   async handleNewGame(data) {
     const now = Date.now();
     this._recoveredStateActive = false;
+    this._clearEndgameTimer();
+    this.endgameSubState = null; // Clear ENDGAME sub-state when entering STAGING
     this.phase = 'STAGING';
     this.resolving = true;
     this.lastNewGameAt = now;
@@ -207,8 +215,18 @@ export default class GameStateService {
     this.phase = 'ENDGAME';
     this.lastRoundEndedAt = now;
     this.lastPhaseChangeAt = now;
+
+    // Warn if we're recovering into ENDGAME state (dangerous - no visibility into sub-state)
+    if (this._recoveredStateActive) {
+      this.verboseLogger(1, '[GameState] WARNING: Recovered into ENDGAME phase. Voting sub-states unknown - timer approximations may be inaccurate.');
+    }
+
+    // Start ENDGAME sub-state timer chain
+    this.endgameSubState = 'scoreboard';
+    this._startEndgameTimer(now);
+
     await this._persistState();
-    this.verboseLogger(2, '[GameState] ROUND_ENDED -> ENDGAME.');
+    this.verboseLogger(2, '[GameState] ROUND_ENDED -> ENDGAME(scoreboard).');
   }
 
   async handleLayerInfoUpdated() {
@@ -263,6 +281,13 @@ export default class GameStateService {
     }
   }
 
+  _clearEndgameTimer() {
+    if (this._endgameTimer) {
+      clearTimeout(this._endgameTimer);
+      this._endgameTimer = null;
+    }
+  }
+
   _startStagingLiveTimer(stagingStartedAtMs) {
     this._clearStagingLiveTimer();
 
@@ -278,6 +303,85 @@ export default class GameStateService {
       await this._persistState();
       this.verboseLogger(2, '[GameState] STAGING timer elapsed -> LIVE.');
     }, remaining);
+  }
+
+  _startEndgameTimer(endgameStartedAtMs) {
+    this._clearEndgameTimer();
+
+    const elapsed = Math.max(0, Date.now() - Number(endgameStartedAtMs || Date.now()));
+
+    // Calculate remaining time based on current sub-state
+    let remaining = 0;
+    if (this.endgameSubState === 'scoreboard') {
+      remaining = Math.max(0, this._getTimeBeforeVote() - elapsed);
+    } else if (this.endgameSubState === 'layerVote') {
+      remaining = Math.max(0, this._getLayerVoteDuration() - elapsed);
+    } else if (this.endgameSubState === 'factionVoteTeam1' || this.endgameSubState === 'factionVoteTeam2') {
+      remaining = Math.max(0, this._getTeamVoteDuration() - elapsed);
+    }
+
+    this._endgameTimer = setTimeout(() => {
+      if (this.phase !== 'ENDGAME') return;
+      this._advanceEndgameSubState();
+    }, remaining);
+  }
+
+  _advanceEndgameSubState() {
+    // Timer-based sub-state progression - approximate since SquadJS has no explicit voting events
+    // WARNING: These timers are estimates only. Actual voting may end early or extend due to player activity.
+    // Reloading during ENDGAME will lose track of voting state entirely.
+
+    if (this.endgameSubState === 'scoreboard') {
+      this.endgameSubState = 'layerVote';
+      this.verboseLogger(2, '[GameState] ENDGAME scoreboard elapsed -> layerVote.');
+      this._startEndgameTimer(Date.now());
+      return;
+    }
+
+    if (this.endgameSubState === 'layerVote') {
+      this.endgameSubState = 'factionVoteTeam1';
+      this.verboseLogger(2, '[GameState] ENDGAME layerVote elapsed -> factionVoteTeam1.');
+      this._startEndgameTimer(Date.now());
+      return;
+    }
+
+    if (this.endgameSubState === 'factionVoteTeam1') {
+      this.endgameSubState = 'factionVoteTeam2';
+      this.verboseLogger(2, '[GameState] ENDGAME factionVoteTeam1 elapsed -> factionVoteTeam2.');
+      this._startEndgameTimer(Date.now());
+      return;
+    }
+
+    if (this.endgameSubState === 'factionVoteTeam2') {
+      this.endgameSubState = null;
+      this.verboseLogger(2, '[GameState] ENDGAME factionVoteTeam2 elapsed -> waiting for NEW_GAME.');
+      // Stay in ENDGAME but with null sub-state, waiting for NEW_GAME
+    }
+  }
+
+  // ENDGAME sub-state getters
+  getEndgameSubState() {
+    return this.endgameSubState;
+  }
+
+  isEndgameScoreboard() {
+    return this.phase === 'ENDGAME' && this.endgameSubState === 'scoreboard';
+  }
+
+  isEndgameLayerVote() {
+    return this.phase === 'ENDGAME' && this.endgameSubState === 'layerVote';
+  }
+
+  isEndgameFactionVote() {
+    return this.phase === 'ENDGAME' && (this.endgameSubState === 'factionVoteTeam1' || this.endgameSubState === 'factionVoteTeam2');
+  }
+
+  isEndgameFactionVoteTeam1() {
+    return this.phase === 'ENDGAME' && this.endgameSubState === 'factionVoteTeam1';
+  }
+
+  isEndgameFactionVoteTeam2() {
+    return this.phase === 'ENDGAME' && this.endgameSubState === 'factionVoteTeam2';
   }
 
   async _initPersistence() {
@@ -404,6 +508,7 @@ export default class GameStateService {
 
   async _transitionRecoveredStateToLive(reason, now = Date.now()) {
     this._clearStagingLiveTimer();
+    this._clearEndgameTimer();
     this.phase = 'LIVE';
     this.resolving = false;
     this.lastPhaseChangeAt = now;
@@ -462,6 +567,7 @@ export default class GameStateService {
       await write();
     }
   }
+
   _getDbService() {
     return this.parent?.services?.db || null;
   }
@@ -485,5 +591,28 @@ export default class GameStateService {
     }
 
     return dataTypes;
+  }
+
+  // Get voting durations from server config (with safe defaults)
+  _getServerConfig() {
+    return this.parent?.services?.serverConfig || null;
+  }
+
+  _getTimeBeforeVote() {
+    const config = this._getServerConfig();
+    // default 30s from VoteConfig.cfg
+    return config?.getTimeBeforeVote ? config.getTimeBeforeVote() * 1000 : 30000;
+  }
+
+  _getLayerVoteDuration() {
+    const config = this._getServerConfig();
+    // default 25s from VoteConfig.cfg
+    return config?.getLayerVoteDuration ? config.getLayerVoteDuration() * 1000 : 25000;
+  }
+
+  _getTeamVoteDuration() {
+    const config = this._getServerConfig();
+    // default 25s from VoteConfig.cfg
+    return config?.getTeamVoteDuration ? config.getTeamVoteDuration() * 1000 : 25000;
   }
 }

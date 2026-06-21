@@ -404,6 +404,136 @@ await runTest('mount/unmount does not bind server listeners directly', async () 
   assert.equal(server.listenerCount('UPDATED_PLAYER_INFORMATION'), 0);
 });
 
+// Mock ServerConfig service for testing
+class MockServerConfig {
+  constructor(configOverrides = {}) {
+    this.getTimeBeforeVote = () => configOverrides.timeBeforeVote ?? 30;
+    this.getLayerVoteDuration = () => configOverrides.layerVoteDuration ?? 25;
+    this.getTeamVoteDuration = () => configOverrides.teamVoteDuration ?? 25;
+  }
+}
+
+await runTest('ROUND_ENDED transitions to ENDGAME with scoreboard sub-state', async () => {
+  const server = new MockServer();
+  const parent = { services: { serverConfig: new MockServerConfig() } };
+  const service = new GameStateService({ parent, server });
+
+  await service.mount();
+  await service.handleRoundEnded();
+
+  assert.equal(service.getPhase(), 'ENDGAME');
+  assert.equal(service.isEnding(), true);
+  assert.equal(service.isEndgameScoreboard(), true);
+  assert.equal(service.getEndgameSubState(), 'scoreboard');
+
+  await service.unmount();
+});
+
+await runTest('ENDGAME scoreboard transitions to layerVote after TimeBeforeVote', async () => {
+  const server = new MockServer();
+  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0 }) } };
+  const service = new GameStateService({ parent, server });
+
+  await service.mount();
+  await service.handleRoundEnded();
+  assert.equal(service.isEndgameScoreboard(), true);
+
+  // Wait for scoreboard timer to elapse (0ms)
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(service.isEndgameLayerVote(), true);
+
+  await service.unmount();
+});
+
+await runTest('ENDGAME layerVote transitions to factionVoteTeam1', async () => {
+  const server = new MockServer();
+  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0 }) } };
+  const service = new GameStateService({ parent, server });
+
+  await service.mount();
+  await service.handleRoundEnded();
+
+  // Fast-forward through scoreboard
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(service.isEndgameLayerVote(), true);
+
+  // Fast-forward through layerVote
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(service.isEndgameFactionVoteTeam1(), true);
+
+  await service.unmount();
+});
+
+await runTest('ENDGAME factionVoteTeam1 transitions to factionVoteTeam2', async () => {
+  const server = new MockServer();
+  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0, teamVoteDuration: 0 }) } };
+  const service = new GameStateService({ parent, server });
+
+  await service.mount();
+  await service.handleRoundEnded();
+
+  // Fast-forward through scoreboard -> layerVote -> factionVoteTeam1
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(service.isEndgameFactionVoteTeam1(), true);
+
+  // Fast-forward through factionVoteTeam1
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(service.isEndgameFactionVoteTeam2(), true);
+
+  await service.unmount();
+});
+
+await runTest('ENDGAME factionVoteTeam2 transitions to null (waiting for NewGame)', async () => {
+  const server = new MockServer();
+  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0, teamVoteDuration: 0 }) } };
+  const service = new GameStateService({ parent, server });
+
+  await service.mount();
+  await service.handleRoundEnded();
+
+  // Fast-forward through all voting phases
+  // Need to wait for all timer callbacks to execute (setTimeout 0 still needs time)
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  // Is now in ENDGAME with null sub-state (waiting for NEW_GAME)
+  assert.equal(service.isEnding(), true);
+  assert.equal(service.getEndgameSubState(), null);
+
+  await service.unmount();
+});
+
+await runTest('NEW_GAME clears ENDGAME timer and sub-state', async () => {
+  const server = new MockServer();
+  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 60 }) } };
+  const service = new GameStateService({ parent, server });
+
+  await service.mount();
+  await service.handleRoundEnded();
+  assert.equal(service.isEndgameScoreboard(), true);
+
+  // NEW_GAME should clear the timer and reset sub-state
+  await service.handleNewGame({ layer: 'Mutaha_RAAS_v3' });
+  assert.equal(service.getPhase(), 'STAGING');
+  assert.equal(service.getEndgameSubState(), null);
+
+  await service.unmount();
+});
+
+await runTest('ENDGAME sub-state query methods return false outside ENDGAME', async () => {
+  const server = new MockServer();
+  const service = new GameStateService({ server });
+
+  await service.mount();
+
+  assert.equal(service.isEndgameScoreboard(), false);
+  assert.equal(service.isEndgameLayerVote(), false);
+  assert.equal(service.isEndgameFactionVote(), false);
+  assert.equal(service.isEndgameFactionVoteTeam1(), false);
+  assert.equal(service.isEndgameFactionVoteTeam2(), false);
+  assert.equal(service.getEndgameSubState(), null);
+
+  await service.unmount();
+});
+
 if (!process.exitCode) {
   console.log('\nAll game-state-service tests passed.');
 }
