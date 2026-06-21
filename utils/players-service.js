@@ -4,17 +4,18 @@
  * Stage 1 scope:
  * - Centralize player registry diffing via UPDATED_PLAYER_INFORMATION
  * - Emit S3-prefixed lifecycle events (join/leave/team-change)
- * - Own per-player move attribution intent map
+ * - Own per-player move attribution intent map (default 90s TTL)
  * - Provide priority-based per-player + global locking helpers
  * - Provide minimal reconnect memory persistence (db-backed when available)
+ * - Lock priority: TeamBalancer > SmartAssign > Switch
  */
 
 // Round flow notes for future reference:
-    // LIVE -> ROUND_ENDED event -> ENDGAME (map/faction voting window)
-    // -> NEW_GAME event -> STAGING(resolving=true) -> STAGING(resolving=false) -> LIVE.
-    // During map load around NEW_GAME, players can briefly report teamID=null (sometimes
-    // a tick before NEW_GAME). We treat this as a transient state while teams resolve;
-    // we still consider prior teams valid unless a player actually swaps during this window.
+// - LIVE -> ROUND_ENDED event -> ENDGAME (map/faction voting window)
+// - NEW_GAME event -> STAGING(resolving=true) -> STAGING(resolving=false) -> LIVE.
+// - During map load around NEW_GAME, players can briefly report teamID=null (sometimes
+//   a tick before NEW_GAME). Treat this as transient while teams resolve; prior teams
+//   remain valid unless a player actually swaps during this window.
 
 const DEFAULT_ATTRIBUTION_TTL_MS = 90000;
 const DEFAULT_LOCK_TTL_MS = 3000;
@@ -25,7 +26,6 @@ export default class PlayersService {
   constructor({
     parent = null,
     server,
-    dbService = null,
     verboseLogger = () => {},
     attributionTtlMs = DEFAULT_ATTRIBUTION_TTL_MS,
     defaultLockTtlMs = DEFAULT_LOCK_TTL_MS,
@@ -33,7 +33,6 @@ export default class PlayersService {
   } = {}) {
     this.parent = parent;
     this.server = server;
-    this.dbService = dbService;
     this.verboseLogger = verboseLogger;
 
     this.attributionTtlMs = Number.isFinite(attributionTtlMs) ? attributionTtlMs : DEFAULT_ATTRIBUTION_TTL_MS;
@@ -245,8 +244,9 @@ export default class PlayersService {
       updatedAt: Date.now()
     };
 
-    if (this.reconnectModel) {
-      await this.dbService.executeWithRetry(async () => {
+    const dbService = this._getDbService();
+    if (this.reconnectModel && dbService?.executeWithRetry) {
+      await dbService.executeWithRetry(async () => {
         await this.reconnectModel.upsert(record);
       });
     }
@@ -260,8 +260,11 @@ export default class PlayersService {
     const key = this._normalizeIdentifier(eosID);
     if (!key) return null;
 
+    const dbService = this._getDbService();
     if (this.reconnectModel) {
-      const row = await this.dbService.executeWithRetry(async () => this.reconnectModel.findByPk(key));
+      const row = await dbService?.executeWithRetry
+        ? dbService.executeWithRetry(async () => this.reconnectModel.findByPk(key))
+        : this.reconnectModel.findByPk(key);
       if (row) {
         const normalized = this._normalizeReconnectRow(row);
         if (this._isReconnectStale(normalized)) {
@@ -284,8 +287,9 @@ export default class PlayersService {
   }
 
   async clearReconnects() {
-    if (this.reconnectModel) {
-      await this.dbService.executeWithRetry(async () => {
+    const dbService = this._getDbService();
+    if (this.reconnectModel && dbService?.executeWithRetry) {
+      await dbService.executeWithRetry(async () => {
         await this.reconnectModel.destroy({ where: {} });
       });
     }
@@ -560,9 +564,10 @@ export default class PlayersService {
   }
 
   async _deleteReconnectRow(eosID) {
-    if (!this.reconnectModel || !this.dbService) return;
+    const dbService = this._getDbService();
+    if (!this.reconnectModel || !dbService?.executeWithRetry) return;
 
-    await this.dbService.executeWithRetry(async () => {
+    await dbService.executeWithRetry(async () => {
       await this.reconnectModel.destroy({ where: { eosID } });
     });
   }
@@ -570,7 +575,8 @@ export default class PlayersService {
   async _pruneReconnects(now = Date.now(), { force = false } = {}) {
     this._pruneReconnectMemory(now);
 
-    if (!this.reconnectPersistence || !this.reconnectModel || !this.dbService) return;
+    const dbService = this._getDbService();
+    if (!this.reconnectPersistence || !this.reconnectModel || !dbService) return;
 
     if (!force && this._lastReconnectPruneAt) {
       if ((now - this._lastReconnectPruneAt) < this.reconnectPruneIntervalMs) return;
@@ -579,10 +585,10 @@ export default class PlayersService {
     this._lastReconnectPruneAt = now;
     const cutoff = now - this.reconnectMaxAgeMs;
 
-    const connector = this.dbService.getConnector?.();
+    const connector = dbService.getConnector?.();
     if (connector && typeof connector.query === 'function') {
       try {
-        await this.dbService.executeWithRetry(async () => {
+        await dbService.executeWithRetry(async () => {
           await connector.query('DELETE FROM S3PlayerReconnects WHERE updatedAt < :cutoff', {
             replacements: { cutoff }
           });
@@ -596,8 +602,8 @@ export default class PlayersService {
     const Op =
       this.reconnectModel?.sequelize?.constructor?.Op ||
       this.reconnectModel?.sequelize?.Sequelize?.Op ||
-      this.dbService?.getConnector?.()?.constructor?.Sequelize?.Op ||
-      this.dbService?.getConnector?.()?.Sequelize?.Op ||
+      dbService.getConnector?.()?.constructor?.Sequelize?.Op ||
+      dbService.getConnector?.()?.Sequelize?.Op ||
       null;
     if (!Op) {
       this.verboseLogger(1, '[Players] Skipping reconnect DB prune: Sequelize Op not available.');
@@ -605,7 +611,7 @@ export default class PlayersService {
     }
 
     try {
-      await this.dbService.executeWithRetry(async () => {
+      await dbService.executeWithRetry(async () => {
         await this.reconnectModel.destroy({ where: { updatedAt: { [Op.lt]: cutoff } } });
       });
     } catch (err) {
@@ -692,16 +698,17 @@ export default class PlayersService {
   }
 
   async _initReconnectPersistence() {
-    if (!this.reconnectPersistence || !this.dbService) return;
+    const dbService = this._getDbService();
+    if (!this.reconnectPersistence || !dbService) return;
 
-    const connector = this.dbService.getConnector?.();
+    const connector = dbService.getConnector?.();
     if (!connector) return;
 
-    if (!this._migrationRegistered && typeof this.dbService.registerMigration === 'function') {
+    if (!this._migrationRegistered && typeof dbService.registerMigration === 'function') {
       this._migrationRegistered = true;
 
       try {
-        this.dbService.registerMigration('2026-06-21-002-s3-player-reconnects', async ({ sequelize, transaction }) => {
+        dbService.registerMigration('2026-06-21-002-s3-player-reconnects', async ({ sequelize, transaction }) => {
           const queryInterface = sequelize.getQueryInterface?.();
 
           if (queryInterface && typeof queryInterface.describeTable === 'function' && typeof queryInterface.createTable === 'function') {
@@ -712,7 +719,7 @@ export default class PlayersService {
               // Table does not exist, continue.
             }
 
-            const DataTypes = this.dbService.getDataTypes();
+            const DataTypes = dbService.getDataTypes();
             await queryInterface.createTable('S3PlayerReconnects', {
               eosID: {
                 type: DataTypes.STRING,
@@ -762,35 +769,35 @@ export default class PlayersService {
       }
     }
 
-    if (typeof this.dbService.runMigrations === 'function') {
-      await this.dbService.runMigrations();
+    if (typeof dbService.runMigrations === 'function') {
+      await dbService.runMigrations();
     }
 
-    this.reconnectModel = this.dbService.defineModel?.(
+    this.reconnectModel = dbService.defineModel?.(
       'S3PlayerReconnect',
       {
         eosID: {
-          type: this.dbService.getDataTypes().STRING,
+          type: dbService.getDataTypes().STRING,
           primaryKey: true
         },
         steamID: {
-          type: this.dbService.getDataTypes().STRING,
+          type: dbService.getDataTypes().STRING,
           allowNull: true
         },
         playerName: {
-          type: this.dbService.getDataTypes().STRING,
+          type: dbService.getDataTypes().STRING,
           allowNull: true
         },
         lastTeamID: {
-          type: this.dbService.getDataTypes().INTEGER,
+          type: dbService.getDataTypes().INTEGER,
           allowNull: true
         },
         lastSeenAt: {
-          type: this.dbService.getDataTypes().BIGINT,
+          type: dbService.getDataTypes().BIGINT,
           allowNull: true
         },
         updatedAt: {
-          type: this.dbService.getDataTypes().BIGINT,
+          type: dbService.getDataTypes().BIGINT,
           allowNull: false
           }
       },
@@ -812,5 +819,9 @@ export default class PlayersService {
       lastSeenAt: plain.lastSeenAt ?? null,
       updatedAt: plain.updatedAt ?? null
     };
+  }
+
+  _getDbService() {
+    return this.parent?.services?.db || null;
   }
 }

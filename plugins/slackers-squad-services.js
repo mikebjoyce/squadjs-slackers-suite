@@ -114,10 +114,17 @@ export default class SlackersSquadServices extends BasePlugin {
   }
 
   async prepareToMount() {
+    this.services.db = new DBService({
+      parent: this,
+      sequelize: this.options.database,
+      connectors: this.connectors,
+      databaseOption: this.options.database,
+      verboseLogger: (...args) => this.verbose(...args)
+    });
+
     this.services.gameState = new GameStateService({
       parent: this,
       server: this.server,
-      sequelize: this.options.database,
       ignoredGameModes: this.options.ignoredGameModes,
       verboseLogger: (...args) => this.verbose(...args)
     });
@@ -143,23 +150,18 @@ export default class SlackersSquadServices extends BasePlugin {
       }
     });
 
-    this.services.db = new DBService({
-      parent: this,
-      sequelize: this.options.database,
-      connectors: this.connectors,
-      databaseOption: this.options.database,
-      verboseLogger: (...args) => this.verbose(...args)
-    });
-
     this.services.players = new PlayersService({
       parent: this,
       server: this.server,
-      dbService: this.services.db,
       verboseLogger: (...args) => this.verbose(...args)
     });
   }
 
   async mount() {
+    if (this.services.db) {
+      await this.services.db.mount();
+    }
+
     if (this.services.gameState) {
       await this.services.gameState.mount();
     }
@@ -170,10 +172,6 @@ export default class SlackersSquadServices extends BasePlugin {
 
     if (this.services.clans) {
       await this.services.clans.mount();
-    }
-
-    if (this.services.db) {
-      await this.services.db.mount();
     }
 
     if (this.services.players) {

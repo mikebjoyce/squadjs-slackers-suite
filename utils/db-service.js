@@ -6,6 +6,7 @@
  * - Provide optional SQLite mutex serialization helpers
  * - Enforce SQLite WAL pragmas once per connector
  * - Provide lightweight migration runner (no sync({ alter: true }))
+ * - Standardize connector resolution for S³ services + later plugin migrations
  */
 export default class DBService {
   constructor({

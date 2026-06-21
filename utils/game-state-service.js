@@ -4,17 +4,18 @@
  * Stage 1 scope:
  * - Centralize round phase tracking (STAGING -> LIVE -> ENDGAME)
  * - Keep SA-style "resolving" as an internal STAGING sub-state
- * - Share inferGameMode/resolveLayerInfo behavior with parity to reference plugins
- * - Provide ignored-game-mode matching utility
- * - Persist/recover state via sequelize connector for restart resilience
+ * - Share inferGameMode/resolveLayerInfo behavior with parity to TB/Elo/SA/Switch
+ * - Provide ignored-game-mode matching utility (default Seed/Jensen in callers)
+ * - Persist/recover state via dbService/Sequelize connector for restart resilience
+ * - Validate recovered state against round age + authoritative layer updates
  */
 
 // Round flow notes for future reference:
-    // LIVE -> ROUND_ENDED event -> ENDGAME (map/faction voting window)
-    // -> NEW_GAME event -> STAGING(resolving=true) -> STAGING(resolving=false) -> LIVE.
-    // During map load around NEW_GAME, players can briefly report teamID=null (sometimes
-    // a tick before NEW_GAME). We treat this as a transient state while teams resolve;
-    // we still consider prior teams valid unless a player actually swaps during this window.
+// - LIVE -> ROUND_ENDED event -> ENDGAME (map/faction voting window)
+// - NEW_GAME event -> STAGING(resolving=true) -> STAGING(resolving=false) -> LIVE.
+// - During map load around NEW_GAME, players can briefly report teamID=null (sometimes
+//   a tick before NEW_GAME). Treat this as transient while teams resolve; prior teams
+//   remain valid unless a player actually swaps during this window.
 
 export default class GameStateService {
   constructor({
@@ -22,14 +23,12 @@ export default class GameStateService {
     server,
     verboseLogger = () => {},
     ignoredGameModes = [],
-    sequelize = null,
     stagingDurationMs = 360000,
     maxRecoveredRoundAgeMs = 7200000
   } = {}) {
     this.parent = parent;
     this.server = server;
     this.verboseLogger = verboseLogger;
-    this.sequelize = sequelize;
 
     this.defaultIgnoredGameModes = Array.isArray(ignoredGameModes)
       ? ignoredGameModes
@@ -183,7 +182,6 @@ export default class GameStateService {
   }
 
   async handleNewGame(data) {
-    
     const now = Date.now();
     this._recoveredStateActive = false;
     this.phase = 'STAGING';
@@ -283,16 +281,21 @@ export default class GameStateService {
   }
 
   async _initPersistence() {
-    if (!this.sequelize) return;
+    const dbService = this._getDbService();
+    const sequelize = this._getSequelize(dbService);
+    if (!sequelize) return;
 
-    const DataTypes = this._getDataTypes();
+    const DataTypes = this._getDataTypes(dbService, sequelize);
 
-    if (this.sequelize.models?.S3GameState) {
-      this.GameStateModel = this.sequelize.models.S3GameState;
+    if (sequelize.models?.S3GameState) {
+      this.GameStateModel = sequelize.models.S3GameState;
       return;
     }
 
-    this.GameStateModel = this.sequelize.define('S3GameState', {
+    const defineModel = dbService?.defineModel?.bind(dbService);
+    const modelFactory = defineModel || sequelize.define.bind(sequelize);
+
+    this.GameStateModel = modelFactory('S3GameState', {
       id: {
         type: DataTypes.INTEGER,
         primaryKey: true
@@ -332,7 +335,13 @@ export default class GameStateService {
       timestamps: false
     });
 
-    await this.GameStateModel.sync();
+    if (dbService?.executeWithRetry) {
+      await dbService.executeWithRetry(async () => {
+        await this.GameStateModel.sync();
+      });
+    } else {
+      await this.GameStateModel.sync();
+    }
   }
 
   async _recoverPersistedState() {
@@ -433,23 +442,43 @@ export default class GameStateService {
   async _persistState() {
     if (!this.GameStateModel) return;
 
-    await this.GameStateModel.upsert({
-      id: 1,
-      phase: this.phase,
-      resolving: this.resolving,
-      lastPhaseChangeAt: this.lastPhaseChangeAt,
-      lastNewGameAt: this.lastNewGameAt,
-      lastRoundEndedAt: this.lastRoundEndedAt,
-      lastLayerName: this.layerNameCached || null,
-      lastGamemode: this.gameModeCached || null
-    });
+    const dbService = this._getDbService();
+
+    const write = async () => {
+      await this.GameStateModel.upsert({
+        id: 1,
+        phase: this.phase,
+        resolving: this.resolving,
+        lastPhaseChangeAt: this.lastPhaseChangeAt,
+        lastNewGameAt: this.lastNewGameAt,
+        lastRoundEndedAt: this.lastRoundEndedAt,
+        lastLayerName: this.layerNameCached || null,
+        lastGamemode: this.gameModeCached || null
+      });
+    };
+    if (dbService?.executeWithRetry) {
+      await dbService.executeWithRetry(write);
+    } else {
+      await write();
+    }
+  }
+  _getDbService() {
+    return this.parent?.services?.db || null;
   }
 
-  _getDataTypes() {
+  _getSequelize(dbService = this._getDbService()) {
+    return dbService?.getConnector?.() || null;
+  }
+
+  _getDataTypes(dbService = this._getDbService(), sequelize = this._getSequelize(dbService)) {
+    if (dbService?.getDataTypes) {
+      return dbService.getDataTypes();
+    }
+
     const dataTypes =
-      this.sequelize?.constructor?.DataTypes ||
-      this.sequelize?.Sequelize?.DataTypes ||
-      this.sequelize?.DataTypes;
+      sequelize?.constructor?.DataTypes ||
+      sequelize?.Sequelize?.DataTypes ||
+      sequelize?.DataTypes;
 
     if (!dataTypes) {
       throw new Error('GameStateService could not resolve Sequelize DataTypes from connector.');

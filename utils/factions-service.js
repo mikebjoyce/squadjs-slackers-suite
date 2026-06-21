@@ -2,9 +2,10 @@
  * Shared factions service for Slacker's Squad Services (S³).
  *
  * Stage 1 scope:
- * - Centralize team/faction abbreviation discovery
- * - Provide shared team-name lookup helpers
+ * - Centralize team/faction abbreviation discovery (TB + Switch parity)
+ * - Provide shared team-name lookup helpers for callers
  * - Keep resolution gated to LIVE phase via gameState service
+ * - SA/Elo confirmed to use numeric teamID only (no name resolution yet)
  */
 export default class FactionsService {
   constructor({

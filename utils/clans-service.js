@@ -4,8 +4,9 @@
  * Stage 1 scope:
  * - Centralize clan-tag extraction/grouping logic used across TB/SA/Elo.
  * - Expose pure utility APIs for later consumer modules.
- * - Keep behavior parity with the most complete reference implementation,
- *   including ignoreList support and tag-cache helpers.
+ * - Keep behavior parity with the most complete reference implementation
+ *   (SA/TB), including ignoreList support + tag-cache helpers.
+ * - Optionally merge near-miss tags via Levenshtein distance (Elo parity gap noted).
  */
 export default class ClansService {
   constructor({
