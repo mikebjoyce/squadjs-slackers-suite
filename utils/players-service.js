@@ -39,8 +39,11 @@ export default class PlayersService {
     this.defaultLockTtlMs = Number.isFinite(defaultLockTtlMs) ? defaultLockTtlMs : DEFAULT_LOCK_TTL_MS;
     this.reconnectPersistence = reconnectPersistence !== false;
 
-    this.registry = new Map(); // key -> player state
+    this.registry = new Map(); // key (prefer EOS ID; fallback to steamID) -> player state
+    // Optional index for legacy/secondary IDs. steamID may be undefined for EOS-only players.
     this.steamIndex = new Map(); // steamID -> key
+    // Map keyed by EOS ID (preferred) or steamID (fallback) for move attribution.
+    // steamID may be undefined for EOS-only players.
     this.moveAttribution = new Map(); // id -> { targetTeamID, source, expiresAt }
 
     this.playerLocks = new Map(); // key -> lock
@@ -517,6 +520,7 @@ export default class PlayersService {
   _toPlayerState(player, now, { joinEmitted = false } = {}) {
     return {
       eosID: player?.eosID || null,
+      // steamID may be undefined/null for EOS-only players.
       steamID: player?.steamID || null,
       name: player?.name || 'Unknown',
       teamID: player?.teamID ?? null,
@@ -530,6 +534,7 @@ export default class PlayersService {
   _selectPlayerKey(player) {
     const eosID = this._normalizeIdentifier(player?.eosID);
     if (eosID) return eosID;
+    // Fallback for non-EOS identifiers (steamID can be undefined for EOS-only players).
     return this._normalizeIdentifier(player?.steamID);
   }
 
