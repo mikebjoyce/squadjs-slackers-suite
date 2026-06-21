@@ -108,7 +108,8 @@ export default class SlackersSquadServices extends BasePlugin {
       handleRoundEnded: this.handleRoundEnded.bind(this),
       handleLayerInfoUpdated: this.handleLayerInfoUpdated.bind(this),
       handleServerInfoUpdated: this.handleServerInfoUpdated.bind(this),
-      handleUpdatedPlayerInfo: this.handleUpdatedPlayerInfo.bind(this)
+      handleUpdatedPlayerInfo: this.handleUpdatedPlayerInfo.bind(this),
+      handlePlayerConnected: this.handlePlayerConnected.bind(this)
     };
   }
 
@@ -213,6 +214,7 @@ export default class SlackersSquadServices extends BasePlugin {
     this.server.on('UPDATED_LAYER_INFORMATION', this.listeners.handleLayerInfoUpdated);
     this.server.on('UPDATED_SERVER_INFORMATION', this.listeners.handleServerInfoUpdated);
     this.server.on('UPDATED_PLAYER_INFORMATION', this.listeners.handleUpdatedPlayerInfo);
+    this.server.on('PLAYER_CONNECTED', this.listeners.handlePlayerConnected);
   }
 
   _unbindServerEvents() {
@@ -223,6 +225,7 @@ export default class SlackersSquadServices extends BasePlugin {
     this.server.removeListener('UPDATED_LAYER_INFORMATION', this.listeners.handleLayerInfoUpdated);
     this.server.removeListener('UPDATED_SERVER_INFORMATION', this.listeners.handleServerInfoUpdated);
     this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.listeners.handleUpdatedPlayerInfo);
+    this.server.removeListener('PLAYER_CONNECTED', this.listeners.handlePlayerConnected);
   }
 
   async handleNewGame(data) {
@@ -268,6 +271,12 @@ export default class SlackersSquadServices extends BasePlugin {
 
     if (this.services.players?.handleUpdatedPlayerInfo) {
       await this.services.players.handleUpdatedPlayerInfo(data);
+    }
+  }
+
+  async handlePlayerConnected(data) {
+    if (this.services.players?.handlePlayerConnected) {
+      await this.services.players.handlePlayerConnected(data);
     }
   }
 }

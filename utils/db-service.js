@@ -85,6 +85,17 @@ export default class DBService {
     return connector._s3_mutex;
   }
 
+  static async withConnectorMutex(connector, logicFn) {
+    if (!connector || typeof logicFn !== 'function') {
+      throw new Error('withConnectorMutex requires connector and logicFn.');
+    }
+
+    const mutex = DBService.getConnectorMutex(connector);
+    const resultPromise = mutex.then(() => logicFn());
+    connector._s3_mutex = resultPromise.catch(() => {});
+    return resultPromise;
+  }
+
   static async withSqliteMutex(connector, logicFn) {
     if (!connector || typeof logicFn !== 'function') {
       throw new Error('withSqliteMutex requires connector and logicFn.');
@@ -94,10 +105,7 @@ export default class DBService {
       return logicFn();
     }
 
-    const mutex = DBService.getConnectorMutex(connector);
-    const resultPromise = mutex.then(() => logicFn());
-    connector._s3_mutex = resultPromise.catch(() => {});
-    return resultPromise;
+    return DBService.withConnectorMutex(connector, logicFn);
   }
 
   static async executeWithRetry(connector, logicFn, retryOptions = {}) {
@@ -126,7 +134,7 @@ export default class DBService {
       return null;
     };
 
-    return DBService.withSqliteMutex(connector, runAttempt);
+    return DBService.withConnectorMutex(connector, runAttempt);
   }
 
   static async withTransaction(connector, logicFn, { transactionOptions = null } = {}) {

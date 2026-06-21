@@ -8,8 +8,18 @@
  * - Provide priority-based per-player + global locking helpers
  * - Provide minimal reconnect memory persistence (db-backed when available)
  */
+
+// Round flow notes for future reference:
+    // LIVE -> ROUND_ENDED event -> ENDGAME (map/faction voting window)
+    // -> NEW_GAME event -> STAGING(resolving=true) -> STAGING(resolving=false) -> LIVE.
+    // During map load around NEW_GAME, players can briefly report teamID=null (sometimes
+    // a tick before NEW_GAME). We treat this as a transient state while teams resolve;
+    // we still consider prior teams valid unless a player actually swaps during this window.
+
 const DEFAULT_ATTRIBUTION_TTL_MS = 90000;
 const DEFAULT_LOCK_TTL_MS = 3000;
+const DEFAULT_RECONNECT_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+const DEFAULT_RECONNECT_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
 export default class PlayersService {
   constructor({
@@ -37,9 +47,13 @@ export default class PlayersService {
 
     this.reconnectModel = null;
     this._reconnectMemory = new Map();
+    this.reconnectMaxAgeMs = DEFAULT_RECONNECT_MAX_AGE_MS;
+    this.reconnectPruneIntervalMs = DEFAULT_RECONNECT_PRUNE_INTERVAL_MS;
+    this._lastReconnectPruneAt = 0;
 
     this._migrationRegistered = false;
     this._isMounted = false;
+    this._initialSyncComplete = false;
 
     this.PRIORITY = {
       TeamBalancer: 3,
@@ -48,7 +62,8 @@ export default class PlayersService {
     };
 
     this.listeners = {
-      handleUpdatedPlayerInfo: this.handleUpdatedPlayerInfo.bind(this)
+      handleUpdatedPlayerInfo: this.handleUpdatedPlayerInfo.bind(this),
+      handlePlayerConnected: this.handlePlayerConnected.bind(this)
     };
   }
 
@@ -62,8 +77,10 @@ export default class PlayersService {
     }
 
     await this._initReconnectPersistence();
+    await this._pruneReconnects(Date.now(), { force: true });
 
     this._isMounted = true;
+    this._initialSyncComplete = false;
     this.verboseLogger(2, '[Players] Mounted.');
   }
 
@@ -79,6 +96,7 @@ export default class PlayersService {
     this.globalLock = null;
 
     this._isMounted = false;
+    this._initialSyncComplete = false;
     this.verboseLogger(2, '[Players] Unmounted.');
   }
 
@@ -206,6 +224,7 @@ export default class PlayersService {
   }
 
   async rememberReconnect(eosID, payload = {}) {
+    await this._pruneReconnects();
     const key = this._normalizeIdentifier(eosID);
     if (!key) return false;
 
@@ -229,6 +248,7 @@ export default class PlayersService {
   }
 
   async getReconnect(eosID) {
+    await this._pruneReconnects();
     const key = this._normalizeIdentifier(eosID);
     if (!key) return null;
 
@@ -236,12 +256,23 @@ export default class PlayersService {
       const row = await this.dbService.executeWithRetry(async () => this.reconnectModel.findByPk(key));
       if (row) {
         const normalized = this._normalizeReconnectRow(row);
+        if (this._isReconnectStale(normalized)) {
+          await this._deleteReconnectRow(key);
+          this._reconnectMemory.delete(key);
+          return null;
+        }
         this._reconnectMemory.set(key, normalized);
         return normalized;
       }
     }
 
-    return this._reconnectMemory.get(key) || null;
+    const cached = this._reconnectMemory.get(key) || null;
+    if (cached && this._isReconnectStale(cached)) {
+      this._reconnectMemory.delete(key);
+      return null;
+    }
+
+    return cached;
   }
 
   async clearReconnects() {
@@ -254,57 +285,81 @@ export default class PlayersService {
     this._reconnectMemory.clear();
   }
 
+  async handlePlayerConnected(data = {}) {
+    this._cleanupExpiredState();
+    await this._pruneReconnects();
+
+    const now = Date.now();
+    const player = data?.player || {};
+
+    const rawPlayer = {
+      eosID: player?.eosID || data?.eosID || null,
+      steamID: player?.steamID || data?.steamID || null,
+      name: player?.name || data?.name || 'Unknown',
+      teamID: player?.teamID ?? null,
+      squadID: player?.squadID ?? null
+    };
+
+    const result = this._registerPlayer(rawPlayer, now, {
+      emitJoin: true,
+      source: 'PLAYER_CONNECTED'
+    });
+
+    if (!result) return;
+
+    if (!result.isNew) {
+      result.state.lastSeenAt = now;
+    }
+  }
+
   async handleUpdatedPlayerInfo() {
     this._cleanupExpiredState();
+    await this._pruneReconnects();
 
     const players = this.server.players || [];
     const now = Date.now();
     const current = new Set();
+    const isInitialSync = !this._initialSyncComplete;
 
     for (const rawPlayer of players) {
-      const key = this._selectPlayerKey(rawPlayer);
-      if (!key) continue;
+      const result = this._registerPlayer(rawPlayer, now, {
+        emitJoin: !isInitialSync,
+        source: 'S3PlayersRegistry'
+      });
 
-      current.add(key);
-      const state = this.registry.get(key);
+      if (!result) continue;
 
-      if (!state) {
-        const joined = this._toPlayerState(rawPlayer, now);
-        this.registry.set(key, joined);
-        this._indexPlayer(joined, key);
+      current.add(result.key);
 
-        this.server.emit('S3_PLAYER_JOINED', {
-          player: { ...joined },
-          source: 'S3PlayersRegistry'
-        });
-        continue;
-      }
+      if (isInitialSync || result.isNew) continue;
 
-      const previousTeamID = state.teamID;
-      const nextTeamID = rawPlayer?.teamID;
-
-      state.name = rawPlayer?.name || state.name;
-      state.teamID = nextTeamID;
-      state.squadID = rawPlayer?.squadID ?? state.squadID;
-      state.eosID = rawPlayer?.eosID || state.eosID;
-      state.steamID = rawPlayer?.steamID || state.steamID;
-      state.lastSeenAt = now;
-
-      this._indexPlayer(state, key);
+      const previousTeamID = result.previousTeamID;
+      const nextTeamID = result.state.teamID;
 
       if (
         String(previousTeamID) !== String(nextTeamID) &&
         this._isRealTeam(previousTeamID) &&
         this._isRealTeam(nextTeamID)
       ) {
-        const attribution = this._consumeMoveAttribution(state, nextTeamID) || 'Manual/Game';
+        const attribution = this._consumeMoveAttribution(result.state, nextTeamID) || 'Manual/Game';
         this.server.emit('S3_PLAYER_TEAM_CHANGED', {
-          player: { ...state },
+          player: { ...result.state },
           previousTeamID,
           teamID: nextTeamID,
           source: attribution
         });
       }
+    }
+
+    if (isInitialSync) {
+      for (const [key, tracked] of this.registry.entries()) {
+        if (current.has(key)) continue;
+        this.registry.delete(key);
+        this._deindexPlayer(tracked, key);
+      }
+
+      this._initialSyncComplete = true;
+      return;
     }
 
     for (const [key, tracked] of this.registry.entries()) {
@@ -324,7 +379,7 @@ export default class PlayersService {
     return teamID === 1 || teamID === 2;
   }
 
-  _toPlayerState(player, now) {
+  _toPlayerState(player, now, { joinEmitted = false } = {}) {
     return {
       eosID: player?.eosID || null,
       steamID: player?.steamID || null,
@@ -332,7 +387,8 @@ export default class PlayersService {
       teamID: player?.teamID ?? null,
       squadID: player?.squadID ?? null,
       joinTime: now,
-      lastSeenAt: now
+      lastSeenAt: now,
+      joinEmitted
     };
   }
 
@@ -405,6 +461,8 @@ export default class PlayersService {
   _cleanupExpiredState() {
     const now = Date.now();
 
+    this._pruneReconnectMemory(now);
+
     for (const [id, attribution] of this.moveAttribution.entries()) {
       if (attribution.expiresAt <= now) {
         this.moveAttribution.delete(id);
@@ -419,6 +477,131 @@ export default class PlayersService {
 
     if (this.globalLock && this.globalLock.expiresAt <= now) {
       this._clearGlobalLock();
+    }
+  }
+
+  _registerPlayer(rawPlayer, now, { emitJoin = true, source = 'S3PlayersRegistry' } = {}) {
+    const key = this._selectPlayerKey(rawPlayer);
+    if (!key) return null;
+
+    const state = this.registry.get(key);
+
+    if (!state) {
+      const joined = this._toPlayerState(rawPlayer, now, { joinEmitted: emitJoin });
+      this.registry.set(key, joined);
+      this._indexPlayer(joined, key);
+
+      if (emitJoin) {
+        this.server.emit('S3_PLAYER_JOINED', {
+          player: { ...joined },
+          source
+        });
+      }
+
+      return {
+        key,
+        state: joined,
+        previousTeamID: null,
+        isNew: true
+      };
+    }
+
+    const previousTeamID = state.teamID;
+
+    state.name = rawPlayer?.name || state.name;
+    state.teamID = rawPlayer?.teamID ?? state.teamID;
+    state.squadID = rawPlayer?.squadID ?? state.squadID;
+    state.eosID = rawPlayer?.eosID || state.eosID;
+    state.steamID = rawPlayer?.steamID || state.steamID;
+    state.lastSeenAt = now;
+
+    this._indexPlayer(state, key);
+
+    if (emitJoin && !state.joinEmitted) {
+      this.server.emit('S3_PLAYER_JOINED', {
+        player: { ...state },
+        source
+      });
+      state.joinEmitted = true;
+    }
+
+    return {
+      key,
+      state,
+      previousTeamID,
+      isNew: false
+    };
+  }
+
+  _pruneReconnectMemory(now = Date.now()) {
+    const cutoff = now - this.reconnectMaxAgeMs;
+
+    for (const [key, record] of this._reconnectMemory.entries()) {
+      const updatedAt = Number(record?.updatedAt) || Number(record?.lastSeenAt) || 0;
+      if (updatedAt && updatedAt < cutoff) {
+        this._reconnectMemory.delete(key);
+      }
+    }
+  }
+
+  _isReconnectStale(record, now = Date.now()) {
+    if (!record) return false;
+    const updatedAt = Number(record?.updatedAt) || Number(record?.lastSeenAt) || 0;
+    if (!updatedAt) return false;
+    return updatedAt < (now - this.reconnectMaxAgeMs);
+  }
+
+  async _deleteReconnectRow(eosID) {
+    if (!this.reconnectModel || !this.dbService) return;
+
+    await this.dbService.executeWithRetry(async () => {
+      await this.reconnectModel.destroy({ where: { eosID } });
+    });
+  }
+
+  async _pruneReconnects(now = Date.now(), { force = false } = {}) {
+    this._pruneReconnectMemory(now);
+
+    if (!this.reconnectPersistence || !this.reconnectModel || !this.dbService) return;
+
+    if (!force && this._lastReconnectPruneAt) {
+      if ((now - this._lastReconnectPruneAt) < this.reconnectPruneIntervalMs) return;
+    }
+
+    this._lastReconnectPruneAt = now;
+    const cutoff = now - this.reconnectMaxAgeMs;
+
+    const connector = this.dbService.getConnector?.();
+    if (connector && typeof connector.query === 'function') {
+      try {
+        await this.dbService.executeWithRetry(async () => {
+          await connector.query('DELETE FROM S3PlayerReconnects WHERE updatedAt < :cutoff', {
+            replacements: { cutoff }
+          });
+        });
+      } catch (err) {
+        this.verboseLogger(1, `[Players] Failed pruning reconnect DB rows: ${err.message}`);
+      }
+      return;
+    }
+
+    const Op =
+      this.reconnectModel?.sequelize?.constructor?.Op ||
+      this.reconnectModel?.sequelize?.Sequelize?.Op ||
+      this.dbService?.getConnector?.()?.constructor?.Sequelize?.Op ||
+      this.dbService?.getConnector?.()?.Sequelize?.Op ||
+      null;
+    if (!Op) {
+      this.verboseLogger(1, '[Players] Skipping reconnect DB prune: Sequelize Op not available.');
+      return;
+    }
+
+    try {
+      await this.dbService.executeWithRetry(async () => {
+        await this.reconnectModel.destroy({ where: { updatedAt: { [Op.lt]: cutoff } } });
+      });
+    } catch (err) {
+      this.verboseLogger(1, `[Players] Failed pruning reconnect DB rows: ${err.message}`);
     }
   }
 

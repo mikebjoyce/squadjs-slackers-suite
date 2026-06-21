@@ -27,6 +27,11 @@ class MockDBService {
       define: () => {}
     };
     this._model = {
+      sequelize: {
+        constructor: {
+          Op: { lt: Symbol('lt') }
+        }
+      },
       async upsert(payload) {
         this._rows.set(payload.eosID, { ...payload });
       },
@@ -90,7 +95,7 @@ await runTest('mount/unmount listener symmetry', async () => {
   const service = new PlayersService({ server });
 
   await service.mount();
-  assert.equal(server.listenerCount('UPDATED_PLAYER_INFORMATION'), 1);
+  assert.equal(server.listenerCount('UPDATED_PLAYER_INFORMATION'), 0);
 
   await service.unmount();
   assert.equal(server.listenerCount('UPDATED_PLAYER_INFORMATION'), 0);
@@ -105,16 +110,24 @@ await runTest('registry diff emits S3 join/leave events', async () => {
     { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 3 },
     { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 2, squadID: 7 }
   ];
-  await service.onUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
 
-  assert.equal(server.take('S3_PLAYER_JOINED').length, 2);
+  assert.equal(server.take('S3_PLAYER_JOINED').length, 0);
   assert.equal(service.getAllPlayers().length, 2);
 
   server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 3 }];
-  await service.onUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
 
   assert.equal(server.take('S3_PLAYER_LEFT').length, 1);
   assert.equal(service.getAllPlayers().length, 1);
+
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 3 },
+    { eosID: 'e3', steamID: 's3', name: 'Charlie', teamID: 2, squadID: 4 }
+  ];
+  await service.handleUpdatedPlayerInfo();
+
+  assert.equal(server.take('S3_PLAYER_JOINED').length, 1);
 
   await service.unmount();
 });
@@ -125,15 +138,15 @@ await runTest('team changes emit only for real team transitions (null guard)', a
   await service.mount();
 
   server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: null, squadID: 1 }];
-  await service.onUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
 
   server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 }];
-  await service.onUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
 
   assert.equal(server.take('S3_PLAYER_TEAM_CHANGED').length, 0);
 
   server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 2, squadID: 1 }];
-  await service.onUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
 
   assert.equal(server.take('S3_PLAYER_TEAM_CHANGED').length, 1);
   await service.unmount();
@@ -145,11 +158,11 @@ await runTest('recordMove attribution is consumed on matching team change', asyn
   await service.mount();
 
   server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 }];
-  await service.onUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
 
   service.recordMove('e1', 2, 'SmartAssign');
   server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 2, squadID: 1 }];
-  await service.onUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
 
   const changes = server.take('S3_PLAYER_TEAM_CHANGED');
   assert.equal(changes.length, 1);
@@ -164,13 +177,13 @@ await runTest('recordMove attribution expires and falls back to Manual/Game', as
   await service.mount();
 
   server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 }];
-  await service.onUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
 
   service.recordMove('e1', 2, 'SmartAssign');
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 2, squadID: 1 }];
-  await service.onUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
 
   const changes = server.take('S3_PLAYER_TEAM_CHANGED');
   assert.equal(changes.length, 1);
@@ -185,7 +198,7 @@ await runTest('lock/canAct priority and global preemption behavior', async () =>
   await service.mount();
 
   server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 }];
-  await service.onUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
 
   assert.equal(service.lock('e1', 'Switch', 1000), true);
   assert.equal(service.canAct('e1', 'Switch'), true);
@@ -209,7 +222,7 @@ await runTest('lock TTL expiration releases lock', async () => {
   await service.mount();
 
   server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 }];
-  await service.onUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
 
   assert.equal(service.lock('e1', 'Switch', 20), true);
   assert.equal(service.isLockedBy('e1'), 'Switch');

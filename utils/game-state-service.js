@@ -8,6 +8,14 @@
  * - Provide ignored-game-mode matching utility
  * - Persist/recover state via sequelize connector for restart resilience
  */
+
+// Round flow notes for future reference:
+    // LIVE -> ROUND_ENDED event -> ENDGAME (map/faction voting window)
+    // -> NEW_GAME event -> STAGING(resolving=true) -> STAGING(resolving=false) -> LIVE.
+    // During map load around NEW_GAME, players can briefly report teamID=null (sometimes
+    // a tick before NEW_GAME). We treat this as a transient state while teams resolve;
+    // we still consider prior teams valid unless a player actually swaps during this window.
+
 export default class GameStateService {
   constructor({
     server,
@@ -118,7 +126,7 @@ export default class GameStateService {
     if (name.includes('invasion')) return 'Invasion';
     if (name.includes('raas')) return 'RAAS';
     if (name.includes('aas')) return 'AAS';
-    if (name.includes('tc')) return 'TC';
+    if (name.includes('_tc_')) return 'TC';
     if (name.includes('skirmish')) return 'Skirmish';
     if (name.includes('insurgency')) return 'Insurgency';
     if (name.includes('destruction')) return 'Destruction';
@@ -173,6 +181,7 @@ export default class GameStateService {
   }
 
   async handleNewGame(data) {
+    
     const now = Date.now();
     this._recoveredStateActive = false;
     this.phase = 'STAGING';
