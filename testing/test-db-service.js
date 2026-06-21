@@ -110,7 +110,7 @@ await runTest('SQLite mutex serializes concurrent operations', async () => {
   assert.deepEqual(order, ['start-1', 'end-1', 'start-2', 'end-2']);
 });
 
-await runTest('Non-SQLite mutex serializes concurrent operations', async () => {
+await runTest('Non-SQLite mutex allows concurrent operations (no serialization)', async () => {
   const sequelize = new MockSequelize({ dialect: 'postgres' });
 
   const order = [];
@@ -139,7 +139,8 @@ await runTest('Non-SQLite mutex serializes concurrent operations', async () => {
   const [r1, r2] = await Promise.all([p1, p2]);
   assert.equal(r1, 1);
   assert.equal(r2, 2);
-  assert.deepEqual(order, ['start-1', 'end-1', 'start-2', 'end-2']);
+  // Non-SQLite connectors should allow concurrent execution (no mutex serialization)
+  assert.deepEqual(order, ['start-1', 'start-2', 'end-2', 'end-1']);
 });
 
 await runTest('ensureSqlitePragmas applies once per connector', async () => {

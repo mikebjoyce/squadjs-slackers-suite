@@ -98,7 +98,7 @@ await runTest('LIVE-gated behavior: no poll while STAGING, polls once LIVE and f
   assert.equal(service.getCachedAbbreviations()[2], undefined);
 
   gameState.setPhase('LIVE');
-  service.onUpdatedPlayerInfo();
+  service.handleUpdatedPlayerInfo();
 
   await new Promise((resolve) => setTimeout(resolve, 10));
   const cache = service.getCachedAbbreviations();
@@ -144,7 +144,7 @@ await runTest('extractor short-circuits after resolving both teams', async () =>
   assert.equal(roleReadCount, 2);
 });
 
-await runTest('mount/unmount listener symmetry and cleanup', async () => {
+await runTest('mount/unmount does not bind server listeners directly (parent plugin handles binding)', async () => {
   const server = new MockServer();
   const gameState = new MockGameState('LIVE');
   const service = new FactionsService({ server, gameState, pollIntervalMs: 25 });
@@ -156,15 +156,18 @@ await runTest('mount/unmount listener symmetry and cleanup', async () => {
 
   await service.mount();
 
-  assert.equal(server.listenerCount('NEW_GAME'), 1);
-  assert.equal(server.listenerCount('ROUND_ENDED'), 1);
-  assert.equal(server.listenerCount('UPDATED_PLAYER_INFORMATION'), 1);
+  // FactionsService does not bind listeners directly; parent plugin handles that
+  assert.equal(server.listenerCount('NEW_GAME'), 0);
+  assert.equal(server.listenerCount('ROUND_ENDED'), 0);
+  assert.equal(server.listenerCount('UPDATED_PLAYER_INFORMATION'), 0);
 
-  server.emit('NEW_GAME');
-  assert.equal(service.getCachedAbbreviations()[1], undefined);
+  // Simulate parent plugin calling the handler methods
+  service.handleNewGame();
+  assert.equal(Object.keys(service.getCachedAbbreviations()).length, 0);
 
   await service.unmount();
 
+  // Still no listeners bound directly
   assert.equal(server.listenerCount('NEW_GAME'), 0);
   assert.equal(server.listenerCount('ROUND_ENDED'), 0);
   assert.equal(server.listenerCount('UPDATED_PLAYER_INFORMATION'), 0);

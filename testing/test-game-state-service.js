@@ -24,16 +24,16 @@ class MockSequelize {
   }
 
   define(name) {
-    const rows = this._rows;
+    const self = this;
     const model = {
       async sync() {},
       async findByPk(id) {
-        const row = rows.get(id);
+        const row = self._rows.get(id);
         if (!row) return null;
         return { toJSON: () => ({ ...row }) };
       },
       async upsert(payload) {
-        rows.set(payload.id, { ...payload });
+        self._rows.set(payload.id, { ...payload });
       }
     };
 
@@ -146,13 +146,19 @@ await runTest('phase transitions ROUND_ENDED -> ENDGAME', async () => {
 await runTest('persists and recovers phase/resolving/layer state via sequelize connector', async () => {
   const sequelize = new MockSequelize();
 
+  // Create a mock DB service that wraps the sequelize
+  const dbService = {
+    getConnector: () => sequelize,
+    getDataTypes: () => sequelize.constructor.DataTypes,
+    executeWithRetry: (fn) => fn()
+  };
+
   const server1 = new MockServer();
-  const parent1 = { services: {} };
+  const parent1 = { services: { db: dbService } };
   parent1.services.players = new PlayersService({ parent: parent1, server: server1 });
   const service1 = new GameStateService({
     parent: parent1,
     server: server1,
-    sequelize,
     ignoredGameModes: ['Seed', 'Jensen'],
     stagingDurationMs: 600000
   });
@@ -176,9 +182,10 @@ await runTest('persists and recovers phase/resolving/layer state via sequelize c
   await parent1.services.players.unmount();
 
   const server2 = new MockServer();
+  const parent2 = { services: { db: dbService } };
   const service2 = new GameStateService({
+    parent: parent2,
     server: server2,
-    sequelize,
     ignoredGameModes: ['Seed', 'Jensen'],
     stagingDurationMs: 600000
   });
@@ -194,10 +201,18 @@ await runTest('persists and recovers phase/resolving/layer state via sequelize c
 await runTest('invalidates recovered state when recovered round age is impossible', async () => {
   const sequelize = new MockSequelize();
 
+  // Create a mock DB service that wraps the sequelize
+  const dbService = {
+    getConnector: () => sequelize,
+    getDataTypes: () => sequelize.constructor.DataTypes,
+    executeWithRetry: (fn) => fn()
+  };
+
   const server1 = new MockServer();
+  const parent1 = { services: { db: dbService } };
   const service1 = new GameStateService({
+    parent: parent1,
     server: server1,
-    sequelize,
     stagingDurationMs: 600000,
     maxRecoveredRoundAgeMs: 7200000
   });
@@ -206,16 +221,23 @@ await runTest('invalidates recovered state when recovered round age is impossibl
   await service1.handleNewGame({ layer: 'Mutaha_RAAS_v3' });
   await service1.unmount();
 
-  const staleRow = sequelize._rows.get(1);
-  staleRow.phase = 'STAGING';
-  staleRow.resolving = true;
-  staleRow.lastNewGameAt = Date.now() - 7205000;
-  sequelize._rows.set(1, staleRow);
+  // Directly set stale state in the shared _rows map
+  sequelize._rows.set(1, {
+    id: 1,
+    phase: 'STAGING',
+    resolving: true,
+    lastPhaseChangeAt: Date.now(),
+    lastNewGameAt: Date.now() - 7205000,
+    lastRoundEndedAt: null,
+    lastLayerName: 'Mutaha_RAAS_v3',
+    lastGamemode: 'RAAS'
+  });
 
   const server2 = new MockServer();
+  const parent2 = { services: { db: dbService } };
   const service2 = new GameStateService({
+    parent: parent2,
     server: server2,
-    sequelize,
     stagingDurationMs: 600000,
     maxRecoveredRoundAgeMs: 7200000
   });
@@ -229,10 +251,18 @@ await runTest('invalidates recovered state when recovered round age is impossibl
 await runTest('invalidates recovered STAGING when it is already overdue', async () => {
   const sequelize = new MockSequelize();
 
+  // Create a mock DB service that wraps the sequelize
+  const dbService = {
+    getConnector: () => sequelize,
+    getDataTypes: () => sequelize.constructor.DataTypes,
+    executeWithRetry: (fn) => fn()
+  };
+
   const server1 = new MockServer();
+  const parent1 = { services: { db: dbService } };
   const service1 = new GameStateService({
+    parent: parent1,
     server: server1,
-    sequelize,
     stagingDurationMs: 1000,
     maxRecoveredRoundAgeMs: 99999999
   });
@@ -241,16 +271,23 @@ await runTest('invalidates recovered STAGING when it is already overdue', async 
   await service1.handleNewGame({ layer: 'Mutaha_RAAS_v3' });
   await service1.unmount();
 
-  const staleRow = sequelize._rows.get(1);
-  staleRow.phase = 'STAGING';
-  staleRow.resolving = true;
-  staleRow.lastNewGameAt = Date.now() - 5000;
-  sequelize._rows.set(1, staleRow);
+  // Directly set stale state in the shared _rows map
+  sequelize._rows.set(1, {
+    id: 1,
+    phase: 'STAGING',
+    resolving: true,
+    lastPhaseChangeAt: Date.now(),
+    lastNewGameAt: Date.now() - 5000,
+    lastRoundEndedAt: null,
+    lastLayerName: 'Mutaha_RAAS_v3',
+    lastGamemode: 'RAAS'
+  });
 
   const server2 = new MockServer();
+  const parent2 = { services: { db: dbService } };
   const service2 = new GameStateService({
+    parent: parent2,
     server: server2,
-    sequelize,
     stagingDurationMs: 1000,
     maxRecoveredRoundAgeMs: 99999999
   });
@@ -264,13 +301,19 @@ await runTest('invalidates recovered STAGING when it is already overdue', async 
 await runTest('invalidates recovered state on authoritative known-layer divergence', async () => {
   const sequelize = new MockSequelize();
 
+  // Create a mock DB service that wraps the sequelize
+  const dbService = {
+    getConnector: () => sequelize,
+    getDataTypes: () => sequelize.constructor.DataTypes,
+    executeWithRetry: (fn) => fn()
+  };
+
   const server1 = new MockServer();
-  const parent1 = { services: {} };
+  const parent1 = { services: { db: dbService } };
   parent1.services.players = new PlayersService({ parent: parent1, server: server1 });
   const service1 = new GameStateService({
     parent: parent1,
     server: server1,
-    sequelize,
     stagingDurationMs: 600000,
     maxRecoveredRoundAgeMs: 99999999
   });
@@ -286,9 +329,10 @@ await runTest('invalidates recovered state on authoritative known-layer divergen
   await parent1.services.players.unmount();
 
   const server2 = new MockServer();
+  const parent2 = { services: { db: dbService } };
   const service2 = new GameStateService({
+    parent: parent2,
     server: server2,
-    sequelize,
     stagingDurationMs: 600000,
     maxRecoveredRoundAgeMs: 99999999
   });
@@ -296,10 +340,10 @@ await runTest('invalidates recovered state on authoritative known-layer divergen
   await service2.mount();
   assert.equal(service2.getPhase(), 'STAGING');
 
-  await service2.onServerInfoUpdated({ currentLayer: 'Unknown' });
+  await service2.handleServerInfoUpdated({ currentLayer: 'Unknown' });
   assert.equal(service2.getPhase(), 'STAGING');
 
-  await service2.onServerInfoUpdated({ currentLayer: 'DifferentLayer_AAS_v2' });
+  await service2.handleServerInfoUpdated({ currentLayer: 'DifferentLayer_AAS_v2' });
   assert.equal(service2.getPhase(), 'LIVE');
   assert.equal(service2.getLayerName(), 'DifferentLayer_AAS_v2');
 

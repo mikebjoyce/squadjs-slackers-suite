@@ -127,7 +127,10 @@ await runTest('registry diff emits S3 join/leave events', async () => {
   ];
   await service.handleUpdatedPlayerInfo();
 
-  assert.equal(server.take('S3_PLAYER_JOINED').length, 2);
+  // Only e3 is a new player; e1 was already registered during initial sync
+  // and has joinEmitted=true, so it should not re-emit S3_PLAYER_JOINED
+  assert.equal(server.take('S3_PLAYER_JOINED').length, 1);
+  assert.equal(server.take('S3_PLAYER_JOINED')[0].payload.player.eosID, 'e3');
 
   await service.unmount();
 });

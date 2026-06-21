@@ -135,7 +135,8 @@ export default class DBService {
       return null;
     };
 
-    return DBService.withConnectorMutex(connector, runAttempt);
+    // Only serialize for SQLite connectors; other dialects handle concurrency internally.
+    return DBService.withSqliteMutex(connector, runAttempt);
   }
 
   static async withTransaction(connector, logicFn, { transactionOptions = null } = {}) {

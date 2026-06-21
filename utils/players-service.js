@@ -384,6 +384,15 @@ export default class PlayersService {
         this._deindexPlayer(tracked, key);
       }
 
+      // Mark all players registered during initial sync as having join emitted.
+      // This prevents them from emitting S3_PLAYER_JOINED on the very next tick.
+      for (const [key] of this.registry.entries()) {
+        const state = this.registry.get(key);
+        if (state && !state.joinEmitted) {
+          state.joinEmitted = true;
+        }
+      }
+
       this._initialSyncComplete = true;
       // We still want projection readiness on the very first tick.
       this._refreshProjectionState({
