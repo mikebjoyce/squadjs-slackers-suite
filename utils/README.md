@@ -8,6 +8,7 @@ This folder is reserved for shared utility modules used by the base plugin and s
 - `factions-service.js`
 - `clans-service.js`
 - `db-service.js`
+- `players-service.js`
 
 ## DB service usage snippet (shared retry/jitter with your own connector)
 

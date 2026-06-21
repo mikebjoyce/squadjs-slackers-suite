@@ -24,9 +24,9 @@ export default class FactionsService {
     this._teamAbbreviationPollingInterval = null;
 
     this.listeners = {
-      onNewGame: this.onNewGame.bind(this),
-      onRoundEnded: this.onRoundEnded.bind(this),
-      onUpdatedPlayerInfo: this.onUpdatedPlayerInfo.bind(this)
+      handleNewGame: this.handleNewGame.bind(this),
+      handleRoundEnded: this.handleRoundEnded.bind(this),
+      handleUpdatedPlayerInfo: this.handleUpdatedPlayerInfo.bind(this)
     };
   }
 
@@ -43,10 +43,6 @@ export default class FactionsService {
       await this.unmount();
     }
 
-    this.server.on('NEW_GAME', this.listeners.onNewGame);
-    this.server.on('ROUND_ENDED', this.listeners.onRoundEnded);
-    this.server.on('UPDATED_PLAYER_INFORMATION', this.listeners.onUpdatedPlayerInfo);
-
     this._isMounted = true;
     this._ensurePollingState();
     this.verboseLogger(2, '[Factions] Mounted.');
@@ -55,26 +51,22 @@ export default class FactionsService {
   async unmount() {
     if (!this._isMounted) return;
 
-    this.server.removeListener('NEW_GAME', this.listeners.onNewGame);
-    this.server.removeListener('ROUND_ENDED', this.listeners.onRoundEnded);
-    this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.listeners.onUpdatedPlayerInfo);
-
     this.stopPollingTeamAbbreviations();
     this._isMounted = false;
     this.verboseLogger(2, '[Factions] Unmounted.');
   }
 
-  onNewGame() {
+  handleNewGame() {
     this.cachedAbbreviations = {};
     this.stopPollingTeamAbbreviations();
     this.verboseLogger(3, '[Factions] NEW_GAME detected -> cleared abbreviation cache.');
   }
 
-  onRoundEnded() {
+  handleRoundEnded() {
     this.stopPollingTeamAbbreviations();
   }
 
-  onUpdatedPlayerInfo() {
+  handleUpdatedPlayerInfo() {
     this._ensurePollingState();
   }
 

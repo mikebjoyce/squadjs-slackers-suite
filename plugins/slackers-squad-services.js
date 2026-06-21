@@ -3,18 +3,19 @@ import GameStateService from '../utils/game-state-service.js';
 import FactionsService from '../utils/factions-service.js';
 import ClansService from '../utils/clans-service.js';
 import DBService from '../utils/db-service.js';
+import PlayersService from '../utils/players-service.js';
 
 /**
- * Base scaffold plugin for Slacker's Squad Services (S³).
+ * Shared services plugin for Slacker's Squad Services (S³).
  *
- * Stage 1 scope:
- * - Declare connector contracts only (Discord + database)
- * - Provide lifecycle skeleton for future service modules
- * - Implement gameState first; remaining modules follow in later stages
+ * Stage 1 status:
+ * - Provides connector/config contracts (Discord + database + shared service options)
+ * - Composes and mounts gameState, factions, clans, db, and players services
+ * - Exposes a single lifecycle-managed service container for later migration wiring
  */
 export default class SlackersSquadServices extends BasePlugin {
   static get description() {
-    return "Base Slacker's Squad Services scaffold plugin with Discord + database connector wiring.";
+    return "Shared Slacker's Squad Services plugin wiring gameState, factions, clans, db, and players modules.";
   }
 
   static get defaultEnabled() {
@@ -98,7 +99,16 @@ export default class SlackersSquadServices extends BasePlugin {
       gameState: null,
       factions: null,
       clans: null,
-      db: null
+      db: null,
+      players: null
+    };
+
+    this.listeners = {
+      handleNewGame: this.handleNewGame.bind(this),
+      handleRoundEnded: this.handleRoundEnded.bind(this),
+      handleLayerInfoUpdated: this.handleLayerInfoUpdated.bind(this),
+      handleServerInfoUpdated: this.handleServerInfoUpdated.bind(this),
+      handleUpdatedPlayerInfo: this.handleUpdatedPlayerInfo.bind(this)
     };
   }
 
@@ -135,6 +145,12 @@ export default class SlackersSquadServices extends BasePlugin {
       databaseOption: this.options.database,
       verboseLogger: (...args) => this.verbose(...args)
     });
+
+    this.services.players = new PlayersService({
+      server: this.server,
+      dbService: this.services.db,
+      verboseLogger: (...args) => this.verbose(...args)
+    });
   }
 
   async mount() {
@@ -154,10 +170,22 @@ export default class SlackersSquadServices extends BasePlugin {
       await this.services.db.mount();
     }
 
-    this.verbose(1, 'Mounted SlackerSquadServices with gameState, factions, clans, and db services.');
+    if (this.services.players) {
+      await this.services.players.mount();
+    }
+
+    this._bindServerEvents();
+
+    this.verbose(1, 'Mounted SlackerSquadServices with gameState, factions, clans, db, and players services.');
   }
 
   async unmount() {
+    this._unbindServerEvents();
+
+    if (this.services.players) {
+      await this.services.players.unmount();
+    }
+
     if (this.services.clans) {
       await this.services.clans.unmount();
     }
@@ -175,5 +203,71 @@ export default class SlackersSquadServices extends BasePlugin {
     }
 
     this.verbose(1, 'Unmounted SlackerSquadServices and shared services.');
+  }
+
+  _bindServerEvents() {
+    if (!this.server || typeof this.server.on !== 'function') return;
+
+    this.server.on('NEW_GAME', this.listeners.handleNewGame);
+    this.server.on('ROUND_ENDED', this.listeners.handleRoundEnded);
+    this.server.on('UPDATED_LAYER_INFORMATION', this.listeners.handleLayerInfoUpdated);
+    this.server.on('UPDATED_SERVER_INFORMATION', this.listeners.handleServerInfoUpdated);
+    this.server.on('UPDATED_PLAYER_INFORMATION', this.listeners.handleUpdatedPlayerInfo);
+  }
+
+  _unbindServerEvents() {
+    if (!this.server || typeof this.server.removeListener !== 'function') return;
+
+    this.server.removeListener('NEW_GAME', this.listeners.handleNewGame);
+    this.server.removeListener('ROUND_ENDED', this.listeners.handleRoundEnded);
+    this.server.removeListener('UPDATED_LAYER_INFORMATION', this.listeners.handleLayerInfoUpdated);
+    this.server.removeListener('UPDATED_SERVER_INFORMATION', this.listeners.handleServerInfoUpdated);
+    this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.listeners.handleUpdatedPlayerInfo);
+  }
+
+  async handleNewGame(data) {
+    if (this.services.gameState?.handleNewGame) {
+      await this.services.gameState.handleNewGame(data);
+    }
+
+    if (this.services.factions?.handleNewGame) {
+      this.services.factions.handleNewGame(data);
+    }
+  }
+
+  async handleRoundEnded(data) {
+    if (this.services.gameState?.handleRoundEnded) {
+      await this.services.gameState.handleRoundEnded(data);
+    }
+
+    if (this.services.factions?.handleRoundEnded) {
+      this.services.factions.handleRoundEnded(data);
+    }
+  }
+
+  async handleLayerInfoUpdated(data) {
+    if (this.services.gameState?.handleLayerInfoUpdated) {
+      await this.services.gameState.handleLayerInfoUpdated(data);
+    }
+  }
+
+  async handleServerInfoUpdated(data) {
+    if (this.services.gameState?.handleServerInfoUpdated) {
+      await this.services.gameState.handleServerInfoUpdated(data);
+    }
+  }
+
+  async handleUpdatedPlayerInfo(data) {
+    if (this.services.gameState?.handleUpdatedPlayerInfo) {
+      await this.services.gameState.handleUpdatedPlayerInfo(data);
+    }
+
+    if (this.services.factions?.handleUpdatedPlayerInfo) {
+      this.services.factions.handleUpdatedPlayerInfo(data);
+    }
+
+    if (this.services.players?.handleUpdatedPlayerInfo) {
+      await this.services.players.handleUpdatedPlayerInfo(data);
+    }
   }
 }

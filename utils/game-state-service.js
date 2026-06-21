@@ -46,11 +46,11 @@ export default class GameStateService {
     this._recoveredStateActive = false;
 
     this.listeners = {
-      onNewGame: this.onNewGame.bind(this),
-      onRoundEnded: this.onRoundEnded.bind(this),
-      onLayerInfoUpdated: this.onLayerInfoUpdated.bind(this),
-      onServerInfoUpdated: this.onServerInfoUpdated.bind(this),
-      onUpdatedPlayerInfo: this.onUpdatedPlayerInfo.bind(this)
+      handleNewGame: this.handleNewGame.bind(this),
+      handleRoundEnded: this.handleRoundEnded.bind(this),
+      handleLayerInfoUpdated: this.handleLayerInfoUpdated.bind(this),
+      handleServerInfoUpdated: this.handleServerInfoUpdated.bind(this),
+      handleUpdatedPlayerInfo: this.handleUpdatedPlayerInfo.bind(this)
     };
   }
 
@@ -67,12 +67,6 @@ export default class GameStateService {
     await this._recoverPersistedState();
     await this._validateRecoveredState('mount');
 
-    this.server.on('NEW_GAME', this.listeners.onNewGame);
-    this.server.on('ROUND_ENDED', this.listeners.onRoundEnded);
-    this.server.on('UPDATED_LAYER_INFORMATION', this.listeners.onLayerInfoUpdated);
-    this.server.on('UPDATED_SERVER_INFORMATION', this.listeners.onServerInfoUpdated);
-    this.server.on('UPDATED_PLAYER_INFORMATION', this.listeners.onUpdatedPlayerInfo);
-
     if (this.server.currentLayer) {
       await this.resolveLayerInfo(this.server.currentLayer, 'mount');
     }
@@ -83,12 +77,6 @@ export default class GameStateService {
 
   async unmount() {
     if (!this._isMounted) return;
-
-    this.server.removeListener('NEW_GAME', this.listeners.onNewGame);
-    this.server.removeListener('ROUND_ENDED', this.listeners.onRoundEnded);
-    this.server.removeListener('UPDATED_LAYER_INFORMATION', this.listeners.onLayerInfoUpdated);
-    this.server.removeListener('UPDATED_SERVER_INFORMATION', this.listeners.onServerInfoUpdated);
-    this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.listeners.onUpdatedPlayerInfo);
 
     this._clearStagingLiveTimer();
     this._isMounted = false;
@@ -184,7 +172,7 @@ export default class GameStateService {
     });
   }
 
-  async onNewGame(data) {
+  async handleNewGame(data) {
     const now = Date.now();
     this._recoveredStateActive = false;
     this.phase = 'STAGING';
@@ -193,7 +181,7 @@ export default class GameStateService {
     this.lastPhaseChangeAt = now;
 
     if (data?.layer) {
-      await this.resolveLayerInfo(data.layer, 'onNewGame');
+      await this.resolveLayerInfo(data.layer, 'handleNewGame');
     }
 
     this._startStagingLiveTimer(now);
@@ -202,7 +190,7 @@ export default class GameStateService {
     this.verboseLogger(2, '[GameState] NEW_GAME -> STAGING (resolving=true).');
   }
 
-  async onRoundEnded() {
+  async handleRoundEnded() {
     const now = Date.now();
     this._recoveredStateActive = false;
     this._clearStagingLiveTimer();
@@ -214,26 +202,26 @@ export default class GameStateService {
     this.verboseLogger(2, '[GameState] ROUND_ENDED -> ENDGAME.');
   }
 
-  async onLayerInfoUpdated() {
-    await this.resolveLayerInfo(this.server.currentLayer, 'onLayerInfoUpdated');
+  async handleLayerInfoUpdated() {
+    await this.resolveLayerInfo(this.server.currentLayer, 'handleLayerInfoUpdated');
   }
 
-  async onServerInfoUpdated(info) {
+  async handleServerInfoUpdated(info) {
     if (!info?.currentLayer) return;
 
     const incomingName = this._extractLayerName(info.currentLayer);
 
-    await this._validateRecoveredState('onServerInfoUpdated', { serverLayerName: incomingName });
+    await this._validateRecoveredState('handleServerInfoUpdated', { serverLayerName: incomingName });
 
     if (!this._isKnownLayerName(incomingName)) return;
 
     if (this.lastKnownGoodLayer?.name === incomingName) return;
 
-    await this.resolveLayerInfo(info.currentLayer, 'onServerInfoUpdated');
+    await this.resolveLayerInfo(info.currentLayer, 'handleServerInfoUpdated');
   }
 
-  async onUpdatedPlayerInfo() {
-    await this._validateRecoveredState('onUpdatedPlayerInfo');
+  async handleUpdatedPlayerInfo() {
+    await this._validateRecoveredState('handleUpdatedPlayerInfo');
 
     if (!(this.phase === 'STAGING' && this.resolving)) return;
 
