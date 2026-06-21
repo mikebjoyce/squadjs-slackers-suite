@@ -7,7 +7,7 @@ import GameStateService from '../utils/game-state-service.js';
  * Stage 1 scope:
  * - Declare connector contracts only (Discord + database)
  * - Provide lifecycle skeleton for future service modules
- * - No service implementations yet (gameState/factions/clans/db/players)
+ * - Implement gameState first; remaining modules follow in later stages
  */
 export default class SlackersSquadServices extends BasePlugin {
   static get description() {
@@ -37,6 +37,11 @@ export default class SlackersSquadServices extends BasePlugin {
         description: 'Discord admin channel ID used by SlackersSquadServices.',
         default: '',
         example: '667741905228136459'
+      },
+      ignoredGameModes: {
+        required: false,
+        description: 'Modes/maps excluded by shared game-state ignored-mode checks.',
+        default: ['Seed', 'Jensen']
       }
     };
   }
@@ -52,7 +57,8 @@ export default class SlackersSquadServices extends BasePlugin {
   async prepareToMount() {
     this.services.gameState = new GameStateService({
       server: this.server,
-      ignoredGameModes: ['Seed', 'Jensen'],
+      sequelize: this.options.database,
+      ignoredGameModes: this.options.ignoredGameModes,
       log: (...args) => this.verbose(...args)
     });
   }
