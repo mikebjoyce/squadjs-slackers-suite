@@ -4,6 +4,7 @@ import FactionsService from '../utils/factions-service.js';
 import ClansService from '../utils/clans-service.js';
 import DBService from '../utils/db-service.js';
 import PlayersService from '../utils/players-service.js';
+import ServerConfigService from '../utils/server-config-service.js';
 
 /**
  * Shared services plugin for Slacker's Squad Services (S³).
@@ -11,6 +12,7 @@ import PlayersService from '../utils/players-service.js';
  * Stage 1 status:
  * - Provides connector/config contracts (Discord + database + shared service options)
  * - Composes and mounts gameState, factions, clans, db, and players services
+ * - Provides serverConfig service for parsing Squad server configuration files
  * - Exposes a single lifecycle-managed service container for later migration wiring
  */
 export default class SlackersSquadServices extends BasePlugin {
@@ -41,6 +43,11 @@ export default class SlackersSquadServices extends BasePlugin {
         description: 'Discord admin channel ID used by SlackersSquadServices.',
         default: '',
         example: '667741905228136459'
+      },
+      configPath: {
+        required: false,
+        description: 'Path to Squad server ServerConfig directory containing Server.cfg and VoteConfig.cfg.',
+        default: './SquadGame/ServerConfig/'
       },
       ignoredGameModes: {
         required: false,
@@ -100,7 +107,8 @@ export default class SlackersSquadServices extends BasePlugin {
       factions: null,
       clans: null,
       db: null,
-      players: null
+      players: null,
+      serverConfig: null
     };
 
     this.listeners = {
@@ -155,9 +163,19 @@ export default class SlackersSquadServices extends BasePlugin {
       server: this.server,
       verboseLogger: (...args) => this.verbose(...args)
     });
+
+    this.services.serverConfig = new ServerConfigService({
+      parent: this,
+      verboseLogger: (...args) => this.verbose(...args),
+      configPath: this.options.configPath
+    });
   }
 
   async mount() {
+    if (this.services.serverConfig) {
+      await this.services.serverConfig.mount();
+    }
+
     if (this.services.db) {
       await this.services.db.mount();
     }
@@ -180,7 +198,7 @@ export default class SlackersSquadServices extends BasePlugin {
 
     this._bindServerEvents();
 
-    this.verbose(1, 'Mounted SlackerSquadServices with gameState, factions, clans, db, and players services.');
+    this.verbose(1, 'Mounted SlackerSquadServices with gameState, factions, clans, db, players, and serverConfig services.');
   }
 
   async unmount() {
@@ -204,6 +222,10 @@ export default class SlackersSquadServices extends BasePlugin {
 
     if (this.services.gameState) {
       await this.services.gameState.unmount();
+    }
+
+    if (this.services.serverConfig) {
+      await this.services.serverConfig.unmount();
     }
 
     this.verbose(1, 'Unmounted SlackerSquadServices and shared services.');
