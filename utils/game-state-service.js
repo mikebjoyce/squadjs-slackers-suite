@@ -11,14 +11,14 @@
 export default class GameStateService {
   constructor({
     server,
-    log = () => {},
+    verboseLogger = () => {},
     ignoredGameModes = [],
     sequelize = null,
     stagingDurationMs = 360000,
     maxRecoveredRoundAgeMs = 7200000
   } = {}) {
     this.server = server;
-    this.log = log;
+    this.verboseLogger = verboseLogger;
     this.sequelize = sequelize;
 
     this.defaultIgnoredGameModes = Array.isArray(ignoredGameModes)
@@ -78,7 +78,7 @@ export default class GameStateService {
     }
 
     this._isMounted = true;
-    this.log(2, '[GameState] Mounted.');
+    this.verboseLogger(2, '[GameState] Mounted.');
   }
 
   async unmount() {
@@ -92,7 +92,7 @@ export default class GameStateService {
 
     this._clearStagingLiveTimer();
     this._isMounted = false;
-    this.log(2, '[GameState] Unmounted.');
+    this.verboseLogger(2, '[GameState] Unmounted.');
   }
 
   getPhase() {
@@ -144,13 +144,13 @@ export default class GameStateService {
       try {
         layer = await layer;
       } catch (err) {
-        this.log(1, `[GameState:${source}] Failed to resolve layer promise: ${err.message}`);
+        this.verboseLogger(1, `[GameState:${source}] Failed to resolve layer promise: ${err.message}`);
         layer = null;
       }
     }
 
     if (!layer) {
-      this.log(3, `[GameState:${source}] Layer object is null/undefined.`);
+      this.verboseLogger(3, `[GameState:${source}] Layer object is null/undefined.`);
       return false;
     }
 
@@ -170,7 +170,7 @@ export default class GameStateService {
     this.lastKnownGoodLayer = { gamemode, name };
     await this._persistState();
 
-    this.log(4, `[GameState:${source}] Layer info updated: ${gamemode} / ${name}`);
+    this.verboseLogger(4, `[GameState:${source}] Layer info updated: ${gamemode} / ${name}`);
     return true;
   }
 
@@ -199,7 +199,7 @@ export default class GameStateService {
     this._startStagingLiveTimer(now);
     await this._persistState();
 
-    this.log(2, '[GameState] NEW_GAME -> STAGING (resolving=true).');
+    this.verboseLogger(2, '[GameState] NEW_GAME -> STAGING (resolving=true).');
   }
 
   async onRoundEnded() {
@@ -211,7 +211,7 @@ export default class GameStateService {
     this.lastRoundEndedAt = now;
     this.lastPhaseChangeAt = now;
     await this._persistState();
-    this.log(2, '[GameState] ROUND_ENDED -> ENDGAME.');
+    this.verboseLogger(2, '[GameState] ROUND_ENDED -> ENDGAME.');
   }
 
   async onLayerInfoUpdated() {
@@ -245,7 +245,7 @@ export default class GameStateService {
 
     this.resolving = false;
     await this._persistState();
-    this.log(2, `[GameState] All ${players.length} players resolved -> STAGING(resolving=false).`);
+    this.verboseLogger(2, `[GameState] All ${players.length} players resolved -> STAGING(resolving=false).`);
   }
 
   _clearStagingLiveTimer() {
@@ -268,7 +268,7 @@ export default class GameStateService {
       this.resolving = false;
       this.lastPhaseChangeAt = Date.now();
       await this._persistState();
-      this.log(2, '[GameState] STAGING timer elapsed -> LIVE.');
+      this.verboseLogger(2, '[GameState] STAGING timer elapsed -> LIVE.');
     }, remaining);
   }
 
@@ -391,7 +391,7 @@ export default class GameStateService {
     this.lastNewGameAt = null;
     this._recoveredStateActive = false;
     await this._persistState();
-    this.log(1, `[GameState] Recovered state invalidated -> LIVE (${reason}).`);
+    this.verboseLogger(1, `[GameState] Recovered state invalidated -> LIVE (${reason}).`);
   }
 
   async _validateRecoveredState(source = 'unknown', { serverLayerName = null } = {}) {

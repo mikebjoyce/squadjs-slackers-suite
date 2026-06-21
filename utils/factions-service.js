@@ -10,12 +10,12 @@ export default class FactionsService {
   constructor({
     server,
     gameState,
-    log = () => {},
+    verboseLogger = () => {},
     pollIntervalMs = 5000
   } = {}) {
     this.server = server;
     this.gameState = gameState;
-    this.log = log;
+    this.verboseLogger = verboseLogger;
 
     this.pollIntervalMs = Number.isFinite(pollIntervalMs) ? pollIntervalMs : 5000;
 
@@ -49,7 +49,7 @@ export default class FactionsService {
 
     this._isMounted = true;
     this._ensurePollingState();
-    this.log(2, '[Factions] Mounted.');
+    this.verboseLogger(2, '[Factions] Mounted.');
   }
 
   async unmount() {
@@ -61,13 +61,13 @@ export default class FactionsService {
 
     this.stopPollingTeamAbbreviations();
     this._isMounted = false;
-    this.log(2, '[Factions] Unmounted.');
+    this.verboseLogger(2, '[Factions] Unmounted.');
   }
 
   onNewGame() {
     this.cachedAbbreviations = {};
     this.stopPollingTeamAbbreviations();
-    this.log(3, '[Factions] NEW_GAME detected -> cleared abbreviation cache.');
+    this.verboseLogger(3, '[Factions] NEW_GAME detected -> cleared abbreviation cache.');
   }
 
   onRoundEnded() {
@@ -134,7 +134,7 @@ export default class FactionsService {
 
     if (!this._teamAbbreviationPollingInterval) {
       this._teamAbbreviationPollingInterval = setInterval(() => this.pollTeamAbbreviations(), this.pollIntervalMs);
-      this.log(4, '[Factions] Starting team abbreviation polling.');
+      this.verboseLogger(4, '[Factions] Starting team abbreviation polling.');
     }
 
     this.pollTeamAbbreviations();
@@ -145,7 +145,7 @@ export default class FactionsService {
 
     clearInterval(this._teamAbbreviationPollingInterval);
     this._teamAbbreviationPollingInterval = null;
-    this.log(4, '[Factions] Stopped team abbreviation polling.');
+    this.verboseLogger(4, '[Factions] Stopped team abbreviation polling.');
   }
 
   pollTeamAbbreviations() {
@@ -157,7 +157,7 @@ export default class FactionsService {
         ...this.cachedAbbreviations,
         ...discovered
       };
-      this.log(4, `[Factions] Updated cached abbreviations: ${JSON.stringify(this.cachedAbbreviations)}`);
+      this.verboseLogger(4, `[Factions] Updated cached abbreviations: ${JSON.stringify(this.cachedAbbreviations)}`);
     }
 
     if (this._hasBothTeams()) {
