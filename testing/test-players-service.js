@@ -170,6 +170,83 @@ await runTest('team changes emit only for real team transitions (null guard)', a
   await service.unmount();
 });
 
+await runTest('projection returns flipped teams during null-teamID window', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({
+    server,
+    verboseLogger: (level, message) => {
+      server.emitted.push({ event: 'LOG', payload: { level, message } });
+    }
+  });
+  await service.mount();
+
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 2, squadID: 2 }
+  ];
+  await service.handleUpdatedPlayerInfo();
+
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: null, squadID: 1 },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: null, squadID: 2 }
+  ];
+  await service.handleUpdatedPlayerInfo();
+
+  const snapshot = service.getAllPlayers();
+  const alpha = snapshot.find((player) => player.eosID === 'e1');
+  const bravo = snapshot.find((player) => player.eosID === 'e2');
+
+  assert.equal(alpha.teamID, 2);
+  assert.equal(bravo.teamID, 1);
+
+  const logs = server.take('LOG');
+  assert.ok(logs.some((entry) => entry.payload.message.includes('Projection active')));
+
+  await service.unmount();
+});
+
+await runTest('projection keeps new joins and logs mismatches on reconcile', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({
+    server,
+    verboseLogger: (level, message) => {
+      server.emitted.push({ event: 'LOG', payload: { level, message } });
+    }
+  });
+  await service.mount();
+
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 }
+  ];
+  await service.handleUpdatedPlayerInfo();
+
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: null, squadID: 1 },
+    { eosID: 'e3', steamID: 's3', name: 'Charlie', teamID: 1, squadID: 3 }
+  ];
+  await service.handleUpdatedPlayerInfo();
+
+  let snapshot = service.getAllPlayers();
+  const charlie = snapshot.find((player) => player.eosID === 'e3');
+  assert.equal(charlie.teamID, 1);
+
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 },
+    { eosID: 'e3', steamID: 's3', name: 'Charlie', teamID: 1, squadID: 3 }
+  ];
+  await service.handleUpdatedPlayerInfo();
+
+  snapshot = service.getAllPlayers();
+  assert.equal(snapshot.length, 2);
+  assert.equal(snapshot.find((player) => player.eosID === 'e1').teamID, 1);
+
+  const logs = server.take('LOG');
+  assert.ok(logs.some((entry) => entry.payload.message.includes('Projection active')));
+  assert.ok(logs.some((entry) => entry.payload.message.includes('projected team')));
+
+  await service.unmount();
+});
+
 await runTest('recordMove attribution is consumed on matching team change', async () => {
   const server = new MockServer();
   const service = new PlayersService({ server, attributionTtlMs: 90000 });

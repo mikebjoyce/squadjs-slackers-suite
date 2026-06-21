@@ -55,6 +55,10 @@ export default class PlayersService {
     this._migrationRegistered = false;
     this._isMounted = false;
     this._initialSyncComplete = false;
+    // Snapshot of the last fully-resolved team list. Used to build projections when teamIDs go null.
+    this._lastStablePlayers = null;
+    // Active projection map when we detect the null-teamID window after NEW_GAME.
+    this._projectedPlayers = null;
 
     this.PRIORITY = {
       TeamBalancer: 3,
@@ -105,7 +109,9 @@ export default class PlayersService {
     const key = this._resolvePlayerKey(eosIDOrSteamID);
     if (!key) return null;
 
-    const value = this.registry.get(key);
+    // Return best-available data (projected while resolving, otherwise real registry).
+    const active = this._getActiveRegistry();
+    const value = active.get(key) || this.registry.get(key);
     return value ? { ...value } : null;
   }
 
@@ -114,7 +120,9 @@ export default class PlayersService {
   }
 
   getAllPlayers() {
-    return [...this.registry.values()].map((p) => ({ ...p }));
+    // Keep call sites blind to projection; always return the most stable data we can provide.
+    const active = this._getActiveRegistry();
+    return [...active.values()].map((p) => ({ ...p }));
   }
 
   areTeamsResolved() {
@@ -332,6 +340,9 @@ export default class PlayersService {
     const now = Date.now();
     const current = new Set();
     const isInitialSync = !this._initialSyncComplete;
+    // If any player reports a non-1/2 teamID, we are in the null-teamID window.
+    const hasNullTeams = players.some((player) => !this._isRealTeam(player?.teamID));
+    const allResolved = players.length > 0 && !hasNullTeams;
 
     for (const rawPlayer of players) {
       const result = this._registerPlayer(rawPlayer, now, {
@@ -371,6 +382,12 @@ export default class PlayersService {
       }
 
       this._initialSyncComplete = true;
+      // We still want projection readiness on the very first tick.
+      this._refreshProjectionState({
+        current,
+        allResolved,
+        hasNullTeams
+      });
       return;
     }
 
@@ -385,10 +402,116 @@ export default class PlayersService {
         source: 'S3PlayersRegistry'
       });
     }
+
+    this._refreshProjectionState({
+      current,
+      allResolved,
+      hasNullTeams
+    });
   }
 
   _isRealTeam(teamID) {
     return teamID === 1 || teamID === 2;
+  }
+
+  _getActiveRegistry() {
+    return this._projectedPlayers || this.registry;
+  }
+
+  _refreshProjectionState({ current, allResolved, hasNullTeams }) {
+    // When we have a fully-resolved player list, cache it as a stable baseline.
+    // This baseline is flipped when the null-teamID window appears after NEW_GAME.
+    if (allResolved) {
+      if (this._projectedPlayers) {
+        this._reconcileProjection();
+        this._projectedPlayers = null;
+      }
+
+      this._lastStablePlayers = this._snapshotRegistry();
+    }
+
+    // Only build projection once per resolving window, using the last stable snapshot.
+    if (hasNullTeams && this._lastStablePlayers && !this._projectedPlayers) {
+      this._projectedPlayers = this._buildProjection(this._lastStablePlayers);
+      if (this._projectedPlayers.size) {
+        this.verboseLogger(2, `[Players] Projection active for ${this._projectedPlayers.size} players.`);
+      }
+    }
+
+    // Keep projected entries synced with the latest real data (names/squad IDs/joined players).
+    if (this._projectedPlayers) {
+      this._syncProjection(current);
+    }
+
+    return;
+  }
+
+  _snapshotRegistry() {
+    // Copy to avoid mutating the stable snapshot while real registry updates continue.
+    return new Map([...this.registry.entries()].map(([key, state]) => [key, { ...state }]));
+  }
+
+  _buildProjection(snapshot) {
+    const projected = new Map();
+
+    for (const [key, state] of snapshot.entries()) {
+      if (!this._isRealTeam(state.teamID)) continue;
+
+      // Flip teams 1 <-> 2 to match the known swap at round transition.
+      const teamID = state.teamID === 1 ? 2 : 1;
+      projected.set(key, { ...state, teamID });
+    }
+
+    return projected;
+  }
+
+  _syncProjection(currentKeys) {
+    for (const key of currentKeys) {
+      const registryState = this.registry.get(key);
+      if (!registryState) continue;
+
+      const projected = this._projectedPlayers.get(key);
+      // New player during the null window: just inject their real teamID.
+      if (!projected) {
+        this._projectedPlayers.set(key, { ...registryState });
+        continue;
+      }
+
+      projected.name = registryState.name;
+      projected.eosID = registryState.eosID;
+      projected.steamID = registryState.steamID;
+      projected.squadID = registryState.squadID;
+      projected.lastSeenAt = registryState.lastSeenAt;
+
+      // Overwrite projected team if the real team is resolved mid-window.
+      if (this._isRealTeam(registryState.teamID)) {
+        projected.teamID = registryState.teamID;
+      }
+    }
+
+    // Remove projected players no longer present in the live registry.
+    for (const key of this._projectedPlayers.keys()) {
+      if (!currentKeys.has(key)) {
+        this._projectedPlayers.delete(key);
+      }
+    }
+  }
+
+  _reconcileProjection() {
+    // Log-only reconciliation when the null window resolves.
+    // We do not issue corrective RCON commands here; this is diagnostics only.
+    for (const [key, projected] of this._projectedPlayers.entries()) {
+      const actual = this.registry.get(key);
+      if (!actual || !this._isRealTeam(actual.teamID)) continue;
+
+      if (String(projected.teamID) !== String(actual.teamID)) {
+        const name = actual.name || projected.name || key;
+        this.verboseLogger(
+          2,
+          `[Players Projection] ${name} projected team ${projected.teamID} -> actual ${actual.teamID}`
+        );
+      }
+    }
   }
 
   _toPlayerState(player, now, { joinEmitted = false } = {}) {
@@ -521,7 +644,7 @@ export default class PlayersService {
     const previousTeamID = state.teamID;
 
     state.name = rawPlayer?.name || state.name;
-    state.teamID = rawPlayer?.teamID ?? state.teamID;
+    state.teamID = rawPlayer?.teamID ?? null;
     state.squadID = rawPlayer?.squadID ?? state.squadID;
     state.eosID = rawPlayer?.eosID || state.eosID;
     state.steamID = rawPlayer?.steamID || state.steamID;
