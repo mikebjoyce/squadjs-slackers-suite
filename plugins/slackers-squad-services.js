@@ -1,5 +1,6 @@
 import BasePlugin from './base-plugin.js';
 import GameStateService from '../utils/game-state-service.js';
+import FactionsService from '../utils/factions-service.js';
 
 /**
  * Base scaffold plugin for Slacker's Squad Services (S³).
@@ -50,7 +51,8 @@ export default class SlackersSquadServices extends BasePlugin {
     super(server, options, connectors);
 
     this.services = {
-      gameState: null
+      gameState: null,
+      factions: null
     };
   }
 
@@ -61,6 +63,12 @@ export default class SlackersSquadServices extends BasePlugin {
       ignoredGameModes: this.options.ignoredGameModes,
       log: (...args) => this.verbose(...args)
     });
+
+    this.services.factions = new FactionsService({
+      server: this.server,
+      gameState: this.services.gameState,
+      log: (...args) => this.verbose(...args)
+    });
   }
 
   async mount() {
@@ -68,14 +76,22 @@ export default class SlackersSquadServices extends BasePlugin {
       await this.services.gameState.mount();
     }
 
-    this.verbose(1, 'Mounted SlackerSquadServices with gameState service.');
+    if (this.services.factions) {
+      await this.services.factions.mount();
+    }
+
+    this.verbose(1, 'Mounted SlackerSquadServices with gameState and factions services.');
   }
 
   async unmount() {
+    if (this.services.factions) {
+      await this.services.factions.unmount();
+    }
+
     if (this.services.gameState) {
       await this.services.gameState.unmount();
     }
 
-    this.verbose(1, 'Unmounted SlackerSquadServices and gameState service.');
+    this.verbose(1, 'Unmounted SlackerSquadServices and shared services.');
   }
 }
