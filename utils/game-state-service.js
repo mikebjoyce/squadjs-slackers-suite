@@ -599,7 +599,15 @@ export default class GameStateService {
     return dataTypes;
   }
 
-  // Get voting durations from server config (with safe defaults)
+  // Get voting durations from server config (with safe defaults).
+  //
+  // IMPLICIT DEPENDENCY: serverConfig must be mounted before gameState.
+  // The ENDGAME sub-state timer chain (scoreboard→layerVote→factionVoteTeam1→factionVoteTeam2)
+  // reads real vote durations from the server's VoteConfig.cfg via ServerConfigService.
+  // If serverConfig hasn't mounted yet when gameState enters ENDGAME, the timers fall back
+  // to safe defaults (30s/25s/25s), which match standard Squad voting durations.
+  // This dependency was discovered during implementation and is why the container mounts
+  // serverConfig first in mount(), diverging from the original build-order plan.
   _getServerConfig() {
     return this.parent?.services?.serverConfig || null;
   }

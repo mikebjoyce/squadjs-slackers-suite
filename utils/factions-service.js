@@ -120,6 +120,13 @@ export default class FactionsService {
     return firstPlayer ? Number(firstPlayer.teamID) || null : null;
   }
 
+  // LIVE-gating rationale: faction abbreviations (e.g. "US", "RUS", "GB", "CAF") are only
+  // meaningful during active gameplay. During STAGING (teams resolving, map loading) and
+  // ENDGAME (scoreboard, voting), player roles may not be loaded yet or may reflect the
+  // previous round's factions. Polling is therefore restricted to the LIVE phase only.
+  // Once both teams are resolved (cache complete), polling stops automatically — no need
+  // to keep scanning every interval. A NEW_GAME event clears the cache and polling resumes
+  // when LIVE is reached again.
   _ensurePollingState() {
     const live = this.gameState.isLive();
     const hasBoth = this._hasBothTeams();

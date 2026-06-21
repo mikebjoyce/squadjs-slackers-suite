@@ -436,6 +436,38 @@ export default class PlayersService {
     return this._projectedPlayers || this.registry;
   }
 
+  // ---------------------------------------------------------------------------
+  // Null-teamID projection subsystem
+  //
+  // At round transition (NEW_GAME), RCON briefly serves teamID=null for some or
+  // all players while teams re-establish (~30-90s). Instead of blocking all
+  // join/assignment logic during this window, we serve a projected player list
+  // built from the last stable snapshot, with teams flipped (1↔2) to match the
+  // known round-transition swap. This design was originally specified in
+  // DesignDocs/player-state-manager-design.md and was subsumed into PlayersService
+  // during Stage 1 implementation (S³ uses one lifecycle, not a separate singleton).
+  //
+  // Flow:
+  //   1. _refreshProjectionState() — called every UPDATED_PLAYER_INFORMATION tick.
+  //      Decides whether to build, update, or tear down the projection.
+  //   2. _snapshotRegistry() — copies the current registry as a stable baseline
+  //      when all teamIDs are real (1/2). Used as the projection seed.
+  //   3. _buildProjection(snapshot) — flips team 1↔2 on the stable snapshot to
+  //      produce projected state representing post-swap reality.
+  //   4. _syncProjection(currentKeys) — keeps projected state in sync with live
+  //      data (names, squad IDs, new joiners) while the null window is active.
+  //   5. _reconcileProjection() — when the null window resolves, logs mismatches
+  //      between projected and actual teams for diagnostics. No corrective RCON
+  //      commands are issued — log-only reconciliation.
+  //
+  // Key invariants:
+  //   - getPlayer()/getAllPlayers() return projected data when projection is active
+  //     (via _getActiveRegistry()), so callers are never exposed to null teamIDs.
+  //   - _projectedPlayers is null when not in the projection window (fast path).
+  //   - Team-change emissions are suppressed during the null window (both old/new
+  //     team must be real before S3_PLAYER_TEAM_CHANGED fires).
+  // ---------------------------------------------------------------------------
+
   _refreshProjectionState({ current, allResolved, hasNullTeams }) {
     // When we have a fully-resolved player list, cache it as a stable baseline.
     // This baseline is flipped when the null-teamID window appears after NEW_GAME.

@@ -1,19 +1,10 @@
 /**
- * ServerConfigService — parses Squad server configuration files and caches key values for runtime access.
- * Part of Slacker's Squad Services (S³).
+ * Shared server config service for Slacker's Squad Services (S³).
  *
- * Scope:
- * - Parse Squad server configuration files (Server.cfg, VoteConfig.cfg) at mount time
- * - Cache key server settings (AllowTeamChanges, MaxPlayers, TimeBetweenMatches, voting durations)
+ * Stage 1 scope:
+ * - Parse Squad server configuration files at mount time
+ * - Cache key values for runtime access
  * - Provide fallback defaults when files are unavailable
- *
- * Build order: 6 (depends on: verboseLogger, configPath; consumed by: <planned, not yet wired>)
- * Design ref: DesignDocs/slackers-squad-services-design.md §<planned, not yet wired>
- *
- * @example
- * const svc = new ServerConfigService({ configPath: './SquadGame/ServerConfig/' });
- * await svc.mount();
- * svc.getAllowTeamChanges();
  */
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -34,7 +25,12 @@ const DEFAULT_CONFIG = {
 
 //Allow team changes lets us (if false) determine the source of team changes. We track all of them except admin team changes. We can infer.
 //Max players and Num reserved slots play together to determine how high the server pop naturally goes to. 100 - 2 = 98 is the natural max, if admins join then it can go up to 100. Both TeamBalancer and SmartAssign (and I guess switch too) care about the max team size and this information is going to be very important. Note: 98 may be natural state, but theres lots of admins on so it is normal for it to be full too...
-//
+//TimeBetweenMatches is for when voting is off, but we cant tell right now if voting is on. lets assume it always is.
+// TimeBeforeVote and LayerVoteDuration is really important for TeamBalancer as it needs to get its scramble out before faction voting starts or it'll get blocked. 
+// So when the round ends we get the first timer TimeBeforeVote, the layer voting starts and lasts for LayerVoteDuration, then faction voting starts (and no team changes can occur as the engine blocks it) for TeamVote_Duration amt of time until we get a short 10s window or something (unknown) before the map rolls.
+// It should be noted that during the voting, if enough people cast their vote for an option it can end the timer completely and just move forward. So these are hard bounds rather than actual truths... but still... good to know the stage or infer an approximation of the end game phase.
+// (1) it'd be nice if the game state could know that our switch failure are probably due to faction voting having been started. 
+// (2) we can have more sub phases like the resolving stage, but for the end game where its pre-vote, layerVote, factionVote. We should stop trying to switch players during faction vote (at least SA and Switch plugins).
 
 /**
  * Parse a Squad config file and extract key=value pairs.
