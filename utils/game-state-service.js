@@ -18,6 +18,7 @@
 
 export default class GameStateService {
   constructor({
+    parent = null,
     server,
     verboseLogger = () => {},
     ignoredGameModes = [],
@@ -25,6 +26,7 @@ export default class GameStateService {
     stagingDurationMs = 360000,
     maxRecoveredRoundAgeMs = 7200000
   } = {}) {
+    this.parent = parent;
     this.server = server;
     this.verboseLogger = verboseLogger;
     this.sequelize = sequelize;
@@ -233,6 +235,17 @@ export default class GameStateService {
     await this._validateRecoveredState('handleUpdatedPlayerInfo');
 
     if (!(this.phase === 'STAGING' && this.resolving)) return;
+
+    const playersService = this.parent?.services?.players || null;
+    if (playersService?.areTeamsResolved) {
+      const allResolved = playersService.areTeamsResolved();
+      if (!allResolved) return;
+
+      this.resolving = false;
+      await this._persistState();
+      this.verboseLogger(2, '[GameState] All tracked players resolved -> STAGING(resolving=false).');
+      return;
+    }
 
     const players = this.server.players || [];
     if (!players.length) return;

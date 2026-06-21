@@ -127,7 +127,25 @@ await runTest('registry diff emits S3 join/leave events', async () => {
   ];
   await service.handleUpdatedPlayerInfo();
 
-  assert.equal(server.take('S3_PLAYER_JOINED').length, 1);
+  assert.equal(server.take('S3_PLAYER_JOINED').length, 2);
+
+  await service.unmount();
+});
+
+await runTest('areTeamsResolved returns true only when all tracked players are on real teams', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({ server });
+  await service.mount();
+
+  assert.equal(service.areTeamsResolved(), false);
+
+  server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: null, squadID: 1 }];
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.areTeamsResolved(), false);
+
+  server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 }];
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.areTeamsResolved(), true);
 
   await service.unmount();
 });

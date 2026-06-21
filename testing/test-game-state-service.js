@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import GameStateService from '../utils/game-state-service.js';
+import PlayersService from '../utils/players-service.js';
 
 class MockServer extends EventEmitter {
   constructor() {
@@ -90,10 +91,14 @@ await runTest('isIgnoredMode matches case-insensitive substrings', async () => {
 
 await runTest('phase transitions NEW_GAME resolving -> STAGING(resolving=false) when teams resolve', async () => {
   const server = new MockServer();
-  const service = new GameStateService({ server, stagingDurationMs: 2500 });
+  const parent = { services: {} };
+  parent.services.players = new PlayersService({ parent, server });
+  const service = new GameStateService({ parent, server, stagingDurationMs: 2500 });
+  parent.services.gameState = service;
 
+  await parent.services.players.mount();
   await service.mount();
-  await service.onNewGame({ layer: 'Mutaha_RAAS_v3' });
+  await service.handleNewGame({ layer: 'Mutaha_RAAS_v3' });
 
   assert.equal(service.getPhase(), 'STAGING');
   assert.equal(service.isResolving(), true);
@@ -103,11 +108,13 @@ await runTest('phase transitions NEW_GAME resolving -> STAGING(resolving=false) 
     { eosID: '2', teamID: 2 }
   ];
 
-  await service.onUpdatedPlayerInfo();
+  await parent.services.players.handleUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
   assert.equal(service.getPhase(), 'STAGING');
   assert.equal(service.isResolving(), false);
 
   await service.unmount();
+  await parent.services.players.unmount();
 });
 
 await runTest('phase transitions STAGING -> LIVE only by staging timer', async () => {
@@ -115,7 +122,7 @@ await runTest('phase transitions STAGING -> LIVE only by staging timer', async (
   const service = new GameStateService({ server, stagingDurationMs: 20 });
 
   await service.mount();
-  await service.onNewGame({ layer: 'Mutaha_RAAS_v3' });
+  await service.handleNewGame({ layer: 'Mutaha_RAAS_v3' });
 
   assert.equal(service.getPhase(), 'STAGING');
   await new Promise((resolve) => setTimeout(resolve, 35));
@@ -129,7 +136,7 @@ await runTest('phase transitions ROUND_ENDED -> ENDGAME', async () => {
   const service = new GameStateService({ server });
 
   await service.mount();
-  await service.onRoundEnded();
+  await service.handleRoundEnded();
   assert.equal(service.getPhase(), 'ENDGAME');
   assert.equal(service.isEnding(), true);
 
@@ -140,26 +147,33 @@ await runTest('persists and recovers phase/resolving/layer state via sequelize c
   const sequelize = new MockSequelize();
 
   const server1 = new MockServer();
+  const parent1 = { services: {} };
+  parent1.services.players = new PlayersService({ parent: parent1, server: server1 });
   const service1 = new GameStateService({
+    parent: parent1,
     server: server1,
     sequelize,
     ignoredGameModes: ['Seed', 'Jensen'],
     stagingDurationMs: 600000
   });
+  parent1.services.gameState = service1;
 
+  await parent1.services.players.mount();
   await service1.mount();
-  await service1.onNewGame({ layer: 'JensensRange_Skirmish_v2' });
+  await service1.handleNewGame({ layer: 'JensensRange_Skirmish_v2' });
 
   server1.players = [
     { eosID: '1', teamID: 1 },
     { eosID: '2', teamID: 2 }
   ];
-  await service1.onUpdatedPlayerInfo();
+  await parent1.services.players.handleUpdatedPlayerInfo();
+  await service1.handleUpdatedPlayerInfo();
 
   assert.equal(service1.getPhase(), 'STAGING');
   assert.equal(service1.isResolving(), false);
   assert.equal(service1.isIgnoredMode(), true);
   await service1.unmount();
+  await parent1.services.players.unmount();
 
   const server2 = new MockServer();
   const service2 = new GameStateService({
@@ -189,7 +203,7 @@ await runTest('invalidates recovered state when recovered round age is impossibl
   });
 
   await service1.mount();
-  await service1.onNewGame({ layer: 'Mutaha_RAAS_v3' });
+  await service1.handleNewGame({ layer: 'Mutaha_RAAS_v3' });
   await service1.unmount();
 
   const staleRow = sequelize._rows.get(1);
@@ -224,7 +238,7 @@ await runTest('invalidates recovered STAGING when it is already overdue', async 
   });
 
   await service1.mount();
-  await service1.onNewGame({ layer: 'Mutaha_RAAS_v3' });
+  await service1.handleNewGame({ layer: 'Mutaha_RAAS_v3' });
   await service1.unmount();
 
   const staleRow = sequelize._rows.get(1);
@@ -251,18 +265,25 @@ await runTest('invalidates recovered state on authoritative known-layer divergen
   const sequelize = new MockSequelize();
 
   const server1 = new MockServer();
+  const parent1 = { services: {} };
+  parent1.services.players = new PlayersService({ parent: parent1, server: server1 });
   const service1 = new GameStateService({
+    parent: parent1,
     server: server1,
     sequelize,
     stagingDurationMs: 600000,
     maxRecoveredRoundAgeMs: 99999999
   });
+  parent1.services.gameState = service1;
 
+  await parent1.services.players.mount();
   await service1.mount();
-  await service1.onNewGame({ layer: 'OldLayer_RAAS_v1' });
+  await service1.handleNewGame({ layer: 'OldLayer_RAAS_v1' });
   server1.players = [{ eosID: '1', teamID: 1 }];
-  await service1.onUpdatedPlayerInfo();
+  await parent1.services.players.handleUpdatedPlayerInfo();
+  await service1.handleUpdatedPlayerInfo();
   await service1.unmount();
+  await parent1.services.players.unmount();
 
   const server2 = new MockServer();
   const service2 = new GameStateService({
@@ -287,17 +308,22 @@ await runTest('invalidates recovered state on authoritative known-layer divergen
 
 await runTest('startup churn with null team IDs does not clear resolving early', async () => {
   const server = new MockServer();
-  const service = new GameStateService({ server, stagingDurationMs: 2500 });
+  const parent = { services: {} };
+  parent.services.players = new PlayersService({ parent, server });
+  const service = new GameStateService({ parent, server, stagingDurationMs: 2500 });
+  parent.services.gameState = service;
 
+  await parent.services.players.mount();
   await service.mount();
-  await service.onNewGame({ layer: 'Mutaha_RAAS_v3' });
+  await service.handleNewGame({ layer: 'Mutaha_RAAS_v3' });
 
   server.players = [
     { eosID: '1', teamID: null },
     { eosID: '2', teamID: 1 }
   ];
 
-  await service.onUpdatedPlayerInfo();
+  await parent.services.players.handleUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
   assert.equal(service.isResolving(), true);
 
   server.players = [
@@ -305,23 +331,25 @@ await runTest('startup churn with null team IDs does not clear resolving early',
     { eosID: '2', teamID: 2 }
   ];
 
-  await service.onUpdatedPlayerInfo();
+  await parent.services.players.handleUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
   assert.equal(service.isResolving(), false);
 
   await service.unmount();
+  await parent.services.players.unmount();
 });
 
-await runTest('mount/unmount listener symmetry', async () => {
+await runTest('mount/unmount does not bind server listeners directly', async () => {
   const server = new MockServer();
   const service = new GameStateService({ server });
 
   await service.mount();
 
-  assert.equal(server.listenerCount('NEW_GAME'), 1);
-  assert.equal(server.listenerCount('ROUND_ENDED'), 1);
-  assert.equal(server.listenerCount('UPDATED_LAYER_INFORMATION'), 1);
-  assert.equal(server.listenerCount('UPDATED_SERVER_INFORMATION'), 1);
-  assert.equal(server.listenerCount('UPDATED_PLAYER_INFORMATION'), 1);
+  assert.equal(server.listenerCount('NEW_GAME'), 0);
+  assert.equal(server.listenerCount('ROUND_ENDED'), 0);
+  assert.equal(server.listenerCount('UPDATED_LAYER_INFORMATION'), 0);
+  assert.equal(server.listenerCount('UPDATED_SERVER_INFORMATION'), 0);
+  assert.equal(server.listenerCount('UPDATED_PLAYER_INFORMATION'), 0);
 
   await service.unmount();
 

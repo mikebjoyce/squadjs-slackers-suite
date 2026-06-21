@@ -23,6 +23,7 @@ const DEFAULT_RECONNECT_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
 export default class PlayersService {
   constructor({
+    parent = null,
     server,
     dbService = null,
     verboseLogger = () => {},
@@ -30,6 +31,7 @@ export default class PlayersService {
     defaultLockTtlMs = DEFAULT_LOCK_TTL_MS,
     reconnectPersistence = true
   } = {}) {
+    this.parent = parent;
     this.server = server;
     this.dbService = dbService;
     this.verboseLogger = verboseLogger;
@@ -114,6 +116,12 @@ export default class PlayersService {
 
   getAllPlayers() {
     return [...this.registry.values()].map((p) => ({ ...p }));
+  }
+
+  areTeamsResolved() {
+    const players = [...this.registry.values()];
+    if (!players.length) return false;
+    return players.every((player) => player?.teamID === 1 || player?.teamID === 2);
   }
 
   recordMove(eosIDOrSteamID, targetTeamID, source, options = {}) {

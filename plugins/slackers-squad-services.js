@@ -115,6 +115,7 @@ export default class SlackersSquadServices extends BasePlugin {
 
   async prepareToMount() {
     this.services.gameState = new GameStateService({
+      parent: this,
       server: this.server,
       sequelize: this.options.database,
       ignoredGameModes: this.options.ignoredGameModes,
@@ -122,12 +123,14 @@ export default class SlackersSquadServices extends BasePlugin {
     });
 
     this.services.factions = new FactionsService({
+      parent: this,
       server: this.server,
       gameState: this.services.gameState,
       verboseLogger: (...args) => this.verbose(...args)
     });
 
     this.services.clans = new ClansService({
+      parent: this,
       verboseLogger: (...args) => this.verbose(...args),
       options: {
         enabled: this.options.enableClanTagGrouping,
@@ -141,6 +144,7 @@ export default class SlackersSquadServices extends BasePlugin {
     });
 
     this.services.db = new DBService({
+      parent: this,
       sequelize: this.options.database,
       connectors: this.connectors,
       databaseOption: this.options.database,
@@ -148,6 +152,7 @@ export default class SlackersSquadServices extends BasePlugin {
     });
 
     this.services.players = new PlayersService({
+      parent: this,
       server: this.server,
       dbService: this.services.db,
       verboseLogger: (...args) => this.verbose(...args)
