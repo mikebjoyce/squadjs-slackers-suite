@@ -641,6 +641,23 @@ export default class Switch extends DiscordBasePlugin {
             await this.server.updateSquadList();
             await this.server.updatePlayerList();
 
+            // Phase gate: engine-level team changes are impossible during faction voting
+            if (this.s3IsEndgameFactionVote()) {
+                this.warn(steamID, '[Switch] Team changes are locked during faction voting. Try again when the next round starts.');
+                this.verbose(1, `[Switch] Denied ${playerName}: faction vote in progress.`);
+                return;
+            }
+
+            // S³ lock gate: check if this player is being processed by a higher-priority actor
+            const eosID2 = info.player?.eosID;
+            if (eosID2 && this._s3?.services?.players) {
+                if (!this._s3.services.players.canAct(eosID2, 'Switch')) {
+                    this.warn(steamID, '[Switch] You are currently being processed — please try again shortly.');
+                    this.verbose(1, `[Switch] Denied ${playerName}: canAct returned false (locked by higher-priority actor).`);
+                    return;
+                }
+            }
+
             // Detect liberal mode
             const isLiberal = this.isLiberalMode();
             const effectiveCap = isLiberal ? this.options.liberalSwitchMaxUnbalancedSlots : null;
@@ -799,9 +816,23 @@ export default class Switch extends DiscordBasePlugin {
      * Checks both cached layer name and gamemode against the liberal modes list.
      */
     isLiberalMode() {
-        const checkLayer = (this.currentLayerName || '').toLowerCase();
-        const checkMode = (this.currentGamemode || '').toLowerCase();
+        // Prefer S³ gameState when available (single source of truth for layer/gamemode)
+        const layerName = this.s3GameStateLayer() ?? this.currentLayerName;
+        const gamemode = this.s3GameStateGamemode() ?? this.currentGamemode;
+        const checkLayer = (layerName || '').toLowerCase();
+        const checkMode = (gamemode || '').toLowerCase();
         return this._liberalModes.some(m => checkLayer.includes(m) || checkMode.includes(m));
+    }
+
+    // S³ gameState helpers (null-safe, return null when S³ not available)
+    s3GameStateLayer() {
+        return this._s3?.services?.gameState?.getLayerName?.() ?? null;
+    }
+    s3GameStateGamemode() {
+        return this._s3?.services?.gameState?.getGamemode?.() ?? null;
+    }
+    s3IsEndgameFactionVote() {
+        return this._s3?.services?.gameState?.isEndgameFactionVote?.() === true;
     }
 
     /**
@@ -1014,6 +1045,14 @@ export default class Switch extends DiscordBasePlugin {
         
         this._queueProcessing = true;
         try {
+            // Phase gate: don't attempt switches during faction voting (engine-level block)
+            if (this.s3IsEndgameFactionVote()) {
+                if (this._switchQueue.size > 0) {
+                    this.verbose(2, `[Queue] Faction vote in progress — skipping queue processing.`);
+                }
+                return;
+            }
+
             if (this.isSABalancingActive) {
                 this.verbose(2, `[Queue] Processing suspended — SmartAssign is currently evaluating joins.`);
                 return;
