@@ -62,7 +62,6 @@
 
 import Logger from '../../core/logger.js';
 import EloCalculator from './elo-calculator.js';
-import { extractRawPrefix, normalizeTag } from './elo-clan-grouping.js';
 
 const formatDuration = (ms) => {
   const seconds = Math.floor((ms / 1000) % 60);
@@ -587,6 +586,22 @@ export const EloDiscord = {
       const args = content.replace(/^!elo\s*/i, '').trim().split(/\s+/).filter(Boolean);
       const sub = args[0]?.toLowerCase();
 
+      // S³ ClansService delegation — uses this._s3 (set by elo-tracker.js mount())
+      this._extractRawPrefix = (name) => {
+        if (this._s3?.services?.clans) {
+          return this._s3.services.clans.extractRawPrefix(name);
+        }
+        Logger.verbose('EloTracker', 1, 'Clans service unavailable — cannot extract clan prefix');
+        return null;
+      };
+      this._normalizeTag = (raw) => {
+        if (this._s3?.services?.clans) {
+          return this._s3.services.clans.normalizeTag(raw);
+        }
+        Logger.verbose('EloTracker', 1, 'Clans service unavailable — cannot normalize clan tag');
+        return null;
+      };
+
       const hasAdminRole = (!this.options.discordAdminRoleIDs || this.options.discordAdminRoleIDs.length === 0) || 
         (message.member && this.options.discordAdminRoleIDs.some(roleID => message.member.roles.cache.has(roleID)));
 
@@ -947,14 +962,14 @@ export const EloDiscord = {
           return;
         }
 
-        const searchNorm = normalizeTag(query);
+        const searchNorm = this._normalizeTag(query);
         if (!searchNorm) {
           await message.reply('Invalid clan tag query.');
           return;
         }
 
         const allPlayers = await this.db.exportPlayerStats();
-        const members = allPlayers.filter(p => normalizeTag(extractRawPrefix(p.name)) === searchNorm);
+        const members = allPlayers.filter(p => this._normalizeTag(this._extractRawPrefix(p.name)) === searchNorm);
 
         if (members.length === 0) {
           await message.reply(`No players found with clan tag matching: "${query}"`);
@@ -966,7 +981,7 @@ export const EloDiscord = {
         const rawCounts = {};
 
         members.forEach(p => {
-          const raw = extractRawPrefix(p.name);
+          const raw = this._extractRawPrefix(p.name);
           rawCounts[raw] = (rawCounts[raw] || 0) + 1;
           totalWins += p.wins;
           totalLosses += p.losses;
@@ -1015,8 +1030,8 @@ export const EloDiscord = {
         const clans = {};
 
         allPlayers.forEach(p => {
-          const raw = extractRawPrefix(p.name);
-          const norm = normalizeTag(raw);
+          const raw = this._extractRawPrefix(p.name);
+          const norm = this._normalizeTag(raw);
           if (!norm) return;
 
           if (!clans[norm]) {

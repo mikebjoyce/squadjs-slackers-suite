@@ -11,7 +11,7 @@
  */
 
 import { readFileSync, writeFileSync } from 'fs';
-import { extractRawPrefix, normalizeTag } from '../utils/elo-clan-grouping.js';
+import { extractRawPrefix, normalizeTag } from '../testing/elo-clan-grouping.js';
 
 
 const args = process.argv.slice(2);

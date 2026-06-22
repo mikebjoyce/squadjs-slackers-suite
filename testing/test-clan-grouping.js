@@ -14,7 +14,7 @@ import {
   normalizeTag,
   levenshteinDistance,
   extractClanGroups
-} from '../utils/elo-clan-grouping.js';
+} from './elo-clan-grouping.js';
 
 export default async function runClanGroupingTests(runTest) {
 
