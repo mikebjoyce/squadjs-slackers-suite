@@ -55,6 +55,7 @@ export default class SASwapExecutor {
     this.recentlyCompletedMoves = new Map();
     this.retryTimer = null;
     this.isProcessing = false;
+    this._s3 = options.s3 || null;  // S³ reference for canAct preemption check
   }
 
   isRecentSmartAssignMove(steamID, newTeamID) {
@@ -157,6 +158,16 @@ export default class SASwapExecutor {
                 continue;
              } else if (playerAfterUpdate) {
                 // Still on wrong team! Unlock for retry.
+                // Before retrying, check if preempted by a higher-priority lock (e.g., TB scramble).
+                const eosID = playerAfterUpdate.eosID;
+                if (eosID && this._s3?.services?.players?.canAct) {
+                  if (!this._s3.services.players.canAct(eosID, 'SmartAssign')) {
+                    Logger.verbose('SmartAssign', 1, `[SwapExecutor] ${steamID} preempted by higher-priority lock — aborting retry.`);
+                    this.server.emit('SMART_ASSIGN_MOVE_FAILED', { steamID, reason: 'PreemptedByLock' });
+                    playersToRemove.push(steamID);
+                    continue;
+                  }
+                }
                 moveData.awaitingVerification = false; 
              } else {
                 this.server.emit('SMART_ASSIGN_MOVE_FAILED', { steamID, reason: 'Disconnected' });

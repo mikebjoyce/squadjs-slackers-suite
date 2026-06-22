@@ -155,9 +155,11 @@ export default class SmartAssign extends BasePlugin {
     super(server, options, connectors);
 
     this.db = new SADatabase(server, options, connectors);
+    this._s3 = null;  // Runtime discovery of SlackersSquadServices
     this.executor = new SASwapExecutor(server, {
       retryIntervalMs: 50,
-      maxCompletionTimeMs: 3000
+      maxCompletionTimeMs: 3000,
+      s3: this._s3  // S³ reference for canAct preemption check in retry branch
     });
     this.eventLogger = new SAEventLogger(options, this.db);
 
@@ -267,6 +269,9 @@ export default class SmartAssign extends BasePlugin {
      this.onMoveFailed = this.onMoveFailed.bind(this);
      this.onMoveSuccess = this.onMoveSuccess.bind(this);
      this.onMoveRetry = this.onMoveRetry.bind(this);
+     this.onS3PlayerJoined = this.onS3PlayerJoined.bind(this);
+     this.onS3PlayerTeamChanged = this.onS3PlayerTeamChanged.bind(this);
+     this.onS3PlayerLeft = this.onS3PlayerLeft.bind(this);
   }
 
   async mount() {
@@ -279,6 +284,18 @@ export default class SmartAssign extends BasePlugin {
     }
 
     this._ignoredModes = (this.options.ignoredGameModes || ['seed', 'jensen']).map(m => String(m).toLowerCase());
+
+    // S³ runtime discovery
+    const s3 = this.server.plugins.find((p) => p.constructor.name === 'SlackersSquadServices');
+    if (s3) {
+      this._s3 = s3;
+      this.executor._s3 = s3;  // Update executor's reference for canAct guard
+      Logger.verbose('SmartAssign', 2, '[S3] Discovered SlackersSquadServices for SmartAssign.');
+      const svc = this._s3?.services || {};
+      Logger.verbose('SmartAssign', 2, `[S3] Available: gameState=${!!svc.gameState} factions=${!!svc.factions} clans=${!!svc.clans} db=${!!svc.db} players=${!!svc.players}`);
+    } else {
+      Logger.verbose('SmartAssign', 2, '[S3] SlackersSquadServices not found — using fallback implementations.');
+    }
 
     // Initialize DB
     const { roundStartTime: persistedStartTime } = await this.db.initDB();
@@ -342,6 +359,11 @@ export default class SmartAssign extends BasePlugin {
       this.server.on('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
       this.server.on('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
 
+      // S³ parallel-run event subscribers (Phase C — logging only, no RCON moves)
+      this.server.on('S3_PLAYER_JOINED', this.onS3PlayerJoined);
+      this.server.on('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
+      this.server.on('S3_PLAYER_LEFT', this.onS3PlayerLeft);
+
      // ═══════════════════════════════════════════════════════════════════════════════════
      // LAYER INFO BOOTSTRAP: Initialize layer caches from server state at mount time
      //
@@ -376,6 +398,9 @@ export default class SmartAssign extends BasePlugin {
      this.server.removeListener('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
      this.server.removeListener('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
      this.server.removeListener('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
+     this.server.removeListener('S3_PLAYER_JOINED', this.onS3PlayerJoined);
+     this.server.removeListener('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
+     this.server.removeListener('S3_PLAYER_LEFT', this.onS3PlayerLeft);
     this._pendingPlayerMoves.clear();
     this.executor.cleanup();
     Logger.verbose('SmartAssign', 1, 'SmartAssign unmounted.');
@@ -1257,11 +1282,46 @@ export default class SmartAssign extends BasePlugin {
          * No retry spam, no bounce loops. See sa-swap-executor.js for the full design.
          */
         this.executor.queueMove(player.steamID, targetTeam);
+
+        // S³ attribution: record the move so S³'s S3_PLAYER_TEAM_CHANGED fires with source='SmartAssign'
+        if (this._s3?.services?.players?.recordMove && (player.eosID || player.steamID)) {
+          this._s3.services.players.recordMove(player.eosID || player.steamID, targetTeam, 'SmartAssign');
+        }
       }
     } finally {
       this._joiningPlayers.delete(lockKey);
       this.server.emit('SMART_ASSIGN_EVAL_END', { eosID: player.eosID, steamID: player.steamID });
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════════
+  // S³ PLAYER EVENTS: Parallel-run subscribers for Phase C validation
+  //
+  // These listeners run alongside SA's existing knownPlayers diff engine during Phase C.
+  // They log what S³ sees vs. what old SA does, enabling side-by-side comparison before
+  // the old code is cut in the cleanup phase. No RCON moves are issued from these handlers.
+  // ═══════════════════════════════════════════════════════════════════════════════════
+
+  onS3PlayerJoined(data) {
+    if (!this.ready) return;
+    const player = data?.player;
+    if (!player) return;
+    Logger.verbose('SmartAssign', 2, `[S3-PARALLEL] JOIN: ${player.name || player.eosID} (eosID=${player.eosID}, steamID=${player.steamID}, team=${player.teamID}), old SA knownPlayers.has=${this.knownPlayers.has(player.steamID)}, phase=${this.phase}`);
+  }
+
+  onS3PlayerTeamChanged(data) {
+    if (!this.ready) return;
+    const { player, previousTeamID, teamID, source } = data || {};
+    if (!player) return;
+    const externalMatch = this._externalMoveMap.get(player.steamID || player.eosID);
+    Logger.verbose('SmartAssign', 2, `[S3-PARALLEL] TEAM_CHANGE: ${player.name || player.eosID} ${previousTeamID}→${teamID}, source=${source}, old SA externalMoveMap match=${externalMatch?.source || 'none'}`);
+  }
+
+  onS3PlayerLeft(data) {
+    if (!this.ready) return;
+    const player = data?.player;
+    if (!player) return;
+    Logger.verbose('SmartAssign', 2, `[S3-PARALLEL] LEAVE: ${player.name || player.eosID} (eosID=${player.eosID}, steamID=${player.steamID}, team=${player.teamID}), old SA knownPlayers.has=${this.knownPlayers.has(player.steamID)}`);
   }
 
   async handlePlayerLeave(player) {
@@ -1453,12 +1513,18 @@ export default class SmartAssign extends BasePlugin {
       //
       // Once all players have resolved to real teams, build the lightweight per-player tag cache
       // that will be used for fast clan lookups during the round. This happens exactly once per round.
+      // Prefer S³ clans service, fall back to SA's own sa-clan-grouper.
       // ═════════════════════════════════════════════════════════════════════════════════════
       if (this.options.enableClanGrouping) {
-        this._playerTagCache = buildPlayerTagCache(this.server.players, {
-          caseSensitive: this.options.clanGroupCaseSensitive || false
-        });
-        Logger.verbose('SmartAssign', 2, `[Clan] Built player tag cache with ${this._playerTagCache.size} entries at snapshot time.`);
+        if (this._s3?.services?.clans?.isEnabled()) {
+          this._playerTagCache = this._s3.services.clans.buildPlayerTagCache(this.server.players);
+          Logger.verbose('SmartAssign', 2, `[Clan] Built player tag cache via S³ with ${this._playerTagCache.size} entries at snapshot time.`);
+        } else {
+          this._playerTagCache = buildPlayerTagCache(this.server.players, {
+            caseSensitive: this.options.clanGroupCaseSensitive || false
+          });
+          Logger.verbose('SmartAssign', 2, `[Clan] Built player tag cache with ${this._playerTagCache.size} entries at snapshot time.`);
+        }
       }
 
       this.logEvent('ROUND_SNAPSHOT', null, { players: snapshotPlayers }, false);
