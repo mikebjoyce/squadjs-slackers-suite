@@ -19,6 +19,8 @@
 
 // Round flow notes for future reference:
 // - LIVE -> ROUND_ENDED event -> ENDGAME (map/faction voting window)
+// - ENDGAME sub-states: scoreboard -> layerVote -> factionVoteTeam1 -> factionVoteTeam2 -> postVoting -> (waiting for NEW_GAME)
+// - postVoting is passive (~10s results display before map roll); no timer — we sit until NEW_GAME clears it
 // - NEW_GAME event -> STAGING(resolving=true) -> STAGING(resolving=false) -> LIVE.
 // - During map load around NEW_GAME, players can briefly report teamID=null (sometimes
 //   a tick before NEW_GAME). Treat this as transient while teams resolve; prior teams
@@ -61,7 +63,7 @@ export default class GameStateService {
     this._isMounted = false;
     this.GameStateModel = null;
     this._recoveredStateActive = false;
-    // ENDGAME sub-state: 'scoreboard' | 'layerVote' | 'factionVoteTeam1' | 'factionVoteTeam2' | null
+    // ENDGAME sub-state: 'scoreboard' | 'layerVote' | 'factionVoteTeam1' | 'factionVoteTeam2' | 'postVoting' | null
     // Note: ENDGAME sub-states are NOT persisted. Recovering into ENDGAME is dangerous and warns.
     this.endgameSubState = null;
 
@@ -359,9 +361,18 @@ export default class GameStateService {
     }
 
     if (this.endgameSubState === 'factionVoteTeam2') {
-      this.endgameSubState = null;
-      this.verboseLogger(2, '[GameState] ENDGAME factionVoteTeam2 elapsed -> waiting for NEW_GAME.');
-      // Stay in ENDGAME but with null sub-state, waiting for NEW_GAME
+      this.endgameSubState = 'postVoting';
+      this.verboseLogger(2, '[GameState] ENDGAME factionVoteTeam2 elapsed -> postVoting.');
+      // Stay in postVoting (passive, no timer) until NEW_GAME clears the ENDGAME phase.
+      // postVoting represents the ~10s results-display window before the map rolls.
+      // We wait for the server's NEW_GAME event rather than approximating with another timer.
+      return;
+    }
+
+    if (this.endgameSubState === 'postVoting') {
+      // No timer transition from postVoting — this is a passive wait state.
+      // NEW_GAME in handleNewGame() will clear endgameSubState to null and set phase to STAGING.
+      this.verboseLogger(3, '[GameState] ENDGAME postVoting elapsed but no transition — waiting for NEW_GAME.');
     }
   }
 
@@ -388,6 +399,14 @@ export default class GameStateService {
 
   isEndgameFactionVoteTeam2() {
     return this.phase === 'ENDGAME' && this.endgameSubState === 'factionVoteTeam2';
+  }
+
+  isEndgamePostVoting() {
+    return this.phase === 'ENDGAME' && this.endgameSubState === 'postVoting';
+  }
+
+  isEndgameVotingComplete() {
+    return this.phase === 'ENDGAME' && (this.endgameSubState === 'postVoting' || this.endgameSubState === null);
   }
 
   async _initPersistence() {

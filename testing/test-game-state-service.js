@@ -483,7 +483,7 @@ await runTest('ENDGAME factionVoteTeam1 transitions to factionVoteTeam2', async 
   await service.unmount();
 });
 
-await runTest('ENDGAME factionVoteTeam2 transitions to null (waiting for NewGame)', async () => {
+await runTest('ENDGAME factionVoteTeam2 transitions to postVoting (waiting for NewGame)', async () => {
   const server = new MockServer();
   const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0, teamVoteDuration: 0 }) } };
   const service = new GameStateService({ parent, server });
@@ -491,12 +491,34 @@ await runTest('ENDGAME factionVoteTeam2 transitions to null (waiting for NewGame
   await service.mount();
   await service.handleRoundEnded();
 
-  // Fast-forward through all voting phases
-  // Need to wait for all timer callbacks to execute (setTimeout 0 still needs time)
+  // Fast-forward through all voting phases (scoreboard -> layerVote -> factionVoteTeam1 -> factionVoteTeam2)
   await new Promise((resolve) => setTimeout(resolve, 50));
-  // Is now in ENDGAME with null sub-state (waiting for NEW_GAME)
+  // Is now in ENDGAME with postVoting sub-state (waiting for NEW_GAME)
   assert.equal(service.isEnding(), true);
+  assert.equal(service.getEndgameSubState(), 'postVoting');
+  assert.equal(service.isEndgamePostVoting(), true);
+  assert.equal(service.isEndgameVotingComplete(), true);
+
+  await service.unmount();
+});
+
+await runTest('postVoting transitions to STAGING via NEW_GAME and clears sub-state to null', async () => {
+  const server = new MockServer();
+  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0, teamVoteDuration: 0 }) } };
+  const service = new GameStateService({ parent, server });
+
+  await service.mount();
+  await service.handleRoundEnded();
+
+  // Fast-forward through all voting phases into postVoting
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(service.isEndgamePostVoting(), true);
+
+  // NEW_GAME should clear the ENDGAME phase and sub-state
+  await service.handleNewGame({ layer: 'Mutaha_RAAS_v3' });
+  assert.equal(service.getPhase(), 'STAGING');
   assert.equal(service.getEndgameSubState(), null);
+  assert.equal(service.isEndgameVotingComplete(), false);
 
   await service.unmount();
 });
@@ -529,6 +551,8 @@ await runTest('ENDGAME sub-state query methods return false outside ENDGAME', as
   assert.equal(service.isEndgameFactionVote(), false);
   assert.equal(service.isEndgameFactionVoteTeam1(), false);
   assert.equal(service.isEndgameFactionVoteTeam2(), false);
+  assert.equal(service.isEndgamePostVoting(), false);
+  assert.equal(service.isEndgameVotingComplete(), false);
   assert.equal(service.getEndgameSubState(), null);
 
   await service.unmount();
