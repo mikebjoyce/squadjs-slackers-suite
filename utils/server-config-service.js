@@ -122,6 +122,14 @@ export default class ServerConfigService {
   }
 
   /**
+   * Check if the service is currently mounted and ready.
+   * @returns {boolean} - True if service is mounted
+   */
+  isReady() {
+    return this._isMounted;
+  }
+
+  /**
    * Mount the service - parse config files once.
    */
   async mount() {

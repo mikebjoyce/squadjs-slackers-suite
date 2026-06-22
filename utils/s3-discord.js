@@ -170,12 +170,12 @@ function buildStatusEmbed(plugin) {
   const globalLockOwner = players?.isGloballyLockedBy?.() ?? null;
 
   const mountStatus = [
-    `serverConfig: ${checkmark(sc?.isReady?.())}`,
-    `db: ${checkmark(db?.isReady?.())}`,
-    `gameState: ${checkmark(gs?.isReady?.())}`,
-    `factions: ${checkmark(factions?._isMounted)}`,
-    `clans: ${checkmark(clans?._isMounted)}`,
-    `players: ${checkmark(players?._isMounted)}`
+    `serverConfig: ${checkmark(sc?._isMounted ?? sc?.isReady?.() ?? false)}`,
+    `db: ${checkmark(db?._isMounted ?? db?.isReady?.() ?? false)}`,
+    `gameState: ${checkmark(gs?._isMounted ?? gs?.isReady?.() ?? false)}`,
+    `factions: ${checkmark(factions?._isMounted ?? false)}`,
+    `clans: ${checkmark(clans?._isMounted ?? false)}`,
+    `players: ${checkmark(players?._isMounted ?? false)}`
   ];
 
   const team1Name = factions?.getTeamName?.(1) ?? 'Team 1';
@@ -250,7 +250,7 @@ function buildServicesEmbed(plugin) {
     } else if (key === 'serverConfig') {
       extra = ` | loaded: ${checkmark(svc?.isLoadedSuccessfully?.() ?? false)}`;
     } else if (key === 'db') {
-      extra = ` | connector: ${svc?.options?.databaseOption ?? '?'}`;
+      extra = ` | connector: ${svc?._databaseOption ?? svc?.getConnectorName?.() ?? '?'}`;
     }
     return `${checkmark(mounted)} **${label}**${extra}`;
   });

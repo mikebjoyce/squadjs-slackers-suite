@@ -75,6 +75,10 @@ export default class FactionsService {
     this._ensurePollingState();
   }
 
+  isEnabled() {
+    return this._isMounted;
+  }
+
   getCachedAbbreviations() {
     return { ...this.cachedAbbreviations };
   }

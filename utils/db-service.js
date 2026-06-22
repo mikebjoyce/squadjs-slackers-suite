@@ -34,6 +34,8 @@ export default class DBService {
       databaseOption
     });
 
+    this._databaseOption = databaseOption ?? null;
+
     this.models = {};
     this._isMounted = false;
     this._migrations = [];
@@ -192,6 +194,20 @@ export default class DBService {
 
   getConnector() {
     return this.sequelize;
+  }
+
+  isReady() {
+    return this._isMounted;
+  }
+
+  getConnectorName() {
+    if (typeof this._databaseOption === 'string') {
+      return this._databaseOption;
+    }
+    if (this.sequelize && typeof this.sequelize.getDialect === 'function') {
+      return this.sequelize.getDialect();
+    }
+    return this.sequelize ? 'sequelize' : null;
   }
 
   getDataTypes() {
