@@ -222,16 +222,14 @@ export default class EloTracker extends BasePlugin {
     this.ready = false;
     this._roundStartEmbedPending = null;
     this.lastRoundSnapshot = null;
-    this.lastKnownGoodLayer = null;
+    this._s3 = null;                // Reference to SlackersSquadServices (runtime discovery)
     this._scrambleEmbedTimer = null;
 
     // Bound listeners — mirror TeamBalancer pattern exactly
     this.listeners = {};
     this.listeners.onNewGame = this.onNewGame.bind(this);
-    this.listeners.onLayerInfoUpdated = this.onLayerInfoUpdated.bind(this);
     this.listeners.onUpdatedPlayerInfo = this.onUpdatedPlayerInfo.bind(this);
     this.listeners.onRoundEnded = this.onRoundEnded.bind(this);
-    this.listeners.onServerInfoUpdated = this.onServerInfoUpdated.bind(this);
     this.listeners.onTeamBalancerScramble = this.onTeamBalancerScramble.bind(this);
     EloDiscord.registerDiscordCommands(this);
     this.listeners.onDiscordMessage = this.onDiscordMessage.bind(this);
@@ -240,12 +238,31 @@ export default class EloTracker extends BasePlugin {
     this.listeners.onEloAdminCommand = this.onEloAdminCommand.bind(this);
   }
 
+  _resolveS3() {
+    if (!this.server.plugins) {
+      Logger.verbose('EloTracker', 1, '[S3] server.plugins not available — S³ discovery deferred.');
+      return;
+    }
+    const s3 = this.server.plugins.find(p => p.constructor.name === 'SlackersSquadServices');
+    if (s3) {
+      // Runtime discovery matches the TB→EloTracker pattern
+      // (ReferenceScripts/squadjs-team-balancer/plugins/team-balancer.js uses
+      //  this.server.plugins.find(p => p.constructor.name === 'EloTracker'))
+      this._s3 = s3;
+      Logger.verbose('EloTracker', 1, '[S3] Discovered SlackersSquadServices for EloTracker.');
+    } else {
+      this._s3 = null;
+      Logger.verbose('EloTracker', 1, '[S3] SlackersSquadServices not found — using fallback implementations.');
+    }
+  }
+
   async mount() {
     if (this._isMounted) {
       return;
     }
     Logger.verbose('EloTracker', 1, 'Mounting plugin.');
     this.ready = false;
+    this._resolveS3();
 
     const { roundStartTime: persistedStartTime } = await this.db.initDB();
 
@@ -308,28 +325,22 @@ export default class EloTracker extends BasePlugin {
       }
     }
 
-    // Register listeners
+    // Register listeners (LAYER_INFO_UPDATED and SERVER_INFO_UPDATED are owned by S³ — Elo defers to gameState)
     this.server.removeListener('NEW_GAME', this.listeners.onNewGame);
-    this.server.removeListener('UPDATED_LAYER_INFORMATION', this.listeners.onLayerInfoUpdated);
     this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.listeners.onUpdatedPlayerInfo);
     this.server.removeListener('ROUND_ENDED', this.listeners.onRoundEnded);
-    this.server.removeListener('UPDATED_SERVER_INFORMATION', this.listeners.onServerInfoUpdated);
     this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.listeners.onTeamBalancerScramble);
     this.server.removeListener('CHAT_COMMAND:elo', this.listeners.onEloCommand);
     this.server.removeListener('CHAT_COMMAND:eloadmin', this.listeners.onEloAdminCommand);
 
     this.server.on('NEW_GAME', this.listeners.onNewGame);
-    this.server.on('UPDATED_LAYER_INFORMATION', this.listeners.onLayerInfoUpdated);
     this.server.on('UPDATED_PLAYER_INFORMATION', this.listeners.onUpdatedPlayerInfo);
     this.server.on('ROUND_ENDED', this.listeners.onRoundEnded);
-    this.server.on('UPDATED_SERVER_INFORMATION', this.listeners.onServerInfoUpdated);
     this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.listeners.onTeamBalancerScramble);
     this.server.on('CHAT_COMMAND:elo', this.listeners.onEloCommand);
     this.server.on('CHAT_COMMAND:eloadmin', this.listeners.onEloAdminCommand);
 
-    if (this.server.currentLayer) {
-      await this.resolveLayerInfo(this.server.currentLayer, 'mount');
-    }
+    // Layer info is owned by S³ gameState — it resolves at mount, on events, and provides getLayerName()/getGamemode()
     
     if (this.options.discordClient) {
       this.options.discordClient.removeListener('message', this.listeners.onDiscordMessage);
@@ -348,10 +359,8 @@ export default class EloTracker extends BasePlugin {
     Logger.verbose('EloTracker', 1, 'Unmounting plugin.');
 
     this.server.removeListener('NEW_GAME', this.listeners.onNewGame);
-    this.server.removeListener('UPDATED_LAYER_INFORMATION', this.listeners.onLayerInfoUpdated);
     this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.listeners.onUpdatedPlayerInfo);
     this.server.removeListener('ROUND_ENDED', this.listeners.onRoundEnded);
-    this.server.removeListener('UPDATED_SERVER_INFORMATION', this.listeners.onServerInfoUpdated);
     this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.listeners.onTeamBalancerScramble);
     this.server.removeListener('CHAT_COMMAND:elo', this.listeners.onEloCommand);
     this.server.removeListener('CHAT_COMMAND:eloadmin', this.listeners.onEloAdminCommand);
@@ -374,65 +383,13 @@ export default class EloTracker extends BasePlugin {
    * Event Handlers
    */
 
-  inferGameMode(layerName) {
-    if (!layerName) return 'Unknown';
-    const name = layerName.toLowerCase();
-    if (name.includes('seed')) return 'Seed';
-    if (name.includes('invasion')) return 'Invasion';
-    if (name.includes('raas')) return 'RAAS';
-    if (name.includes('aas')) return 'AAS';
-    if (name.includes('tc')) return 'TC';
-    if (name.includes('skirmish')) return 'Skirmish';
-    if (name.includes('insurgency')) return 'Insurgency';
-    if (name.includes('destruction')) return 'Destruction';
-    if (name.includes('jensen')) return 'Jensen';
-    return 'Unknown';
-  }
-
-  async resolveLayerInfo(layerData, source = 'Unknown') {
-    let layer = layerData;
-    if (layer instanceof Promise) {
-      try {
-        layer = await layer;
-      } catch (err) {
-        Logger.verbose('EloTracker', 1, `[${source}] Failed to resolve layer promise: ${err.message}`);
-        layer = null;
-      }
-    }
-    
-    if (!layer) {
-      Logger.verbose('EloTracker', 3, `[${source}] Layer object is completely null or undefined.`);
-      return false;
-    }
-    
-    let gamemode = 'Unknown';
-    let name = 'Unknown';
-
-    if (typeof layer === 'string') {
-      name = layer;
-      gamemode = this.inferGameMode(name);
-      Logger.verbose('EloTracker', 4, `[${source}] Layer is a string ("${layer}"), inferred gamemode: ${gamemode}.`);
-    } else if (typeof layer === 'object') {
-      name = layer.name || layer.layer || 'Unknown';
-      gamemode = layer.gamemode || this.inferGameMode(name);
-      if (gamemode === 'Unknown' || name === 'Unknown') {
-         Logger.verbose('EloTracker', 4, `[${source}] Layer object missing properties: ${JSON.stringify(layer)}`);
-      }
-    }
-
-    this.lastKnownGoodLayer = { gamemode, name };
-    Logger.verbose('EloTracker', 4, `[${source}] Layer info updated: ${gamemode} / ${name}`);
-    return true;
-  }
-
    async onNewGame(data) {
      if (!this.ready) return;
 
      Logger.verbose('EloTracker', 1, 'NEW_GAME event received. Starting new session.');
 
-     if (data && data.layer) {
-       await this.resolveLayerInfo(data.layer, 'onNewGame');
-     }
+     // Layer info is owned by S³ gameState — it resolves on NEW_GAME via its own handlers.
+     // EloTracker reads gamemode/layerName from gameState when needed.
 
      const now = Date.now();
      this.session.startRound(now);
@@ -554,39 +511,18 @@ export default class EloTracker extends BasePlugin {
     }, 5000);
   }
 
-  async onLayerInfoUpdated() {
-    try {
-      await this.resolveLayerInfo(this.server.currentLayer, 'onLayerInfoUpdated');
-    } catch (err) {
-      Logger.verbose('EloTracker', 4, `Error in onLayerInfoUpdated: ${err.message}`);
+  _isIgnoredMatch() {
+    if (this._s3?.services?.gameState) {
+      const gs = this._s3.services.gameState;
+      const matched = gs.isIgnoredMode(this.options.ignoredGameModes);
+      if (matched) return matched; // true → the mode was matched
+      if (gs.getGamemode() === 'Unknown' && gs.getLayerName() === 'Unknown') return 'Unknown';
+      return null;
     }
-  }
 
-  async onServerInfoUpdated(info) {
-    try {
-      if (info && info.currentLayer) {
-        const incomingName = typeof info.currentLayer === 'string'
-          ? info.currentLayer
-          : info.currentLayer?.name;
-
-        if (this.lastKnownGoodLayer?.name === incomingName) return;
-
-        await this.resolveLayerInfo(info.currentLayer, 'onServerInfoUpdated');
-      }
-    } catch (err) {
-      Logger.verbose('EloTracker', 4, `Error in onServerInfoUpdated: ${err.message}`);
-    }
-  }
-
-  isIgnoredMatch() {
+    // Fallback — S³ not available
     let gameMode = this.server.currentLayer?.gamemode ?? '';
     let layerName = this.server.currentLayer?.name ?? '';
-    
-    if (!gameMode && !layerName) {
-      if (!this.lastKnownGoodLayer) return 'Unknown'; // distinct from null/"not ignored"
-      gameMode = this.lastKnownGoodLayer.gamemode;
-      layerName = this.lastKnownGoodLayer.name;
-    }
 
     const gameModeLower = gameMode.toLowerCase();
     const layerNameLower = layerName.toLowerCase();
@@ -598,17 +534,27 @@ export default class EloTracker extends BasePlugin {
       }
     }
 
+    if (!gameMode && !layerName) return 'Unknown';
     return null;
   }
 
-  async onRoundEnded(data) {
-    const gameMode = this.server.currentLayer?.gamemode
-      ?? this.lastKnownGoodLayer?.gamemode
-      ?? null;
+  _getLayerName() {
+    if (this._s3?.services?.gameState) {
+      return this._s3.services.gameState.getLayerName();
+    }
+    return this.server.currentLayer?.name ?? 'Unknown';
+  }
 
-    const layerName = this.server.currentLayer?.name
-      ?? this.lastKnownGoodLayer?.name
-      ?? 'Unknown';
+  _getGamemode() {
+    if (this._s3?.services?.gameState) {
+      return this._s3.services.gameState.getGamemode();
+    }
+    return this.server.currentLayer?.gamemode ?? null;
+  }
+
+  async onRoundEnded(data) {
+    const gameMode = this._getGamemode();
+    const layerName = this._getLayerName();
 
     if (!this.ready) {
       Logger.verbose('EloTracker', 1, '[onRoundEnded] Fired but plugin not ready. Skipping.');
@@ -635,7 +581,7 @@ export default class EloTracker extends BasePlugin {
       return;
     }
 
-    const ignoredReason = this.isIgnoredMatch();
+    const ignoredReason = this._isIgnoredMatch();
     if (ignoredReason) {
       const label = ignoredReason === 'Unknown' ? 'Game mode unknown — skipping (safe default)' : `Ignored match type: ${ignoredReason}`;
       Logger.verbose('EloTracker', 1, `[onRoundEnded] ${label}`);
@@ -976,7 +922,7 @@ export default class EloTracker extends BasePlugin {
     };
 
     return {
-      layerName: this.server.currentLayer?.name ?? this.lastKnownGoodLayer?.name ?? 'Unknown',
+      layerName: this._getLayerName(),
       roundStartTime: this.session.roundStartTime,
       t1, t2,
       muDelta,
