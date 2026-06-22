@@ -126,6 +126,10 @@ export default class GameStateService {
     return this.phase === 'STAGING' && this.resolving;
   }
 
+  isReady() {
+    return this._isMounted;
+  }
+
   getGamemode() {
     return this.gameModeCached || this.lastKnownGoodLayer?.gamemode || 'Unknown';
   }
