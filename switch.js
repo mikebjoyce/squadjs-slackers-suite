@@ -176,6 +176,7 @@ export default class Switch extends DiscordBasePlugin {
         this._queuePollInterval = null;     // Fast-poll interval for queue processing
         this._lastQueuePollTime = 0;        // Track last poll time for debounce
         this._queueProcessing = false;      // Re-entrancy guard for _processQueue
+        this._s3 = null;                    // Reference to SlackersSquadServices (runtime discovery)
         
         // Layer tracking for liberal mode detection
         this.currentLayerName = null;
@@ -263,7 +264,26 @@ export default class Switch extends DiscordBasePlugin {
         }
     }
 
+    _resolveS3() {
+        if (!this.server.plugins) {
+            this.verbose(1, '[S3] server.plugins not available — S³ discovery deferred.');
+            return;
+        }
+        const s3 = this.server.plugins.find(p => p.constructor.name === 'SlackersSquadServices');
+        if (s3) {
+            // Runtime discovery matches the TB→EloTracker pattern
+            // (ReferenceScripts/squadjs-team-balancer/plugins/team-balancer.js uses
+            //  this.server.plugins.find(p => p.constructor.name === 'EloTracker'))
+            this._s3 = s3;
+            this.verbose(1, '[S3] Discovered SlackersSquadServices for Switch.');
+        } else {
+            this._s3 = null;
+            this.verbose(1, '[S3] SlackersSquadServices not found — using fallback implementations.');
+        }
+    }
+
     async mount() {
+        this._resolveS3();
         await this.models.PlayerCooldowns.sync({ alter: true });
 
         // Initialize liberal mode substring list (lowercased for comparison)
@@ -1559,6 +1579,11 @@ export default class Switch extends DiscordBasePlugin {
     }
 
     getFactionId(team) {
+        // Delegate to S³ factions service when available; fallback to legacy scan
+        if (this._s3?.services?.factions) {
+            return this._s3.services.factions.getFactionId(team);
+        }
+
         const firstPlayer = this.server.players.find(p => p.role.toLowerCase().startsWith(team.toLowerCase()));
         if (firstPlayer) return firstPlayer.teamID;
 
@@ -1663,6 +1688,7 @@ export default class Switch extends DiscordBasePlugin {
             clearTimeout(timeout);
         }
         this._saEvalLocks.clear();
+        this._s3 = null;
         this.verbose(1, 'Switch plugin was un-mounted.');
     }
 
