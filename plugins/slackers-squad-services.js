@@ -5,6 +5,7 @@ import ClansService from '../utils/clans-service.js';
 import DBService from '../utils/db-service.js';
 import PlayersService from '../utils/players-service.js';
 import ServerConfigService from '../utils/server-config-service.js';
+import { registerS3DiscordCommands } from '../utils/s3-discord.js';
 
 /**
  * SlackersSquadServices — Composes and mounts shared player lifecycle, game state, faction, clan, and persistence services for consumption by TeamBalancer, SmartAssign, Switch, and EloTracker plugins.
@@ -40,14 +41,14 @@ export default class SlackersSquadServices extends BasePlugin {
         default: 'sqlite'
       },
       discordClient: {
-        required: true,
+        required: false,
         connector: 'discord',
-        description: 'Discord connector name for admin channel integration.',
+        description: 'Discord connector name for S³ admin commands (!s3). Set to null to disable Discord integration.',
         default: 'discord'
       },
       channelID: {
-        required: true,
-        description: 'Discord admin channel ID used by SlackersSquadServices.',
+        required: false,
+        description: 'Discord admin channel ID for !s3 commands. Only required if discordClient is configured.',
         default: '',
         example: '667741905228136459'
       },
@@ -117,6 +118,8 @@ export default class SlackersSquadServices extends BasePlugin {
       players: null,
       serverConfig: null
     };
+
+    this._s3DiscordCleanup = null;
 
     this.listeners = {
       handleNewGame: this.handleNewGame.bind(this),
@@ -205,10 +208,19 @@ export default class SlackersSquadServices extends BasePlugin {
 
     this._bindServerEvents();
 
+    // Register Discord !s3 commands (gracefully degrades if no discordClient configured)
+    this._s3DiscordCleanup = registerS3DiscordCommands(this);
+
     this.verbose(1, 'Mounted SlackerSquadServices with gameState, factions, clans, db, players, and serverConfig services.');
   }
 
   async unmount() {
+    // Deregister Discord commands before shutting down services
+    if (this._s3DiscordCleanup) {
+      this._s3DiscordCleanup();
+      this._s3DiscordCleanup = null;
+    }
+
     this._unbindServerEvents();
 
     if (this.services.players) {
