@@ -263,6 +263,22 @@ export default class Switch extends DiscordBasePlugin {
         }
     }
 
+    async _syncPlayerCooldowns() {
+        try {
+            await this.models.PlayerCooldowns.sync({ alter: true });
+        } catch (err) {
+            if (err?.name === 'SequelizeDatabaseError' &&
+                err?.parent?.code === 'SQLITE_ERROR' &&
+                err?.parent?.sql && err.parent.sql.includes('PRIMARY KEY')) {
+                this.verbose(1, '[Switch] Table schema mismatch detected, recreating PlayerCooldowns table...');
+                await this.models.PlayerCooldowns.drop();
+                await this.models.PlayerCooldowns.sync({ alter: true });
+            } else {
+                throw err;
+            }
+        }
+    }
+
     _resolveS3() {
         if (!this.server.plugins) {
             this.verbose(1, '[S3] server.plugins not available — S³ discovery deferred.');
@@ -283,7 +299,7 @@ export default class Switch extends DiscordBasePlugin {
 
     async mount() {
         this._resolveS3();
-        await this.models.PlayerCooldowns.sync({ alter: true });
+        await this._syncPlayerCooldowns();
 
         // Initialize liberal mode substring list (lowercased for comparison)
         this._liberalModes = (this.options.liberalSwitchGameModes || ['Seed', 'Jensen']).map(m => String(m).toLowerCase());
@@ -316,7 +332,7 @@ export default class Switch extends DiscordBasePlugin {
         }
         await super.prepareToMount();
         await this.models.Endmatch.sync();
-        await this.models.PlayerCooldowns.sync({ alter: true });
+        await this._syncPlayerCooldowns();
     }
 
     createModel(name, schema) {
