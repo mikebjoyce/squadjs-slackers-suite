@@ -260,6 +260,19 @@ export default class GameStateService {
 
     if (!(this.phase === 'STAGING' && this.resolving)) return;
 
+    // Two-tier team resolution check:
+    //
+    // 1. Prefer PlayersService (lines 263-272): If playersService is mounted, its `areTeamsResolved()`
+    //    checks the service's own curated `this.registry` — a managed subset of tracked players.
+    //    When the method returns `false` (not resolved), the early `return` on line 266 prevents
+    //    fallthrough to the raw-server fallback below. This is intentional: the two checks target
+    //    different data pools (registry vs server.players) and could disagree; gating on the
+    //    service's opinion avoids false positives from stale server-side player entries.
+    //
+    // 2. Fallback (lines 274-282): Only reached when `playersService` is absent (null/undefined).
+    //    Checks raw `this.server.players` directly — the unmanaged, full server player list.
+    //    This is a degraded-mode safety net that still works when no PlayersService has mounted.
+
     const playersService = this.parent?.services?.players || null;
     if (playersService?.areTeamsResolved) {
       const allResolved = playersService.areTeamsResolved();
@@ -271,6 +284,7 @@ export default class GameStateService {
       return;
     }
 
+    // Fallback: PlayersService absent — check raw server data.
     const players = this.server.players || [];
     if (!players.length) return;
 
