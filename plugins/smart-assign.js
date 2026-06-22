@@ -503,9 +503,12 @@ export default class SmartAssign extends BasePlugin {
     this.phase = 'resolving';
     Logger.verbose('SmartAssign', 2, '[Phase] NEW_GAME: switched to resolving phase. Waiting for 100% team resolution before snapshot and active phase.');
     
-    // Reset layer name cache so snapshot captures the new round's layer
-    this.currentLayerName = null;
-    this.currentGamemode = null;
+    // Reset layer name cache so snapshot captures the new round's layer.
+    // If S³ gameState owns layer resolution, keep self-tracked state as fallback only.
+    if (!this._s3?.services?.gameState) {
+      this.currentLayerName = null;
+      this.currentGamemode = null;
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════════
@@ -550,6 +553,9 @@ export default class SmartAssign extends BasePlugin {
     //   2. Server enters staging phase (Scoreboard/Voting screens)
     //   3. Map fully loads with new gamemode
     //   4. NEW_GAME finally fires, transitioning to staging (true round start)
+    //
+    // With S³ gameState active, SA delegates phase awareness to S³ (single source of truth).
+    // SA's own `this.phase` is retained for standalone fallback only.
     //
     // During this window, players may join/leave while the server finishes loading the
     // new map and layer name changes. Any joins/leaves in this period are part of the
@@ -1151,19 +1157,29 @@ export default class SmartAssign extends BasePlugin {
        this.logEvent('JOIN', player, {}, this.phase !== 'active');
 
        // ═══════════════════════════════════════════════════════════════════════════
-       // PHASE CHECK: Skip assignment if not in active phase
+       // PHASE CHECK: Skip assignment if not in active phase.
        //
-       // During game_end (end-of-round) and resolving (NEW_GAME waiting for 100% team resolution)
-       // phases, skip all assignment decisions and let Squad's native assignment handle joins.
-       // This prevents:
-       //   - End-of-round joins being assigned after round is over
-       //   - Early-round joins during null-teamID window causing population miscounts
+       // When S³ gameState is available, delegate to S³ for phase awareness (single source of truth).
+       // Otherwise fall back to SA's self-inferred `this.phase` (standalone mode).
        //
-       // Assignment resumes only when phase is 'active'.
+       // SA should process joins during STAGING (S³ projection provides team data via getAllPlayers())
+       // and LIVE. The only engine-level block is during ENDGAME faction voting. SA/TB locks are
+       // handled separately via canAct/lock in the executor.
        // ═══════════════════════════════════════════════════════════════════════════
-       if (this.phase !== 'active') {
-         Logger.verbose('SmartAssign', 3, `[Join] Phase is '${this.phase}' — skipping assignment for ${player.name}.`);
-         return;
+       if (this._s3?.services?.gameState) {
+         const gs = this._s3.services.gameState;
+         // Block only during faction voting (engine-level team change lockout).
+         // STAGING and LIVE are fine — S³'s PlayersService.projection provides team data.
+         if (gs.isEndgameFactionVote?.()) {
+           Logger.verbose('SmartAssign', 3, `[Join] S³ gameState: faction vote in progress — skipping assignment for ${player.name}.`);
+           return;
+         }
+       } else {
+         // Standalone fallback: use self-inferred phase
+         if (this.phase !== 'active') {
+           Logger.verbose('SmartAssign', 3, `[Join] Phase is '${this.phase}' — skipping assignment for ${player.name}.`);
+           return;
+         }
        }
 
        // Check if the current layer/gamemode is ignored
