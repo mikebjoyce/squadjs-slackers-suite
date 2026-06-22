@@ -141,7 +141,6 @@ export default class Switch extends DiscordBasePlugin {
         this.getPlayerBySteamID = this.getPlayerBySteamID.bind(this);
         this.getPlayerByUsernameOrSteamID = this.getPlayerByUsernameOrSteamID.bind(this);
         this.doubleSwitchPlayer = this.doubleSwitchPlayer.bind(this);
-        this.getFactionId = this.getFactionId.bind(this);
         this.switchSquad = this.switchSquad.bind(this);
         this.getSecondsFromJoin = this.getSecondsFromJoin.bind(this);
         this.getSecondsFromMatchStart = this.getSecondsFromMatchStart.bind(this);
@@ -1564,13 +1563,9 @@ export default class Switch extends DiscordBasePlugin {
      }
 
     getPlayersFromSquad(number, team) {
-        let team_id = null;
-
-        if (+team >= 0) team_id = +team;
-        else team_id = this.getFactionId(team);
-
-        if (!team_id) {
-            this.verbose(1, "Could not find a faction from:", team);
+        const team_id = +team;
+        if (!(team_id >= 0)) {
+            this.verbose(1, "Invalid team ID for getPlayersFromSquad:", team);
             return;
         }
         return this.server.players.filter((p) => p.teamID == team_id && p.squadID == number)
@@ -1615,18 +1610,6 @@ export default class Switch extends DiscordBasePlugin {
             name: player.name,
             steamID: player.steamID,
         });
-    }
-
-    getFactionId(team) {
-        // Delegate to S³ factions service when available; fallback to legacy scan
-        if (this._s3?.services?.factions) {
-            return this._s3.services.factions.getFactionId(team);
-        }
-
-        const firstPlayer = this.server.players.find(p => p.role.toLowerCase().startsWith(team.toLowerCase()));
-        if (firstPlayer) return firstPlayer.teamID;
-
-        return null;
     }
 
     /**
