@@ -68,6 +68,9 @@ export default class PlayersService {
     this._lastStablePlayers = null;
     // Active projection map when we detect the null-teamID window after NEW_GAME.
     this._projectedPlayers = null;
+    // Snapshot of this.server.squads (raw SquadJS squad objects), refreshed each tick
+    // when teams are fully resolved. Used by getSquads() to serve full squad metadata.
+    this._squadsCache = null;
 
     this.PRIORITY = {
       TeamBalancer: 3,
@@ -132,6 +135,40 @@ export default class PlayersService {
     // Keep call sites blind to projection; always return the most stable data we can provide.
     const active = this._getActiveRegistry();
     return [...active.values()].map((p) => ({ ...p }));
+  }
+
+  getSquads() {
+    // Returns cached SquadJS squad objects enriched with leader-first player lists.
+    // Array of { squadID, teamID, squadName, locked (bool), players: eosID[] }
+    const squads = this._squadsCache || [];
+    const active = this._getActiveRegistry();
+
+    // Build squadID -> { leaders[], members[] } from player registry
+    const bySquad = new Map();
+    for (const [, p] of active) {
+      if (p.squadID == null) continue;
+      if (!bySquad.has(p.squadID)) {
+        bySquad.set(p.squadID, { leaders: [], members: [] });
+      }
+      const entry = bySquad.get(p.squadID);
+      if (p.isLeader) {
+        entry.leaders.push(p.eosID);
+      } else {
+        entry.members.push(p.eosID);
+      }
+    }
+
+    return squads
+      .map((s) => ({
+        squadID: s.squadID,
+        teamID: s.teamID,
+        squadName: s.squadName,
+        locked: s.locked === 'True' || s.locked === true,
+        players: bySquad.has(s.squadID)
+          ? [...bySquad.get(s.squadID).leaders, ...bySquad.get(s.squadID).members]
+          : []
+      }))
+      .filter((s) => s.players.length > 0);
   }
 
   areTeamsResolved() {
@@ -426,6 +463,11 @@ export default class PlayersService {
       allResolved,
       hasNullTeams
     });
+
+    // Snapshot squad data when teams are resolved (metadata stable even during null-window)
+    if (allResolved && this.server.squads) {
+      this._squadsCache = [...this.server.squads];
+    }
   }
 
   _isRealTeam(teamID) {
@@ -572,6 +614,7 @@ export default class PlayersService {
       name: player?.name || 'Unknown',
       teamID: player?.teamID ?? null,
       squadID: player?.squadID ?? null,
+      isLeader: player?.isLeader ?? false,
       joinTime: now,
       lastSeenAt: now,
       joinEmitted
