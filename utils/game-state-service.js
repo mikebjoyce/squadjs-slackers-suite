@@ -32,7 +32,7 @@ export default class GameStateService {
     server,
     verboseLogger = () => {},
     ignoredGameModes = [],
-    stagingDurationMs = 360000,
+    stagingDurationMs = 180000, //default staging phase is 3 minutes (depends on game mode, squad wiki source; veracity unknown)
     maxRecoveredRoundAgeMs = 7200000
   } = {}) {
     this.parent = parent;
@@ -43,7 +43,7 @@ export default class GameStateService {
       ? ignoredGameModes
       : [];
 
-    this.stagingDurationMs = Number.isFinite(stagingDurationMs) ? stagingDurationMs : 360000;
+    this.stagingDurationMs = Number.isFinite(stagingDurationMs) ? stagingDurationMs : 180000;
     this.maxRecoveredRoundAgeMs = Number.isFinite(maxRecoveredRoundAgeMs)
       ? maxRecoveredRoundAgeMs
       : 7200000;
