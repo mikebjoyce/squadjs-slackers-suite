@@ -55,13 +55,13 @@ const EloCommands = {
     // Shared respond helper — wraps rcon.warn with logging
     tracker.respond = async function(player, msg) {
       const name = player?.name || 'Unknown';
-      const steamID = player?.steamID;
-      Logger.verbose('EloTracker', 2, `[Response to ${name} (${steamID || 'Unknown'})]\n${msg}`);
-      if (steamID) {
+      const ident = player?.name || player?.eosID || player?.steamID;
+      Logger.verbose('EloTracker', 2, `[Response to ${name}]\n${msg}`);
+      if (ident) {
         try {
-          await this.server.rcon.warn(steamID, msg);
+          await this.server.rcon.warn(ident, msg);
         } catch (err) {
-          Logger.verbose('EloTracker', 1, `[EloCommands] rcon.warn failed for ${steamID}: ${err.message}`);
+          Logger.verbose('EloTracker', 1, `[EloCommands] rcon.warn failed for ${ident}: ${err.message}`);
         }
       }
       return msg;
