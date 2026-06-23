@@ -1658,7 +1658,13 @@ export default class Switch extends DiscordBasePlugin {
             timestamp: executionTimestamp
         });
         this.verbose(2, `[Switch] EVENT EMITTED: PLAYER_MOVED_BY_PLUGIN registered for attribution (TTL=30s)`);
-        
+
+        // S³ attribution: Record the move so S³'s S3_PLAYER_TEAM_CHANGED fires with the correct source
+        if (this._s3?.services?.players?.recordMove && eosID) {
+          this._s3.services.players.recordMove(eosID, targetTeam, source);
+          this.verbose(2, `[Switch] S³ recordMove registered: source=${source}, targetTeam=${targetTeam}`);
+        }
+
         try {
             // Per RCON_IDENTIFIER_FINDINGS: eosID is NOT a valid RCON identifier.
             // Player name is the only universally reliable RCON identifier.
