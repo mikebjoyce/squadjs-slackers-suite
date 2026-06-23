@@ -27,6 +27,10 @@ const DEFAULT_ATTRIBUTION_TTL_MS = 90000;
 const DEFAULT_LOCK_TTL_MS = 3000;
 const DEFAULT_RECONNECT_MAX_AGE_MS = 12 * 60 * 60 * 1000;
 const DEFAULT_RECONNECT_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+const DEFAULT_REFRESH_MIN_INTERVAL_MS = 3000;   // hard floor — no faster than 3s between RCON calls
+const DEFAULT_REFRESH_MAX_INTERVAL_MS = 60000;   // hard ceiling — natural SquadJS tick rate
+const DEFAULT_REFRESH_DEBOUNCE_WINDOW_MS = 250; // coalesce window for requestRefresh()
+const DEFAULT_REFRESH_NOW_FLOOR_MS = 1000;      // minimum gap for refreshNow() before re-calling RCON
 
 export default class PlayersService {
   constructor({
@@ -35,7 +39,11 @@ export default class PlayersService {
     verboseLogger = () => {},
     attributionTtlMs = DEFAULT_ATTRIBUTION_TTL_MS,
     defaultLockTtlMs = DEFAULT_LOCK_TTL_MS,
-    reconnectPersistence = true
+    reconnectPersistence = true,
+    refreshMinIntervalMs = DEFAULT_REFRESH_MIN_INTERVAL_MS,
+    refreshMaxIntervalMs = DEFAULT_REFRESH_MAX_INTERVAL_MS,
+    refreshDebounceWindowMs = DEFAULT_REFRESH_DEBOUNCE_WINDOW_MS,
+    refreshNowFloorMs = DEFAULT_REFRESH_NOW_FLOOR_MS
   } = {}) {
     this.parent = parent;
     this.server = server;
@@ -44,6 +52,10 @@ export default class PlayersService {
     this.attributionTtlMs = Number.isFinite(attributionTtlMs) ? attributionTtlMs : DEFAULT_ATTRIBUTION_TTL_MS;
     this.defaultLockTtlMs = Number.isFinite(defaultLockTtlMs) ? defaultLockTtlMs : DEFAULT_LOCK_TTL_MS;
     this.reconnectPersistence = reconnectPersistence !== false;
+    this.refreshMinIntervalMs = Number.isFinite(refreshMinIntervalMs) ? Math.max(1000, refreshMinIntervalMs) : DEFAULT_REFRESH_MIN_INTERVAL_MS;
+    this.refreshMaxIntervalMs = Number.isFinite(refreshMaxIntervalMs) ? Math.max(this.refreshMinIntervalMs, refreshMaxIntervalMs) : DEFAULT_REFRESH_MAX_INTERVAL_MS;
+    this.refreshDebounceWindowMs = Number.isFinite(refreshDebounceWindowMs) ? Math.max(50, refreshDebounceWindowMs) : DEFAULT_REFRESH_DEBOUNCE_WINDOW_MS;
+    this.refreshNowFloorMs = Number.isFinite(refreshNowFloorMs) ? Math.max(500, refreshNowFloorMs) : DEFAULT_REFRESH_NOW_FLOOR_MS;
 
     this.registry = new Map(); // key (prefer EOS ID; fallback to steamID) -> player state
     // Optional index for legacy/secondary IDs. steamID may be undefined for EOS-only players.
@@ -78,6 +90,26 @@ export default class PlayersService {
       Switch: 1
     };
 
+    // ---------------------------------------------------------------------------
+    // Coalesced refresh manager
+    //
+    // Provides debounced requestRefresh() (fire-and-forget, coalesces burst calls)
+    // and refreshNow() (awaitable, respects 1s floor). Consumers register their
+    // desired max-staleness interval; the effective interval is the minimum of
+    // all registered intervals, clamped to [refreshMinIntervalMs, refreshMaxIntervalMs].
+    // When a natural UPDATED_PLAYER_INFORMATION tick arrives, any pending debounce
+    // is cancelled (data is already fresh). After each full tick, S3_PLAYERS_UPDATED
+    // is emitted so consumers can run post-refresh logic without their own polling.
+    // ---------------------------------------------------------------------------
+    this._refreshState = {
+      debounceTimer: null,           // setTimeout handle for pending requestRefresh()
+      lastRefreshTime: 0,            // timestamp of last actual updatePlayerList() call
+      registeredIntervals: new Map(), // Map<source (string), maxStalenessMs (number)>
+      effectiveInterval: null,         // computed clamp(min(allRegistered), refreshMin, refreshMax)
+      periodicTimer: null,           // setInterval handle for periodic forced refreshes
+      requestorUrgency: null         // 'high' | 'normal' — highest urgency seen in current window
+    };
+
     this.listeners = {
       handleUpdatedPlayerInfo: this.handleUpdatedPlayerInfo.bind(this),
       handlePlayerConnected: this.handlePlayerConnected.bind(this)
@@ -98,11 +130,20 @@ export default class PlayersService {
 
     this._isMounted = true;
     this._initialSyncComplete = false;
+
+    // Start periodic refresh timer if any consumer registered interest before mount.
+    if (this._refreshState.effectiveInterval) {
+      this._startPeriodicRefresh();
+    }
+
     this.verboseLogger(2, '[Players] Mounted.');
   }
 
   async unmount() {
     if (!this._isMounted) return;
+
+    // Stop periodic refresh timer and cancel any pending debounce.
+    this._stopPeriodicRefresh();
 
     for (const lock of this.playerLocks.values()) {
       if (lock?.timeout) clearTimeout(lock.timeout);
@@ -175,6 +216,87 @@ export default class PlayersService {
     const players = [...this.registry.values()];
     if (!players.length) return false;
     return players.every((player) => player?.teamID === 1 || player?.teamID === 2);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Coalesced refresh manager — public API
+  // ---------------------------------------------------------------------------
+
+  registerRefreshInterest(source, { maxStalenessMs } = {}) {
+    const normalized = this._normalizeSource(source);
+    const interval = Number.isFinite(maxStalenessMs) ? Math.max(1000, maxStalenessMs) : this.refreshMaxIntervalMs;
+    this._refreshState.registeredIntervals.set(normalized, interval);
+    this._recomputeEffectiveInterval();
+  }
+
+  unregisterRefreshInterest(source) {
+    const normalized = this._normalizeSource(source);
+    this._refreshState.registeredIntervals.delete(normalized);
+    this._recomputeEffectiveInterval();
+  }
+
+  requestRefresh(source, { urgency = 'normal' } = {}) {
+    const normalized = this._normalizeSource(source);
+    // Only honor requests from registered consumers.
+    if (!this._refreshState.registeredIntervals.has(normalized)) return;
+
+    // Upgrade urgency if needed.
+    if (urgency === 'high') {
+      this._refreshState.requestorUrgency = 'high';
+    }
+
+    if (this._refreshState.debounceTimer) {
+      // Timer already pending; let it ride (urgency upgrade above ensures it
+      // will be handled on fire if needed).
+      return;
+    }
+
+    const debounceMs = this._refreshState.requestorUrgency === 'high'
+      ? Math.min(this.refreshDebounceWindowMs, 100)
+      : this.refreshDebounceWindowMs;
+
+    this._refreshState.debounceTimer = setTimeout(async () => {
+      this._refreshState.debounceTimer = null;
+      const urgency = this._refreshState.requestorUrgency;
+      this._refreshState.requestorUrgency = null;
+
+      const now = Date.now();
+      const elapsed = now - this._refreshState.lastRefreshTime;
+      if (elapsed < this.refreshMinIntervalMs) {
+        // Too soon since last refresh; reschedule for remaining gap.
+        const remaining = this.refreshMinIntervalMs - elapsed;
+        this.verboseLogger(3, `[Players] Refresh debounce: ${elapsed}ms since last, rescheduling in ${remaining}ms (urgency=${urgency || 'normal'})`);
+        this._refreshState.debounceTimer = setTimeout(() => {
+          this._refreshState.debounceTimer = null;
+          this._refreshState.requestorUrgency = null;
+          this._executeRefresh(source);
+        }, remaining);
+        return;
+      }
+
+      await this._executeRefresh(normalized);
+    }, debounceMs);
+  }
+
+  async refreshNow(source) {
+    const normalized = this._normalizeSource(source);
+    if (!this._refreshState.registeredIntervals.has(normalized)) return;
+
+    const now = Date.now();
+    const elapsed = now - this._refreshState.lastRefreshTime;
+    if (elapsed < this.refreshNowFloorMs) {
+      this.verboseLogger(3, `[Players] refreshNow skipped: ${elapsed}ms since last (floor=${this.refreshNowFloorMs}ms)`);
+      return;
+    }
+
+    // Cancel any pending debounce.
+    if (this._refreshState.debounceTimer) {
+      clearTimeout(this._refreshState.debounceTimer);
+      this._refreshState.debounceTimer = null;
+      this._refreshState.requestorUrgency = null;
+    }
+
+    await this._executeRefresh(normalized);
   }
 
   recordMove(eosIDOrSteamID, targetTeamID, source, options = {}) {
@@ -429,6 +551,17 @@ export default class PlayersService {
     this._cleanupExpiredState();
     await this._pruneReconnects();
 
+    // Cancel any pending scheduled refresh — natural tick just provided fresh data.
+    if (this._refreshState.debounceTimer) {
+      clearTimeout(this._refreshState.debounceTimer);
+      this._refreshState.debounceTimer = null;
+      this._refreshState.requestorUrgency = null;
+      this.verboseLogger(3, '[Players] Cancelled pending refresh — natural UPDATED_PLAYER_INFORMATION tick arrived.');
+    }
+
+    // Reset periodic timer clock: the natural tick counts as a full refresh.
+    this._refreshState.lastRefreshTime = Date.now();
+
     const players = this.server.players || [];
     const now = Date.now();
     const current = new Set();
@@ -438,6 +571,7 @@ export default class PlayersService {
     const allResolved = players.length > 0 && !hasNullTeams;
     let joinCount = 0;
     let leaveCount = 0;
+    let teamChangeCount = 0;
 
     this.verboseLogger(2, `[Players] UPDATED_PLAYER_INFORMATION: ${players.length} server players, ${this.registry.size} tracked, initialSync=${isInitialSync}, hasNullTeams=${hasNullTeams}`);
 
@@ -471,7 +605,10 @@ export default class PlayersService {
         this._isRealTeam(previousTeamID) &&
         this._isRealTeam(nextTeamID)
       ) {
+        teamChangeCount++;
         const attribution = this._consumeMoveAttribution(result.state, nextTeamID) || 'Manual/Game';
+        const playerName = result.state.name || result.key;
+        this.verboseLogger(1, `[Players] TEAM_CHANGE: ${playerName} (${result.key}) ${previousTeamID}→${nextTeamID}, source=${attribution}`);
         this.server.emit('S3_PLAYER_TEAM_CHANGED', {
           player: { ...result.state },
           previousTeamID,
@@ -544,6 +681,17 @@ export default class PlayersService {
     }
 
     this.verboseLogger(2, `[Players] Tick: ${joinCount} joined, ${leaveCount} left, ${this.registry.size} tracked`);
+
+    // Emit batch-complete signal for consumers
+    this.server.emit('S3_PLAYERS_UPDATED', {
+      joinCount,
+      leaveCount,
+      teamChangeCount,
+      playerCount: this.registry.size,
+      isInitialSync,
+      projectionActive: !!this._projectedPlayers,
+      source: 'S3PlayersRegistry'
+    });
   }
 
   _isRealTeam(teamID) {
@@ -552,6 +700,62 @@ export default class PlayersService {
 
   _getActiveRegistry() {
     return this._projectedPlayers || this.registry;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Coalesced refresh manager — private helpers
+  // ---------------------------------------------------------------------------
+
+  async _executeRefresh(source) {
+    this._refreshState.debounceTimer = null;
+    this._refreshState.requestorUrgency = null;
+
+    try {
+      await this.server.updatePlayerList();
+      this._refreshState.lastRefreshTime = Date.now();
+      this.verboseLogger(2, `[Players] Refresh executed (source=${source})`);
+    } catch (err) {
+      this.verboseLogger(1, `[Players] Refresh failed (source=${source}): ${err.message}`);
+      // Don't throw — handleUpdatedPlayerInfo won't have been called, but
+      // we still track lastRefreshTime to avoid spamming retries.
+    }
+  }
+
+  _recomputeEffectiveInterval() {
+    const intervals = [...this._refreshState.registeredIntervals.values()];
+    if (intervals.length === 0) {
+      this._refreshState.effectiveInterval = null;
+      this._stopPeriodicRefresh();
+      return;
+    }
+
+    const minInterval = Math.min(...intervals);
+    this._refreshState.effectiveInterval = Math.max(
+      this.refreshMinIntervalMs,
+      Math.min(minInterval, this.refreshMaxIntervalMs)
+    );
+
+    this._startPeriodicRefresh();
+    this.verboseLogger(3, `[Players] Effective refresh interval: ${this._refreshState.effectiveInterval}ms (from ${intervals.length} registrant(s): [${intervals.join(', ')}])`);
+  }
+
+  _startPeriodicRefresh() {
+    this._stopPeriodicRefresh();
+    if (!this._refreshState.effectiveInterval) return;
+    this._refreshState.periodicTimer = setInterval(async () => {
+      await this._executeRefresh('S3Periodic');
+    }, this._refreshState.effectiveInterval);
+  }
+
+  _stopPeriodicRefresh() {
+    if (this._refreshState.periodicTimer) {
+      clearInterval(this._refreshState.periodicTimer);
+      this._refreshState.periodicTimer = null;
+    }
+    if (this._refreshState.debounceTimer) {
+      clearTimeout(this._refreshState.debounceTimer);
+      this._refreshState.debounceTimer = null;
+    }
   }
 
   // ---------------------------------------------------------------------------
