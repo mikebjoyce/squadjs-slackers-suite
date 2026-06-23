@@ -1838,18 +1838,36 @@ export default class Switch extends DiscordBasePlugin {
             this.verbose(2, `  [${i}] steamID=${p.steamID}, name=${p.name}`);
         });
 
+        // Filter: only lock players who are OUTSIDE the switch time window.
+        // Players who recently joined or are in a short round should not be locked,
+        // because they had no time to exploit the pre-scramble imbalance.
+        const switchWindowMs = this.options.switchEnabledMinutes * 60 * 1000;
+        const lockoutPlayers = [];
+        for (const p of affectedPlayers) {
+            if (!p.eosID) {
+                this.verbose(1, `[SCRAMBLE_EVENT] Skipping ${p.name} — missing eosID`);
+                continue;
+            }
+            const joinSeconds = await this.getSecondsFromJoin(p.eosID);
+            const matchSeconds = this.getSecondsFromMatchStart();
+            const withinWindow = (joinSeconds * 1000) < switchWindowMs || (matchSeconds * 1000) < switchWindowMs;
+            if (withinWindow) {
+                this.verbose(2, `[SCRAMBLE_EVENT] Skipping lockdown for ${p.name} — within switch window (join: ${joinSeconds.toFixed(1)}s, match: ${matchSeconds.toFixed(1)}s)`);
+                continue;
+            }
+            lockoutPlayers.push(p);
+        }
+
         const lockdownDuration = this.options.scrambleLockdownDurationMinutes * 60 * 1000;
         const expiry = new Date(Date.now() + lockdownDuration);
         this.verbose(2, `[SCRAMBLE_EVENT] Lockdown duration: ${this.options.scrambleLockdownDurationMinutes}min | Expiry: ${expiry.toISOString()}`);
 
-         const records = affectedPlayers
-             .filter(p => {
-                 if (!p.eosID) {
-                     this.verbose(1, `[SCRAMBLE_EVENT] Skipping player ${p.name} — missing eosID`);
-                     return false;
-                 }
-                 return true;
-             })
+        if (lockoutPlayers.length === 0) {
+            this.verbose(1, `[SCRAMBLE_EVENT] All ${affectedPlayers.length} affected players are within the switch window — no lockdown records written.`);
+            return;
+        }
+
+         const records = lockoutPlayers
              .map(p => {
                  return { eosID: p.eosID, steamID: p.steamID ?? null, playerName: p.name, scrambleLockdownExpiry: expiry };
              });
@@ -1875,11 +1893,11 @@ export default class Switch extends DiscordBasePlugin {
                 const embed = {
                     title: '🌪️ Scramble Lockdown Initiated',
                     color: 0xff9800,
-                    description: `${affectedPlayers.length} players have been locked from switching for the next ${this.options.scrambleLockdownDurationMinutes} minutes.`,
+                    description: `${records.length} players have been locked from switching for the next ${this.options.scrambleLockdownDurationMinutes} minutes.`,
                     fields: [
                         { name: 'Lockdown Duration', value: `${this.options.scrambleLockdownDurationMinutes} minutes`, inline: true },
                         { name: 'Expires At', value: `<t:${Math.floor(expiry.getTime() / 1000)}:R>`, inline: true },
-                        { name: 'Players Affected', value: String(affectedPlayers.length), inline: true }
+                        { name: 'Players Affected', value: String(records.length), inline: true }
                     ],
                     timestamp: new Date().toISOString()
                 };
