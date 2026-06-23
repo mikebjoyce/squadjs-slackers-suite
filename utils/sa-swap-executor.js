@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SA-SWAP-EXECUTOR v1.0.0                    ║
+ * ║                    SA-SWAP-EXECUTOR v1.0.1                    ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -28,6 +28,19 @@
  *    success. If the player is still on the wrong team, unlock and retry
  *    (rare — means RCON rejected the first command). If the player has
  *    left the server, emit failed and clean up.
+ *
+ * ─── RCON IDENTIFIER MIGRATION (v1.0.1) ──────────────────────────
+ *
+ * Per RCON_IDENTIFIER_FINDINGS.md (June 2026), player name is the only
+ * universally reliable RCON identifier on this Squad server version.
+ * - eosID and steamID are both rejected by AdminForceTeamChange/AdminWarn.
+ * - player.name is always available for connected players.
+ * - The identifier cascade: name || eosID || steamID.
+ *
+ * Changes in v1.0.1:
+ *   - queueMove() now accepts (playerKey, playerName, eosID, targetTeamID)
+ *   - RCON commands use rcon.execute("AdminForceTeamChange \"playerName\"")
+ *   - Player lookups in processRetries() use eosID || steamID (dual-key)
  *
  * Author:
  * Discord: `real_slacker`
@@ -58,42 +71,63 @@ export default class SASwapExecutor {
     this._s3 = options.s3 || null;  // S³ reference for canAct preemption check
   }
 
-  isRecentSmartAssignMove(steamID, newTeamID) {
-    if (this.pendingPlayerMoves.has(steamID)) {
-      const move = this.pendingPlayerMoves.get(steamID);
+  /**
+   * Checks if a recent SmartAssign move matches the specified player/team.
+   * Uses dual-key (eosID || steamID) lookup to handle EOS-only players.
+   * @param {string} playerKey - eosID || steamID
+   * @param {string|number} newTeamID - Target team (1 or 2)
+   * @returns {boolean}
+   */
+  isRecentSmartAssignMove(playerKey, newTeamID) {
+    if (this.pendingPlayerMoves.has(playerKey)) {
+      const move = this.pendingPlayerMoves.get(playerKey);
       if (String(move.targetTeamID) === String(newTeamID)) return true;
     }
-    const recent = this.recentlyCompletedMoves.get(steamID);
+    const recent = this.recentlyCompletedMoves.get(playerKey);
     if (recent && String(recent.targetTeamID) === String(newTeamID) && Date.now() - recent.time < SASwapExecutor.RECENT_MOVE_WINDOW_MS) {
       return true;
     }
     return false;
   }
 
-   queueMove(steamID, targetTeamID) {
-     if (!steamID || !targetTeamID) return;
-     if (this.pendingPlayerMoves.has(steamID)) return;
+  /**
+   * Queue a player move for execution.
+   * Uses player.name as the RCON identifier (per RCON_IDENTIFIER_FINDINGS.md).
+   * 
+   * @param {string} playerKey - eosID || steamID (deduplication key)
+   * @param {string} playerName - Player display name (RCON identifier — guaranteed working)
+   * @param {string} eosID - Player's EOS ID (for S³ canAct lookups)
+   * @param {string|number} targetTeamID - Target team (1 or 2)
+   */
+  queueMove(playerKey, playerName, eosID, targetTeamID) {
+    if (!playerKey || !playerName || !targetTeamID) {
+      Logger.verbose('SmartAssign', 4, `[SwapExecutor] queueMove skipped: missing playerKey=${!!playerKey}, playerName=${!!playerName}, targetTeamID=${!!targetTeamID}`);
+      return;
+    }
+    if (this.pendingPlayerMoves.has(playerKey)) return;
 
-      this.pendingPlayerMoves.set(steamID, {
-        targetTeamID,
-        attempts: 0,
-        commandSent: false,       // Tracks whether an RCON command has been sent (gates PRE-CHECK: prevents re-firing after command sent).
-        awaitingVerification: false, // State lock: true while we wait for the post-command updatePlayerList() to resolve.
-        startTime: Date.now()
-      });
+    this.pendingPlayerMoves.set(playerKey, {
+      playerName,
+      eosID,
+      targetTeamID,
+      attempts: 0,
+      commandSent: false,
+      awaitingVerification: false,
+      startTime: Date.now()
+    });
 
-     Logger.verbose('SmartAssign', 4, `[SwapExecutor] Queued move for ${steamID} -> ${targetTeamID}`);
+    Logger.verbose('SmartAssign', 4, `[SwapExecutor] Queued move for ${playerName} (${playerKey}) -> ${targetTeamID}`);
 
-     if (!this.retryTimer) {
-       this.startMonitoring();
-     }
-     
-     // Fire the first RCON command immediately instead of waiting for the first timer tick.
-     // This eliminates the 0-150ms initial delay, reducing the join-swap window significantly.
-     this.processRetries().catch((err) => {
-       Logger.verbose('SmartAssign', 2, `[SwapExecutor] First-fire error: ${err?.message}`);
-     });
-   }
+    if (!this.retryTimer) {
+      this.startMonitoring();
+    }
+    
+    // Fire the first RCON command immediately instead of waiting for the first timer tick.
+    // This eliminates the 0-150ms initial delay, reducing the join-swap window significantly.
+    this.processRetries().catch((err) => {
+      Logger.verbose('SmartAssign', 2, `[SwapExecutor] First-fire error: ${err?.message}`);
+    });
+  }
 
   startMonitoring() {
     this.retryTimer = setInterval(() => {
@@ -112,26 +146,26 @@ export default class SASwapExecutor {
       const playersToRemove = [];
       
       const staleThreshold = now - SASwapExecutor.RECENT_MOVE_WINDOW_MS;
-      for (const [sid, entry] of this.recentlyCompletedMoves.entries()) {
-        if (entry.time < staleThreshold) this.recentlyCompletedMoves.delete(sid);
+      for (const [key, entry] of this.recentlyCompletedMoves.entries()) {
+        if (entry.time < staleThreshold) this.recentlyCompletedMoves.delete(key);
       }
 
-      for (const [steamID, moveData] of this.pendingPlayerMoves.entries()) {
+      for (const [playerKey, moveData] of this.pendingPlayerMoves.entries()) {
         try {
           if (now - moveData.startTime > this.options.maxCompletionTimeMs) {
-            Logger.verbose('SmartAssign', 1, `[SwapExecutor] Timeout for ${steamID}`);
-            this.server.emit('SMART_ASSIGN_MOVE_FAILED', { steamID, reason: 'Timeout' });
-            playersToRemove.push(steamID);
+            Logger.verbose('SmartAssign', 1, `[SwapExecutor] Timeout for ${playerKey}`);
+            this.server.emit('SMART_ASSIGN_MOVE_FAILED', { playerKey, playerName: moveData.playerName, reason: 'Timeout' });
+            playersToRemove.push(playerKey);
             continue;
           }
 
           // PRE-CHECK: If the player is already on the correct team (e.g., game assigned them
           // correctly before we could act), skip the RCON command entirely.
-          const player = this.server.players.find((p) => p.steamID === steamID);
+          const player = this.server.players.find((p) => (p.eosID || p.steamID) === playerKey);
           if (player && String(player.teamID) === String(moveData.targetTeamID) && !moveData.commandSent) {
-            Logger.verbose('SmartAssign', 4, `[SwapExecutor] ${steamID} already on target team. No RCON needed.`);
-            this.recentlyCompletedMoves.set(steamID, { targetTeamID: moveData.targetTeamID, time: now });
-            playersToRemove.push(steamID);
+            Logger.verbose('SmartAssign', 4, `[SwapExecutor] ${moveData.playerName} already on target team. No RCON needed.`);
+            this.recentlyCompletedMoves.set(playerKey, { targetTeamID: moveData.targetTeamID, time: now });
+            playersToRemove.push(playerKey);
             continue;
           }
 
@@ -144,17 +178,17 @@ export default class SASwapExecutor {
           if (moveData.awaitingVerification) {
              await this.server.updatePlayerList();
              
-             const playerAfterUpdate = this.server.players.find((p) => p.steamID === steamID);
+             const playerAfterUpdate = this.server.players.find((p) => (p.eosID || p.steamID) === playerKey);
              if (playerAfterUpdate && String(playerAfterUpdate.teamID) === String(moveData.targetTeamID)) {
-                Logger.verbose('SmartAssign', 4, `[SwapExecutor] Success verified for ${steamID}`);
+                Logger.verbose('SmartAssign', 4, `[SwapExecutor] Success verified for ${moveData.playerName}`);
                 this.server.emit('SMART_ASSIGN_MOVE_SUCCESS', { 
-                   steamID, 
+                   playerKey,
                    eosID: playerAfterUpdate.eosID, 
                    teamID: moveData.targetTeamID, 
                    name: playerAfterUpdate.name 
                 });
-                playersToRemove.push(steamID);
-                this.recentlyCompletedMoves.set(steamID, { targetTeamID: moveData.targetTeamID, time: now });
+                playersToRemove.push(playerKey);
+                this.recentlyCompletedMoves.set(playerKey, { targetTeamID: moveData.targetTeamID, time: now });
                 continue;
              } else if (playerAfterUpdate) {
                 // Still on wrong team! Unlock for retry.
@@ -162,45 +196,50 @@ export default class SASwapExecutor {
                 const eosID = playerAfterUpdate.eosID;
                 if (eosID && this._s3?.services?.players?.canAct) {
                   if (!this._s3.services.players.canAct(eosID, 'SmartAssign')) {
-                    Logger.verbose('SmartAssign', 1, `[SwapExecutor] ${steamID} preempted by higher-priority lock — aborting retry.`);
-                    this.server.emit('SMART_ASSIGN_MOVE_FAILED', { steamID, reason: 'PreemptedByLock' });
-                    playersToRemove.push(steamID);
+                    Logger.verbose('SmartAssign', 1, `[SwapExecutor] ${moveData.playerName} preempted by higher-priority lock — aborting retry.`);
+                    this.server.emit('SMART_ASSIGN_MOVE_FAILED', { playerKey, playerName: moveData.playerName, reason: 'PreemptedByLock' });
+                    playersToRemove.push(playerKey);
                     continue;
                   }
                 }
                 moveData.awaitingVerification = false; 
              } else {
-                this.server.emit('SMART_ASSIGN_MOVE_FAILED', { steamID, reason: 'Disconnected' });
-                playersToRemove.push(steamID);
+                this.server.emit('SMART_ASSIGN_MOVE_FAILED', { playerKey, playerName: moveData.playerName, reason: 'Disconnected' });
+                playersToRemove.push(playerKey);
                 continue;
              }
           }
 
           moveData.attempts++;
           moveData.lastCommandTime = now;
-          
-          if (typeof this.server.rcon?.switchTeam === 'function') {
-            const response = await this.server.rcon.switchTeam(steamID, moveData.targetTeamID);
+
+          // RCON IDENTIFIER MIGRATION (v1.0.1):
+          // Use player.name for AdminForceTeamChange (confirmed working per RCON_IDENTIFIER_FINDINGS.md).
+          // Wrap in quotes for compatibility with names containing spaces.
+          if (moveData.playerName) {
+            const command = `AdminForceTeamChange "${moveData.playerName}"`;
+            const response = await this.server.rcon.execute(command);
             moveData.commandSent = true;
             moveData.awaitingVerification = true;
             
-             // NOTE: This event fires on every command attempt including the first.
-             // Event name: SMART_ASSIGN_MOVE_RETRY (legacy label, now aliased as COMMAND_SENT for clarity).
-             // For public API consumers: treat this as a "command sent" event, not a retry indicator.
-             // The event name will be deprecated in a future version in favor of SMART_ASSIGN_COMMAND_SENT.
-             this.server.emit('SMART_ASSIGN_MOVE_RETRY', { 
-               steamID, 
-               attempt: moveData.attempts, 
-               method: 'Await-Verification',
-               response: response 
-             });
+            Logger.verbose('SmartAssign', 3, `[SwapExecutor] RCON sent: ${command} -> ${JSON.stringify(response)}`);
+            
+            this.server.emit('SMART_ASSIGN_MOVE_RETRY', { 
+              playerKey,
+              playerName: moveData.playerName,
+              attempt: moveData.attempts,
+              method: 'Name-based (v1.0.1)',
+              response
+            });
+          } else {
+            Logger.verbose('SmartAssign', 2, `[SwapExecutor] No player name available for ${playerKey} — cannot send RCON.`);
           }
         } catch (err) {
-          Logger.verbose('SmartAssign', 1, `[SwapExecutor] Error processing ${steamID}: ${err?.message}`);
+          Logger.verbose('SmartAssign', 1, `[SwapExecutor] Error processing ${playerKey}: ${err?.message}`);
         }
       }
 
-      for (const sid of playersToRemove) this.pendingPlayerMoves.delete(sid);
+      for (const key of playersToRemove) this.pendingPlayerMoves.delete(key);
       if (this.pendingPlayerMoves.size === 0 && this.retryTimer) {
         clearInterval(this.retryTimer);
         this.retryTimer = null;

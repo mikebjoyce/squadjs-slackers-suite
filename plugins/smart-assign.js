@@ -938,20 +938,21 @@ export default class SmartAssign extends BasePlugin {
       let hasRealTeams = false;
       
       for (const p of this.server.players) {
-        if (p.steamID) {
-          this.knownPlayers.set(p.steamID, {
-            steamID: p.steamID,
-            name: p.name,
-            teamID: p.teamID,
-            squadID: p.squadID
-          });
-          if (!this._sessionJoinTimes.has(p.steamID)) {
-            this._sessionJoinTimes.set(p.steamID, Date.now());
-          }
-          // Check if this player has a real team (1 or 2, not null)
-          if (p.teamID === 1 || p.teamID === 2) {
-            hasRealTeams = true;
-          }
+        const playerKey = p.eosID || p.steamID;
+        if (!playerKey) continue;
+        
+        this.knownPlayers.set(playerKey, {
+          steamID: p.steamID,
+          name: p.name,
+          teamID: p.teamID,
+          squadID: p.squadID
+        });
+        if (!this._sessionJoinTimes.has(playerKey)) {
+          this._sessionJoinTimes.set(playerKey, Date.now());
+        }
+        // Check if this player has a real team (1 or 2, not null)
+        if (p.teamID === 1 || p.teamID === 2) {
+          hasRealTeams = true;
         }
       }
       
@@ -983,18 +984,37 @@ export default class SmartAssign extends BasePlugin {
      * teamID=1 or teamID=2, and only explicit team changes between these two states need to be tracked.
      */
 
-    // Create a quick lookup set for current steamIDs to detect leaves efficiently
-    const currentSteamIDs = new Set(this.server.players.map(p => p.steamID).filter(Boolean));
+    //
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+    // DUAL-KEY DELTA-DIFF (eosID primary, steamID fallback)
+    //
+    // After the safe-sync handshake (lines 938-957) was migrated to use playerKey = p.eosID || p.steamID,
+    // the delta-diff engine below must also use eosID as the primary key. Otherwise, EOS-only players
+    // (steamID === undefined) are:
+    //   1. Skipped by the `if (!p.steamID) continue` join gate (never registered as joined)
+    //   2. Missing from `currentSteamIDs` (keyed on steamID only)
+    //   3. Their knownPlayers entry (keyed on eosID) is iterated in the leave loop and never
+    //      matches `currentSteamIDs` → false disconnect every tick.
+    //
+    // Since `knownPlayers` already stores entries keyed on playerKey = eosID || steamID (from safe-sync),
+    // the delta-diff must use the *same* key derivation to find them.
+    //
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+    //
+    
+    // Build a key set of current players using the same key derivation as safe-sync (eosID primary, steamID fallback).
+    const currentPlayerKeys = new Set(this.server.players.map(p => p.eosID || p.steamID).filter(Boolean));
     const batchPromises = [];
 
-    // Check for JOINS and TEAM CHANGES directly against the server array
+    // Check for JOINS and TEAM CHANGES — no longer gated on steamID; EOS-only players now participate
     for (const p of this.server.players) {
-      if (!p.steamID) continue;
+      const playerKey = p.eosID || p.steamID;
+      if (!playerKey) continue;
 
-      if (!this.knownPlayers.has(p.steamID) && !this._joiningPlayers.has(p.steamID)) {
+      if (!this.knownPlayers.has(playerKey) && !this._joiningPlayers.has(playerKey)) {
         batchPromises.push(this.handlePlayerJoin(p));
       } else {
-        const kp = this.knownPlayers.get(p.steamID);
+        const kp = this.knownPlayers.get(playerKey);
         if (String(kp.teamID) !== String(p.teamID)) {
           // NULL-GUARD: Skip firing TEAM_CHANGE events if either old or new teamID is null.
           // kp.teamID === null: Safe-sync captured initial null state; team is now resolving (not a real change).
@@ -1016,7 +1036,7 @@ export default class SmartAssign extends BasePlugin {
              // ═══════════════════════════════════════════════════════════════════════════
              
              const isSmartAssignMove = this.executor.isRecentSmartAssignMove(p.steamID, p.teamID);
-             Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${p.steamID}): isRecentSmartAssignMove=${isSmartAssignMove}`);
+             Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${playerKey}): isRecentSmartAssignMove=${isSmartAssignMove}`);
              
              // Smart-Assign moves take precedence to prevent mis-attribution if an auto-assigned reconnect 
              // happens to land exactly during an external move event window.
@@ -1055,7 +1075,7 @@ export default class SmartAssign extends BasePlugin {
                 }
               }
 
-             Logger.verbose('SmartAssign', 2, `[Attribution] ${p.name} (${p.steamID}): DECISION: source=${source}, reason=${attributionReason}`);
+             Logger.verbose('SmartAssign', 2, `[Attribution] ${p.name} (${playerKey}): DECISION: source=${source}, reason=${attributionReason}`);
              
              const oldTeamID = kp.teamID;
              kp.teamID = p.teamID;
@@ -1071,12 +1091,13 @@ export default class SmartAssign extends BasePlugin {
       }
     }
 
-    // Check for LEAVES
-    for (const [steamID, kp] of this.knownPlayers.entries()) {
-      if (!currentSteamIDs.has(steamID)) {
+    // Check for LEAVES — iterate knownPlayers keys (eosID primary, steamID fallback) against currentPlayerKeys
+    for (const [key, kp] of this.knownPlayers.entries()) {
+      if (!currentPlayerKeys.has(key)) {
+        Logger.verbose('SmartAssign', 2, `[LEAVE] Player disconnected: ${kp.name} (${kp.steamID}) via key=${key}`);
         // Delete from map FIRST to prevent re-entrancy loops if UPDATED_PLAYER_INFORMATION
         // fires again while handlePlayerLeave is awaiting the DB write.
-        this.knownPlayers.delete(steamID);
+        this.knownPlayers.delete(key);
         batchPromises.push(this.handlePlayerLeave(kp));
       }
     }
