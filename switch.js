@@ -172,8 +172,6 @@ export default class Switch extends DiscordBasePlugin {
         this._nullTeamIDWindowActive = false;
         this._nullTeamIDWindowTimeout = null;
         this._saEvalLocks = new Map();
-        this._queuePollInterval = null;     // Fast-poll interval for queue processing
-        this._lastQueuePollTime = 0;        // Track last poll time for debounce
         this._queueProcessing = false;      // Re-entrancy guard for _processQueue
         this._s3 = null;                    // Reference to SlackersSquadServices (runtime discovery)
         
@@ -308,6 +306,12 @@ export default class Switch extends DiscordBasePlugin {
     async mount() {
         this._resolveS3();
         await this._syncPlayerCooldowns();
+
+        // Register refresh interest with S³ PlayersService for queue processing
+        if (this._s3?.services?.players?.registerRefreshInterest) {
+            this._s3.services.players.registerRefreshInterest('Switch', { maxStalenessMs: 10000 });
+            this.verbose(1, '[S3] Registered Switch refresh interest (maxStalenessMs=10000).');
+        }
 
         this._liberalModes = (this.options.liberalSwitchGameModes || ['Seed', 'Jensen']).map(m => String(m).toLowerCase());
 
@@ -861,7 +865,6 @@ export default class Switch extends DiscordBasePlugin {
         this._switchQueue.clear();
         this._lastTeamSnapshot = null;
         this.verbose(2, '[Queue] Switch queue cleared on round end.');
-        this._stopQueuePolling();
         await this.cleanup();
         await this.doSwitchMatchend();
         this.recentDisconnections = {};
@@ -987,42 +990,13 @@ export default class Switch extends DiscordBasePlugin {
         return { eligible: true };
     }
 
-    _startQueuePolling() {
-         if (this._queuePollInterval !== null) return;
-
-         this._queuePollInterval = setInterval(async () => {
-             if (Date.now() - this._lastQueuePollTime < 10_000) {
-                 return;
-             }
-
-             if (this._switchQueue.size === 0) {
-                 this._stopQueuePolling();
-                 return;
-             }
-
-             this._lastQueuePollTime = Date.now();
-             try {
-                 await this.server.updatePlayerList();
-             } catch (err) {
-                 this.verbose(1, `[Queue Poll] updatePlayerList failed: ${err.message}`);
-             }
-         }, 10_000);
-
-         if (this._switchQueue.size > 0) {
-             this.verbose(2, `[Queue Poll] Fast-poll interval started.`);
-         }
-     }
-
-    _stopQueuePolling() {
-        if (this._queuePollInterval !== null) {
-            clearInterval(this._queuePollInterval);
-            this._queuePollInterval = null;
-            if (this._switchQueue.size > 0) {
-                this.verbose(2, `[Queue Poll] Fast-poll interval stopped.`);
-            }
+    _requestQueueRefresh() {
+        // Trigger player list refresh via S³ PlayersService when queue is active.
+        // S³ handles coalescing, rate-limiting, and natural-tick cancellation.
+        if (this._s3?.services?.players?.requestRefresh) {
+            this._s3.services.players.requestRefresh('Switch', { urgency: 'normal' });
         }
     }
-
     _enqueuePlayer(player, reason) {
         const { eosID, steamID, name: playerName, teamID } = player;
 
@@ -1077,7 +1051,7 @@ export default class Switch extends DiscordBasePlugin {
         );
         this.verbose(1, `[Queue] ${playerName} (T${teamID}) enqueued at position ${enqueuePos}. Queue size: ${this._switchQueue.size}`);
 
-        this._startQueuePolling();
+        this._requestQueueRefresh();
     }
 
     async _processQueue() {
@@ -1703,6 +1677,11 @@ export default class Switch extends DiscordBasePlugin {
     }
 
     async unmount() {
+        // Unregister S³ refresh interest (if S³ was available)
+        if (this._s3?.services?.players?.unregisterRefreshInterest) {
+            this._s3.services.players.unregisterRefreshInterest('Switch');
+        }
+
         this.server.removeListener('CHAT_MESSAGE', this.onChatMessage);
         this.server.removeListener('PLAYER_CONNECTED', this.onPlayerConnected);
         this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
