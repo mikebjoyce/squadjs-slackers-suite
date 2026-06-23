@@ -46,8 +46,7 @@
  */
 
 import Logger from '../../core/logger.js';
-
-const SIGMA_MULTIPLIER = 3.0;
+import EloCalculator from './elo-calculator.js';
 
 const EloCommands = {
   register(tracker) {
