@@ -198,17 +198,6 @@ export default class SmartAssign extends BasePlugin {
      // RCON IDENTIFIER MIGRATION: _externalMoveMap uses playerKey (eosID || steamID) for dual-key support
      this._externalMoveMap = new Map(); // Map<playerKey, { source, targetTeamID, time }> for per-player attribution
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // OPTIMIZATION: Debounced Forced RCON Poll
-    //
-    // Purpose: Prevent burst joins from triggering multiple overlapping updatePlayerList() calls.
-    //          Instead, coalesce rapid joins into a single poll with a 250ms debounce window.
-    //
-    // Impact: When 5–10 players join within 200ms (common post-round rush), we fire one poll
-    //         instead of 5–10, while still maintaining the full side-effect benefit (disconnect
-    //         detection speedup) and the primary benefit (fresh data for executor verification).
-    // ═══════════════════════════════════════════════════════════════════════════
-     this._pendingPlayerListUpdate = null;
 
       // ═══════════════════════════════════════════════════════════════════════════
       // OPTIMIZATION: In-Memory Reconnect Memory Map
@@ -305,6 +294,12 @@ export default class SmartAssign extends BasePlugin {
       Logger.verbose('SmartAssign', 2, '[S3] Discovered SlackersSquadServices for SmartAssign.');
       const svc = this._s3?.services || {};
       Logger.verbose('SmartAssign', 2, `[S3] Available: gameState=${!!svc.gameState} factions=${!!svc.factions} clans=${!!svc.clans} db=${!!svc.db} players=${!!svc.players}`);
+
+      // Register refresh interest with S³ PlayersService for fast join detection
+      if (svc.players?.registerRefreshInterest) {
+        svc.players.registerRefreshInterest('SmartAssign', { maxStalenessMs: 5000 });
+        Logger.verbose('SmartAssign', 2, '[S3] Registered SmartAssign refresh interest (maxStalenessMs=5000).');
+      }
     } else {
       Logger.verbose('SmartAssign', 2, '[S3] SlackersSquadServices not found — using fallback implementations.');
     }
@@ -399,6 +394,10 @@ export default class SmartAssign extends BasePlugin {
     if (this._pendingPlayerListUpdate) clearTimeout(this._pendingPlayerListUpdate);
     this.eventLogger.cleanup();
     await this.finalizeRoundLog();
+    // Unregister S³ refresh interest (if S³ was available)
+    if (this._s3?.services?.players?.unregisterRefreshInterest) {
+      this._s3.services.players.unregisterRefreshInterest('SmartAssign');
+    }
      this.server.removeListener('NEW_GAME', this.onNewGame);
      this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
      this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
@@ -840,31 +839,21 @@ export default class SmartAssign extends BasePlugin {
     if (!p || !playerKey) return;
 
     /**
-     * DESIGN DECISION: Debounced Forced Join Refresh
-     *
-     * Intentionally NOT awaited. The move is queued immediately below using the
-     * playerKey from the Log Parser event (before RCON even knows the player exists).
-     * This background poll's real job is to provide fresh data for SASwapExecutor's
-     * post-command verification step: after the RCON move command lands, the executor
-     * calls updatePlayerList() again to confirm the player is on the correct team.
-     *
-     * Side-effect: every forced refresh also reveals other players who have left the
-     * server since the last 30s poll cycle, effectively speeding up disconnect detection
-     * for everyone on the server whenever anyone joins.
-     *
-     * OPTIMIZATION: The poll is debounced with a 250ms window to coalesce burst joins
-     * (5-10 players within 200ms) into a single poll instead of many overlapping calls.
-     * This preserves all benefits while reducing RCON load during post-round rushes.
-     *
      * JOIN/LEAVE TIMING: Track this join timestamp so that any LEAVEs discovered in the
      * subsequent RCON poll can be backdated to appear before this JOIN in the event log.
      */
     this._currentJoinTimestamp = Date.now();
-    this._schedulePlayerListUpdate();
+
+    // Request a debounced player list refresh from S³ PlayersService.
+    // S³ handles coalescing rapid joins, rate-limiting, and natural-tick cancellation.
+    // If S³ is not available, skip the refresh (fallback: wait for natural ~30s poll).
+    if (this._s3?.services?.players?.requestRefresh) {
+      this._s3.services.players.requestRefresh('SmartAssign', { urgency: 'high' });
+    }
 
     // Trigger join handling immediately using the log-provided player data.
     // The executor will fire the RCON move before the player is even visible
-    // in the ListPlayers array — the debounced poll above will catch up shortly after.
+    // in the ListPlayers array — S³'s forced refresh will catch up shortly after.
     if (!this.knownPlayers.has(playerKey)) {
       await this.handlePlayerJoin(p);
     }
