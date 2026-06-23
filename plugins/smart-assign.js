@@ -53,6 +53,17 @@
  * - Passive Mode: Set enableSmartAssign: false to observe only real server events (JOIN, LEAVE,
  *   TEAM_CHANGE). The algorithm does not run and no ASSIGNMENT events are logged.
  *
+ * ─── RCON IDENTIFIER MIGRATION ─────────────────────────────────
+ *
+ * Per RCON_IDENTIFIER_FINDINGS.md (June 2026), player.name is the only
+ * universally reliable RCON identifier. All RCON commands now use
+ * player.name via SASwapExecutor's name-based queueMove().
+ * - onPlayerConnected no longer gates on steamID only
+ * - knownPlayers keys use eosID || steamID (dual-key)
+ * - _pendingPlayerMoves keys use eosID || steamID
+ * - _externalMoveMap uses eosID || steamID (dual-key)
+ * - isRecentSmartAssignMove() and event handlers use playerKey
+ *
  * ─── CONFIGURATION ───────────────────────────────────────────────
  *
  * database: Sequelize connector name (default: 'sqlite').
@@ -179,12 +190,13 @@ export default class SmartAssign extends BasePlugin {
      this._pendingAssignments = { 1: 0, 2: 0 };
      this._pendingMu = { 1: 0, 2: 0 };
      this._pendingVeterans = { 1: 0, 2: 0 };
-     this._pendingPlayerMoves = new Map();
+     this._pendingPlayerMoves = new Map(); // Map<playerKey, { targetTeam, mu, isVeteran }>
      this.currentRoundStartTime = null;
      this.ready = false;
      this.initialSyncComplete = false;
      this._isFinalizingRound = false;
-     this._externalMoveMap = new Map(); // Map<steamID, { source, targetTeamID, time }> for per-player attribution
+     // RCON IDENTIFIER MIGRATION: _externalMoveMap uses playerKey (eosID || steamID) for dual-key support
+     this._externalMoveMap = new Map(); // Map<playerKey, { source, targetTeamID, time }> for per-player attribution
 
     // ═══════════════════════════════════════════════════════════════════════════
     // OPTIMIZATION: Debounced Forced RCON Poll
@@ -729,8 +741,7 @@ export default class SmartAssign extends BasePlugin {
       const source = data.source || (data.event || 'Unknown');
       const recordedTime = Date.now();
       
-      // Normalize steamID lookup (prefer steamID as primary key, fall back to eosID)
-      // CRITICAL: Use steamID as primary key because onUpdatedPlayerInfo looks up by p.steamID
+      // RCON IDENTIFIER MIGRATION: Use playerKey (eosID || steamID) for dual-key support
       const playerIdentifier = steamID || eosID;
       if (!playerIdentifier) {
         Logger.verbose('SmartAssign', 1, `[ExternalMove] WARNING: Received PLAYER_MOVED_BY_PLUGIN event with no eosID or steamID. Data: ${JSON.stringify(data)}`);
@@ -767,52 +778,56 @@ export default class SmartAssign extends BasePlugin {
       }
     }
 
+  // RCON IDENTIFIER MIGRATION: Event handlers now extract playerKey from data and use dual-key lookups
   async onMoveFailed(data) {
     if (!this.ready) return;
-    const { steamID, reason } = data;
+    const { playerKey, playerName, reason } = data;
+    const pid = playerKey || data.steamID;
 
-    if (this._pendingPlayerMoves.has(steamID)) {
-      const move = this._pendingPlayerMoves.get(steamID);
+    if (pid && this._pendingPlayerMoves.has(pid)) {
+      const move = this._pendingPlayerMoves.get(pid);
       this._pendingAssignments[move.targetTeam] = Math.max(0, this._pendingAssignments[move.targetTeam] - 1);
       this._pendingMu[move.targetTeam] = Math.max(0, this._pendingMu[move.targetTeam] - move.mu);
       if (move.isVeteran) {
         this._pendingVeterans[move.targetTeam] = Math.max(0, this._pendingVeterans[move.targetTeam] - 1);
       }
-      this._pendingPlayerMoves.delete(steamID);
+      this._pendingPlayerMoves.delete(pid);
     }
 
-    const p = this.server.players.find((x) => x.steamID === steamID) || { steamID, name: 'Unknown' };
-    Logger.verbose('SmartAssign', 1, `[SmartAssign] Abandoned move for ${p.name} (${steamID}) - ${reason}`);
+    const p = this.server.players.find((x) => (x.eosID || x.steamID) === pid) || { steamID: pid, name: playerName || 'Unknown' };
+    Logger.verbose('SmartAssign', 1, `[SmartAssign] Abandoned move for ${p.name} (${pid}) - ${reason}`);
     this.logEvent('MOVE_FAILED', p, { reason }, this.phase !== 'active');
   }
 
   async onMoveSuccess(data) {
     if (!this.ready) return;
-    const { steamID, teamID } = data;
+    const { playerKey, teamID } = data;
+    const pid = playerKey || data.steamID;
 
-    if (this._pendingPlayerMoves.has(steamID)) {
-      const move = this._pendingPlayerMoves.get(steamID);
+    if (pid && this._pendingPlayerMoves.has(pid)) {
+      const move = this._pendingPlayerMoves.get(pid);
       this._pendingAssignments[move.targetTeam] = Math.max(0, this._pendingAssignments[move.targetTeam] - 1);
       this._pendingMu[move.targetTeam] = Math.max(0, this._pendingMu[move.targetTeam] - move.mu);
       if (move.isVeteran) {
         this._pendingVeterans[move.targetTeam] = Math.max(0, this._pendingVeterans[move.targetTeam] - 1);
       }
-      this._pendingPlayerMoves.delete(steamID);
+      this._pendingPlayerMoves.delete(pid);
     }
 
-    const p = this.server.players.find((x) => x.steamID === steamID);
+    const p = this.server.players.find((x) => (x.eosID || x.steamID) === pid || x.name === data.name);
     if (p) {
-      Logger.verbose('SmartAssign', 2, `[SmartAssign] Verified move success for ${p.name} (${steamID}) to Team ${teamID}`);
+      Logger.verbose('SmartAssign', 2, `[SmartAssign] Verified move success for ${p.name} (${pid}) to Team ${teamID}`);
       this.logEvent('MOVE_SUCCESS', p, { teamID }, this.phase !== 'active');
     }
   }
 
   async onMoveRetry(data) {
     if (!this.ready) return;
-    const { steamID, attempt, method } = data;
-    const p = this.server.players.find((x) => x.steamID === steamID);
+    const { playerKey, playerName, attempt, method } = data;
+    const pid = playerKey || data.steamID;
+    const p = this.server.players.find((x) => (x.eosID || x.steamID) === pid || x.name === playerName);
     if (p) {
-      Logger.verbose('SmartAssign', 3, `[SmartAssign] Retrying move for ${p.name} (${steamID}) | Attempt: ${attempt} | Method: ${method}`);
+      Logger.verbose('SmartAssign', 3, `[SmartAssign] Retrying move for ${p.name} (${pid}) | Attempt: ${attempt} | Method: ${method}`);
       this.logEvent('MOVE_RETRY', p, { attempt, method }, this.phase !== 'active');
     }
   }
@@ -820,13 +835,15 @@ export default class SmartAssign extends BasePlugin {
   async onPlayerConnected(info) {
     if (!this.ready) return;
     const p = info.player;
-    if (!p || !p.steamID) return;
+    // RCON IDENTIFIER MIGRATION: Use playerKey (eosID || steamID) instead of gating on steamID only
+    const playerKey = p && (p.eosID || p.steamID);
+    if (!p || !playerKey) return;
 
     /**
      * DESIGN DECISION: Debounced Forced Join Refresh
      *
      * Intentionally NOT awaited. The move is queued immediately below using the
-     * SteamID from the Log Parser event (before RCON even knows the player exists).
+     * playerKey from the Log Parser event (before RCON even knows the player exists).
      * This background poll's real job is to provide fresh data for SASwapExecutor's
      * post-command verification step: after the RCON move command lands, the executor
      * calls updatePlayerList() again to confirm the player is on the correct team.
@@ -848,7 +865,7 @@ export default class SmartAssign extends BasePlugin {
     // Trigger join handling immediately using the log-provided player data.
     // The executor will fire the RCON move before the player is even visible
     // in the ListPlayers array — the debounced poll above will catch up shortly after.
-    if (!this.knownPlayers.has(p.steamID)) {
+    if (!this.knownPlayers.has(playerKey)) {
       await this.handlePlayerJoin(p);
     }
   }
@@ -1035,7 +1052,8 @@ export default class SmartAssign extends BasePlugin {
              //   3. Default to Manual/Game — no attribution source found
              // ═══════════════════════════════════════════════════════════════════════════
              
-             const isSmartAssignMove = this.executor.isRecentSmartAssignMove(p.steamID, p.teamID);
+             // RCON IDENTIFIER MIGRATION: Use playerKey (eosID || steamID) for executor lookup
+             const isSmartAssignMove = this.executor.isRecentSmartAssignMove(playerKey, p.teamID);
              Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${playerKey}): isRecentSmartAssignMove=${isSmartAssignMove}`);
              
              // Smart-Assign moves take precedence to prevent mis-attribution if an auto-assigned reconnect 
@@ -1044,31 +1062,31 @@ export default class SmartAssign extends BasePlugin {
                source = 'Smart-Assign';
                attributionReason = 'isRecentSmartAssignMove() = true';
               } else {
-                // Check for per-player external move attribution (Team-Balancer or Switch plugin)
-                const hasExternalMove = this._externalMoveMap.has(p.steamID);
-                Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${p.steamID}): _externalMoveMap.has=${hasExternalMove}, mapSize=${this._externalMoveMap.size}`);
+                // RCON IDENTIFIER MIGRATION: Use playerKey (eosID || steamID) for _externalMoveMap lookup
+                const hasExternalMove = this._externalMoveMap.has(playerKey);
+                Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${playerKey}): _externalMoveMap.has=${hasExternalMove}, mapSize=${this._externalMoveMap.size}`);
                 
                 if (hasExternalMove) {
-                  const externalMove = this._externalMoveMap.get(p.steamID);
-                  Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${p.steamID}): externalMove event found: source=${externalMove.source}, sourceTeam=${externalMove.sourceTeamID}, targetTeam=${externalMove.targetTeamID}, timestamp=${new Date(externalMove.timestamp).toISOString()}, ttlExpiry=${new Date(externalMove.ttlExpiry).toISOString()}`);
+                  const externalMove = this._externalMoveMap.get(playerKey);
+                  Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${playerKey}): externalMove event found: source=${externalMove.source}, sourceTeam=${externalMove.sourceTeamID}, targetTeam=${externalMove.targetTeamID}, timestamp=${new Date(externalMove.timestamp).toISOString()}, ttlExpiry=${new Date(externalMove.ttlExpiry).toISOString()}`);
                   
                   const isExpired = externalMove.ttlExpiry && Date.now() > externalMove.ttlExpiry;
                   const isTargetMatch = String(externalMove.targetTeamID) === String(p.teamID);
-                  Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${p.steamID}): isExpired=${isExpired}, isTargetMatch=${isTargetMatch}`);
+                  Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${playerKey}): isExpired=${isExpired}, isTargetMatch=${isTargetMatch}`);
                   
                   if (externalMove && isTargetMatch && !isExpired) {
                     source = externalMove.source;
                     attributionReason = `externalMoveMap match: source=${externalMove.source}, targetTeam=${externalMove.targetTeamID}`;
                     // Consume the move to prevent re-attribution on subsequent team changes
-                    this._externalMoveMap.delete(p.steamID);
-                    Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${p.steamID}): CONSUMED external move entry from map (now size=${this._externalMoveMap.size})`);
+                    this._externalMoveMap.delete(playerKey);
+                    Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${playerKey}): CONSUMED external move entry from map (now size=${this._externalMoveMap.size})`);
                   } else if (isExpired) {
                     attributionReason = 'externalMoveMap entry expired (TTL exceeded)';
-                    this._externalMoveMap.delete(p.steamID);
-                    Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${p.steamID}): Removed expired external move entry (was expired at ${new Date(externalMove.ttlExpiry).toISOString()})`);
+                    this._externalMoveMap.delete(playerKey);
+                    Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${playerKey}): Removed expired external move entry (was expired at ${new Date(externalMove.ttlExpiry).toISOString()})`);
                   } else if (!isTargetMatch) {
                     attributionReason = `externalMoveMap target mismatch: expected ${externalMove.targetTeamID}, got ${p.teamID}`;
-                    Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${p.steamID}): Target team mismatch, ignoring external move`);
+                    Logger.verbose('SmartAssign', 3, `[Attribution] ${p.name} (${playerKey}): Target team mismatch, ignoring external move`);
                   }
                 } else {
                   attributionReason = 'No externalMoveMap entry found';
@@ -1127,16 +1145,17 @@ export default class SmartAssign extends BasePlugin {
     this.server.emit('SMART_ASSIGN_EVAL_START', { eosID: player.eosID, steamID: player.steamID });
 
     try {
-      // Register to known players
-      this.knownPlayers.set(player.steamID, {
+      // RCON IDENTIFIER MIGRATION: Use playerKey (eosID || steamID) for knownPlayers key
+      const playerKey = player.eosID || player.steamID;
+      this.knownPlayers.set(playerKey, {
         steamID: player.steamID,
         name: player.name,
         teamID: player.teamID,
         squadID: player.squadID
       });
 
-      if (!this._sessionJoinTimes.has(player.steamID)) {
-        this._sessionJoinTimes.set(player.steamID, Date.now());
+      if (!this._sessionJoinTimes.has(playerKey)) {
+        this._sessionJoinTimes.set(playerKey, Date.now());
       }
 
        // ═══════════════════════════════════════════════════════════════════════════
@@ -1174,7 +1193,7 @@ export default class SmartAssign extends BasePlugin {
          this._playerTagCache.set(player.eosID, tag);
        }
 
-       Logger.verbose('SmartAssign', 3, `[JOIN] Player connected: ${player.name} (${player.steamID})`);
+       Logger.verbose('SmartAssign', 3, `[JOIN] Player connected: ${player.name} (${playerKey})`);
        this.logEvent('JOIN', player, {}, this.phase !== 'active');
 
        // ═══════════════════════════════════════════════════════════════════════════
@@ -1256,7 +1275,7 @@ export default class SmartAssign extends BasePlugin {
         timemarks.preWarmMs = Date.now() - preWarmStart;
         timemarks.preWarmMu = preWarmRating.mu;
 
-        // Read reconnect memory synchronously from Map
+        // Read reconnect memory synchronously from Map — still keyed on steamID (known limitation for EOS-only players)
         const reconnectTeamStart = Date.now();
         const reconnectTeam = this._reconnectMemory.get(player.steamID) || null;
         timemarks.reconnectTeamMs = Date.now() - reconnectTeamStart;
@@ -1306,23 +1325,24 @@ export default class SmartAssign extends BasePlugin {
           this._pendingVeterans[targetTeam]++;
         }
         
-        // NOTE: pendingPlayerMu is captured here and subtracted onMoveSuccess. If the player's 
-        // Elo changes during the brief execution window, _pendingMu may drift slightly.
-        // This is a known, low-impact approximation that resets naturally on NEW_GAME.
-        this._pendingPlayerMoves.set(player.steamID, { targetTeam, mu: pendingPlayerMu, isVeteran });
+        // RCON IDENTIFIER MIGRATION: Use playerKey (eosID || steamID) for _pendingPlayerMoves key
+        this._pendingPlayerMoves.set(playerKey, { targetTeam, mu: pendingPlayerMu, isVeteran });
 
         /**
          * ARCHITECTURE: Log-Driven Join Swap
-         * We queue the move immediately using the SteamID from the Log Parser event,
+         * We queue the move immediately using player.name from the Log Parser event,
          * firing the RCON command blind before the player is visible in ListPlayers.
          * SASwapExecutor sends the command once, then force-polls to verify the result.
          * No retry spam, no bounce loops. See sa-swap-executor.js for the full design.
+         *
+         * RCON IDENTIFIER MIGRATION: queueMove now accepts (playerKey, playerName, eosID, targetTeamID)
+         * — uses player.name (guaranteed available) for the RCON command.
          */
-        this.executor.queueMove(player.steamID, targetTeam);
+        this.executor.queueMove(playerKey, player.name, player.eosID, targetTeam);
 
         // S³ attribution: record the move so S³'s S3_PLAYER_TEAM_CHANGED fires with source='SmartAssign'
-        if (this._s3?.services?.players?.recordMove && (player.eosID || player.steamID)) {
-          this._s3.services.players.recordMove(player.eosID || player.steamID, targetTeam, 'SmartAssign');
+        if (this._s3?.services?.players?.recordMove && playerKey) {
+          this._s3.services.players.recordMove(playerKey, targetTeam, 'SmartAssign');
         }
       }
     } finally {
@@ -1343,14 +1363,15 @@ export default class SmartAssign extends BasePlugin {
     if (!this.ready) return;
     const player = data?.player;
     if (!player) return;
-    Logger.verbose('SmartAssign', 2, `[S3-PARALLEL] JOIN: ${player.name || player.eosID} (eosID=${player.eosID}, steamID=${player.steamID}, team=${player.teamID}), old SA knownPlayers.has=${this.knownPlayers.has(player.steamID)}, phase=${this.phase}`);
+    Logger.verbose('SmartAssign', 2, `[S3-PARALLEL] JOIN: ${player.name || player.eosID} (eosID=${player.eosID}, steamID=${player.steamID}, team=${player.teamID}), old SA knownPlayers.has=${this.knownPlayers.has(player.eosID || player.steamID)}, phase=${this.phase}`);
   }
 
   onS3PlayerTeamChanged(data) {
     if (!this.ready) return;
     const { player, previousTeamID, teamID, source } = data || {};
     if (!player) return;
-    const externalMatch = this._externalMoveMap.get(player.steamID || player.eosID);
+    const playerKey = player.eosID || player.steamID;
+    const externalMatch = this._externalMoveMap.get(playerKey);
     Logger.verbose('SmartAssign', 2, `[S3-PARALLEL] TEAM_CHANGE: ${player.name || player.eosID} ${previousTeamID}→${teamID}, source=${source}, old SA externalMoveMap match=${externalMatch?.source || 'none'}`);
   }
 
@@ -1358,7 +1379,7 @@ export default class SmartAssign extends BasePlugin {
     if (!this.ready) return;
     const player = data?.player;
     if (!player) return;
-    Logger.verbose('SmartAssign', 2, `[S3-PARALLEL] LEAVE: ${player.name || player.eosID} (eosID=${player.eosID}, steamID=${player.steamID}, team=${player.teamID}), old SA knownPlayers.has=${this.knownPlayers.has(player.steamID)}`);
+    Logger.verbose('SmartAssign', 2, `[S3-PARALLEL] LEAVE: ${player.name || player.eosID} (eosID=${player.eosID}, steamID=${player.steamID}, team=${player.teamID}), old SA knownPlayers.has=${this.knownPlayers.has(player.eosID || player.steamID)}`);
   }
 
   async handlePlayerLeave(player) {
@@ -1382,6 +1403,7 @@ export default class SmartAssign extends BasePlugin {
        // function returns, guaranteeing the database reflects the disconnect before the
        // next UPDATED_PLAYER_INFORMATION cycle. This prevents race conditions where a 
        // rejoining player finds stale/missing reconnect records.
+       // NOTE: _reconnectMemory remains keyed on steamID (known limitation — S³ owns this in Stage 3+)
        this._reconnectMemory.set(player.steamID, tid);
        await this.db.savePlayerDisconnect(player.steamID, tid);
      }
