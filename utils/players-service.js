@@ -190,6 +190,8 @@ export default class PlayersService {
       expiresAt
     });
 
+    this.verboseLogger(3, `[Lock] Attribution recorded: key=${id}, target=${Number(targetTeamID)}, source=${source || 'Unknown'}, ttlMs=${ttlMs}`);
+
     return true;
   }
 
@@ -200,6 +202,7 @@ export default class PlayersService {
     const requesterPriority = this._priorityOf(requester);
 
     if (this.globalLock && this.globalLock.source !== requester && this.globalLock.priority >= requesterPriority) {
+      this.verboseLogger(2, `[Lock] canAct(${eosIDOrSteamID}, ${requester}) => false: blocked by global lock (holder=${this.globalLock.source}, priority=${this.globalLock.priority} >= ${requesterPriority})`);
       return false;
     }
 
@@ -209,6 +212,8 @@ export default class PlayersService {
     const held = this.playerLocks.get(key);
     if (!held) return true;
     if (held.source === requester) return true;
+
+    this.verboseLogger(2, `[Lock] canAct(${key}, ${requester}) => false: locked by ${held.source} (priority=${held.priority} >= ${requesterPriority})`);
     return held.priority < requesterPriority;
   }
 
@@ -230,7 +235,9 @@ export default class PlayersService {
       return false;
     }
 
-    this._setPlayerLock(key, normalizedSource, Math.max(1, ttlMs));
+    const ttl = Math.max(1, ttlMs);
+    this._setPlayerLock(key, normalizedSource, ttl);
+    this.verboseLogger(2, `[Lock] Player lock acquired on ${key} by ${normalizedSource} (priority=${requesterPriority}, ttlMs=${ttl})`);
     return true;
   }
 
@@ -245,6 +252,7 @@ export default class PlayersService {
     if (existing.source !== normalizedSource) return false;
 
     this._clearPlayerLock(key);
+    this.verboseLogger(2, `[Lock] Player lock released on ${key} by ${normalizedSource}`);
     return true;
   }
 
@@ -255,10 +263,13 @@ export default class PlayersService {
     const requesterPriority = this._priorityOf(normalizedSource);
 
     if (this.globalLock && this.globalLock.source !== normalizedSource && this.globalLock.priority >= requesterPriority) {
+      this.verboseLogger(2, `[Lock] lockGlobal denied for ${normalizedSource}: already held by ${this.globalLock.source} (priority=${this.globalLock.priority} >= ${requesterPriority})`);
       return false;
     }
 
-    this._setGlobalLock(normalizedSource, Math.max(1, ttlMs));
+    const ttl = Math.max(1, ttlMs);
+    this._setGlobalLock(normalizedSource, ttl);
+    this.verboseLogger(1, `[Lock] Global lock acquired by ${normalizedSource} (priority=${requesterPriority}, ttlMs=${ttl})`);
     return true;
   }
 
@@ -268,6 +279,7 @@ export default class PlayersService {
     const normalizedSource = this._normalizeSource(source);
     if (this.globalLock.source !== normalizedSource) return false;
 
+    this.verboseLogger(1, `[Lock] Global lock released by ${this.globalLock.source}`);
     this._clearGlobalLock();
     return true;
   }
@@ -939,6 +951,7 @@ export default class PlayersService {
     }
 
     this.playerLocks.delete(key);
+    this.verboseLogger(2, `[Lock] Player lock on ${key} expired (source=${existing.source})`);
     this.server.emit('S3_PLAYER_LOCK_CHANGED', {
       key,
       source: existing.source,
@@ -977,6 +990,7 @@ export default class PlayersService {
       clearTimeout(previous.timeout);
     }
 
+    this.verboseLogger(2, `[Lock] Global lock ${this.globalLock.source === previous.source ? 'expired' : 'cleared'} (source=${previous.source})`);
     this.globalLock = null;
     this.server.emit('S3_GLOBAL_LOCK_CHANGED', {
       source: previous.source,
