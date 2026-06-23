@@ -351,6 +351,33 @@ export default class PlayersService {
     this._reconnectMemory.clear();
   }
 
+  async _checkReconnect(playerState) {
+    // Fire-and-forget reconnect detection: check if this player was recently on the server.
+    // If found, emit S3_PLAYER_RECONNECTED for consumers.
+    const eosID = this._normalizeIdentifier(playerState?.eosID);
+    if (!eosID) return;
+
+    try {
+      const reconnect = await this.getReconnect(eosID);
+      if (reconnect) {
+        const secondsAgo = ((Date.now() - (Number(reconnect.lastSeenAt) || 0)) / 1000).toFixed(0);
+        const playerName = playerState?.name || reconnect.playerName || eosID;
+        this.verboseLogger(
+          1,
+          `[Players] RECONNECT: ${playerName} (eosID=${eosID}) lastSeen ${secondsAgo}s ago, prevTeam=${reconnect.lastTeamID}`
+        );
+        this.server.emit('S3_PLAYER_RECONNECTED', {
+          player: { ...playerState, eosID },
+          previousTeamID: reconnect.lastTeamID,
+          disconnectedAt: reconnect.lastSeenAt,
+          reconnectedAt: Date.now()
+        });
+      }
+    } catch (err) {
+      this.verboseLogger(1, `[Players] RECONNECT check error for ${eosID}: ${err.message}`);
+    }
+  }
+
   async handlePlayerConnected(data = {}) {
     this._cleanupExpiredState();
     await this._pruneReconnects();
@@ -366,12 +393,20 @@ export default class PlayersService {
       squadID: player?.squadID ?? null
     };
 
+    const playerName = rawPlayer.name;
+    this.verboseLogger(1, `[Players] PLAYER_CONNECTED: ${playerName} (eosID=${rawPlayer.eosID}, steamID=${rawPlayer.steamID}, teamID=${rawPlayer.teamID})`);
+
     const result = this._registerPlayer(rawPlayer, now, {
       emitJoin: true,
       source: 'PLAYER_CONNECTED'
     });
 
     if (!result) return;
+
+    if (result.isNew && result.state) {
+      // Check for reconnect on first-time registration via PLAYER_CONNECTED
+      await this._checkReconnect(result.state);
+    }
 
     if (!result.isNew) {
       result.state.lastSeenAt = now;
@@ -389,6 +424,10 @@ export default class PlayersService {
     // If any player reports a non-1/2 teamID, we are in the null-teamID window.
     const hasNullTeams = players.some((player) => !this._isRealTeam(player?.teamID));
     const allResolved = players.length > 0 && !hasNullTeams;
+    let joinCount = 0;
+    let leaveCount = 0;
+
+    this.verboseLogger(2, `[Players] UPDATED_PLAYER_INFORMATION: ${players.length} server players, ${this.registry.size} tracked, initialSync=${isInitialSync}, hasNullTeams=${hasNullTeams}`);
 
     for (const rawPlayer of players) {
       const result = this._registerPlayer(rawPlayer, now, {
@@ -399,6 +438,16 @@ export default class PlayersService {
       if (!result) continue;
 
       current.add(result.key);
+
+      if (result.isNew) {
+        joinCount++;
+
+        // Check for reconnect on new player registration via tick diff
+        if (!isInitialSync && result.state) {
+          // Fire-and-forget reconnect check
+          this._checkReconnect(result.state);
+        }
+      }
 
       if (isInitialSync || result.isNew) continue;
 
@@ -452,9 +501,22 @@ export default class PlayersService {
       this.registry.delete(key);
       this._deindexPlayer(tracked, key);
 
+      leaveCount++;
+
+      const playerName = tracked.name || key;
+      this.verboseLogger(1, `[Players] Player LEFT: ${playerName} (eosID=${tracked.eosID}, steamID=${tracked.steamID}, teamID=${tracked.teamID})`);
+
       this.server.emit('S3_PLAYER_LEFT', {
         player: { ...tracked },
         source: 'S3PlayersRegistry'
+      });
+
+      // Fire-and-forget: remember this player for reconnect detection on return
+      this.rememberReconnect(tracked.eosID, {
+        steamID: tracked.steamID,
+        playerName: tracked.name,
+        lastTeamID: tracked.teamID,
+        lastSeenAt: tracked.lastSeenAt || now
       });
     }
 
@@ -468,6 +530,8 @@ export default class PlayersService {
     if (allResolved && this.server.squads) {
       this._squadsCache = [...this.server.squads];
     }
+
+    this.verboseLogger(2, `[Players] Tick: ${joinCount} joined, ${leaveCount} left, ${this.registry.size} tracked`);
   }
 
   _isRealTeam(teamID) {
@@ -721,11 +785,15 @@ export default class PlayersService {
       this.registry.set(key, joined);
       this._indexPlayer(joined, key);
 
+      const playerName = joined.name || key;
+      this.verboseLogger(1, `[Players] NEW player: ${playerName} (eosID=${joined.eosID}, steamID=${joined.steamID}, teamID=${joined.teamID}, source=${source})`);
+
       if (emitJoin) {
         this.server.emit('S3_PLAYER_JOINED', {
           player: { ...joined },
           source
         });
+        this.verboseLogger(1, `[Players] JOIN emitted: ${playerName} (eosID=${joined.eosID}, teamID=${joined.teamID}, source=${source})`);
       }
 
       return {
@@ -753,6 +821,8 @@ export default class PlayersService {
         source
       });
       state.joinEmitted = true;
+      const playerName = state.name || key;
+      this.verboseLogger(1, `[Players] JOIN emitted (returning): ${playerName} (eosID=${state.eosID}, teamID=${state.teamID}, source=${source})`);
     }
 
     return {

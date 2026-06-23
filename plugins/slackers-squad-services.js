@@ -305,6 +305,9 @@ export default class SlackersSquadServices extends BasePlugin {
   }
 
   async handleUpdatedPlayerInfo(data) {
+    const playerCount = this.server?.players?.length ?? 0;
+    this.verbose(3, `[S3] UPDATED_PLAYER_INFORMATION tick: ${playerCount} players`);
+
     if (this.services.gameState?.handleUpdatedPlayerInfo) {
       await this.services.gameState.handleUpdatedPlayerInfo(data);
     }
@@ -319,6 +322,11 @@ export default class SlackersSquadServices extends BasePlugin {
   }
 
   async handlePlayerConnected(data) {
+    const player = data?.player || {};
+    const playerName = player?.name || data?.name || 'Unknown';
+    const eosID = player?.eosID || data?.eosID || 'N/A';
+    this.verbose(2, `[S3] PLAYER_CONNECTED: ${playerName} (eosID=${eosID})`);
+
     if (this.services.players?.handlePlayerConnected) {
       await this.services.players.handlePlayerConnected(data);
     }
