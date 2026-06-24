@@ -22,7 +22,7 @@
 import { readFileSync } from 'fs';
 import * as readline from 'readline';
 import EloCalculator from '../utils/elo-calculator.js';
-import { extractRawPrefix, normalizeTag } from '../testing/elo-clan-grouping.js';
+import { extractRawPrefix, normalizeTag } from './elo-clan-grouping.js';
 
 // ─── Constants (mirror elo-discord.js) ───────────────────────────────────────
 

@@ -168,7 +168,6 @@ export default class EloTracker extends BasePlugin {
       minPlayersForElo: { default: 80, type: 'number' },
       minRoundsForLeaderboard: { default: 10, type: 'number' },
       roundStartEmbedDelayMs: { required: false, default: 180000, type: 'number' },
-      ignoredGameModes: { default: ['Seed', 'Jensen'], type: 'array' },
       enablePublicIngameCommands: { default: true, type: 'boolean' },
       discordClient: {
         required: false,
@@ -264,37 +263,26 @@ export default class EloTracker extends BasePlugin {
     this.ready = false;
     this._resolveS3();
 
-    const { roundStartTime: persistedStartTime } = await this.db.initDB();
+    // Initialize DB models (required before any DB access; S³ owns roundStartTime now)
+    await this.db.initDB();
 
     // --- Prune stale player entries ---
     const { tier1, tier2 } = await this.db.pruneStaleEntries(this.options.minRoundsForLeaderboard);
     Logger.verbose('EloTracker', 1, `[mount] Pruned stale entries — Tier 1 (provisional): ${tier1}, Tier 2 (calibrated): ${tier2}`);
 
-    // Restart Recovery
-    let serverRoundStart = this.server.matchStartTime ? this.server.matchStartTime.getTime() : null;
-
-    if (!serverRoundStart && this.server.layerHistory && this.server.layerHistory.length > 0) {
-      serverRoundStart = this.server.layerHistory[0].time.getTime();
-    }
-
-    if (!serverRoundStart) {
-      Logger.verbose('EloTracker', 1, 'Restart recovery unavailable: Could not determine server round start time.');
-    }
-
-    const threeHours = 3 * 60 * 60 * 1000;
-
-    if (persistedStartTime && serverRoundStart && Math.abs(persistedStartTime - serverRoundStart) < threeHours) {
-      // Same round detected after a restart
-      this.session.startRound(persistedStartTime);
-      Logger.verbose('EloTracker', 1, `Restart detected. Resuming round from saved start time: ${new Date(persistedStartTime).toISOString()}`);
+    // Restart Recovery — delegated to S³ GameStateService
+    const gs = this._s3?.services?.gameState;
+    const recoveredStart = gs?.getRoundStartTime?.();
+    if (recoveredStart) {
+      this.session.startRound(recoveredStart);
+      Logger.verbose('EloTracker', 1, `Restart detected. Resuming round from S³ roundStartTime: ${new Date(recoveredStart).toISOString()}`);
       // Immediately populate sessions for currently connected players
-      this.session.updatePlayers(this.server.players, persistedStartTime);
+      this.session.updatePlayers(this.server.players, recoveredStart);
     } else {
-      // Fresh round
-      const now = Date.now();
-      this.session.startRound(now);
-      await this.db.saveRoundStartTime(now);
-      Logger.verbose('EloTracker', 1, `New round started. Start time set to: ${new Date(now).toISOString()}`);
+      // Fresh round — S³ will set roundStartTime on NEW_GAME; for now use Date.now() as fallback
+      // so the session manager has a timestamp to work with during early-join players
+      Logger.verbose('EloTracker', 1, 'No restart recovery from S³. Starting fresh.');
+      this.session.startRound(Date.now());
     }
 
     // Fetch Discord channels
@@ -386,15 +374,14 @@ export default class EloTracker extends BasePlugin {
    async onNewGame(data) {
      if (!this.ready) return;
 
-     Logger.verbose('EloTracker', 1, 'NEW_GAME event received. Starting new session.');
+      Logger.verbose('EloTracker', 1, 'NEW_GAME event received. Starting new session.');
 
-     // Layer info is owned by S³ gameState — it resolves on NEW_GAME via its own handlers.
-     // EloTracker reads gamemode/layerName from gameState when needed.
-
-     const now = Date.now();
-     this.session.startRound(now);
-     await this.db.saveRoundStartTime(now);
-     this.lastRoundSnapshot = null;
+      // Layer info and round start time are owned by S³ gameState — it resolves on NEW_GAME
+      // via its own handlers. Read roundStartTime from S³ for cross-plugin consistency.
+      const gs = this._s3?.services?.gameState;
+      const roundStartTime = gs?.getRoundStartTime?.() ?? Date.now();
+      this.session.startRound(roundStartTime);
+      this.lastRoundSnapshot = null;
      this.eloCache.clear();
      this._roundStartEmbedPending = Date.now();
 
@@ -512,44 +499,19 @@ export default class EloTracker extends BasePlugin {
   }
 
   _isIgnoredMatch() {
-    if (this._s3?.services?.gameState) {
-      const gs = this._s3.services.gameState;
-      const matched = gs.isIgnoredMode(this.options.ignoredGameModes);
-      if (matched) return matched; // true → the mode was matched
-      if (gs.getGamemode() === 'Unknown' && gs.getLayerName() === 'Unknown') return 'Unknown';
-      return null;
-    }
-
-    // Fallback — S³ not available
-    let gameMode = this.server.currentLayer?.gamemode ?? '';
-    let layerName = this.server.currentLayer?.name ?? '';
-
-    const gameModeLower = gameMode.toLowerCase();
-    const layerNameLower = layerName.toLowerCase();
-
-    for (const ignoredMode of this.options.ignoredGameModes) {
-      const ignoredLower = ignoredMode.toLowerCase();
-      if (gameModeLower.includes(ignoredLower) || layerNameLower.includes(ignoredLower)) {
-        return ignoredMode;
-      }
-    }
-
-    if (!gameMode && !layerName) return 'Unknown';
+    const gs = this._s3.services.gameState;
+    const matched = gs.isIgnoredMode();
+    if (matched) return true; // true → the mode was matched
+    if (gs.getGamemode() === 'Unknown' && gs.getLayerName() === 'Unknown') return 'Unknown';
     return null;
   }
 
   _getLayerName() {
-    if (this._s3?.services?.gameState) {
-      return this._s3.services.gameState.getLayerName();
-    }
-    return this.server.currentLayer?.name ?? 'Unknown';
+    return this._s3.services.gameState.getLayerName();
   }
 
   _getGamemode() {
-    if (this._s3?.services?.gameState) {
-      return this._s3.services.gameState.getGamemode();
-    }
-    return this.server.currentLayer?.gamemode ?? null;
+    return this._s3.services.gameState.getGamemode();
   }
 
   async onRoundEnded(data) {
@@ -753,9 +715,10 @@ export default class EloTracker extends BasePlugin {
       Logger.verbose('EloTracker', 1, `[onRoundEnded] DB write failed: ${err.message}`);
     }
 
+    const gs = this._s3?.services?.gameState;
     const matchRecord = {
       ts: roundEndTime,
-      matchId: roundEndTime.toString(),
+      matchId: gs?.getMatchId?.() ?? roundEndTime.toString(),
       endedAt: roundEndTime,
       layerName: layerName,
       gameMode: gameMode ?? 'Unknown',
@@ -813,14 +776,10 @@ export default class EloTracker extends BasePlugin {
 
     // Fire-and-forget database insert if enabled and roundRecord was created
     if (this.options.enableDatabaseLogging && roundRecord && roundRecord.id) {
-      // Compute matchId and roundStartTime from session state
-      const roundStartTime = this.session.roundStartTime;
-      let matchId = null;
-      if (roundStartTime !== null && roundStartTime !== undefined) {
-        matchId = Math.floor(roundStartTime / 1000).toString(36).slice(-8);
-      } else {
-        Logger.verbose('EloTracker', 2, '[DB] Warning: session.roundStartTime is null — matchId will be null. Cross-plugin joins will not be possible for this round.');
-      }
+      // Read matchId and roundStartTime from S³ GameStateService for cross-plugin consistency
+      const gs = this._s3?.services?.gameState;
+      const roundStartTime = gs?.getRoundStartTime?.() ?? this.session.roundStartTime;
+      const matchId = gs?.getMatchId?.();
 
       const playerRows = matchRecord.players.map(p => ({
         matchId: matchId,
