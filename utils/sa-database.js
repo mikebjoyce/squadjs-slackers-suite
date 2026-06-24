@@ -199,7 +199,8 @@ export default class SADatabase {
     }
   }
 
-   async clearReconnectMemory() {
+  // DEPRECATED — Stage 4: replaced by S³ PlayersService reconnect
+  async clearReconnectMemory() {
      if (!this.ReconnectMemoryModel) return;
      
      try {
@@ -214,6 +215,7 @@ export default class SADatabase {
      }
    }
 
+  // DEPRECATED — Stage 4: replaced by S³ PlayersService reconnect
   async savePlayerDisconnect(steamID, teamID) {
     if (!this.ReconnectMemoryModel || !steamID) return;
     if (teamID !== 1 && teamID !== 2) return;
@@ -247,7 +249,8 @@ export default class SADatabase {
     }
   }
 
-   async getAllReconnectMemory() {
+  // DEPRECATED — Stage 4: replaced by S³ PlayersService reconnect
+  async getAllReconnectMemory() {
      if (!this.ReconnectMemoryModel) return new Map();
 
      try {

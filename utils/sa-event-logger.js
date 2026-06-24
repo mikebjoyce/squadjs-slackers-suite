@@ -136,9 +136,9 @@ export default class SAEventLogger {
     * @param {string} layerName - Name of the map/layer
     * @param {string} gamemode - Gamemode of the round
     * @param {boolean} smartAssignActive - Whether SmartAssign was actively assigning
-    * @param {number} matchStartTime - Unix timestamp of match start (for cross-plugin matchId derivation)
+    * @param {string} matchId - Pre-computed matchId hash from S³ GameStateService (base-36 encoded timestamp)
     */
-   async finalizeRoundLog(roundStartTime, layerName, gamemode, smartAssignActive, matchStartTime = null) {
+   async finalizeRoundLog(roundStartTime, layerName, gamemode, smartAssignActive, matchId = null) {
     if (this._batchFlushTimer) {
       clearInterval(this._batchFlushTimer);
       this._batchFlushTimer = null;
@@ -158,12 +158,8 @@ export default class SAEventLogger {
 
     Logger.verbose('SmartAssign', 1, `[EventLogger] Finalizing round log with ${events.length} events.`);
 
-    // Compute matchId from matchStartTime if provided
-    let matchId = null;
-    if (matchStartTime !== null && matchStartTime !== undefined) {
-      matchId = Math.floor(matchStartTime / 1000).toString(36).slice(-8);
-    } else {
-      Logger.verbose('SmartAssign', 2, '[DB] Warning: matchStartTime is null — matchId will be null. Cross-plugin joins will not be possible for this round.');
+    if (matchId === null || matchId === undefined) {
+      Logger.verbose('SmartAssign', 2, '[DB] Warning: matchId is null. Cross-plugin joins will not be possible for this round.');
     }
 
     const roundLog = {
