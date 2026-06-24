@@ -215,7 +215,7 @@ export default class SmartAssign extends BasePlugin {
       //         Note: evaluateTeamAssignment() is async (awaits getMu() calls inside the evaluator).
       //         queueMove() is synchronous (just enqueues the move).
       // ═══════════════════════════════════════════════════════════════════════════
-     this._reconnectMemory = new Map();
+      this._clanCacheBuilt = false;
 
        this.eloTracker = null;
 
@@ -271,9 +271,10 @@ export default class SmartAssign extends BasePlugin {
      this.onMoveSuccess = this.onMoveSuccess.bind(this);
      this.onMoveRetry = this.onMoveRetry.bind(this);
      this.onS3PlayerJoined = this.onS3PlayerJoined.bind(this);
-     this.onS3PlayerTeamChanged = this.onS3PlayerTeamChanged.bind(this);
-     this.onS3PlayerLeft = this.onS3PlayerLeft.bind(this);
-  }
+      this.onS3PlayerTeamChanged = this.onS3PlayerTeamChanged.bind(this);
+      this.onS3PlayerLeft = this.onS3PlayerLeft.bind(this);
+      this.onS3GameStateLive = this.onS3GameStateLive.bind(this);
+   }
 
   async mount() {
     await super.mount();
@@ -334,12 +335,8 @@ export default class SmartAssign extends BasePlugin {
        this.currentRoundStartTime = Number(persistedStartTime);
        this._snapshotTaken = true; // Assume snapshot exists in temp log
        
-       // ─ CRASH RECOVERY: Hydrate in-memory reconnect memory from DB
-      // On crash recovery, we resume the same round, so the reconnect memory
-      // that was persisted to the DB during the crashed session is still valid.
-      // Load it into memory to avoid awaiting DB reads during subsequent joins.
-      this._reconnectMemory = await this.db.getAllReconnectMemory();
-      Logger.verbose('SmartAssign', 1, `Hydrated ${this._reconnectMemory.size} reconnect records on restart.`);
+       // Reconnect memory is served by S³ PlayersService (Stage 4)
+      Logger.verbose('SmartAssign', 1, 'Reconnect memory served by S³ PlayersService.');
     } else {
       // New round or no data
       Logger.verbose('SmartAssign', 1, 'New round or no persisted state. Starting fresh.');
@@ -347,7 +344,7 @@ export default class SmartAssign extends BasePlugin {
       // Finalize any leftover temp logs from a previous crashed session
       await this.finalizeRoundLog();
 
-      await this.db.clearReconnectMemory();
+      // Reconnect memory cleared by S³ (Stage 4)
       const now = serverRoundStart || Date.now();
       await this.db.saveRoundStartTime(now);
       this.currentRoundStartTime = now;
@@ -366,10 +363,11 @@ export default class SmartAssign extends BasePlugin {
       this.server.on('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
       this.server.on('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
 
-      // S³ parallel-run event subscribers (Phase C — logging only, no RCON moves)
+      // S³ event subscribers (Stage 4 — active assignment path, dual-run with Path B)
       this.server.on('S3_PLAYER_JOINED', this.onS3PlayerJoined);
       this.server.on('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
       this.server.on('S3_PLAYER_LEFT', this.onS3PlayerLeft);
+      this.server.on('S3_GAME_STATE_LIVE', this.onS3GameStateLive);
 
      // ═══════════════════════════════════════════════════════════════════════════════════
      // LAYER INFO BOOTSTRAP: Initialize layer caches from server state at mount time
@@ -412,6 +410,7 @@ export default class SmartAssign extends BasePlugin {
      this.server.removeListener('S3_PLAYER_JOINED', this.onS3PlayerJoined);
      this.server.removeListener('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
      this.server.removeListener('S3_PLAYER_LEFT', this.onS3PlayerLeft);
+     this.server.removeListener('S3_GAME_STATE_LIVE', this.onS3GameStateLive);
     this._pendingPlayerMoves.clear();
     this.executor.cleanup();
     Logger.verbose('SmartAssign', 1, 'SmartAssign unmounted.');
@@ -471,7 +470,7 @@ export default class SmartAssign extends BasePlugin {
       this._pendingPlayerListUpdate = null;
     }
 
-    await this.db.clearReconnectMemory();
+    // Reconnect memory cleared by S³ (Stage 4)
     const now = Date.now();
     await this.db.saveRoundStartTime(now);
     this.currentRoundStartTime = now;
@@ -491,12 +490,9 @@ export default class SmartAssign extends BasePlugin {
     this._pendingVeterans[2] = 0;
     this._pendingPlayerMoves.clear();
     
-    // Clear in-memory reconnect memory alongside DB clear (synchronized in onNewGame above)
-    // This ensures the new round starts fresh with no reconnect history.
-    this._reconnectMemory.clear();
-    
-    // Clear player tag cache so it gets rebuilt at snapshot time
+    // Clear player tag cache and clan cache flag so they get rebuilt
     this._playerTagCache.clear();
+    this._clanCacheBuilt = false;
     
     // ═════════════════════════════════════════════════════════════════════════════════════
     // RESOLVING PHASE: Set phase to wait for 100% team resolution before enabling assignment.
@@ -1264,9 +1260,10 @@ export default class SmartAssign extends BasePlugin {
         timemarks.preWarmMs = Date.now() - preWarmStart;
         timemarks.preWarmMu = preWarmRating.mu;
 
-        // Read reconnect memory synchronously from Map — still keyed on steamID (known limitation for EOS-only players)
+        // Read reconnect memory from S³ PlayersService
         const reconnectTeamStart = Date.now();
-        const reconnectTeam = this._reconnectMemory.get(player.steamID) || null;
+        const reconnectRecord = await this._s3?.services?.players?.getReconnect(player.eosID);
+        const reconnectTeam = reconnectRecord?.teamID || null;
         timemarks.reconnectTeamMs = Date.now() - reconnectTeamStart;
 
         // 2. STALE-STATE BATCHING PROTECTION
@@ -1348,27 +1345,56 @@ export default class SmartAssign extends BasePlugin {
   // the old code is cut in the cleanup phase. No RCON moves are issued from these handlers.
   // ═══════════════════════════════════════════════════════════════════════════════════
 
-  onS3PlayerJoined(data) {
+  async onS3PlayerJoined(data) {
     if (!this.ready) return;
     const player = data?.player;
     if (!player) return;
-    Logger.verbose('SmartAssign', 2, `[S3-PARALLEL] JOIN: ${player.name || player.eosID} (eosID=${player.eosID}, steamID=${player.steamID}, team=${player.teamID}), old SA knownPlayers.has=${this.knownPlayers.has(player.eosID || player.steamID)}, phase=${this.phase}`);
+    Logger.verbose('SmartAssign', 3, `[S3] JOIN: ${player.name || player.eosID} team=${player.teamID}`);
+
+    // Build clan tag cache from S³ projection on first join of the round
+    if (!this._clanCacheBuilt && this.options.enableClanGrouping && this._s3?.services?.clans) {
+      const allPlayers = this._s3.services.players.getAllPlayers();
+      this._playerTagCache = this._s3.services.clans.buildPlayerTagCache(allPlayers, {
+        caseSensitive: this.options.clanGroupCaseSensitive
+      });
+      this._clanCacheBuilt = true;
+      Logger.verbose('SmartAssign', 2, `[Clan] Tag cache built from S³ ClansService: ${this._playerTagCache.size} players.`);
+    }
+
+    await this.handlePlayerJoin(player);
   }
 
-  onS3PlayerTeamChanged(data) {
+  async onS3PlayerTeamChanged(data) {
     if (!this.ready) return;
     const { player, previousTeamID, teamID, source } = data || {};
     if (!player) return;
-    const playerKey = player.eosID || player.steamID;
-    const externalMatch = this._externalMoveMap.get(playerKey);
-    Logger.verbose('SmartAssign', 2, `[S3-PARALLEL] TEAM_CHANGE: ${player.name || player.eosID} ${previousTeamID}→${teamID}, source=${source}, old SA externalMoveMap match=${externalMatch?.source || 'none'}`);
+    Logger.verbose('SmartAssign', 3, `[S3] TEAM_CHANGE: ${player.name || player.eosID} ${previousTeamID}→${teamID}, source=${source}`);
+    await this.handleTeamChange(player, previousTeamID, teamID, source || 'Manual/Game');
   }
 
-  onS3PlayerLeft(data) {
+  async onS3PlayerLeft(data) {
     if (!this.ready) return;
     const player = data?.player;
     if (!player) return;
-    Logger.verbose('SmartAssign', 2, `[S3-PARALLEL] LEAVE: ${player.name || player.eosID} (eosID=${player.eosID}, steamID=${player.steamID}, team=${player.teamID}), old SA knownPlayers.has=${this.knownPlayers.has(player.eosID || player.steamID)}`);
+    Logger.verbose('SmartAssign', 3, `[S3] LEAVE: ${player.name || player.eosID}`);
+    await this.handlePlayerLeave(player);
+  }
+
+  async onS3GameStateLive(data) {
+    if (!this.ready) return;
+    Logger.verbose('SmartAssign', 2, `[S3] GAME_STATE_LIVE: ${data.gamemode} / ${data.layerName}`);
+
+    // Fire ROUND_SNAPSHOT log event (replaces _ensureSnapshot in Stage 4)
+    const allPlayers = this._s3?.services?.players?.getAllPlayers() || [];
+    const snapshotPlayers = allPlayers.map(p => ({
+      name: p.name,
+      eosID: p.eosID,
+      teamID: p.teamID,
+      joinedServerAt: this._sessionJoinTimes.get(p.eosID || p.steamID) || Date.now()
+    }));
+
+    this.logEvent('ROUND_SNAPSHOT', null, { players: snapshotPlayers }, false);
+    Logger.verbose('SmartAssign', 2, `[Snapshot] Round snapshot captured via S3_GAME_STATE_LIVE with ${snapshotPlayers.length} players.`);
   }
 
   async handlePlayerLeave(player) {
@@ -1383,18 +1409,10 @@ export default class SmartAssign extends BasePlugin {
       this._playerTagCache.delete(player.eosID);
     }
     
-     // Save to reconnect memory if they were on a valid team
+     // Save to S³ reconnect memory (fire-and-forget) if they were on a valid team
      const tid = Number(player.teamID);
-     if (tid === 1 || tid === 2) {
-       // ─ OPTIMIZATION: Write to both in-memory Map and DB
-       // In-memory write is immediate (synchronous), providing fast lookups on rejoin.
-       // DB write is awaited to ensure ordering: the LEAVE event is logged before this
-       // function returns, guaranteeing the database reflects the disconnect before the
-       // next UPDATED_PLAYER_INFORMATION cycle. This prevents race conditions where a 
-       // rejoining player finds stale/missing reconnect records.
-       // NOTE: _reconnectMemory remains keyed on steamID (known limitation — S³ owns this in Stage 3+)
-       this._reconnectMemory.set(player.steamID, tid);
-       await this.db.savePlayerDisconnect(player.steamID, tid);
+     if ((tid === 1 || tid === 2) && this._s3?.services?.players?.rememberReconnect) {
+       this._s3.services.players.rememberReconnect(player.eosID, { teamID: tid });
      }
   }
 
