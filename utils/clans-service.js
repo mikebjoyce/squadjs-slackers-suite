@@ -37,6 +37,7 @@ export default class ClansService {
     };
 
     this._isMounted = false;
+    this._playerTagCache = new Map();
   }
 
   async mount() {
@@ -263,6 +264,40 @@ export default class ClansService {
     if (teamCounts[2] > 0) return 2;
 
     return null;
+  }
+
+  getPlayerTag(eosID) {
+    if (!eosID) return null;
+    return this._playerTagCache.get(eosID) ?? null;
+  }
+
+  addPlayerToCache(eosID, name) {
+    if (!eosID || !name) return;
+    const raw = this.extractRawPrefix(name);
+    const tag = raw ? (this.options.caseSensitive ? raw : this.normalizeTag(raw)) : null;
+    this._playerTagCache.set(eosID, tag);
+  }
+
+  removePlayerFromCache(eosID) {
+    if (!eosID) return;
+    this._playerTagCache.delete(eosID);
+  }
+
+  clearPlayerTagCache() {
+    this._playerTagCache.clear();
+  }
+
+  getPlayerTagCache() {
+    return new Map(this._playerTagCache);
+  }
+
+  rebuildFromAllPlayers(players) {
+    this._playerTagCache.clear();
+    for (const p of players || []) {
+      if (!p?.eosID) continue;
+      this.addPlayerToCache(p.eosID, p.name);
+    }
+    this.verboseLogger(2, `[Clans] Tag cache rebuilt: ${this._playerTagCache.size} players.`);
   }
 }
 

@@ -641,6 +641,12 @@ export default class PlayersService {
         allResolved,
         hasNullTeams
       });
+
+      // Build ClansService tag cache from initial player sync (closed loop)
+      if (this.parent?.services?.clans) {
+        this.parent.services.clans.rebuildFromAllPlayers([...this.registry.values()]);
+      }
+
       return;
     }
 
@@ -659,6 +665,11 @@ export default class PlayersService {
         player: { ...tracked },
         source: 'S3PlayersRegistry'
       });
+
+      // Remove from ClansService tag cache (closed loop)
+      if (this.parent?.services?.clans) {
+        this.parent.services.clans.removePlayerFromCache(tracked?.eosID);
+      }
 
       // Fire-and-forget: remember this player for reconnect detection on return
       this.rememberReconnect(tracked.eosID, {
@@ -1009,6 +1020,12 @@ export default class PlayersService {
           player: { ...joined },
           source
         });
+
+        // Update ClansService tag cache incrementally (closed loop)
+        if (this.parent?.services?.clans) {
+          this.parent.services.clans.addPlayerToCache(joined.eosID, joined.name);
+        }
+
         this.verboseLogger(1, `[Players] JOIN emitted: ${playerName} (eosID=${joined.eosID}, teamID=${joined.teamID}, source=${source})`);
       }
 

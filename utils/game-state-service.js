@@ -43,6 +43,9 @@ export default class GameStateService {
       ? ignoredGameModes
       : [];
 
+    // Internal overridable ignoredGameModes, set by S³ plugin via setIgnoredGameModes() at mount time
+    this._ignoredGameModes = null;
+
     this.stagingDurationMs = Number.isFinite(stagingDurationMs) ? stagingDurationMs : 180000;
     this.maxRecoveredRoundAgeMs = Number.isFinite(maxRecoveredRoundAgeMs)
       ? maxRecoveredRoundAgeMs
@@ -53,6 +56,10 @@ export default class GameStateService {
     this.lastPhaseChangeAt = Date.now();
     this.lastNewGameAt = null;
     this.lastRoundEndedAt = null;
+
+    // Centralized round start time and matchId hash for cross-plugin consistency
+    this.roundStartTime = null;
+    this.matchId = null;
 
     this.gameModeCached = null;
     this.layerNameCached = null;
@@ -130,6 +137,25 @@ export default class GameStateService {
     return this._isMounted;
   }
 
+  /**
+   * Get the current round's start time (Unix epoch ms).
+   * Set synchronously in handleNewGame() before any await.
+   * Returns null if no round has started yet.
+   */
+  getRoundStartTime() {
+    return this.roundStartTime;
+  }
+
+  /**
+   * Get the current round's matchId hash (base-36 encoded timestamp).
+   * Derived from roundStartTime using the same formula across all consumers:
+   *   Math.floor(roundStartTime / 1000).toString(36).slice(-8)
+   * Returns null if no round has started yet.
+   */
+  getMatchId() {
+    return this.matchId;
+  }
+
   getGamemode() {
     return this.gameModeCached || this.lastKnownGoodLayer?.gamemode || 'Unknown';
   }
@@ -189,7 +215,8 @@ export default class GameStateService {
     return true;
   }
 
-  isIgnoredMode(ignoredGameModes = this.defaultIgnoredGameModes) {
+  isIgnoredMode() {
+    const ignoredGameModes = this._ignoredGameModes ?? this.defaultIgnoredGameModes;
     const gameMode = this.getGamemode().toLowerCase();
     const layerName = this.getLayerName().toLowerCase();
 
@@ -197,6 +224,16 @@ export default class GameStateService {
       const candidate = String(mode).toLowerCase();
       return gameMode.includes(candidate) || layerName.includes(candidate);
     });
+  }
+
+  /**
+   * Set ignored game modes at runtime. Called by S³ plugin during mount().
+   * Normalizes all entries to lowercase for consistent matching.
+   * @param {string[]} modes - Array of mode/map substrings to ignore.
+   */
+  setIgnoredGameModes(modes) {
+    this._ignoredGameModes = (modes || []).map(m => String(m).toLowerCase());
+    this.verboseLogger(3, `[GameState] Ignored game modes set: ${JSON.stringify(this._ignoredGameModes)}`);
   }
 
   async handleNewGame(data) {
@@ -208,6 +245,10 @@ export default class GameStateService {
     this.resolving = true;
     this.lastNewGameAt = now;
     this.lastPhaseChangeAt = now;
+
+    // Set centralized roundStartTime and matchId synchronously before any await
+    this.roundStartTime = this.server.matchStartTime?.getTime() ?? now;
+    this.matchId = Math.floor(this.roundStartTime / 1000).toString(36).slice(-8);
 
     if (data?.layer) {
       await this.resolveLayerInfo(data.layer, 'handleNewGame');
@@ -476,6 +517,14 @@ export default class GameStateService {
       lastGamemode: {
         type: DataTypes.STRING,
         allowNull: true
+      },
+      roundStartTime: {
+        type: DataTypes.BIGINT,
+        allowNull: true
+      },
+      matchId: {
+        type: DataTypes.STRING,
+        allowNull: true
       }
     }, {
       tableName: 'S3_GameState',
@@ -508,6 +557,10 @@ export default class GameStateService {
     this.lastPhaseChangeAt = Number(state.lastPhaseChangeAt) || Date.now();
     this.lastNewGameAt = state.lastNewGameAt ? Number(state.lastNewGameAt) : null;
     this.lastRoundEndedAt = state.lastRoundEndedAt ? Number(state.lastRoundEndedAt) : null;
+
+    // Recover centralized roundStartTime and matchId
+    this.roundStartTime = state.roundStartTime ? Number(state.roundStartTime) : null;
+    this.matchId = state.matchId || null;
 
     this.layerNameCached = state.lastLayerName || this.layerNameCached;
     this.gameModeCached = state.lastGamemode || this.gameModeCached;
@@ -556,6 +609,8 @@ export default class GameStateService {
     this.resolving = false;
     this.lastPhaseChangeAt = now;
     this.lastNewGameAt = null;
+    this.roundStartTime = null;
+    this.matchId = null;
     this._recoveredStateActive = false;
     await this._persistState();
     this.verboseLogger(1, `[GameState] Recovered state invalidated -> LIVE (${reason}).`);
@@ -601,7 +656,9 @@ export default class GameStateService {
         lastNewGameAt: this.lastNewGameAt,
         lastRoundEndedAt: this.lastRoundEndedAt,
         lastLayerName: this.layerNameCached || null,
-        lastGamemode: this.gameModeCached || null
+        lastGamemode: this.gameModeCached || null,
+        roundStartTime: this.roundStartTime,
+        matchId: this.matchId
       });
     };
     if (dbService?.executeWithRetry) {

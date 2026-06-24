@@ -191,6 +191,9 @@ export default class SlackersSquadServices extends BasePlugin {
     }
 
     if (this.services.gameState) {
+      // Push S³'s ignoredGameModes config into GameStateService before mount
+      // so isIgnoredMode() reads the single source of truth.
+      this.services.gameState.setIgnoredGameModes(this.options.ignoredGameModes);
       await this.services.gameState.mount();
     }
 
