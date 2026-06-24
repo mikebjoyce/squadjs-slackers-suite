@@ -134,8 +134,6 @@ export default class Switch extends DiscordBasePlugin {
         super(server, options, connectors);
 
         this.onChatMessage = this.onChatMessage.bind(this);
-        this.onPlayerConnected = this.onPlayerConnected.bind(this);
-        this.onUpdatedPlayerInfo = this.onUpdatedPlayerInfo.bind(this);
         this.switchPlayer = this.switchPlayer.bind(this);
         this.getPlayersByUsername = this.getPlayersByUsername.bind(this);
         this.getPlayerBySteamID = this.getPlayerBySteamID.bind(this);
@@ -158,26 +156,19 @@ export default class Switch extends DiscordBasePlugin {
         this.safeTransaction = this.safeTransaction.bind(this);
         this.safeDiscordReply = this.safeDiscordReply.bind(this);
         this._checkSwitchEligibility = this._checkSwitchEligibility.bind(this);
-        this.onSAEvalStart = this.onSAEvalStart.bind(this);
-        this.onSAEvalEnd = this.onSAEvalEnd.bind(this);
+        this.onS3PlayerJoined = this.onS3PlayerJoined.bind(this);
+        this.onS3PlayerLeft = this.onS3PlayerLeft.bind(this);
+        this.onS3PlayerTeamChanged = this.onS3PlayerTeamChanged.bind(this);
 
-        this.playersConnectionTime = {};
         this.recentSwitches = [];
         this.recentDoubleSwitches = [];
         this.recentDisconnections = {};
-        this._knownConnectedPlayers = new Map(); // eosID → { teamID, name, steamID }
         this._switchQueue = new Map();      // eosID → { eosID, steamID, playerName, teamID, queuedAt, warnInterval }
         this._lastTeamSnapshot = null;      // { t1: number, t2: number } — previous poll's team counts for stability check
         this._switchedOnJoin = new Set();
-        this._nullTeamIDWindowActive = false;
-        this._nullTeamIDWindowTimeout = null;
-        this._saEvalLocks = new Map();
         this._queueProcessing = false;      // Re-entrancy guard for _processQueue
         this._s3 = null;                    // Reference to SlackersSquadServices (runtime discovery)
         
-        // Layer tracking for liberal mode detection
-        this.currentLayerName = null;
-        this.currentGamemode = null;
         this._liberalModes = [];
 
         this.models = {};
@@ -315,22 +306,13 @@ export default class Switch extends DiscordBasePlugin {
 
         this._liberalModes = (this.options.liberalSwitchGameModes || ['Seed', 'Jensen']).map(m => String(m).toLowerCase());
 
-        if (this.server.currentLayer?.name) {
-            this.currentLayerName = this.server.currentLayer.name;
-            this.currentGamemode = this.server.currentLayer.gamemode || null;
-            this.verbose(1, `[Layer] Bootstrapped from server.currentLayer at mount: ${this.currentLayerName} (${this.currentGamemode})`);
-        }
-
         this.server.on('CHAT_MESSAGE', this.onChatMessage);
-        this.server.on('PLAYER_CONNECTED', this.onPlayerConnected);
-        this.server.on('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
         this.server.on('ROUND_ENDED', this.onRoundEnded)
         this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
         this.server.on('NEW_GAME', this.onNewGame.bind(this));
-        this.server.on('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo.bind(this));
-        this.server.on('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated.bind(this));
-        this.server.on('SMART_ASSIGN_EVAL_START', this.onSAEvalStart);
-        this.server.on('SMART_ASSIGN_EVAL_END', this.onSAEvalEnd);
+        this.server.on('S3_PLAYER_JOINED', this.onS3PlayerJoined);
+        this.server.on('S3_PLAYER_LEFT', this.onS3PlayerLeft);
+        this.server.on('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
         if (this.options.discordClient) {
             this.options.discordClient.on('message', this.onDiscordMessage);
         }
@@ -666,29 +648,6 @@ export default class Switch extends DiscordBasePlugin {
                     return;
             }
         } else {
-            if (this._nullTeamIDWindowActive) {
-                const eosID = info.player?.eosID;
-                if (!eosID) return;
-
-                const eligibility = await this._checkSwitchEligibility(info.player);
-                if (!eligibility.eligible) {
-                    if (eligibility.reason === 'scramble_lock') {
-                        this.warn(eosID, `[Switch] Scramble lock active — expires in ${eligibility.remaining}m.\nYour switch window may close before this expires.\nUse !switch check to see your full status.`);
-                        this.verbose(1, `[Queue] Denied ${playerName} during transition: Scramble lockdown active.`);
-                    } else if (eligibility.reason === 'time_window') {
-                        this.warn(eosID, `[Switch] Join/match window closed.\nSwitching is only allowed in the first ${this.options.switchEnabledMinutes}m after joining or after\nmatch start — whichever gives you more time.\nUse !switch explain for details.`);
-                        this.verbose(1, `[Queue] Denied ${playerName} during transition: Match time limit exceeded.`);
-                    } else if (eligibility.reason === 'cooldown') {
-                        this.warn(eosID, `[Switch] On cooldown — available in ${eligibility.remaining}m.\nUse !switch check to see your full status.`);
-                        this.verbose(1, `[Queue] Denied ${playerName} during transition: Cooldown active.`);
-                    }
-                    return;
-                }
-
-                this._enqueuePlayer(info.player, 'Server is mid-transition — team assignments are still resolving.');
-                return;
-            }
-
             await this.server.updateSquadList();
             await this.server.updatePlayerList();
 
@@ -748,12 +707,6 @@ export default class Switch extends DiscordBasePlugin {
                     this.warn(eosID, `[Switch] On cooldown — available in ${eligibility.remaining}m.\nUse !switch check to see your full status.`);
                     this.verbose(1, `[Switch] Denied ${playerName}: Cooldown active.`);
                 }
-                return;
-            }
-
-            if (this.isSABalancingActive) {
-                this.warn(eosID, '[Switch Queue]\nServer is currently balancing joins.\nYou have been added to the queue.');
-                this._enqueuePlayer(info.player, 'Server balancing in progress.');
                 return;
             }
 
@@ -885,20 +838,12 @@ export default class Switch extends DiscordBasePlugin {
      * Checks both cached layer name and gamemode against the liberal modes list.
      */
     isLiberalMode() {
-        const layerName = this.s3GameStateLayer() ?? this.currentLayerName;
-        const gamemode = this.s3GameStateGamemode() ?? this.currentGamemode;
-        const checkLayer = (layerName || '').toLowerCase();
-        const checkMode = (gamemode || '').toLowerCase();
-        return this._liberalModes.some(m => checkLayer.includes(m) || checkMode.includes(m));
+        const gs = this._s3?.services?.gameState;
+        const layerName = (gs?.getLayerName?.() || '').toLowerCase();
+        const gamemode = (gs?.getGamemode?.() || '').toLowerCase();
+        return this._liberalModes.some(m => layerName.includes(m) || gamemode.includes(m));
     }
 
-    // S³ gameState helpers (null-safe, return null when S³ not available)
-    s3GameStateLayer() {
-        return this._s3?.services?.gameState?.getLayerName?.() ?? null;
-    }
-    s3GameStateGamemode() {
-        return this._s3?.services?.gameState?.getGamemode?.() ?? null;
-    }
     s3IsEndgameFactionVote() {
         return this._s3?.services?.gameState?.isEndgameFactionVote?.() === true;
     }
@@ -1069,10 +1014,6 @@ export default class Switch extends DiscordBasePlugin {
                 return;
             }
 
-            if (this.isSABalancingActive) {
-                this.verbose(2, `[Queue] Processing suspended — SmartAssign is currently evaluating joins.`);
-                return;
-            }
             const windowMs = this.options.switchEnabledMinutes * 60 * 1000;
             const now = Date.now();
 
@@ -1221,155 +1162,13 @@ export default class Switch extends DiscordBasePlugin {
         }
     }
 
-    async onUpdatedLayerInfo() {
-        const name = this.server.currentLayer?.name || null;
-        const mode = this.server.currentLayer?.gamemode || null;
-
-        if (name) {
-            this.currentLayerName = name;
-            this.currentGamemode = mode;
-            this.verbose(2, `[Layer] Updated layer cache: ${name} (${mode})`);
-        }
-    }
-
-    get isSABalancingActive() {
-        return this._saEvalLocks.size > 0;
-    }
-
-    onSAEvalStart(data) {
-        const key = data.eosID || data.steamID;
-        if (!key) return;
-
-        if (this._saEvalLocks.has(key)) {
-            clearTimeout(this._saEvalLocks.get(key));
-        }
-
-        const timeout = setTimeout(() => {
-            if (this._saEvalLocks.has(key)) {
-                this._saEvalLocks.delete(key);
-                this.verbose(1, `[Switch Lock] Fallback TTL (3s) expired; dropping lock for ${key}`);
-            }
-        }, 3000);
-
-        this.verbose(2, `[Switch Lock] Lock acquired for ${key}`);
-        this._saEvalLocks.set(key, timeout);
-    }
-
-    onSAEvalEnd(data) {
-        const key = data.eosID || data.steamID;
-        if (this._saEvalLocks.has(key)) {
-            clearTimeout(this._saEvalLocks.get(key));
-            this._saEvalLocks.delete(key);
-            this.verbose(2, `[Switch Lock] Lock released for ${key}`);
-        }
-    }
-
-    async onServerInfoUpdated(info) {
-        try {
-            if (info && info.currentLayer) {
-                const incomingName = typeof info.currentLayer === 'string'
-                    ? info.currentLayer
-                    : info.currentLayer?.name;
-
-                if (incomingName) {
-                    this.currentLayerName = incomingName;
-                    if (typeof info.currentLayer === 'object' && info.currentLayer.gamemode) {
-                        this.currentGamemode = info.currentLayer.gamemode;
-                    }
-                    this.verbose(2, `[Layer] Updated from server info: ${incomingName}`);
-                }
-            }
-        } catch (err) {
-            this.verbose(1, `[onServerInfoUpdated] Error resolving layer: ${err?.message}`);
-        }
-    }
-
     async getSecondsFromJoin(eosID) {
-        let joinTime = this.playersConnectionTime[eosID];
-
-        if (!joinTime) {
-            const records = await this.models.PlayerCooldowns.findAll({
-                where: { eosID: eosID },
-                limit: 1
-            });
-            if (records.length > 0 && records[0].firstSeenTimestamp) {
-                joinTime = new Date(records[0].firstSeenTimestamp).getTime();
-                this.playersConnectionTime[eosID] = joinTime;
-            }
-        }
-
-        return joinTime ? (Date.now() - joinTime) / 1000 : 0;
+        const player = this._s3?.services?.players?.getPlayer(eosID);
+        return player?.joinTime ? (Date.now() - player.joinTime) / 1000 : 0;
     }
 
     getSecondsFromMatchStart() {
         return (Date.now() - +this.server.layerHistory[ 0 ].time) / 1000 || 0;
-    }
-
-    async onUpdatedPlayerInfo(info) {
-        if (!this.server.players) return;
-        
-        if (this._nullTeamIDWindowActive) {
-            const anyNull = this.server.players.some(p => p.teamID === null);
-            if (anyNull) return;
-            this._nullTeamIDWindowActive = false;
-            clearTimeout(this._nullTeamIDWindowTimeout);
-        }
-        
-        const currentEosIDs = new Set(this.server.players.map(p => p.eosID).filter(Boolean));
-
-        for (const p of this.server.players) {
-            if (!p.eosID) continue;
-            if (!this._knownConnectedPlayers.has(p.eosID)) {
-                // NEW PLAYER DETECTED
-                const now = Date.now();
-                if (!this.playersConnectionTime[p.eosID]) {
-                    this.playersConnectionTime[p.eosID] = now;
-                    try {
-                        await this.safeTransaction(async (t) => {
-                            await this.models.PlayerCooldowns.upsert({
-                                eosID: p.eosID,
-                                steamID: p.steamID,
-                                playerName: p.name,
-                                firstSeenTimestamp: new Date(now)
-                            }, { transaction: t });
-                        });
-                    } catch (err) {
-                        this.verbose(1, `Failed to persist join time for ${p.name}: ${err.message}`);
-                    }
-
-                    if (!this._switchedOnJoin.has(p.eosID)) {
-                        this._switchedOnJoin.add(p.eosID);
-                        if (this.options.switchToOldTeamAfterRejoin) {
-                            const preDisconnectionData = this.recentDisconnections[p.steamID];
-                            if (preDisconnectionData) {
-                                setTimeout(() => {
-                                    this.switchToPreDisconnectionTeam({ player: p });
-                                }, 100);
-                            }
-                        }
-                    }
-                }
-                this._knownConnectedPlayers.set(p.eosID, { teamID: p.teamID, name: p.name, steamID: p.steamID });
-            } else {
-                const existing = this._knownConnectedPlayers.get(p.eosID);
-                if (p.teamID !== null) {
-                    existing.teamID = p.teamID;
-                    existing.name = p.name;
-                }
-            }
-        }
-
-        // Detect leaves
-        for (const [eosID, data] of this._knownConnectedPlayers.entries()) {
-            if (!currentEosIDs.has(eosID)) {
-                this._knownConnectedPlayers.delete(eosID);
-                this.handlePlayerLeave(eosID, data.teamID, data.name, data.steamID);
-            }
-        }
-
-        if (!this._nullTeamIDWindowActive) {
-            await this._processQueue();
-        }
     }
 
     handlePlayerLeave(eosID, teamID, playerName, steamID) {
@@ -1387,76 +1186,6 @@ export default class Switch extends DiscordBasePlugin {
             if (this.recentDisconnections[key].time.getTime() < cutoff) delete this.recentDisconnections[key];
         }
         this.recentDoubleSwitches = this.recentDoubleSwitches.filter(p => p.steamID != steamID);
-    }
-
-    async onPlayerConnected(info) {
-        if (!info?.player?.steamID) return;
-        
-        const steamID = info.player.steamID;
-        const eosID = info.player?.eosID;
-        const playerName = info.player.name;
-        const teamID = info.player.teamID;
-
-        this.verbose(2, `Player connected ${playerName}`);
-        const now = Date.now();
-
-        const alreadyRegistered = this.playersConnectionTime[eosID] && this._switchedOnJoin.has(eosID);
-        if (alreadyRegistered) {
-            this.verbose(1, `[Rejoin] ${playerName} already registered via UPDATED_PLAYER_INFORMATION, skipping double-registration.`);
-            return;
-        }
-
-        const preDisconnectionData = this.recentDisconnections[steamID];
-        const disconnectionValid = preDisconnectionData && (Date.now() - preDisconnectionData.time.getTime()) < (20 * 60 * 1000);
-
-        if (disconnectionValid) {
-            if (!eosID) {
-                this.verbose(1, `[Rejoin] Missing eosID for player ${playerName}, resetting join time`);
-                this.playersConnectionTime[eosID] = now;
-            } else if (!this.playersConnectionTime[eosID]) {
-                try {
-                    const records = await this.models.PlayerCooldowns.findAll({
-                        where: { eosID: eosID },
-                        limit: 1
-                    });
-                    if (records.length > 0 && records[0].firstSeenTimestamp) {
-                        this.playersConnectionTime[eosID] = new Date(records[0].firstSeenTimestamp).getTime();
-                        this.verbose(2, `[Rejoin] ${playerName} retained join time from pre-disconnection.`);
-                    } else {
-                        this.playersConnectionTime[eosID] = now;
-                    }
-                } catch (err) {
-                    this.verbose(2, `Failed to hydrate join time for ${playerName}: ${err.message}`);
-                    this.playersConnectionTime[eosID] = now;
-                }
-            }
-        } else {
-            if (eosID) {
-                this.playersConnectionTime[eosID] = now;
-            }
-            
-            try {
-                if (!eosID) {
-                    this.verbose(1, `[PlayerCooldowns] Missing eosID for player ${playerName}, skipping DB write`);
-                } else {
-                    await this.safeTransaction(async (t) => {
-                        await this.models.PlayerCooldowns.upsert({
-                            eosID,
-                            steamID,
-                            playerName,
-                            firstSeenTimestamp: new Date(now)
-                        }, { transaction: t });
-                    });
-                }
-            } catch (err) {
-                this.verbose(1, `Failed to persist join time for ${playerName}: ${err.message}`);
-            }
-        }
-
-        if (!this._switchedOnJoin.has(eosID)) {
-            this._switchedOnJoin.add(eosID);
-            this.switchToPreDisconnectionTeam(info);
-        }
     }
 
     async switchToPreDisconnectionTeam(info) {
@@ -1619,21 +1348,7 @@ export default class Switch extends DiscordBasePlugin {
           return null;
         }
         
-        // EMIT BEFORE RCON: Attribution event must reach SmartAssign's _externalMoveMap
-        // BEFORE the team change is detected by UPDATED_PLAYER_INFORMATION polling.
-        this.verbose(1, `[Attribution] SWITCH emitting PLAYER_MOVED_BY_PLUGIN: player=${player.name} (eosID=${eosID}), sourceTeam=${currentTeam}, targetTeam=${targetTeam}, source='${source}'`);
-        this.server.emit('PLAYER_MOVED_BY_PLUGIN', {
-            eosID: player.eosID,
-            steamID,
-            name: player.name,
-            sourceTeamID: currentTeam,
-            targetTeamID: targetTeam,
-            source: source,
-            timestamp: executionTimestamp
-        });
-        this.verbose(2, `[Switch] EVENT EMITTED: PLAYER_MOVED_BY_PLUGIN registered for attribution (TTL=30s)`);
-
-        // S³ attribution: Record the move so S³'s S3_PLAYER_TEAM_CHANGED fires with the correct source
+        // S³ attribution: Record the move so S3_PLAYER_TEAM_CHANGED fires with the correct source
         if (this._s3?.services?.players?.recordMove && eosID) {
           this._s3.services.players.recordMove(eosID, targetTeam, source);
           this.verbose(2, `[Switch] S³ recordMove registered: source=${source}, targetTeam=${targetTeam}`);
@@ -1663,17 +1378,55 @@ export default class Switch extends DiscordBasePlugin {
     }
 
     onNewGame() {
-        this._nullTeamIDWindowActive = true;
-        clearTimeout(this._nullTeamIDWindowTimeout);
-        this._nullTeamIDWindowTimeout = setTimeout(() => {
-            this._nullTeamIDWindowActive = false;
-            this.verbose(1, '[NEW_GAME] Null-teamID window safety timeout triggered.');
-        }, 60_000);
-        
-        this.currentLayerName = null;
-        this.currentGamemode = null;
-        
-        this.verbose(1, '[NEW_GAME] Null-teamID window opened (players may have null teamID for up to 30s).');
+        this.verbose(1, '[NEW_GAME] Round started — null-teamID window handled by S³ players service.');
+    }
+
+    async onS3PlayerJoined(data) {
+        if (!data?.player?.eosID) return;
+        const { eosID, steamID, name, teamID } = data.player;
+
+        // Rejoin auto-switch (moved from onPlayerConnected)
+        if (!this._switchedOnJoin.has(eosID)) {
+            this._switchedOnJoin.add(eosID);
+            if (this.options.switchToOldTeamAfterRejoin) {
+                const preDisconnectionData = this.recentDisconnections[steamID];
+                if (preDisconnectionData) {
+                    setTimeout(() => {
+                        this.switchToPreDisconnectionTeam({ player: { eosID, steamID, name, teamID } }).catch(err => {
+                            this.verbose(1, `Error auto-switching ${name} to old team: ${err.message}`);
+                        });
+                    }, 5000);
+                }
+            }
+        }
+
+        // Trigger queue processing if not in faction vote
+        if (!this._s3?.services?.gameState?.isEndgameFactionVote?.()) {
+            await this._processQueue();
+        }
+    }
+
+    async onS3PlayerLeft(data) {
+        if (!data?.player?.eosID) return;
+        this._removePlayerFromQueue(data.player.eosID);
+        if (!this._s3?.services?.gameState?.isEndgameFactionVote?.()) {
+            await this._processQueue();
+        }
+    }
+
+    async onS3PlayerTeamChanged(data) {
+        if (!data?.player?.eosID) return;
+        if (!this._s3?.services?.gameState?.isEndgameFactionVote?.()) {
+            await this._processQueue();
+        }
+    }
+
+    _removePlayerFromQueue(eosID) {
+        if (this._switchQueue.has(eosID)) {
+            const entry = this._switchQueue.get(eosID);
+            clearInterval(entry.warnInterval);
+            this._switchQueue.delete(eosID);
+        }
     }
 
     async unmount() {
@@ -1683,25 +1436,17 @@ export default class Switch extends DiscordBasePlugin {
         }
 
         this.server.removeListener('CHAT_MESSAGE', this.onChatMessage);
-        this.server.removeListener('PLAYER_CONNECTED', this.onPlayerConnected);
-        this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
         this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
         this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
         this.server.removeListener('NEW_GAME', this.onNewGame.bind(this));
-        this.server.removeListener('UPDATED_LAYER_INFORMATION', this.onUpdatedLayerInfo.bind(this));
-        this.server.removeListener('UPDATED_SERVER_INFORMATION', this.onServerInfoUpdated.bind(this));
-        this.server.removeListener('SMART_ASSIGN_EVAL_START', this.onSAEvalStart);
-        this.server.removeListener('SMART_ASSIGN_EVAL_END', this.onSAEvalEnd);
+        this.server.removeListener('S3_PLAYER_JOINED', this.onS3PlayerJoined);
+        this.server.removeListener('S3_PLAYER_LEFT', this.onS3PlayerLeft);
+        this.server.removeListener('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
         if (this.options.discordClient) this.options.discordClient.removeListener('message', this.onDiscordMessage);
-        clearTimeout(this._nullTeamIDWindowTimeout);
         for (const entry of this._switchQueue.values()) {
             clearInterval(entry.warnInterval);
         }
         this._switchQueue.clear();
-        for (const timeout of this._saEvalLocks.values()) {
-            clearTimeout(timeout);
-        }
-        this._saEvalLocks.clear();
         this._s3 = null;
         this.verbose(1, 'Switch plugin was un-mounted.');
     }
@@ -1767,13 +1512,6 @@ export default class Switch extends DiscordBasePlugin {
                     transaction: t
                 });
             });
-
-            const currentEosIDs = new Set(this.server.players.map(p => p.eosID).filter(Boolean));
-            for (const eosID in this.playersConnectionTime) {
-                if (!currentEosIDs.has(eosID)) {
-                    delete this.playersConnectionTime[eosID];
-                }
-            }
 
             const currentSteamIDs = this.server.players.map(p => p.steamID);
             for (const steamID in this.recentDisconnections) {
