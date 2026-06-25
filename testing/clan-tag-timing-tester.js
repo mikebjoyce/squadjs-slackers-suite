@@ -1,26 +1,32 @@
+// DEPRECATED — Stage 5: This script imports from sa-clan-grouper.js which was replaced by S³ ClansService.
+// sa-clan-grouper.js has been deleted. This test/tool script cannot be migrated to S³ and is retained for reference only.
+
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║               CLAN-TAG-TIMING-TESTER v1.0.0                  ║
- * ║                 TESTING/DIAGNOSTICS ONLY - NOT FOR PRODUCTION ║
+ * ║                CLAN-TAG-TIMING-TESTER                        ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Diagnostic plugin to determine whether clan tags are available at
+ * Diagnostic plugin to measure whether clan tags are available at
  * PLAYER_CONNECTED time (log parser) or arrive later via RCON polling.
- * Captures timing and Elo cache state to identify the best design for
- * clan grouping in SmartAssign.
+ * Captures timing and Elo cache state to validate clan grouping design
+ * decisions in SmartAssign.
  *
- * ⚠️  WARNING: This file is located in testing/ and is intended for
- *     development and diagnostic use only. Do NOT deploy to production.
+ * ─── USAGE ───────────────────────────────────────────────────────
  *
- * ─── MINIMAL CONFIG ────────────────────────────────────────────────
+ *   node testing/clan-tag-timing-tester.js
  *
- * {
- *   "plugin": "ClanTagTimingTester",
- *   "enabled": true,
- *   "targetEOSID": null  // null = monitor all joins; set to specific EOSID to target one player
- * }
+ * Requires a running SquadJS server with the plugin enabled in config.json:
+ *   { "plugin": "ClanTagTimingTester", "enabled": true, "targetEOSID": null }
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - This is a DEV-ONLY diagnostic tool. Do NOT deploy to production.
+ * - DEPRECATED: imports from sa-clan-grouper.js which was removed in
+ *   Stage 5 (replaced by S³ ClansService). Retained for reference only.
+ * - Set targetEOSID to null to monitor all joins, or to a specific
+ *   EOSID to focus on a single player.
  *
  * ═══════════════════════════════════════════════════════════════
  */

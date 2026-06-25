@@ -1,49 +1,49 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SA-SWAP-EXECUTOR v1.0.1                    ║
+ * ║                     SA-SWAP-EXECUTOR                          ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
  * Reliable background queue for executing RCON team switches.
- * Uses "One-Hit & Verify" logic to achieve verified swaps in <3s.
+ * Uses "One-Hit & Verify" logic to fire the RCON move command
+ * immediately on join (before the player appears in ListPlayers),
+ * then force-poll to verify the result. Achieves verified swaps
+ * in <3s while preventing bounce-loops via state locking.
  *
- * ─── DESIGN DECISIONS: WHY "ONE-HIT & VERIFY"? ──────────────────
- *
- * 1. THE PROBLEM: Squad's RCON ListPlayers (which feeds server.players)
- *    polls every ~30s. If we wait for it to discover a newly joined
- *    player before moving them, we blow the <5s swap window entirely.
- *
- * 2. THE SOLUTION: Fire Blind. We get the SteamID from the Log Parser
- *    (which fires within ~100ms of join) and send the RCON move command
- *    before the player even appears in ListPlayers.
- *
- * 3. THE BOUNCE LOOP PROBLEM: A naive retry loop would see the stale
- *    player list, think the move failed, and spam RCON continuously —
- *    causing the player to bounce between teams every ~500ms.
- *
- * 4. THE FIX: State Locking ("One-Hit & Verify"). Send the RCON command
- *    ONCE, then set awaitingVerification = true. Force a fresh poll via
- *    updatePlayerList() and check the result. If it succeeded, emit
- *    success. If the player is still on the wrong team, unlock and retry
- *    (rare — means RCON rejected the first command). If the player has
- *    left the server, emit failed and clean up.
- *
- * ─── RCON IDENTIFIER MIGRATION (v1.0.1) ──────────────────────────
- *
- * Per RCON_IDENTIFIER_FINDINGS.md (June 2026), player name is the only
+ * RCON commands use player name as the identifier (per
+ * RCON_IDENTIFIER_FINDINGS.md, June 2026) since it is the only
  * universally reliable RCON identifier on this Squad server version.
- * - eosID and steamID are both rejected by AdminForceTeamChange/AdminWarn.
- * - player.name is always available for connected players.
- * - The identifier cascade: name || eosID || steamID.
  *
- * Changes in v1.0.1:
- *   - queueMove() now accepts (playerKey, playerName, eosID, targetTeamID)
- *   - RCON commands use rcon.execute("AdminForceTeamChange \"playerName\"")
- *   - Player lookups in processRetries() use eosID || steamID (dual-key)
+ * ─── EXPORTS ─────────────────────────────────────────────────────
  *
- * Author:
- * Discord: `real_slacker`
+ * SASwapExecutor (class)
+ *   Constructor accepts (server, config).
+ *   Key public methods:
+ *     queueMove(playerKey, playerName, eosID, targetTeamID)
+ *       — Enqueues a player for team switch via RCON.
+ *     cleanup()
+ *       — Clears the move queue and resets state on plugin unmount.
+ *
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
+ *
+ * Logger (../../core/logger.js)
+ *   Verbose logging from SquadJS core.
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - "Fire Blind" strategy: the RCON command is sent before the player
+ *   is visible in ListPlayers, using data from the Log Parser (~100ms
+ *   after join) to hit the <5s swap window.
+ * - State locking prevents bounce-loops: awaitingVerification flag
+ *   ensures only one RCON command is in-flight per player. If
+ *   verification fails, the retry branch triggers a forced S³ player
+ *   list refresh (if S³ is available) before re-attempting.
+ * - Identifier cascade: name → eosID → steamID. name is used for RCON
+ *   commands; eosID/steamID are used for player lookups and move tracking.
+ * - queueMove() accepts (playerKey, playerName, eosID, targetTeamID).
+ *   playerKey is typically eosID || steamID and is used internally for
+ *   move tracking and duplicate detection.
  *
  * ═══════════════════════════════════════════════════════════════
  */

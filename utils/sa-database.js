@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                      SA-DATABASE v1.0.0                       ║
+ * ║                         SA-DATABASE                           ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -8,23 +8,37 @@
  * Persistent storage utility for the SmartAssign plugin.
  * Handles reading and writing player reconnect memory and round state data
  * to a Sequelize database (SQLite, MySQL, PostgreSQL, etc.).
- * Includes retry logic for database locks and SQLite-specific mutex serialization
- * to ensure stability in high-concurrency environments.
+ * Includes retry logic for database locks and SQLite-specific mutex
+ * serialisation to ensure stability in high-concurrency environments.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
- * SADatabase (default)
- *   Key methods:
- *     initDB()                          — Initializes models and syncs.
- *     saveRoundStartTime(timestamp)     — Updates the current round's start time.
- *     clearReconnectMemory()            — Wipes all disconnected player records.
+ * SADatabase (class)
+ *   Constructor accepts (server, options, connectors).
+ *   Key public methods:
+ *     initDB()                         — Initialises models and syncs.
+ *     saveRoundStartTime(timestamp)    — Updates the current round's start time.
+ *     clearReconnectMemory()           — Wipes all disconnected player records.
  *     savePlayerDisconnect(steamID, team) — Saves a player's team state.
- *     getReconnectTeam(steamID)         — Retrieves a returning player's team.
- *     getAllReconnectMemory()           — Bulk loads all reconnect records into a Map (for crash recovery).
- *     cleanupOldData()                  — Prunes records older than 12 hours.
+ *     getReconnectTeam(steamID)        — Retrieves a returning player's team.
+ *     getAllReconnectMemory()          — Bulk loads all reconnect records into a Map.
+ *     cleanupOldData()                 — Prunes records older than 12 hours.
  *
- * Author:
- * Discord: `real_slacker`
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
+ *
+ * Sequelize (npm)
+ *   ORM for SQLite/MySQL/PostgreSQL persistence.
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Uses a promise-chain mutex (_mutex) to serialise SQLite writes,
+ *   preventing SQLITE_BUSY errors from concurrent operations.
+ * - Retry logic (_executeWithRetry) attempts up to 5 times with
+ *   exponential backoff on SQLITE_BUSY or database-locked errors.
+ * - Reconnect memory model stores steamID, teamID, and a timestamp;
+ *   records older than 12 hours are pruned by cleanupOldData().
+ * - Round state is tracked in a single-row SmartAssignStateModel
+ *   keyed by a deterministic round key (date + layer).
  *
  * ═══════════════════════════════════════════════════════════════
  */

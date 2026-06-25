@@ -1,36 +1,41 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SA-EVENT-LOGGER v1.0.0                     ║
+ * ║                      SA-EVENT-LOGGER                          ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
  * Handles all JSONL event logging for SmartAssign player lifecycle events.
- * Manages in-memory batching, temp file flushing, and round log finalization.
- * Separates I/O concerns from core assignment logic.
+ * Manages in-memory batching, temp file flushing, and round log
+ * finalisation. Separates I/O concerns from core assignment logic.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
- * SAEventLogger (default)
- *   Key methods:
- *     logEvent(eventType, player, extraData, betweenRounds, serverPlayers = [])
- *       — Batches an event into memory. serverPlayers is used to populate t1/t2 population counts embedded in the event.
- *     _flushTempLog()
- *       — Appends in-memory batch to temp file
- *     finalizeRoundLog(roundStartTime, layerName, gamemode, smartAssignActive)
- *       — Finalizes temp log into main JSONL round record
+ * SAEventLogger (class)
+ *   Constructor accepts (options, db).
+ *   Key public methods:
+ *     logEvent(eventType, player, extraData, betweenRounds, serverPlayers)
+ *       — Batches an event into memory with embedded t1/t2 population counts.
+ *     finalizeRoundLog(roundStartTime, layerName, gamemode, smartAssignActive, matchId)
+ *       — Finalises temp log into a permanent JSONL round record.
  *     loadTempEvents()
- *       — Loads accumulated events from temp file into memory
+ *       — Loads accumulated events from temp file into memory (crash recovery).
  *     cleanup()
- *       — Clears timers on plugin unmount
+ *       — Clears batching timers on plugin unmount.
  *
- * ─── DEPENDENCIES ─────────────────────────────────────────────────
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
- * Node fs/promises for async file I/O
- * Logger from SquadJS core
+ * fs/promises (Node built-in)
+ *   Async file I/O for JSONL read/write operations.
  *
- * Author:
- * Discord: `real_slacker`
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Events are batched in-memory (_eventBatch) and flushed to a temp
+ *   file periodically (_startBatchFlushTimer) to minimise disk I/O.
+ * - finalizeRoundLog() renames the temp file to the permanent log path
+ *   and optionally writes to the database via SADatabase.insertRoundWithEvents().
+ * - Separate temp file per round prevents partial writes from corrupting
+ *   completed round logs during crashes.
  *
  * ═══════════════════════════════════════════════════════════════
  */

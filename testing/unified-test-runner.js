@@ -1,6 +1,9 @@
+// DEPRECATED — Stage 5: This script imports from sa-clan-grouper.js which was replaced by S³ ClansService.
+// sa-clan-grouper.js has been deleted. This test/tool script cannot be migrated to S³ and is retained for reference only.
+
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║            UNIFIED-TEST-RUNNER (SmartAssign) v1.0.0           ║
+ * ║              UNIFIED-TEST-RUNNER (SmartAssign)                ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -10,37 +13,23 @@
  * both a baseline (vanilla Squad) and the SmartAssign plugin, measuring
  * Elo balance, forced moves, reconnect success rates, and clan coherence.
  *
- * Supports three replay scenarios:
- *   - Historical matches (from JSONL event logs with real player data)
- *   - Synthetic matches (pattern-based generation from churn statistics)
- *   - Prolonged peak matches (10-50+ hour simulations at 95-100 population)
+ * ─── USAGE ───────────────────────────────────────────────────────
  *
- * ─── USAGE ─────────────────────────────────────────────────────
+ *   node testing/unified-test-runner.js <log.jsonl> [--elo <backup.json>] [--exhaustive] [--repl [match_idx]]
  *
- * node unified-test-runner.js <log.jsonl> [--elo <backup.json>] [--exhaustive] [--repl [match_idx]]
+ *   <log.jsonl>           Event log from sa-event-logger.js
+ *   --elo <backup.json>   Load real Mu values from EloTracker backup
+ *   --exhaustive          Enable verbose per-join logging
+ *   --repl [match_idx]    Start interactive REPL
  *
- *   <log.jsonl>           Event log from sa-event-logger.js (historical matches)
- *   --elo <backup.json>   Load real Mu values from EloTracker backup (optional)
- *   --exhaustive          Enable verbose per-join logging for all events
- *   --repl [match_idx]    Start interactive REPL (optional: initialize from match_idx)
+ * ─── NOTES ───────────────────────────────────────────────────────
  *
- * ─── EXPORTS ─────────────────────────────────────────────────────
- *
- * simulateHistoricalMatch(match, engineConfig, seededRandom, logStream, targetInitialPop)
- *   — Simulates a match against an engine (Baseline or SmartAssign).
- *     Returns metrics: avgGap, avgSumGap, forcedMoves, rejoinRate, clanCoherence, etc.
- *
- * startREPL(eloMap, initialMatch)
- *   — Interactive command-line prompt for manual testing and debugging.
- *
- * ─── DEV-ONLY WARNING ─────────────────────────────────────────────
- *
- * This file is intended for development, testing, and algorithm validation only.
- * It is NOT intended for production deployment. Do not include testing/
- * in production SquadJS installations.
- *
- * Author:
- * Discord: `real_slacker`
+ * - DEV-ONLY testing tool. Do NOT deploy to production.
+ * - DEPRECATED: imports from sa-clan-grouper.js which was removed in
+ *   Stage 5 (replaced by S³ ClansService). Retained for reference only.
+ * - Supports three replay scenarios: historical matches (JSONL logs),
+ *   synthetic matches (pattern-based generation), and prolonged peak
+ *   matches (10-50+ hour simulations at 95-100 population).
  *
  * ═══════════════════════════════════════════════════════════════
  */

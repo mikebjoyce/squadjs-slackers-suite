@@ -1,51 +1,51 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                   SA-TEAM-EVALUATOR v2.0.0                    ║
+ * ║                    SA-TEAM-EVALUATOR                          ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
  * Pure functional module for team assignment scoring and evaluation.
- * No side effects, no state ownership. All state is passed as arguments.
+ * No side effects, no state ownership — all state is passed as arguments.
  * Provides a 3-metric Composite Scoring System aligned with TeamBalancer's
- * algorithm for competitive balance:
- *   - Mean ELO difference
- *   - Top-15 ELO difference (high-skill parity)
- *   - Veteran parity (experience distribution)
+ * algorithm for competitive balance: Mean ELO difference, Top-15 ELO
+ * difference (high-skill parity), and Veteran parity (experience distribution).
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
- * evaluateTeamAssignment(player, server, context) [async]
- *   — Core algorithm that returns { targetTeam, reason }
+ * evaluateTeamAssignment(player, server, context) (async function)
+ *   — Core algorithm that evaluates both teams and returns
+ *     { targetTeam, reason, debugInfo }. Considers hard pop cap,
+ *     physical server cap, reconnect priority, clan grouping, and
+ *     3-metric composite Elo scoring.
  *
- * getRating(player, eloTracker) [async]
- *   — Retrieves player { mu, roundsPlayed } with fallback to defaults
+ * getRating(player, eloTracker) (async function)
+ *   — Retrieves player { mu, roundsPlayed } from EloTracker with
+ *     fallback to defaults (mu=25.0, roundsPlayed=0).
  *
- * ─── CLAN GROUPING ────────────────────────────────────────────────
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
- * SmartAssign can now group clan members on join to keep them together,
- * provided it doesn't violate hard population caps or size parity.
- * This is step 3.5 in the priority hierarchy:
+ * (No local imports — pure logic module with no file dependencies
+ *  beyond the caller-provided eloTracker reference.)
  *
- *   1. Hard Pop Cap → forced team or both-ok
- *   2. Physical Server Cap → forced team or both-ok
- *   3.0 Reconnect Priority → previous team if cap allows
- *   3.5 Clan Grouping → clan team if ALL mates there and cap allows
- *   4. Composite Skill Balance → best 3-metric score
- *   5. Population tie-break → smaller team
+ * ─── NOTES ───────────────────────────────────────────────────────
  *
- * ─── DESIGN NOTES ─────────────────────────────────────────────────
- *
- * All functions are pure (deterministic, no side effects).
- * Caller is responsible for:
- *   - Managing state (pendingAssignments, reconnectMemory, etc.)
- *   - Passing state as arguments
- *   - Handling any warning flags that need tracking (eloNotReadyWarned, etc.)
- *
- * This allows unit testing without a full plugin mount.
- *
- * Author:
- * Discord: `real_slacker`
+ * - All functions are pure (deterministic, no side effects). This
+ *   allows unit testing without a full plugin mount.
+ * - Caller is responsible for managing state (pendingAssignments,
+ *   reconnectMemory, playerTagCache, etc.) and passing it as arguments.
+ * - Priority hierarchy for team assignment:
+ *     1. Hard Pop Cap → forced team or both-ok
+ *     2. Physical Server Cap → forced team or both-ok
+ *     3. Reconnect Priority → previous team if cap allows
+ *     3.5. Clan Grouping → clan team if ALL mates there and cap allows
+ *     4. Composite Skill Balance → best 3-metric score
+ *     5. Population tie-break → smaller team
+ * - Clan grouping uses a player tag cache (provided by caller via S³
+ *   ClansService) to detect clan membership and route players to their
+ *   clan's team when all clan mates are on one side.
+ * - Players with pending moves (in pendingPlayerMoves) are excluded
+ *   from evaluation to prevent double-counting.
  *
  * ═══════════════════════════════════════════════════════════════
  */

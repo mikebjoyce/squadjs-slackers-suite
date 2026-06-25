@@ -1,43 +1,37 @@
+// DEPRECATED — Stage 5: This script imports from sa-clan-grouper.js which was replaced by S³ ClansService.
+// sa-clan-grouper.js has been deleted. This test/tool script cannot be migrated to S³ and is retained for reference only.
+
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║            OPTIMIZE-PARAMS (SmartAssign) v1.0.0               ║
+ * ║              OPTIMIZE-PARAMS (SmartAssign)                    ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
  * Parameter optimizer for SmartAssign's assignment algorithm.
- * Performs a coarse-then-fine grid search to find the parameter set that
- * minimizes mean Mu gap (regret) between teams across all JOIN events.
+ * Performs a coarse-then-fine grid search to find the parameter set
+ * that minimises mean Mu gap (regret) between teams across all JOIN
+ * events in historical match data.
  *
- * Scoring metric:
- *   regret = MuGap(chosen team) - MuGap(optimal team) per JOIN decision
- *   round_score = mean(regret) across all JOINs in a round
- *   total_score = mean(round_score) across all rounds
+ * ─── USAGE ───────────────────────────────────────────────────────
  *
- * ─── USAGE ─────────────────────────────────────────────────────
+ *   node testing/optimize-params.js <log.jsonl> [--elo <backup.json>] [--min-elo-coverage 0.5] [--top 5] [--pin param=value ...]
  *
- * node optimize-params.js <log.jsonl> [--elo <backup.json>] [--min-elo-coverage 0.5] [--top 5] [--pin param=value ...]
+ *   <log.jsonl>              Event log from sa-event-logger.js
+ *   --elo <file.json>        Load real Mu values from EloTracker backup
+ *   --min-elo-coverage <f>   Only rounds with ≥fraction JOINs having real Elo (default: 0.0)
+ *   --top <N>                Top N coarse candidates for fine pass (default: 5)
+ *   --pin param=value        Pin a parameter (e.g., --pin graceHigh=1 graceLow=2)
  *
- *   <log.jsonl>                 Event log from sa-event-logger.js
- *   --elo <file.json>           Load real Mu values from EloTracker backup
- *   --min-elo-coverage <frac>   Only include rounds where ≥frac of JOINs have real Elo (default: 0.0)
- *   --top <N>                   Top N coarse candidates to expand in fine pass (default: 5)
- *   --pin param=value           Pin a parameter to a fixed value (e.g., --pin graceHigh=1 graceLow=2)
+ * ─── NOTES ───────────────────────────────────────────────────────
  *
- * ─── OUTPUT ─────────────────────────────────────────────────────
- *
- * Coarse & fine pass results, top 10 parameter sets, baseline comparison
- * (no-op vs population-only), per-round breakdown for winner, and clan
- * grouping effectiveness metrics.
- *
- * ─── DEV-ONLY WARNING ─────────────────────────────────────────────
- *
- * This file is intended for development and parameter tuning only.
- * It is NOT intended for production deployment. Do not include testing/
- * in production SquadJS installations.
- *
- * Author:
- * Discord: `real_slacker`
+ * - DEV-ONLY parameter tuning tool. Do NOT deploy to production.
+ * - DEPRECATED: imports from sa-clan-grouper.js which was removed in
+ *   Stage 5 (replaced by S³ ClansService). Retained for reference only.
+ * - Scoring metric: regret = MuGap(chosen team) - MuGap(optimal team)
+ *   per JOIN; round_score = mean(regret); total_score = mean(round_score).
+ * - Outputs coarse & fine pass results, top 10 parameter sets, baseline
+ *   comparison, per-round breakdown, and clan grouping effectiveness metrics.
  *
  * ═══════════════════════════════════════════════════════════════
  */

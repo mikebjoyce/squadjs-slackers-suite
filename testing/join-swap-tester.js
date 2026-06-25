@@ -1,7 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  JOIN-SWAP-TESTER v1.0.0                     ║
- * ║                 TESTING/DIAGNOSTICS ONLY - NOT FOR PRODUCTION ║
+ * ║                    JOIN-SWAP-TESTER                           ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -10,16 +9,19 @@
  * disconnect detection. Targets a specific player and logs detailed
  * performance metrics for SmartAssign validation.
  *
- * ⚠️  WARNING: This file is located in testing/ and is intended for
- *     development and diagnostic use only. Do NOT deploy to production.
+ * ─── USAGE ───────────────────────────────────────────────────────
  *
- * ─── MINIMALIST CONFIG ────────────────────────────────────────────
+ *   node testing/join-swap-tester.js
  *
- * {
- *   "plugin": "JoinSwapTester",
- *   "enabled": true,
- *   "targetEOSID": "player-eos-id-here"
- * }
+ * Requires a running SquadJS server with the plugin enabled in config.json:
+ *   { "plugin": "JoinSwapTester", "enabled": true, "targetEOSID": "player-eos-id-here" }
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - DEV-ONLY diagnostic tool. Do NOT deploy to production.
+ * - Targets a specific player by EOSID and runs full lifecycle profiling:
+ *   join → immediate swap to opposite team, verified swap time report,
+ *   disconnect → RCON detection delay report.
  *
  * ═══════════════════════════════════════════════════════════════
  */
