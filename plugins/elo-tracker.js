@@ -40,18 +40,28 @@
  *   In-game chat command handlers for !elo and !eloadmin.
  *
  * ─── S³ INTEGRATION ──────────────────────────────────────────────
- * <!-- TO REVIEW: consolidate with cross-plugin S³ documentation -->
+ *
+ * S³ (Slacker's Squad Services) is the centralised service container
+ * for shared state across Slacker's Squad plugins.  It owns the
+ * ground truth for server configuration, game-state lifecycle,
+ * player state, faction metadata, clan grouping, database access,
+ * and cross-plugin event routing.  Consumer plugins discover S³ at
+ * runtime via this.server.plugins and access services through flat
+ * getters (e.g. this._s3?.gameState) guarded by isReady() checks.
+ *
+ * GitHub: https://github.com/mikebjoyce/squadjs-slackers-squad-services
  *
  * Consumed Services:
  *   - gameState: roundStartTime recovery, layer/gamemode fallback on
  *     server restart, and layer-name checks for ignored game modes.
  *
- * Listened Events (from other plugins):
+ * Emitted Events:
+ *   - None.
+ *
+ * Listened Events:
  *   - TEAM_BALANCER_SCRAMBLE_EXECUTED: fired by TeamBalancer after a
  *     scramble; EloTracker captures a team-balance snapshot for Discord
  *     reporting.
- *
- * <!-- END TO REVIEW -->
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
@@ -478,18 +488,19 @@ export default class EloTracker extends BasePlugin {
 
   _isIgnoredMatch() {
     const gs = this._s3?.gameState;
-    const matched = gs.isIgnoredMode();
+    if (!gs) return null; // No S³ → can't determine, not ignored
+    const matched = gs.isIgnoredMode?.();
     if (matched) return true; // true → the mode was matched
-    if (gs.getGamemode() === 'Unknown' && gs.getLayerName() === 'Unknown') return 'Unknown';
+    if (gs.getGamemode?.() === 'Unknown' && gs.getLayerName?.() === 'Unknown') return 'Unknown';
     return null;
   }
 
   _getLayerName() {
-    return this._s3?.gameState.getLayerName();
+    return this._s3?.gameState?.getLayerName?.();
   }
 
   _getGamemode() {
-    return this._s3?.gameState.getGamemode();
+    return this._s3?.gameState?.getGamemode?.();
   }
 
   async onRoundEnded(data) {
