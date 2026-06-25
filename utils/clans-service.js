@@ -79,6 +79,14 @@ export default class ClansService {
     };
 
     this._isMounted = false;
+
+    /**
+     * @private Internal cache — do not access directly from consumer plugins.
+     * Use addPlayerToCache() / getPlayerTagCache() public API instead.
+     * Bypassing this (e.g. consumer writes `clans._playerTagCache.set(...)`)
+     * couples the consumer to the internal property name and bypasses
+     * future guard logic. See Stage 6.2a.
+     */
     this._playerTagCache = new Map();
   }
 

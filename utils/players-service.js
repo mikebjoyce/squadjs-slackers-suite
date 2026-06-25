@@ -20,7 +20,8 @@
  *   Locking:      canAct(), lock(), unlock(), lockGlobal(),
  *                 unlockGlobal(), isLockedBy(), isGloballyLockedBy()
  *   Attribution:  recordMove()
- *   Reconnects:   rememberReconnect(), getReconnect(), clearReconnects()
+ *   Reconnects:   rememberReconnect(), getReconnect(), peekReconnect(),
+ *                 clearReconnects()
  *   Refresh:      registerRefreshInterest(), unregisterRefreshInterest(),
  *                 requestRefresh(), refreshNow()
  *   Lifecycle:    mount(), unmount(), isReady(),
@@ -518,6 +519,43 @@ export default class PlayersService {
     }
 
     this._reconnectMemory.clear();
+  }
+
+  /**
+   * Non-destructive reconnect lookup — returns the same data as getReconnect()
+   * but does NOT delete the record. Multiple consumers can call this for the
+   * same player without consuming it. Used internally to enrich S3_PLAYER_JOINED
+   * payloads with previousTeamID so all listeners get the data without calling
+   * the destructive getReconnect().
+   *
+   * Still respects staleness checks — returns null for stale/expired data without
+   * removing the underlying record (bulk cleanup via prune handles that).
+   */
+  async peekReconnect(eosID) {
+    await this._pruneReconnects();
+    const key = this._normalizeIdentifier(eosID);
+    if (!key) return null;
+
+    const dbService = this._getDbService();
+    if (this.reconnectModel) {
+      const row = await dbService?.executeWithRetry
+        ? dbService.executeWithRetry(async () => this.reconnectModel.findByPk(key))
+        : this.reconnectModel.findByPk(key);
+      if (row) {
+        const normalized = this._normalizeReconnectRow(row);
+        if (this._isReconnectStale(normalized)) {
+          return null;
+        }
+        this._reconnectMemory.set(key, normalized);
+        return normalized;
+      }
+    }
+
+    const cached = this._reconnectMemory.get(key) || null;
+    if (cached && this._isReconnectStale(cached)) {
+      return null;
+    }
+    return cached || null;
   }
 
   async _checkReconnect(playerState) {
@@ -1051,8 +1089,14 @@ export default class PlayersService {
       this.verboseLogger(1, `[Players] NEW player: ${playerName} (eosID=${joined.eosID}, steamID=${joined.steamID}, teamID=${joined.teamID}, source=${source})`);
 
       if (emitJoin) {
+        // Synchronous in-memory peek for reconnect data to provide previousTeamID
+        // in the join payload. Only checks the in-memory cache (prune already ran
+        // before _registerPlayer is called), avoiding an async DB lookup.
+        const reconnectInfo = this._reconnectMemory.get(key) || null;
+        const previousTeamID = reconnectInfo?.lastTeamID ?? null;
         this.server.emit('S3_PLAYER_JOINED', {
           player: { ...joined },
+          previousTeamID,
           source
         });
 
@@ -1084,8 +1128,11 @@ export default class PlayersService {
     this._indexPlayer(state, key);
 
     if (emitJoin && !state.joinEmitted) {
+      const reconnectInfo = this._reconnectMemory.get(key) || null;
+      const previousTeamID = reconnectInfo?.lastTeamID ?? null;
       this.server.emit('S3_PLAYER_JOINED', {
         player: { ...state },
+        previousTeamID,
         source
       });
       state.joinEmitted = true;

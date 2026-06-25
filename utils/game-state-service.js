@@ -20,7 +20,7 @@
  *   Phase: getPhase(), isStaging(), isLive(), isEnding(), isResolving()
  *   Layer: getGamemode(), getLayerName(), inferGameMode(layerName),
  *          resolveLayerInfo(layerData, source), isIgnoredMode(),
- *          setIgnoredGameModes(modes)
+ *          isSeedMode(), isTrainingMode(), setIgnoredGameModes(modes)
  *   Timing: getRoundStartTime(), getMatchId()
  *   ENDGAME sub-state: getEndgameSubState(), isEndgameScoreboard(),
  *          isEndgameLayerVote(), isEndgameFactionVote(),
@@ -258,6 +258,31 @@ export default class GameStateService {
       const candidate = String(mode).toLowerCase();
       return gameMode.includes(candidate) || layerName.includes(candidate);
     });
+  }
+
+  /**
+   * Check if current layer is a Seed mode round (used for auto-scramble decisions).
+   * Intentionally distinct from isIgnoredMode() — Seed can be both "ignored" for
+   * win-streak tracking AND trigger auto-scramble behaviour (e.g. TeamBalancer).
+   * Jensen/Training rounds are NOT Seed — see isTrainingMode().
+   */
+  isSeedMode() {
+    if (!this.isReady()) return false;
+    const gameMode = this.getGamemode().toLowerCase();
+    const layerName = this.getLayerName().toLowerCase();
+    return gameMode.includes('seed') || layerName.includes('seed');
+  }
+
+  /**
+   * Check if current layer is a Training/Jensen's Range round.
+   * Separate from isSeedMode() so consumers can distinguish between
+   * "auto-scramble on Seed" and "skip Elite/ranking logic on Training".
+   */
+  isTrainingMode() {
+    if (!this.isReady()) return false;
+    const gameMode = this.getGamemode().toLowerCase();
+    const layerName = this.getLayerName().toLowerCase();
+    return gameMode.includes('jensen') || layerName.includes('jensen');
   }
 
   /**
