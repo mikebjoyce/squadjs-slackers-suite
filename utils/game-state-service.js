@@ -318,7 +318,8 @@ export default class GameStateService {
     //    Checks raw `this.server.players` directly — the unmanaged, full server player list.
     //    This is a degraded-mode safety net that still works when no PlayersService has mounted.
 
-    const playersService = this.parent?.services?.players || null;
+    // Stage 5.2g — flat access via S³ plugin getters
+    const playersService = this.parent?.players || null;
     if (playersService?.areTeamsResolved) {
       const allResolved = playersService.areTeamsResolved();
       if (!allResolved) return;
@@ -669,7 +670,8 @@ export default class GameStateService {
   }
 
   _getDbService() {
-    return this.parent?.services?.db || null;
+    // Stage 5.2g — flat access via S³ plugin getters
+    return this.parent?.db || null;
   }
 
   _getSequelize(dbService = this._getDbService()) {
@@ -703,7 +705,8 @@ export default class GameStateService {
   // This dependency was discovered during implementation and is why the container mounts
   // serverConfig first in mount(), diverging from the original build-order plan.
   _getServerConfig() {
-    return this.parent?.services?.serverConfig || null;
+    // Stage 5.2g — flat access via S³ plugin getters
+    return this.parent?.serverConfig || null;
   }
 
   _getTimeBeforeVote() {

@@ -131,6 +131,15 @@ export default class SlackersSquadServices extends BasePlugin {
     };
   }
 
+  // Flat accessors — Stage 5.2a: consumers use this._s3?.gameState (not this._s3?.services?.gameState)
+  // Each returns the underlying service instance (may be null before mount completes).
+  get gameState()     { return this.services.gameState; }
+  get serverConfig()  { return this.services.serverConfig; }
+  get db()            { return this.services.db; }
+  get factions()      { return this.services.factions; }
+  get clans()         { return this.services.clans; }
+  get players()       { return this.services.players; }
+
   async prepareToMount() {
     this.services.db = new DBService({
       parent: this,

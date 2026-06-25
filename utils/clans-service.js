@@ -54,6 +54,10 @@ export default class ClansService {
     return !!this.options.enabled;
   }
 
+  isReady() {
+    return this._isMounted;
+  }
+
   getOptions(overrides = {}) {
     return {
       ...this.options,

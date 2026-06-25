@@ -79,6 +79,10 @@ export default class FactionsService {
     return this._isMounted;
   }
 
+  isReady() {
+    return this._isMounted;
+  }
+
   getCachedAbbreviations() {
     return { ...this.cachedAbbreviations };
   }

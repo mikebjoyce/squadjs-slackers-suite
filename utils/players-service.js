@@ -158,6 +158,10 @@ export default class PlayersService {
     this.verboseLogger(2, '[Players] Unmounted.');
   }
 
+  isReady() {
+    return this._isMounted;
+  }
+
   getPlayer(eosIDOrSteamID) {
     const key = this._resolvePlayerKey(eosIDOrSteamID);
     if (!key) return null;

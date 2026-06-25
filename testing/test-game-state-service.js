@@ -92,7 +92,7 @@ await runTest('isIgnoredMode matches case-insensitive substrings', async () => {
 await runTest('phase transitions NEW_GAME resolving -> STAGING(resolving=false) when teams resolve', async () => {
   const server = new MockServer();
   const parent = { services: {} };
-  parent.services.players = new PlayersService({ parent, server });
+  parent.players = parent.services.players = new PlayersService({ parent, server });
   const service = new GameStateService({ parent, server, stagingDurationMs: 2500 });
   parent.services.gameState = service;
 
@@ -155,7 +155,8 @@ await runTest('persists and recovers phase/resolving/layer state via sequelize c
 
   const server1 = new MockServer();
   const parent1 = { services: { db: dbService } };
-  parent1.services.players = new PlayersService({ parent: parent1, server: server1 });
+  parent1.db = parent1.services.db;
+  parent1.players = parent1.services.players = new PlayersService({ parent: parent1, server: server1 });
   const service1 = new GameStateService({
     parent: parent1,
     server: server1,
@@ -183,6 +184,7 @@ await runTest('persists and recovers phase/resolving/layer state via sequelize c
 
   const server2 = new MockServer();
   const parent2 = { services: { db: dbService } };
+  parent2.db = parent2.services.db;
   const service2 = new GameStateService({
     parent: parent2,
     server: server2,
@@ -210,6 +212,7 @@ await runTest('invalidates recovered state when recovered round age is impossibl
 
   const server1 = new MockServer();
   const parent1 = { services: { db: dbService } };
+  parent1.db = parent1.services.db;
   const service1 = new GameStateService({
     parent: parent1,
     server: server1,
@@ -235,6 +238,7 @@ await runTest('invalidates recovered state when recovered round age is impossibl
 
   const server2 = new MockServer();
   const parent2 = { services: { db: dbService } };
+  parent2.db = parent2.services.db;
   const service2 = new GameStateService({
     parent: parent2,
     server: server2,
@@ -260,6 +264,7 @@ await runTest('invalidates recovered STAGING when it is already overdue', async 
 
   const server1 = new MockServer();
   const parent1 = { services: { db: dbService } };
+  parent1.db = parent1.services.db;
   const service1 = new GameStateService({
     parent: parent1,
     server: server1,
@@ -285,6 +290,7 @@ await runTest('invalidates recovered STAGING when it is already overdue', async 
 
   const server2 = new MockServer();
   const parent2 = { services: { db: dbService } };
+  parent2.db = parent2.services.db;
   const service2 = new GameStateService({
     parent: parent2,
     server: server2,
@@ -310,7 +316,8 @@ await runTest('invalidates recovered state on authoritative known-layer divergen
 
   const server1 = new MockServer();
   const parent1 = { services: { db: dbService } };
-  parent1.services.players = new PlayersService({ parent: parent1, server: server1 });
+  parent1.db = parent1.services.db;
+  parent1.players = parent1.services.players = new PlayersService({ parent: parent1, server: server1 });
   const service1 = new GameStateService({
     parent: parent1,
     server: server1,
@@ -330,6 +337,7 @@ await runTest('invalidates recovered state on authoritative known-layer divergen
 
   const server2 = new MockServer();
   const parent2 = { services: { db: dbService } };
+  parent2.db = parent2.services.db;
   const service2 = new GameStateService({
     parent: parent2,
     server: server2,
@@ -353,7 +361,7 @@ await runTest('invalidates recovered state on authoritative known-layer divergen
 await runTest('startup churn with null team IDs does not clear resolving early', async () => {
   const server = new MockServer();
   const parent = { services: {} };
-  parent.services.players = new PlayersService({ parent, server });
+  parent.players = parent.services.players = new PlayersService({ parent, server });
   const service = new GameStateService({ parent, server, stagingDurationMs: 2500 });
   parent.services.gameState = service;
 
@@ -415,7 +423,7 @@ class MockServerConfig {
 
 await runTest('ROUND_ENDED transitions to ENDGAME with scoreboard sub-state', async () => {
   const server = new MockServer();
-  const parent = { services: { serverConfig: new MockServerConfig() } };
+  const parent = { services: { serverConfig: new MockServerConfig() }, serverConfig: new MockServerConfig() };
   const service = new GameStateService({ parent, server });
 
   await service.mount();
@@ -431,7 +439,7 @@ await runTest('ROUND_ENDED transitions to ENDGAME with scoreboard sub-state', as
 
 await runTest('ENDGAME scoreboard transitions to layerVote after TimeBeforeVote', async () => {
   const server = new MockServer();
-  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0 }) } };
+  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0 }) }, serverConfig: new MockServerConfig({ timeBeforeVote: 0 }) };
   const service = new GameStateService({ parent, server });
 
   await service.mount();
@@ -447,7 +455,7 @@ await runTest('ENDGAME scoreboard transitions to layerVote after TimeBeforeVote'
 
 await runTest('ENDGAME layerVote transitions to factionVoteTeam1', async () => {
   const server = new MockServer();
-  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0 }) } };
+  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0 }) }, serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0 }) };
   const service = new GameStateService({ parent, server });
 
   await service.mount();
@@ -466,7 +474,7 @@ await runTest('ENDGAME layerVote transitions to factionVoteTeam1', async () => {
 
 await runTest('ENDGAME factionVoteTeam1 transitions to factionVoteTeam2', async () => {
   const server = new MockServer();
-  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0, teamVoteDuration: 0 }) } };
+  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0, teamVoteDuration: 0 }) }, serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0, teamVoteDuration: 0 }) };
   const service = new GameStateService({ parent, server });
 
   await service.mount();
@@ -485,7 +493,7 @@ await runTest('ENDGAME factionVoteTeam1 transitions to factionVoteTeam2', async 
 
 await runTest('ENDGAME factionVoteTeam2 transitions to postVoting (waiting for NewGame)', async () => {
   const server = new MockServer();
-  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0, teamVoteDuration: 0 }) } };
+  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0, teamVoteDuration: 0 }) }, serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0, teamVoteDuration: 0 }) };
   const service = new GameStateService({ parent, server });
 
   await service.mount();
@@ -504,7 +512,7 @@ await runTest('ENDGAME factionVoteTeam2 transitions to postVoting (waiting for N
 
 await runTest('postVoting transitions to STAGING via NEW_GAME and clears sub-state to null', async () => {
   const server = new MockServer();
-  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0, teamVoteDuration: 0 }) } };
+  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0, teamVoteDuration: 0 }) }, serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0, teamVoteDuration: 0 }) };
   const service = new GameStateService({ parent, server });
 
   await service.mount();
@@ -525,7 +533,7 @@ await runTest('postVoting transitions to STAGING via NEW_GAME and clears sub-sta
 
 await runTest('NEW_GAME clears ENDGAME timer and sub-state', async () => {
   const server = new MockServer();
-  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 60 }) } };
+  const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 60 }) }, serverConfig: new MockServerConfig({ timeBeforeVote: 60 }) };
   const service = new GameStateService({ parent, server });
 
   await service.mount();
