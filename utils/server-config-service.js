@@ -1,12 +1,48 @@
 /**
- * Shared server config service for Slacker's Squad Services (S³).
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║               SERVER CONFIG SERVICE                          ║
+ * ╚═══════════════════════════════════════════════════════════════╝
  *
- * Stage 1 scope:
- * - Parse Squad server configuration files at mount time
- * - Cache key values for runtime access
- * - Provide fallback defaults when files are unavailable
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Parses Squad server configuration files (Server.cfg, VoteConfig.cfg)
+ * at mount time and caches key values for runtime access. Falls back
+ * to standard Squad defaults when config files are unavailable or
+ * unparseable.
+ *
+ * ─── EXPORTS ─────────────────────────────────────────────────────
+ *
+ * ServerConfigService (class, default)
+ *   mount()              — Reads and parses config files from disk.
+ *   unmount()            — Resets mounted state.
+ *   isReady()            — Returns true when service is mounted.
+ *   isLoadedSuccessfully() — Returns true if at least one config file
+ *                            was parsed successfully.
+ *   getConfig()          — Returns all config values as a flat object.
+ *   getConfigPath()      — Returns the resolved config directory path.
+ *   getAllowTeamChanges()   — Server.cfg AllowTeamChanges setting.
+ *   getMaxPlayers()         — Server.cfg MaxPlayers setting.
+ *   getNumReservedSlots()   — Server.cfg NumReservedSlots setting.
+ *   getTimeBetweenMatches() — Server.cfg TimeBetweenMatches (seconds).
+ *   getTimeBeforeVote()     — Server.cfg TimeBeforeVote (seconds).
+ *   getTeamVoteDuration()   — VoteConfig.cfg TeamVote_Duration (seconds).
+ *   getLayerVoteDuration()  — VoteConfig.cfg LayerVoteDuration (seconds).
+ *
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
+ *
+ * node:fs (stdlib)
+ *   Synchronous file I/O (readFileSync, existsSync).
+ * node:path (stdlib)
+ *   Path resolution and joining (join, resolve, dirname).
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Fallback defaults match standard Squad voting durations (30s/25s/25s).
+ * - Config file parse errors silently fall back to DEFAULT_CONFIG.
+ * - Mount-order critical: consumed by gameState for ENDGAME timer chain.
+ * - Only reads files at mount time — does not watch for file changes.
+ *
  */
-
 import { readFileSync, existsSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 

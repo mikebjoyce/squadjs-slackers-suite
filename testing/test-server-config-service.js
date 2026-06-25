@@ -1,3 +1,25 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║          SERVER CONFIG SERVICE TEST                          ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Validates ServerConfigService: parsing of Squad Server.cfg and
+ * VoteConfig.cfg files, vote duration extraction, and default
+ * fallback values when config keys are missing.
+ *
+ * ─── USAGE ───────────────────────────────────────────────────────
+ *
+ *   node testing/test-server-config-service.js
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Creates a temp directory under project root for config files.
+ * - Cleans up the temp directory after test completion.
+ *
+ */
+
 import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';

@@ -1,3 +1,24 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║          PLAYERS SERVICE TEST                                ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Validates PlayersService: player tracking, reconnect detection,
+ * global and per-player locking, event emission, and player info
+ * updates.
+ *
+ * ─── USAGE ───────────────────────────────────────────────────────
+ *
+ *   node testing/test-players-service.js
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Uses mock Server and mock DBService — no running SquadJS required.
+ *
+ */
+
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import PlayersService from '../utils/players-service.js';

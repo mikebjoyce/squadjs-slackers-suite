@@ -1,19 +1,50 @@
 /**
- * PlayersService — centralized player registry with move attribution and priority-based locking.
- * Part of Slacker's Squad Services (S³).
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║               PLAYERS SERVICE                                ║
+ * ╚═══════════════════════════════════════════════════════════════╝
  *
- * Scope:
- * - Centralize player registry diffing via UPDATED_PLAYER_INFORMATION lifecycle events
- * - Own per-player move attribution with TTL-based consumption before team change emission
- * - Provide priority-based per-player and global locking for TeamBalancer, SmartAssign, Switch coordination
- * - Provide minimal reconnect memory persistence (db-backed when available)
+ * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Build order: 6 (depends on: parent, server, verboseLogger; consumed by: <planned, not yet wired>)
- * Design ref: DesignDocs/slackers-squad-services-design.md §4
+ * Centralizes player registry management with per-tick diffing via
+ * UPDATED_PLAYER_INFORMATION events. Provides move attribution with
+ * TTL-based consumption, priority-based per-player and global locking
+ * for multi-plugin coordination, DB-backed reconnect memory, a
+ * coalesced refresh manager, and a null-teamID projection subsystem
+ * for round-transition stability.
  *
- * @example
- * // Inside handleUpdatedPlayerInfo, on every UPDATED_PLAYER_INFORMATION tick:
- * this.services.players.handleUpdatedPlayerInfo(data);
+ * ─── EXPORTS ─────────────────────────────────────────────────────
+ *
+ * PlayersService (class, default)
+ *   Registry:     getPlayer(), hasPlayer(), getAllPlayers(),
+ *                 getSquads(), areTeamsResolved()
+ *   Locking:      canAct(), lock(), unlock(), lockGlobal(),
+ *                 unlockGlobal(), isLockedBy(), isGloballyLockedBy()
+ *   Attribution:  recordMove()
+ *   Reconnects:   rememberReconnect(), getReconnect(), clearReconnects()
+ *   Refresh:      registerRefreshInterest(), unregisterRefreshInterest(),
+ *                 requestRefresh(), refreshNow()
+ *   Lifecycle:    mount(), unmount(), isReady(),
+ *                 handlePlayerConnected(), handleUpdatedPlayerInfo()
+ *
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
+ *
+ * (No local imports — depends on parent, server, and verboseLogger
+ *  injected via constructor.)
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Lock priority ordering: TeamBalancer(3) > SmartAssign(2) > Switch(1).
+ * - Null-teamID projection: When teams go null after NEW_GAME, a
+ *   projected player list is served with teams flipped 1↔2.
+ * - Emitted events: S3_PLAYER_JOINED, S3_PLAYER_LEFT,
+ *   S3_PLAYER_TEAM_CHANGED, S3_PLAYER_RECONNECTED, S3_PLAYERS_UPDATED,
+ *   S3_PLAYER_LOCK_CHANGED, S3_GLOBAL_LOCK_CHANGED.
+ * - Refresh manager coalesces burst requestRefresh() calls with
+ *   configurable debounce; periodic forced refreshes when consumer
+ *   intervals are registered.
+ * - Reconnect memory is DB-backed when DBService is available, with
+ *   in-memory fallback and periodic pruning.
+ *
  */
 
 // Round flow notes for future reference:

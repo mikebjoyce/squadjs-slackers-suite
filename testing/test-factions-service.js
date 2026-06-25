@@ -1,3 +1,24 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║          FACTIONS SERVICE TEST                               ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Validates FactionsService: faction and team name resolution from
+ * game layer data, live-phase gating, and layer/faction cache clearing
+ * on new game events.
+ *
+ * ─── USAGE ───────────────────────────────────────────────────────
+ *
+ *   node testing/test-factions-service.js
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Uses mock Server and mock GameState — no running SquadJS required.
+ *
+ */
+
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import FactionsService from '../utils/factions-service.js';

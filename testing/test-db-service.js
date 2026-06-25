@@ -1,3 +1,24 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║          DB SERVICE TEST                                     ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Validates DBService: Sequelize initialization, table creation, CRUD
+ * operations, retry logic, and dialect detection.
+ *
+ * ─── USAGE ───────────────────────────────────────────────────────
+ *
+ *   node testing/test-db-service.js
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Uses mock Sequelize — no SQLite file created. No running server
+ *   required.
+ *
+ */
+
 import assert from 'node:assert/strict';
 import DBService from '../utils/db-service.js';
 

@@ -1,3 +1,24 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║          GAME STATE SERVICE TEST                             ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Validates GameStateService lifecycle: phase transitions, matchId and
+ * roundStartTime centralization, stale recovery detection, ENDGAME timer
+ * chain cancellation, and mount-time fallback behavior.
+ *
+ * ─── USAGE ───────────────────────────────────────────────────────
+ *
+ *   node testing/test-game-state-service.js
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Uses mock Sequelize and mock Server — no running SquadJS required.
+ *
+ */
+
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import GameStateService from '../utils/game-state-service.js';

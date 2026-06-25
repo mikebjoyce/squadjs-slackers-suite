@@ -1,20 +1,54 @@
 /**
- * GameState — Centralizes round phase tracking and layer/gamemode resolution.
- * Part of Slacker's Squad Services (S³).
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║               GAME STATE SERVICE                             ║
+ * ╚═══════════════════════════════════════════════════════════════╝
  *
- * Scope:
- * - Tracks round phases (STAGING → LIVE → ENDGAME) with resolving sub-state during STAGING
- * - Infers and resolves layer information (gamemode from layer name)
- * - Manages ENDGAME sub-state progression via timer-based voting state machine
- * - Provides parameterized ignored-mode substring matching utility
- * - Persists/recovers state for restart resilience with round-age validation
+ * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Build order: 3 (depends on: parent, server, verboseLogger, ignoredGameModes; consumed by: factions; <planned, not yet wired> TB, SA, Switch, Elo)
- * Design ref: DesignDocs/slackers-squad-services-design.md §5
+ * Centralizes round phase tracking (STAGING → LIVE → ENDGAME with
+ * resolving sub-state), layer and gamemode inference from layer names,
+ * ENDGAME sub-state progression via timer-based voting approximations,
+ * and crash-safe state persistence and recovery with round-age validation.
  *
- * @example
- * // inside factions-service handleUpdatedPlayerInfo, gates team abbreviation polling in LIVE phase
- * this.gameState.isLive(); // true if round is in LIVE phase
+ * ─── EXPORTS ─────────────────────────────────────────────────────
+ *
+ * GameStateService (class, default)
+ *   mount()              — Initialises persistence, recovers state,
+ *                          resolves current layer, registers event listeners.
+ *   unmount()            — Clears timers and resets mounted state.
+ *   isReady()            — Returns true when service is mounted.
+ *   Phase: getPhase(), isStaging(), isLive(), isEnding(), isResolving()
+ *   Layer: getGamemode(), getLayerName(), inferGameMode(layerName),
+ *          resolveLayerInfo(layerData, source), isIgnoredMode(),
+ *          setIgnoredGameModes(modes)
+ *   Timing: getRoundStartTime(), getMatchId()
+ *   ENDGAME sub-state: getEndgameSubState(), isEndgameScoreboard(),
+ *          isEndgameLayerVote(), isEndgameFactionVote(),
+ *          isEndgameFactionVoteTeam1(), isEndgameFactionVoteTeam2(),
+ *          isEndgamePostVoting(), isEndgameVotingComplete()
+ *   Lifecycle events: handleNewGame(), handleRoundEnded(),
+ *          handleLayerInfoUpdated(), handleServerInfoUpdated(),
+ *          handleUpdatedPlayerInfo()
+ *
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
+ *
+ * (No local imports — service is dependency-injected with parent,
+ *  server, and verboseLogger.)
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Implicit dependency: serverConfig must be mounted before gameState
+ *   so ENDGAME timers can read real vote durations from VoteConfig.cfg.
+ * - Persists phase, resolving, timestamps, layer info, roundStartTime,
+ *   and matchId to the S3_GameState database table for crash recovery.
+ * - Recovered rounds older than maxRecoveredRoundAgeMs (default 2 hours)
+ *   are invalidated and transitioned to LIVE; Seed mode rounds can
+ *   exceed this limit — documented as a known limitation.
+ * - ENDGAME sub-states are NOT persisted. Recovering into ENDGAME
+ *   warns about lost sub-state visibility.
+ * - Timer-based ENDGAME progression is approximate — actual voting may
+ *   end early if enough players cast votes.
+ *
  */
 
 // Round flow notes for future reference:

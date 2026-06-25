@@ -1,16 +1,49 @@
 /**
- * Shared DB service for Slacker's Squad Services (S³).
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║               DB SERVICE                                     ║
+ * ╚═══════════════════════════════════════════════════════════════╝
  *
- * Stage 1 scope:
- * - Centralize retry+jitter lock handling for sequelize operations
- * - Provide optional SQLite mutex serialization helpers
- * - Enforce SQLite WAL pragmas once per connector
- * - Provide lightweight migration runner (no sync({ alter: true }))
- * - Standardize connector resolution for S³ services + later plugin migrations
+ * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * @example
- * // not yet invoked — representative call shape for future consumers
- * svc.services.db.defineModel('PlayerStats', { kills: { type: DataTypes.INTEGER } });
+ * Centralizes Sequelize connector management with SQLite-specific
+ * retry+jitter locking, WAL pragma enforcement, mutex serialization,
+ * and a lightweight migration runner. Provides a uniform database
+ * interface for all S³ services and plugin consumers.
+ *
+ * ─── EXPORTS ─────────────────────────────────────────────────────
+ *
+ * DBService (class, default)
+ *   mount()                — Initialises Sequelize, runs WAL pragmas,
+ *                            inits migration model, applies pending migrations.
+ *   unmount()              — Resets mounted state.
+ *   isReady()              — Returns true when service is mounted.
+ *   getConnector()         — Returns the underlying Sequelize instance.
+ *   getConnectorName()     — Returns dialect name or connector label.
+ *   getDataTypes()         — Resolves Sequelize DataTypes from connector.
+ *   defineModel(name, schema, opts) — Defines and caches a Sequelize model.
+ *   registerMigration(id, runFn) — Registers a named migration for execution.
+ *   runMigrations()        — Applies all pending registered migrations.
+ *   executeWithRetry(fn, opts) — Wraps logicFn with retry+jitter, SQLite-mutexed.
+ *   withTransaction(fn, opts) — Executes logicFn inside a Sequelize transaction.
+ *   withTransactionWithRetry(fn, opts) — Transaction with retry+jitter.
+ *   ensureSqlitePragmas()  — Enforces WAL + synchronous=NORMAL on SQLite.
+ *   Static: resolveConnector(), isLockError(), isSqlite(),
+ *           withConnectorMutex(), withSqliteMutex(),
+ *           executeWithRetry(), withTransaction(),
+ *           ensureSqlitePragmas(), sleep(), getConnectorMutex()
+ *
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
+ *
+ * (No local imports — depends on Sequelize passed via constructor.)
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Falls back to no-op mode when no Sequelize connector is available.
+ * - Migrations are idempotent — previously-applied migrations are skipped.
+ * - SQLite operations are serialized through a per-connector mutex to
+ *   prevent concurrent write contention.
+ * - Retry defaults: 5 attempts, 200ms base delay, 500ms jitter.
+ *
  */
 export default class DBService {
   constructor({

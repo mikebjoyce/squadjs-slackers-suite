@@ -1,18 +1,60 @@
 /**
- * ClansService — Extracts and groups player clan tags from names, with caching and team-assignment helpers.
- * Part of Slacker's Squad Services (S³).
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║               CLANS SERVICE                                  ║
+ * ╚═══════════════════════════════════════════════════════════════╝
  *
- * Scope:
- * - Extracts clan tags from player names using multiple regex patterns.
- * - Groups players by clan tag with configurable size limits and Levenshtein merge.
- * - Provides player tag cache and clan team lookup for join-time decisions.
+ * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Build order: 4 (depends on: verboseLogger; consumed by: <planned, not yet wired>)
- * Design ref: DesignDocs/slackers-squad-services-design.md §7
+ * Extracts and groups player clan tags from player names using
+ * multiple regex strategies. Groups players by normalized tag with
+ * configurable size limits, Levenshtein-distance merge, and
+ * ignore-list filtering. Provides per-player tag caching and
+ * clan-team lookup for join-time assignment decisions.
  *
- * @example
- * // not yet invoked — representative call shape for future consumers
- * svc.services.clans.extractClanGroups([{name: '[TAG] P1', eosID: '1'}, {name: 'TAG P2', eosID: '2'}]);
+ * ─── EXPORTS ─────────────────────────────────────────────────────
+ *
+ * ClansService (class, default)
+ *   mount()            — Sets mounted state.
+ *   unmount()          — Resets mounted state.
+ *   isEnabled()        — Returns true if clan grouping is enabled
+ *                        in options.
+ *   isReady()          — Returns true when service is mounted.
+ *   getOptions(overrides) — Returns merged options.
+ *   getGroupingOptions(overrides) — Returns grouping-specific subset
+ *                                   of options.
+ *   extractRawPrefix(name)  — Extracts clan tag prefix from name
+ *                             using 5 regex strategies.
+ *   normalizeTag(raw)       — Normalizes a tag (NFD unicode, ASCII
+ *                             folding, uppercase).
+ *   levenshteinDistance(a, b) — Computes edit distance between tags.
+ *   extractClanGroups(rawPlayers, opts) — Groups players by clan tag
+ *                              with size filtering and Levenshtein merge.
+ *   buildPlayerTagCache(players, opts) — Builds eosID→tag map.
+ *   getClanTeamForPlayer(joiningPlayer, cache, serverPlayers, opts)
+ *                              — Returns team where player's clan
+ *                                is concentrated.
+ *   getPlayerTag(eosID)        — Gets cached tag for a player.
+ *   addPlayerToCache(eosID, name) — Adds/updates single player's tag.
+ *   removePlayerFromCache(eosID) — Removes player from tag cache.
+ *   clearPlayerTagCache()      — Clears all cached tags.
+ *   getPlayerTagCache()        — Returns a copy of the tag cache.
+ *   rebuildFromAllPlayers(players) — Rebuilds tag cache from all
+ *                                    current players.
+ *
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
+ *
+ * (No local imports — pure logic with injected verboseLogger and options.)
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Five regex strategies for tag extraction: bracket, separator,
+ *   double-space, short-tag, and bare prefix.
+ * - Unicode-to-ASCII folding via NON_ASCII_MAP (const at end of file).
+ * - Levenshtein merge coalesces near-matching tags within maxEditDistance.
+ * - Ignore-list filtering supports case-sensitive and case-insensitive modes.
+ * - Per-player _playerTagCache supports incremental add/remove/clear
+ *   for closed-loop updates from PlayersService.
+ *
  */
 export default class ClansService {
   constructor({

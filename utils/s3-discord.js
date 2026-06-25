@@ -1,41 +1,51 @@
 /**
- * S³ Discord — Admin command surface for inspecting and testing SlackersSquadServices.
- * Part of Slacker's Squad Services (S³).
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║               S³ DISCORD                                     ║
+ * ╚═══════════════════════════════════════════════════════════════╝
  *
- * Purpose:
- * - Provides !s3 commands for Stage 3 live-server testing (see DesignDocs/stage3-testing-plan.md)
- * - Read-only inspection of all 6 S³ services via Discord embeds
- * - Verbose-log watch relay for concurrency debugging
- * - Automated pre-flight and smoke-test commands
+ * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Commands (all admin-channel only):
- *   !s3 status     — Overview: service mount status, game phase, player count, lock state
- *   !s3 services   — Per-service detail
- *   !s3 gamestate  — Phase, mode, layer name, sub-state
- *   !s3 factions   — Team 1/2 names, faction IDs
- *   !s3 players    — Full player list with teamID, clan tag
- *   !s3 clans      — Detected clan groups
- *   !s3 locks      — Global lock + per-player locks
- *   !s3 config     — Server config values
- *   !s3 watch <svc> — Relay verbose logs for a service to Discord (5 min default)
- *   !s3 unwatch    — Stop all active watches
- *   !s3 events     — Recent event history (last 20)
- *   !s3 test smoke — Automated Phase 1 smoke tests
- *   !s3 test preflight — Validate §0 pre-flight checklist
- *   !s3 help       — Command reference
+ * Provides the !s3 Discord admin command surface for inspecting and
+ * testing all 6 S³ services. Supports read-only service inspection
+ * via embeds, verbose-log watch relay for concurrency debugging,
+ * automated pre-flight checks, and smoke tests.
  *
- * Integration pattern: Follows the manual Discord management pattern (Pattern B)
- * used by elo-tracker. This module is imported by slackers-squad-services.js and
- * registerS3DiscordCommands(plugin) is called during mount().
+ * ─── EXPORTS ─────────────────────────────────────────────────────
  *
- * @example
- * // In slackers-squad-services.js mount():
- * import { registerS3DiscordCommands } from '../utils/s3-discord.js';
- * // ...
- * this._s3DiscordCleanup = registerS3DiscordCommands(this);
+ * registerS3DiscordCommands(plugin) (function)
+ *   Attaches a Discord message listener for !s3 commands and returns
+ *   a cleanup function to call during unmount().
  *
- * // In unmount():
- * this._s3DiscordCleanup?.();
+ * Internal classes and helpers (not exported):
+ *   WatchManager — Manages verbose-log interception and relay to
+ *                  Discord channels with configurable TTL.
+ *   Embed builders: buildStatusEmbed(), buildServicesEmbed(),
+ *     buildGameStateEmbed(), buildFactionsEmbed(),
+ *     buildPlayersEmbed(), buildClansEmbed(), buildLocksEmbed(),
+ *     buildConfigEmbed(), buildEventsEmbed(), buildHelpEmbed().
+ *   Test runners:  runPreflightCheck(), runSmokeTest().
+ *   Helpers:       sendDiscordMessage(), formatDuration(),
+ *     phaseEmoji(), checkmark(), truncate().
+ *
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
+ *
+ * (No local imports — depends on plugin instance passed to
+ *  registerS3DiscordCommands().)
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Integration pattern: Pattern B (manual Discord management) from
+ *   elo-tracker. registerS3DiscordCommands(plugin) is called during
+ *   S³ plugin mount() and returns a cleanup function.
+ * - All !s3 commands are gated to the configured admin channel only.
+ * - Watch relay intercepts plugin.verbose() using an interceptor
+ *   pattern; automatically expires after 5 minutes by default.
+ * - Commands: status, services, gamestate, factions, players, clans,
+ *   locks, config, watch <svc>, unwatch, events, test (preflight|smoke),
+ *   help.
+ * - sendDiscordMessage() handles 429 rate-limits with one automatic
+ *   retry and falls back to v12 embed shape.
+ *
  */
 
 /**

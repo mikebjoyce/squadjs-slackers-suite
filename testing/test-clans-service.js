@@ -1,3 +1,24 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║          CLANS SERVICE TEST                                  ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Validates ClansService tag extraction strategies (bracketed,
+ * separator, spacing, bare-prefix, unicode), normalization (diacritics,
+ * unicode lookalikes), and tag merging logic.
+ *
+ * ─── USAGE ───────────────────────────────────────────────────────
+ *
+ *   node testing/test-clans-service.js
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Pure unit tests — no external dependencies or server required.
+ *
+ */
+
 import assert from 'node:assert/strict';
 import ClansService from '../utils/clans-service.js';
 

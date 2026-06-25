@@ -1,3 +1,127 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║           SLACKERS SQUAD SERVICES PLUGIN v1.0.0              ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * S³ (Slacker's Squad Services) is the centralized service container
+ * for shared state across SquadJS plugins. It composes and manages the
+ * lifecycle of six services — gameState, serverConfig, db, factions,
+ * clans, and players — and delegates SquadJS server events to them.
+ * Consumer plugins (TeamBalancer, SmartAssign, Switch, EloTracker)
+ * discover S³ at runtime and access services via flat getters.
+ *
+ * ─── EXPORTS ─────────────────────────────────────────────────────
+ *
+ * SlackersSquadServices (default)
+ *   Extends BasePlugin. Key public methods:
+ *     prepareToMount()           — Instantiates all 6 service instances.
+ *     mount()                    — Mounts services in order (serverConfig→db→gameState→factions→clans→players),
+ *                                   binds server events, registers Discord !s3 commands.
+ *     unmount()                  — Unbinds events, unmounts services in reverse order, cleans up Discord.
+ *     handleNewGame(data)         — Delegates NEW_GAME to gameState and factions.
+ *     handleRoundEnded(data)      — Delegates ROUND_ENDED to gameState and factions.
+ *     handleLayerInfoUpdated(d)   — Delegates UPDATED_LAYER_INFORMATION to gameState.
+ *     handleServerInfoUpdated(d)  — Delegates UPDATED_SERVER_INFORMATION to gameState.
+ *     handleUpdatedPlayerInfo(d)  — Delegates UPDATED_PLAYER_INFORMATION to gameState, factions, players.
+ *     handlePlayerConnected(d)    — Delegates PLAYER_CONNECTED to players.
+ *
+ *   Flat accessors (Stage 5.2a):
+ *     get gameState()             — Returns this.services.gameState.
+ *     get serverConfig()          — Returns this.services.serverConfig.
+ *     get db()                    — Returns this.services.db.
+ *     get factions()              — Returns this.services.factions.
+ *     get clans()                 — Returns this.services.clans.
+ *     get players()               — Returns this.services.players.
+ *
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
+ *
+ * BasePlugin (./base-plugin.js)
+ *   SquadJS base class providing server, options, and connectors.
+ * GameStateService (../utils/game-state-service.js)
+ *   Round phase tracking, matchId/roundStartTime, ENDGAME timer chain.
+ * FactionsService (../utils/factions-service.js)
+ *   Faction/team name resolution from game layer data.
+ * ClansService (../utils/clans-service.js)
+ *   Clan tag detection, normalization, merging, and grouping.
+ * DBService (../utils/db-service.js)
+ *   Sequelize/SQLite persistence for game state across restarts.
+ * PlayersService (../utils/players-service.js)
+ *   Player tracking, reconnect detection, global/per-player locking.
+ * ServerConfigService (../utils/server-config-service.js)
+ *   Parses Squad Server.cfg and VoteConfig.cfg at mount time.
+ * registerS3DiscordCommands (../utils/s3-discord.js)
+ *   Discord !s3 admin command registration and dispatch.
+ *
+ * ─── S³ INTEGRATION ──────────────────────────────────────────────
+ *
+ * This plugin IS the S³ service container. Consumer plugins discover
+ * it at runtime by searching this.server.plugins for SlackersSquadServices
+ * and storing the reference as this._s3. Services are accessed via flat
+ * getters (e.g., this._s3.gameState) guarded with isReady() checks.
+ *
+ * Provided Services:
+ *   - serverConfig: Squad Server.cfg / VoteConfig.cfg parsing.
+ *   - db:           Sequelize/SQLite persistence for round state.
+ *   - gameState:    Round phase, matchId, roundStartTime, ENDGAME chain.
+ *   - factions:     Faction/team name resolution for teamIDs.
+ *   - clans:        Clan tag grouping, normalization, merging.
+ *   - players:      Player tracking, reconnect detection, locks.
+ *
+ * Delegated SquadJS Events:
+ *   NEW_GAME                  → gameState, factions
+ *   ROUND_ENDED               → gameState, factions
+ *   UPDATED_LAYER_INFORMATION  → gameState
+ *   UPDATED_SERVER_INFORMATION → gameState
+ *   UPDATED_PLAYER_INFORMATION → gameState, factions, players
+ *   PLAYER_CONNECTED          → players
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Service mount order is strict: serverConfig → db → gameState →
+ *   factions → clans → players. serverConfig must mount first so
+ *   vote durations are available before ENDGAME fires.
+ * - ignoredGameModes is pushed into GameStateService before its mount
+ *   so isIgnoredMode() reads the single source of truth.
+ * - Discord integration gracefully degrades — if no discordClient
+ *   connector is configured, registerS3DiscordCommands is a no-op.
+ * - Unmount destroys services in reverse order (players → clans →
+ *   factions → gameState → db → serverConfig).
+ * - Consumer plugins use the flat access pattern: this._s3?.gameState
+ *   (not this._s3?.services?.gameState). Guard with isReady() before
+ *   direct access.
+ * - Flat getters are backed by this.services — they return null
+ *   before prepareToMount() runs and valid instances afterward.
+ *
+ * ─── COMMANDS ────────────────────────────────────────────────────
+ *
+ * No in-game chat commands.
+ *
+ * Discord Admin (channelID only):
+ *   !s3 status               → Overview: service mount status, game phase, player count.
+ *   !s3 services             → Per-service detail.
+ *   !s3 gamestate            → Phase, mode, layer name, sub-state.
+ *   !s3 factions             → Team 1/2 names, faction IDs.
+ *   !s3 players              → Full player list with teamID, clan tag.
+ *   !s3 clans                → Detected clan groups.
+ *   !s3 locks                → Global lock + per-player locks.
+ *   !s3 config               → Server config values.
+ *   !s3 watch <svc>          → Relay verbose logs for a service to Discord.
+ *   !s3 unwatch              → Stop all active watches.
+ *   !s3 events               → Recent event history (last 20).
+ *   !s3 test smoke           → Automated smoke tests.
+ *   !s3 test preflight       → Validate pre-flight checklist.
+ *   !s3 help                 → Command reference.
+ *
+ * ─── AUTHOR ──────────────────────────────────────────────────────
+ *
+ * Slacker
+ * Discord: `real_slacker`
+ * GitHub:  https://github.com/mikebjoyce/squadjs-slackers-squad-services
+ *
+ */
+
 import BasePlugin from './base-plugin.js';
 import GameStateService from '../utils/game-state-service.js';
 import FactionsService from '../utils/factions-service.js';
@@ -6,23 +130,6 @@ import DBService from '../utils/db-service.js';
 import PlayersService from '../utils/players-service.js';
 import ServerConfigService from '../utils/server-config-service.js';
 import { registerS3DiscordCommands } from '../utils/s3-discord.js';
-
-/**
- * SlackersSquadServices — Composes and mounts shared player lifecycle, game state, faction, clan, and persistence services for consumption by TeamBalancer, SmartAssign, Switch, and EloTracker plugins.
- * Part of Slacker's Squad Services (S³).
- *
- * Scope:
- * - Composes gameState, factions, clans, db, and players services as a lifecycle-managed container
- * - Provides serverConfig service for parsing Squad server configuration files at mount time
- * - Delegates server events (NEW_GAME, ROUND_ENDED, UPDATED_LAYER_INFORMATION, etc.) to subscribed services
- *
- * Build order: 1 (depends on: server, options, connectors; consumed by: <planned, not yet wired> TB, SA, Switch, Elo)
- * Design ref: DesignDocs/slackers-squad-services-design.md §3
- *
- * @example
- * // not yet invoked — representative call shape for future consumers
- * svc.services.gameState.isLive(); // Check if round is in LIVE phase
- */
 export default class SlackersSquadServices extends BasePlugin {
   static get description() {
     return "Shared Slacker's Squad Services plugin wiring gameState, factions, clans, db, and players modules.";

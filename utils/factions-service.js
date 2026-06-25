@@ -1,15 +1,49 @@
 /**
- * Shared factions service for Slacker's Squad Services (S³).
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║               FACTIONS SERVICE                               ║
+ * ╚═══════════════════════════════════════════════════════════════╝
  *
- * Stage 1 scope:
- * - Centralize team/faction abbreviation discovery (TB + Switch parity)
- * - Provide shared team-name lookup helpers for callers
- * - Keep resolution gated to LIVE phase via gameState service
- * - SA/Elo confirmed to use numeric teamID only (no name resolution yet)
+ * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * @example
- * // not yet invoked — representative call shape for future consumers
- * svc.services.factions.getTeamName(1); // Returns "Team 1" or cached abbreviation
+ * Discovers team and faction abbreviations from player role strings
+ * (e.g., "US", "RUS", "GB", "CAF") by scanning roles during the LIVE
+ * phase. Provides shared team-name lookup helpers for all consumer
+ * plugins that display faction information.
+ *
+ * ─── EXPORTS ─────────────────────────────────────────────────────
+ *
+ * FactionsService (class, default)
+ *   mount()     — Registers event listeners, starts abbreviation polling.
+ *   unmount()   — Stops polling, resets mounted state.
+ *   isReady()   — Returns true when service is mounted.
+ *   isEnabled() — Returns true when mounted (alias for isReady()).
+ *   getTeamName(teamID, opts) — Returns faction abbreviation or
+ *                               generic "Team N".
+ *   getFactionId(faction)     — Resolves a faction name/role to teamID.
+ *   getCachedAbbreviations()  — Returns current cached abbreviations.
+ *   handleNewGame()           — Clears abbreviation cache on NEW_GAME.
+ *   handleRoundEnded()        — Stops polling on ROUND_ENDED.
+ *   handleUpdatedPlayerInfo() — Ensures polling state on each tick.
+ *   pollTeamAbbreviations()       — Scans roles for faction abbreviations.
+ *   extractTeamAbbreviationsFromRoles() — Extracts abbreviations from
+ *                                   player role strings.
+ *   stopPollingTeamAbbreviations() — Stops the polling interval.
+ *
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
+ *
+ * (No local imports — depends on server and gameState injected via
+ *  constructor.)
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Polling is gated to the LIVE phase only — faction abbreviations are
+ *   meaningless during STAGING (teams resolving) and ENDGAME (voting).
+ * - Polling stops automatically once both teams' abbreviations are cached.
+ * - Cache clears on every NEW_GAME event.
+ * - Falls back to generic "Team N" when abbreviation is not yet cached.
+ * - The abbreviation regex extracts 2–6 uppercase characters before an
+ *   underscore in the role string (e.g., "US_Rifleman" → "US").
+ *
  */
 export default class FactionsService {
   constructor({
