@@ -4,10 +4,141 @@ import { setTimeout as delay } from "timers/promises";
 const { DataTypes, Op } = Sequelize;
 
 /**
- * SquadJS Switch Plugin - Persistent Join Time
- * @author Slacker
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║                    SWITCH PLUGIN v2.0.0                       ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Manages player team-change requests with cooldown enforcement,
+ * scramble-aware lockout, and persistent join-timer tracking across
+ * server restarts. Integrates with TeamBalancer to lock switching
+ * after scrambles and with SlackersSquadServices for player state
+ * tracking and attribution. Supports in-game chat commands and
+ * Discord admin commands.
+ *
+ * ─── EXPORTS ─────────────────────────────────────────────────────
+ *
+ * Switch (default)
+ *   Extends DiscordBasePlugin. Key public methods:
+ *     mount()                          — Registers event listeners, discovers S³, initialises DB.
+ *     unmount()                        — Removes listeners, clears queue, unregisters S³ interest.
+ *     prepareToMount()                 — Migrates DB schema, syncs models before mount.
+ *     createModel(name, schema)        — Defines a Sequelize model on the plugin's DB connector.
+ *     safeTransaction(logicFn)         — Retry wrapper for SQLite-busy DB transactions.
+ *     safeDiscordReply(message, text)  — Guarded Discord message reply with error suppression.
+ *     switchPlayer(eosID)              — Executes AdminForceTeamChange via RCON for one player.
+ *     doubleSwitchPlayer(eosID, forced, senderSteamID) — Swaps a player to the opposite team and back.
+ *     switchSquad(number, team)        — Switches all members of a squad to the opposite team.
+ *     doubleSwitchSquad(number, team)  — Double-switches all members of a squad.
+ *     getDiagnosticInfo()              — Returns DB health, active lock count, and stored player count.
+ *     checkPlayer(ident)               — Looks up a player's cooldown/lock state by eosID or name.
+ *     cleanup()                        — Purges expired cooldown rows and stale disconnection records.
+ *     getPlayersByUsername(username)   — Fuzzy player search by name substring.
+ *     getPlayerBySteamID(steamID)      — Exact player lookup by SteamID.
+ *     getPlayerByUsernameOrSteamID(steamID, ident) — Combined lookup with ambiguity warnings.
+ *     getSecondsFromJoin(eosID)        — Seconds since player joined (via S³ or fallback).
+ *     getSecondsFromMatchStart()       — Seconds since current layer started.
+ *     getTeamBalanceDifference()       — Returns signed team-size delta (Team1 − Team2).
+ *     getSwitchSlotsPerTeam(teamID, effectiveCap) — Available switch slots for a given team.
+ *     addPlayerToMatchendSwitches(p)   — Queues a player for end-of-round team switch.
+ *     addSquadToMatchendSwitches(n, t) — Queues an entire squad for end-of-round switch.
+ *     onChatMessage(info)              — Handles all in-game !switch / !change / double-switch commands.
+ *     onDiscordMessage(message)        — Handles Discord !switch admin commands.
+ *     onRoundEnded(info)               — Processes end-of-round switch queue.
+ *     onScrambleExecuted(data)         — Applies scramble lockdown to affected players.
+ *     onNewGame()                      — Logs new-game transition.
+ *     onS3PlayerJoined(data)           — Triggers rejoin auto-switch and queue processing.
+ *     onS3PlayerLeft(data)             — Removes player from queue, triggers queue processing.
+ *     onS3PlayerTeamChanged(data)      — Triggers queue processing on team change.
+ *
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
+ *
+ * DiscordBasePlugin (./discord-base-plugin.js)
+ *   SquadJS base class providing Discord connector, server, and options.
+ *
+ * ─── S³ INTEGRATION ──────────────────────────────────────────────
+ * <!-- TO REVIEW: consolidate S³ integration text across all plugins -->
+ *
+ * SlackersSquadServices is a required supporting plugin. This plugin
+ * discovers S³ at runtime via server.plugins lookup and uses it for:
+ *
+ * Consumed Services:
+ *   - players.registerRefreshInterest: registers Switch for stale-player refresh polling.
+ *   - players.getPlayer: resolves join time for cooldown window calculations.
+ *   - players.recordMove: attributes team-change source before RCON execution.
+ *   - gameState.isEndgameFactionVote: suppresses queue processing during faction votes.
+ *
+ * Listened Events:
+ *   - S3_PLAYER_JOINED: triggers rejoin auto-switch and queue processing.
+ *   - S3_PLAYER_LEFT: stores disconnection state; removes player from switch queue.
+ *   - S3_PLAYER_TEAM_CHANGED: triggers queue re-evaluation.
+ *
+ * Cross-Plugin Events:
+ *   - TEAM_BALANCER_SCRAMBLE_EXECUTED (listened): applies scramble lockdown
+ *     to affected players for a configurable duration.
+ *
+ * <!-- /TO REVIEW -->
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Forked from the original SquadJS Switch plugin by fantinodavide.
+ *   Original author credit retained.
+ * - Scramble lockdown skips players still within their switch-enabled
+ *   window (join or match start), since they had no time to exploit
+ *   pre-scramble imbalance.
+ * - Liberal game modes (default: Seed, Jensen) relax cooldown and time
+ *   limits. Configured via liberalSwitchGameModes and
+ *   liberalSwitchMaxUnbalancedSlots.
+ * - Dynamic balance tolerance scales extra imbalance slots linearly
+ *   from dynamicBalancePlayerFloor (default 90) up to 98 players.
+ * - Switch queue uses a stability gate: solo switches are only
+ *   processed when team counts are stable across two consecutive polls.
+ * - RCON identifier cascade: player name is the only universally
+ *   reliable RCON identifier. eosID/steamID are NOT valid for RCON.
+ * - DB transaction retry (safeTransaction) handles SQLITE_BUSY with
+ *   up to 5 retries and exponential backoff.
+ * - PlayerCooldowns table is auto-migrated on mount; schema mismatch
+ *   triggers a drop-and-recreate.
+ * - Endmatch switch queue persists across restarts via the Endmatch
+ *   model; processed on ROUND_ENDED.
+ *
+ * ─── COMMANDS ────────────────────────────────────────────────────
+ *
+ * Public (all players):
+ *   !switch                        → Request a team change (checks balance, cooldowns, locks).
+ *   !switch help                   → In-game warning popup explaining eligibility rules.
+ *   !switch explain                → Detailed breakdown of why you can or cannot switch.
+ *   !switch cancel                 → Leave the switch queue.
+ *   !switch prefer <team>          → Set team preference for end-of-match switch queue.
+ *   !bug / !stuck / !doubleswitch  → Double-switch (swap to opposite team and back).
+ *
+ * Admin (in-game):
+ *   !switch now <name>             → Force immediate team switch for a player.
+ *   !switch double <name>          → Force double-switch for a player.
+ *   !switch squad <n> <team>       → Switch an entire squad to the opposite team.
+ *   !switch swap <name1> <name2>   → Swap two players between teams.
+ *   !switch check <name/steamID>   → Look up a player's cooldown and lock status.
+ *   !switch clear <name/steamID>   → Remove all cooldowns and locks for a player.
+ *   !switch clearall               → Wipe the entire cooldown database.
+ *   !switch diag                   → Show DB health, active locks, and top-10 locked players.
+ *   !switch help                   → List all admin commands.
+ *
+ * Admin (Discord):
+ *   !switch diag                   → Database health + RCON latency + top-10 locked players.
+ *   !switch check <name/steamID>   → Real-time eligibility lookup with timestamps.
+ *   !switch clear <name/steamID>   → Remove cooldowns/locks for a player.
+ *   !switch clearall               → Wipe entire cooldown database.
+ *   !switch help                   → List all Discord admin commands.
+ *
+ * ─── AUTHOR ──────────────────────────────────────────────────────
+ *
+ * Original Author: fantinodavide (https://github.com/fantinodavide)
+ * Modified by:     Slacker
+ * Discord:         `real_slacker`
+ * GitHub:          https://github.com/mikebjoyce/squadjs-switch-teambalancer-aware
+ *
  */
-
 export default class Switch extends DiscordBasePlugin {
     static get description() {
         return "Switch plugin with persistent join timers";
@@ -299,8 +430,8 @@ export default class Switch extends DiscordBasePlugin {
         await this._syncPlayerCooldowns();
 
         // Register refresh interest with S³ PlayersService for queue processing
-        if (this._s3?.services?.players?.registerRefreshInterest) {
-            this._s3.services.players.registerRefreshInterest('Switch', { maxStalenessMs: 10000 });
+        if (this._s3?.players?.registerRefreshInterest) {
+            this._s3?.players.registerRefreshInterest('Switch', { maxStalenessMs: 10000 });
             this.verbose(1, '[S3] Registered Switch refresh interest (maxStalenessMs=10000).');
         }
 
@@ -644,7 +775,18 @@ export default class Switch extends DiscordBasePlugin {
                     }
                     break;
                 default:
-                    await this.warn(eosID, `Unknown subcommand: "${subCommand}"`);
+                    await this.warn(eosID, [
+                        `Unknown subcommand: "${subCommand}"`,
+                        '',
+                        '=== Switch Commands ===',
+                        '!switch — Request team switch',
+                        '!switch check — Show your eligibility status',
+                        '!switch explain — Explain the rules',
+                        '!switch status <player> — (Admin) Check a player',
+                        '!switch clear <player> — (Admin) Clear player cooldown',
+                        '!switch clearall — (Admin) Clear all cooldowns',
+                        '!switch cancel — Leave the switch queue'
+                    ].join('\n'));
                     return;
             }
         } else {
@@ -660,8 +802,8 @@ export default class Switch extends DiscordBasePlugin {
 
             // S³ lock gate: check if this player is being processed by a higher-priority actor
             const eosID2 = info.player?.eosID;
-            if (eosID2 && this._s3?.services?.players) {
-                if (!this._s3.services.players.canAct(eosID2, 'Switch')) {
+            if (eosID2 && this._s3?.players) {
+                if (!this._s3?.players.canAct(eosID2, 'Switch')) {
                     this.warn(eosID, '[Switch] You are currently being processed — please try again shortly.');
                     this.verbose(1, `[Switch] Denied ${playerName}: canAct returned false (locked by higher-priority actor).`);
                     return;
@@ -838,14 +980,14 @@ export default class Switch extends DiscordBasePlugin {
      * Checks both cached layer name and gamemode against the liberal modes list.
      */
     isLiberalMode() {
-        const gs = this._s3?.services?.gameState;
+        const gs = this._s3?.gameState;
         const layerName = (gs?.getLayerName?.() || '').toLowerCase();
         const gamemode = (gs?.getGamemode?.() || '').toLowerCase();
         return this._liberalModes.some(m => layerName.includes(m) || gamemode.includes(m));
     }
 
     s3IsEndgameFactionVote() {
-        return this._s3?.services?.gameState?.isEndgameFactionVote?.() === true;
+        return this._s3?.gameState?.isEndgameFactionVote?.() === true;
     }
 
     /**
@@ -938,8 +1080,8 @@ export default class Switch extends DiscordBasePlugin {
     _requestQueueRefresh() {
         // Trigger player list refresh via S³ PlayersService when queue is active.
         // S³ handles coalescing, rate-limiting, and natural-tick cancellation.
-        if (this._s3?.services?.players?.requestRefresh) {
-            this._s3.services.players.requestRefresh('Switch', { urgency: 'normal' });
+        if (this._s3?.players?.requestRefresh) {
+            this._s3?.players.requestRefresh('Switch', { urgency: 'normal' });
         }
     }
     _enqueuePlayer(player, reason) {
@@ -1163,7 +1305,7 @@ export default class Switch extends DiscordBasePlugin {
     }
 
     async getSecondsFromJoin(eosID) {
-        const player = this._s3?.services?.players?.getPlayer(eosID);
+        const player = this._s3?.players?.getPlayer(eosID);
         return player?.joinTime ? (Date.now() - player.joinTime) / 1000 : 0;
     }
 
@@ -1349,8 +1491,8 @@ export default class Switch extends DiscordBasePlugin {
         }
         
         // S³ attribution: Record the move so S3_PLAYER_TEAM_CHANGED fires with the correct source
-        if (this._s3?.services?.players?.recordMove && eosID) {
-          this._s3.services.players.recordMove(eosID, targetTeam, source);
+        if (this._s3?.players?.recordMove && eosID) {
+          this._s3?.players.recordMove(eosID, targetTeam, source);
           this.verbose(2, `[Switch] S³ recordMove registered: source=${source}, targetTeam=${targetTeam}`);
         }
 
@@ -1401,7 +1543,7 @@ export default class Switch extends DiscordBasePlugin {
         }
 
         // Trigger queue processing if not in faction vote
-        if (!this._s3?.services?.gameState?.isEndgameFactionVote?.()) {
+        if (!this._s3?.gameState?.isEndgameFactionVote?.()) {
             await this._processQueue();
         }
     }
@@ -1409,14 +1551,14 @@ export default class Switch extends DiscordBasePlugin {
     async onS3PlayerLeft(data) {
         if (!data?.player?.eosID) return;
         this._removePlayerFromQueue(data.player.eosID);
-        if (!this._s3?.services?.gameState?.isEndgameFactionVote?.()) {
+        if (!this._s3?.gameState?.isEndgameFactionVote?.()) {
             await this._processQueue();
         }
     }
 
     async onS3PlayerTeamChanged(data) {
         if (!data?.player?.eosID) return;
-        if (!this._s3?.services?.gameState?.isEndgameFactionVote?.()) {
+        if (!this._s3?.gameState?.isEndgameFactionVote?.()) {
             await this._processQueue();
         }
     }
@@ -1431,8 +1573,8 @@ export default class Switch extends DiscordBasePlugin {
 
     async unmount() {
         // Unregister S³ refresh interest (if S³ was available)
-        if (this._s3?.services?.players?.unregisterRefreshInterest) {
-            this._s3.services.players.unregisterRefreshInterest('Switch');
+        if (this._s3?.players?.unregisterRefreshInterest) {
+            this._s3?.players.unregisterRefreshInterest('Switch');
         }
 
         this.server.removeListener('CHAT_MESSAGE', this.onChatMessage);
