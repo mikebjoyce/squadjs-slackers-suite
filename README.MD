@@ -42,13 +42,15 @@ Provides squad-preserving scramble functionality. When a scramble is executed, T
 
 **[SlackersSquadServices](https://github.com/mikebjoyce/SlackersSquadServices)**
 
-<!-- TO REVIEW: consolidate S³ integration text across all plugins -->
+S³ is a **required** supporting plugin that provides centralised shared state across Slacker's Squad plugins. Switch discovers S³ at mount time and uses it for:
 
-S³ is a required supporting plugin. Switch discovers S³ at runtime and uses it for player state tracking (`players.getPlayer` for join-time lookups, `players.recordMove` for team-change attribution, `players.registerRefreshInterest` for stale-player polling), and game-state queries (`gameState.isEndgameFactionVote` to suppress switching during faction votes). Switch also listens for the S³ events `S3_PLAYER_JOINED`, `S3_PLAYER_LEFT`, and `S3_PLAYER_TEAM_CHANGED` to drive queue processing and rejoin auto-switch logic.
+- **Player state tracking** (`players.getPlayer` for join-time lookups, `players.recordMove` for team-change attribution, `players.registerRefreshInterest` for stale-player polling)
+- **Game-state queries** (`gameState.isEndgameFactionVote` to suppress switching during faction votes, `gameState.getLayerName` / `gameState.getGamemode` for liberal-mode detection)
+- **S³ events** (`S3_PLAYER_JOINED`, `S3_PLAYER_LEFT`, `S3_PLAYER_TEAM_CHANGED`) to drive queue processing and rejoin auto-switch logic
 
-<!-- /TO REVIEW -->
+Switch will fail to mount if S³ is absent — there is no fallback path.
 
-**Setup**: Install S³. Switch discovers it automatically at runtime via `server.plugins` lookup.
+**Setup**: Install S³ in `config.json` before Switch. It must appear in the plugins array before Switch so it is mounted first. No manual configuration beyond installation is needed.
 
 ---
 
