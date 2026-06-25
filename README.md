@@ -50,7 +50,26 @@ S³ is a **required** supporting plugin that provides shared game state, player 
 
 ## Commands
 
-No in-game chat commands. SmartAssign operates automatically during player joins with no manual intervention required.
+**In-game chat:** None. SmartAssign operates automatically during player joins with no manual intervention required.
+
+**Discord Admin (via SlackersSquadServices):** When used with the S³ plugin, the following admin commands are available in a configured Discord channel:
+
+- `!s3 status` — Overview: service mount status, game phase, player count.
+- `!s3 services` — Per-service detail.
+- `!s3 gamestate` — Phase, mode, layer name, sub-state.
+- `!s3 factions` — Team 1/2 names, faction IDs.
+- `!s3 players` — Full player list with teamID, clan tag.
+- `!s3 clans` — Detected clan groups.
+- `!s3 locks` — Global lock + per-player locks.
+- `!s3 config` — Server config values.
+- `!s3 watch <svc>` — Relay verbose logs for a service to Discord.
+- `!s3 unwatch` — Stop all active watches.
+- `!s3 events` — Recent event history (last 20).
+- `!s3 test smoke` — Automated smoke tests.
+- `!s3 test preflight` — Validate pre-flight checklist.
+- `!s3 help` — Command reference.
+
+> **Note:** Discord commands require the `discordClient` connector and `channelID` to be configured in the S³ plugin options.
 
 ---
 
