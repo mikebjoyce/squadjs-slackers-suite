@@ -63,7 +63,11 @@ export default class JoinSwapTester extends BasePlugin {
 
     this.executor = new SASwapExecutor(server, {
       retryIntervalMs: 500,
-      maxCompletionTimeMs: 15000 
+      maxCompletionTimeMs: 15000,
+      callbacks: {
+        onSuccess: (data) => this.onMoveSuccess(data),
+        onFailed: (data) => this.onMoveFailed(data)
+      }
     });
 
     this.states = {
@@ -97,8 +101,6 @@ export default class JoinSwapTester extends BasePlugin {
   async mount() {
     this.server.on('PLAYER_CONNECTED', this.onPlayerConnected);
     this.server.on('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
-    this.server.on('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
-    this.server.on('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
     
     // CUSTOM LOG-PARSER HOOK: Instant Disconnect Detection
     // This regex looks for the exact millisecond the connection closes.
@@ -122,8 +124,6 @@ export default class JoinSwapTester extends BasePlugin {
   async unmount() {
     this.server.removeListener('PLAYER_CONNECTED', this.onPlayerConnected);
     this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.onUpdatedPlayerInfo);
-    this.server.removeListener('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
-    this.server.removeListener('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
     this.executor.cleanup();
   }
 

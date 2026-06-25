@@ -38,32 +38,38 @@
  *   Provides gameState, players, and clans services. See S³ INTEGRATION below.
  *
  * ─── S³ INTEGRATION ──────────────────────────────────────────────
- * <!-- <TO REVIEW> S³ integration description — consolidate across plugins later -->
  *
- * SmartAssign requires SlackersSquadServices (S³) for core functionality.
- * The plugin discovers S³ at runtime via plugin registry lookup.
+ * S³ (Slacker's Squad Services) is the centralised service container
+ * for shared state across Slacker's Squad plugins.  It owns the
+ * ground truth for server configuration, game-state lifecycle,
+ * player state, faction metadata, clan grouping, database access,
+ * and cross-plugin event routing.  Consumer plugins discover S³ at
+ * runtime via this.server.plugins and access services through flat
+ * getters (e.g. this._s3?.gameState) guarded by isReady() checks.
+ *
+ * GitHub: https://github.com/mikebjoyce/squadjs-slackers-squad-services
  *
  * Consumed Services:
- *   - gameState: round start time, match ID, layer/gamemode, ignored mode check,
- *     faction vote detection, round snapshot data.
- *   - players: refresh interest registration, reconnect memory, move attribution
- *     (recordMove), player list retrieval.
- *   - clans: clan tag extraction, normalisation, tag cache lookups for clan grouping.
+ *   - gameState: getRoundStartTime(), getMatchId(), getLayerName(),
+ *               getGamemode(), isIgnoredMode(), isFactionVoteInProgress(),
+ *               getRoundSnapshot() — round lifecycle and game-mode detection.
+ *   - players:   getAllPlayers(), getReconnect(), recordMove(),
+ *               rememberReconnect(), requestRefresh(),
+ *               unregisterRefreshInterest() — player state and move tracking.
+ *   - clans:     isEnabled(), extractRawPrefix(), normalizeTag(),
+ *               getPlayerTagCache() — clan tag grouping lookups.
  *
- * Emitted Events:
- *   - SMART_ASSIGN_MOVE_FAILED: fired when an RCON team switch fails or times out.
- *   - SMART_ASSIGN_MOVE_SUCCESS: fired when an RCON team switch is verified complete.
- *   - SMART_ASSIGN_MOVE_RETRY: fired on each retry attempt for a pending move.
+ * Internal Callbacks (from SASwapExecutor, Stage 6.1a):
+ *   - onFailed:  Invoked on RCON switch timeout, preemption, or disconnect.
+ *   - onSuccess: Invoked when RCON switch is verified.
+ *   - onRetry:   Invoked on each RCON retry attempt.
+ *   These replaced server.emit('SMART_ASSIGN_MOVE_*', ...) with direct callback wiring.
  *
  * Listened Events:
- *   - S3_PLAYER_JOINED: triggers the full join assignment pipeline.
- *   - S3_PLAYER_TEAM_CHANGED: logs team changes with source attribution.
- *   - S3_PLAYER_LEFT: triggers disconnect handling and reconnect memory save.
- *   - S3_GAME_STATE_LIVE: fires round snapshot with full player roster.
- *
- * If S³ is not present at mount time, the plugin falls back to direct event
- * listeners (PLAYER_CONNECTED, etc.) and limited functionality.
- * <!-- </TO REVIEW> -->
+ *   - S3_PLAYER_JOINED:       Triggers the full join assignment pipeline.
+ *   - S3_PLAYER_TEAM_CHANGED: Logs team changes with source attribution.
+ *   - S3_PLAYER_LEFT:         Triggers disconnect handling and reconnect memory save.
+ *   - S3_GAME_STATE_LIVE:     Fires round snapshot with full player roster.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
@@ -96,6 +102,9 @@
  *        top of the base for returning players (clan grouping gets the same).
  * - Strict 1-player max imbalance enforced at high population (96+).
  * - Bypasses auto-assignment completely during specified ignored modes (Seed/Jensen).
+ * - S³ (SlackersSquadServices) is a required supporting plugin. If it is
+ *   absent at mount time, SmartAssign will fail to mount — there is no
+ *   fallback path. See README.md for setup instructions.
  * - Accuracy: Players with pending moves are excluded from team evaluation to
  *   prevent double-counting.
  * - Passive Mode: Set enableSmartAssign: false to observe only real server events
@@ -113,7 +122,7 @@
  * ─── CONFIGURATION ───────────────────────────────────────────────
  *
  * database: Sequelize connector name (default: 'sqlite').
- * logPath: Path for JSONL event logging (default: './auto-assign-log.jsonl').
+ * logPath: Path for JSONL event logging (default: './smart-assign-log.jsonl').
  * enableSmartAssign: Toggle auto-assignment logic (default: true).
  * enableEventLogging: Toggle JSONL event logging (default: true).
  * ignoredGameModes: Array of modes to skip logic on (default: ['Seed', 'Jensen']).
@@ -175,7 +184,7 @@ export default class SmartAssign extends BasePlugin {
       logPath: {
         required: false,
         description: 'Path to JSONL file for player lifecycle events.',
-        default: './auto-assign-log.jsonl',
+        default: './smart-assign-log.jsonl',
         type: 'string'
       },
       enableDatabaseLogging: {
@@ -217,11 +226,16 @@ export default class SmartAssign extends BasePlugin {
       // State bindings
       this.onNewGame = this.onNewGame.bind(this);
       this.onRoundEnded = this.onRoundEnded.bind(this);
-      this.onPlayerConnected = this.onPlayerConnected.bind(this);
       this.onScrambleExecuted = this.onScrambleExecuted.bind(this);
       this.onMoveFailed = this.onMoveFailed.bind(this);
       this.onMoveSuccess = this.onMoveSuccess.bind(this);
       this.onMoveRetry = this.onMoveRetry.bind(this);
+      // Wire executor callbacks (Stage 6.1a) — replaces server.emit() round-trip with direct invocation
+      this.executor.callbacks = {
+        onFailed: this.onMoveFailed,
+        onSuccess: this.onMoveSuccess,
+        onRetry: this.onMoveRetry
+      };
       this.onS3PlayerJoined = this.onS3PlayerJoined.bind(this);
        this.onS3PlayerTeamChanged = this.onS3PlayerTeamChanged.bind(this);
        this.onS3PlayerLeft = this.onS3PlayerLeft.bind(this);
@@ -241,23 +255,20 @@ export default class SmartAssign extends BasePlugin {
       Logger.verbose('SmartAssign', 1, '[SmartAssign] Warning: EloTracker found but getMu() is missing. Falling back to population-only/internal-props.');
     }
 
-
-    // S³ runtime discovery
+    // S³ runtime discovery — required, no fallback
     const s3 = this.server.plugins.find((p) => p.constructor.name === 'SlackersSquadServices');
-    if (s3) {
-      this._s3 = s3;
-      this.executor._s3 = s3;  // Update executor's reference for canAct guard
-      Logger.verbose('SmartAssign', 2, '[S3] Discovered SlackersSquadServices for SmartAssign.');
-      const svc = this._s3?.services || {};
-      Logger.verbose('SmartAssign', 2, `[S3] Available: gameState=${!!svc.gameState} factions=${!!svc.factions} clans=${!!svc.clans} db=${!!svc.db} players=${!!svc.players}`);
+    if (!s3) {
+      throw new Error('[S3] SlackersSquadServices is required for SmartAssign to function. Ensure it is in config.json before SmartAssign and restart.');
+    }
+    this._s3 = s3;
+    this.executor._s3 = s3;  // Update executor's reference for canAct guard
+    Logger.verbose('SmartAssign', 2, '[S3] Discovered SlackersSquadServices for SmartAssign.');
 
-      // Register refresh interest with S³ PlayersService for fast join detection
-      if (svc.players?.registerRefreshInterest) {
-        svc.players.registerRefreshInterest('SmartAssign', { maxStalenessMs: 5000 });
-        Logger.verbose('SmartAssign', 2, '[S3] Registered SmartAssign refresh interest (maxStalenessMs=5000).');
-      }
-    } else {
-      Logger.verbose('SmartAssign', 2, '[S3] SlackersSquadServices not found — using fallback implementations.');
+    // Register refresh interest with S³ PlayersService for fast join detection
+    const mountPlayers = this._s3?.players;
+    if (mountPlayers?.isReady() && mountPlayers.registerRefreshInterest) {
+      mountPlayers.registerRefreshInterest('SmartAssign', { maxStalenessMs: 5000 });
+      Logger.verbose('SmartAssign', 2, '[S3] Registered SmartAssign refresh interest (maxStalenessMs=5000).');
     }
 
     // Perform initial DB cleanup and start periodic maintenance
@@ -267,7 +278,7 @@ export default class SmartAssign extends BasePlugin {
     }, 6 * 60 * 60 * 1000);
 
     // Restart Recovery — delegated to S³ GameStateService
-    const gs = this._s3?.gameState;
+    const gs = this._s3.gameState;
     const recoveredStart = gs?.getRoundStartTime?.();
     if (recoveredStart) {
       Logger.verbose('SmartAssign', 1, `Restart detected. Resuming round from S³ roundStartTime: ${recoveredStart}`);
@@ -281,11 +292,7 @@ export default class SmartAssign extends BasePlugin {
 
       this.server.on('NEW_GAME', this.onNewGame);
       this.server.on('ROUND_ENDED', this.onRoundEnded);
-      this.server.on('PLAYER_CONNECTED', this.onPlayerConnected);
       this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
-      this.server.on('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
-      this.server.on('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
-      this.server.on('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
 
       // S³ event subscribers (Stage 4 — active assignment path)
       this.server.on('S3_PLAYER_JOINED', this.onS3PlayerJoined);
@@ -302,17 +309,14 @@ export default class SmartAssign extends BasePlugin {
     if (this.cleanupInterval) clearInterval(this.cleanupInterval);
     this.eventLogger.cleanup();
     await this.finalizeRoundLog();
-    // Unregister S³ refresh interest (if S³ was available)
-    if (this._s3?.players?.unregisterRefreshInterest) {
-      this._s3?.players.unregisterRefreshInterest('SmartAssign');
+    // Unregister S³ refresh interest
+    const unmountPlayers = this._s3?.players;
+    if (unmountPlayers?.isReady() && unmountPlayers.unregisterRefreshInterest) {
+      unmountPlayers.unregisterRefreshInterest('SmartAssign');
     }
      this.server.removeListener('NEW_GAME', this.onNewGame);
      this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
-     this.server.removeListener('PLAYER_CONNECTED', this.onPlayerConnected);
      this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
-     this.server.removeListener('SMART_ASSIGN_MOVE_FAILED', this.onMoveFailed);
-     this.server.removeListener('SMART_ASSIGN_MOVE_SUCCESS', this.onMoveSuccess);
-     this.server.removeListener('SMART_ASSIGN_MOVE_RETRY', this.onMoveRetry);
      this.server.removeListener('S3_PLAYER_JOINED', this.onS3PlayerJoined);
      this.server.removeListener('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
      this.server.removeListener('S3_PLAYER_LEFT', this.onS3PlayerLeft);
@@ -422,25 +426,7 @@ export default class SmartAssign extends BasePlugin {
     }
   }
 
-  async onPlayerConnected(info) {
-    if (!this.ready) return;
-    const p = info.player;
-    // RCON IDENTIFIER MIGRATION: Use playerKey (eosID || steamID) instead of gating on steamID only
-    const playerKey = p && (p.eosID || p.steamID);
-    if (!p || !playerKey) return;
-
-    // Request a debounced player list refresh from S³ PlayersService.
-    if (this._s3?.players?.requestRefresh) {
-      this._s3?.players.requestRefresh('SmartAssign', { urgency: 'high' });
-    }
-
-    // Trigger join handling immediately using the log-provided player data.
-    // The executor will fire the RCON move before the player is even visible
-    // in the ListPlayers array — S³'s forced refresh will catch up shortly after.
-    await this.handlePlayerJoin(p);
-  }
-
-  async handlePlayerJoin(player) {
+  async handlePlayerJoin(player, reconnectTeam = null) {
     const lockKey = player.eosID || player.steamID;
     if (!lockKey) {
       Logger.verbose('SmartAssign', 1, `[SmartAssign] Cannot process join for ${player.name} - missing eosID/steamID.`);
@@ -458,27 +444,26 @@ export default class SmartAssign extends BasePlugin {
       }
 
        // ═══════════════════════════════════════════════════════════════════════════
-       // CLAN GROUPING: Delegate tag maintenance to S³ ClansService.
+       // CLAN GROUPING: Compute tag locally for SA's own evaluation.
        // ═══════════════════════════════════════════════════════════════════════════
+       // SA computes its own tag from name extraction + optional Elo DB fallback,
+       // then merges it into a read-only copy of S³'s playerTagCache for the evaluator.
+       // SA no longer writes to S³'s internal _playerTagCache (self-maintained by S³).
+       let joinPlayerTag = null;
        if (this._isClanGroupingEnabled() && player.eosID) {
          const clans = this._s3?.clans;
-         const raw = clans.extractRawPrefix(player.name);
-         let tag = raw ? (clans.options.caseSensitive ? raw : clans.normalizeTag(raw)) : null;
+         if (clans?.isReady()) {
+           const raw = clans.extractRawPrefix(player.name);
+           joinPlayerTag = raw ? (clans.options.caseSensitive ? raw : clans.normalizeTag(raw)) : null;
 
-         if (!tag && this.eloTracker && this.eloTracker.db) {
-           this._queryEloDBForTag(player.eosID)
-             .then((dbTag) => {
-               if (dbTag) {
-                 clans._playerTagCache.set(player.eosID, dbTag);
-                 Logger.verbose('SmartAssign', 3, `[Clan] Tag resolved from EloTracker DB for ${player.name}: "${dbTag}"`);
-               }
-             })
-             .catch((err) => {
-               Logger.verbose('SmartAssign', 3, `[Clan] EloTracker DB fallback failed for ${player.eosID}: ${err?.message}`);
-             });
+           if (!joinPlayerTag && this.eloTracker?.db) {
+             const dbTag = await this._queryEloDBForTag(player.eosID);
+             if (dbTag) {
+               joinPlayerTag = dbTag;
+               Logger.verbose('SmartAssign', 3, `[Clan] Tag resolved from EloTracker DB for ${player.name}: "${dbTag}"`);
+             }
+           }
          }
-
-         clans._playerTagCache.set(player.eosID, tag);
        }
 
        Logger.verbose('SmartAssign', 3, `[JOIN] Player connected: ${player.name} (${playerKey})`);
@@ -518,13 +503,12 @@ export default class SmartAssign extends BasePlugin {
         timemarks.preWarmMs = Date.now() - preWarmStart;
         timemarks.preWarmMu = preWarmRating.mu;
 
-        const reconnectTeamStart = Date.now();
-        const reconnectRecord = await this._s3?.players?.getReconnect(player.eosID);
-        const reconnectTeam = reconnectRecord?.teamID || null;
-        timemarks.reconnectTeamMs = Date.now() - reconnectTeamStart;
+        // reconnectTeam sourced from S3_PLAYER_JOINED data.previousTeamID
+        // (passed via handlePlayerJoin flow) — no need to call destructive getReconnect().
+        timemarks.reconnectTeamMs = 0;
 
         const evalStart = Date.now();
-        const evalResult = await this.evaluateTeamAssignment(player, reconnectTeam);
+        const evalResult = await this.evaluateTeamAssignment(player, reconnectTeam, joinPlayerTag);
        const { targetTeam, reason, debugInfo } = evalResult;
        timemarks.evaluateMs = Date.now() - evalStart;
        timemarks.totalPipelineMs = Date.now() - phaseStartTime;
@@ -558,8 +542,9 @@ export default class SmartAssign extends BasePlugin {
         this.executor.queueMove(playerKey, player.name, player.eosID, targetTeam);
 
         // S³ attribution: record the move so S³'s S3_PLAYER_TEAM_CHANGED fires with source='SmartAssign'
-        if (this._s3?.players?.recordMove && playerKey) {
-          this._s3?.players.recordMove(playerKey, targetTeam, 'SmartAssign');
+        const recordPlayers = this._s3?.players;
+        if (recordPlayers?.isReady() && recordPlayers.recordMove && playerKey) {
+          recordPlayers.recordMove(playerKey, targetTeam, 'SmartAssign');
         }
       }
     } finally {
@@ -575,9 +560,10 @@ export default class SmartAssign extends BasePlugin {
     if (!this.ready) return;
     const player = data?.player;
     if (!player) return;
-    Logger.verbose('SmartAssign', 3, `[S3] JOIN: ${player.name || player.eosID} team=${player.teamID}`);
+    const previousTeamID = data?.previousTeamID ?? null;
+    Logger.verbose('SmartAssign', 3, `[S3] JOIN: ${player.name || player.eosID} team=${player.teamID}, previousTeamID=${previousTeamID}`);
 
-    await this.handlePlayerJoin(player);
+    await this.handlePlayerJoin(player, previousTeamID);
   }
 
   async onS3PlayerTeamChanged(data) {
@@ -621,8 +607,11 @@ export default class SmartAssign extends BasePlugin {
 
      // Save to S³ reconnect memory (fire-and-forget) if they were on a valid team
      const tid = Number(player.teamID);
-     if ((tid === 1 || tid === 2) && this._s3?.players?.rememberReconnect) {
-       this._s3?.players.rememberReconnect(player.eosID, { teamID: tid });
+     if (tid === 1 || tid === 2) {
+       const reconnectPlayers = this._s3?.players;
+       if (reconnectPlayers?.isReady() && reconnectPlayers.rememberReconnect) {
+         reconnectPlayers.rememberReconnect(player.eosID, { teamID: tid });
+       }
      }
   }
 
@@ -662,7 +651,14 @@ export default class SmartAssign extends BasePlugin {
     }
   }
 
-  evaluateTeamAssignment(player, reconnectTeam = null) {
+  evaluateTeamAssignment(player, reconnectTeam = null, localTag = null) {
+    let tagCache = null;
+    if (this._isClanGroupingEnabled() && this._s3?.clans) {
+      tagCache = this._s3.clans.getPlayerTagCache() || new Map();
+      if (localTag && player.eosID) {
+        tagCache.set(player.eosID, localTag);
+      }
+    }
     return evaluateTeamAssignment(player, this.server, {
       reconnectTeam,
       pendingAssignments: this._pendingAssignments,
@@ -671,7 +667,7 @@ export default class SmartAssign extends BasePlugin {
       pendingPlayerMoves: this._pendingPlayerMoves,
       eloTracker: this.eloTracker,
       ignoredModes: [],
-      playerTagCache: this._isClanGroupingEnabled() ? this._s3?.clans.getPlayerTagCache() : null,
+      playerTagCache: tagCache,
       clanGroupOptions: {
         minSize: this._s3?.clans?.options?.minSize || 2,
         caseSensitive: this._s3?.clans?.options?.caseSensitive || false

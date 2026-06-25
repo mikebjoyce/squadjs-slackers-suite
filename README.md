@@ -40,7 +40,7 @@ Tracks per-player TrueSkill ratings (μ/σ) across rounds. SmartAssign automatic
 
 ### SlackersSquadServices (S³)
 
-**[squadjs-smart-assign](https://github.com/mikebjoyce/squadjs-smart-assign)**
+**[squadjs-slackers-squad-services](https://github.com/mikebjoyce/squadjs-slackers-squad-services)**
 
 S³ is a **required** supporting plugin that provides shared game state, player management, and clan services to all consumer plugins. SmartAssign consumes `gameState` (round metadata, mode checks), `players` (reconnect memory, move attribution, refresh interest), and `clans` (tag extraction, normalisation, cache) services.
 
@@ -85,9 +85,6 @@ Add the following to your `config.json`:
     "logPath": "./smart-assign-log.jsonl",
     "enableSmartAssign": true,
     "enableEventLogging": true,
-    "enableClanGrouping": true,
-    "clanGroupMinSize": 2,
-    "clanGroupCaseSensitive": false,
     "enableDatabaseLogging": false
   }
 ]
@@ -126,7 +123,7 @@ squad-server/
 | `database` | string | Yes | `"sqlite"` | A valid Sequelize connector name (e.g. `"sqlite"`, `"mysql"`, `"postgres"`) for reconnect memory storage. |
 | `enableSmartAssign` | boolean | No | `true` | If true, runs the assignment algorithm and moves players. If false, only logs real server events (passive mode). |
 | `enableEventLogging` | boolean | No | `true` | Toggle the JSONL lifecycle event logging output entirely. |
-| `logPath` | string | No | `"./auto-assign-log.jsonl"` | File path for JSONL player lifecycle events. |
+| `logPath` | string | No | `"./smart-assign-log.jsonl"` | File path for JSONL player lifecycle events. |
 | `ignoredGameModes` | array | No | `["Seed", "Jensen"]` | Array of layer/gamemode substrings where SmartAssign should not alter teams. |
 | `enableClanGrouping` | boolean | No | `true` | If true, players in clans will be kept together on the same team if all clan mates are on one team. |
 | `clanGroupMinSize` | number | No | `2` | Minimum number of players to consider a group as a clan for grouping purposes. |
