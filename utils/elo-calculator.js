@@ -43,9 +43,12 @@
    *   interdependent set. If you wish to change the scale of the system,
    *   you must update all constants proportionally.
    *
-   * Author:
- * Discord: `real_slacker`
- *
+   * ─── AUTHOR ──────────────────────────────────────────────────────
+   *
+   * Slacker
+   * Discord: real_slacker
+   * GitHub:  https://github.com/mikebjoyce/squadjs-elo-tracker
+   *
  * ═══════════════════════════════════════════════════════════════
  */
 

@@ -1,12 +1,23 @@
 /**
- * test-clan-grouping.js
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║              TEST: CLAN GROUPING                               ║
+ * ╚═══════════════════════════════════════════════════════════════╝
  *
- * Unit tests for utils/elo-clan-grouping.js — the unified clan-tag
- * detection + normalization + grouping module shared by elo-discord.js,
- * tools/elo-inspect.js, and tools/elo-clans-audit.js.
+ * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Pinned cases include the user's reported homoglyph example
- * ([♣ΛCE] vs [♣ΛC€]) which must collapse to a single group.
+ * Unit tests for the unified clan-tag detection, normalization, and
+ * grouping module shared by elo-discord.js, tools/elo-inspect.js,
+ * and tools/elo-clans-audit.js. Verifies homoglyph collapsing
+ * ([♣ΛCE] vs [♣ΛC€]) and other edge cases.
+ *
+ * ─── USAGE ───────────────────────────────────────────────────────
+ *
+ *   node testing/run-all-tests.js
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Pure logic test; no server or database dependency.
+ *
  */
 
 import {

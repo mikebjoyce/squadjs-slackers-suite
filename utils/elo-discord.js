@@ -54,8 +54,12 @@
  *   timeout. Pending state is stored on tracker._resetConfirmPending.
  * - formatDuration is a local helper (not exported).
  *
- * Author:
- * Discord: `real_slacker`
+ *
+ * ─── AUTHOR ──────────────────────────────────────────────────────
+ *
+ * Slacker
+ * Discord: real_slacker
+ * GitHub:  https://github.com/mikebjoyce/squadjs-elo-tracker
  *
  * ═══════════════════════════════════════════════════════════════
  */

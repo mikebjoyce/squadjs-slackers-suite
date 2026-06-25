@@ -39,8 +39,12 @@
  *   Calculates and displays a "Competitive Skill Rank" (CSR) (μ - 3.0σ)
  *   as the primary player rank to encourage active play.
  *
- * Author:
- * Discord: `real_slacker`
+ *
+ * ─── AUTHOR ──────────────────────────────────────────────────────
+ *
+ * Slacker
+ * Discord: real_slacker
+ * GitHub:  https://github.com/mikebjoyce/squadjs-elo-tracker
  *
  * ═══════════════════════════════════════════════════════════════
  */
@@ -115,7 +119,10 @@ const EloCommands = {
       try {
         const record = await this._findPlayerByIdentifier(identifier);
         if (!record) {
-          return await this.respond(player, `No ELO record found for: ${identifier}`);
+          return await this.respond(player, [
+            `No ELO record found for: ${identifier}`,
+            'Type !elo help for available commands.'
+          ].join('\n'));
         }
 
         const minRounds = this.options.minRoundsForLeaderboard;

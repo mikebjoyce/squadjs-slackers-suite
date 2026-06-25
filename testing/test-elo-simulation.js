@@ -1,20 +1,22 @@
 /**
- * test-elo-simulation.js
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║               TEST: ELO SIMULATION                             ║
+ * ╚═══════════════════════════════════════════════════════════════╝
  *
- * Simulation tests for EloCalculator.
- * Models a realistic Squad server population:
- *   - ~50 regulars (high play frequency)
- *   - ~200 semi-regulars (moderate frequency)
- *   - ~250 randoms (low frequency, drop in occasionally)
+ * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Validates statistical properties over time:
- *   1. No NaN / Infinity ever produced
- *   2. Sigma decreases for active players
- *   3. Consistently winning players rise; losing players fall
- *   4. Ratings stay within sane bounds after many rounds
- *   5. Participation scaling produces proportional deltas
- *   6. Veteran players (low sigma) move less per round than rookies (high sigma)
- *   7. Single player long-run: sigma floors correctly, mu converges
+ * Simulates 20 rounds of 50v50 with a weighted player pool to verify
+ * long-term stability of the TrueSkill algorithm—rating convergence,
+ * absence of NaN/infinite values, and no runaway sigma inflation.
+ *
+ * ─── USAGE ───────────────────────────────────────────────────────
+ *
+ *   node testing/run-all-tests.js
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Pure math test; no database or server dependency.
+ *
  */
 
 import EloCalculator from '../utils/elo-calculator.js';

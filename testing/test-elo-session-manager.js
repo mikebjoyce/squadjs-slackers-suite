@@ -1,3 +1,24 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║              TEST: ELO SESSION MANAGER                         ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Validates the in-memory session tracker: startRound, updatePlayers
+ * (joins, team switches, disconnects), endRound participation ratio
+ * calculation, and edge cases (null-teamID, zero-time players).
+ *
+ * ─── USAGE ───────────────────────────────────────────────────────
+ *
+ *   node testing/run-all-tests.js
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Uses mocked Date.now() to simulate precise timing.
+ *
+ */
+
 import EloSessionManager from '../utils/elo-session-manager.js';
 
 // Mock Date.now() to control time

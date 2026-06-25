@@ -39,8 +39,12 @@
  *   and session.activeSegment. Closing activeSegment updates the
  *   array entry in-place.
  *
- * Author:
- * Discord: `real_slacker`
+ *
+ * ─── AUTHOR ──────────────────────────────────────────────────────
+ *
+ * Slacker
+ * Discord: real_slacker
+ * GitHub:  https://github.com/mikebjoyce/squadjs-elo-tracker
  *
  * ═══════════════════════════════════════════════════════════════
  */

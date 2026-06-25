@@ -1,3 +1,24 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║                  TEST: ELO TRACKER PLUGIN                      ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Validates the main EloTracker plugin: mount/unmount lifecycle,
+ * event listener registration, round outcome processing, and
+ * integration with the in-memory session manager and calculator.
+ *
+ * ─── USAGE ───────────────────────────────────────────────────────
+ *
+ *   node testing/run-all-tests.js
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Uses mocked server, rcon, and plugin APIs; no live SquadJS required.
+ *
+ */
+
 import EloTracker from '../plugins/elo-tracker.js';
 
 export default async function runTrackerTests(runTest) {

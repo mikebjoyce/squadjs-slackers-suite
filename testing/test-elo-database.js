@@ -1,3 +1,26 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║                  TEST: ELO DATABASE                            ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Validates the Sequelize persistence layer: initDB model creation,
+ * upsertPlayerStats, bulkIncrementPlayerStats, leaderboard queries,
+ * and export/import round-trip integrity using an in-memory SQLite
+ * instance.
+ *
+ * ─── USAGE ───────────────────────────────────────────────────────
+ *
+ *   node testing/run-all-tests.js
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Uses an in-memory SQLite database; no file I/O required.
+ * - Requires the `sequelize` npm package to be installed.
+ *
+ */
+
 import Sequelize from 'sequelize';
 import EloDatabase from '../utils/elo-database.js';
 

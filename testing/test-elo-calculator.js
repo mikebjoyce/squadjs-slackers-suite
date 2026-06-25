@@ -1,3 +1,23 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║                  TEST: ELO CALCULATOR                         ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Validates the TrueSkill math engine: constant defaults, win/loss/draw
+ * delta calculations, and edge cases (empty teams, c===0 guard).
+ *
+ * ─── USAGE ───────────────────────────────────────────────────────
+ *
+ *   node testing/test-elo-calculator.js
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Run via the unified test runner: node testing/run-all-tests.js
+ *
+ */
+
 import EloCalculator from '../utils/elo-calculator.js';
 
 export default async function runCalculatorTests(runTest) {

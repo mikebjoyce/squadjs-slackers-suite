@@ -56,8 +56,12 @@
  * - pruneStaleEntries() removes provisional players unseen for 30 days
  *   and calibrated players unseen for 90 days.
  *
- * Author:
- * Discord: `real_slacker`
+ *
+ * ─── AUTHOR ──────────────────────────────────────────────────────
+ *
+ * Slacker
+ * Discord: real_slacker
+ * GitHub:  https://github.com/mikebjoyce/squadjs-elo-tracker
  *
  * ═══════════════════════════════════════════════════════════════
  */

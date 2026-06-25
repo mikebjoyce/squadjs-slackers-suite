@@ -1,3 +1,25 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║               TEST RUNNER: ALL TESTS                          ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Unified test runner that discovers and executes all test suites
+ * in the testing/ directory. Provides a runTest helper with pass/fail
+ * logging and aggregates results from every suite.
+ *
+ * ─── USAGE ───────────────────────────────────────────────────────
+ *
+ *   node testing/run-all-tests.js
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Tests that require a live SquadJS server or database connector
+ *   will be skipped automatically if their dependencies are absent.
+ *
+ */
+
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 
