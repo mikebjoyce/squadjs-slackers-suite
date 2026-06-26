@@ -147,6 +147,8 @@ const { DataTypes, Op } = Sequelize;
  *
  */
 export default class Switch extends DiscordBasePlugin {
+    static version = '2.0.0';
+
     static get description() {
         return "Switch plugin with persistent join timers";
     }
@@ -302,7 +304,10 @@ export default class Switch extends DiscordBasePlugin {
         this.recentDoubleSwitches = [];
         // recentDisconnections removed in Stage 6.2b — replaced by S3_PLAYER_JOINED's
         // previousTeamID payload and S³ reconnect data.
-        this._switchQueue = new Map();      // eosID → { eosID, steamID, playerName, teamID, queuedAt, warnInterval }
+        this._switchQueue = {
+            t1: [], // players on T1 wanting T2 — ordered FIFO
+            t2: []  // players on T2 wanting T1 — ordered FIFO
+        };
         this._lastTeamSnapshot = null;      // { t1: number, t2: number } — previous poll's team counts for stability check
         this._switchedOnJoin = new Set();
         this._queueProcessing = false;      // Re-entrancy guard for _processQueue
@@ -770,10 +775,7 @@ export default class Switch extends DiscordBasePlugin {
                     this.warn(eosID, "All player cooldowns cleared.");
                     break;
                 case 'cancel':
-                    if (this._switchQueue.has(info.player?.eosID)) {
-                        const entry = this._switchQueue.get(info.player.eosID);
-                        clearInterval(entry.warnInterval);
-                        this._switchQueue.delete(info.player.eosID);
+                    if (this._removePlayerFromQueue(info.player?.eosID)) {
                         this.warn(eosID, '[Switch Queue] Removed — you left the queue.');
                         this.verbose(1, `[Queue] ${playerName} cancelled — left the queue.`);
                     } else {
@@ -859,7 +861,7 @@ export default class Switch extends DiscordBasePlugin {
                 return;
             }
 
-            const queueSameTeam = [...this._switchQueue.values()].filter(e => e.teamID === teamID).length;
+            const queueSameTeam = this._switchQueue[teamID === 1 ? 't1' : 't2'].length;
             if (queueSameTeam > 0) {
                 this._enqueuePlayer(info.player, 'Other players are already waiting in the queue.');
                 return;
@@ -961,12 +963,9 @@ export default class Switch extends DiscordBasePlugin {
      }
 
     async onRoundEnded(dt) {
-        for (const entry of this._switchQueue.values()) {
-            clearInterval(entry.warnInterval);
-        }
-        this._switchQueue.clear();
+        // Queue persists across normal round ends — teams don't change, so switch requests stay valid.
         this._lastTeamSnapshot = null;
-        this.verbose(2, '[Queue] Switch queue cleared on round end.');
+        this.verbose(2, `[Queue] Round ended — queue preserved (${this._getQueueSize()} entries remain).`);
         await this.cleanup();
         await this.doSwitchMatchend();
         this._switchedOnJoin.clear();
@@ -1003,18 +1002,20 @@ export default class Switch extends DiscordBasePlugin {
     getDynamicExtraSlots() {
         if (!this.options.dynamicBalanceTolerance) return 0;
 
-        const UPPER_BOUND = 98;
+        const effectiveCap = this?._s3?.serverConfig?.isReady()
+          ? this._s3.serverConfig.getMaxPlayers() - this._s3.serverConfig.getNumReservedSlots()
+          : 98;
         const floor = this.options.dynamicBalancePlayerFloor;
         const extra = this.options.dynamicBalanceExtraSlots;
 
         let totalPlayers = 0;
         for (let p of this.server.players) totalPlayers++;
 
-        if (totalPlayers >= UPPER_BOUND) return 0;
+        if (totalPlayers >= effectiveCap) return 0;
         
         if (totalPlayers <= floor) return extra;
         
-        const interpolated = extra * (UPPER_BOUND - totalPlayers) / (UPPER_BOUND - floor);
+        const interpolated = extra * (effectiveCap - totalPlayers) / (effectiveCap - floor);
         return Math.round(interpolated);
     }
 
@@ -1042,7 +1043,10 @@ export default class Switch extends DiscordBasePlugin {
              teamPlayerCount[+p.teamID]++;
 
          const receivingTeam = teamID === 1 ? 2 : 1;
-         if ((teamPlayerCount[receivingTeam] || 0) >= 50) return 0;
+         const maxTeamSize = this?._s3?.serverConfig?.isReady()
+           ? Math.floor(this._s3.serverConfig.getMaxPlayers() / 2)
+           : 50;
+         if ((teamPlayerCount[receivingTeam] || 0) >= maxTeamSize) return 0;
 
          return 1;
      }
@@ -1101,14 +1105,16 @@ export default class Switch extends DiscordBasePlugin {
         }
 
         const windowMs = this.options.switchEnabledMinutes * 60 * 1000;
+        const targetTeam = teamID === 1 ? 2 : 1;
+        const subQueue = teamID === 1 ? 't1' : 't2';
 
-        if (this._switchQueue.has(eosID)) {
-            const existing = this._switchQueue.get(eosID);
+        // Check if already queued
+        if (this._findQueueEntry(eosID)) {
+            const existing = this._findQueueEntry(eosID).entry;
             const elapsed = Date.now() - existing.queuedAt;
             const remaining = ((windowMs - elapsed) / 60000).toFixed(1);
-            const targetTeam = existing.teamID === 1 ? 2 : 1;
             this.warn(eosID,
-                `[Switch Queue]\nYou are already in the queue.\n~${remaining}m remaining | Team ${existing.teamID} → Team ${targetTeam}\nType !switch cancel to leave.`
+                `[Switch Queue]\nYou are already in the queue.\n~${remaining}m remaining | Team ${existing.currentTeamID} → Team ${existing.targetTeamID}\nType !switch cancel to leave.`
             );
             return;
         }
@@ -1116,37 +1122,106 @@ export default class Switch extends DiscordBasePlugin {
         const queuedAt = Date.now();
 
         const warnInterval = setInterval(() => {
-            const entry = this._switchQueue.get(eosID);
-            if (!entry) { clearInterval(warnInterval); return; }
+            const found = this._findQueueEntry(eosID);
+            if (!found) { clearInterval(warnInterval); return; }
 
+            const entry = found.entry;
             const elapsed = Date.now() - entry.queuedAt;
             const remaining = ((windowMs - elapsed) / 60000).toFixed(1);
 
-            const sameTeam = [...this._switchQueue.values()]
-                .filter(e => e.teamID === entry.teamID)
-                .sort((a, b) => a.queuedAt - b.queuedAt);
+            const sameTeam = this._switchQueue[entry.currentTeamID === 1 ? 't1' : 't2'];
             const pos = sameTeam.findIndex(e => e.eosID === eosID) + 1;
-            const targetTeam = entry.teamID === 1 ? 2 : 1;
 
             this.warn(entry.eosID,
-                `[Switch Queue]\nPosition ${pos} in the queue.\n~${remaining}m remaining | Team ${entry.teamID} → Team ${targetTeam}\nType !switch cancel to leave.`
+                `[Switch Queue]\nPosition ${pos} in the queue.\n~${remaining}m remaining | Team ${entry.currentTeamID} → Team ${entry.targetTeamID}\nType !switch cancel to leave.`
             );
         }, 30_000);
 
-        const sameTeamAtEnqueue = [...this._switchQueue.values()]
-            .filter(e => e.teamID === teamID);
-        const enqueuePos = sameTeamAtEnqueue.length + 1;
-        const targetTeam = teamID === 1 ? 2 : 1;
-        const remainingAtEnqueue = (windowMs / 60000).toFixed(1);
+        const enqueuePos = this._switchQueue[subQueue].length + 1;
 
-        this._switchQueue.set(eosID, { eosID, steamID, playerName, teamID, queuedAt, warnInterval });
+        const entry = { eosID, steamID, playerName, currentTeamID: teamID, targetTeamID: targetTeam, queuedAt, warnInterval };
+        this._switchQueue[subQueue].push(entry);
 
         this.warn(eosID,
-            `[Switch Queue]\nAdded to position ${enqueuePos} in the queue.\n~${remainingAtEnqueue}m remaining | Team ${teamID} → Team ${targetTeam}\n${reason}\nType !switch cancel to leave.`
+            `[Switch Queue]\nAdded to position ${enqueuePos} in the queue.\n~${(windowMs / 60000).toFixed(1)}m remaining | Team ${teamID} → Team ${targetTeam}\n${reason}\nType !switch cancel to leave.`
         );
-        this.verbose(1, `[Queue] ${playerName} (T${teamID}) enqueued at position ${enqueuePos}. Queue size: ${this._switchQueue.size}`);
+        this.verbose(1, `[Queue] ${playerName} (T${teamID} → T${targetTeam}) enqueued at position ${enqueuePos}. Queue size: ${this._getQueueSize()}`);
 
         this._requestQueueRefresh();
+    }
+
+    _getQueueSize() {
+        return this._switchQueue.t1.length + this._switchQueue.t2.length;
+    }
+
+    _clearAllQueueEntries(reason) {
+        for (const entry of [...this._switchQueue.t1, ...this._switchQueue.t2]) {
+            clearInterval(entry.warnInterval);
+        }
+        this._switchQueue.t1 = [];
+        this._switchQueue.t2 = [];
+        this.verbose(2, `[Queue] All entries cleared: ${reason}`);
+    }
+
+    /**
+     * Returns a read-only snapshot of the current switch queue.
+     * @returns {{ t1ToT2: Array, t2ToT1: Array }}
+     *   Each entry: { eosID, steamID, playerName, currentTeamID, targetTeamID, queuedAt }
+     *   warnInterval is NOT exposed in the snapshot.
+     */
+    getQueueSnapshot() {
+        return {
+            t1ToT2: this._switchQueue.t1.map(e => ({ eosID: e.eosID, steamID: e.steamID, playerName: e.playerName, currentTeamID: e.currentTeamID, targetTeamID: e.targetTeamID, queuedAt: e.queuedAt })),
+            t2ToT1: this._switchQueue.t2.map(e => ({ eosID: e.eosID, steamID: e.steamID, playerName: e.playerName, currentTeamID: e.currentTeamID, targetTeamID: e.targetTeamID, queuedAt: e.queuedAt }))
+        };
+    }
+
+    /**
+     * Removes a player from the switch queue by eosID.
+     * Clears warnInterval, removes from appropriate sub-queue.
+     * @param {string} eosID
+     * @returns {object|null} The removed entry, or null if not found.
+     */
+    consumeQueueEntry(eosID) {
+        const entry = this._removePlayerFromQueue(eosID);
+        if (entry) {
+            this.verbose(1, `[Queue] ${entry.playerName} consumed externally via handshake. Queue size: ${this._getQueueSize()}`);
+        }
+        return entry || null;
+    }
+
+    /**
+     * Force-swaps a queued player — removes them from the queue and
+     * runs Switch's own solo-switch pipeline (RCON move, cooldown,
+     * messaging, attribution). Called by SmartAssign's handshake when
+     * a swap is approved. The joining player's move is already queued
+     * by SA — this method only handles the Switch-queued player.
+     *
+     * Does NOT race with _processQueue because the entry is removed
+     * before the RCON move begins. If the player is not in the queue,
+     * returns false and no switch is attempted (SA falls back to
+     * baseline assignment for the joining player only).
+     *
+     * @param {string} eosID - The queue entry's eosID
+     * @returns {Promise<boolean>} true if the player was successfully
+     *   removed and switched; false if not in queue
+     */
+    async forceQueueSwap(eosID) {
+        const entry = this._removePlayerFromQueue(eosID);
+        if (!entry) {
+            this.verbose(1, `[Queue] forceQueueSwap: ${eosID} not found in queue (already consumed/cancelled/disconnected).`);
+            return false;
+        }
+        this.verbose(1, `[Queue] forceQueueSwap: Initiating handshake swap for ${entry.playerName}. Queue size: ${this._getQueueSize()}`);
+
+        try {
+            await this._taggedSwitchPlayer(eosID, 'Handshake-Swap');
+            this.verbose(1, `[Queue] forceQueueSwap: ${entry.playerName} switched successfully via handshake.`);
+            return true;
+        } catch (err) {
+            this.verbose(1, `[Queue] forceQueueSwap: Switch failed for ${entry.playerName}: ${err.message}. Player was already removed from queue — cooldown may have been applied.`);
+            return false;
+        }
     }
 
     async _processQueue() {
@@ -1158,21 +1233,26 @@ export default class Switch extends DiscordBasePlugin {
         this._queueProcessing = true;
         try {
             if (this.s3IsEndgameFactionVote()) {
-                if (this._switchQueue.size > 0) {
+                if (this._getQueueSize() > 0) {
                     this.verbose(2, `[Queue] Faction vote in progress — skipping queue processing.`);
                 }
                 return;
             }
 
             const windowMs = this.options.switchEnabledMinutes * 60 * 1000;
-            const now = Date.now();
+            const nowTs = Date.now();
 
-            for (const [eosID, entry] of this._switchQueue.entries()) {
-                if ((now - entry.queuedAt) >= windowMs) {
-                    clearInterval(entry.warnInterval);
-                    this._switchQueue.delete(eosID);
-                    this.warn(entry.eosID, `[Switch Queue] Removed — join/match window closed.\nYour ${this.options.switchEnabledMinutes}m window expired while waiting.\nUse !switch explain for details.`);
-                    this.verbose(2, `[Queue] ${entry.playerName} expired and removed from queue.`);
+            // Expiry sweep on both sub-queues
+            for (const subQueue of ['t1', 't2']) {
+                const arr = this._switchQueue[subQueue];
+                for (let i = arr.length - 1; i >= 0; i--) {
+                    const entry = arr[i];
+                    if ((nowTs - entry.queuedAt) >= windowMs) {
+                        clearInterval(entry.warnInterval);
+                        arr.splice(i, 1);
+                        this.warn(entry.eosID, `[Switch Queue] Removed — join/match window closed.\nYour ${this.options.switchEnabledMinutes}m window expired while waiting.\nUse !switch explain for details.`);
+                        this.verbose(2, `[Queue] ${entry.playerName} expired and removed from queue.`);
+                    }
                 }
             }
 
@@ -1187,13 +1267,9 @@ export default class Switch extends DiscordBasePlugin {
                 && prevSnapshot.t2 === t2;
             this._lastTeamSnapshot = { t1, t2 };
 
-            const t1Candidates = [...this._switchQueue.values()]
-                .filter(e => e.teamID === 1)
-                .sort((a, b) => a.queuedAt - b.queuedAt);
-            const t2Candidates = [...this._switchQueue.values()]
-                .filter(e => e.teamID === 2)
-                .sort((a, b) => a.queuedAt - b.queuedAt);
-
+            // Pair swap: FIFO heads from each sub-queue
+            const t1Candidates = [...this._switchQueue.t1]; // already FIFO ordered
+            const t2Candidates = [...this._switchQueue.t2];
             const pairCount = Math.min(t1Candidates.length, t2Candidates.length);
 
             for (let i = 0; i < pairCount; i++) {
@@ -1203,23 +1279,19 @@ export default class Switch extends DiscordBasePlugin {
                 const live1 = this.server.players.find(p => p.eosID === p1.eosID);
                 const live2 = this.server.players.find(p => p.eosID === p2.eosID);
 
-                if (!live1 || live1.teamID !== p1.teamID) {
-                    clearInterval(p1.warnInterval);
-                    this._switchQueue.delete(p1.eosID);
+                if (!live1 || live1.teamID !== p1.currentTeamID) {
+                    this._removePlayerFromQueue(p1.eosID);
                     this.verbose(1, `[Queue] ${p1.playerName} team changed externally — removed from queue.`);
                     continue;
                 }
-                if (!live2 || live2.teamID !== p2.teamID) {
-                    clearInterval(p2.warnInterval);
-                    this._switchQueue.delete(p2.eosID);
+                if (!live2 || live2.teamID !== p2.currentTeamID) {
+                    this._removePlayerFromQueue(p2.eosID);
                     this.verbose(1, `[Queue] ${p2.playerName} team changed externally — removed from queue.`);
                     continue;
                 }
 
-                clearInterval(p1.warnInterval);
-                this._switchQueue.delete(p1.eosID);
-                clearInterval(p2.warnInterval);
-                this._switchQueue.delete(p2.eosID);
+                this._removePlayerFromQueue(p1.eosID);
+                this._removePlayerFromQueue(p2.eosID);
 
                 this.warn(p1.eosID, '[Switch Queue] Swap partner found — switching now.');
                 this.warn(p2.eosID, '[Switch Queue] Swap partner found — switching now.');
@@ -1247,41 +1319,34 @@ export default class Switch extends DiscordBasePlugin {
             }
 
             if (!stable) {
-                if (this._switchQueue.size > 0) {
+                if (this._getQueueSize() > 0) {
                     this.verbose(2, `[Queue] Team counts changed (${prevSnapshot?.t1 ?? '?'}v${prevSnapshot?.t2 ?? '?'} → ${t1}v${t2}) — skipping solo processing this tick.`);
                 }
                 return;
             }
 
-            const remaining = [...this._switchQueue.values()]
-                .sort((a, b) => a.queuedAt - b.queuedAt);
+            const t1Queued = this._switchQueue.t1.length;
+            const t2Queued = this._switchQueue.t2.length;
 
-            const isLiberal = this.isLiberalMode();
-            const effectiveCap = isLiberal ? this.options.liberalSwitchMaxUnbalancedSlots : null;
-
-            const t1Queued = remaining.filter(e => e.teamID === 1).length;
-            const t2Queued = remaining.filter(e => e.teamID === 2).length;
-
-            if (this._switchQueue.size > 0) {
+            if (this._getQueueSize() > 0) {
                 this.verbose(2, `[Queue] T1: ${t1Queued} queued | T2: ${t2Queued} queued | Teams: ${t1}v${t2} | Diff: ${t1 - t2}`);
             }
 
-            const firstT1 = remaining.find(e => e.teamID === 1);
-            const firstT2 = remaining.find(e => e.teamID === 2);
+            const firstT1 = this._switchQueue.t1[0] || null;
+            const firstT2 = this._switchQueue.t2[0] || null;
 
             for (const entry of [firstT1, firstT2].filter(Boolean)) {
                 const live = this.server.players.find(p => p.eosID === entry.eosID);
-                if (!live || live.teamID !== entry.teamID) {
-                    clearInterval(entry.warnInterval);
-                    this._switchQueue.delete(entry.eosID);
+                if (!live || live.teamID !== entry.currentTeamID) {
+                    this._removePlayerFromQueue(entry.eosID);
                     this.verbose(1, `[Queue] ${entry.playerName} team changed externally — removed from queue.`);
                     continue;
                 }
 
-                const slots = this.getSwitchSlotsPerTeam(entry.teamID, effectiveCap);
+                const effectiveCap = this.isLiberalMode() ? this.options.liberalSwitchMaxUnbalancedSlots : null;
+                const slots = this.getSwitchSlotsPerTeam(entry.currentTeamID, effectiveCap);
                 if (slots > 0) {
-                    clearInterval(entry.warnInterval);
-                    this._switchQueue.delete(entry.eosID);
+                    this._removePlayerFromQueue(entry.eosID);
 
                     this.warn(entry.eosID, '[Switch Queue] Balance slot opened — switching now.');
                     await this._taggedSwitchPlayer(entry.eosID, 'Player-Queue');
@@ -1299,7 +1364,7 @@ export default class Switch extends DiscordBasePlugin {
                         }
                     }
 
-                    this.verbose(1, `[Queue] Solo switch fired for ${entry.playerName} (T${entry.teamID})`);
+                    this.verbose(1, `[Queue] Solo switch fired for ${entry.playerName} (T${entry.currentTeamID})`);
 
                     break;
                 }
@@ -1323,10 +1388,7 @@ export default class Switch extends DiscordBasePlugin {
     }
 
     handlePlayerLeave(eosID, teamID, playerName) {
-        if (this._switchQueue.has(eosID)) {
-            const entry = this._switchQueue.get(eosID);
-            clearInterval(entry.warnInterval);
-            this._switchQueue.delete(eosID);
+        if (this._removePlayerFromQueue(eosID)) {
             this.verbose(2, `[Queue] ${playerName} disconnected — removed from queue.`);
         }
         this.verbose(2, `Player disconnected ${playerName}`);
@@ -1564,12 +1626,32 @@ export default class Switch extends DiscordBasePlugin {
         }
     }
 
-    _removePlayerFromQueue(eosID) {
-        if (this._switchQueue.has(eosID)) {
-            const entry = this._switchQueue.get(eosID);
-            clearInterval(entry.warnInterval);
-            this._switchQueue.delete(eosID);
+    /**
+     * Find a queue entry across both sub-queues by eosID.
+     * @param {string} eosID
+     * @returns {{ entry: object, subQueue: string, index: number } | null}
+     */
+    _findQueueEntry(eosID) {
+        for (const subQueue of ['t1', 't2']) {
+            const idx = this._switchQueue[subQueue].findIndex(e => e.eosID === eosID);
+            if (idx !== -1) {
+                return { entry: this._switchQueue[subQueue][idx], subQueue, index: idx };
+            }
         }
+        return null;
+    }
+
+    /**
+     * Remove a player from the queue by eosID. Clears warnInterval.
+     * @param {string} eosID
+     * @returns {object|null} The removed entry, or null if not found.
+     */
+    _removePlayerFromQueue(eosID) {
+        const found = this._findQueueEntry(eosID);
+        if (!found) return null;
+        clearInterval(found.entry.warnInterval);
+        this._switchQueue[found.subQueue].splice(found.index, 1);
+        return found.entry;
     }
 
     async unmount() {
@@ -1587,10 +1669,7 @@ export default class Switch extends DiscordBasePlugin {
         this.server.removeListener('S3_PLAYER_LEFT', this.onS3PlayerLeft);
         this.server.removeListener('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
         if (this.options.discordClient) this.options.discordClient.removeListener('message', this.onDiscordMessage);
-        for (const entry of this._switchQueue.values()) {
-            clearInterval(entry.warnInterval);
-        }
-        this._switchQueue.clear();
+        this._clearAllQueueEntries('Plugin unmount');
         this._s3 = null;
         this.verbose(1, 'Switch plugin was un-mounted.');
     }
@@ -1682,8 +1761,13 @@ export default class Switch extends DiscordBasePlugin {
         const { affectedPlayers } = data;
         this.verbose(2, `[SCRAMBLE_EVENT] onScrambleExecuted called with data: ${JSON.stringify(data)}`);
         
+        // Clear the switch queue on scramble — teams have been reshuffled, all pending switch
+        // requests are stale. Players must re-join the queue after the scramble if they still
+        // want to switch. This runs BEFORE lockdown logic so queued players are cleaned up first.
+        this._clearAllQueueEntries('Scramble');
+
         if (!affectedPlayers || affectedPlayers.length === 0) {
-            this.verbose(1, `[SCRAMBLE_EVENT] WARNING: affectedPlayers is empty or undefined!`);
+            this.verbose(1, `[SCRAMBLE_EVENT] WARNING: affectedPlayers is empty or undefined — queue cleared, but no lockdown records written.`);
             return;
         }
 

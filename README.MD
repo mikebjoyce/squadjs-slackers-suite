@@ -168,6 +168,29 @@ squad-server/
 
 ---
 
+## Handshake Integration
+
+The Switch plugin exposes a public API for external consumers (such as SmartAssign) to read and consume queue entries. This is used by the **SA-Switch Handshake** feature: when SmartAssign evaluates a joining player, it may swap them with a Switch-queued player for a more balanced outcome that also satisfies the Switch player's request.
+
+### Public API
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `getQueueSnapshot()` | `() → { t1ToT2: Array, t2ToT1: Array }` | Returns shallow copies of both directional sub-queues. Read-only — no side effects. Each entry exposes `{ eosID, steamID, playerName, currentTeamID, targetTeamID, queuedAt }`. `warnInterval` is NOT exposed. |
+| `forceQueueSwap(eosID)` | `(String) → boolean` | Removes the player from the queue, clears warn intervals, and executes the RCON switch. Returns `true` on success, `false` if player was already consumed/cancelled/disconnected. |
+| `consumeQueueEntry(eosID)` | `(String) → Entry | null` | _(Alternative)_ Removes queue bookkeeping only — does NOT execute RCON. Returns the entry or null. |
+
+### Version Compatibility
+
+- `static version = '2.0.0'` — initial public API with dual-array queue.
+- Consumers should check `plugin.constructor.version` (wrapped in try/catch) and require `>= 2.0.0` before using the API.
+
+### Consumer Discovery
+
+External plugins discover Switch at runtime via `this.server.plugins.find(p => p.constructor.name === 'Switch')`. The consumer verifies the version and method existence before enabling handshake features.
+
+---
+
 ## Configuration Options
 
 ### Required
