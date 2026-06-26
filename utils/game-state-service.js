@@ -108,6 +108,10 @@ export default class GameStateService {
     // Note: ENDGAME sub-states are NOT persisted. Recovering into ENDGAME is dangerous and warns.
     this.endgameSubState = null;
 
+    // Subscription callbacks
+    this._onGamePhaseChangeCallbacks = [];
+    this._onLayerGameModeChangeCallbacks = [];
+
     this.listeners = {
       handleNewGame: this.handleNewGame.bind(this),
       handleRoundEnded: this.handleRoundEnded.bind(this),
@@ -129,6 +133,17 @@ export default class GameStateService {
     await this._initPersistence();
     await this._recoverPersistedState();
     await this._validateRecoveredState('mount');
+
+    // Backfill roundStartTime when mounting mid-round (phase is LIVE but no NEW_GAME has fired yet).
+    // This is the earliest moment S³ knows about the current round. Consumer plugins (EloTracker,
+    // SmartAssign) rely on getRoundStartTime() for restart recovery — without this, they'd get null
+    // and start a fresh session mid-round, losing continuity.
+    if (this.phase === 'LIVE' && this.roundStartTime === null) {
+      this.roundStartTime = Date.now();
+      this.matchId = Math.floor(this.roundStartTime / 1000).toString(36).slice(-8);
+      await this._persistState();
+      this.verboseLogger(2, `[GameState] Mounted mid-round — backfilled roundStartTime: ${new Date(this.roundStartTime).toISOString()}`);
+    }
 
     if (this.server.currentLayer) {
       await this.resolveLayerInfo(this.server.currentLayer, 'mount');
@@ -169,6 +184,79 @@ export default class GameStateService {
 
   isReady() {
     return this._isMounted;
+  }
+
+  /**
+   * Register a callback for game phase changes (STAGING/LIVE/ENDGAME transitions
+   * including ENDGAME sub-state changes). Fires after the service's internal state
+   * is fully committed.
+   * @param {Function} callback - Receives { phase, prevPhase, subPhase, roundStartTime, matchId, layer }
+   * @returns {Function} unsubscribe function
+   */
+  onGamePhaseChange(callback) {
+    if (typeof callback !== 'function') {
+      throw new Error('GameStateService.onGamePhaseChange requires a function callback.');
+    }
+    this._onGamePhaseChangeCallbacks.push(callback);
+    this.verboseLogger(4, `[GameState] Added phase change subscriber (total: ${this._onGamePhaseChangeCallbacks.length})`);
+    return () => {
+      this._onGamePhaseChangeCallbacks = this._onGamePhaseChangeCallbacks.filter(cb => cb !== callback);
+      this.verboseLogger(4, `[GameState] Removed phase change subscriber (total: ${this._onGamePhaseChangeCallbacks.length})`);
+    };
+  }
+
+  /**
+   * Register a callback for layer/game mode changes. Fires after the service
+   * resolves new layer info and the cached values are updated.
+   * @param {Function} callback - Receives { layerName, gameMode }
+   * @returns {Function} unsubscribe function
+   */
+  onLayerGameModeChange(callback) {
+    if (typeof callback !== 'function') {
+      throw new Error('GameStateService.onLayerGameModeChange requires a function callback.');
+    }
+    this._onLayerGameModeChangeCallbacks.push(callback);
+    this.verboseLogger(4, `[GameState] Added layer/gamemode subscriber (total: ${this._onLayerGameModeChangeCallbacks.length})`);
+    return () => {
+      this._onLayerGameModeChangeCallbacks = this._onLayerGameModeChangeCallbacks.filter(cb => cb !== callback);
+      this.verboseLogger(4, `[GameState] Removed layer/gamemode subscriber (total: ${this._onLayerGameModeChangeCallbacks.length})`);
+    };
+  }
+
+  // ── Notification methods ──────────────────────────────────────────
+
+  _notifyGamePhaseChange(prevPhase) {
+    const payload = {
+      phase: this.phase,
+      prevPhase,
+      subPhase: this.endgameSubState,
+      roundStartTime: this.roundStartTime,
+      matchId: this.matchId,
+      layer: this.layerNameCached
+    };
+    for (const cb of this._onGamePhaseChangeCallbacks) {
+      try {
+        cb(payload);
+      } catch (err) {
+        this.verboseLogger(1, `[GameState] Phase change callback error: ${err.message}`);
+      }
+    }
+  }
+
+  _notifyLayerGameModeChange(prevLayer, prevGameMode) {
+    const payload = {
+      layerName: this.layerNameCached,
+      gameMode: this.gameModeCached,
+      prevLayer,
+      prevGameMode
+    };
+    for (const cb of this._onLayerGameModeChangeCallbacks) {
+      try {
+        cb(payload);
+      } catch (err) {
+        this.verboseLogger(1, `[GameState] Layer/gamemode callback error: ${err.message}`);
+      }
+    }
   }
 
   /**
@@ -232,6 +320,10 @@ export default class GameStateService {
     let gamemode = 'Unknown';
     let name = 'Unknown';
 
+    // Capture previous values for notification
+    const prevLayer = this.layerNameCached;
+    const prevGameMode = this.gameModeCached;
+
     if (typeof layer === 'string') {
       name = layer;
       gamemode = this.inferGameMode(name);
@@ -246,6 +338,7 @@ export default class GameStateService {
     await this._persistState();
 
     this.verboseLogger(4, `[GameState:${source}] Layer info updated: ${gamemode} / ${name}`);
+    this._notifyLayerGameModeChange(prevLayer, prevGameMode);
     return true;
   }
 
@@ -317,6 +410,7 @@ export default class GameStateService {
     await this._persistState();
 
     this.verboseLogger(2, '[GameState] NEW_GAME -> STAGING (resolving=true).');
+    this._notifyGamePhaseChange('STAGING');
   }
 
   async handleRoundEnded() {
@@ -339,6 +433,7 @@ export default class GameStateService {
 
     await this._persistState();
     this.verboseLogger(2, '[GameState] ROUND_ENDED -> ENDGAME(scoreboard).');
+    this._notifyGamePhaseChange('ENDGAME');
   }
 
   async handleLayerInfoUpdated() {
@@ -429,6 +524,7 @@ export default class GameStateService {
       this.lastPhaseChangeAt = Date.now();
       await this._persistState();
       this.verboseLogger(2, '[GameState] STAGING timer elapsed -> LIVE.');
+      this._notifyGamePhaseChange('LIVE');
     }, remaining);
   }
 
@@ -461,6 +557,7 @@ export default class GameStateService {
     if (this.endgameSubState === 'scoreboard') {
       this.endgameSubState = 'layerVote';
       this.verboseLogger(2, '[GameState] ENDGAME scoreboard elapsed -> layerVote.');
+      this._notifyGamePhaseChange('ENDGAME');
       this._startEndgameTimer(Date.now());
       return;
     }
@@ -468,6 +565,7 @@ export default class GameStateService {
     if (this.endgameSubState === 'layerVote') {
       this.endgameSubState = 'factionVoteTeam1';
       this.verboseLogger(2, '[GameState] ENDGAME layerVote elapsed -> factionVoteTeam1.');
+      this._notifyGamePhaseChange('ENDGAME');
       this._startEndgameTimer(Date.now());
       return;
     }
@@ -475,6 +573,7 @@ export default class GameStateService {
     if (this.endgameSubState === 'factionVoteTeam1') {
       this.endgameSubState = 'factionVoteTeam2';
       this.verboseLogger(2, '[GameState] ENDGAME factionVoteTeam1 elapsed -> factionVoteTeam2.');
+      this._notifyGamePhaseChange('ENDGAME');
       this._startEndgameTimer(Date.now());
       return;
     }
@@ -482,6 +581,7 @@ export default class GameStateService {
     if (this.endgameSubState === 'factionVoteTeam2') {
       this.endgameSubState = 'postVoting';
       this.verboseLogger(2, '[GameState] ENDGAME factionVoteTeam2 elapsed -> postVoting.');
+      this._notifyGamePhaseChange('ENDGAME');
       // Stay in postVoting (passive, no timer) until NEW_GAME clears the ENDGAME phase.
       // postVoting represents the ~10s results-display window before the map rolls.
       // We wait for the server's NEW_GAME event rather than approximating with another timer.

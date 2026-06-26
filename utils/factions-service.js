@@ -62,6 +62,9 @@ export default class FactionsService {
     this._isMounted = false;
     this._teamAbbreviationPollingInterval = null;
 
+    // Subscription callbacks — fires once per round when both team abbreviations are discovered
+    this._onFactionsResolvedCallbacks = [];
+
     this.listeners = {
       handleNewGame: this.handleNewGame.bind(this),
       handleRoundEnded: this.handleRoundEnded.bind(this),
@@ -115,6 +118,38 @@ export default class FactionsService {
 
   isReady() {
     return this._isMounted;
+  }
+
+  /**
+   * Register a callback for faction abbreviations being resolved (both team
+   * abbreviations discovered via role scanning during LIVE phase).
+   * Fires after the abbreviation cache is updated. Fires at most once per round.
+   * @param {Function} callback - Receives { abbreviations: { 1: 'US', 2: 'RUS' } }
+   * @returns {Function} unsubscribe function
+   */
+  onFactionsResolved(callback) {
+    if (typeof callback !== 'function') {
+      throw new Error('FactionsService.onFactionsResolved requires a function callback.');
+    }
+    this._onFactionsResolvedCallbacks.push(callback);
+    this.verboseLogger(4, `[Factions] Added factions-resolved subscriber (total: ${this._onFactionsResolvedCallbacks.length})`);
+    return () => {
+      this._onFactionsResolvedCallbacks = this._onFactionsResolvedCallbacks.filter(cb => cb !== callback);
+      this.verboseLogger(4, `[Factions] Removed factions-resolved subscriber (total: ${this._onFactionsResolvedCallbacks.length})`);
+    };
+  }
+
+  _notifyFactionsResolved() {
+    const payload = {
+      abbreviations: { ...this.cachedAbbreviations }
+    };
+    for (const cb of this._onFactionsResolvedCallbacks) {
+      try {
+        cb(payload);
+      } catch (err) {
+        this.verboseLogger(1, `[Factions] Factions-resolved callback error: ${err.message}`);
+      }
+    }
   }
 
   getCachedAbbreviations() {
@@ -197,6 +232,7 @@ export default class FactionsService {
   pollTeamAbbreviations() {
     if (!this.gameState.isLive()) return;
 
+    const wasComplete = this._hasBothTeams();
     const discovered = this.extractTeamAbbreviationsFromRoles();
     if (Object.keys(discovered).length > 0) {
       this.cachedAbbreviations = {
@@ -208,6 +244,10 @@ export default class FactionsService {
 
     if (this._hasBothTeams()) {
       this.stopPollingTeamAbbreviations();
+      // Notify subscribers if this is the first time both teams resolved
+      if (!wasComplete) {
+        this._notifyFactionsResolved();
+      }
     }
   }
 

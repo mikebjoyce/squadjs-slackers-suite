@@ -23,7 +23,7 @@
  *   Reconnects:   rememberReconnect(), getReconnect(), peekReconnect(),
  *                 clearReconnects()
  *   Refresh:      registerRefreshInterest(), unregisterRefreshInterest(),
- *                 requestRefresh(), refreshNow()
+ *                 requestRefresh(), refreshNow(), refreshNowImmediate()
  *   Lifecycle:    mount(), unmount(), isReady(),
  *                 handlePlayerConnected(), handleUpdatedPlayerInfo()
  *
@@ -108,6 +108,10 @@ export default class PlayersService {
     this._migrationRegistered = false;
     this._isMounted = false;
     this._initialSyncComplete = false;
+
+    // Subscription callbacks
+    this._onPlayerDataChangedCallbacks = [];
+    this._onPlayerConnectedCallbacks = [];
     // Snapshot of the last fully-resolved team list. Used to build projections when teamIDs go null.
     this._lastStablePlayers = null;
     // Active projection map when we detect the null-teamID window after NEW_GAME.
@@ -192,6 +196,78 @@ export default class PlayersService {
 
   isReady() {
     return this._isMounted;
+  }
+
+  /**
+   * Register a callback for player data changes (after every UPDATED_PLAYER_INFORMATION
+   * tick is fully processed). Fires after the service's registry and projections are
+   * committed.
+   * @param {Function} callback - Receives { joinCount, leaveCount, teamChangeCount, playerCount, projectionActive }
+   * @returns {Function} unsubscribe function
+   */
+  onPlayerDataChanged(callback) {
+    if (typeof callback !== 'function') {
+      throw new Error('PlayersService.onPlayerDataChanged requires a function callback.');
+    }
+    this._onPlayerDataChangedCallbacks.push(callback);
+    this.verboseLogger(4, `[Players] Added player-data subscriber (total: ${this._onPlayerDataChangedCallbacks.length})`);
+    return () => {
+      this._onPlayerDataChangedCallbacks = this._onPlayerDataChangedCallbacks.filter(cb => cb !== callback);
+      this.verboseLogger(4, `[Players] Removed player-data subscriber (total: ${this._onPlayerDataChangedCallbacks.length})`);
+    };
+  }
+
+  /**
+   * Register a callback when a player connects to the server (after PLAYER_CONNECTED
+   * event is fully processed, including reconnect detection).
+   * @param {Function} callback - Receives { player, isNew, previousTeamID }
+   * @returns {Function} unsubscribe function
+   */
+  onPlayerConnected(callback) {
+    if (typeof callback !== 'function') {
+      throw new Error('PlayersService.onPlayerConnected requires a function callback.');
+    }
+    this._onPlayerConnectedCallbacks.push(callback);
+    this.verboseLogger(4, `[Players] Added player-connected subscriber (total: ${this._onPlayerConnectedCallbacks.length})`);
+    return () => {
+      this._onPlayerConnectedCallbacks = this._onPlayerConnectedCallbacks.filter(cb => cb !== callback);
+      this.verboseLogger(4, `[Players] Removed player-connected subscriber (total: ${this._onPlayerConnectedCallbacks.length})`);
+    };
+  }
+
+  // ── Notification methods ──────────────────────────────────────────
+
+  _notifyPlayerDataChanged() {
+    const payload = {
+      joinCount: this._lastTickJoinCount || 0,
+      leaveCount: this._lastTickLeaveCount || 0,
+      teamChangeCount: this._lastTickTeamChangeCount || 0,
+      playerCount: this.registry.size,
+      projectionActive: !!this._projectedPlayers,
+      phase: this.phase
+    };
+    for (const cb of this._onPlayerDataChangedCallbacks) {
+      try {
+        cb(payload);
+      } catch (err) {
+        this.verboseLogger(1, `[Players] Player-data callback error: ${err.message}`);
+      }
+    }
+  }
+
+  _notifyPlayerConnected(player, isNew, previousTeamID) {
+    const payload = {
+      player: { ...player },
+      isNew,
+      previousTeamID
+    };
+    for (const cb of this._onPlayerConnectedCallbacks) {
+      try {
+        cb(payload);
+      } catch (err) {
+        this.verboseLogger(1, `[Players] Player-connected callback error: ${err.message}`);
+      }
+    }
   }
 
   getPlayer(eosIDOrSteamID) {
@@ -326,6 +402,26 @@ export default class PlayersService {
     }
 
     // Cancel any pending debounce.
+    if (this._refreshState.debounceTimer) {
+      clearTimeout(this._refreshState.debounceTimer);
+      this._refreshState.debounceTimer = null;
+      this._refreshState.requestorUrgency = null;
+    }
+
+    await this._executeRefresh(normalized);
+  }
+
+  /**
+   * One-shot explicit refresh that bypasses the registration check and floor.
+   * Cancels any pending debounce and immediately calls updatePlayerList().
+   * Designed for consumers that need a single post-move verification refresh
+   * without maintaining a registered periodic interest (e.g., TeamBalancer's
+   * SwapExecutor after a scramble).
+   */
+  async refreshNowImmediate(source) {
+    const normalized = this._normalizeSource(source);
+
+    // Cancel any pending debounce so we don't double-refresh.
     if (this._refreshState.debounceTimer) {
       clearTimeout(this._refreshState.debounceTimer);
       this._refreshState.debounceTimer = null;
@@ -618,6 +714,11 @@ export default class PlayersService {
     if (!result.isNew) {
       result.state.lastSeenAt = now;
     }
+
+    // Notify connected subscribers
+    if (result) {
+      this._notifyPlayerConnected(result.state, result.isNew, result.previousTeamID);
+    }
   }
 
   async handleUpdatedPlayerInfo() {
@@ -764,6 +865,11 @@ export default class PlayersService {
       this._squadsCache = [...this.server.squads];
     }
 
+    // Store tick counts for notification payload
+    this._lastTickJoinCount = joinCount;
+    this._lastTickLeaveCount = leaveCount;
+    this._lastTickTeamChangeCount = teamChangeCount;
+
     this.verboseLogger(2, `[Players] Tick: ${joinCount} joined, ${leaveCount} left, ${this.registry.size} tracked`);
 
     // Emit batch-complete signal for consumers
@@ -776,6 +882,9 @@ export default class PlayersService {
       projectionActive: !!this._projectedPlayers,
       source: 'S3PlayersRegistry'
     });
+
+    // Notify data-changed subscribers after everything is committed
+    this._notifyPlayerDataChanged();
   }
 
   _isRealTeam(teamID) {
