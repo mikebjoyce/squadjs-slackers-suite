@@ -218,6 +218,7 @@ export default class SmartAssign extends BasePlugin {
       this._pendingPlayerMoves = new Map(); // Map<playerKey, { targetTeam, mu, isVeteran }>
       this.ready = false;
      this._isFinalizingRound = false;
+      this._joinMutex = Promise.resolve();  // Serializes concurrent join evaluations
 
        this.eloTracker = null;
 
@@ -240,6 +241,21 @@ export default class SmartAssign extends BasePlugin {
        this.onS3PlayerTeamChanged = this.onS3PlayerTeamChanged.bind(this);
        this.onS3PlayerLeft = this.onS3PlayerLeft.bind(this);
        this.onS3GameStateLive = this.onS3GameStateLive.bind(this);
+  }
+
+  /**
+   * Simple promise-based mutex. Ensures sequential execution of the
+   * evaluateTeamAssignment + pending-increment critical section across
+   * concurrent handlePlayerJoin invocations. See §7.1f for the full audit.
+   * @returns {Promise<Function>} A release function to call when done.
+   */
+  async _acquireJoinMutex() {
+    let release;
+    const newPromise = new Promise(resolve => { release = resolve; });
+    const prevPromise = this._joinMutex;
+    this._joinMutex = newPromise;
+    await prevPromise;
+    return release;
   }
 
   _isClanGroupingEnabled() {
@@ -507,46 +523,58 @@ export default class SmartAssign extends BasePlugin {
         // (passed via handlePlayerJoin flow) — no need to call destructive getReconnect().
         timemarks.reconnectTeamMs = 0;
 
-        const evalStart = Date.now();
-        const evalResult = await this.evaluateTeamAssignment(player, reconnectTeam, joinPlayerTag);
-       const { targetTeam, reason, debugInfo } = evalResult;
-       timemarks.evaluateMs = Date.now() - evalStart;
-       timemarks.totalPipelineMs = Date.now() - phaseStartTime;
+        // ═══════════════════════════════════════════════════════════════════════════
+        // MUTEX: Serialize concurrent join evaluations to prevent team overshoot.
+        // Join concurrency bug (7.1f): overlapping evaluateTeamAssignment() calls
+        // both see stale _pendingAssignments and may route to the same team.
+        // The mutex ensures only one evaluation runs at a time, so the next in line
+        // sees the updated pending state from the previous evaluation.
+        // ═══════════════════════════════════════════════════════════════════════════
+        const release = await this._acquireJoinMutex();
+        try {
+          const evalStart = Date.now();
+          const evalResult = await this.evaluateTeamAssignment(player, reconnectTeam, joinPlayerTag);
+          const { targetTeam, reason, debugInfo } = evalResult;
+          timemarks.evaluateMs = Date.now() - evalStart;
+          timemarks.totalPipelineMs = Date.now() - phaseStartTime;
 
-       const playerTag = debugInfo?.playerTag || 'null';
-       const clanTeam = debugInfo?.clanTeam || 'none';
+          const playerTag = debugInfo?.playerTag || 'null';
+          const clanTeam = debugInfo?.clanTeam || 'none';
 
-        Logger.verbose('SmartAssign', 3, `[TIMING] ${player.name} join pipeline: tag=${playerTag}, clanTeam=${clanTeam}, mu=${timemarks.preWarmMu?.toFixed(2) ?? 'N/A'} | preWarm=${timemarks.preWarmMs}ms, reconnect=${timemarks.reconnectTeamMs}ms (in-memory), evaluate=${timemarks.evaluateMs}ms, total=${timemarks.totalPipelineMs}ms`);
+          Logger.verbose('SmartAssign', 3, `[TIMING] ${player.name} join pipeline: tag=${playerTag}, clanTeam=${clanTeam}, mu=${timemarks.preWarmMu?.toFixed(2) ?? 'N/A'} | preWarm=${timemarks.preWarmMs}ms, reconnect=${timemarks.reconnectTeamMs}ms (in-memory), evaluate=${timemarks.evaluateMs}ms, total=${timemarks.totalPipelineMs}ms`);
 
-      if (reconnectTeam && reconnectTeam === targetTeam) {
-        Logger.verbose('SmartAssign', 3, `[SmartAssign] Applied reconnect memory for ${player.name} -> Team ${targetTeam} (${reason})`);
-      } else if (reconnectTeam && reconnectTeam !== targetTeam) {
-        Logger.verbose('SmartAssign', 3, `[SmartAssign] Ignored reconnect memory for ${player.name} (Previous: Team ${reconnectTeam}) -> Team ${targetTeam} (${reason})`);
-      } else {
-        Logger.verbose('SmartAssign', 3, `[SmartAssign] Evaluated fresh join for ${player.name} -> Team ${targetTeam} (${reason})`);
-      }
+          if (reconnectTeam && reconnectTeam === targetTeam) {
+            Logger.verbose('SmartAssign', 3, `[SmartAssign] Applied reconnect memory for ${player.name} -> Team ${targetTeam} (${reason})`);
+          } else if (reconnectTeam && reconnectTeam !== targetTeam) {
+            Logger.verbose('SmartAssign', 3, `[SmartAssign] Ignored reconnect memory for ${player.name} (Previous: Team ${reconnectTeam}) -> Team ${targetTeam} (${reason})`);
+          } else {
+            Logger.verbose('SmartAssign', 3, `[SmartAssign] Evaluated fresh join for ${player.name} -> Team ${targetTeam} (${reason})`);
+          }
 
-        // If the player is currently on the wrong team, queue a team change
-        if (targetTeam !== null && String(player.teamID) !== String(targetTeam)) {
-          this._pendingAssignments[targetTeam]++;
-          const pendingPlayerMu = (await getRating(player, this.eloTracker)).mu;
-          this._pendingMu[targetTeam] += pendingPlayerMu;
+          // If the player is currently on the wrong team, queue a team change
+          if (targetTeam !== null && String(player.teamID) !== String(targetTeam)) {
+            this._pendingAssignments[targetTeam]++;
+            const pendingPlayerMu = (await getRating(player, this.eloTracker)).mu;
+            this._pendingMu[targetTeam] += pendingPlayerMu;
 
-        const isVeteran = preWarmRating.roundsPlayed >= 10;
-        if (isVeteran) {
-          this._pendingVeterans[targetTeam]++;
+            const isVeteran = preWarmRating.roundsPlayed >= 10;
+            if (isVeteran) {
+              this._pendingVeterans[targetTeam]++;
+            }
+
+            this._pendingPlayerMoves.set(playerKey, { targetTeam, mu: pendingPlayerMu, isVeteran });
+
+            this.executor.queueMove(playerKey, player.name, player.eosID, targetTeam);
+
+            // S³ attribution: record the move so S³'s S3_PLAYER_TEAM_CHANGED fires with source='SmartAssign'
+            const recordPlayers = this._s3?.players;
+            if (recordPlayers?.isReady() && recordPlayers.recordMove && playerKey) {
+              recordPlayers.recordMove(playerKey, targetTeam, 'SmartAssign');
+            }
+          }
+        } finally {
+          release();
         }
-
-        this._pendingPlayerMoves.set(playerKey, { targetTeam, mu: pendingPlayerMu, isVeteran });
-
-        this.executor.queueMove(playerKey, player.name, player.eosID, targetTeam);
-
-        // S³ attribution: record the move so S³'s S3_PLAYER_TEAM_CHANGED fires with source='SmartAssign'
-        const recordPlayers = this._s3?.players;
-        if (recordPlayers?.isReady() && recordPlayers.recordMove && playerKey) {
-          recordPlayers.recordMove(playerKey, targetTeam, 'SmartAssign');
-        }
-      }
     } finally {
       this._joiningPlayers.delete(lockKey);
     }
