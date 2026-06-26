@@ -42,8 +42,9 @@
  * - Persists phase, resolving, timestamps, layer info, roundStartTime,
  *   and matchId to the S3_GameState database table for crash recovery.
  * - Recovered rounds older than maxRecoveredRoundAgeMs (default 2 hours)
- *   are invalidated and transitioned to LIVE; Seed mode rounds can
- *   exceed this limit — documented as a known limitation.
+ *   are invalidated and transitioned to LIVE; Seed and Training mode
+ *   rounds are exempted from both the age check and the staging-overdue
+ *   check since they have no meaningful STAGING phase and can run 4+ hours.
  * - ENDGAME sub-states are NOT persisted. Recovering into ENDGAME
  *   warns about lost sub-state visibility.
  * - Timer-based ENDGAME progression is approximate — actual voting may
@@ -513,11 +514,20 @@ export default class GameStateService {
   _startStagingLiveTimer(stagingStartedAtMs) {
     this._clearStagingLiveTimer();
 
+    // Seed and Training maps have no meaningful STAGING phase — players join/leave
+    // freely and the server stays in pre-round indefinitely. Skip the forced timer
+    // transition; the next NEW_GAME event will handle phase advancement naturally.
+    if (this.isSeedMode() || this.isTrainingMode()) {
+      this.verboseLogger(2, '[GameState] Seed/Training mode — skipping STAGING timer (phase remains STAGING until NEW_GAME).');
+      return;
+    }
+
     const elapsed = Math.max(0, Date.now() - Number(stagingStartedAtMs || Date.now()));
     const remaining = Math.max(0, this.stagingDurationMs - elapsed);
 
     this._stagingLiveTimer = setTimeout(async () => {
       if (this.phase !== 'STAGING') return;
+      this._recoveredStateActive = false;
 
       this.phase = 'LIVE';
       this.resolving = false;
@@ -733,7 +743,30 @@ export default class GameStateService {
     }
 
     if (this.phase === 'STAGING' && this.lastNewGameAt) {
-      this._startStagingLiveTimer(this.lastNewGameAt);
+      if (this.resolving === false) {
+        // Teams were already resolved before crash — skip timer, go straight to LIVE
+        this.phase = 'LIVE';
+        this._recoveredStateActive = false;
+        this.lastPhaseChangeAt = Date.now();
+        this.verboseLogger(2, '[GameState] Recovered STAGING with resolving=false -> LIVE (skipping timer).');
+      } else {
+        this._startStagingLiveTimer(this.lastNewGameAt);
+      }
+    }
+
+    // ENDGAME stale-round guard: if lastRoundEndedAt >5 min ago, the next NEW_GAME
+    // likely already passed — transition to LIVE rather than sitting in a phantom ENDGAME.
+    // Leave endgameSubState as null (constructor default) — the timer chain is NOT
+    // restarted; consumers see isEnding()=true but isEndgameFactionVote()=false (safe).
+    if (this.phase === 'ENDGAME' && this.lastRoundEndedAt) {
+      if ((Date.now() - this.lastRoundEndedAt) > 300000) {
+        this.phase = 'LIVE';
+        this.resolving = false;
+        this._recoveredStateActive = false;
+        this.lastPhaseChangeAt = Date.now();
+        this.verboseLogger(2, '[GameState] Recovered ENDGAME but round stale (>5min) -> LIVE.');
+      }
+      // else: stay in ENDGAME, subState=null, no timer, wait for NEW_GAME
     }
 
     this._recoveredStateActive = true;
@@ -754,11 +787,19 @@ export default class GameStateService {
 
   _isRecoveredRoundTooOld(now = Date.now()) {
     if (!this.lastNewGameAt) return false;
+    // Seed and Training modes have no meaningful round lifecycle — players join/leave
+    // freely and a single "round" can last 4+ hours. Exclude from age check so crash
+    // recovery doesn't falsely invalidate a legitimate seed/training round.
+    if (this.isSeedMode() || this.isTrainingMode()) return false;
     return (now - this.lastNewGameAt) > this.maxRecoveredRoundAgeMs;
   }
 
   _isRecoveredStagingOverdue(now = Date.now()) {
     if (this.phase !== 'STAGING' || !this.lastNewGameAt) return false;
+    // Seed and Training modes have no meaningful STAGING phase — the server sits in
+    // pre-round indefinitely. Exclude from overdue check so recovery doesn't force
+    // a premature LIVE transition on seed/training layers.
+    if (this.isSeedMode() || this.isTrainingMode()) return false;
     return (now - this.lastNewGameAt) >= this.stagingDurationMs;
   }
 
@@ -789,6 +830,19 @@ export default class GameStateService {
     if (this._isRecoveredStagingOverdue(now)) {
       await this._transitionRecoveredStateToLive(`${source}:staging_overdue`, now);
       return;
+    }
+
+    // Cross-reference matchStartTime against persisted roundStartTime (GAP #4 fix).
+    // If SquadJS restarted mid-round but the game server advanced to a new round,
+    // the persisted roundStartTime will differ from the live server's matchStartTime.
+    // 5000ms tolerance accounts for clock skew between the game server and this process.
+    if (this.server.matchStartTime && this.roundStartTime) {
+      const liveMatchStartMs = this.server.matchStartTime.getTime();
+      const recoveredRoundStartMs = this.roundStartTime;
+      if (Math.abs(liveMatchStartMs - recoveredRoundStartMs) > 5000) {
+        await this._transitionRecoveredStateToLive(`${source}:matchStartTime_divergence`, now);
+        return;
+      }
     }
 
     if (this._isKnownLayerName(serverLayerName)) {
