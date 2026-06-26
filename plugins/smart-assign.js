@@ -146,9 +146,7 @@ import BasePlugin from './base-plugin.js';
 import SADatabase from '../utils/sa-database.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
 import SAEventLogger from '../utils/sa-event-logger.js';
-import { evaluateTeamAssignment, getRating } from '../utils/sa-team-evaluator.js';
-
-const MAX_TEAM_SIZE = 50;
+import { evaluateTeamAssignment, getRating, getPenalty, computeScore } from '../utils/sa-team-evaluator.js';
 
 export default class SmartAssign extends BasePlugin {
   static version = '1.1.1';
@@ -192,6 +190,24 @@ export default class SmartAssign extends BasePlugin {
         description: 'If true, mirrors JSONL event data into database tables for querying (default: false).',
         default: false,
         type: 'boolean'
+      },
+      handshakeWithSwitch: {
+        required: false,
+        description: 'Enable handshake with Switch queue (requires Switch plugin v2.0.0+). When enabled, SA may optionally swap a joining player with a Switch-queued player to improve balance satisfaction.',
+        default: false,
+        type: 'boolean'
+      },
+      handshakeScoreThreshold: {
+        required: false,
+        description: 'How much worse the swap score can be vs baseline before rejecting (lower = stricter). Only used in eloGated mode.',
+        default: 0.5,
+        type: 'number'
+      },
+      handshakeMode: {
+        required: false,
+        description: 'Handshake mode: "eloGated" (scoring gates the swap) or "queueDrain" (skip scoring, always swap if hard constraints pass).',
+        default: 'eloGated',
+        type: 'string'
       }
     };
   }
@@ -221,6 +237,10 @@ export default class SmartAssign extends BasePlugin {
       this._joinMutex = Promise.resolve();  // Serializes concurrent join evaluations
 
        this.eloTracker = null;
+
+       // Handshake with Switch plugin (7.1c — SA-Switch handshake)
+       this._switchPlugin = null;       // Discovered at mount, null if absent/incompatible
+       this._handshakeEnabled = false;  // Reflects toggle AND plugin availability
 
        this._warnFlags = { eloNotReadyWarned: false };
 
@@ -279,6 +299,33 @@ export default class SmartAssign extends BasePlugin {
     this._s3 = s3;
     this.executor._s3 = s3;  // Update executor's reference for canAct guard
     Logger.verbose('SmartAssign', 2, '[S3] Discovered SlackersSquadServices for SmartAssign.');
+
+    // Switch plugin discovery for handshake integration (7.1c)
+    try {
+      const switchPlugin = this.server.plugins.find(p => p.constructor.name === 'Switch');
+      if (switchPlugin) {
+        let pluginVersion = null;
+        try {
+          pluginVersion = switchPlugin.constructor.version;
+        } catch (_) {
+          Logger.verbose('SmartAssign', 1, '[Handshake] Switch plugin found but no static version property (pre-2.0). Handshake unavailable.');
+        }
+        const versionOk = pluginVersion && parseInt(String(pluginVersion).split('.')[0], 10) >= 2;
+        if (typeof switchPlugin.getQueueSnapshot === 'function'
+            && typeof switchPlugin.forceQueueSwap === 'function'
+            && versionOk) {
+          this._switchPlugin = switchPlugin;
+          this._handshakeEnabled = this.options.handshakeWithSwitch === true;
+          Logger.verbose('SmartAssign', 1, `[Handshake] Switch plugin v${pluginVersion} discovered. Handshake ${this._handshakeEnabled ? 'enabled' : 'disabled (toggle off)'}.`);
+        } else {
+          Logger.verbose('SmartAssign', 1, `[Handshake] Switch plugin found but incompatible version (${pluginVersion || 'unknown'}). Handshake unavailable.`);
+        }
+      } else {
+        Logger.verbose('SmartAssign', 1, '[Handshake] Switch plugin not found. Handshake unavailable.');
+      }
+    } catch (err) {
+      Logger.verbose('SmartAssign', 1, `[Handshake] Error discovering Switch plugin: ${err.message}`);
+    }
 
     // Register refresh interest with S³ PlayersService for fast join detection
     const mountPlayers = this._s3?.players;
@@ -524,6 +571,21 @@ export default class SmartAssign extends BasePlugin {
         timemarks.reconnectTeamMs = 0;
 
         // ═══════════════════════════════════════════════════════════════════════════
+        // PERFORMANCE: Frontload handshake snapshot fetch (fire-and-forget)
+        // Kick off getQueueSnapshot() early so it resolves in parallel with
+        // evaluateTeamAssignment(). If it doesn't resolve in time, the handshake
+        // evaluation falls back to baseline (no swap).
+        // ═══════════════════════════════════════════════════════════════════════════
+        let handshakeSnapshotPromise = null;
+        if (this._handshakeEnabled && this._switchPlugin) {
+          try {
+            handshakeSnapshotPromise = this._switchPlugin.getQueueSnapshot();
+          } catch (_) {
+            handshakeSnapshotPromise = null;
+          }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════════
         // MUTEX: Serialize concurrent join evaluations to prevent team overshoot.
         // Join concurrency bug (7.1f): overlapping evaluateTeamAssignment() calls
         // both see stale _pendingAssignments and may route to the same team.
@@ -551,25 +613,68 @@ export default class SmartAssign extends BasePlugin {
             Logger.verbose('SmartAssign', 3, `[SmartAssign] Evaluated fresh join for ${player.name} -> Team ${targetTeam} (${reason})`);
           }
 
+          // ═══════════════════════════════════════════════════════════════════════════
+          // HANDSHAKE EVALUATION (7.1c): Check if a swap with Switch queue improves balance
+          // ═══════════════════════════════════════════════════════════════════════════
+          let finalTargetTeam = targetTeam;
+          let handshakeActive = false;
+          let handshakeSwitchPlayerEosID = null;
+
+          if (this._handshakeEnabled && this._switchPlugin && targetTeam !== null && handshakeSnapshotPromise) {
+            try {
+              const hsResult = await this._evaluateHandshakeSwap(player, evalResult, handshakeSnapshotPromise);
+              if (hsResult.shouldOverride) {
+                finalTargetTeam = hsResult.joiningPlayerTargetTeam;
+                handshakeSwitchPlayerEosID = hsResult.switchPlayerEosID;
+                handshakeActive = true;
+                Logger.verbose('SmartAssign', 2, `[Handshake] Swap approved for ${player.name}: joining → Team ${finalTargetTeam}, switch player ${hsResult.switchPlayerName}. Reason: ${hsResult.reason}`);
+              } else {
+                Logger.verbose('SmartAssign', 3, `[Handshake] No swap for ${player.name}: ${hsResult.reason}`);
+              }
+            } catch (hsErr) {
+              Logger.verbose('SmartAssign', 2, `[Handshake] Evaluation error for ${player.name}: ${hsErr.message}. Falling back to baseline.`);
+            }
+          }
+
           // If the player is currently on the wrong team, queue a team change
-          if (targetTeam !== null && String(player.teamID) !== String(targetTeam)) {
-            this._pendingAssignments[targetTeam]++;
+          if (finalTargetTeam !== null && String(player.teamID) !== String(finalTargetTeam)) {
+            this._pendingAssignments[finalTargetTeam]++;
             const pendingPlayerMu = (await getRating(player, this.eloTracker)).mu;
-            this._pendingMu[targetTeam] += pendingPlayerMu;
+            this._pendingMu[finalTargetTeam] += pendingPlayerMu;
 
             const isVeteran = preWarmRating.roundsPlayed >= 10;
             if (isVeteran) {
-              this._pendingVeterans[targetTeam]++;
+              this._pendingVeterans[finalTargetTeam]++;
             }
 
-            this._pendingPlayerMoves.set(playerKey, { targetTeam, mu: pendingPlayerMu, isVeteran });
+            this._pendingPlayerMoves.set(playerKey, { targetTeam: finalTargetTeam, mu: pendingPlayerMu, isVeteran });
 
-            this.executor.queueMove(playerKey, player.name, player.eosID, targetTeam);
+            this.executor.queueMove(playerKey, player.name, player.eosID, finalTargetTeam);
 
             // S³ attribution: record the move so S³'s S3_PLAYER_TEAM_CHANGED fires with source='SmartAssign'
             const recordPlayers = this._s3?.players;
             if (recordPlayers?.isReady() && recordPlayers.recordMove && playerKey) {
-              recordPlayers.recordMove(playerKey, targetTeam, 'SmartAssign');
+              recordPlayers.recordMove(playerKey, finalTargetTeam, 'SmartAssign');
+            }
+
+            // ═══════════════════════════════════════════════════════════════════════════
+            // HANDSHAKE EXECUTION: After queueing joining player's move, tell Switch to
+            // force-swap the Switch-queued player. Switch's forceQueueSwap() removes the
+            // player from its queue and runs the solo-switch pipeline (RCON, cooldown,
+            // messaging, attribution). If returns false (player already consumed/cancelled/
+            // disconnected), the joining player's move was already queued — no rollback needed.
+            // ═══════════════════════════════════════════════════════════════════════════
+            if (handshakeActive && handshakeSwitchPlayerEosID && this._switchPlugin) {
+              try {
+                const swapResult = await this._switchPlugin.forceQueueSwap(handshakeSwitchPlayerEosID);
+                if (swapResult) {
+                  Logger.verbose('SmartAssign', 2, `[Handshake] Switch player consumed via forceQueueSwap successfully.`);
+                } else {
+                  Logger.verbose('SmartAssign', 2, `[Handshake] forceQueueSwap returned false (player already gone). Joining player move still queued.`);
+                }
+              } catch (fqsErr) {
+                Logger.verbose('SmartAssign', 2, `[Handshake] forceQueueSwap error: ${fqsErr.message}. Joining player move is unaffected.`);
+              }
             }
           }
         } finally {
@@ -653,6 +758,286 @@ export default class SmartAssign extends BasePlugin {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════════════
+  // HANDSHAKE EVALUATION (7.1c)
+  // ═══════════════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Evaluates whether a swap with a Switch-queued player would produce a better
+   * team balance outcome than the baseline assignment. Uses the decision matrix
+   * finalized in 7.1g: single-head FIFO candidate, F1-F6 filters, composite-only
+   * scoring comparison with threshold.
+   *
+   * Called inside the mutex, after evaluateTeamAssignment returns. The snapshot
+   * promise is fire-and-forget from earlier in the pipeline — by the time this
+   * runs, it should already be resolved.
+   *
+   * @param {object} player - The joining player
+   * @param {object} baselineResult - { targetTeam, reason, baselineScore }
+   * @param {Promise|null} snapshotPromise - Resolves to Switch's getQueueSnapshot()
+   * @returns {Promise<object>} { shouldOverride, joiningPlayerTargetTeam, switchPlayerEosID, switchPlayerName, reason }
+   */
+  async _evaluateHandshakeSwap(player, baselineResult, snapshotPromise) {
+    // Preconditions:
+    // P1: handshakeWithSwitch toggle — checked before call via _handshakeEnabled
+    // P2: _switchPlugin available — checked before call
+    // P3: baseline has a valid target
+    if (baselineResult.targetTeam === null) {
+      return { shouldOverride: false, reason: 'P3: baseline targetTeam is null' };
+    }
+    // P4: Don't override reconnect priority or clan grouping
+    const skipReasons = ['Reconnect Memory (Priority)', 'Clan Grouping'];
+    if (skipReasons.some(r => baselineResult.reason && baselineResult.reason.startsWith(r))) {
+      Logger.verbose('SmartAssign', 3, `[Handshake] Skipped for ${player.name}: baseline reason is "${baselineResult.reason}".`);
+      return { shouldOverride: false, reason: `P4: baseline is ${baselineResult.reason}` };
+    }
+
+    // Get the queue snapshot (should already be resolved from frontloading)
+    let snapshot;
+    try {
+      snapshot = await snapshotPromise;
+    } catch (err) {
+      Logger.verbose('SmartAssign', 2, `[Handshake] Snapshot fetch failed for ${player.name}: ${err.message}`);
+      return { shouldOverride: false, reason: 'Snapshot fetch failed' };
+    }
+    if (!snapshot) {
+      return { shouldOverride: false, reason: 'No snapshot available' };
+    }
+
+    // Determine relevant sub-queue
+    const baselineTarget = baselineResult.targetTeam;
+    // If baseline wants T1, look in t2ToT1 (players on T2 wanting T1)
+    // If baseline wants T2, look in t1ToT2 (players on T1 wanting T2)
+    const relevantQueue = baselineTarget === 1 ? snapshot.t2ToT1 : snapshot.t1ToT2;
+
+    // F1: Sub-queue must have a head
+    if (!relevantQueue || relevantQueue.length === 0) {
+      return { shouldOverride: false, reason: 'F1: relevant sub-queue empty' };
+    }
+
+    // Single head only — strict FIFO
+    const candidate = relevantQueue[0];
+
+    // F2: Candidate must exist in S³ player list
+    const allPlayers = this._s3?.players?.getAllPlayers?.() || [];
+    const livePlayer = allPlayers.find(p => p.eosID === candidate.eosID);
+    if (!livePlayer) {
+      return { shouldOverride: false, reason: `F2: candidate ${candidate.playerName} not in S³ players` };
+    }
+
+    // F3: Candidate's live teamID must match queued currentTeamID
+    if (String(livePlayer.teamID) !== String(candidate.currentTeamID)) {
+      return { shouldOverride: false, reason: `F3: ${candidate.playerName} team changed externally (live=${livePlayer.teamID}, queued=${candidate.currentTeamID})` };
+    }
+
+    // F4: Candidate must NOT be in _joiningPlayers (mid-rejoin)
+    if (this._joiningPlayers.has(candidate.eosID)) {
+      return { shouldOverride: false, reason: `F4: ${candidate.playerName} is mid-rejoin` };
+    }
+
+    // --- Virtual constraint checks (F5-F6) ---
+    // Collect current per-team data from server.players
+    const pending = this._pendingAssignments;
+    let t1Count = pending[1] || 0;
+    let t2Count = pending[2] || 0;
+    let t1MuSum = this._pendingMu[1] || 0;
+    let t2MuSum = this._pendingMu[2] || 0;
+    let t1Vets = this._pendingVeterans[1] || 0;
+    let t2Vets = this._pendingVeterans[2] || 0;
+    const t1Mus = [];
+    const t2Mus = [];
+    let hasElo = !!(this.eloTracker?.ready);
+
+    for (const p of this.server.players) {
+      if (!p || p.eosID === player.eosID || p.eosID === candidate.eosID) continue;
+      if (this._pendingPlayerMoves.has(p.steamID || p.eosID)) continue;
+      const tid = String(p.teamID);
+      if (tid === '1') {
+        t1Count++;
+        if (hasElo) {
+          const r = await getRating(p, this.eloTracker);
+          t1MuSum += r.mu;
+          t1Mus.push(r.mu);
+          if (r.roundsPlayed >= 10) t1Vets++;
+        }
+      } else if (tid === '2') {
+        t2Count++;
+        if (hasElo) {
+          const r = await getRating(p, this.eloTracker);
+          t2MuSum += r.mu;
+          t2Mus.push(r.mu);
+          if (r.roundsPlayed >= 10) t2Vets++;
+        }
+      }
+    }
+
+    // Virtual snapshot: Swap candidate → targetTeamID, joining player → candidate's currentTeamID
+    const virtualT1Count = t1Count;
+    const virtualT2Count = t2Count;
+    const candidateTarget = Number(candidate.targetTeamID);
+    const candidateCurrent = Number(candidate.currentTeamID);
+    const joiningTarget = baselineTarget; // SA wants to send joining player here
+    // Virtual: candidate moves FROM candidateCurrent TO candidateTarget
+    // Virtual: joining player moves TO candidateCurrent (vacated spot)
+
+    // Build virtual counts
+    let virtT1Count, virtT2Count, virtT1MuSum, virtT2MuSum, virtT1Vets, virtT2Vets;
+    let virtT1Mus, virtT2Mus;
+
+    // Start with actual counts (excluding candidate and joining player)
+    // Then add them in their virtual positions
+    let baseT1Count = t1Count;
+    let baseT2Count = t2Count;
+    let baseT1MuSum = t1MuSum;
+    let baseT2MuSum = t2MuSum;
+    let baseT1Vets = t1Vets;
+    let baseT2Vets = t2Vets;
+    let baseT1Mus = [...t1Mus];
+    let baseT2Mus = [...t2Mus];
+
+    // Add candidate data (their current team count)
+    const candidateRating = await getRating({ eosID: candidate.eosID, steamID: candidate.steamID }, this.eloTracker);
+    const candidateIsVet = candidateRating.roundsPlayed >= 10;
+
+    // Add joining player data
+    const joinPlayerRating = await getRating(player, this.eloTracker);
+    const joinPlayerIsVet = joinPlayerRating.roundsPlayed >= 10;
+
+    // Build virtual: candidate moves to targetTeamID, joining player takes vacated spot
+    // Initialize virtual state = base state + joining player on their chosen baseline team
+    virtT1Count = baseT1Count;
+    virtT2Count = baseT2Count;
+    virtT1MuSum = baseT1MuSum;
+    virtT2MuSum = baseT2MuSum;
+    virtT1Vets = baseT1Vets;
+    virtT2Vets = baseT2Vets;
+    virtT1Mus = [...baseT1Mus];
+    virtT2Mus = [...baseT2Mus];
+
+    // Add joining player to their baseline target team
+    if (joiningTarget === 1) {
+      virtT1Count++;
+      virtT1MuSum += joinPlayerRating.mu;
+      virtT1Mus.push(joinPlayerRating.mu);
+      if (joinPlayerIsVet) virtT1Vets++;
+    } else {
+      virtT2Count++;
+      virtT2MuSum += joinPlayerRating.mu;
+      virtT2Mus.push(joinPlayerRating.mu);
+      if (joinPlayerIsVet) virtT2Vets++;
+    }
+
+    // F5: Graduated population cap check on virtual state
+    const virtTotalPop = virtT1Count + virtT2Count;
+    let virtMaxImbalance;
+    if (virtTotalPop >= 96) virtMaxImbalance = 1;
+    else if (virtTotalPop >= 90) virtMaxImbalance = 2;
+    else if (virtTotalPop >= 82) virtMaxImbalance = 3;
+    else virtMaxImbalance = 4;
+
+    const diff = Math.abs(virtT1Count - virtT2Count);
+    if (diff > virtMaxImbalance) {
+      return { shouldOverride: false, reason: `F5: virtual pop cap violation (diff=${diff}, max=${virtMaxImbalance})` };
+    }
+
+    // F6: Neither team exceeds physical server cap in virtual snapshot
+    const maxTeamSize = this?._s3?.serverConfig?.isReady()
+      ? Math.floor(this._s3.serverConfig.getMaxPlayers() / 2)
+      : 50;
+    if (virtT1Count > maxTeamSize || virtT2Count > maxTeamSize) {
+      return { shouldOverride: false, reason: `F6: virtual team exceeds cap (maxTeamSize=${maxTeamSize}, T1=${virtT1Count}, T2=${virtT2Count})` };
+    }
+
+    // Mode: queueDrain → skip scoring, always swap
+    const handshakeMode = this.options.handshakeMode || 'eloGated';
+    if (handshakeMode === 'queueDrain') {
+      Logger.verbose('SmartAssign', 2, `[Handshake] queueDrain mode: swap approved for ${candidate.playerName} (hard constraints passed).`);
+      return {
+        shouldOverride: true,
+        joiningPlayerTargetTeam: candidateCurrent,
+        switchPlayerEosID: candidate.eosID,
+        switchPlayerName: candidate.playerName,
+        reason: 'handshake_swap_queueDrain'
+      };
+    }
+
+    // eloGated mode: compute virtual score
+    if (!hasElo) {
+      // No Elo data — can't do scoring comparison. queueDrain mode would have caught this.
+      // Fall back to baseline.
+      return { shouldOverride: false, reason: 'No Elo data for scoring comparison' };
+    }
+
+    // Compute scores using exported computeScore
+    // Baseline score: the score for the baseline placement
+    const baselineScore = baselineResult.baselineScore;
+
+    // Virtual score: compute on the virtual state where:
+    // - candidate moved to their targetTeamID
+    // - joining player moved to candidateCurrent
+    // This means we need the state AFTER both moves
+    
+    // The virtual state for scoring: we need Mu arrays reflecting both moves.
+    // Starting from base state (neither candidate nor joining player):
+    // - Move candidate → candidateTarget
+    // - Move joining player → candidateCurrent
+    
+    let scoreT1Mus, scoreT2Mus, scoreT1Vets, scoreT2Vets, scoreT1Count, scoreT2Count;
+
+    // Start fresh: base state (neither player)
+    scoreT1Count = baseT1Count;
+    scoreT2Count = baseT2Count;
+    scoreT1MuSum = baseT1MuSum;
+    scoreT2MuSum = baseT2MuSum;
+    scoreT1Vets = baseT1Vets;
+    scoreT2Vets = baseT2Vets;
+    scoreT1Mus = [...baseT1Mus];
+    scoreT2Mus = [...baseT2Mus];
+
+    // Add candidate to their TARGET team
+    if (candidateTarget === 1) {
+      scoreT1Count++;
+      scoreT1MuSum += candidateRating.mu;
+      scoreT1Mus.push(candidateRating.mu);
+      if (candidateIsVet) scoreT1Vets++;
+    } else {
+      scoreT2Count++;
+      scoreT2MuSum += candidateRating.mu;
+      scoreT2Mus.push(candidateRating.mu);
+      if (candidateIsVet) scoreT2Vets++;
+    }
+
+    // Add joining player to candidate's CURRENT team (the vacated spot)
+    if (candidateCurrent === 1) {
+      scoreT1Count++;
+      scoreT1MuSum += joinPlayerRating.mu;
+      scoreT1Mus.push(joinPlayerRating.mu);
+      if (joinPlayerIsVet) scoreT1Vets++;
+    } else {
+      scoreT2Count++;
+      scoreT2MuSum += joinPlayerRating.mu;
+      scoreT2Mus.push(joinPlayerRating.mu);
+      if (joinPlayerIsVet) scoreT2Vets++;
+    }
+
+    const virtualScore = computeScore(scoreT1Mus, scoreT2Mus, scoreT1Vets, scoreT2Vets, scoreT1Count, scoreT2Count);
+    const threshold = this.options.handshakeScoreThreshold || 0.5;
+
+    Logger.verbose('SmartAssign', 2, `[Handshake] ${player.name}: baselineScore=${baselineScore.toFixed(2)}, virtualScore=${virtualScore.toFixed(2)}, threshold=${threshold}`);
+
+    if (virtualScore <= baselineScore + threshold) {
+      return {
+        shouldOverride: true,
+        joiningPlayerTargetTeam: candidateCurrent,
+        switchPlayerEosID: candidate.eosID,
+        switchPlayerName: candidate.playerName,
+        reason: `handshake_swap_eloGated (base=${baselineScore.toFixed(2)}, virt=${virtualScore.toFixed(2)})`
+      };
+    }
+
+    return { shouldOverride: false, reason: `Scoring threshold not met (base=${baselineScore.toFixed(2)}, virt=${virtualScore.toFixed(2)}, threshold=${threshold})` };
+  }
+
   async _queryEloDBForTag(eosID) {
     try {
       const playerStats = await this.eloTracker.db.getPlayerStats(eosID);
@@ -700,7 +1085,10 @@ export default class SmartAssign extends BasePlugin {
         minSize: this._s3?.clans?.options?.minSize || 2,
         caseSensitive: this._s3?.clans?.options?.caseSensitive || false
       },
-      warnFlags: this._warnFlags
+      warnFlags: this._warnFlags,
+      maxTeamSize: this?._s3?.serverConfig?.isReady()
+        ? Math.floor(this._s3.serverConfig.getMaxPlayers() / 2)
+        : 50
     });
   }
 

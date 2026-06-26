@@ -135,6 +135,39 @@ squad-server/
 
 ---
 
+## Switch Handshake (Optional)
+
+The Switch Handshake feature allows SmartAssign to optionally include Switch-queued players in its team balance evaluation. When a joining player's baseline assignment is close to balanced, SmartAssign may swap the joining player with a Switch-queued player, satisfying the Switch player's request while still producing a balanced outcome.
+
+### How It Works
+
+1. **Discovery:** At mount time, SmartAssign detects the Switch plugin via `this.server.plugins.find()`. If found with version ≥2.0.0 and the required public API, the handshake is available.
+2. **Frontloading:** When a player joins, SmartAssign fires `getQueueSnapshot()` asynchronously (before the main evaluation), so the snapshot is ready when needed.
+3. **Evaluation:** After `evaluateTeamAssignment()` returns a baseline result, SmartAssign checks the relevant sub-queue (players whose target team matches the baseline). If the head candidate passes all filters (F1–F6), virtual scoring is computed.
+4. **Decision:** In `eloGated` mode (default), the swap is adopted only if the virtual score is within `handshakeScoreThreshold` of the baseline. In `queueDrain` mode, any candidate passing hard constraints is swapped regardless of score.
+5. **Execution:** SmartAssign queues both RCON moves through its own executor and calls `forceQueueSwap()` on the Switch plugin to clean up queue bookkeeping.
+
+### Configuration
+
+| Option | Type | Required | Default | Description |
+--------|------|----------|---------|-------------|
+| `handshakeWithSwitch` | boolean | No | `false` | Enable handshake with Switch queue (requires Switch plugin v2.0.0+). |
+| `handshakeScoreThreshold` | number | No | `0.5` | How much worse the swap score can be vs baseline before rejecting (lower = stricter, `eloGated` mode only). |
+| `handshakeMode` | string | No | `"eloGated"` | `"eloGated"` — scoring gates the swap; `"queueDrain"` — swap if hard constraints pass, ignore scoring. |
+
+### Graceful Degradation
+
+- Switch plugin absent → handshake disabled, verbose-log once at mount, no errors.
+- Switch plugin incompatible version → same graceful handling.
+- Snapshot fetch fails → fall back to baseline for that join.
+- `consumeQueueEntry` / `forceQueueSwap` returns null (race) → joining player move unaffected, Switch player not moved.
+
+### Requirements
+
+- **Switch plugin v2.0.0+** must be installed and enabled in `config.json` before SmartAssign.
+
+---
+
 ## Configuration Options
 
 | Option | Type | Required | Default | Description |

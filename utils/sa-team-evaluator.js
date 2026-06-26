@@ -53,7 +53,64 @@
 import Logger from '../../core/logger.js';
 import { getClanTeamForPlayer } from './sa-clan-grouper.js';
 
-const MAX_TEAM_SIZE = 50;
+/**
+ * Non-linear penalty curve (matches TeamBalancer).
+ * Exported for reuse by handshake evaluation.
+ * @param {number} diff - Composite ELO difference
+ * @returns {number} Penalty score
+ */
+export function getPenalty(diff) {
+  if (diff <= 0.1) return diff * 20;
+  if (diff <= 0.3) return 2.0 + (diff - 0.1) * 40;
+  if (diff <= 0.6) return 10.0 + (diff - 0.3) * 80;
+  return 34.0 + (diff - 0.6) * 150;
+}
+
+/**
+ * Computes the 3-metric composite score for a given team configuration.
+ * Metrics: Mean ELO difference (0.6×), Top-15 ELO difference (0.4×),
+ * Veteran parity penalty (300× ratio difference).
+ * Exported for reuse by handshake evaluation (virtual swap scoring).
+ * Lower score = more balanced.
+ *
+ * @param {number[]} t1Mus - Mu values for team 1
+ * @param {number[]} t2Mus - Mu values for team 2
+ * @param {number} t1Veterans - Veteran count for team 1
+ * @param {number} t2Veterans - Veteran count for team 2
+ * @param {number} t1Count - Total player count for team 1 (including joining player)
+ * @param {number} t2Count - Total player count for team 2 (including joining player)
+ * @returns {number} Composite score
+ */
+export function computeScore(t1Mus, t2Mus, t1Veterans, t2Veterans, t1Count, t2Count) {
+  // Metric 1: Mean ELO difference
+  const getMean = (mus) => mus.length > 0 ? mus.reduce((a, b) => a + b, 0) / mus.length : 25.0;
+  const meanT1 = getMean(t1Mus);
+  const meanT2 = getMean(t2Mus);
+  const meanDiff = Math.abs(meanT1 - meanT2);
+
+  // Metric 2: Top-15 ELO difference (or all if fewer than 15 per side)
+  const getTop15Avg = (mus) => {
+    if (mus.length === 0) return 25.0;
+    const sorted = [...mus].sort((a, b) => b - a);
+    const slice = sorted.slice(0, 15);
+    return slice.reduce((a, b) => a + b, 0) / slice.length;
+  };
+  const top15T1 = getTop15Avg(t1Mus);
+  const top15T2 = getTop15Avg(t2Mus);
+  const top15Diff = Math.abs(top15T1 - top15T2);
+
+  // Composite ELO penalty
+  const compositeDiff = 0.6 * meanDiff + 0.4 * top15Diff;
+  const eloBalancePenalty = getPenalty(compositeDiff);
+
+  // Metric 3: Veteran parity penalty
+  const vet1Ratio = t1Count > 0 ? t1Veterans / t1Count : 0;
+  const vet2Ratio = t2Count > 0 ? t2Veterans / t2Count : 0;
+  const veteranPenalty = Math.abs(vet1Ratio - vet2Ratio) * 300;
+
+  return eloBalancePenalty + veteranPenalty;
+}
+
 const REGULAR_MIN_ROUNDS = 10;  // Veteran threshold
 
 /**
@@ -74,7 +131,8 @@ const REGULAR_MIN_ROUNDS = 10;  // Veteran threshold
  *     ignoredModes: string[],               // Lowercase gamemode substrings to skip
  *     playerTagCache: Map<eosID, tag|null>, // Clan tag cache (optional)
  *     clanGroupOptions: { minSize, caseSensitive }, // Clan grouping options
- *     warnFlags: { eloNotReadyWarned: boolean }
+ *     warnFlags: { eloNotReadyWarned: boolean },
+ *     maxTeamSize: number                      // Physical team cap (default 50)
  *   }
  * @returns {Promise<object>} { targetTeam: 1|2|null, reason: string }
  */
@@ -89,8 +147,9 @@ export async function evaluateTeamAssignment(player, server, context) {
      ignoredModes = [],
      playerTagCache = null,
      clanGroupOptions = { minSize: 2, caseSensitive: false },
-     warnFlags = { eloNotReadyWarned: false }
-   } = context;
+     warnFlags = { eloNotReadyWarned: false },
+      maxTeamSize = 50
+    } = context;
 
   // Check if current layer/gamemode is ignored
   const currentLayerName = server.currentLayer && server.currentLayer.name
@@ -182,10 +241,10 @@ export async function evaluateTeamAssignment(player, server, context) {
   if ((t1Count + 1) - t2Count > effectiveMaxImbalance) return { targetTeam: 2, reason: 'Hard Population Cap' };
   if ((t2Count + 1) - t1Count > effectiveMaxImbalance) return { targetTeam: 1, reason: 'Hard Population Cap' };
 
-  // 2.1 PHYSICAL SERVER CAP (50)
-  if (t1Count >= MAX_TEAM_SIZE && t2Count >= MAX_TEAM_SIZE) return { targetTeam: null, reason: 'Server Full' };
-  if (t1Count >= MAX_TEAM_SIZE && t2Count < MAX_TEAM_SIZE) return { targetTeam: 2, reason: 'Team 1 Full' };
-  if (t2Count >= MAX_TEAM_SIZE && t1Count < MAX_TEAM_SIZE) return { targetTeam: 1, reason: 'Team 2 Full' };
+  // 2.1 PHYSICAL SERVER CAP (derived from MaxPlayers / 2, default 50)
+  if (t1Count >= maxTeamSize && t2Count >= maxTeamSize) return { targetTeam: null, reason: 'Server Full' };
+  if (t1Count >= maxTeamSize && t2Count < maxTeamSize) return { targetTeam: 2, reason: 'Team 1 Full' };
+  if (t2Count >= maxTeamSize && t1Count < maxTeamSize) return { targetTeam: 1, reason: 'Team 2 Full' };
 
   // 3.0 RECONNECT PRIORITY ROUTING
   if (isRejoin) {
@@ -336,7 +395,7 @@ export async function evaluateTeamAssignment(player, server, context) {
     const playerTag = playerTagCache ? playerTagCache.get(player.eosID) : null;
     const debugInfo = { playerTag, clanTeam: debugClanTeam };
 
-    return { targetTeam, reason, debugInfo };
+    return { targetTeam, reason, debugInfo, baselineScore: targetTeam === 1 ? scoreT1Biased : scoreT2Biased };
 }
 
 /**
