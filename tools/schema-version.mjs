@@ -32,6 +32,7 @@
  *   s3-core       | 0               | (none)           | S³ DBService
  *   smart-assign  | 2               | v1→v2 (SA v2)   | smart-assign.js
  *   elo-tracker   | 2               | v1→v2 (Elo v2)  | elo-tracker.js
+ *   team-balancer | 1               | (none)           | team-balancer.js
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
@@ -124,6 +125,11 @@ const MIGRATION_MANIFEST = [
         }
       }
     ]
+  },
+  {
+    pluginName: 'team-balancer',
+    expectedVersion: 1,
+    migrations: []
   }
 ];
 
