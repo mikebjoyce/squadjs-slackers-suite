@@ -279,6 +279,11 @@ export default class SmartAssign extends BasePlugin {
     return release;
   }
 
+  /**
+   * Checks if clan grouping is enabled via S³ ClansService.
+   * Note: This checks the toggle (isEnabled), not service readiness (isReady).
+   * Callers must separately guard with clans.isReady() before using clans methods.
+   */
   _isClanGroupingEnabled() {
     return !!(this._s3?.clans?.isEnabled?.());
   }
@@ -300,6 +305,10 @@ export default class SmartAssign extends BasePlugin {
     this._s3 = s3;
     this.executor._s3 = s3;  // Update executor's reference for canAct guard
     Logger.verbose('SmartAssign', 2, '[S3] Discovered SlackersSquadServices for SmartAssign.');
+
+    // 7.4k-3: Wait for S³ to finish mounting before accessing its services
+    await this._s3.ready();
+    Logger.verbose('SmartAssign', 2, '[S3] S³ is fully mounted — proceeding with migration registration.');
 
     // ═══════════════════════════════════════════════════════════════
     // SCHEMA MIGRATION: Register SA v2 to drop 4 orphan tables (7.4j)
@@ -397,10 +406,10 @@ export default class SmartAssign extends BasePlugin {
 
     // DB maintenance: SA_AssignmentLog is lazily synced on first write.
     // Restart Recovery — delegated to S³ GameStateService
-    const gs = this._s3.gameState;
-    const recoveredStart = gs?.getRoundStartTime?.();
+    const gs = this._s3?.gameState;
+    const recoveredStart = gs?.isReady?.() ? gs.getRoundStartTime() : null;
     if (recoveredStart) {
-      Logger.verbose('SmartAssign', 1, `Restart detected. Resuming round from S³ roundStartTime: ${recoveredStart}`);
+      Logger.verbose('SmartAssign', 1, `Restart detected. Resuming round from S³ roundStartTime: ${new Date(recoveredStart).toISOString()}`);
     } else {
       // New round or no data
       Logger.verbose('SmartAssign', 1, 'New round or no persisted S³ state. Starting fresh.');
@@ -702,7 +711,7 @@ export default class SmartAssign extends BasePlugin {
 
             // S³ attribution: record the move so S³'s S3_PLAYER_TEAM_CHANGED fires with source='SmartAssign'
             const recordPlayers = this._s3?.players;
-            if (recordPlayers?.isReady() && recordPlayers.recordMove && playerKey) {
+            if (recordPlayers?.isReady() && playerKey) {
               recordPlayers.recordMove(playerKey, finalTargetTeam, 'SmartAssign');
             }
 
