@@ -48,6 +48,9 @@
  *
  */
 
+import { buildMigrationEmbed } from './s3-migration-discord.js';
+import { listBackups, restoreBackup } from './s3-backup.js';
+
 /**
  * Send a Discord message with embed(s). Resilient: normalises embed→embeds,
  * handles 429 rate-limit with one automatic retry, falls back to v12 embed shape.
@@ -1103,6 +1106,232 @@ export function registerS3DiscordCommands(plugin) {
           }
 
           await message.reply('Usage: `!s3 test <preflight|smoke>`');
+          return;
+        }
+
+        case 'migrate': {
+          const migrateSub = args[1]?.toLowerCase();
+
+          if (migrateSub === 'pending') {
+            const pending = plugin.services.db?.getPendingMigrations() ?? null;
+            if (!pending || pending.length === 0) {
+              await sendDiscordMessage(message.channel, {
+                embeds: [{ color: 0x2ecc71, title: '✅ No Pending Migrations', description: 'All plugin schema versions are up to date.', timestamp: new Date().toISOString() }]
+              }, 'S3', (...a) => plugin.verbose(...a));
+              return;
+            }
+            const embed = buildMigrationEmbed(pending, 'pending');
+            await sendDiscordMessage(message.channel, { embeds: [embed] }, 'S3', (...a) => plugin.verbose(...a));
+            return;
+          }
+
+          if (migrateSub === 'status') {
+            const db = plugin.services.db;
+            const me = db?.migrationEngine;
+
+            if (!db || !me) {
+              await sendDiscordMessage(message.channel, {
+                embeds: [{ color: 0xe74c3c, title: '❌ DB Service Not Available', description: 'The database service has not been initialised.', timestamp: new Date().toISOString() }]
+              }, 'S3', (...a) => plugin.verbose(...a));
+              return;
+            }
+
+            const versionStatus = await db.verifySchemaVersions();
+            const lines = [];
+            for (const [pluginName, expectedVersion] of db._expectedVersions) {
+              const p = versionStatus.pending.find((x) => x.pluginName === pluginName);
+              const current = p ? p.currentVersion : expectedVersion;
+              const status = p ? `⚠️ v${current} → v${expectedVersion} (${p.behind} behind)` : `✅ v${current} (current)`;
+              lines.push(`**${pluginName}**: ${status}`);
+            }
+            if (lines.length === 0) lines.push('No plugins have registered schema versions.');
+
+            await sendDiscordMessage(message.channel, {
+              embeds: [{
+                color: versionStatus.upToDate ? 0x2ecc71 : 0xf39c12,
+                title: versionStatus.upToDate ? '📋 Schema Status — All Current' : '📋 Schema Status — Pending Migrations',
+                description: lines.join('\n'),
+                timestamp: new Date().toISOString()
+              }]
+            }, 'S3', (...a) => plugin.verbose(...a));
+            return;
+          }
+
+          if (migrateSub === 'force') {
+            const db = plugin.services.db;
+            const me = db?.migrationEngine;
+            const pending = db?.getPendingMigrations() ?? null;
+
+            if (!pending || pending.length === 0) {
+              await sendDiscordMessage(message.channel, {
+                embeds: [{ color: 0x2ecc71, title: '✅ No Pending Migrations', description: 'Nothing to force-migrate.', timestamp: new Date().toISOString() }]
+              }, 'S3', (...a) => plugin.verbose(...a));
+              return;
+            }
+
+            if (!db || !me) {
+              await sendDiscordMessage(message.channel, {
+                embeds: [{ color: 0xe74c3c, title: '❌ DB Service Not Available', timestamp: new Date().toISOString() }]
+              }, 'S3', (...a) => plugin.verbose(...a));
+              return;
+            }
+
+            const isDryRun = args.includes('--dry-run');
+            const runningEmbed = buildMigrationEmbed(pending, 'running');
+            await sendDiscordMessage(message.channel, { embeds: [runningEmbed] }, 'S3', (...a) => plugin.verbose(...a));
+
+            let totalApplied = 0;
+            let totalSkipped = 0;
+            let hadError = false;
+            let lastError = null;
+
+            for (const p of pending) {
+              try {
+                const result = await me.runMigrations(p.pluginName, { force: true, dryRun: isDryRun });
+                totalApplied += result.applied || 0;
+                totalSkipped += result.skipped || 0;
+              } catch (err) {
+                hadError = true;
+                lastError = err.message;
+                break;
+              }
+            }
+
+            if (isDryRun) {
+              await sendDiscordMessage(message.channel, {
+                embeds: [{ color: 0x3498db, title: '📋 Dry Run Complete', description: `${totalSkipped} migration(s) would be applied. Run without --dry-run to execute.`, timestamp: new Date().toISOString() }]
+              }, 'S3', (...a) => plugin.verbose(...a));
+              return;
+            }
+
+            db._resolveMigrationGate(!hadError);
+
+            if (hadError) {
+              const failEmbed = buildMigrationEmbed(pending, 'failed', { error: lastError, totalApplied, totalSkipped });
+              await sendDiscordMessage(message.channel, { embeds: [failEmbed] }, 'S3', (...a) => plugin.verbose(...a));
+            } else {
+              const doneEmbed = buildMigrationEmbed(pending, 'complete', { totalApplied, totalSkipped });
+              await sendDiscordMessage(message.channel, { embeds: [doneEmbed] }, 'S3', (...a) => plugin.verbose(...a));
+            }
+            return;
+          }
+
+          await message.reply('Usage: `!s3 migrate <pending|status|force [--dry-run]>`');
+          return;
+        }
+
+        case 'backup': {
+          const backupSub = args[1]?.toLowerCase();
+
+          if (backupSub === 'list') {
+            const backups = listBackups();
+            if (backups.length === 0) {
+              await sendDiscordMessage(message.channel, {
+                embeds: [{ color: 0x95a5a6, title: '📦 No Backups Found', description: 'No database backups have been created yet. Run a migration with `!s3 migrate force` to trigger a backup first.', timestamp: new Date().toISOString() }]
+              }, 'S3', (...a) => plugin.verbose(...a));
+              return;
+            }
+
+            const lines = backups.map((b, i) => {
+              const ageMs = Date.now() - b.timestamp;
+              const age = formatDuration(ageMs);
+              return `**#${i + 1}** \`${b.filename}\` — ${b.sizeFormatted} (${b.age})`;
+            });
+
+            await sendDiscordMessage(message.channel, {
+              embeds: [{
+                color: 0x3498db,
+                title: `📦 Database Backups (${backups.length})`,
+                description: lines.join('\n'),
+                fields: [{
+                  name: '⚠️ Restore',
+                  value: 'To restore a backup: `!s3 backup restore <filename>`\nThis will **overwrite** the current database. Use with extreme caution.',
+                  inline: false
+                }],
+                timestamp: new Date().toISOString()
+              }]
+            }, 'S3', (...a) => plugin.verbose(...a));
+            return;
+          }
+
+          if (backupSub === 'restore') {
+            const filename = args[2];
+            if (!filename) {
+              await message.reply('Usage: `!s3 backup restore <filename>`\nGet the filename from `!s3 backup list`.');
+              return;
+            }
+
+            // Get DB path from the migration engine
+            const me = plugin.services.db?.migrationEngine;
+            const dbPath = me?.dbPath;
+
+            if (!dbPath) {
+              await sendDiscordMessage(message.channel, {
+                embeds: [{ color: 0xe74c3c, title: '❌ Database Path Unknown', description: 'Cannot determine the database file path. The database may use a non-SQLite connector.', timestamp: new Date().toISOString() }]
+              }, 'S3', (...a) => plugin.verbose(...a));
+              return;
+            }
+
+            // Verify backup exists with a quick list
+            const backups = listBackups();
+            const backup = backups.find((b) => b.filename === filename);
+            if (!backup) {
+              await sendDiscordMessage(message.channel, {
+                embeds: [{ color: 0xe74c3c, title: '❌ Backup Not Found', description: `No backup named \`${filename}\` exists. Use \`!s3 backup list\` to see available backups.`, timestamp: new Date().toISOString() }]
+              }, 'S3', (...a) => plugin.verbose(...a));
+              return;
+            }
+
+            // Send restoration confirmation embed
+            await sendDiscordMessage(message.channel, {
+              embeds: [{
+                color: 0xe67e22,
+                title: '⚠️ Confirm Database Restore',
+                description: `This will **overwrite** the current database with backup \`${filename}\` (${backup.sizeFormatted}, ${backup.age}).`,
+                fields: [
+                  { name: 'Source', value: `\`${filename}\``, inline: true },
+                  { name: 'Target', value: `\`${dbPath}\``, inline: true },
+                  { name: 'Instructions', value: 'To proceed, use:\n`!s3 backup restore --confirm ' + filename + '`', inline: false }
+                ],
+                timestamp: new Date().toISOString()
+              }]
+            }, 'S3', (...a) => plugin.verbose(...a));
+            return;
+          }
+
+          if (backupSub === 'restore' && args.includes('--confirm')) {
+            // Find the filename after --confirm
+            const confirmIdx = args.indexOf('--confirm');
+            const filename = args[confirmIdx + 1];
+            if (!filename) {
+              await message.reply('Usage: `!s3 backup restore --confirm <filename>`');
+              return;
+            }
+
+            const me = plugin.services.db?.migrationEngine;
+            const dbPath = me?.dbPath;
+
+            if (!dbPath) {
+              await sendDiscordMessage(message.channel, {
+                embeds: [{ color: 0xe74c3c, title: '❌ Database Path Unknown', description: 'Cannot determine the database file path.', timestamp: new Date().toISOString() }]
+              }, 'S3', (...a) => plugin.verbose(...a));
+              return;
+            }
+
+            try {
+              restoreBackup(filename, dbPath);
+              await sendDiscordMessage(message.channel, {
+                embeds: [{ color: 0x2ecc71, title: '✅ Database Restored', description: `Successfully restored \`${filename}\`. The SquadJS server must be restarted for changes to take effect.`, timestamp: new Date().toISOString() }]
+              }, 'S3', (...a) => plugin.verbose(...a));
+            } catch (err) {
+              await sendDiscordMessage(message.channel, {
+                embeds: [{ color: 0xe74c3c, title: '❌ Restore Failed', description: `**${err.message}**`, timestamp: new Date().toISOString() }]
+              }, 'S3', (...a) => plugin.verbose(...a));
+            }
+            return;
+          }
+
+          await message.reply('Usage: `!s3 backup <list|restore <filename>>`');
           return;
         }
 

@@ -129,7 +129,9 @@ import ClansService from '../utils/clans-service.js';
 import DBService from '../utils/db-service.js';
 import PlayersService from '../utils/players-service.js';
 import ServerConfigService from '../utils/server-config-service.js';
+import LoggingService from '../utils/logging-service.js';
 import { registerS3DiscordCommands } from '../utils/s3-discord.js';
+import { setupMigrationPrompt } from '../utils/s3-migration-discord.js';
 export default class SlackersSquadServices extends BasePlugin {
   static get description() {
     return "Shared Slacker's Squad Services plugin wiring gameState, factions, clans, db, and players modules.";
@@ -210,6 +212,24 @@ export default class SlackersSquadServices extends BasePlugin {
         type: 'boolean',
         description: 'Compatibility option for later consumers that may pull full squads when preserving clans.',
         default: false
+      },
+      enableDatabaseLogging: {
+        required: false,
+        type: 'boolean',
+        description: 'Enable shared S³ logging tables (S3_PlayerEvents, S3_GameStateEvents, S3_PlayerSnapshots). When false, LoggingService runs in no-op mode.',
+        default: false
+      },
+      enableFileLogging: {
+        required: false,
+        type: 'boolean',
+        description: 'Enable JSONL file mirror for S³ logging events. Each DB write is also appended as a self-contained JSONL line to the logPath file.',
+        default: false
+      },
+      logPath: {
+        required: false,
+        description: 'Path to JSONL file for S³ event mirror. Only used when enableFileLogging is true.',
+        default: './s3-log.jsonl',
+        type: 'string'
       }
     };
   }
@@ -223,10 +243,12 @@ export default class SlackersSquadServices extends BasePlugin {
       clans: null,
       db: null,
       players: null,
-      serverConfig: null
+      serverConfig: null,
+      logging: null
     };
 
     this._s3DiscordCleanup = null;
+    this._migrationDiscordCleanup = null;
 
     this.listeners = {
       handleNewGame: this.handleNewGame.bind(this),
@@ -246,6 +268,7 @@ export default class SlackersSquadServices extends BasePlugin {
   get factions()      { return this.services.factions; }
   get clans()         { return this.services.clans; }
   get players()       { return this.services.players; }
+  get logging()       { return this.services.logging; }
 
   async prepareToMount() {
     this.services.db = new DBService({
@@ -253,7 +276,8 @@ export default class SlackersSquadServices extends BasePlugin {
       sequelize: this.options.database,
       connectors: this.connectors,
       databaseOption: this.options.database,
-      verboseLogger: (...args) => this.verbose(...args)
+      verboseLogger: (...args) => this.verbose(...args),
+      emitEvent: (...args) => this.emit(...args)
     });
 
     this.services.gameState = new GameStateService({
@@ -295,6 +319,18 @@ export default class SlackersSquadServices extends BasePlugin {
       verboseLogger: (...args) => this.verbose(...args),
       configPath: this.options.configPath
     });
+
+    this.services.logging = new LoggingService({
+      parent: this,
+      server: this.server,
+      verboseLogger: (...args) => this.verbose(...args),
+      dbService: this.services.db,
+      gameState: this.services.gameState,
+      enableDatabaseLogging: this.options.enableDatabaseLogging,
+      enableFileLogging: this.options.enableFileLogging,
+      logPath: this.options.logPath,
+      emitEvent: (...args) => this.emit(...args)
+    });
   }
 
   async mount() {
@@ -325,15 +361,28 @@ export default class SlackersSquadServices extends BasePlugin {
       await this.services.players.mount();
     }
 
+    if (this.services.logging) {
+      await this.services.logging.mount();
+    }
+
     this._bindServerEvents();
 
     // Register Discord !s3 commands (gracefully degrades if no discordClient configured)
     this._s3DiscordCleanup = registerS3DiscordCommands(this);
 
-    this.verbose(1, 'Mounted SlackerSquadServices with gameState, factions, clans, db, players, and serverConfig services.');
+    // 7.4d — Check for pending migrations and prompt via Discord if any
+    this._checkAndPromptMigrations();
+
+    this.verbose(1, 'Mounted SlackerSquadServices with gameState, factions, clans, db, players, serverConfig, and logging services.');
   }
 
   async unmount() {
+    // Clean up migration Discord prompt
+    if (this._migrationDiscordCleanup) {
+      this._migrationDiscordCleanup();
+      this._migrationDiscordCleanup = null;
+    }
+
     // Deregister Discord commands before shutting down services
     if (this._s3DiscordCleanup) {
       this._s3DiscordCleanup();
@@ -341,6 +390,10 @@ export default class SlackersSquadServices extends BasePlugin {
     }
 
     this._unbindServerEvents();
+
+    if (this.services.logging) {
+      await this.services.logging.unmount();
+    }
 
     if (this.services.players) {
       await this.services.players.unmount();
@@ -449,5 +502,32 @@ export default class SlackersSquadServices extends BasePlugin {
     if (this.services.players?.handlePlayerConnected) {
       await this.services.players.handlePlayerConnected(data);
     }
+  }
+
+  /**
+   * Check for pending schema migrations after Discord is registered, and
+   * post an embed to the admin channel for human confirmation (7.4d).
+   * If no migrations are pending, does nothing.
+   * If Discord isn't configured, logs a warning about pending migrations.
+   */
+  async _checkAndPromptMigrations() {
+    const db = this.services.db;
+    if (!db || !db.isReady()) {
+      this.verbose(3, '[S3 Migration] DB not ready yet — skipping migration check.');
+      return;
+    }
+
+    const pending = db.getPendingMigrations();
+    if (!pending || pending.length === 0) {
+      this.verbose(3, '[S3 Migration] No pending migrations.');
+      return;
+    }
+
+    this.verbose(2, `[S3 Migration] ${pending.length} plugin(s) have pending schema migrations. Prompting via Discord...`);
+
+    // Fire and forget — the Discord prompt runs async; S³ doesn't block on it
+    setupMigrationPrompt(this, pending).catch((err) => {
+      this.verbose(1, `[S3 Migration] Discord prompt failed: ${err.message}`);
+    });
   }
 }

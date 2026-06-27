@@ -361,7 +361,6 @@ export default class GameStateService {
    * Jensen/Training rounds are NOT Seed — see isTrainingMode().
    */
   isSeedMode() {
-    if (!this.isReady()) return false;
     const gameMode = this.getGamemode().toLowerCase();
     const layerName = this.getLayerName().toLowerCase();
     return gameMode.includes('seed') || layerName.includes('seed');
@@ -373,7 +372,6 @@ export default class GameStateService {
    * "auto-scramble on Seed" and "skip Elite/ranking logic on Training".
    */
   isTrainingMode() {
-    if (!this.isReady()) return false;
     const gameMode = this.getGamemode().toLowerCase();
     const layerName = this.getLayerName().toLowerCase();
     return gameMode.includes('jensen') || layerName.includes('jensen');
@@ -535,6 +533,15 @@ export default class GameStateService {
       await this._persistState();
       this.verboseLogger(2, '[GameState] STAGING timer elapsed -> LIVE.');
       this._notifyGamePhaseChange('LIVE');
+
+      // Emit server-wide event so consumer plugins (e.g. SmartAssign snapshot)
+      // can capture the full player roster once the round is live and teams resolved.
+      this.server?.emit?.('S3_ROUND_LIVE', {
+        roundStartTime: this.roundStartTime,
+        matchId: this.matchId,
+        layerName: this.layerNameCached,
+        gamemode: this.gameModeCached
+      });
     }, remaining);
   }
 
@@ -749,6 +756,7 @@ export default class GameStateService {
         this._recoveredStateActive = false;
         this.lastPhaseChangeAt = Date.now();
         this.verboseLogger(2, '[GameState] Recovered STAGING with resolving=false -> LIVE (skipping timer).');
+        this._notifyGamePhaseChange('STAGING');
       } else {
         this._startStagingLiveTimer(this.lastNewGameAt);
       }
@@ -765,6 +773,7 @@ export default class GameStateService {
         this._recoveredStateActive = false;
         this.lastPhaseChangeAt = Date.now();
         this.verboseLogger(2, '[GameState] Recovered ENDGAME but round stale (>5min) -> LIVE.');
+        this._notifyGamePhaseChange('ENDGAME');
       }
       // else: stay in ENDGAME, subState=null, no timer, wait for NEW_GAME
     }
@@ -804,6 +813,7 @@ export default class GameStateService {
   }
 
   async _transitionRecoveredStateToLive(reason, now = Date.now()) {
+    const prevPhase = this.phase;
     this._clearStagingLiveTimer();
     this._clearEndgameTimer();
     this.phase = 'LIVE';
@@ -815,6 +825,7 @@ export default class GameStateService {
     this._recoveredStateActive = false;
     await this._persistState();
     this.verboseLogger(1, `[GameState] Recovered state invalidated -> LIVE (${reason}).`);
+    this._notifyGamePhaseChange(prevPhase);
   }
 
   async _validateRecoveredState(source = 'unknown', { serverLayerName = null } = {}) {

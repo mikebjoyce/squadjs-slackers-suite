@@ -7,26 +7,30 @@
  *
  * Centralizes Sequelize connector management with SQLite-specific
  * retry+jitter locking, WAL pragma enforcement, mutex serialization,
- * and a lightweight migration runner. Provides a uniform database
- * interface for all S³ services and plugin consumers.
+ * per-plugin schema version tracking, and a MigrationEngine for
+ * applying version-ordered schema migrations. Provides a uniform
+ * database interface for all S³ services and plugin consumers.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * DBService (class, default)
- *   mount()                — Initialises Sequelize, runs WAL pragmas,
- *                            inits migration model, applies pending migrations.
- *   unmount()              — Resets mounted state.
- *   isReady()              — Returns true when service is mounted.
- *   getConnector()         — Returns the underlying Sequelize instance.
- *   getConnectorName()     — Returns dialect name or connector label.
- *   getDataTypes()         — Resolves Sequelize DataTypes from connector.
+ *   mount()                     — Initialises Sequelize, runs WAL pragmas,
+ *                                  inits SchemaVersion model, verifies versions.
+ *   unmount()                   — Resets mounted state.
+ *   isReady()                   — Returns true when service is mounted.
+ *   getConnector()              — Returns the underlying Sequelize instance.
+ *   getConnectorName()          — Returns dialect name or connector label.
+ *   getDataTypes()              — Resolves Sequelize DataTypes from connector.
  *   defineModel(name, schema, opts) — Defines and caches a Sequelize model.
- *   registerMigration(id, runFn) — Registers a named migration for execution.
- *   runMigrations()        — Applies all pending registered migrations.
- *   executeWithRetry(fn, opts) — Wraps logicFn with retry+jitter, SQLite-mutexed.
- *   withTransaction(fn, opts) — Executes logicFn inside a Sequelize transaction.
+ *   registerExpectedVersion(pluginName, version) — Declares a plugin's expected
+ *                                  schema version for verification.
+ *   verifySchemaVersions()      — Returns { upToDate, pending } comparing
+ *                                  registered expected versions against DB.
+ *   get migrationEngine()       — Returns the MigrationEngine instance.
+ *   executeWithRetry(fn, opts)  — Wraps logicFn with retry+jitter, SQLite-mutexed.
+ *   withTransaction(fn, opts)   — Executes logicFn inside a Sequelize transaction.
  *   withTransactionWithRetry(fn, opts) — Transaction with retry+jitter.
- *   ensureSqlitePragmas()  — Enforces WAL + synchronous=NORMAL on SQLite.
+ *   ensureSqlitePragmas()       — Enforces WAL + synchronous=NORMAL on SQLite.
  *   Static: resolveConnector(), isLockError(), isSqlite(),
  *           withConnectorMutex(), withSqliteMutex(),
  *           executeWithRetry(), withTransaction(),
@@ -34,27 +38,35 @@
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
- * (No local imports — depends on Sequelize passed via constructor.)
+ * MigrationEngine (../utils/migration-engine.js)
+ *   Per-plugin migration runner with transaction-safe up/down.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
  * - Falls back to no-op mode when no Sequelize connector is available.
- * - Migrations are idempotent — previously-applied migrations are skipped.
+ * - SchemaVersion enables per-plugin version tracking (replaces old
+ *   flat S3_Migrations table from Stage 7.4b).
+ * - The MigrationEngine does NOT auto-run on startup — migrations are
+ *   gated behind Discord confirmation (7.4d).
  * - SQLite operations are serialized through a per-connector mutex to
  *   prevent concurrent write contention.
  * - Retry defaults: 5 attempts, 200ms base delay, 500ms jitter.
  *
  */
+import MigrationEngine from './migration-engine.js';
+
 export default class DBService {
   constructor({
     sequelize = null,
     connectors = null,
     databaseOption = null,
     verboseLogger = () => {},
-    defaultRetry = {}
+    defaultRetry = {},
+    emitEvent = () => {}
   } = {}) {
     this.verboseLogger = verboseLogger;
     this.connectors = connectors || null;
+    this.emitEvent = emitEvent;
     this.defaultRetry = {
       attempts: Number.isFinite(defaultRetry.attempts) ? defaultRetry.attempts : 5,
       baseDelayMs: Number.isFinite(defaultRetry.baseDelayMs) ? defaultRetry.baseDelayMs : 200,
@@ -71,8 +83,14 @@ export default class DBService {
 
     this.models = {};
     this._isMounted = false;
-    this._migrations = [];
-    this.MigrationsModel = null;
+    this.SchemaVersionsModel = null;
+    this._expectedVersions = new Map();
+    this._migrationEngine = null;
+
+    // 7.4d — Migration gate: pending list + promise for consumer wait
+    this._pendingMigrations = null;     // null = no check done, [] = up-to-date, array = pending
+    this._migrationGate = null;         // Promise that consumers await
+    this._resolveMigrationGateFn = null; // Resolver for the gate
   }
 
   static resolveConnector({ sequelize = null, connectors = null, databaseOption = null } = {}) {
@@ -201,6 +219,18 @@ export default class DBService {
     return true;
   }
 
+  /* ────────────────────────────────────── PUBLIC ACCESSORS ────────────────────────────────────── */
+
+  /**
+   * Get the MigrationEngine instance. Created lazily on first mount.
+   * @returns {import('./migration-engine.js').default|null}
+   */
+  get migrationEngine() {
+    return this._migrationEngine;
+  }
+
+  /* ────────────────────────────────────── LIFECYCLE ────────────────────────────────────── */
+
   async mount() {
     if (this._isMounted) {
       await this.unmount();
@@ -213,17 +243,35 @@ export default class DBService {
     }
 
     await DBService.ensureSqlitePragmas(this.sequelize);
-    await this._initMigrationsModel();
-    await this.runMigrations();
+
+    // Initialise SchemaVersion table (per-plugin version tracking, replaces old S3_Migrations)
+    await this._initSchemaVersionModel();
+
+    // Extract SQLite storage path from connector config for backup (7.4e)
+    const dbPath = this.sequelize?.config?.storage || null;
+
+    // Create MigrationEngine instance
+    this._migrationEngine = new MigrationEngine({
+      dbService: this,
+      verboseLogger: this.verboseLogger,
+      emitEvent: this.emitEvent,
+      dbPath
+    });
+
+    // Verify schema versions (logs pending migrations but does NOT auto-run)
+    await this._verifySchemaVersions();
 
     this._isMounted = true;
     this.verboseLogger(2, '[DB] Mounted.');
   }
 
   async unmount() {
+    this._migrationEngine = null;
     this._isMounted = false;
     this.verboseLogger(2, '[DB] Unmounted.');
   }
+
+  /* ────────────────────────────────────── CONNECTOR METHODS ────────────────────────────────────── */
 
   getConnector() {
     return this.sequelize;
@@ -255,6 +303,8 @@ export default class DBService {
 
     return dataTypes;
   }
+
+  /* ────────────────────────────────────── DELEGATED HELPERS ────────────────────────────────────── */
 
   async executeWithRetry(logicFn, retryOptions = {}) {
     return DBService.executeWithRetry(this.sequelize, logicFn, {
@@ -289,69 +339,201 @@ export default class DBService {
     return model;
   }
 
-  registerMigration(id, runFn) {
-    if (!id || typeof id !== 'string') {
-      throw new Error('registerMigration requires a non-empty string id.');
+  /* ────────────────────────────────────── SCHEMA VERSION PUBLIC API ────────────────────────────────────── */
+
+  /**
+   * Register a plugin's expected schema version.
+   * Called by consumer plugins during their own mount/init to declare
+   * their expected schema version. This is used by verifySchemaVersions()
+   * to detect pending migrations.
+   *
+   * @param {string} pluginName - Unique plugin identifier
+   * @param {number} version    - Expected schema version (positive integer)
+   */
+  registerExpectedVersion(pluginName, version) {
+    if (!pluginName || typeof pluginName !== 'string') {
+      throw new Error('registerExpectedVersion requires a non-empty pluginName string.');
     }
-    if (typeof runFn !== 'function') {
-      throw new Error('registerMigration requires a function runFn.');
+    if (!Number.isInteger(version) || version < 0) {
+      throw new Error(`registerExpectedVersion for "${pluginName}" requires a non-negative integer version, got ${version}.`);
     }
 
-    if (this._migrations.some((m) => m.id === id)) {
-      throw new Error(`Duplicate migration id: ${id}`);
-    }
-
-    this._migrations.push({ id, runFn });
-    this._migrations.sort((a, b) => a.id.localeCompare(b.id));
+    this._expectedVersions.set(pluginName, version);
+    this.verboseLogger(3, `[DB] Registered expected version v${version} for "${pluginName}".`);
   }
 
-  async runMigrations() {
-    if (!this.sequelize || !this.MigrationsModel) return;
+  /**
+   * Verify all registered plugin schema versions against the DB.
+   * Does NOT run migrations — only reports the diff.
+   *
+   * @returns {Promise<{upToDate: boolean, pending: Array<{pluginName: string, currentVersion: number, expectedVersion: number}>}>}
+   */
+  async verifySchemaVersions() {
+    if (!this.SchemaVersionsModel) {
+      return { upToDate: true, pending: [] };
+    }
 
-    for (const migration of this._migrations) {
-      const existing = await this.MigrationsModel.findByPk(migration.id);
-      if (existing) continue;
+    const pending = [];
 
-      await this.withTransactionWithRetry(async (t) => {
-        await migration.runFn({
-          sequelize: this.sequelize,
-          db: this,
-          transaction: t
+    for (const [pluginName, expectedVersion] of this._expectedVersions) {
+      try {
+        const row = await this.SchemaVersionsModel.findOne({ where: { pluginName } });
+        const currentVersion = row ? row.version : 0;
+
+        if (currentVersion < expectedVersion) {
+          pending.push({
+            pluginName,
+            currentVersion,
+            expectedVersion,
+            behind: expectedVersion - currentVersion
+          });
+        }
+      } catch (err) {
+        this.verboseLogger(1, `[DB] Error checking version for "${pluginName}": ${err.message}`);
+        pending.push({
+          pluginName,
+          currentVersion: -1,
+          expectedVersion,
+          error: err.message
         });
-
-        await this.MigrationsModel.create({
-          id: migration.id,
-          appliedAt: Date.now()
-        }, { transaction: t });
-      });
-
-      this.verboseLogger(3, `[DB] Applied migration ${migration.id}.`);
+      }
     }
+
+    return { upToDate: pending.length === 0, pending };
   }
 
-  async _initMigrationsModel() {
+  /* ────────────────────────────────────── 7.4d MIGRATION GATE API ────────────────────────────────────── */
+
+  /**
+   * Check if there are pending schema migrations that require human approval.
+   * Returns null if verification has not been run yet, an empty array if
+   * everything is up to date, or an array of pending migration descriptors.
+   *
+   * Consumer plugins call this before running sync({ alter: true }) to decide
+   * whether to skip their DB init until after migrations complete.
+   *
+   * @returns {Array<{pluginName: string, currentVersion: number, expectedVersion: number, behind: number}>|null}
+   */
+  getPendingMigrations() {
+    return this._pendingMigrations;
+  }
+
+  /**
+   * Wait for pending migrations to be resolved (confirmed, cancelled, or timed out).
+   * If no migrations are pending, returns immediately.
+   * Consumer plugins can await this before running sync({ alter: true }).
+   *
+   * @returns {Promise<void>}
+   */
+  async waitForMigrations() {
+    // No gate was created — either up-to-date or no check yet
+    if (!this._migrationGate) return;
+    // If check already ran and found nothing, the gate resolves instantly
+    if (this._pendingMigrations !== null && this._pendingMigrations.length === 0) return;
+    await this._migrationGate;
+  }
+
+  /**
+   * Resolve the migration gate, unblocking consumer plugins that are awaiting
+   * waitForMigrations(). Called by the Discord confirmation handler after
+   * migrations complete, are cancelled, or time out.
+   *
+   * @param {boolean} [wasApplied=false] - If true, pending migrations were applied
+   */
+  _resolveMigrationGate(wasApplied = false) {
+    if (this._resolveMigrationGateFn) {
+      this._resolveMigrationGateFn();
+      this._resolveMigrationGateFn = null;
+    }
+    if (wasApplied) {
+      this._pendingMigrations = []; // Clear pending — they're applied now
+    }
+    this._migrationGate = null;
+    this.verboseLogger(2, `[DB] Migration gate resolved (wasApplied=${wasApplied}). Consumer plugins unblocked.`);
+  }
+
+  /* ────────────────────────────────────── INTERNAL ────────────────────────────────────── */
+
+  /**
+   * Initialise the S3_SchemaVersions table (per-plugin version tracking).
+   * Replaces the old flat S3_Migrations table.
+   */
+  async _initSchemaVersionModel() {
     const DataTypes = this.getDataTypes();
 
-    this.MigrationsModel = this.sequelize.models?.S3Migrations || this.sequelize.define(
-      'S3Migrations',
+    this.SchemaVersionsModel = this.sequelize.models?.S3SchemaVersions || this.sequelize.define(
+      'S3SchemaVersions',
       {
         id: {
+          type: DataTypes.INTEGER,
+          primaryKey: true,
+          autoIncrement: true
+        },
+        pluginName: {
           type: DataTypes.STRING,
-          primaryKey: true
+          allowNull: false,
+          unique: true
+        },
+        version: {
+          type: DataTypes.INTEGER,
+          allowNull: false,
+          defaultValue: 0
         },
         appliedAt: {
           type: DataTypes.BIGINT,
           allowNull: false
+        },
+        migrationHash: {
+          type: DataTypes.STRING,
+          allowNull: false
+        },
+        description: {
+          type: DataTypes.STRING,
+          allowNull: true
         }
       },
       {
-        tableName: 'S3_Migrations',
+        tableName: 'S3_SchemaVersions',
         timestamps: false
       }
     );
 
     await this.executeWithRetry(async () => {
-      await this.MigrationsModel.sync();
+      await this.SchemaVersionsModel.sync();
     });
+
+    this.verboseLogger(3, '[DB] Initialised S3_SchemaVersions table.');
+  }
+
+  /**
+   * Verify registered schema versions on mount and log any pending migrations.
+   * Stores the result in _pendingMigrations and creates the migration gate
+   * promise so consumer plugins can await waitForMigrations().
+   * Does NOT auto-trigger migrations — that is gated behind 7.4d (Discord confirmation).
+   * The Discord prompt is fired later (after Discord registers) via _checkAndPromptMigrations().
+   */
+  async _verifySchemaVersions() {
+    const result = await this.verifySchemaVersions();
+
+    if (result.upToDate) {
+      this.verboseLogger(3, '[DB] All plugin schema versions are up to date.');
+      this._pendingMigrations = [];
+      return;
+    }
+
+    // Store pending migrations for the Discord prompt (7.4d)
+    this._pendingMigrations = result.pending;
+
+    // Create migration gate — consumer plugins can await this before sync({ alter: true })
+    this._migrationGate = new Promise((resolve) => {
+      this._resolveMigrationGateFn = resolve;
+    });
+
+    this.verboseLogger(2, `[DB] ${result.pending.length} plugin(s) have pending schema migrations. Gate created.`);
+    for (const p of result.pending) {
+      this.verboseLogger(2, `  "${p.pluginName}": v${p.currentVersion || '(new)'} → v${p.expectedVersion} (${p.behind} behind)`);
+    }
+
+    this.verboseLogger(2, '[DB] Migrations are NOT auto-applied. Waiting for Discord confirmation (see 7.4d).');
   }
 }

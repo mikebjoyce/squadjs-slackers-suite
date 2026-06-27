@@ -214,7 +214,8 @@ await runTest('persists and recovers phase/resolving/layer state via sequelize c
   });
 
   await service2.mount();
-  assert.equal(service2.getPhase(), 'STAGING');
+  // G2: STAGING with resolving=false now transitions to LIVE on recovery
+  assert.equal(service2.getPhase(), 'LIVE');
   assert.equal(service2.isResolving(), false);
   assert.equal(service2.getLayerName(), 'JensensRange_Skirmish_v2');
   assert.equal(service2.isIgnoredMode(), true);
@@ -367,10 +368,14 @@ await runTest('invalidates recovered state on authoritative known-layer divergen
   });
 
   await service2.mount();
-  assert.equal(service2.getPhase(), 'STAGING');
+  // G2: STAGING with resolving=false transitions to LIVE immediately on recovery
+  assert.equal(service2.getPhase(), 'LIVE');
 
+  // Since _recoveredStateActive is already cleared by G2, handleServerInfoUpdated
+  // skips _validateRecoveredState — but layer divergence is detected by
+  // resolveLayerInfo instead, and the layer gets updated.
   await service2.handleServerInfoUpdated({ currentLayer: 'Unknown' });
-  assert.equal(service2.getPhase(), 'STAGING');
+  assert.equal(service2.getPhase(), 'LIVE');
 
   await service2.handleServerInfoUpdated({ currentLayer: 'DifferentLayer_AAS_v2' });
   assert.equal(service2.getPhase(), 'LIVE');
@@ -474,6 +479,15 @@ await runTest('ENDGAME scoreboard transitions to layerVote after TimeBeforeVote'
   await service.unmount();
 });
 
+async function waitForSubState(service, expectedFnName, timeoutMs = 1000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (service[expectedFnName]()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${expectedFnName} (current subState: ${service.getEndgameSubState()})`);
+}
+
 await runTest('ENDGAME layerVote transitions to factionVoteTeam1', async () => {
   const server = new MockServer();
   const parent = { services: { serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0 }) }, serverConfig: new MockServerConfig({ timeBeforeVote: 0, layerVoteDuration: 0 }) };
@@ -482,12 +496,12 @@ await runTest('ENDGAME layerVote transitions to factionVoteTeam1', async () => {
   await service.mount();
   await service.handleRoundEnded();
 
-  // Fast-forward through scoreboard
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  // Wait for scoreboard -> layerVote (0ms timer chain)
+  await waitForSubState(service, 'isEndgameLayerVote');
   assert.equal(service.isEndgameLayerVote(), true);
 
-  // Fast-forward through layerVote
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  // Wait for layerVote -> factionVoteTeam1 (0ms timer chain)
+  await waitForSubState(service, 'isEndgameFactionVoteTeam1');
   assert.equal(service.isEndgameFactionVoteTeam1(), true);
 
   await service.unmount();
@@ -501,12 +515,12 @@ await runTest('ENDGAME factionVoteTeam1 transitions to factionVoteTeam2', async 
   await service.mount();
   await service.handleRoundEnded();
 
-  // Fast-forward through scoreboard -> layerVote -> factionVoteTeam1
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  // Wait for scoreboard -> layerVote -> factionVoteTeam1 (0ms timer chain)
+  await waitForSubState(service, 'isEndgameFactionVoteTeam1');
   assert.equal(service.isEndgameFactionVoteTeam1(), true);
 
-  // Fast-forward through factionVoteTeam1
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  // Wait for factionVoteTeam1 -> factionVoteTeam2
+  await waitForSubState(service, 'isEndgameFactionVoteTeam2');
   assert.equal(service.isEndgameFactionVoteTeam2(), true);
 
   await service.unmount();
