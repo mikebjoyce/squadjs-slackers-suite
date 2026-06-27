@@ -254,6 +254,41 @@ export default class EloTracker extends BasePlugin {
     // Initialize DB models (required before any DB access; S³ owns roundStartTime now)
     await this.db.initDB();
 
+    // 7.4j Part B — Register and run Elo v2 migration (drop roundStartTime from Elo_PluginState)
+    const s3db = this._s3?.db;
+    if (s3db?.isReady() && s3db.migrationEngine) {
+      s3db.registerExpectedVersion('elo-tracker', 2);
+
+      s3db.migrationEngine.registerMigrations('elo-tracker', [
+        {
+          version: 2,
+          description: 'Drop vestigial roundStartTime column from Elo_PluginState (now read from S³ GameStateService)',
+          up: async (qi) => {
+            // Note: if the column was already dropped by Sequelize sync(), removeColumn is a no-op
+            await qi.removeColumn('Elo_PluginState', 'roundStartTime');
+          },
+          down: async (qi) => {
+            await qi.addColumn('Elo_PluginState', 'roundStartTime', {
+              type: qi.DataTypes.BIGINT,
+              allowNull: true
+            });
+          }
+        }
+      ]);
+
+      // Check for pending migrations and apply them
+      const recheck = await s3db.verifySchemaVersions();
+      if (!recheck.upToDate) {
+        Logger.verbose('EloTracker', 1, `[7.4j] Elo has ${recheck.pending.length} pending migration(s) — applying now.`);
+        const result = await s3db.migrationEngine.runMigrations('elo-tracker');
+        Logger.verbose('EloTracker', 1, `[7.4j] Elo v2 migration complete: applied=${result.applied}, skipped=${result.skipped}.`);
+      } else {
+        Logger.verbose('EloTracker', 3, '[7.4j] Elo schema already up to date.');
+      }
+    } else {
+      Logger.verbose('EloTracker', 1, '[7.4j] S³ DB or migrationEngine not available — skipping migration registration.');
+    }
+
     // --- Prune stale player entries ---
     const { tier1, tier2 } = await this.db.pruneStaleEntries(this.options.minRoundsForLeaderboard);
     Logger.verbose('EloTracker', 1, `[mount] Pruned stale entries — Tier 1 (provisional): ${tier1}, Tier 2 (calibrated): ${tier2}`);

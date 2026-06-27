@@ -117,26 +117,22 @@ export default class EloDatabase {
    async initDB() {
      if (!this.sequelize) {
        Logger.verbose('EloTracker', 1, '[DB] No sequelize connector available.');
-       return { roundStartTime: null };
+       return false;
      }
 
     try {
-      this.models.PluginState = this.sequelize.define(
-        'Elo_PluginState',
-        {
-          id: {
-            type: Sequelize.INTEGER,
-            primaryKey: true,
-            autoIncrement: false,
-            defaultValue: 1
+        this.models.PluginState = this.sequelize.define(
+          'Elo_PluginState',
+          {
+            id: {
+              type: Sequelize.INTEGER,
+              primaryKey: true,
+              autoIncrement: false,
+              defaultValue: 1
+            }
           },
-          roundStartTime: {
-            type: Sequelize.BIGINT,
-            allowNull: true
-          }
-        },
-        { timestamps: false }
-      );
+          { timestamps: false }
+        );
 
       this.models.PlayerStats = this.sequelize.define(
         'Elo_PlayerStats',
@@ -318,39 +314,21 @@ export default class EloDatabase {
       }).catch(() => 0);
       Logger.verbose('EloTracker', 1, `[DB] PlayerStats table initialized: ${playerStatsCount} rows found on startup.`);
 
-      const state = await this._executeWithRetry(async () => {
+      await this._executeWithRetry(async () => {
         return await this.sequelize.transaction(async (t) => {
-          const [record] = await this.models.PluginState.findOrCreate({
+          await this.models.PluginState.findOrCreate({
             where: { id: 1 },
-            defaults: { id: 1, roundStartTime: null },
+            defaults: { id: 1 },
             transaction: t
           });
-          return record;
         });
       });
 
       Logger.verbose('EloTracker', 1, '[DB] Database initialized.');
-      return { roundStartTime: state.roundStartTime ? parseInt(state.roundStartTime) : null };
+      return true;
     } catch (error) {
       Logger.verbose('EloTracker', 1, `[DB] Error initializing database: ${error.message}`);
-      return { roundStartTime: null };
-    }
-  }
-
-  async saveRoundStartTime(timestamp) {
-    if (!this.sequelize) return null;
-    try {
-      return await this._executeWithRetry(async () => {
-        return await this.sequelize.transaction(async (t) => {
-          await this.models.PluginState.update(
-            { roundStartTime: timestamp },
-            { where: { id: 1 }, transaction: t }
-          );
-        });
-      });
-    } catch (error) {
-      Logger.verbose('EloTracker', 1, `[DB] Error saving roundStartTime: ${error.message}`);
-      return null;
+      return false;
     }
   }
 

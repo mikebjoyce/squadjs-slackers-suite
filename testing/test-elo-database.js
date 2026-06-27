@@ -49,10 +49,11 @@ export default async function runDatabaseTests(runTest) {
     if (!db.models.RoundHistory) throw new Error('RoundHistory model missing');
     if (!db.models.PluginState) throw new Error('PluginState model missing');
 
-    // Verify PluginState initialized with default row
+    // Verify PluginState initialized with default row (roundStartTime column removed in 7.4j)
     const state = await db.models.PluginState.findOne({ where: { id: 1 } });
     if (!state) throw new Error('PluginState not initialized');
-    if (state.roundStartTime !== null) throw new Error('roundStartTime should be null initially');
+    // roundStartTime column was removed in 7.4j Part B — no longer a field on the model
+    if (state.id !== 1) throw new Error('PluginState should have id=1');
   });
 
   await runTest('CRUD: Save and Search', async () => {
