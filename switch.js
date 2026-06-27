@@ -1,7 +1,7 @@
 import Sequelize from 'sequelize';
 import DiscordBasePlugin from './discord-base-plugin.js';
 import { setTimeout as delay } from "timers/promises";
-const { DataTypes, Op } = Sequelize;
+const { Op } = Sequelize;
 
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
@@ -21,12 +21,8 @@ const { DataTypes, Op } = Sequelize;
  *
  * Switch (default)
  *   Extends DiscordBasePlugin. Key public methods:
- *     mount()                          — Registers event listeners, discovers S³, initialises DB.
+ *     mount()                          — Registers event listeners, discovers S³, registers migrations.
  *     unmount()                        — Removes listeners, clears queue, unregisters S³ interest.
- *     prepareToMount()                 — Migrates DB schema, syncs models before mount.
- *     createModel(name, schema)        — Defines a Sequelize model on the plugin's DB connector.
- *     safeTransaction(logicFn)         — Retry wrapper for SQLite-busy DB transactions.
- *     safeDiscordReply(message, text)  — Guarded Discord message reply with error suppression.
  *     switchPlayer(eosID)              — Executes AdminForceTeamChange via RCON for one player.
  *     doubleSwitchPlayer(eosID, forced, senderSteamID) — Swaps a player to the opposite team and back.
  *     switchSquad(number, team)        — Switches all members of a squad to the opposite team.
@@ -58,6 +54,12 @@ const { DataTypes, Op } = Sequelize;
  *   SquadJS base class providing Discord connector, server, and options.
  *
  * ─── S³ INTEGRATION ──────────────────────────────────────────────
+ *
+ * DB models are managed via S³ MigrationEngine (7.4l). Tables
+ * (SwitchPlugin_PlayerCooldowns, SwitchPlugin_Endmatches) are created
+ * through version-tracked migrations on the S³ connector, replacing
+ * the old createModel() / sync({alter}) / raw ALTER TABLE pattern.
+ * All transactions use s3db.withTransactionWithRetry().
  *
  * S³ (Slacker's Squad Services) is the centralised service container
  * for shared state across Slacker's Squad plugins.  It owns the
@@ -103,12 +105,12 @@ const { DataTypes, Op } = Sequelize;
  *   processed when team counts are stable across two consecutive polls.
  * - RCON identifier cascade: player name is the only universally
  *   reliable RCON identifier. eosID/steamID are NOT valid for RCON.
- * - DB transaction retry (safeTransaction) handles SQLITE_BUSY with
- *   up to 5 retries and exponential backoff.
- * - PlayerCooldowns table is auto-migrated on mount; schema mismatch
- *   triggers a drop-and-recreate.
- * - Endmatch switch queue persists across restarts via the Endmatch
- *   model; processed on ROUND_ENDED.
+ * - DB transaction retry (via s3db.withTransactionWithRetry()) handles
+ *   SQLITE_BUSY with retry+jitter.
+ * - PlayerCooldowns table is version-tracked via S³ MigrationEngine
+ *   — no more sync({alter}) or drop-and-recreate.
+ * - Endmatch switch queue persists across restarts via the
+ *   SwitchPlugin_Endmatches table; processed on ROUND_ENDED.
  *
  * ─── COMMANDS ────────────────────────────────────────────────────
  *
@@ -293,7 +295,6 @@ export default class Switch extends DiscordBasePlugin {
         this.checkPlayer = this.checkPlayer.bind(this);
         this.onDiscordMessage = this.onDiscordMessage.bind(this);
         this.getDiagnosticInfo = this.getDiagnosticInfo.bind(this);
-        this.safeTransaction = this.safeTransaction.bind(this);
         this.safeDiscordReply = this.safeDiscordReply.bind(this);
         this._checkSwitchEligibility = this._checkSwitchEligibility.bind(this);
         this.onS3PlayerJoined = this.onS3PlayerJoined.bind(this);
@@ -302,8 +303,6 @@ export default class Switch extends DiscordBasePlugin {
 
         this.recentSwitches = [];
         this.recentDoubleSwitches = [];
-        // recentDisconnections removed in Stage 6.2b — replaced by S3_PLAYER_JOINED's
-        // previousTeamID payload and S³ reconnect data.
         this._switchQueue = {
             t1: [], // players on T1 wanting T2 — ordered FIFO
             t2: []  // players on T2 wanting T1 — ordered FIFO
@@ -312,90 +311,19 @@ export default class Switch extends DiscordBasePlugin {
         this._switchedOnJoin = new Set();
         this._queueProcessing = false;      // Re-entrancy guard for _processQueue
         this._s3 = null;                    // Reference to SlackersSquadServices (runtime discovery)
+        this._s3db = null;                  // Cached S³ DBService reference
         
         this._liberalModes = [];
 
-        this.models = {};
-
-        this.createModel('Endmatch', {
-            id: {
-                type: DataTypes.INTEGER,
-                primaryKey: true,
-                autoIncrement: true
-            },
-            name: {
-                type: DataTypes.STRING
-            },
-            steamID: {
-                type: DataTypes.STRING
-            },
-            eosID: {
-                type: DataTypes.STRING
-            },
-            created_at: {
-                type: DataTypes.DATE,
-                defaultValue: DataTypes.NOW
-            }
-        });
-
-        this.createModel('PlayerCooldowns', {
-            eosID: {
-                type: DataTypes.STRING,
-                primaryKey: true,
-                allowNull: false
-            },
-            steamID: {
-                type: DataTypes.STRING,
-                allowNull: true
-            },
-            playerName: {
-                type: DataTypes.STRING,
-                allowNull: true
-            },
-            lastSwitchTimestamp: {
-                type: DataTypes.DATE,
-                allowNull: true
-            },
-            firstSeenTimestamp: {
-                type: DataTypes.DATE,
-                allowNull: true
-            },
-            scrambleLockdownExpiry: {
-                type: DataTypes.DATE,
-                allowNull: true
-            }
-        });
+        // Models are now on S³ — accessed via this._s3db.models.SwitchPlugin_PlayerCooldowns etc.
 
         this.broadcast = (msg) => { this.server.rcon.broadcast(msg); };
-        // warn() now resolves player name from server.players before calling rcon.warn.
-        // Per RCON_IDENTIFIER_FINDINGS: eosID/steamID are NOT valid RCON identifiers.
-        // Player name is the only universally reliable RCON identifier.
         this.warn = (id, msg) => {
             if (!id) return;
             const player = this.server.players.find(p => p.eosID === id || p.steamID === id);
-            const name = player?.name || id; // fallback to raw id if player not found
+            const name = player?.name || id;
             this.server.rcon.warn(name, msg);
         };
-    }
-
-    async safeTransaction(logicFn) {
-        const maxRetries = 5;
-        for (let i = 0; i < maxRetries; i++) {
-            try {
-                return await this.options.database.transaction(logicFn);
-            } catch (err) {
-                const isLocked = err.message && (
-                    err.message.includes('SQLITE_BUSY') ||
-                    err.message.includes('database is locked') ||
-                    err.name === 'SequelizeTimeoutError'
-                );
-                if (isLocked && i < maxRetries - 1) {
-                    await delay(Math.random() * 500 + 200);
-                } else {
-                    throw err;
-                }
-            }
-        }
     }
 
     async safeDiscordReply(message, content) {
@@ -404,22 +332,6 @@ export default class Switch extends DiscordBasePlugin {
             await message.reply(content);
         } catch (err) {
             this.verbose(1, `Discord reply failed: ${err.message}`);
-        }
-    }
-
-    async _syncPlayerCooldowns() {
-        try {
-            await this.models.PlayerCooldowns.sync({ alter: true });
-        } catch (err) {
-            if (err?.name === 'SequelizeDatabaseError' &&
-                err?.parent?.code === 'SQLITE_ERROR' &&
-                err?.parent?.sql && err.parent.sql.includes('PRIMARY KEY')) {
-                this.verbose(1, '[Switch] Table schema mismatch detected, recreating PlayerCooldowns table...');
-                await this.models.PlayerCooldowns.drop();
-                await this.models.PlayerCooldowns.sync({ alter: true });
-            } else {
-                throw err;
-            }
         }
     }
 
@@ -437,7 +349,127 @@ export default class Switch extends DiscordBasePlugin {
 
     async mount() {
         this._resolveS3();
-        await this._syncPlayerCooldowns();
+
+        // 7.4k-3: Wait for S³ to finish mounting before accessing its services
+        await this._s3.ready();
+        this.verbose(1, '[S3] S³ is fully mounted — proceeding.');
+
+        // ═══════════════════════════════════════════════════════════════
+        // 7.4l: SCHEMA MIGRATION — Define models + register Switch v1
+        // ═══════════════════════════════════════════════════════════════
+        const s3db = this._s3.db;
+        if (s3db?.isReady() && s3db.migrationEngine) {
+            this._s3db = s3db;
+
+            // Define models on S³ connector (idempotent — defineModel caches)
+            s3db.defineModel('SwitchPlugin_PlayerCooldowns', {
+                eosID: {
+                    type: s3db.getDataTypes().STRING,
+                    primaryKey: true,
+                    allowNull: false
+                },
+                steamID: {
+                    type: s3db.getDataTypes().STRING,
+                    allowNull: true
+                },
+                playerName: {
+                    type: s3db.getDataTypes().STRING,
+                    allowNull: true
+                },
+                lastSwitchTimestamp: {
+                    type: s3db.getDataTypes().DATE,
+                    allowNull: true
+                },
+                firstSeenTimestamp: {
+                    type: s3db.getDataTypes().DATE,
+                    allowNull: true
+                },
+                scrambleLockdownExpiry: {
+                    type: s3db.getDataTypes().DATE,
+                    allowNull: true
+                }
+            });
+
+            s3db.defineModel('SwitchPlugin_Endmatches', {
+                id: {
+                    type: s3db.getDataTypes().INTEGER,
+                    primaryKey: true,
+                    autoIncrement: true
+                },
+                name: {
+                    type: s3db.getDataTypes().STRING
+                },
+                steamID: {
+                    type: s3db.getDataTypes().STRING
+                },
+                eosID: {
+                    type: s3db.getDataTypes().STRING
+                },
+                created_at: {
+                    type: s3db.getDataTypes().DATE,
+                    defaultValue: s3db.getDataTypes().NOW
+                }
+            });
+
+            // Register expected version + v1 migration (creates both tables idempotently)
+            s3db.registerExpectedVersion('switch', 1);
+            s3db.migrationEngine.registerMigrations('switch', [
+                {
+                    version: 1,
+                    description: 'Create SwitchPlugin_PlayerCooldowns and SwitchPlugin_Endmatches',
+                    up: async (qi) => {
+                        // Check which tables already exist (safe for already-running installs)
+                        const existingRaw = await qi.rawQuery("SELECT name FROM sqlite_master WHERE type='table'");
+                        const existing = (Array.isArray(existingRaw) ? existingRaw : []).map(r => r.name);
+
+                        if (!existing.includes('SwitchPlugin_PlayerCooldowns')) {
+                            await qi.createTable('SwitchPlugin_PlayerCooldowns', {
+                                eosID: { type: qi.DataTypes.STRING, primaryKey: true, allowNull: false },
+                                steamID: { type: qi.DataTypes.STRING, allowNull: true },
+                                playerName: { type: qi.DataTypes.STRING, allowNull: true },
+                                lastSwitchTimestamp: { type: qi.DataTypes.DATE, allowNull: true },
+                                firstSeenTimestamp: { type: qi.DataTypes.DATE, allowNull: true },
+                                scrambleLockdownExpiry: { type: qi.DataTypes.DATE, allowNull: true }
+                            });
+                        }
+
+                        if (!existing.includes('SwitchPlugin_Endmatches')) {
+                            await qi.createTable('SwitchPlugin_Endmatches', {
+                                id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+                                name: { type: qi.DataTypes.STRING },
+                                steamID: { type: qi.DataTypes.STRING },
+                                eosID: { type: qi.DataTypes.STRING },
+                                created_at: { type: qi.DataTypes.DATE, defaultValue: qi.DataTypes.NOW }
+                            });
+                        }
+                    },
+                    down: async (qi) => {
+                        await qi.dropTable('SwitchPlugin_PlayerCooldowns');
+                        await qi.dropTable('SwitchPlugin_Endmatches');
+                    }
+                }
+            ]);
+
+            // Re-verify schema versions now that Switch has registered, then run the migration
+            const recheck = await s3db.verifySchemaVersions();
+            if (!recheck.upToDate) {
+                this.verbose(1, `[7.4l] Switch has ${recheck.pending.length} pending migration(s) — applying now.`);
+                const result = await s3db.migrationEngine.runMigrations('switch');
+                this.verbose(1, `[7.4l] Switch v1 migration complete: applied=${result.applied}, skipped=${result.skipped}.`);
+
+                // Re-verify after migration
+                const postCheck = await s3db.verifySchemaVersions();
+                if (!postCheck.upToDate) {
+                    this.verbose(1, `[7.4l] WARNING: ${postCheck.pending.length} migration(s) still pending after run.`);
+                } else {
+                    this.verbose(2, '[7.4l] Switch schema is now up to date (v1).');
+                }
+            } else {
+                this.verbose(2, '[7.4l] Switch schema already up to date.');
+            }
+        } else {
+            this.verbose(1, '[7.4l] S³ DB or migrationEngine not available — cannot register Switch schema. Mounting without DB.');
+        }
 
         // Register refresh interest with S³ PlayersService for queue processing
         const mountPlayers = this._s3.players;
@@ -465,43 +497,42 @@ export default class Switch extends DiscordBasePlugin {
             this.options.channelID = this.options.discordChannelID;
         }
         await super.prepareToMount();
-        await this.models.Endmatch.sync();
+        // 7.4l: Table sync and ALTER TABLE are removed — handled by S³ MigrationEngine in mount()
+    }
 
-        // Migration: ensure eosID column exists on existing Endmatch tables
-        // (sync() only CREATE TABLE IF NOT EXISTS — it does not alter existing tables)
+    /* ────────────────────────────────────── DB HELPERS ────────────────────────────────────── */
+
+    /**
+     * Get cached model reference. Guards against null s3db (graceful fallback).
+     */
+    _getModel(name) {
+        return this._s3db?.models?.[name] || null;
+    }
+
+    /**
+     * Execute a DB function with retry+jitter via S³ DBService.
+     * Gracefully returns null if S³ DB is unavailable.
+     */
+    async _withDb(fn) {
+        if (!this._s3db?.isReady?.()) return null;
         try {
-            await this.options.database.getQueryInterface().sequelize.query(
-                'ALTER TABLE `SwitchPlugin_Endmatches` ADD COLUMN `eosID` VARCHAR(255);'
-            );
-            this.verbose(1, '[Switch] Endmatch table migrated: added eosID column.');
+            return await this._s3db.withTransactionWithRetry(fn);
         } catch (err) {
-            // SQLite throws if column already exists — idempotent, ignore
-            if (!err.message.includes('duplicate column') && !err.message.includes('already exists')) {
-                // Log unexpected errors but don't block mount
-                this.verbose(1, `[Switch] Endmatch migration note: ${err.message}`);
-            }
+            this.verbose(1, `[DB] Error in _withDb: ${err.message}`);
+            return null;
         }
-
-        await this._syncPlayerCooldowns();
     }
 
-    createModel(name, schema) {
-        this.models[ name ] = this.options.database.define(`SwitchPlugin_${name}`, schema, {
-            timestamps: false
-        });
-    }
+    /* ────────────────────────────────────── COMMAND HANDLING ────────────────────────────────────── */
 
     async onChatMessage(info) {
         try {
-            // Use eosID as primary identifier (always present per SquadJS spec)
-            // steamID is the fallback — see .agents/skills/creating-squadjs-plugins/SKILL.md
             const eosID = info.player?.eosID;
             const steamID = info.player?.steamID;
             const playerName = info.player?.name;
             const teamID = info.player?.teamID;
             const message = info.message.toLowerCase();
 
-            // Guard: both IDs unavailable — can't execute RCON, abort
             if (!eosID && !steamID) {
                 this.verbose(1, `[Switch] Aborting onChatMessage: player ${playerName} has no eosID or steamID`);
                 return;
@@ -537,6 +568,27 @@ export default class Switch extends DiscordBasePlugin {
                         this._taggedSwitchPlayer(pl.eosID, 'Admin-Force').catch(err => {
                             this.verbose(1, `Admin switch now failed: ${err.message}`);
                         });
+                    }
+                    break;
+                case 'swap':
+                    if (!isAdmin) {
+                        this.verbose(1, `[Denied] Player ${playerName} (not admin) attempted admin command: ${subCommand}`);
+                        return;
+                    }
+                    this.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
+                    {
+                        const swapArgs = commandSplit.splice(1).join(' ').split(' ');
+                        const name1 = swapArgs[0];
+                        const name2 = swapArgs[1];
+                        const p1 = this.getPlayerByUsernameOrSteamID(steamID, name1);
+                        const p2 = this.getPlayerByUsernameOrSteamID(steamID, name2);
+                        if (p1 && p2) {
+                            await this._taggedSwitchPlayer(p1.eosID, 'Admin-Force');
+                            await this._taggedSwitchPlayer(p2.eosID, 'Admin-Force');
+                            this.warn(steamID, `Swapped ${p1.name} and ${p2.name}.`);
+                        } else {
+                            this.warn(steamID, 'One or both players not found.');
+                        }
                     }
                     break;
                 case 'double':
@@ -645,7 +697,6 @@ export default class Switch extends DiscordBasePlugin {
                     {
                         const ident = commandSplit.splice(1).join(' ');
                         if (ident) {
-                            // Admin-only: check another player
                             if (!isAdmin) {
                                 this.verbose(1, `[Denied] Player ${playerName} (not admin) attempted admin command: ${subCommand}`);
                                 this.warn(eosID, 'Only admins can check other players. Use !switch check with no name to see your own status.');
@@ -664,7 +715,6 @@ export default class Switch extends DiscordBasePlugin {
                                 this.verbose(1, `[Check] Admin check result: player=${result.playerName || result.steamID}, locked=${locked}, cooldown=${cooldown}`);
                             }
                         } else {
-                            // Any player: check their own eligibility (show all 4 conditions)
                             const eosID = info.player?.eosID;
                             const teamID = info.player?.teamID;
                             if (!eosID || !teamID) {
@@ -673,15 +723,14 @@ export default class Switch extends DiscordBasePlugin {
                             }
 
                             const isLiberal = this.isLiberalMode();
-                            const cooldownData = await this.models.PlayerCooldowns.findByPk(eosID);
+                            const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+                            const cooldownData = PlayerCooldowns ? await PlayerCooldowns.findByPk(eosID) : null;
                             const now = Date.now();
 
-                            // 1. Balance check
                             const effectiveCap = isLiberal ? this.options.liberalSwitchMaxUnbalancedSlots : null;
                             const availableSwitchSlots = this.getSwitchSlotsPerTeam(teamID, effectiveCap);
                             const balanceOK = availableSwitchSlots > 0;
 
-                            // 2. Time window check
                             const connectionSeconds = await this.getSecondsFromJoin(eosID);
                             const matchSeconds = this.getSecondsFromMatchStart();
                             const limit = this.options.switchEnabledMinutes;
@@ -695,7 +744,6 @@ export default class Switch extends DiscordBasePlugin {
                                 timeWindowMsg = `Closed (${connMin}m join, ${matchMin}m match)`;
                             }
 
-                            // 3. Cooldown check
                             const cooldownDuration = this.options.switchCooldownMinutes > 0
                                 ? this.options.switchCooldownMinutes * 60 * 1000
                                 : this.options.switchCooldownHours * 60 * 60 * 1000;
@@ -710,7 +758,6 @@ export default class Switch extends DiscordBasePlugin {
                                 }
                             }
 
-                            // 4. Scramble lock check
                             let scrambleOK = true;
                             let scrambleMsg = 'Not active';
                             if (cooldownData && cooldownData.scrambleLockdownExpiry && new Date(cooldownData.scrambleLockdownExpiry).getTime() > now) {
@@ -719,7 +766,6 @@ export default class Switch extends DiscordBasePlugin {
                                 scrambleMsg = `${remaining}m remaining`;
                             }
 
-                            // Build status message
                             let statusMsg = '[Switch] Status:\n';
                             statusMsg += `[${balanceOK ? 'OK' : 'X '}] Balance  | ${balanceOK ? 'Slot available' : 'Teams full'}\n`;
                             
@@ -757,9 +803,12 @@ export default class Switch extends DiscordBasePlugin {
                             this.warn(eosID, 'Player not found or multiple matches.');
                             return;
                         }
-                        await this.safeTransaction(async (t) => {
-                            await this.models.PlayerCooldowns.destroy({ where: { eosID: result.eosID }, transaction: t });
-                        });
+                        const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+                        if (PlayerCooldowns) {
+                            await this._withDb(async (t) => {
+                                await PlayerCooldowns.destroy({ where: { eosID: result.eosID }, transaction: t });
+                            });
+                        }
                         this.warn(eosID, `Cleared cooldowns for ${result.playerName || result.steamID}`);
                     }
                     break;
@@ -769,9 +818,14 @@ export default class Switch extends DiscordBasePlugin {
                         return;
                     }
                     this.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
-                    await this.safeTransaction(async (t) => {
-                        await this.models.PlayerCooldowns.destroy({ where: {}, truncate: true, transaction: t });
-                    });
+                    {
+                        const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+                        if (PlayerCooldowns) {
+                            await this._withDb(async (t) => {
+                                await PlayerCooldowns.destroy({ where: {}, truncate: true, transaction: t });
+                            });
+                        }
+                    }
                     this.warn(eosID, "All player cooldowns cleared.");
                     break;
                 case 'cancel':
@@ -801,17 +855,15 @@ export default class Switch extends DiscordBasePlugin {
             await this.server.updateSquadList();
             await this.server.updatePlayerList();
 
-            // Phase gate: engine-level team changes are impossible during faction voting
             if (this.s3IsEndgameFactionVote()) {
                 this.warn(eosID, '[Switch] Team changes are locked during faction voting. Try again when the next round starts.');
                 this.verbose(1, `[Switch] Denied ${playerName}: faction vote in progress.`);
                 return;
             }
 
-            // S³ lock gate: check if this player is being processed by a higher-priority actor
             const eosID2 = info.player?.eosID;
             const canActPlayers = this._s3.players;
-            if (eosID2 && canActPlayers?.isReady && canActPlayers.canAct) {
+            if (eosID2 && canActPlayers?.isReady?.() && canActPlayers.canAct) {
                 if (!canActPlayers.canAct(eosID2, 'Switch')) {
                     this.warn(eosID, '[Switch] You are currently being processed — please try again shortly.');
                     this.verbose(1, `[Switch] Denied ${playerName}: canAct returned false (locked by higher-priority actor).`);
@@ -819,12 +871,10 @@ export default class Switch extends DiscordBasePlugin {
                 }
             }
 
-            // Detect liberal mode
             const isLiberal = this.isLiberalMode();
             const effectiveCap = isLiberal ? this.options.liberalSwitchMaxUnbalancedSlots : null;
             const availableSwitchSlots = this.getSwitchSlotsPerTeam(teamID, effectiveCap);
 
-            // Enhanced logging: show current team and target team
             const targetTeam = teamID === 1 ? 2 : 1;
             let teamPlayerCount = [null, 0, 0];
             for (let p of this.server.players) {
@@ -877,10 +927,6 @@ export default class Switch extends DiscordBasePlugin {
              try {
                  await this._taggedSwitchPlayer(eosID, 'Player-Self');
                  
-                 // VERIFY: After RCON returns success, check the player actually moved teams.
-                 // AdminForceTeamChange can return SUCCESS from the RCON layer even when the game
-                 // engine silently rejects the move (e.g., 1v0 edge case, team-locked state).
-                 // We do a follow-up poll and verify teamID changed before marking switchSuccess=true.
                  await delay(1000);
                  await this.server.updatePlayerList();
                  const postSwitchPlayer = this.server.players.find(p => p.eosID === eosID);
@@ -925,9 +971,12 @@ export default class Switch extends DiscordBasePlugin {
                         } else {
                             const now = new Date();
                             this.verbose(1, `[Switch] Writing cooldown for ${playerName} (eosID=${eosID}) at ${now.toISOString()}`);
-                            await this.safeTransaction(async (t) => {
-                                await this.models.PlayerCooldowns.upsert({ eosID, steamID, playerName, lastSwitchTimestamp: now }, { transaction: t });
-                            });
+                            const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+                            if (PlayerCooldowns) {
+                                await this._withDb(async (t) => {
+                                    await PlayerCooldowns.upsert({ eosID, steamID, playerName, lastSwitchTimestamp: now }, { transaction: t });
+                                });
+                            }
                             this.verbose(1, `[Switch] Cooldown written successfully for ${playerName}`);
                         }
                     } catch (dbErr) {
@@ -946,7 +995,9 @@ export default class Switch extends DiscordBasePlugin {
     }
 
      async doSwitchMatchend() {
-         const players = await this.models.Endmatch.findAll();
+         const Endmatches = this._getModel('SwitchPlugin_Endmatches');
+         if (!Endmatches) return;
+         const players = await Endmatches.findAll();
          if (players.length == 0) return;
          players.forEach((pl) => {
              this.warn(pl.steamID ? pl.eosID || pl.steamID : pl.eosID, '[Switch] Round ending — you will be switched in 15 seconds.');
@@ -954,7 +1005,7 @@ export default class Switch extends DiscordBasePlugin {
          await delay(15 * 1000);
          await Promise.all(players.map(async (pl) => {
              await this._taggedSwitchPlayer(pl.eosID || pl.steamID, 'Admin-Force');
-             return await this.models.Endmatch.destroy({
+             return await Endmatches.destroy({
                  where: {
                      id: pl.id
                  }
@@ -963,7 +1014,6 @@ export default class Switch extends DiscordBasePlugin {
      }
 
     async onRoundEnded(dt) {
-        // Queue persists across normal round ends — teams don't change, so switch requests stay valid.
         this._lastTeamSnapshot = null;
         this.verbose(2, `[Queue] Round ended — queue preserved (${this._getQueueSize()} entries remain).`);
         await this.cleanup();
@@ -980,10 +1030,6 @@ export default class Switch extends DiscordBasePlugin {
         return balanceDiff;
     }
 
-    /**
-     * HELPER: Detect if we're in a liberal switching mode (Seed/Jensen).
-     * Checks both cached layer name and gamemode against the liberal modes list.
-     */
     isLiberalMode() {
         const gs = this._s3.gameState;
         const layerName = (gs?.getLayerName?.() || '').toLowerCase();
@@ -996,9 +1042,6 @@ export default class Switch extends DiscordBasePlugin {
         return gs?.isEndgameFactionVote?.() === true;
     }
 
-    /**
-     * HELPER: Compute dynamic extra tolerance slots based on current player count.
-     */
     getDynamicExtraSlots() {
         if (!this.options.dynamicBalanceTolerance) return 0;
 
@@ -1055,7 +1098,8 @@ export default class Switch extends DiscordBasePlugin {
         const eosID = player?.eosID;
         if (!eosID) return { eligible: false, reason: 'missing_eos' };
 
-        const cooldownData = await this.models.PlayerCooldowns.findByPk(eosID);
+        const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+        const cooldownData = PlayerCooldowns ? await PlayerCooldowns.findByPk(eosID) : null;
         const now = Date.now();
 
         if (cooldownData && cooldownData.scrambleLockdownExpiry && new Date(cooldownData.scrambleLockdownExpiry).getTime() > now) {
@@ -1089,8 +1133,6 @@ export default class Switch extends DiscordBasePlugin {
     }
 
     _requestQueueRefresh() {
-        // Trigger player list refresh via S³ PlayersService when queue is active.
-        // S³ handles coalescing, rate-limiting, and natural-tick cancellation.
         const refreshPlayers = this._s3.players;
         if (refreshPlayers?.isReady() && refreshPlayers.requestRefresh) {
             refreshPlayers.requestRefresh('Switch', { urgency: 'normal' });
@@ -1108,7 +1150,6 @@ export default class Switch extends DiscordBasePlugin {
         const targetTeam = teamID === 1 ? 2 : 1;
         const subQueue = teamID === 1 ? 't1' : 't2';
 
-        // Check if already queued
         if (this._findQueueEntry(eosID)) {
             const existing = this._findQueueEntry(eosID).entry;
             const elapsed = Date.now() - existing.queuedAt;
@@ -1163,12 +1204,6 @@ export default class Switch extends DiscordBasePlugin {
         this.verbose(2, `[Queue] All entries cleared: ${reason}`);
     }
 
-    /**
-     * Returns a read-only snapshot of the current switch queue.
-     * @returns {{ t1ToT2: Array, t2ToT1: Array }}
-     *   Each entry: { eosID, steamID, playerName, currentTeamID, targetTeamID, queuedAt }
-     *   warnInterval is NOT exposed in the snapshot.
-     */
     getQueueSnapshot() {
         return {
             t1ToT2: this._switchQueue.t1.map(e => ({ eosID: e.eosID, steamID: e.steamID, playerName: e.playerName, currentTeamID: e.currentTeamID, targetTeamID: e.targetTeamID, queuedAt: e.queuedAt })),
@@ -1176,12 +1211,6 @@ export default class Switch extends DiscordBasePlugin {
         };
     }
 
-    /**
-     * Removes a player from the switch queue by eosID.
-     * Clears warnInterval, removes from appropriate sub-queue.
-     * @param {string} eosID
-     * @returns {object|null} The removed entry, or null if not found.
-     */
     consumeQueueEntry(eosID) {
         const entry = this._removePlayerFromQueue(eosID);
         if (entry) {
@@ -1190,22 +1219,6 @@ export default class Switch extends DiscordBasePlugin {
         return entry || null;
     }
 
-    /**
-     * Force-swaps a queued player — removes them from the queue and
-     * runs Switch's own solo-switch pipeline (RCON move, cooldown,
-     * messaging, attribution). Called by SmartAssign's handshake when
-     * a swap is approved. The joining player's move is already queued
-     * by SA — this method only handles the Switch-queued player.
-     *
-     * Does NOT race with _processQueue because the entry is removed
-     * before the RCON move begins. If the player is not in the queue,
-     * returns false and no switch is attempted (SA falls back to
-     * baseline assignment for the joining player only).
-     *
-     * @param {string} eosID - The queue entry's eosID
-     * @returns {Promise<boolean>} true if the player was successfully
-     *   removed and switched; false if not in queue
-     */
     async forceQueueSwap(eosID) {
         const entry = this._removePlayerFromQueue(eosID);
         if (!entry) {
@@ -1242,7 +1255,6 @@ export default class Switch extends DiscordBasePlugin {
             const windowMs = this.options.switchEnabledMinutes * 60 * 1000;
             const nowTs = Date.now();
 
-            // Expiry sweep on both sub-queues
             for (const subQueue of ['t1', 't2']) {
                 const arr = this._switchQueue[subQueue];
                 for (let i = arr.length - 1; i >= 0; i--) {
@@ -1267,8 +1279,7 @@ export default class Switch extends DiscordBasePlugin {
                 && prevSnapshot.t2 === t2;
             this._lastTeamSnapshot = { t1, t2 };
 
-            // Pair swap: FIFO heads from each sub-queue
-            const t1Candidates = [...this._switchQueue.t1]; // already FIFO ordered
+            const t1Candidates = [...this._switchQueue.t1];
             const t2Candidates = [...this._switchQueue.t2];
             const pairCount = Math.min(t1Candidates.length, t2Candidates.length);
 
@@ -1301,16 +1312,19 @@ export default class Switch extends DiscordBasePlugin {
 
                 if (!this.isLiberalMode()) {
                     const now = new Date();
-                    for (const p of [p1, p2]) {
-                        try {
-                            await this.safeTransaction(async (t) => {
-                                await this.models.PlayerCooldowns.upsert(
-                                    { eosID: p.eosID, steamID: p.steamID, playerName: p.playerName, lastSwitchTimestamp: now },
-                                    { transaction: t }
-                                );
-                            });
-                        } catch (dbErr) {
-                            this.verbose(1, `[Queue] Cooldown write failed for ${p.playerName}: ${dbErr.message}`);
+                    const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+                    if (PlayerCooldowns) {
+                        for (const p of [p1, p2]) {
+                            try {
+                                await this._withDb(async (t) => {
+                                    await PlayerCooldowns.upsert(
+                                        { eosID: p.eosID, steamID: p.steamID, playerName: p.playerName, lastSwitchTimestamp: now },
+                                        { transaction: t }
+                                    );
+                                });
+                            } catch (dbErr) {
+                                this.verbose(1, `[Queue] Cooldown write failed for ${p.playerName}: ${dbErr.message}`);
+                            }
                         }
                     }
                 }
@@ -1352,15 +1366,18 @@ export default class Switch extends DiscordBasePlugin {
                     await this._taggedSwitchPlayer(entry.eosID, 'Player-Queue');
 
                     if (!this.isLiberalMode()) {
-                        try {
-                            await this.safeTransaction(async (t) => {
-                                await this.models.PlayerCooldowns.upsert(
-                                    { eosID: entry.eosID, steamID: entry.steamID, playerName: entry.playerName, lastSwitchTimestamp: new Date() },
-                                    { transaction: t }
-                                );
-                            });
-                        } catch (dbErr) {
-                            this.verbose(1, `[Queue] Cooldown write failed for ${entry.playerName}: ${dbErr.message}`);
+                        const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+                        if (PlayerCooldowns) {
+                            try {
+                                await this._withDb(async (t) => {
+                                    await PlayerCooldowns.upsert(
+                                        { eosID: entry.eosID, steamID: entry.steamID, playerName: entry.playerName, lastSwitchTimestamp: new Date() },
+                                        { transaction: t }
+                                    );
+                                });
+                            } catch (dbErr) {
+                                this.verbose(1, `[Queue] Cooldown write failed for ${entry.playerName}: ${dbErr.message}`);
+                            }
                         }
                     }
 
@@ -1392,7 +1409,6 @@ export default class Switch extends DiscordBasePlugin {
             this.verbose(2, `[Queue] ${playerName} disconnected — removed from queue.`);
         }
         this.verbose(2, `Player disconnected ${playerName}`);
-        // Clean up double-switch tracking — use eosID as the canonical key
         this.recentDoubleSwitches = this.recentDoubleSwitches.filter(p => p.eosID != eosID);
     }
 
@@ -1505,8 +1521,10 @@ export default class Switch extends DiscordBasePlugin {
     async addSquadToMatchendSwitches(number, team) {
         const players = this.getPlayersFromSquad(number, team);
         if (!players) return;
+        const Endmatches = this._getModel('SwitchPlugin_Endmatches');
+        if (!Endmatches) return;
         for (let p of players) {
-            await this.models.Endmatch.create({
+            await Endmatches.create({
                 name: p.name,
                 steamID: p.steamID,
                 eosID: p.eosID,
@@ -1515,25 +1533,18 @@ export default class Switch extends DiscordBasePlugin {
     }
 
     async addPlayerToMatchendSwitches(player) {
-        await this.models.Endmatch.create({
+        const Endmatches = this._getModel('SwitchPlugin_Endmatches');
+        if (!Endmatches) return;
+        await Endmatches.create({
             name: player.name,
             steamID: player.steamID,
             eosID: player.eosID,
         });
     }
 
-    /**
-     * Records the source of a player switch and emits attribution event BEFORE RCON execution.
-     * Automatically computes the target team (opposite of current team).
-     * Sources: 'Player-Self', 'Admin-Force', 'Switch-Double-Swap', 'Switch-Rejoin'
-     * 
-     * CRITICAL: Event is emitted BEFORE RCON fires to ensure SmartAssign's _externalMoveMap
-     * is populated before UPDATED_PLAYER_INFORMATION polling detects the team change.
-     */
     async _taggedSwitchPlayer(eosID, source) {
         const executionTimestamp = Date.now();
         
-        // Resolve player by eosID (primary identifier per SquadJS spec)
         const player = this.server.players.find(p => p.eosID === eosID);
         if (!player) {
           this.verbose(1, `[Switch] WARNING: Player with eosID ${eosID} not found in server.players for source=${source}`);
@@ -1547,22 +1558,18 @@ export default class Switch extends DiscordBasePlugin {
         
         this.verbose(2, `[Switch] EXECUTING: player=${player.name} (eosID=${eosID}, steamID=${steamID}), source=${source}, currentTeam=${currentTeam}, targetTeam=${targetTeam}, timestamp=${executionTimestamp}`);
         
-        // Guard against null team ID
         if (targetTeam === null) {
           this.verbose(1, `[Switch] ERROR: Cannot switch player ${player.name} - currentTeam is null or invalid (value=${currentTeam})`);
           return null;
         }
         
-        // S³ attribution: Record the move so S3_PLAYER_TEAM_CHANGED fires with the correct source
         const attributionPlayers = this._s3.players;
-        if (attributionPlayers?.isReady() && attributionPlayers.recordMove && eosID) {
+        if (attributionPlayers?.isReady() && eosID) {
           attributionPlayers.recordMove(eosID, targetTeam, source);
           this.verbose(2, `[Switch] S³ recordMove registered: source=${source}, targetTeam=${targetTeam}`);
         }
 
         try {
-            // Per RCON_IDENTIFIER_FINDINGS: eosID is NOT a valid RCON identifier.
-            // Player name is the only universally reliable RCON identifier.
             const result = await this.server.rcon.execute(`AdminForceTeamChange "${player.name}"`);
             this.verbose(3, `[Switch] RCON SUCCESS: AdminForceTeamChange returned for ${player.name}`);
             return result;
@@ -1573,8 +1580,6 @@ export default class Switch extends DiscordBasePlugin {
     }
 
     switchPlayer(eosID) {
-        // Per RCON_IDENTIFIER_FINDINGS: eosID is NOT a valid RCON identifier.
-        // Player name is the only universally reliable RCON identifier.
         const player = this.server.players.find(p => p.eosID === eosID);
         if (!player) {
             this.verbose(1, `[Switch] switchPlayer: Player with eosID ${eosID} not found`);
@@ -1592,8 +1597,6 @@ export default class Switch extends DiscordBasePlugin {
         const { eosID, name, teamID } = data.player;
         const previousTeamID = data.previousTeamID;
 
-        // Rejoin auto-switch — uses previousTeamID from S³'s reconnect memory
-        // (enriched via S3_PLAYER_JOINED payload), not a local cache.
         if (!this._switchedOnJoin.has(eosID)) {
             this._switchedOnJoin.add(eosID);
             if (this.options.switchToOldTeamAfterRejoin && previousTeamID != null) {
@@ -1605,7 +1608,6 @@ export default class Switch extends DiscordBasePlugin {
             }
         }
 
-        // Trigger queue processing if not in faction vote
         if (!this.s3IsEndgameFactionVote()) {
             await this._processQueue();
         }
@@ -1626,11 +1628,6 @@ export default class Switch extends DiscordBasePlugin {
         }
     }
 
-    /**
-     * Find a queue entry across both sub-queues by eosID.
-     * @param {string} eosID
-     * @returns {{ entry: object, subQueue: string, index: number } | null}
-     */
     _findQueueEntry(eosID) {
         for (const subQueue of ['t1', 't2']) {
             const idx = this._switchQueue[subQueue].findIndex(e => e.eosID === eosID);
@@ -1641,11 +1638,6 @@ export default class Switch extends DiscordBasePlugin {
         return null;
     }
 
-    /**
-     * Remove a player from the queue by eosID. Clears warnInterval.
-     * @param {string} eosID
-     * @returns {object|null} The removed entry, or null if not found.
-     */
     _removePlayerFromQueue(eosID) {
         const found = this._findQueueEntry(eosID);
         if (!found) return null;
@@ -1655,7 +1647,6 @@ export default class Switch extends DiscordBasePlugin {
     }
 
     async unmount() {
-        // Unregister S³ refresh interest
         const unmountPlayers = this._s3.players;
         if (unmountPlayers?.isReady() && unmountPlayers.unregisterRefreshInterest) {
             unmountPlayers.unregisterRefreshInterest('Switch');
@@ -1671,6 +1662,7 @@ export default class Switch extends DiscordBasePlugin {
         if (this.options.discordClient) this.options.discordClient.removeListener('message', this.onDiscordMessage);
         this._clearAllQueueEntries('Plugin unmount');
         this._s3 = null;
+        this._s3db = null;
         this.verbose(1, 'Switch plugin was un-mounted.');
     }
 
@@ -1703,13 +1695,16 @@ export default class Switch extends DiscordBasePlugin {
     }
 
     async cleanup() {
+        const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+        if (!PlayerCooldowns) return;
+
         const switchCooldownMs = this.options.switchCooldownMinutes > 0 ? this.options.switchCooldownMinutes * 60 * 1000 : this.options.switchCooldownHours * 60 * 60 * 1000;
         const now = new Date();
         const switchCutoff = new Date(now.getTime() - switchCooldownMs);
 
         try {
-            await this.safeTransaction(async (t) => {
-                await this.models.PlayerCooldowns.destroy({
+            await this._withDb(async (t) => {
+                await PlayerCooldowns.destroy({
                     where: {
                         [Op.and]: [
                             { 
@@ -1735,18 +1730,18 @@ export default class Switch extends DiscordBasePlugin {
                     transaction: t
                 });
             });
-            // recentDisconnections cleanup removed in Stage 6.2b — S³ reconnect memory
-            // handles disconnect tracking with DB-backed persistence and periodic pruning.
         } catch (err) {
             this.verbose(1, `Cleanup error: ${err.message}`);
         }
     }
 
     async checkPlayer(ident) {
-        let record = await this.models.PlayerCooldowns.findByPk(ident);
+        const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+        if (!PlayerCooldowns) return null;
+        let record = await PlayerCooldowns.findByPk(ident);
         if (record) return record;
 
-        const records = await this.models.PlayerCooldowns.findAll({
+        const records = await PlayerCooldowns.findAll({
             where: {
                 playerName: { [Op.like]: `%${ident}%` }
             }
@@ -1761,9 +1756,6 @@ export default class Switch extends DiscordBasePlugin {
         const { affectedPlayers } = data;
         this.verbose(2, `[SCRAMBLE_EVENT] onScrambleExecuted called with data: ${JSON.stringify(data)}`);
         
-        // Clear the switch queue on scramble — teams have been reshuffled, all pending switch
-        // requests are stale. Players must re-join the queue after the scramble if they still
-        // want to switch. This runs BEFORE lockdown logic so queued players are cleaned up first.
         this._clearAllQueueEntries('Scramble');
 
         if (!affectedPlayers || affectedPlayers.length === 0) {
@@ -1776,9 +1768,6 @@ export default class Switch extends DiscordBasePlugin {
             this.verbose(2, `  [${i}] steamID=${p.steamID}, name=${p.name}`);
         });
 
-        // Filter: only lock players who are OUTSIDE the switch time window.
-        // Players who recently joined or are in a short round should not be locked,
-        // because they had no time to exploit the pre-scramble imbalance.
         const switchWindowMs = this.options.switchEnabledMinutes * 60 * 1000;
         const lockoutPlayers = [];
         for (const p of affectedPlayers) {
@@ -1814,18 +1803,21 @@ export default class Switch extends DiscordBasePlugin {
 
         try {
             this.verbose(2, `[SCRAMBLE_EVENT] Starting DB transaction to write scramble locks...`);
-            await this.safeTransaction(async (t) => {
-                const chunkSize = 10;
-                for (let i = 0; i < records.length; i += chunkSize) {
-                    const chunk = records.slice(i, i + chunkSize);
-                    this.verbose(2, `[SCRAMBLE_EVENT] Writing chunk ${Math.floor(i / chunkSize) + 1}/${Math.ceil(records.length / chunkSize)} (${chunk.length} records)`);
-                    await this.models.PlayerCooldowns.bulkCreate(chunk, {
-                        updateOnDuplicate: ['scrambleLockdownExpiry', 'playerName', 'steamID'],
-                        transaction: t
-                    });
-                }
-            });
-            this.verbose(1, `[SCRAMBLE_EVENT] ✅ SUCCESS: Switch lockdown active for ${records.length} players until ${expiry.toISOString()}.`);
+            const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+            if (PlayerCooldowns) {
+                await this._withDb(async (t) => {
+                    const chunkSize = 10;
+                    for (let i = 0; i < records.length; i += chunkSize) {
+                        const chunk = records.slice(i, i + chunkSize);
+                        this.verbose(2, `[SCRAMBLE_EVENT] Writing chunk ${Math.floor(i / chunkSize) + 1}/${Math.ceil(records.length / chunkSize)} (${chunk.length} records)`);
+                        await PlayerCooldowns.bulkCreate(chunk, {
+                            updateOnDuplicate: ['scrambleLockdownExpiry', 'playerName', 'steamID'],
+                            transaction: t
+                        });
+                    }
+                });
+                this.verbose(1, `[SCRAMBLE_EVENT] ✅ SUCCESS: Switch lockdown active for ${records.length} players until ${expiry.toISOString()}.`);
+            }
 
             try {
                 const embed = {
@@ -1855,21 +1847,29 @@ export default class Switch extends DiscordBasePlugin {
         let totalStoredPlayers = 0;
 
         try {
-            await this.options.database.authenticate();
-            dbStatus = 'Connected';
-            totalStoredPlayers = await this.models.PlayerCooldowns.count();
-            
-            const cooldownDurationMs = this.options.switchCooldownMinutes > 0 ? this.options.switchCooldownMinutes * 60 * 1000 : this.options.switchCooldownHours * 60 * 60 * 1000;
-            const cooldownCutoff = new Date(Date.now() - cooldownDurationMs);
+            if (this._s3db?.isReady()) {
+                await this._s3db.sequelize.authenticate();
+                dbStatus = 'Connected';
+            } else {
+                dbStatus = 'S³ DB not available';
+            }
 
-            activeLocks = await this.models.PlayerCooldowns.count({
-                where: {
-                    [Op.or]: [
-                        { scrambleLockdownExpiry: { [Op.gt]: new Date() } },
-                        { lastSwitchTimestamp: { [Op.gt]: cooldownCutoff } }
-                    ]
-                }
-            });
+            const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+            if (PlayerCooldowns) {
+                totalStoredPlayers = await PlayerCooldowns.count();
+                
+                const cooldownDurationMs = this.options.switchCooldownMinutes > 0 ? this.options.switchCooldownMinutes * 60 * 1000 : this.options.switchCooldownHours * 60 * 60 * 1000;
+                const cooldownCutoff = new Date(Date.now() - cooldownDurationMs);
+
+                activeLocks = await PlayerCooldowns.count({
+                    where: {
+                        [Op.or]: [
+                            { scrambleLockdownExpiry: { [Op.gt]: new Date() } },
+                            { lastSwitchTimestamp: { [Op.gt]: cooldownCutoff } }
+                        ]
+                    }
+                });
+            }
         } catch (e) {
             dbStatus = `Error: ${e.message}`;
         }
@@ -1895,8 +1895,12 @@ export default class Switch extends DiscordBasePlugin {
             let playerList = 'None';
 
             try {
-                await this.options.database.authenticate();
-                dbStatus = 'Connected';
+                if (this._s3db?.isReady()) {
+                    await this._s3db.sequelize.authenticate();
+                    dbStatus = 'Connected';
+                } else {
+                    dbStatus = 'S³ DB not available';
+                }
 
                 const start = Date.now();
                 await this.server.rcon.execute('ListPlayers');
@@ -1906,41 +1910,44 @@ export default class Switch extends DiscordBasePlugin {
                 const cooldownDurationMs = this.options.switchCooldownMinutes > 0 ? this.options.switchCooldownMinutes * 60 * 1000 : this.options.switchCooldownHours * 60 * 60 * 1000;
                 const cooldownCutoff = new Date(now.getTime() - cooldownDurationMs);
 
-                standardCooldowns = await this.models.PlayerCooldowns.count({
-                    where: {
-                        lastSwitchTimestamp: { [Op.gt]: cooldownCutoff }
-                    }
-                });
-
-                scrambleLocks = await this.models.PlayerCooldowns.count({
-                    where: {
-                        scrambleLockdownExpiry: { [Op.gt]: now }
-                    }
-                });
-
-                const lockedPlayers = await this.models.PlayerCooldowns.findAll({
-                    where: {
-                        [Op.or]: [
-                            { scrambleLockdownExpiry: { [Op.gt]: now } },
-                            { lastSwitchTimestamp: { [Op.gt]: cooldownCutoff } }
-                        ]
-                    },
-                    order: [['scrambleLockdownExpiry', 'DESC'], ['lastSwitchTimestamp', 'DESC']],
-                    limit: 10
-                });
-
-                if (lockedPlayers.length > 0) {
-                    playerList = lockedPlayers.map(p => {
-                        const parts = [];
-                        if (p.scrambleLockdownExpiry && p.scrambleLockdownExpiry > now) {
-                            parts.push(`🌪️ <t:${Math.floor(p.scrambleLockdownExpiry.getTime() / 1000)}:R>`);
+                const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+                if (PlayerCooldowns) {
+                    standardCooldowns = await PlayerCooldowns.count({
+                        where: {
+                            lastSwitchTimestamp: { [Op.gt]: cooldownCutoff }
                         }
-                        if (p.lastSwitchTimestamp && new Date(p.lastSwitchTimestamp.getTime() + cooldownDurationMs) > now) {
-                            const expiry = new Date(p.lastSwitchTimestamp.getTime() + cooldownDurationMs);
-                            parts.push(`⏳ <t:${Math.floor(expiry.getTime() / 1000)}:R>`);
+                    });
+
+                    scrambleLocks = await PlayerCooldowns.count({
+                        where: {
+                            scrambleLockdownExpiry: { [Op.gt]: now }
                         }
-                        return `**${p.playerName || p.steamID}**: ${parts.join(' ')}`;
-                    }).join('\n');
+                    });
+
+                    const lockedPlayers = await PlayerCooldowns.findAll({
+                        where: {
+                            [Op.or]: [
+                                { scrambleLockdownExpiry: { [Op.gt]: now } },
+                                { lastSwitchTimestamp: { [Op.gt]: cooldownCutoff } }
+                            ]
+                        },
+                        order: [['scrambleLockdownExpiry', 'DESC'], ['lastSwitchTimestamp', 'DESC']],
+                        limit: 10
+                    });
+
+                    if (lockedPlayers.length > 0) {
+                        playerList = lockedPlayers.map(p => {
+                            const parts = [];
+                            if (p.scrambleLockdownExpiry && p.scrambleLockdownExpiry > now) {
+                                parts.push(`🌪️ <t:${Math.floor(p.scrambleLockdownExpiry.getTime() / 1000)}:R>`);
+                            }
+                            if (p.lastSwitchTimestamp && new Date(p.lastSwitchTimestamp.getTime() + cooldownDurationMs) > now) {
+                                const expiry = new Date(p.lastSwitchTimestamp.getTime() + cooldownDurationMs);
+                                parts.push(`⏳ <t:${Math.floor(expiry.getTime() / 1000)}:R>`);
+                            }
+                            return `**${p.playerName || p.steamID}**: ${parts.join(' ')}`;
+                        }).join('\n');
+                    }
                 }
             } catch (err) {
                 dbStatus = `Error: ${err.message}`;
@@ -2006,14 +2013,20 @@ export default class Switch extends DiscordBasePlugin {
                 await this.safeDiscordReply(message, 'Player not found or multiple matches.');
                 return;
             }
-            await this.safeTransaction(async (t) => {
-                await this.models.PlayerCooldowns.destroy({ where: { eosID: result.eosID }, transaction: t });
-            });
+            const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+            if (PlayerCooldowns) {
+                await this._withDb(async (t) => {
+                    await PlayerCooldowns.destroy({ where: { eosID: result.eosID }, transaction: t });
+                });
+            }
             await this.safeDiscordReply(message, `✅ Cleared cooldowns for **${result.playerName || result.steamID}**.`);
         } else if (subCommand === 'clearall') {
-            await this.safeTransaction(async (t) => {
-                await this.models.PlayerCooldowns.destroy({ where: {}, truncate: true, transaction: t });
-            });
+            const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+            if (PlayerCooldowns) {
+                await this._withDb(async (t) => {
+                    await PlayerCooldowns.destroy({ where: {}, truncate: true, transaction: t });
+                });
+            }
             await this.safeDiscordReply(message, '🗑️ All player cooldowns cleared.');
         } else if (subCommand === 'help') {
             const embed = {
