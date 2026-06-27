@@ -5,7 +5,7 @@
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Centralizes Sequelize connector management with SQLite-specific
+ * Centralises Sequelize connector management with SQLite-specific
  * retry+jitter locking, WAL pragma enforcement, mutex serialization,
  * per-plugin schema version tracking, and a MigrationEngine for
  * applying version-ordered schema migrations. Provides a uniform
@@ -21,6 +21,7 @@
  *   getConnector()              — Returns the underlying Sequelize instance.
  *   getConnectorName()          — Returns dialect name or connector label.
  *   getDataTypes()              — Resolves Sequelize DataTypes from connector.
+ *   getDatabasePath()           — Returns the SQLite file path used for backup.
  *   defineModel(name, schema, opts) — Defines and caches a Sequelize model.
  *   registerExpectedVersion(pluginName, version) — Declares a plugin's expected
  *                                  schema version for verification.
@@ -51,6 +52,9 @@
  * - SQLite operations are serialized through a per-connector mutex to
  *   prevent concurrent write contention.
  * - Retry defaults: 5 attempts, 200ms base delay, 500ms jitter.
+ * - Backup/migration assumes a single shared SQLite file. On mount, a
+ *   diagnostic checks for multiple SQLite storage paths in the connectors
+ *   map and warns if backup/migration coverage is partial. See getDatabasePath().
  *
  */
 import MigrationEngine from './migration-engine.js';
@@ -62,11 +66,11 @@ export default class DBService {
     databaseOption = null,
     verboseLogger = () => {},
     defaultRetry = {},
-    emitEvent = () => {}
+    server = null
   } = {}) {
     this.verboseLogger = verboseLogger;
     this.connectors = connectors || null;
-    this.emitEvent = emitEvent;
+    this.server = server;
     this.defaultRetry = {
       attempts: Number.isFinite(defaultRetry.attempts) ? defaultRetry.attempts : 5,
       baseDelayMs: Number.isFinite(defaultRetry.baseDelayMs) ? defaultRetry.baseDelayMs : 200,
@@ -86,6 +90,7 @@ export default class DBService {
     this.SchemaVersionsModel = null;
     this._expectedVersions = new Map();
     this._migrationEngine = null;
+    this._dbPath = null; // 7.4e: SQLite file path for backup (resolved on mount)
 
     // 7.4d — Migration gate: pending list + promise for consumer wait
     this._pendingMigrations = null;     // null = no check done, [] = up-to-date, array = pending
@@ -229,6 +234,23 @@ export default class DBService {
     return this._migrationEngine;
   }
 
+  /**
+   * The SQLite storage path used by the backup/migration system.
+   * Returns null if no SQLite connector is available or if the path
+   * could not be resolved from the connector config.
+   *
+   * Consumer plugins that need to know "where is the DB file" should
+   * call this method rather than reading `sequelize.config.storage`
+   * directly, because the connector may be a raw config object (not
+   * a fully-initialised Sequelize instance), in which case `storage`
+   * lives at the root level.
+   *
+   * @returns {string|null}
+   */
+  getDatabasePath() {
+    return this._dbPath;
+  }
+
   /* ────────────────────────────────────── LIFECYCLE ────────────────────────────────────── */
 
   async mount() {
@@ -247,15 +269,23 @@ export default class DBService {
     // Initialise SchemaVersion table (per-plugin version tracking, replaces old S3_Migrations)
     await this._initSchemaVersionModel();
 
-    // Extract SQLite storage path from connector config for backup (7.4e)
-    const dbPath = this.sequelize?.config?.storage || null;
+    // 7.4e: Extract SQLite storage path from connector config for backup.
+    // The connector may be a raw config object (e.g. { dialect, storage })
+    // returned via the string-key resolver branch, OR a fully-initialised
+    // Sequelize instance (which nests storage under .config.storage).
+    this._dbPath = this.sequelize?.config?.storage || this.sequelize?.storage || null;
+
+    // 7.4k-2: Multi-SQLite diagnostic — warn if connectors map contains
+    // multiple SQLite storage paths. Backup/migration only covers the
+    // primary connector, so other files' tables would be invisible.
+    this._logMultiSqliteWarning();
 
     // Create MigrationEngine instance
     this._migrationEngine = new MigrationEngine({
       dbService: this,
       verboseLogger: this.verboseLogger,
-      emitEvent: this.emitEvent,
-      dbPath
+      server: this.server,
+      dbPath: this._dbPath
     });
 
     // Verify schema versions (logs pending migrations but does NOT auto-run)
@@ -268,6 +298,7 @@ export default class DBService {
   async unmount() {
     this._migrationEngine = null;
     this._isMounted = false;
+    this._dbPath = null;
     this.verboseLogger(2, '[DB] Unmounted.');
   }
 
@@ -516,7 +547,11 @@ export default class DBService {
     const result = await this.verifySchemaVersions();
 
     if (result.upToDate) {
-      this.verboseLogger(3, '[DB] All plugin schema versions are up to date.');
+      if (this._expectedVersions.size > 0) {
+        this.verboseLogger(3, '[DB] All plugin schema versions are up to date.');
+      } else {
+        this.verboseLogger(3, '[DB] No plugin schema versions registered yet — deferring version check.');
+      }
       this._pendingMigrations = [];
       return;
     }
@@ -535,5 +570,47 @@ export default class DBService {
     }
 
     this.verboseLogger(2, '[DB] Migrations are NOT auto-applied. Waiting for Discord confirmation (see 7.4d).');
+  }
+
+  /**
+   * Scan all connectors in the connectors map for SQLite storage paths.
+   * If multiple unique storage paths are found, log a warning that
+   * backup/migration coverage is partial — only the primary connector
+   * file is backed up before schema migrations.
+   *
+   * This is a diagnostic-only check. It does not block mount.
+   */
+  _logMultiSqliteWarning() {
+    if (!this.connectors || typeof this.connectors !== 'object') return;
+
+    const sqlitePaths = new Set();
+
+    for (const [key, value] of Object.entries(this.connectors)) {
+      if (!value || typeof value !== 'object') continue;
+
+      // A SQLite-like connector has either a dialect of 'sqlite' or a 'storage' property
+      const isSqliteLike = value.dialect === 'sqlite' || typeof value.storage === 'string';
+      if (!isSqliteLike) continue;
+
+      const storage = value.storage || value.config?.storage;
+      if (typeof storage === 'string') {
+        sqlitePaths.add(storage);
+      }
+    }
+
+    // Remove the primary path from the set — we only warn about OTHER paths
+    sqlitePaths.delete(this._dbPath);
+
+    if (sqlitePaths.size > 0) {
+      const primary = this._dbPath || '(unknown)';
+      const others = [...sqlitePaths].join(', ');
+      this.verboseLogger(
+        1,
+        `[DB] WARNING: Multiple SQLite storage paths detected. ` +
+        `Backup and migration only cover "${primary}". ` +
+        `Tables in other files (${others}) will be skipped. ` +
+        `All S³-managed plugins should share the same database connector.`
+      );
+    }
   }
 }

@@ -86,8 +86,10 @@
  *   so isIgnoredMode() reads the single source of truth.
  * - Discord integration gracefully degrades — if no discordClient
  *   connector is configured, registerS3DiscordCommands is a no-op.
- * - Unmount destroys services in reverse order (players → clans →
- *   factions → gameState → db → serverConfig).
+ * - Unmount destroys services in reverse order (logging → players → clans →
+ *   db → factions → gameState → serverConfig).
+ *   Note: logging is unmounted first (before unbinding events) so it can
+ *   capture any final teardown activity.
  * - Consumer plugins use the flat access pattern: this._s3?.gameState
  *   (not this._s3?.services?.gameState). Guard with isReady() before
  *   direct access.
@@ -250,6 +252,10 @@ export default class SlackersSquadServices extends BasePlugin {
     this._s3DiscordCleanup = null;
     this._migrationDiscordCleanup = null;
 
+    // 7.4k-3: Deferred ready promise — consumer plugins await this._s3.ready() to ensure
+    // all services, Discord registration, and migration check have completed.
+    this._readyPromise = new Promise((resolve) => { this._resolveReady = resolve; });
+
     this.listeners = {
       handleNewGame: this.handleNewGame.bind(this),
       handleRoundEnded: this.handleRoundEnded.bind(this),
@@ -270,14 +276,24 @@ export default class SlackersSquadServices extends BasePlugin {
   get players()       { return this.services.players; }
   get logging()       { return this.services.logging; }
 
+  /**
+   * Returns a promise that resolves when S³ has fully mounted — all services,
+   * Discord registration, and migration check are complete. Consumer plugins
+   * (SA, Elo, Switch, TB) should await this before accessing S³ services during
+   * their own mount() to avoid the concurrent-mount race (7.4k-3).
+   */
+  ready() {
+    return this._readyPromise;
+  }
+
   async prepareToMount() {
     this.services.db = new DBService({
       parent: this,
+      server: this.server,
       sequelize: this.options.database,
       connectors: this.connectors,
       databaseOption: this.options.database,
-      verboseLogger: (...args) => this.verbose(...args),
-      emitEvent: (...args) => this.emit(...args)
+      verboseLogger: (...args) => this.verbose(...args)
     });
 
     this.services.gameState = new GameStateService({
@@ -328,8 +344,7 @@ export default class SlackersSquadServices extends BasePlugin {
       gameState: this.services.gameState,
       enableDatabaseLogging: this.options.enableDatabaseLogging,
       enableFileLogging: this.options.enableFileLogging,
-      logPath: this.options.logPath,
-      emitEvent: (...args) => this.emit(...args)
+      logPath: this.options.logPath
     });
   }
 
@@ -374,6 +389,9 @@ export default class SlackersSquadServices extends BasePlugin {
     this._checkAndPromptMigrations();
 
     this.verbose(1, 'Mounted SlackerSquadServices with gameState, factions, clans, db, players, serverConfig, and logging services.');
+
+    // Resolve the ready promise — consumer plugins awaiting this._s3.ready() can now proceed
+    this._resolveReady();
   }
 
   async unmount() {

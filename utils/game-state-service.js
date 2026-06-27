@@ -397,8 +397,9 @@ export default class GameStateService {
     this.lastNewGameAt = now;
     this.lastPhaseChangeAt = now;
 
-    // Set centralized roundStartTime and matchId synchronously before any await
-    this.roundStartTime = this.server.matchStartTime?.getTime() ?? now;
+    // S³ owns roundStartTime — use our own process clock as the single source of truth.
+    // server.matchStartTime is not reliable across restarts (new Date per process lifetime).
+    this.roundStartTime = Date.now();
     this.matchId = Math.floor(this.roundStartTime / 1000).toString(36).slice(-8);
 
     if (data?.layer) {
@@ -841,19 +842,6 @@ export default class GameStateService {
     if (this._isRecoveredStagingOverdue(now)) {
       await this._transitionRecoveredStateToLive(`${source}:staging_overdue`, now);
       return;
-    }
-
-    // Cross-reference matchStartTime against persisted roundStartTime (GAP #4 fix).
-    // If SquadJS restarted mid-round but the game server advanced to a new round,
-    // the persisted roundStartTime will differ from the live server's matchStartTime.
-    // 5000ms tolerance accounts for clock skew between the game server and this process.
-    if (this.server.matchStartTime && this.roundStartTime) {
-      const liveMatchStartMs = this.server.matchStartTime.getTime();
-      const recoveredRoundStartMs = this.roundStartTime;
-      if (Math.abs(liveMatchStartMs - recoveredRoundStartMs) > 5000) {
-        await this._transitionRecoveredStateToLive(`${source}:matchStartTime_divergence`, now);
-        return;
-      }
     }
 
     if (this._isKnownLayerName(serverLayerName)) {

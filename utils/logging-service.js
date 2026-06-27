@@ -81,8 +81,7 @@ export default class LoggingService {
     gameState = null,
     enableDatabaseLogging = false,
     enableFileLogging = false,
-    logPath = './s3-log.jsonl',
-    emitEvent = () => {}
+    logPath = './s3-log.jsonl'
   } = {}) {
     this.parent = parent;
     this.server = server;
@@ -92,7 +91,6 @@ export default class LoggingService {
     this.enableDatabaseLogging = enableDatabaseLogging;
     this.enableFileLogging = enableFileLogging;
     this.logPath = logPath;
-    this.emitEvent = emitEvent;
 
     this._isMounted = false;
     this._midRoundTimer = null;

@@ -22,9 +22,11 @@
  * - The engine NEVER auto-triggers migrations on startup — that is
  *   gated behind the Discord confirmation flow (7.4d).
  * - Custom events are emitted for 7.4d integration:
- *     S3_MIGRATION_PENDING
- *     S3_MIGRATION_COMPLETE
- *     S3_MIGRATION_FAILED
+ * Events are emitted on the SquadServer EventEmitter (passed as `server` in
+ * constructor options) so any listener plugin can react:
+ *     S3_MIGRATION_PENDING   — before each migration runs
+ *     S3_MIGRATION_COMPLETE  — after each migration succeeds
+ *     S3_MIGRATION_FAILED    — emitted by calling code when a migration throws
  *
  * ─── METHODS ────────────────────────────────────────────────────
  *
@@ -119,11 +121,17 @@ function createQueryInterface(sequelize, db, transaction) {
     },
 
     async rawQuery(sql, replacements = {}) {
-      return sequelize.query(sql, {
+      const result = await sequelize.query(sql, {
         replacements,
-        transaction,
-        type: sequelize.QueryTypes?.RAW || sequelize.QueryTypes?.SELECT
+        transaction
       });
+      // Sequelize returns [rows, metadata] for SELECT-type queries.
+      // Unwrap to just the rows so migration code (e.g. PRAGMA checks)
+      // works with a flat array of row objects.
+      if (Array.isArray(result) && result.length === 2 && Array.isArray(result[0])) {
+        return result[0];
+      }
+      return result;
     },
 
     DataTypes
@@ -135,19 +143,19 @@ export default class MigrationEngine {
    * @param {Object} opts
    * @param {import('./db-service.js').default} opts.dbService - DBService instance
    * @param {Function} opts.verboseLogger - SquadJS verbose logger
-   * @param {Function} [opts.emitEvent] - Event emitter function (e.g. S³'s this.emit())
+   * @param {Object}  [opts.server]       - SquadServer EventEmitter for emitting S3_MIGRATION_* events
    * @param {string}  [opts.dbPath]       - Path to the SQLite database file for backup (7.4e)
    * @param {string}  [opts.backupDir]    - Backup directory override (default: './backups')
    * @param {number}  [opts.backupRetention=5] - Max backups to retain
    */
-  constructor({ dbService, verboseLogger = () => {}, emitEvent = () => {}, dbPath = null, backupDir = null, backupRetention = 5 } = {}) {
+   constructor({ dbService, verboseLogger = () => {}, server = null, dbPath = null, backupDir = null, backupRetention = 5 } = {}) {
     if (!dbService) {
       throw new Error('MigrationEngine requires a dbService instance.');
     }
 
     this.dbService = dbService;
     this.verboseLogger = verboseLogger;
-    this.emitEvent = emitEvent;
+    this.server = server;
     this.dbPath = dbPath;
     this.backupDir = backupDir;
     this.backupRetention = backupRetention;
@@ -262,35 +270,42 @@ export default class MigrationEngine {
       this.verboseLogger(3, `[MigrationEngine] No dbPath configured — skipping backup.`);
     }
 
-    // TODO 7.4d: Discord confirmation — emit S3_MIGRATION_PENDING, wait for approval
-
     this.verboseLogger(2, `[MigrationEngine] Running ${pending.length} migration(s) for "${pluginName}"...`);
 
     let applied = 0;
     for (const migration of pending) {
-      await this.dbService.withTransactionWithRetry(async (transaction) => {
-        this.emitEvent('S3_MIGRATION_PENDING', {
-          pluginName,
-          fromVersion: appliedVersion,
-          toVersion: migration.version,
-          description: migration.description || ''
+      try {
+        await this.dbService.withTransactionWithRetry(async (transaction) => {
+          this.server?.emit('S3_MIGRATION_PENDING', {
+            pluginName,
+            fromVersion: appliedVersion,
+            toVersion: migration.version,
+            description: migration.description || ''
+          });
+
+          const qi = createQueryInterface(this.dbService.sequelize, this.dbService, transaction);
+
+          await migration.up(qi);
+
+          await this._recordVersion(pluginName, migration.version, migration.up, transaction);
+
+          this.server?.emit('S3_MIGRATION_COMPLETE', {
+            pluginName,
+            version: migration.version
+          });
+
+          this.verboseLogger(3, `[MigrationEngine] Applied v${migration.version} for "${pluginName}".`);
         });
 
-        const qi = createQueryInterface(this.dbService.sequelize, this.dbService, transaction);
-
-        await migration.up(qi);
-
-        await this._recordVersion(pluginName, migration.version, migration.up, transaction);
-
-        this.emitEvent('S3_MIGRATION_COMPLETE', {
+        applied += 1;
+      } catch (err) {
+        this.server?.emit('S3_MIGRATION_FAILED', {
           pluginName,
-          version: migration.version
+          version: migration.version,
+          error: err.message
         });
-
-        this.verboseLogger(3, `[MigrationEngine] Applied v${migration.version} for "${pluginName}".`);
-      });
-
-      applied += 1;
+        throw err; // Re-throw so the calling code knows the batch failed
+      }
     }
 
     return { applied, skipped: pending.length - applied };
