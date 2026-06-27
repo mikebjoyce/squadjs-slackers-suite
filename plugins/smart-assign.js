@@ -20,7 +20,6 @@
  *     evaluateTeamAssignment(player, reconnectTeam) — Thin wrapper; builds context and delegates to sa-team-evaluator.
  *     handlePlayerJoin(player)             — Full join pipeline: reconnect, clan grouping, Elo eval, RCON move.
  *     handlePlayerLeave(player)            — Disconnect handling and reconnect memory persistence.
- *     handleTeamChange(player, oldTeam, newTeam, source) — Logs team changes with source attribution.
  *     logEvent(eventType, player, extraData, betweenRounds, serverPlayers) — Records lifecycle events to JSONL with embedded team populations.
  *     finalizeRoundLog()                   — Writes buffered events to disk and finalises the round log.
  *
@@ -66,10 +65,11 @@
  *   These replaced server.emit('SMART_ASSIGN_MOVE_*', ...) with direct callback wiring.
  *
  * Listened Events:
- *   - S3_PLAYER_JOINED:       Triggers the full join assignment pipeline.
- *   - S3_PLAYER_TEAM_CHANGED: Logs team changes with source attribution.
- *   - S3_PLAYER_LEFT:         Triggers disconnect handling and reconnect memory save.
- *   - S3_GAME_STATE_LIVE:     Fires round snapshot with full player roster.
+ *   - S3_PLAYER_JOINED: Triggers the full join assignment pipeline.
+ *   - S3_PLAYER_LEFT:   Triggers disconnect handling and reconnect memory save.
+ *   - S3_ROUND_LIVE:    Fires round snapshot with full player roster.
+ *   Team change events (S3_PLAYER_TEAM_CHANGED) are no longer listened to
+ *   by SA — they are handled by S³ LoggingService for persistence.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
@@ -215,7 +215,10 @@ export default class SmartAssign extends BasePlugin {
   constructor(server, options, connectors) {
     super(server, options, connectors);
 
-    this.db = new SADatabase(server, options, connectors);
+    const dbConnector = (connectors && connectors[options.database]) || null;
+    this.db = new SADatabase(dbConnector, {
+      enableDatabaseLogging: this.options.enableDatabaseLogging === true
+    });
     this._s3 = null;  // Runtime discovery of SlackersSquadServices
     this.executor = new SASwapExecutor(server, {
       retryIntervalMs: 50,
@@ -258,9 +261,7 @@ export default class SmartAssign extends BasePlugin {
         onRetry: this.onMoveRetry
       };
       this.onS3PlayerJoined = this.onS3PlayerJoined.bind(this);
-       this.onS3PlayerTeamChanged = this.onS3PlayerTeamChanged.bind(this);
        this.onS3PlayerLeft = this.onS3PlayerLeft.bind(this);
-       this.onS3GameStateLive = this.onS3GameStateLive.bind(this);
   }
 
   /**
@@ -300,6 +301,66 @@ export default class SmartAssign extends BasePlugin {
     this.executor._s3 = s3;  // Update executor's reference for canAct guard
     Logger.verbose('SmartAssign', 2, '[S3] Discovered SlackersSquadServices for SmartAssign.');
 
+    // ═══════════════════════════════════════════════════════════════
+    // SCHEMA MIGRATION: Register SA v2 to drop 4 orphan tables (7.4j)
+    // ═══════════════════════════════════════════════════════════════
+    try {
+      const s3db = this._s3.db;
+      if (s3db?.isReady() && s3db.migrationEngine) {
+        s3db.registerExpectedVersion('smart-assign', 2);
+        s3db.migrationEngine.registerMigrations('smart-assign', [
+          {
+            version: 2,
+            description: 'Drop 4 orphan tables (SmartAssignReconnectMemory, SmartAssignState, SA_RoundSummary, SA_PlayerEvent) — replaced by S³ LoggingService + SA_AssignmentLog.',
+            up: async (qi) => {
+              for (const table of ['SmartAssignReconnectMemory', 'SmartAssignState', 'SA_RoundSummary', 'SA_PlayerEvent']) {
+                await qi.dropTable(table);
+              }
+            },
+            down: async (qi) => {
+              await qi.createTable('SmartAssignState', {
+                id: { type: qi.DataTypes.INTEGER, primaryKey: true },
+                roundStartTime: { type: qi.DataTypes.BIGINT, allowNull: true }
+              });
+              await qi.createTable('SmartAssignReconnectMemory', {
+                steamID: { type: qi.DataTypes.STRING, primaryKey: true },
+                teamID: { type: qi.DataTypes.INTEGER },
+                disconnectTime: { type: qi.DataTypes.BIGINT }
+              });
+              await qi.createTable('SA_RoundSummary', {
+                id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+                matchId: { type: qi.DataTypes.STRING, allowNull: true }
+              });
+              await qi.createTable('SA_PlayerEvent', {
+                id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true }
+              });
+            }
+          }
+        ]);
+        // Re-verify schema versions now that SA has registered, then run the migration
+        const recheck = await s3db.verifySchemaVersions();
+        if (!recheck.upToDate) {
+          Logger.verbose('SmartAssign', 1, `[7.4j] SA has ${recheck.pending.length} pending migration(s) — applying now.`);
+          const result = await s3db.migrationEngine.runMigrations('smart-assign');
+          Logger.verbose('SmartAssign', 1, `[7.4j] SA v2 migration complete: applied=${result.applied}, skipped=${result.skipped}.`);
+
+          // Re-verify again after migration to confirm up-to-date status
+          const postCheck = await s3db.verifySchemaVersions();
+          if (!postCheck.upToDate) {
+            Logger.verbose('SmartAssign', 1, `[7.4j] WARNING: ${postCheck.pending.length} migration(s) still pending after run.`);
+          } else {
+            Logger.verbose('SmartAssign', 2, '[7.4j] SA schema is now up to date (v2).');
+          }
+        } else {
+          Logger.verbose('SmartAssign', 2, '[7.4j] SA schema already up to date.');
+        }
+      } else {
+        Logger.verbose('SmartAssign', 1, '[7.4j] S³ DB or migrationEngine not available — skipping migration registration.');
+      }
+    } catch (err) {
+      Logger.verbose('SmartAssign', 1, `[7.4j] Migration registration error: ${err.message}`);
+    }
+
     // Switch plugin discovery for handshake integration (7.1c)
     try {
       const switchPlugin = this.server.plugins.find(p => p.constructor.name === 'Switch');
@@ -334,12 +395,7 @@ export default class SmartAssign extends BasePlugin {
       Logger.verbose('SmartAssign', 2, '[S3] Registered SmartAssign refresh interest (maxStalenessMs=5000).');
     }
 
-    // Perform initial DB cleanup and start periodic maintenance
-    await this.db.cleanupOldData();
-    this.cleanupInterval = setInterval(() => {
-      this.db.cleanupOldData();
-    }, 6 * 60 * 60 * 1000);
-
+    // DB maintenance: SA_AssignmentLog is lazily synced on first write.
     // Restart Recovery — delegated to S³ GameStateService
     const gs = this._s3.gameState;
     const recoveredStart = gs?.getRoundStartTime?.();
@@ -349,8 +405,8 @@ export default class SmartAssign extends BasePlugin {
       // New round or no data
       Logger.verbose('SmartAssign', 1, 'New round or no persisted S³ state. Starting fresh.');
 
-      // Finalize any leftover temp logs from a previous crashed session
-      await this.finalizeRoundLog();
+      // Flush any leftover assignments from a previous crashed session
+      await this.eventLogger.flushAssignmentLog();
     }
 
       this.server.on('NEW_GAME', this.onNewGame);
@@ -359,19 +415,15 @@ export default class SmartAssign extends BasePlugin {
 
       // S³ event subscribers (Stage 4 — active assignment path)
       this.server.on('S3_PLAYER_JOINED', this.onS3PlayerJoined);
-      this.server.on('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
       this.server.on('S3_PLAYER_LEFT', this.onS3PlayerLeft);
-      this.server.on('S3_GAME_STATE_LIVE', this.onS3GameStateLive);
-
-     this.ready = true;
+       this.ready = true;
      Logger.verbose('SmartAssign', 1, 'SmartAssign mounted successfully.');
   }
 
   async unmount() {
     this.ready = false;
-    if (this.cleanupInterval) clearInterval(this.cleanupInterval);
     this.eventLogger.cleanup();
-    await this.finalizeRoundLog();
+    await this.eventLogger.flushAssignmentLog();
     // Unregister S³ refresh interest
     const unmountPlayers = this._s3?.players;
     if (unmountPlayers?.isReady() && unmountPlayers.unregisterRefreshInterest) {
@@ -381,9 +433,7 @@ export default class SmartAssign extends BasePlugin {
      this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
      this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
      this.server.removeListener('S3_PLAYER_JOINED', this.onS3PlayerJoined);
-     this.server.removeListener('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
      this.server.removeListener('S3_PLAYER_LEFT', this.onS3PlayerLeft);
-     this.server.removeListener('S3_GAME_STATE_LIVE', this.onS3GameStateLive);
     this._pendingPlayerMoves.clear();
     this.executor.cleanup();
     Logger.verbose('SmartAssign', 1, 'SmartAssign unmounted.');
@@ -397,10 +447,9 @@ export default class SmartAssign extends BasePlugin {
   // ═══════════════════════════════════════════════════════════════════════════════════
   async onNewGame(info) {
     if (!this.ready) return;
-    Logger.verbose('SmartAssign', 1, 'NEW_GAME detected. Finalizing previous round log.');
+      Logger.verbose('SmartAssign', 1, 'NEW_GAME detected. Flushing assignment log.');
 
-    await this.finalizeRoundLog();
-    this.eventLogger._startBatchFlushTimer();
+    await this.eventLogger.flushAssignmentLog();
 
     this._joiningPlayers.clear();
     this._pendingAssignments[1] = 0;
@@ -699,14 +748,6 @@ export default class SmartAssign extends BasePlugin {
     await this.handlePlayerJoin(player, previousTeamID);
   }
 
-  async onS3PlayerTeamChanged(data) {
-    if (!this.ready) return;
-    const { player, previousTeamID, teamID, source } = data || {};
-    if (!player) return;
-    Logger.verbose('SmartAssign', 3, `[S3] TEAM_CHANGE: ${player.name || player.eosID} ${previousTeamID}→${teamID}, source=${source}`);
-    await this.handleTeamChange(player, previousTeamID, teamID, source || 'Manual/Game');
-  }
-
   async onS3PlayerLeft(data) {
     if (!this.ready) return;
     const player = data?.player;
@@ -715,28 +756,13 @@ export default class SmartAssign extends BasePlugin {
     await this.handlePlayerLeave(player);
   }
 
-  async onS3GameStateLive(data) {
-    if (!this.ready) return;
-    Logger.verbose('SmartAssign', 2, `[S3] GAME_STATE_LIVE: ${data.gamemode} / ${data.layerName}`);
-
-    // Fire ROUND_SNAPSHOT log event (replaces _ensureSnapshot in Stage 4)
-    const allPlayers = this._s3?.players?.getAllPlayers() || [];
-    const snapshotPlayers = allPlayers.map(p => ({
-      name: p.name,
-      eosID: p.eosID,
-      teamID: p.teamID,
-      joinedServerAt: this._sessionJoinTimes.get(p.eosID || p.steamID) || Date.now()
-    }));
-
-    this.logEvent('ROUND_SNAPSHOT', null, { players: snapshotPlayers }, false);
-    Logger.verbose('SmartAssign', 2, `[Snapshot] Round snapshot captured via S3_GAME_STATE_LIVE with ${snapshotPlayers.length} players.`);
-  }
-
   async handlePlayerLeave(player) {
     this._sessionJoinTimes.delete(player.eosID || player.steamID);
 
     Logger.verbose('SmartAssign', 3, `[LEAVE] Player disconnected: ${player.name} (${player.steamID}) from Team ${player.teamID}`);
-    this.logEvent('LEAVE', player, {}, false);
+
+    // Generic LEAVE logging removed (Stage 7.4i) — S³ LoggingService handles
+    // via S3_PLAYER_LEFT. SA only logs assignment-specific events.
 
      // Save to S³ reconnect memory (fire-and-forget) if they were on a valid team
      const tid = Number(player.teamID);
@@ -746,16 +772,6 @@ export default class SmartAssign extends BasePlugin {
          reconnectPlayers.rememberReconnect(player.eosID, { teamID: tid });
        }
      }
-  }
-
-  async handleTeamChange(player, oldTeam, newTeam, source = 'Manual/Game') {
-    if (source === 'Smart-Assign') {
-      Logger.verbose('SmartAssign', 2, `[TEAM_CHANGE] Player ${player.name} was moved to Team ${newTeam} by SmartAssign`);
-    } else if (source === 'Team-Balancer') {
-      Logger.verbose('SmartAssign', 2, `[TEAM_CHANGE] Player ${player.name} was scrambled to Team ${newTeam} by Team-Balancer`);
-    } else {
-      Logger.verbose('SmartAssign', 2, `[TEAM_CHANGE] Player ${player.name} changed from Team ${oldTeam} to Team ${newTeam} (${source})`);
-    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════════
@@ -1093,27 +1109,29 @@ export default class SmartAssign extends BasePlugin {
   }
 
   logEvent(eventType, player, extraData = {}, betweenRounds = false) {
+    // Inject round context (matchId, roundStartTime, layerName, gamemode)
+    // so each assignment event is self-contained with S³ context.
+    const gs = this._s3?.gameState;
+    extraData.matchId = extraData.matchId ?? gs?.getMatchId?.() ?? null;
+    extraData.roundStartTime = extraData.roundStartTime ?? gs?.getRoundStartTime?.() ?? null;
+    extraData.layerName = extraData.layerName ?? gs?.getLayerName?.() ?? null;
+    extraData.gamemode = extraData.gamemode ?? gs?.getGamemode?.() ?? null;
+
     this.eventLogger.logEvent(eventType, player, extraData, betweenRounds, this.server.players);
   }
 
-    async finalizeRoundLog() {
+    async flushAssignmentLog() {
       if (this._isFinalizingRound) {
-        Logger.verbose('SmartAssign', 2, '[Finalize] Concurrent finalization blocked — already in progress.');
+        Logger.verbose('SmartAssign', 2, '[Flush] Concurrent flush blocked — already in progress.');
         return;
       }
        this._isFinalizingRound = true;
         try {
-           // Use captured values from onRoundEnded (preferred) or fall back to S³ or Date.now()
+           // Provide round context to event logger for metadata enrichment
            const roundStartTime = this.previousRoundStartTime ?? this._s3?.gameState?.getRoundStartTime?.() ?? Date.now();
            const matchId = this.previousMatchId ?? this._s3?.gameState?.getMatchId?.() ?? null;
-           await this.eventLogger.finalizeRoundLog(
-             roundStartTime,
-             this.previousRoundLayerName || 'Unknown',
-             this.previousRoundGamemode || 'Unknown',
-             this.options.enableSmartAssign !== false,
-             matchId
-           );
-           // Clear captured values after finalization
+           await this.eventLogger.flushAssignmentLog();
+           // Clear captured values after flush
            this.previousRoundStartTime = null;
            this.previousMatchId = null;
            this.previousRoundLayerName = null;

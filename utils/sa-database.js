@@ -5,40 +5,35 @@
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Persistent storage utility for the SmartAssign plugin.
- * Handles reading and writing player reconnect memory and round state data
- * to a Sequelize database (SQLite, MySQL, PostgreSQL, etc.).
- * Includes retry logic for database locks and SQLite-specific mutex
- * serialisation to ensure stability in high-concurrency environments.
+ * Persistent storage for SmartAssign assignment events. Replaced the
+ * previous all-purpose database utility (round state, reconnect memory,
+ * full event logging) with a single focused table — SA_AssignmentLog —
+ * that records only assignment decisions (MOVE_SUCCESS, MOVE_FAILED,
+ * MOVE_RETRY). Generic player lifecycle events (JOIN, LEAVE, TEAM_CHANGE,
+ * ROUND_SNAPSHOT) are delegated to S³'s LoggingService.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * SADatabase (class)
- *   Constructor accepts (server, options, connectors).
+ *   Constructor accepts (sequelize, enableDatabaseLogging).
  *   Key public methods:
- *     initDB()                         — Initialises models and syncs.
- *     saveRoundStartTime(timestamp)    — Updates the current round's start time.
- *     clearReconnectMemory()           — Wipes all disconnected player records.
- *     savePlayerDisconnect(steamID, team) — Saves a player's team state.
- *     getReconnectTeam(steamID)        — Retrieves a returning player's team.
- *     getAllReconnectMemory()          — Bulk loads all reconnect records into a Map.
- *     cleanupOldData()                 — Prunes records older than 12 hours.
+ *     logAssignmentEvent(event)  — Writes one assignment event to DB.
  *
- * ─── DEPENDENCIES ────────────────────────────────────────────────
+ * ─── DEPRECATED / REMOVED ────────────────────────────────────────
  *
- * Sequelize (npm)
- *   ORM for SQLite/MySQL/PostgreSQL persistence.
+ * The following tables and methods have been removed (Stage 7.4i):
+ *   SmartAssignState        — roundStartTime vestigial (S3_GameState is canonical)
+ *   SmartAssignReconnectMemory — replaced by S³ PlayersService reconnect
+ *   SA_RoundSummary         — replaced by S³ S3_PlayerEvents/S3_GameStateEvents
+ *   SA_PlayerEvent          — replaced by S³ S3_PlayerEvents
+ *   insertRoundWithEvents() — replaced by logAssignmentEvent()
+ *   cleanupOldData()        — no longer needed
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
- * - Uses a promise-chain mutex (_mutex) to serialise SQLite writes,
- *   preventing SQLITE_BUSY errors from concurrent operations.
- * - Retry logic (_executeWithRetry) attempts up to 5 times with
- *   exponential backoff on SQLITE_BUSY or database-locked errors.
- * - Reconnect memory model stores steamID, teamID, and a timestamp;
- *   records older than 12 hours are pruned by cleanupOldData().
- * - Round state is tracked in a single-row SmartAssignStateModel
- *   keyed by a deterministic round key (date + layer).
+ * - All writes are gated behind enableDatabaseLogging (passed from
+ *   SmartAssign options). When disabled, logAssignmentEvent is a no-op.
+ * - Model is lazily synced on first write.
  *
  * ═══════════════════════════════════════════════════════════════
  */
@@ -47,38 +42,53 @@ import Logger from '../../core/logger.js';
 const { DataTypes } = Sequelize;
 
 export default class SADatabase {
-  constructor(server, options, connectors) {
-    this.sequelize = connectors && connectors[options.database];
-    this.SmartAssignStateModel = null;
-    this.ReconnectMemoryModel = null;
+  /**
+   * @param {object} sequelize - Sequelize connector instance
+   * @param {object} [options]
+   * @param {boolean} [options.enableDatabaseLogging=false] - Gate for DB writes
+   */
+  constructor(sequelize, options = {}) {
+    this.sequelize = sequelize;
+    this.enableDatabaseLogging = options.enableDatabaseLogging === true;
+    this.AssignmentLogModel = null;
+    this._syncDone = false;
+
+    // Promise-chain mutex to serialise SQLite writes and prevent lock contention
     this._mutex = Promise.resolve();
+
+    // Enable WAL mode for better concurrent performance
+    if (this.sequelize && this.sequelize.getDialect?.() === 'sqlite') {
+      this.sequelize.query('PRAGMA journal_mode=WAL;').catch(() => {});
+      this.sequelize.query('PRAGMA synchronous=NORMAL;').catch(() => {});
+    }
   }
 
-   async _executeWithRetry(logicFn, attempts = 5) {
-     const runAttempt = async () => {
-       for (let i = 1; i <= attempts; i++) {
-         try {
-           return await logicFn();
-         } catch (err) {
-           const isLocked = err.message && (
-             err.message.includes('SQLITE_BUSY') || 
-             err.message.includes('database is locked') ||
-             err.message.includes('Lock wait timeout exceeded') ||
-             err.name === 'SequelizeTimeoutError'
-           );
-           if (isLocked && i < attempts) {
-             const jitter = Math.random() * 500;
-             await new Promise(resolve => setTimeout(resolve, 200 + jitter));
-           } else {
-             throw err;
-           }
-         }
-       }
-     };
+  /* ────────────────────────────────────── RETRY / MUTEX ────────────────────────────────────── */
 
-    // SQLite-only: Use a promise-chain mutex to serialize writes and prevent lock contention.
-    // MySQL/PostgreSQL use native connection pooling; Sequelize transactions handle concurrency.
-    if (this.sequelize && this.sequelize.getDialect() === 'sqlite') {
+  async _executeWithRetry(logicFn, attempts = 5) {
+    const runAttempt = async () => {
+      for (let i = 1; i <= attempts; i++) {
+        try {
+          return await logicFn();
+        } catch (err) {
+          const isLocked = err.message && (
+            err.message.includes('SQLITE_BUSY') ||
+            err.message.includes('database is locked') ||
+            err.message.includes('Lock wait timeout exceeded') ||
+            err.name === 'SequelizeTimeoutError'
+          );
+          if (isLocked && i < attempts) {
+            const jitter = Math.random() * 500;
+            await new Promise(resolve => setTimeout(resolve, 200 + jitter));
+          } else {
+            throw err;
+          }
+        }
+      }
+    };
+
+    // Serialize writes via promise-chain mutex for SQLite
+    if (this.sequelize && this.sequelize.getDialect?.() === 'sqlite') {
       const resultPromise = this._mutex.then(() => runAttempt());
       this._mutex = resultPromise.catch(() => {});
       return resultPromise;
@@ -87,288 +97,102 @@ export default class SADatabase {
     return runAttempt();
   }
 
-  async initDB() {
-    try {
-      if (!this.sequelize) {
-        Logger.verbose('SmartAssign', 1, '[DB] No sequelize connector available.');
-        return { roundStartTime: null };
-      }
+  /* ────────────────────────────────────── MODEL DEFINITION ────────────────────────────────────── */
 
-      this.SmartAssignStateModel = this.sequelize.define(
-        'SmartAssignState',
-        {
-          id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: false, defaultValue: 1 },
-          /**
-           * DESIGN NOTE: BIGINT and SQLite
-           * DataTypes.BIGINT correctly maps to large numbers, but SQLite/Sequelize will return this 
-           * value as a STRING rather than a native JavaScript Number. Upstream consumers (like smart-assign.js) 
-           * MUST explicitly cast this to Number(persistedStartTime) to avoid silent string-comparison bugs.
-           */
-          roundStartTime: { type: DataTypes.BIGINT, allowNull: true }
+  _defineModel() {
+    if (this.AssignmentLogModel) return;
+
+    this.AssignmentLogModel = this.sequelize.define(
+      'SA_AssignmentLog',
+      {
+        id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+        matchId: { type: DataTypes.STRING, allowNull: true },
+        roundStartTime: { type: DataTypes.BIGINT, allowNull: true },
+        ts: { type: DataTypes.BIGINT, allowNull: false },
+        eventType: {
+          type: DataTypes.STRING,
+          allowNull: false,
+          validate: {
+            isIn: [['MOVE_SUCCESS', 'MOVE_FAILED', 'MOVE_RETRY']]
+          }
         },
-        { timestamps: false, tableName: 'SmartAssignState' }
-      );
-
-      this.ReconnectMemoryModel = this.sequelize.define(
-        'SmartAssignReconnectMemory',
-        {
-          steamID: { type: DataTypes.STRING, primaryKey: true },
-          teamID: { type: DataTypes.INTEGER, allowNull: false },
-          disconnectTime: { type: DataTypes.BIGINT, allowNull: false }
-        },
-        { timestamps: false, tableName: 'SmartAssignReconnectMemory' }
-      );
-
-      // Enforce WAL mode to prevent SQLITE_BUSY deadlocks in high-concurrency environments
-      if (this.sequelize.getDialect() === 'sqlite') {
-        await this.sequelize.query('PRAGMA journal_mode=WAL;');
-        await this.sequelize.query('PRAGMA synchronous=NORMAL;');
+        eosID: { type: DataTypes.STRING, allowNull: true },
+        steamID: { type: DataTypes.STRING, allowNull: true },
+        name: { type: DataTypes.STRING, allowNull: true },
+        targetTeamID: { type: DataTypes.INTEGER, allowNull: true },
+        reason: { type: DataTypes.STRING, allowNull: true },
+        attempt: { type: DataTypes.INTEGER, allowNull: true },
+        method: { type: DataTypes.STRING, allowNull: true },
+        metadata: { type: DataTypes.JSON, allowNull: true }
+      },
+      {
+        tableName: 'SA_AssignmentLog',
+        timestamps: false,
+        indexes: [
+          { name: 'idx_sa_al_matchId', fields: ['matchId'] },
+          { name: 'idx_sa_al_eventType', fields: ['eventType'] },
+          { name: 'idx_sa_al_ts', fields: ['ts'] }
+        ]
       }
-
-      /**
-       * DESIGN NOTE: sync({ alter: true })
-       * In a shared plugin ecosystem like SquadJS, `alter: true` carries a minor production risk. If a schema 
-       * update changes a column type, Sequelize might silently drop and re-add the column depending on the dialect,
-       * leading to data loss. Since this plugin's schema is currently stable, it is left as `alter: true` for 
-       * zero-config deployment, but it should be noted for future structural updates.
-       */
-       await this.SmartAssignStateModel.sync({ alter: true });
-       await this.ReconnectMemoryModel.sync({ alter: true });
-
-       // Define SARoundSummaryModel for optional database logging (opt-in via enableDatabaseLogging)
-        this.SARoundSummaryModel = this.sequelize.define(
-          'SA_RoundSummary',
-          {
-            id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-            matchId: { type: DataTypes.STRING(20), allowNull: true },
-            startTime: { type: DataTypes.BIGINT, allowNull: false },
-            endTime: { type: DataTypes.BIGINT, allowNull: false },
-            layerName: { type: DataTypes.STRING(255), allowNull: true },
-            gamemode: { type: DataTypes.STRING(100), allowNull: true },
-            smartAssignActive: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false }
-          },
-          { timestamps: false, tableName: 'SA_RoundSummary' }
-        );
-
-       // Define SAPlayerEventModel for optional database logging (opt-in via enableDatabaseLogging)
-        this.SAPlayerEventModel = this.sequelize.define(
-          'SA_PlayerEvent',
-          {
-            id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-            roundId: { type: DataTypes.INTEGER, allowNull: false },
-            ts: { type: DataTypes.BIGINT, allowNull: false },
-            eventType: { type: DataTypes.STRING(50), allowNull: false },
-            steamID: { type: DataTypes.STRING(50), allowNull: true },
-            name: { type: DataTypes.STRING(255), allowNull: true },
-            teamID: { type: DataTypes.INTEGER, allowNull: true },
-            squadID: { type: DataTypes.INTEGER, allowNull: true },
-            betweenRounds: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
-            t1: { type: DataTypes.INTEGER, allowNull: true },
-            t2: { type: DataTypes.INTEGER, allowNull: true },
-            extraData: { type: DataTypes.JSON, allowNull: true }
-          },
-          { timestamps: false, tableName: 'SA_PlayerEvent', charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' }
-        );
-
-       await this.SARoundSummaryModel.sync({ alter: true });
-       await this.SAPlayerEventModel.sync({ alter: true });
-
-       return await this._executeWithRetry(async () => {
-        return await this.sequelize.transaction(async (t) => {
-          const [record] = await this.SmartAssignStateModel.findOrCreate({
-            where: { id: 1 },
-            defaults: {
-              roundStartTime: null
-            },
-            transaction: t
-          });
-
-          return {
-            roundStartTime: record.roundStartTime
-          };
-        });
-      });
-    } catch (err) {
-      Logger.verbose('SmartAssign', 1, `[DB] initDB failed: ${err.message}`);
-      return { roundStartTime: null };
-    }
+    );
   }
 
-  async saveRoundStartTime(timestamp) {
-    if (!this.SmartAssignStateModel) return null;
+  /* ────────────────────────────────────── PUBLIC API ────────────────────────────────────── */
 
-    try {
-      return await this._executeWithRetry(async () => {
-        return await this.sequelize.transaction(async (t) => {
-          await this.SmartAssignStateModel.update(
-            { roundStartTime: timestamp },
-            { where: { id: 1 }, transaction: t }
-          );
-          return { roundStartTime: timestamp };
-        });
-      });
-    } catch (err) {
-      Logger.verbose('SmartAssign', 1, `[DB] saveRoundStartTime failed: ${err.message}`);
-      return null;
+  /**
+   * Logs a single assignment event to SA_AssignmentLog.
+   * No-op when enableDatabaseLogging is false.
+   *
+   * @param {object} event
+   * @param {string}  event.eventType     - 'MOVE_SUCCESS' | 'MOVE_FAILED' | 'MOVE_RETRY'
+   * @param {number}  event.ts            - Unix ms timestamp
+   * @param {string}  [event.eosID]
+   * @param {string}  [event.steamID]
+   * @param {string}  [event.name]
+   * @param {number}  [event.targetTeamID]
+   * @param {string}  [event.reason]
+   * @param {number}  [event.attempt]
+   * @param {string}  [event.method]
+   * @param {string}  [event.matchId]
+   * @param {number}  [event.roundStartTime]
+   * @param {object}  [event.metadata]    - Extra context stored as JSON
+   */
+  async logAssignmentEvent(event) {
+    if (!this.enableDatabaseLogging || !this.sequelize) return;
+
+    // Lazy model definition + sync on first write
+    if (!this.AssignmentLogModel) {
+      this._defineModel();
     }
-  }
-
-  // DEPRECATED — Stage 4: replaced by S³ PlayersService reconnect
-  async clearReconnectMemory() {
-     if (!this.ReconnectMemoryModel) return;
-     
-     try {
-       await this._executeWithRetry(async () => {
-         return await this.sequelize.transaction(async (t) => {
-           await this.ReconnectMemoryModel.destroy({ truncate: true, transaction: t });
-         });
-       });
-       Logger.verbose('SmartAssign', 2, '[DB] Reconnect memory cleared for new round.');
-     } catch (err) {
-       Logger.verbose('SmartAssign', 1, `[DB] clearReconnectMemory failed: ${err.message}`);
-     }
-   }
-
-  // DEPRECATED — Stage 4: replaced by S³ PlayersService reconnect
-  async savePlayerDisconnect(steamID, teamID) {
-    if (!this.ReconnectMemoryModel || !steamID) return;
-    if (teamID !== 1 && teamID !== 2) return;
+    if (!this._syncDone) {
+      try {
+        await this.AssignmentLogModel.sync();
+        this._syncDone = true;
+      } catch (err) {
+        Logger.verbose('SmartAssign', 1, `[DB] Failed to sync SA_AssignmentLog: ${err.message}`);
+        return;
+      }
+    }
 
     try {
       await this._executeWithRetry(async () => {
-        return await this.sequelize.transaction(async (t) => {
-          await this.ReconnectMemoryModel.upsert({
-            steamID,
-            teamID,
-            disconnectTime: Date.now()
-          }, { transaction: t });
+        await this.AssignmentLogModel.create({
+          matchId: event.matchId || null,
+          roundStartTime: event.roundStartTime || null,
+          ts: event.ts || Date.now(),
+          eventType: event.eventType,
+          eosID: event.eosID || null,
+          steamID: event.steamID || null,
+          name: event.name || null,
+          targetTeamID: event.targetTeamID != null ? Number(event.targetTeamID) : null,
+          reason: event.reason || null,
+          attempt: event.attempt != null ? Number(event.attempt) : null,
+          method: event.method || null,
+          metadata: event.metadata || null
         });
       });
     } catch (err) {
-      Logger.verbose('SmartAssign', 1, `[DB] savePlayerDisconnect failed: ${err.message}`);
+      Logger.verbose('SmartAssign', 1, `[DB] logAssignmentEvent failed: ${err.message}`);
     }
   }
-
-  async getReconnectTeam(steamID) {
-    if (!this.ReconnectMemoryModel || !steamID) return null;
-
-    try {
-      return await this._executeWithRetry(async () => {
-        const record = await this.ReconnectMemoryModel.findByPk(steamID);
-        return record ? record.teamID : null;
-      });
-    } catch (err) {
-      Logger.verbose('SmartAssign', 1, `[DB] getReconnectTeam failed: ${err.message}`);
-      return null;
-    }
-  }
-
-  // DEPRECATED — Stage 4: replaced by S³ PlayersService reconnect
-  async getAllReconnectMemory() {
-     if (!this.ReconnectMemoryModel) return new Map();
-
-     try {
-       return await this._executeWithRetry(async () => {
-         const records = await this.ReconnectMemoryModel.findAll();
-         const reconnectMap = new Map();
-         for (const record of records) {
-           reconnectMap.set(record.steamID, record.teamID);
-         }
-         return reconnectMap;
-       });
-     } catch (err) {
-       Logger.verbose('SmartAssign', 1, `[DB] getAllReconnectMemory failed: ${err.message}`);
-       return new Map();
-     }
-   }
-
-   async cleanupOldData() {
-     if (!this.ReconnectMemoryModel || !this.SmartAssignStateModel) return;
-
-     const twelveHoursAgo = Date.now() - 12 * 60 * 60 * 1000;
-     try {
-       await this._executeWithRetry(async () => {
-         return await this.sequelize.transaction(async (t) => {
-           // Prune reconnect memory
-           const prunedReconnects = await this.ReconnectMemoryModel.destroy({
-             where: {
-               disconnectTime: { [Sequelize.Op.lt]: twelveHoursAgo }
-             },
-             transaction: t
-           });
-
-            // Prune round start time if old
-            const state = await this.SmartAssignStateModel.findByPk(1, { transaction: t });
-            if (state && state.roundStartTime && Number(state.roundStartTime) < twelveHoursAgo) {
-              state.roundStartTime = null;
-              await state.save({ transaction: t });
-              Logger.verbose('SmartAssign', 2, '[DB] Reset stale round start time.');
-            }
-
-            if (prunedReconnects > 0) {
-              Logger.verbose('SmartAssign', 2, `[DB] Cleanup complete. Pruned ${prunedReconnects} old reconnect records.`);
-            }
-         });
-       });
-     } catch (err) {
-       Logger.verbose('SmartAssign', 1, `[DB] cleanupOldData failed: ${err.message}`);
-     }
-   }
-
-   async insertRoundWithEvents(roundLog) {
-     if (!this.SARoundSummaryModel || !this.SAPlayerEventModel) {
-       Logger.verbose('SmartAssign', 1, '[DB] insertRoundWithEvents called before initDB.');
-       return null;
-     }
-
-     try {
-       return await this._executeWithRetry(async () => {
-         return await this.sequelize.transaction(async (t) => {
-           // Create round summary record
-           const roundRecord = await this.SARoundSummaryModel.create({
-             matchId: roundLog.matchId ?? null,
-             startTime: roundLog.startTime,
-             endTime: roundLog.endTime,
-             layerName: roundLog.layerName,
-             gamemode: roundLog.gamemode,
-             smartAssignActive: roundLog.smartAssignActive
-           }, { transaction: t });
-
-           // Bulk create player events
-           if (roundLog.events && roundLog.events.length > 0) {
-             const eventRecords = roundLog.events.map(event => ({
-               roundId: roundRecord.id,
-               ts: event.ts,
-               eventType: event.eventType,
-               steamID: event.steamID || null,
-               name: event.name || null,
-               teamID: event.teamID || null,
-               squadID: event.squadID || null,
-               betweenRounds: event.betweenRounds || false,
-               t1: event.t1 || null,
-               t2: event.t2 || null,
-               extraData: JSON.stringify({
-                 reason: event.reason,
-                 targetTeam: event.targetTeam,
-                 oldTeam: event.oldTeam,
-                 newTeam: event.newTeam,
-                 source: event.source,
-                 attempt: event.attempt,
-                 method: event.method,
-                 players: event.players
-               })
-             }));
-
-             await this.SAPlayerEventModel.bulkCreate(eventRecords, { transaction: t });
-           }
-
-           Logger.verbose('SmartAssign', 4, `[DB] Round logged: ${roundLog.layerName} (${roundLog.gamemode}) with ${roundLog.events ? roundLog.events.length : 0} events`);
-           return roundRecord.toJSON();
-         });
-       });
-     } catch (err) {
-       Logger.verbose('SmartAssign', 1, `[DB] insertRoundWithEvents failed: ${err.message}`);
-       return null;
-     }
-   }
 }

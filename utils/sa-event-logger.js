@@ -5,37 +5,48 @@
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Handles all JSONL event logging for SmartAssign player lifecycle events.
- * Manages in-memory batching, temp file flushing, and round log
- * finalisation. Separates I/O concerns from core assignment logic.
+ * Handles JSONL + DB logging for SmartAssign assignment decisions only.
+ * Generic player lifecycle events (JOIN, LEAVE, TEAM_CHANGE,
+ * ROUND_SNAPSHOT) are delegated to S³'s LoggingService — this logger
+ * silently drops any non-assignment event types.
+ *
+ * Each assignment event produces one self-contained JSONL line with
+ * inline round context (matchId, roundStartTime, layerName, gamemode)
+ * so the file is independently joinable with S³ tables without needing
+ * a round-wrapper record.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * SAEventLogger (class)
  *   Constructor accepts (options, db).
- *   Key public methods:
  *     logEvent(eventType, player, extraData, betweenRounds, serverPlayers)
- *       — Batches an event into memory with embedded t1/t2 population counts.
- *     finalizeRoundLog(roundStartTime, layerName, gamemode, smartAssignActive, matchId)
- *       — Finalises temp log into a permanent JSONL round record.
- *     loadTempEvents()
- *       — Loads accumulated events from temp file into memory (crash recovery).
+ *       — Writes one JSONL line + optional DB row per assignment event.
+ *     flushAssignmentLog()
+ *       — No-op in this design (events are written immediately).
+ *       Retained for interface compatibility.
  *     cleanup()
- *       — Clears batching timers on plugin unmount.
+ *       — Cleans up any pending state on plugin unmount.
  *
- * ─── DEPENDENCIES ────────────────────────────────────────────────
+ * ─── REVISION HISTORY ────────────────────────────────────────────
  *
- * fs/promises (Node built-in)
- *   Async file I/O for JSONL read/write operations.
+ * Stage 7.4i (2026-06-26):
+ *   - Narrowed to assignment-only events (MOVE_SUCCESS, MOVE_FAILED,
+ *     MOVE_RETRY). Other event types silently dropped.
+ *   - Changed from round-wrapper JSONL to per-event JSONL with inline
+ *     round context. Each line is independently joinable via matchId.
+ *   - Removed temp file batching, batch flush timer, and
+ *     finalizeRoundLog() → replaced with immediate per-event writes
+ *     and flushAssignmentLog() (no-op).
+ *   - DB writes go to SA_AssignmentLog via SADatabase.logAssignmentEvent()
+ *     instead of the old SA_RoundSummary/SA_PlayerEvent tables.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
- * - Events are batched in-memory (_eventBatch) and flushed to a temp
- *   file periodically (_startBatchFlushTimer) to minimise disk I/O.
- * - finalizeRoundLog() renames the temp file to the permanent log path
- *   and optionally writes to the database via SADatabase.insertRoundWithEvents().
- * - Separate temp file per round prevents partial writes from corrupting
- *   completed round logs during crashes.
+ * - enableEventLogging toggles JSONL output (default: true).
+ * - enableDatabaseLogging toggles DB writes; passed through to
+ *   SADatabase so writes are only gated once.
+ * - The logPath file accumulates per-event JSONL lines over time.
+ *   Each line is a self-contained object with round context.
  *
  * ═══════════════════════════════════════════════════════════════
  */
@@ -43,196 +54,120 @@
 import { promises as fsPromises } from 'fs';
 import Logger from '../../core/logger.js';
 
+const ASSIGNMENT_EVENT_TYPES = new Set(['MOVE_SUCCESS', 'MOVE_FAILED', 'MOVE_RETRY']);
+
 export default class SAEventLogger {
   constructor(options = {}, db = null) {
-    this.logPath = options.logPath || './auto-assign-log.jsonl';
+    this.logPath = options.logPath || './smart-assign-log.jsonl';
     this.enableEventLogging = options.enableEventLogging !== false;
     this.db = db;
     this.enableDatabaseLogging = options.enableDatabaseLogging === true;
 
-    this._logWriteQueue = Promise.resolve();
-    this._eventBatch = [];
-    this._batchFlushTimer = null;
+    // Guard: DB must also have logging enabled to receive events
+    if (this.db && !this.enableDatabaseLogging) {
+      this.db = null;  // Don't gate with the DB if logging is disabled
+    }
 
-    // Initialize the batch flush timer
-    this._startBatchFlushTimer();
-  }
-
-  _startBatchFlushTimer() {
-    if (this._batchFlushTimer) clearInterval(this._batchFlushTimer);
-    this._batchFlushTimer = setInterval(() => {
-      this._flushTempLog().catch(err =>
-        Logger.verbose('SmartAssign', 1, `[EventLogger] Flush error: ${err.message}`)
-      );
-    }, 15000);
+    this._eventCount = 0;
   }
 
   /**
-   * Logs an event with optional global team population snapshots.
-   * Batches events in memory to optimize disk I/O.
+   * Logs a single event. Silently drops non-assignment event types
+   * (JOIN, LEAVE, TEAM_CHANGE, ROUND_SNAPSHOT) which are now handled
+   * by S³'s LoggingService. Assignment events (MOVE_SUCCESS, MOVE_FAILED,
+   * MOVE_RETRY) are written to JSONL + DB.
    *
-   * @param {string} eventType - Event type (JOIN, LEAVE, ASSIGNMENT, TEAM_CHANGE, ROUND_SNAPSHOT, etc.)
-   * @param {object} player - Player object with steamID, name, teamID, squadID
-   * @param {object} extraData - Event-specific metadata
-   * @param {boolean} betweenRounds - Whether event occurred during round transition
-   * @param {array} serverPlayers - Current server player list (for t1/t2 counts)
+   * @param {string} eventType - 'MOVE_SUCCESS' | 'MOVE_FAILED' | 'MOVE_RETRY'
+   * @param {object} player - Player object with steamID, eosID, name, teamID, squadID
+   * @param {object} extraData - Event-specific metadata (reason, attempt, method, targetTeamID,
+   *                             matchId, roundStartTime, layerName, gamemode, etc.)
+   * @param {boolean} betweenRounds - Ignored (kept for interface compatibility)
+   * @param {array} serverPlayers - Current server player list (ignored; S³ owns pop counts)
    */
   logEvent(eventType, player, extraData = {}, betweenRounds = false, serverPlayers = []) {
-    if (!this.enableEventLogging) return;
-
-    // Dynamically inject global team populations into the event
-    let t1 = 0;
-    let t2 = 0;
-    for (const p of serverPlayers) {
-      if (String(p.teamID) === '1') t1++;
-      else if (String(p.teamID) === '2') t2++;
-    }
-
-    const event = {
-      ts: Date.now(),
-      eventType,
-      ...(player ? {
-        steamID: player.steamID,
-        name: player.name,
-        teamID: player.teamID,
-        squadID: player.squadID
-      } : {}),
-      ...extraData,
-      betweenRounds,
-      t1,
-      t2
-    };
-
-    // Push to in-memory batch. Flush immediately if threshold is reached.
-    this._eventBatch.push(JSON.stringify(event) + '\n');
-    if (this._eventBatch.length >= 20) {
-      this._flushTempLog().catch(err =>
-        Logger.verbose('SmartAssign', 1, `[EventLogger] Flush error: ${err.message}`)
-      );
-    }
-  }
-
-  /**
-   * Appends the in-memory batch of formatted events to the temporary .temp file.
-   * Chained via a Promise queue to prevent interleaved JSON lines from overlapping fs.appendFile calls.
-   */
-  async _flushTempLog() {
-    if (this._eventBatch.length === 0) return;
-
-    const lines = this._eventBatch.join('');
-    this._eventBatch = [];
-
-    const tempPath = this.logPath + '.temp';
-    this._logWriteQueue = this._logWriteQueue.then(() => {
-      return fsPromises.appendFile(tempPath, lines, 'utf8')
-        .catch((err) =>
-          Logger.verbose('SmartAssign', 1, `[EventLogger] Failed to write temp log: ${err.message}`)
-        );
-    });
-
-    return this._logWriteQueue;
-  }
-
-   /**
-    * Finalizes a round's events from the temp file into the main JSONL log.
-    * Loads all accumulated events, wraps them in a round record, and appends to the main log.
-    *
-    * @param {number} roundStartTime - Unix timestamp when round started
-    * @param {string} layerName - Name of the map/layer
-    * @param {string} gamemode - Gamemode of the round
-    * @param {boolean} smartAssignActive - Whether SmartAssign was actively assigning
-    * @param {string} matchId - Pre-computed matchId hash from S³ GameStateService (base-36 encoded timestamp)
-    */
-   async finalizeRoundLog(roundStartTime, layerName, gamemode, smartAssignActive, matchId = null) {
-    if (this._batchFlushTimer) {
-      clearInterval(this._batchFlushTimer);
-      this._batchFlushTimer = null;
-    }
-
-    // Force flush any pending memory events and wait for the write queue to empty.
-    await this._flushTempLog();
-    await this._logWriteQueue; // drain queue fully
-
-    // Load all events from temp file
-    const events = await this.loadTempEvents();
-
-    if (events.length === 0) {
-      Logger.verbose('SmartAssign', 3, '[EventLogger] Skipping log finalization: 0 events to write.');
+    // Silently drop non-assignment event types
+    if (!ASSIGNMENT_EVENT_TYPES.has(eventType)) {
       return;
     }
 
-    Logger.verbose('SmartAssign', 1, `[EventLogger] Finalizing round log with ${events.length} events.`);
-
-    if (matchId === null || matchId === undefined) {
-      Logger.verbose('SmartAssign', 2, '[DB] Warning: matchId is null. Cross-plugin joins will not be possible for this round.');
-    }
-
-    const roundLog = {
-      startTime: roundStartTime || Date.now(),
-      endTime: Date.now(),
-      matchId: matchId,
-      layerName: layerName || 'Unknown',
-      gamemode: gamemode || 'Unknown',
-      smartAssignActive: smartAssignActive !== false,
-      events: events
+    // Build the event object — self-contained with round context
+    const event = {
+      ts: Date.now(),
+      eventType,
+      eosID: player?.eosID || null,
+      steamID: player?.steamID || null,
+      name: player?.name || null,
+      targetTeamID: extraData.teamID != null ? Number(extraData.teamID) : null,
+      reason: extraData.reason || null,
+      attempt: extraData.attempt != null ? Number(extraData.attempt) : null,
+      method: extraData.method || null,
+      matchId: extraData.matchId || null,
+      roundStartTime: extraData.roundStartTime || null,
+      layerName: extraData.layerName || null,
+      gamemode: extraData.gamemode || null,
+      metadata: {}
     };
 
-    try {
-      await fsPromises.appendFile(this.logPath, JSON.stringify(roundLog) + '\n', 'utf8');
-      const tempPath = this.logPath + '.temp';
-      await fsPromises.unlink(tempPath).catch(() => {});
-      Logger.verbose('SmartAssign', 2, '[EventLogger] Round log finalized successfully.');
-
-      // Fire-and-forget database insert if enabled
-      if (this.enableDatabaseLogging && this.db) {
-        this.db.insertRoundWithEvents(roundLog).catch(err =>
-          Logger.verbose('SmartAssign', 1, `[EventLogger] Database insert failed: ${err.message}`)
-        );
+    // Collect remaining extraData fields into metadata for query flexibility
+    const reservedKeys = new Set(['teamID', 'reason', 'attempt', 'method', 'matchId', 'roundStartTime', 'layerName', 'gamemode']);
+    for (const [key, value] of Object.entries(extraData)) {
+      if (!reservedKeys.has(key) && value !== undefined) {
+        event.metadata[key] = value;
       }
-    } catch (err) {
-      Logger.verbose('SmartAssign', 1, `[EventLogger] Failed to finalize round log: ${err.message}. Events retained in temp log.`);
+    }
+    if (Object.keys(event.metadata).length === 0) {
+      delete event.metadata;
+    }
+
+    // ── JSONL write (fire-and-forget) ──
+    if (this.enableEventLogging) {
+      this._writeJsonl(event).catch((err) =>
+        Logger.verbose('SmartAssign', 1, `[EventLogger] JSONL write error: ${err.message}`)
+      );
+    }
+
+    // ── DB write (fire-and-forget) ──
+    if (this.enableDatabaseLogging && this.db?.logAssignmentEvent) {
+      this.db.logAssignmentEvent(event).catch((err) =>
+        Logger.verbose('SmartAssign', 1, `[EventLogger] DB write error: ${err.message}`)
+      );
+    }
+
+    this._eventCount++;
+  }
+
+  /**
+   * Appends one JSONL line to the log file.
+   * Uses a write queue to prevent interleaved writes from concurrent calls.
+   */
+  async _writeJsonl(event) {
+    if (!this._writeQueue) {
+      this._writeQueue = Promise.resolve();
+    }
+    const line = JSON.stringify(event) + '\n';
+    this._writeQueue = this._writeQueue.then(() =>
+      fsPromises.appendFile(this.logPath, line, 'utf8')
+    );
+    return this._writeQueue;
+  }
+
+  /**
+   * Flush any pending writes. No-op in this design since each event
+   * is written immediately, but retained for interface compatibility
+   * at mount/unmount/round-end boundaries.
+   */
+  async flushAssignmentLog() {
+    if (this._writeQueue) {
+      await this._writeQueue;
+      Logger.verbose('SmartAssign', 3, `[EventLogger] Flushed ${this._eventCount} assignment events.`);
     }
   }
 
   /**
-   * Loads all events from the temporary log file into memory.
-   * Parses JSONL format and returns as array.
-   *
-   * @returns {array} Array of parsed event objects
+   * Cleanup on plugin unmount. Flushes pending writes.
    */
-  async loadTempEvents() {
-    const tempPath = this.logPath + '.temp';
-    try {
-      const data = await fsPromises.readFile(tempPath, 'utf8');
-      const lines = data.trim().split('\n');
-      const events = lines
-        .filter((l) => l.trim())
-        .reduce((acc, l) => {
-          try {
-            acc.push(JSON.parse(l));
-          } catch {
-            Logger.verbose('SmartAssign', 1, '[EventLogger] Skipped malformed temp line.');
-          }
-          return acc;
-        }, []);
-      Logger.verbose('SmartAssign', 2, `[EventLogger] Loaded ${events.length} events from temp log.`);
-      return events;
-    } catch (err) {
-      if (err.code !== 'ENOENT') {
-        Logger.verbose('SmartAssign', 1, `[EventLogger] Failed to load temp events: ${err.message}`);
-      }
-      return [];
-    }
-  }
-
-  /**
-   * Cleans up timers and pending I/O on plugin unmount.
-   */
-  cleanup() {
-    if (this._batchFlushTimer) {
-      clearInterval(this._batchFlushTimer);
-      this._batchFlushTimer = null;
-    }
-    this._eventBatch = [];
+  async cleanup() {
+    await this.flushAssignmentLog();
+    this._eventCount = 0;
   }
 }
