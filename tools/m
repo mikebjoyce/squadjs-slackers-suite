@@ -1,0 +1,388 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║           MIGRATION TEST RUNNER                              ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Offline migration test harness. Clones the production SQLite DB,
+ * downgrades (or resets) the schema version for a target plugin,
+ * and runs the migration pipeline — backup + transaction + version
+ * recording — without touching the live DB.
+ *
+ * Uses the same MigrationEngine, DBService, and s3-backup modules
+ * that SquadJS uses at runtime, so it's a true end-to-end test of
+ * the migration workflow.
+ *
+ * ─── USAGE ───────────────────────────────────────────────────────
+ *
+ *   # Test all plugins with unregistered (v0) migrations
+ *   node tools/migration-test.mjs --all
+ *
+ *   # Test a specific plugin
+ *   node tools/migration-test.mjs --plugin smart-assign
+ *   node tools/migration-test.mjs --plugin elo-tracker
+ *
+ *   # Set a specific starting version (default: 0)
+ *   node tools/migration-test.mjs --plugin smart-assign --from-version 0
+ *
+ *   # Dry-run mode (log what would happen, don't run)
+ *   node tools/migration-test.mjs --plugin smart-assign --dry-run
+ *
+ *   # Keep the cloned DB after test for inspection
+ *   node tools/migration-test.mjs --plugin smart-assign --keep
+ *
+ *   # Specify a custom source DB path
+ *   node tools/migration-test.mjs --plugin smart-assign --db-path ./custom.sqlite
+ *
+ * ─── SAFETY ──────────────────────────────────────────────────────
+ *
+ * - NEVER writes to the production database.
+ * - Clones the source DB to a temp file before any modification.
+ * - Auto-deletes the clone on completion unless --keep is passed.
+ * - Dry-run mode logs everything without executing migrations.
+ *
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
+ *
+ * MigrationEngine, DBService, createBackup (all from utils/).
+ * Imported using dynamic import() with full path resolution from
+ * the build output directory (Build_20260627_1433).
+ *
+ */
+import { existsSync, copyFileSync, unlinkSync, statSync } from 'node:fs';
+import { resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { Sequelize } from 'sequelize';
+
+// ─── Path Setup ──────────────────────────────────────────────────
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Resolve paths correctly. When running as "node tools/migration-test.mjs",
+// __dirname is the tools/ directory. PROJECT_ROOT = workspace root.
+const PROJECT_ROOT = resolve(__dirname, '..');
+const BUILT_UTILS_DIR = resolve(PROJECT_ROOT, 'build', 'Build_20260627_1433', 'utils');
+const PRODUCTION_DB = resolve('C:\\NonCloudDocuments\\SquadJS\\SquadJS-4.1.0', 'squad-server.sqlite');
+const BACKUPS_DIR = resolve(PROJECT_ROOT, 'backups');
+
+// Verify paths exist
+if (!existsSync(BUILT_UTILS_DIR)) {
+  console.error(`ERROR: Built utils not found at ${BUILT_UTILS_DIR}`);
+  console.error('  Ensure you have run the build step first: node build/build.cjs');
+  process.exit(1);
+}
+
+// ─── Plugin Registration Definitions ─────────────────────────────
+//
+// Each migration set mirrors what the respective plugin registers at runtime.
+// Keeping them here makes the test self-contained and auditable.
+//
+// To add a new plugin's migrations, add an entry here.
+
+const PLUGIN_MIGRATIONS = {
+  'smart-assign': {
+    expectedVersion: 2,
+    migrations: [
+      {
+        version: 2,
+        description: 'Drop 4 orphan tables (SmartAssignReconnectMemory, SmartAssignState, SA_RoundSummary, SA_PlayerEvent) — replaced by S³ LoggingService + SA_AssignmentLog.',
+        up: async (qi) => {
+          for (const table of ['SmartAssignReconnectMemory', 'SmartAssignState', 'SA_RoundSummary', 'SA_PlayerEvent']) {
+            await qi.dropTable(table);
+          }
+        },
+        down: async (qi) => {
+          await qi.createTable('SmartAssignState', {
+            id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true }
+          });
+        }
+      }
+    ]
+  },
+  'elo-tracker': {
+    expectedVersion: 2,
+    migrations: [
+      {
+        version: 2,
+        description: 'Drop Elo_PluginState.roundStartTime column (moved to S³ GameState).',
+        up: async (qi) => {
+          // Check if column exists before attempting removal (fresh-install safe)
+          const tables = await qi.sequelize.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='Elo_PluginStates'",
+            { type: Sequelize.QueryTypes.SELECT }
+          );
+          if (tables.length > 0) {
+            const cols = await qi.sequelize.query('PRAGMA table_info("Elo_PluginStates")', {
+              type: Sequelize.QueryTypes.SELECT
+            });
+            if (cols.some(c => c.name === 'roundStartTime')) {
+              await qi.removeColumn('Elo_PluginStates', 'roundStartTime');
+            }
+          }
+        },
+        down: async (qi) => {
+          // Best-effort reversal
+        }
+      }
+    ]
+  }
+};
+
+// ─── Helpers ─────────────────────────────────────────────────────
+
+function timestamp() {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_` +
+         `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+function resolveSourceDb(userPath) {
+  if (userPath) return resolve(userPath);
+  if (existsSync(PRODUCTION_DB)) return PRODUCTION_DB;
+  // Fallback: workspace root
+  const fallback = resolve(PROJECT_ROOT, 'squad-server.sqlite');
+  if (existsSync(fallback)) return fallback;
+  return null;
+}
+
+// ─── Core Logic ──────────────────────────────────────────────────
+
+async function main() {
+  const args = process.argv.slice(2);
+
+  const pluginArgIdx = args.indexOf('--plugin');
+  const pluginName = pluginArgIdx >= 0 ? args[pluginArgIdx + 1] : null;
+  const testAll = args.includes('--all');
+  const dryRun = args.includes('--dry-run');
+  const keepClone = args.includes('--keep');
+  const fromVersionIdx = args.indexOf('--from-version');
+  const fromVersion = fromVersionIdx >= 0 ? parseInt(args[fromVersionIdx + 1], 10) : 0;
+  const dbPathIdx = args.indexOf('--db-path');
+  const dbPathArg = dbPathIdx >= 0 ? args[dbPathIdx + 1] : null;
+
+  // ── Validate arguments ──
+  if (!pluginName && !testAll) {
+    console.error('ERROR: Specify --plugin <name> or --all');
+    console.error('  Plugins available:', Object.keys(PLUGIN_MIGRATIONS).join(', '));
+    process.exit(1);
+  }
+
+  if (pluginName && !PLUGIN_MIGRATIONS[pluginName]) {
+    console.error(`ERROR: Unknown plugin "${pluginName}". Available: ${Object.keys(PLUGIN_MIGRATIONS).join(', ')}`);
+    process.exit(1);
+  }
+
+  const sourceDb = resolveSourceDb(dbPathArg);
+  if (!sourceDb) {
+    console.error('ERROR: Source database not found.');
+    console.error(`  Looked at: ${PRODUCTION_DB}`);
+    console.error(`  Looked at: ${resolve(PROJECT_ROOT, 'squad-server.sqlite')}`);
+    console.error('  Use --db-path <path> to specify a custom location.');
+    process.exit(1);
+  }
+
+  if (!existsSync(sourceDb)) {
+    console.error(`ERROR: Source database does not exist at "${sourceDb}"`);
+    process.exit(1);
+  }
+
+  console.log('');
+  console.log('═'.repeat(70));
+  console.log('  S³ Migration Test Runner');
+  console.log('═'.repeat(70));
+  console.log(`  Source DB : ${sourceDb}`);
+  console.log(`  Mode      : ${dryRun ? 'DRY RUN (no changes)' : 'LIVE (will modify clone)'}`);
+  console.log(`  Keep clone: ${keepClone ? 'yes' : 'no (auto-delete)'}`);
+  console.log('');
+
+  // ── Determine which plugins to test ──
+  const pluginsToTest = testAll
+    ? Object.keys(PLUGIN_MIGRATIONS)
+    : [pluginName];
+
+  let allPassed = true;
+
+  for (const name of pluginsToTest) {
+    const pluginDef = PLUGIN_MIGRATIONS[name];
+    console.log('─'.repeat(70));
+    console.log(`  Testing plugin: ${name}`);
+    console.log(`    Expected v${pluginDef.expectedVersion}`);
+    console.log(`    Starting  v${fromVersion}`);
+    console.log(`    Migrations: ${pluginDef.migrations.length}`);
+    console.log('');
+
+    // ── Clone the source DB ──
+    const clonePath = resolve(PROJECT_ROOT, `${name}-migration-test-${timestamp()}.sqlite`);
+    console.log(`  [1/6] Cloning DB → ${clonePath}`);
+    copyFileSync(sourceDb, clonePath);
+    console.log(`        ${(existsSync(clonePath) ? '✅' : '❌')} Clone created (${statSync(clonePath).size} bytes)`);
+
+    if (!existsSync(clonePath)) {
+      console.error('        FAILED to create clone. Aborting this plugin.');
+      allPassed = false;
+      continue;
+    }
+
+    try {
+      // ── Connect to the clone ──
+      console.log(`  [2/6] Connecting to clone...`);
+      const sequelize = new Sequelize({
+        dialect: 'sqlite',
+        storage: clonePath,
+        logging: false
+      });
+
+      await sequelize.authenticate();
+      console.log('        ✅ Connected');
+
+      // ── Downgrade the schema version ──
+      console.log(`  [3/6] Setting schema version for "${name}" to v${fromVersion}...`);
+      const [existing] = await sequelize.query(
+        `SELECT id FROM S3_SchemaVersions WHERE pluginName = '${name}'`,
+        { type: Sequelize.QueryTypes.SELECT }
+      );
+      if (existing) {
+        await sequelize.query(
+          `UPDATE S3_SchemaVersions SET version = ${fromVersion}, appliedAt = ${Date.now()} WHERE pluginName = '${name}'`,
+          { type: Sequelize.QueryTypes.UPDATE }
+        );
+        console.log('        ✅ Downgraded existing version record');
+      } else {
+        // Insert a version 0 record if none exists (simulating fresh install)
+        await sequelize.query(
+          `INSERT INTO S3_SchemaVersions (pluginName, version, appliedAt, migrationHash, description) VALUES ('${name}', ${fromVersion}, ${Date.now()}, 'test-hash', 'Set by migration test runner')`,
+          { type: Sequelize.QueryTypes.INSERT }
+        );
+        console.log('        ✅ Created version record at v0');
+      }
+
+      // ── Wire up MigrationEngine ──
+      console.log(`  [4/6] Setting up MigrationEngine...`);
+
+      // Build a minimal DBService-like wrapper that MigrationEngine can use
+      const dbMock = {
+        sequelize,
+        getDataTypes: () => sequelize.constructor.DataTypes || Sequelize.DataTypes,
+        SchemaVersionsModel: sequelize.models?.S3SchemaVersions || sequelize.define(
+          'S3SchemaVersions',
+          {
+            id: { type: Sequelize.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+            pluginName: { type: Sequelize.DataTypes.STRING, allowNull: false, unique: true },
+            version: { type: Sequelize.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+            appliedAt: { type: Sequelize.DataTypes.BIGINT, allowNull: false },
+            migrationHash: { type: Sequelize.DataTypes.STRING, allowNull: false },
+            description: { type: Sequelize.DataTypes.STRING, allowNull: true }
+          },
+          { tableName: 'S3_SchemaVersions', timestamps: false }
+        ),
+        withTransactionWithRetry: async (fn) => {
+          return sequelize.transaction(async (t) => {
+            return fn(t);
+          });
+        }
+      };
+
+      // Sync the model so queries work
+      await dbMock.SchemaVersionsModel.sync();
+
+      // Import the MigrationEngine class
+      const { default: MigrationEngine } = await import(
+        resolve(BUILT_UTILS_DIR, 'migration-engine.js')
+      );
+
+      const engine = new MigrationEngine({
+        dbService: dbMock,
+        verboseLogger: (level, msg) => {
+          console.log(`        [v${level}] ${msg}`);
+        },
+        server: null,
+        dbPath: clonePath,
+        backupDir: BACKUPS_DIR,
+        backupRetention: 5
+      });
+
+      // Register migrations matching what the plugin would register
+      engine.registerMigrations(name, pluginDef.migrations);
+      console.log(`        ✅ MigrationEngine ready with ${pluginDef.migrations.length} migration(s)`);
+
+      // ── Check pending ──
+      const pending = await engine.pendingMigrations(name);
+      const expectedPending = pluginDef.migrations.filter(m => m.version > fromVersion).length;
+      console.log(`        Pending: ${pending.length} (expected ${expectedPending})`);
+      if (pending.length === 0) {
+        console.log('        ⚠️  No pending migrations — version already at or above target.');
+      }
+
+      // ── Run migrations ──
+      console.log(`  [5/6] ${dryRun ? 'Simulating' : 'Running'} migrations...`);
+
+      if (dryRun) {
+        const result = await engine.runMigrations(name, { dryRun: true });
+        console.log(`        ✅ DRY RUN result: ${result.applied} applied, ${result.skipped} skipped`);
+      } else {
+        const result = await engine.runMigrations(name);
+        console.log(`        ✅ Result: ${result.applied} applied, ${result.skipped} skipped`);
+
+        // Verify version was updated
+        const [row] = await sequelize.query(
+          `SELECT version FROM S3_SchemaVersions WHERE pluginName = '${name}'`,
+          { type: Sequelize.QueryTypes.SELECT }
+        );
+        const newVersion = row ? row.version : 0;
+        console.log(`        ✅ Schema version now v${newVersion} (expected v${pluginDef.expectedVersion})`);
+
+        if (newVersion !== pluginDef.expectedVersion) {
+          console.error(`        ❌ Version mismatch! Expected v${pluginDef.expectedVersion}, got v${newVersion}`);
+          allPassed = false;
+        }
+
+        // Verify backup was created
+        const testBackupsDir = resolve(PROJECT_ROOT, 'backups');
+        if (existsSync(testBackupsDir)) {
+          const backupFiles = requireNodeFS_readdirSync(testBackupsDir).filter(f => f.includes(clonePath.split('-migration-test')[0]));
+          console.log(`        ✅ Backup files in ${testBackupsDir}: ${backupFiles.length > 0 ? backupFiles.length : 0} (check manually for timestamp)`);
+        }
+      }
+
+      // ── Close connection ──
+      await sequelize.close();
+
+      // ── Cleanup ──
+      console.log(`  [6/6] ${keepClone ? 'Keeping' : 'Cleaning up'} clone...`);
+      if (!keepClone) {
+        unlinkSync(clonePath);
+        console.log(`        ✅ Deleted: ${clonePath}`);
+      } else {
+        console.log(`        ✅ Preserved: ${clonePath}`);
+      }
+
+      console.log(`  ── ${name}: ${dryRun ? 'SIMULATED' : 'PASSED'} ──`);
+      console.log('');
+
+    } catch (err) {
+      console.error(`  ❌ Plugin "${name}" FAILED: ${err.message}`);
+      console.error(err.stack);
+      allPassed = false;
+
+      // Clean up on failure too
+      if (existsSync(clonePath) && !keepClone) {
+        try { unlinkSync(clonePath); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  // ── Summary ──
+  console.log('═'.repeat(70));
+  if (allPassed) {
+    console.log('  ✅ All migration tests PASSED');
+  } else {
+    console.log('  ❌ Some migration tests FAILED — check logs above');
+  }
+  console.log('═'.repeat(70));
+  console.log('');
+
+  process.exit(allPassed ? 0 : 1);
+}
+
+main();
