@@ -1,360 +1,197 @@
- /**
+/**
   * ╔═══════════════════════════════════════════════════════════════╗
   * ║                         ELO DATABASE                          ║
   * ╚═══════════════════════════════════════════════════════════════╝
   *
   * ─── PURPOSE ─────────────────────────────────────────────────────
   *
-  * Sequelize-based persistence layer for the EloTracker plugin, supporting
-  * any SQL database (SQLite, MySQL, PostgreSQL, etc.). Manages player
-  * stats, round history, leaderboard queries, and plugin state using
-  * the Sequelize ORM injected via the connectors argument.
- *
- * ─── EXPORTS ─────────────────────────────────────────────────────
- *
- * EloDatabase (default)
- *   Class. Key public methods:
- *     initDB()                         — Sync models, seed PluginState row.
- *     getPlayerStats(eosID)            — Single player lookup by eosID.
- *     getPlayerStatsBatch(eosIDs)      — Bulk lookup; returns a Map.
- *     searchPlayer(identifier)         — Fuzzy search by eosID/steamID/name.
- *     upsertPlayerStats(eosID, fields) — Single-record upsert.
- *     bulkIncrementPlayerStats(updates) — Batch increment in one transaction.
- *     insertRoundHistory(data)         — Append a round record.
- *     getLeaderboard(limit, minRounds, offset) — Top players by CSR, with optional offset.
- *     getPlayerRank(consRating, minRounds) — Rank of a given CSR value.
- *     getTotalRankedPlayers(minRounds) — Count of players meeting the minimum rounds threshold.
- *     exportPlayerStats()              — Full table dump as plain objects.
- *     importPlayerStats(records)       — Bulk restore from export.
- *     pruneStaleEntries(minRounds)     — Delete old low-activity records.
- *
- *   Leaderboard and rank calculation methods internally apply a
- *   "Competitive Skill Rank" (CSR) formula (μ - 3.0σ) instead of raw Mu.
- *
+  * S³-delegated persistence layer for the EloTracker plugin.
+  * All DB access is routed through S³'s DBService (this._s3db) using
+  * defineModel/getModel for model access and withTransactionWithRetry
+  * for transaction safety. The standalone Sequelize connector and
+  * raw sync() calls have been removed per Stage 8.2 Strategy A.
+  *
+  * ─── EXPORTS ─────────────────────────────────────────────────────
+  *
+  * EloDatabase (default)
+  *   Class. Key public methods:
+  *     initDB()                         — Verify models exist; log row counts.
+  *     getModel(name)                   — Accessor for Sequelize model via S³.
+  *     getPlayerStats(eosID)            — Single player lookup by eosID.
+  *     getPlayerStatsBatch(eosIDs)      — Bulk lookup; returns a Map.
+  *     searchPlayer(identifier)         — Fuzzy search by eosID/steamID/name.
+  *     upsertPlayerStats(eosID, fields) — Single-record upsert.
+  *     bulkIncrementPlayerStats(updates) — Batch increment in one transaction.
+  *     insertRoundHistory(data)         — Append a round record.
+  *     getLeaderboard(limit, minRounds, offset) — Top players by CSR.
+  *     getPlayerRank(consRating, minRounds) — Rank of a given CSR value.
+  *     getTotalRankedPlayers(minRounds) — Count of players meeting min rounds.
+  *     exportPlayerStats()              — Full table dump as plain objects.
+  *     importPlayerStats(records)       — Bulk restore from export.
+  *     pruneStaleEntries(minRounds)     — Delete old low-activity records.
+  *     insertRoundPlayers(roundHistoryId, endedAt, playerRows) — Append detail rows.
+  *
+  *   Leaderboard and rank calculation methods internally apply a
+  *   "Competitive Skill Rank" (CSR) formula (μ - 3.0σ) instead of raw Mu.
+  *
   * ─── DEPENDENCIES ────────────────────────────────────────────────
   *
-  * sequelize (Sequelize)
-  *   ORM for any SQL backend. Injected dynamically via connectors[options.database]
-  *   (default: 'sqlite'). Not instantiated internally. All three models are
-  *   defined and synced in initDB().
-  * Logger (../../core/logger.js)
-  *   Verbose error logging on all caught DB exceptions.
- *
+  * EloCalculator (./elo-calculator.js)
+  *   Default mu/sigma constants and SIGMA_MULTIPLIER for CSR.
+  *
+  * ─── S³ ACCESS ──────────────────────────────────────────────────
+  *
+  * Consumer receives the S³ DBService instance at construction
+  * (not a separate Sequelize connector). All model references go
+  * through this._s3db.getModel('Elo_XXX') and transactions through
+  * this._s3db.withTransactionWithRetry(fn). Models are defined by
+  * elo-tracker.js mount() via s3db.defineModel() before initDB()
+  * is called.
+  *
   * ─── NOTES ───────────────────────────────────────────────────────
   *
-  * - All operations go through _executeWithRetry() — retries up to 5×
-  *   on SQLITE_BUSY or database lock errors, with 200ms + random jitter backoff.
-  * - A promise-chain mutex is attached to the Sequelize instance (SQLite only)
-  *   to serialise writes and prevent concurrent lock contention. MySQL/Postgres
-  *   rely on native connection pooling.
- * - bulkIncrementPlayerStats() INCREMENTS wins, losses, and roundsPlayed.
- *   All other fields are overwritten. Do not pass cumulative totals.
- * - Models are stored on this.models and may be referenced externally
- *   (e.g. this.db.models.PlayerStats.destroy in elo-discord.js).
- * - Sequelize.BIGINT is used for timestamps to avoid JS integer
- *   overflow with Unix ms values.
- * - pruneStaleEntries() removes provisional players unseen for 30 days
- *   and calibrated players unseen for 90 days.
- *
- *
- * ─── AUTHOR ──────────────────────────────────────────────────────
- *
- * Slacker
- * Discord: real_slacker
- * GitHub:  https://github.com/mikebjoyce/squadjs-elo-tracker
- *
- * ═══════════════════════════════════════════════════════════════
- */
+  * - bulkIncrementPlayerStats() INCREMENTS wins, losses, and roundsPlayed.
+  *   All other fields are overwritten. Do not pass cumulative totals.
+  * - importPlayerStats() chunks at 500 records per transaction to
+  *   prevent SQLite write contention.
+  * - pruneStaleEntries() removes provisional players unseen for 30 days
+  *   and calibrated players unseen for 90 days.
+  *
+  * ═══════════════════════════════════════════════════════════════
+  */
 
 import Sequelize from 'sequelize';
-import Logger from '../../core/logger.js';
 import EloCalculator from './elo-calculator.js';
 
+const { Op } = Sequelize;
+
+function isLockError(err) {
+  const message = String(err?.message || '');
+  return (
+    message.includes('SQLITE_BUSY') ||
+    message.includes('database is locked') ||
+    message.includes('Lock wait timeout exceeded') ||
+    err?.name === 'SequelizeTimeoutError'
+  );
+}
+
 export default class EloDatabase {
-  constructor(server, options, connectors) {
+  /**
+   * @param {Object} server   - SquadJS server instance (unused but kept for API compat).
+   * @param {Object} options  - EloTracker options.
+   * @param {Object} s3db     - S³ DBService instance (from this._s3.db).
+   */
+  constructor(server, options, s3db) {
     this.server = server;
     this.options = options;
-    // Respect the "database" option; fall back to 'sqlite' if unspecified
-    this.sequelize = connectors && connectors[options?.database ?? 'sqlite'];
-    this.models = {};
+    this._s3db = s3db;
+    // Expose verbose so that external code can inject a logger if needed.
+    this.verbose = (level, message) => {
+      /* intended to be overridden by the owning plugin */
+    };
   }
 
-  async _executeWithRetry(logicFn, attempts = 5) {
-    const runAttempt = async () => {
-      for (let i = 0; i < attempts; i++) {
-        try {
-          return await logicFn();
-        } catch (err) {
-          const isLocked = err.message && (
-            err.message.includes('SQLITE_BUSY') ||
-            err.message.includes('database is locked') ||
-            err.message.includes('Lock wait timeout exceeded') ||
-            err.name === 'SequelizeTimeoutError'
-          );
-          if (isLocked && i < attempts - 1) {
-            const jitter = Math.random() * 500;
-            await new Promise((resolve) => setTimeout(resolve, 200 + jitter));
-          } else {
-            throw err;
-          }
-        }
-      }
-    };
+  /** --- Model accessor for external consumers (e.g. elo-discord.js) --- */
+  getModel(name) {
+    if (!this._s3db) return null;
+    return this._s3db.getModel(name) || null;
+  }
 
-    if (this.sequelize && typeof this.sequelize.getDialect === 'function' && this.sequelize.getDialect() === 'sqlite') {
-      if (!this.sequelize._squadjs_mutex) {
-        this.sequelize._squadjs_mutex = Promise.resolve();
-      }
-      
-      const resultPromise = this.sequelize._squadjs_mutex.then(() => runAttempt());
-      this.sequelize._squadjs_mutex = resultPromise.catch(() => {});
-      return resultPromise;
+  /** --- Check whether the DB service is ready --- */
+  isReady() {
+    return !!(this._s3db && this._s3db.isReady && this._s3db.isReady());
+  }
+
+  /* ================================================================
+   *  INIT — verify tables exist, log row counts
+   *  ================================================================ */
+
+  async initDB() {
+    if (!this.isReady()) {
+      this.verbose(1, '[DB] S³ DBService not ready — skipped initDB.');
+      return false;
     }
 
-    return runAttempt();
-  }
-
-   async initDB() {
-     if (!this.sequelize) {
-       Logger.verbose('EloTracker', 1, '[DB] No sequelize connector available.');
-       return false;
-     }
-
     try {
-        this.models.PluginState = this.sequelize.define(
-          'Elo_PluginState',
-          {
-            id: {
-              type: Sequelize.INTEGER,
-              primaryKey: true,
-              autoIncrement: false,
-              defaultValue: 1
-            }
-          },
-          { timestamps: false }
-        );
+      // Verify all 4 models are accessible; log row counts as sanity check
+      const modelNames = ['Elo_PluginState', 'Elo_PlayerStats', 'Elo_RoundHistory', 'Elo_RoundPlayers'];
+      for (const name of modelNames) {
+        const model = this._s3db.getModel(name);
+        if (!model) {
+          this.verbose(1, `[DB] WARNING: Model ${name} not found on S³ connector. Migrations may not have run.`);
+        }
+      }
 
-      this.models.PlayerStats = this.sequelize.define(
-        'Elo_PlayerStats',
-        {
-          eosID: {
-            type: Sequelize.STRING,
-            primaryKey: true
-          },
-          steamID: {
-            type: Sequelize.STRING,
-            allowNull: true
-          },
-          discordID: {
-            type: Sequelize.STRING,
-            allowNull: true
-          },
-          name: {
-            type: Sequelize.STRING,
-            allowNull: true
-          },
-          mu: {
-            type: Sequelize.FLOAT,
-            defaultValue: EloCalculator.MU_DEFAULT
-          },
-          sigma: {
-            type: Sequelize.FLOAT,
-            defaultValue: EloCalculator.SIGMA_DEFAULT
-          },
-          wins: {
-            type: Sequelize.INTEGER,
-            defaultValue: 0
-          },
-          losses: {
-            type: Sequelize.INTEGER,
-            defaultValue: 0
-          },
-          roundsPlayed: {
-            type: Sequelize.INTEGER,
-            defaultValue: 0
-          },
-          lastSeen: {
-            type: Sequelize.BIGINT,
-            allowNull: true
-          }
-        },
-        { timestamps: false, charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' }
-      );
+      const playerStatsCount = this._s3db.getModel('Elo_PlayerStats')
+        ? await this._s3db.withTransaction(async (t) => {
+            return await this._s3db.getModel('Elo_PlayerStats').count({ transaction: t });
+          }).catch(() => 0)
+        : 0;
+      this.verbose(1, `[DB] PlayerStats table initialized: ${playerStatsCount} rows found on startup.`);
 
-      this.models.RoundHistory = this.sequelize.define(
-        'Elo_RoundHistory',
-        {
-          id: {
-            type: Sequelize.INTEGER,
-            primaryKey: true,
-            autoIncrement: true
-          },
-          layerName: {
-            type: Sequelize.STRING,
-            allowNull: true
-          },
-          winningTeamID: {
-            type: Sequelize.INTEGER,
-            allowNull: true
-          },
-          ticketDiff: {
-            type: Sequelize.INTEGER,
-            allowNull: true
-          },
-          roundDuration: {
-            type: Sequelize.INTEGER,
-            allowNull: true
-          },
-          endedAt: {
-            type: Sequelize.BIGINT,
-            allowNull: true
-          },
-          playerCount: {
-            type: Sequelize.INTEGER,
-            allowNull: true
-          }
-        },
-        { timestamps: false }
-      );
-
-       // Define Elo_RoundPlayers for optional database logging (opt-in via enableDatabaseLogging)
-       this.models.RoundPlayers = this.sequelize.define(
-         'Elo_RoundPlayers',
-         {
-           id: {
-             type: Sequelize.INTEGER,
-             primaryKey: true,
-             autoIncrement: true
-           },
-           matchId: {
-             type: Sequelize.STRING(20),
-             allowNull: true
-           },
-           roundStartTime: {
-             type: Sequelize.BIGINT,
-             allowNull: true
-           },
-           roundHistoryId: {
-             type: Sequelize.INTEGER,
-             allowNull: false
-           },
-           eosID: {
-             type: Sequelize.STRING,
-             allowNull: false
-           },
-           steamID: {
-             type: Sequelize.STRING,
-             allowNull: true
-           },
-           name: {
-             type: Sequelize.STRING,
-             allowNull: true
-           },
-           teamID: {
-             type: Sequelize.INTEGER,
-             allowNull: false
-           },
-           participationRatio: {
-             type: Sequelize.FLOAT,
-             allowNull: false
-           },
-           muBefore: {
-             type: Sequelize.FLOAT,
-             allowNull: false
-           },
-           sigmaBefore: {
-             type: Sequelize.FLOAT,
-             allowNull: false
-           },
-           rawDeltaMu: {
-             type: Sequelize.FLOAT,
-             allowNull: false
-           },
-           rawDeltaSigma: {
-             type: Sequelize.FLOAT,
-             allowNull: false
-           },
-           scaledDeltaMu: {
-             type: Sequelize.FLOAT,
-             allowNull: false
-           },
-           scaledDeltaSigma: {
-             type: Sequelize.FLOAT,
-             allowNull: false
-           },
-           muAfter: {
-             type: Sequelize.FLOAT,
-             allowNull: false
-           },
-           sigmaAfter: {
-             type: Sequelize.FLOAT,
-             allowNull: false
-           }
-         },
-         { timestamps: false, tableName: 'Elo_RoundPlayers', charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' }
-       );
-
-       await this._executeWithRetry(async () => {
-          // SQLite-only: PRAGMA commands are not supported on MySQL/Postgres
-          if (this.sequelize.getDialect() === 'sqlite') {
-            // Enforce WAL mode to prevent SQLITE_BUSY deadlocks in high-concurrency environments (e.g. DBLog + EloTracker writing simultaneously)
-            await this.sequelize.query('PRAGMA journal_mode=WAL;');
-            await this.sequelize.query('PRAGMA synchronous=NORMAL;');
-          }
-          
-           await this.models.PluginState.sync();
-           await this.models.PlayerStats.sync();
-           await this.models.RoundHistory.sync();
-           await this.models.RoundPlayers.sync();
-        });
-
-      // Log PlayerStats row count on startup to detect silent table recreations
-      const playerStatsCount = await this._executeWithRetry(async () => {
-        return await this.models.PlayerStats.count();
-      }).catch(() => 0);
-      Logger.verbose('EloTracker', 1, `[DB] PlayerStats table initialized: ${playerStatsCount} rows found on startup.`);
-
-      await this._executeWithRetry(async () => {
-        return await this.sequelize.transaction(async (t) => {
-          await this.models.PluginState.findOrCreate({
+      // Ensure PluginState row exists (id=1) for backwards-compatible checks
+      const psModel = this._s3db.getModel('Elo_PluginState');
+      if (psModel) {
+        await this._s3db.withTransaction(async (t) => {
+          await psModel.findOrCreate({
             where: { id: 1 },
             defaults: { id: 1 },
             transaction: t
           });
         });
-      });
+      }
 
-      Logger.verbose('EloTracker', 1, '[DB] Database initialized.');
+      this.verbose(1, '[DB] Database initialized.');
       return true;
     } catch (error) {
-      Logger.verbose('EloTracker', 1, `[DB] Error initializing database: ${error.message}`);
+      this.verbose(1, `[DB] Error initializing database: ${error.message}`);
       return false;
     }
   }
 
-  async getPlayerStats(eosID) {
-    if (!this.sequelize) return null;
+  /* ================================================================
+   *  HELPERS — internal retry wrapper (delegates to S³)
+   *  ================================================================ */
+
+  async _withDb(fn) {
+    if (!this.isReady()) return null;
     try {
-      return await this._executeWithRetry(async () => {
-        const record = await this.models.PlayerStats.findOne({ where: { eosID } });
+      return await this._s3db.withTransactionWithRetry(fn);
+    } catch (err) {
+      if (!isLockError(err)) {
+        this.verbose(1, `[DB] Error in _withDb: ${err.message}`);
+      }
+      return null;
+    }
+  }
+
+  /* ================================================================
+   *  PLAYER STATS — single / batch / search / upsert / increment
+   *  ================================================================ */
+
+  async getPlayerStats(eosID) {
+    if (!this.isReady()) return null;
+    try {
+      return await this._s3db.withTransactionWithRetry(async (t) => {
+        const record = await this._s3db.getModel('Elo_PlayerStats').findOne({
+          where: { eosID },
+          transaction: t
+        });
         return record ? record.toJSON() : null;
       });
     } catch (error) {
-      Logger.verbose('EloTracker', 1, `[DB] Error fetching stats for ${eosID}: ${error.message}`);
+      this.verbose(1, `[DB] Error fetching stats for ${eosID}: ${error.message}`);
       return null;
     }
   }
 
   async getPlayerStatsBatch(eosIDs) {
-    if (!this.sequelize) return new Map();
+    if (!this.isReady()) return new Map();
     try {
-      return await this._executeWithRetry(async () => {
-        const records = await this.models.PlayerStats.findAll({
-          where: {
-            eosID: {
-              [Sequelize.Op.in]: eosIDs
-            }
-          }
+      return await this._s3db.withTransactionWithRetry(async (t) => {
+        const records = await this._s3db.getModel('Elo_PlayerStats').findAll({
+          where: { eosID: { [Op.in]: eosIDs } },
+          transaction: t
         });
         const map = new Map();
         for (const record of records) {
@@ -363,326 +200,311 @@ export default class EloDatabase {
         return map;
       });
     } catch (error) {
-      Logger.verbose('EloTracker', 1, `[DB] Error fetching batch stats: ${error.message}`);
+      this.verbose(1, `[DB] Error fetching batch stats: ${error.message}`);
       return new Map();
     }
   }
 
   async searchPlayer(identifier) {
-    if (!this.sequelize || !identifier) return null;
+    if (!this.isReady() || !identifier) return null;
     const id = identifier.trim();
     try {
-      return await this._executeWithRetry(async () => {
-        const record = await this.models.PlayerStats.findOne({ where: { eosID: id } });
-        if (record) return record.toJSON();
+      return await this._s3db.withTransactionWithRetry(async (t) => {
+        // Op imported from Sequelize
+
+        const exact = await this._s3db.getModel('Elo_PlayerStats').findOne({
+          where: { eosID: id },
+          transaction: t
+        });
+        if (exact) return exact.toJSON();
 
         const escaped = id.replace(/%/g, '\\%').replace(/_/g, '\\_');
-        const fuzzy = await this.models.PlayerStats.findOne({
+        const fuzzy = await this._s3db.getModel('Elo_PlayerStats').findOne({
           where: {
-            [Sequelize.Op.or]: [
+            [Op.or]: [
               { steamID: id },
-              { name: { [Sequelize.Op.like]: `%${escaped}%` } }
+              { name: { [Op.like]: `%${escaped}%` } }
             ]
-          }
+          },
+          transaction: t
         });
         return fuzzy ? fuzzy.toJSON() : null;
       });
     } catch (error) {
-      Logger.verbose('EloTracker', 1, `[DB] Error searching for player ${id}: ${error.message}`);
+      this.verbose(1, `[DB] Error searching for player ${id}: ${error.message}`);
       return null;
     }
   }
 
   async upsertPlayerStats(eosID, fields) {
-    if (!this.sequelize) return null;
+    if (!this.isReady()) return null;
     try {
-      return await this._executeWithRetry(async () => {
-        return await this.sequelize.transaction(async (t) => {
-          const existing = await this.models.PlayerStats.findOne({ where: { eosID }, transaction: t });
-          if (existing) {
-            await existing.update(fields, { transaction: t });
-            return existing.toJSON();
-          } else {
-            const created = await this.models.PlayerStats.create({ eosID, ...fields }, { transaction: t });
-            return created.toJSON();
-          }
-        });
+      return await this._s3db.withTransactionWithRetry(async (t) => {
+        const model = this._s3db.getModel('Elo_PlayerStats');
+        const existing = await model.findOne({ where: { eosID }, transaction: t });
+        if (existing) {
+          await existing.update(fields, { transaction: t });
+          return existing.toJSON();
+        } else {
+          const created = await model.create({ eosID, ...fields }, { transaction: t });
+          return created.toJSON();
+        }
       });
     } catch (error) {
-      Logger.verbose('EloTracker', 1, `[DB] Error upserting stats for ${eosID}: ${error.message}`);
+      this.verbose(1, `[DB] Error upserting stats for ${eosID}: ${error.message}`);
       return null;
     }
   }
 
   async bulkIncrementPlayerStats(updates) {
-    if (!this.sequelize) return null;
+    if (!this.isReady()) return null;
     try {
-      return await this._executeWithRetry(async () => {
-        return await this.sequelize.transaction(async (t) => {
-          const eosIDs = updates.map((u) => u.eosID);
-          const existing = await this.models.PlayerStats.findAll({
-            where: { eosID: { [Sequelize.Op.in]: eosIDs } },
-            transaction: t
-          });
-          const existingMap = new Map(existing.map((r) => [r.eosID, r]));
-
-          const ops = updates.map(update => {
-            const { eosID, ...fields } = update;
-            const record = existingMap.get(eosID);
-            if (record) {
-              // Integrity check: roundsPlayed=0 but mu≠default indicates a column reset
-              if (record.roundsPlayed === 0 && record.mu !== EloCalculator.MU_DEFAULT) {
-                Logger.verbose('EloTracker', 1, `[DB] WARNING: Integrity anomaly for eosID ${eosID} (name: ${record.name}) — roundsPlayed=0 but mu=${record.mu.toFixed(2)} (non-default). Possible column reset detected.`);
-              }
-              return record.update({
-                mu: fields.mu,
-                sigma: fields.sigma,
-                wins: record.wins + (fields.wins ?? 0),
-                losses: record.losses + (fields.losses ?? 0),
-                roundsPlayed: record.roundsPlayed + (fields.roundsPlayed ?? 0),
-                lastSeen: fields.lastSeen,
-                name: fields.name ?? record.name,
-                steamID: fields.steamID ?? record.steamID
-              }, { transaction: t });
-            } else {
-              Logger.verbose('EloTracker', 1, `[DB] WARNING: bulkIncrement — eosID ${eosID} not found in DB (name: ${fields.name}), creating new record with wins=${fields.wins ?? 0} losses=${fields.losses ?? 0} roundsPlayed=${fields.roundsPlayed ?? 0}.`);
-              return this.models.PlayerStats.create({ eosID, ...fields }, { transaction: t });
-            }
-          });
-          
-          await Promise.all(ops);
+      return await this._s3db.withTransactionWithRetry(async (t) => {
+        const model = this._s3db.getModel('Elo_PlayerStats');
+        const eosIDs = updates.map((u) => u.eosID);
+        const existing = await model.findAll({
+          where: { eosID: { [Op.in]: eosIDs } },
+          transaction: t
         });
+        const existingMap = new Map(existing.map((r) => [r.eosID, r]));
+
+        const ops = updates.map(update => {
+          const { eosID, ...fields } = update;
+          const record = existingMap.get(eosID);
+          if (record) {
+            // Integrity check: roundsPlayed=0 but mu≠default indicates a column reset
+            if (record.roundsPlayed === 0 && record.mu !== EloCalculator.MU_DEFAULT) {
+              this.verbose(1, `[DB] WARNING: Integrity anomaly for eosID ${eosID} (name: ${record.name}) — roundsPlayed=0 but mu=${record.mu.toFixed(2)} (non-default). Possible column reset detected.`);
+            }
+            return record.update({
+              mu: fields.mu,
+              sigma: fields.sigma,
+              wins: record.wins + (fields.wins ?? 0),
+              losses: record.losses + (fields.losses ?? 0),
+              roundsPlayed: record.roundsPlayed + (fields.roundsPlayed ?? 0),
+              lastSeen: fields.lastSeen,
+              name: fields.name ?? record.name,
+              steamID: fields.steamID ?? record.steamID
+            }, { transaction: t });
+          } else {
+            this.verbose(1, `[DB] WARNING: bulkIncrement — eosID ${eosID} not found in DB (name: ${fields.name}), creating new record with wins=${fields.wins ?? 0} losses=${fields.losses ?? 0} roundsPlayed=${fields.roundsPlayed ?? 0}.`);
+            return model.create({ eosID, ...fields }, { transaction: t });
+          }
+        });
+
+        await Promise.all(ops);
       });
     } catch (error) {
-      Logger.verbose('EloTracker', 1, `[DB] Error bulk upserting stats: ${error.message}`);
+      this.verbose(1, `[DB] Error bulk upserting stats: ${error.message}`);
       return null;
     }
   }
+
+  /* ================================================================
+   *  ROUND HISTORY
+   *  ================================================================ */
 
   async insertRoundHistory(data) {
-    if (!this.sequelize) return null;
+    if (!this.isReady()) return null;
     try {
-      return await this._executeWithRetry(async () => {
-        return await this.sequelize.transaction(async (t) => {
-          const record = await this.models.RoundHistory.create(data, { transaction: t });
-          return record.toJSON();
-        });
+      return await this._s3db.withTransactionWithRetry(async (t) => {
+        const record = await this._s3db.getModel('Elo_RoundHistory').create(data, { transaction: t });
+        return record.toJSON();
       });
     } catch (error) {
-      Logger.verbose('EloTracker', 1, `[DB] Error inserting round history: ${error.message}`);
+      this.verbose(1, `[DB] Error inserting round history: ${error.message}`);
       return null;
     }
   }
 
-  /**
-   * Retrieves the top players based on Competitive Skill Rank (CSR).
-   * NOTE: This query accurately sorts by CSR (μ - 3.0σ) as defined 
-   * by EloCalculator.SIGMA_MULTIPLIER. This ensures a conservative skill 
-   * estimate is used for rankings, rewarding consistent play rather than 
-   * relying solely on raw estimated skill (μ).
-   */
+  /* ================================================================
+   *  LEADERBOARD & RANKING
+   *  ================================================================ */
+
   async getLeaderboard(limit = 20, minRounds = 10, offset = 0) {
-    if (!this.sequelize) return [];
+    if (!this.isReady()) return [];
     try {
-      return await this._executeWithRetry(async () => {
-        const records = await this.models.PlayerStats.findAll({
+      return await this._s3db.withTransactionWithRetry(async (t) => {
+        const model = this._s3db.getModel('Elo_PlayerStats');
+        const records = await model.findAll({
           where: {
-            roundsPlayed: {
-              [Sequelize.Op.gte]: minRounds
-            }
+            roundsPlayed: { [Op.gte]: minRounds }
           },
           order: [[Sequelize.literal(`(mu - (${EloCalculator.SIGMA_MULTIPLIER} * sigma))`), 'DESC']],
           limit: limit,
-          offset: offset
+          offset: offset,
+          transaction: t
         });
         return records.map((r) => r.toJSON());
       });
     } catch (error) {
-      Logger.verbose('EloTracker', 1, `[DB] Error fetching leaderboard: ${error.message}`);
+      this.verbose(1, `[DB] Error fetching leaderboard: ${error.message}`);
       return [];
     }
   }
 
   async getPlayerRank(consRating, minRounds = 0) {
-    if (!this.sequelize) return 0;
+    if (!this.isReady()) return 0;
     try {
-      return await this._executeWithRetry(async () => {
-        const whereClause = minRounds > 0 ? { roundsPlayed: { [Sequelize.Op.gte]: minRounds } } : {};
-        // Use Number(consRating) to prevent SQL injection since NaN-coercion produces an invalid but harmless query
-        whereClause[Sequelize.Op.and] = Sequelize.literal(`(mu - (${EloCalculator.SIGMA_MULTIPLIER} * sigma)) > ${Number(consRating)}`);
+      return await this._s3db.withTransactionWithRetry(async (t) => {
+        const model = this._s3db.getModel('Elo_PlayerStats');
+        // Op imported from Sequelize at module level
+        const whereClause = minRounds > 0
+          ? { roundsPlayed: { [Op.gte]: minRounds } }
+          : {};
+        whereClause[Op.and] = Sequelize.literal(`(mu - (${EloCalculator.SIGMA_MULTIPLIER} * sigma)) > ${Number(consRating)}`);
 
-        const higherRanked = await this.models.PlayerStats.count({
-          where: whereClause
-        });
+        const higherRanked = await model.count({ where: whereClause, transaction: t });
         return higherRanked + 1;
       });
     } catch (error) {
-      Logger.verbose('EloTracker', 1, `[DB] Error fetching player rank for consRating ${consRating}: ${error.message}`);
+      this.verbose(1, `[DB] Error fetching player rank for consRating ${consRating}: ${error.message}`);
       return 0;
     }
   }
 
   async getTotalPlayers() {
-    if (!this.sequelize) return 0;
+    if (!this.isReady()) return 0;
     try {
-      return await this._executeWithRetry(async () => {
-        return await this.models.PlayerStats.count();
-      });
+      return await this._s3db.withTransaction(async (t) => {
+        return await this._s3db.getModel('Elo_PlayerStats').count({ transaction: t });
+      }).catch(() => 0);
     } catch (error) {
-      Logger.verbose(
-        'EloTracker',
-        1,
-        `[DB] Error fetching total players: ${error.message}`
-      );
+      this.verbose(1, `[DB] Error fetching total players: ${error.message}`);
       return 0;
     }
   }
 
   async getTotalRankedPlayers(minRounds = 10) {
-    if (!this.sequelize) return 0;
+    if (!this.isReady()) return 0;
     try {
-      return await this._executeWithRetry(async () => {
-        return await this.models.PlayerStats.count({
-          where: {
-            roundsPlayed: {
-              [Sequelize.Op.gte]: minRounds
-            }
-          }
+      return await this._s3db.withTransactionWithRetry(async (t) => {
+        return await this._s3db.getModel('Elo_PlayerStats').count({
+          where: { roundsPlayed: { [Op.gte]: minRounds } },
+          transaction: t
         });
       });
     } catch (error) {
-      Logger.verbose(
-        'EloTracker',
-        1,
-        `[DB] Error fetching total ranked players: ${error.message}`
-      );
+      this.verbose(1, `[DB] Error fetching total ranked players: ${error.message}`);
       return 0;
     }
   }
 
+  /* ================================================================
+   *  EXPORT / IMPORT
+   *  ================================================================ */
+
   async exportPlayerStats() {
-    if (!this.sequelize) return [];
+    if (!this.isReady()) return [];
     try {
-      return await this._executeWithRetry(async () => {
-        const records = await this.models.PlayerStats.findAll();
+      return await this._s3db.withTransactionWithRetry(async (t) => {
+        const records = await this._s3db.getModel('Elo_PlayerStats').findAll({ transaction: t });
         return records.map((r) => r.toJSON());
       });
     } catch (error) {
-      Logger.verbose('EloTracker', 1, `[DB] Error exporting stats: ${error.message}`);
+      this.verbose(1, `[DB] Error exporting stats: ${error.message}`);
       return [];
     }
   }
 
-   async importPlayerStats(records) {
-     if (!this.sequelize) return null;
-     const CHUNK_SIZE = 500;
-     try {
-       Logger.verbose('EloTracker', 1, `[DB] Import started: ${records.length} players to restore.`);
-       
-       for (let i = 0; i < records.length; i += CHUNK_SIZE) {
-         const chunk = records.slice(i, i + CHUNK_SIZE);
-         await this._executeWithRetry(async () => {
-           return await this.sequelize.transaction(async (t) => {
-             // Use bulkCreate with updateOnDuplicate for efficient upsert operations.
-             // This will insert new records or update existing ones based on eosID.
-             await this.models.PlayerStats.bulkCreate(chunk, {
-               updateOnDuplicate: [
-                 'steamID',
-                 'discordID',
-                 'name',
-                 'mu',
-                 'sigma',
-                 'wins',
-                 'losses',
-                 'roundsPlayed',
-                 'lastSeen'
-               ],
-               transaction: t
-             });
-           });
-         });
-       }
-       
-       // Log post-import row count and spot-check a sample record
-       const postImportCount = await this._executeWithRetry(async () => {
-         return await this.models.PlayerStats.count();
-       }).catch(() => 0);
-       
-       let sampleRecord = null;
-       if (records.length > 0) {
-         sampleRecord = await this._executeWithRetry(async () => {
-           return await this.models.PlayerStats.findOne({ where: { eosID: records[0].eosID } });
-         }).catch(() => null);
-       }
-       
-       if (sampleRecord) {
-         Logger.verbose('EloTracker', 1, `[DB] Import complete: ${postImportCount} total rows. Sample check: eosID=${sampleRecord.eosID} wins=${sampleRecord.wins} losses=${sampleRecord.losses} roundsPlayed=${sampleRecord.roundsPlayed}.`);
-       } else {
-         Logger.verbose('EloTracker', 1, `[DB] Import complete: ${postImportCount} total rows.`);
-       }
-       
-       return true;
-     } catch (error) {
-       Logger.verbose('EloTracker', 1, `[DB] Error importing stats: ${error.message}`);
-       return null;
-     }
-   }
+  async importPlayerStats(records) {
+    if (!this.isReady()) return null;
+    const CHUNK_SIZE = 500;
+    try {
+      this.verbose(1, `[DB] Import started: ${records.length} players to restore.`);
+
+      for (let i = 0; i < records.length; i += CHUNK_SIZE) {
+        const chunk = records.slice(i, i + CHUNK_SIZE);
+        await this._s3db.withTransactionWithRetry(async (t) => {
+          await this._s3db.getModel('Elo_PlayerStats').bulkCreate(chunk, {
+            updateOnDuplicate: [
+              'steamID', 'discordID', 'name', 'mu', 'sigma',
+              'wins', 'losses', 'roundsPlayed', 'lastSeen'
+            ],
+            transaction: t
+          });
+        });
+      }
+
+      // Log post-import row count and spot-check a sample record
+      const postImportCount = await this._s3db.withTransaction(async (t) => {
+        return await this._s3db.getModel('Elo_PlayerStats').count({ transaction: t });
+      }).catch(() => 0);
+
+      let sampleRecord = null;
+      if (records.length > 0) {
+        sampleRecord = await this._s3db.withTransaction(async (t) => {
+          return await this._s3db.getModel('Elo_PlayerStats').findOne({
+            where: { eosID: records[0].eosID },
+            transaction: t
+          });
+        }).catch(() => null);
+      }
+
+      if (sampleRecord) {
+        this.verbose(1, `[DB] Import complete: ${postImportCount} total rows. Sample check: eosID=${sampleRecord.eosID} wins=${sampleRecord.wins} losses=${sampleRecord.losses} roundsPlayed=${sampleRecord.roundsPlayed}.`);
+      } else {
+        this.verbose(1, `[DB] Import complete: ${postImportCount} total rows.`);
+      }
+
+      return true;
+    } catch (error) {
+      this.verbose(1, `[DB] Error importing stats: ${error.message}`);
+      return null;
+    }
+  }
+
+  /* ================================================================
+   *  MAINTENANCE — prune / bulk insert
+   *  ================================================================ */
 
   async pruneStaleEntries(minRoundsForLeaderboard) {
-    if (!this.sequelize) return { tier1: 0, tier2: 0 };
+    if (!this.isReady()) return { tier1: 0, tier2: 0 };
     const now = Date.now();
     const thirtyDays = 30 * 24 * 60 * 60 * 1000;
     const ninetyDays = 90 * 24 * 60 * 60 * 1000;
-    const tier1Cutoff = new Date(now - thirtyDays).toISOString();
-    const tier2Cutoff = new Date(now - ninetyDays).toISOString();
 
     try {
-      const tier1Count = await this._executeWithRetry(async () => {
-        return await this.models.PlayerStats.destroy({
+      const tier1Count = await this._s3db.withTransactionWithRetry(async (t) => {
+        return await this._s3db.getModel('Elo_PlayerStats').destroy({
           where: {
-            lastSeen: { [Sequelize.Op.lt]: now - thirtyDays },
-            roundsPlayed: { [Sequelize.Op.lt]: minRoundsForLeaderboard }
-          }
+            lastSeen: { [Op.lt]: now - thirtyDays },
+            roundsPlayed: { [Op.lt]: minRoundsForLeaderboard }
+          },
+          transaction: t
         });
       });
 
-      const tier2Count = await this._executeWithRetry(async () => {
-        return await this.models.PlayerStats.destroy({
+      const tier2Count = await this._s3db.withTransactionWithRetry(async (t) => {
+        return await this._s3db.getModel('Elo_PlayerStats').destroy({
           where: {
-            lastSeen: { [Sequelize.Op.lt]: now - ninetyDays },
-            roundsPlayed: { [Sequelize.Op.gte]: minRoundsForLeaderboard }
-          }
+            lastSeen: { [Op.lt]: now - ninetyDays },
+            roundsPlayed: { [Op.gte]: minRoundsForLeaderboard }
+          },
+          transaction: t
         });
       });
 
-      Logger.verbose('EloTracker', 1, `[DB] Pruned stale entries — Tier 1 (provisional unseen since ${tier1Cutoff}): ${tier1Count} deleted. Tier 2 (calibrated unseen since ${tier2Cutoff}): ${tier2Count} deleted.`);
+      this.verbose(1, `[DB] Pruned stale entries — Tier 1 (provisional): ${tier1Count} deleted. Tier 2 (calibrated): ${tier2Count} deleted.`);
       return { tier1: tier1Count, tier2: tier2Count };
     } catch (error) {
-      Logger.verbose('EloTracker', 1, `[DB] Error pruning stale entries: ${error.message}`);
+      this.verbose(1, `[DB] Error pruning stale entries: ${error.message}`);
       return { tier1: 0, tier2: 0 };
     }
   }
 
   async insertRoundPlayers(roundHistoryId, endedAt, playerRows) {
-    if (!this.sequelize || !this.models.RoundPlayers) {
-      Logger.verbose('EloTracker', 1, '[DB] insertRoundPlayers called before initDB.');
-      return null;
-    }
-
+    if (!this.isReady()) return null;
     try {
-      return await this._executeWithRetry(async () => {
-        return await this.sequelize.transaction(async (t) => {
-          // Bulk create player records
-          if (playerRows && playerRows.length > 0) {
-            await this.models.RoundPlayers.bulkCreate(playerRows, { transaction: t });
-          }
-
-          Logger.verbose('EloTracker', 4, `[DB] Inserted ${playerRows ? playerRows.length : 0} player records for round ${roundHistoryId}`);
-          return { roundHistoryId, playerCount: playerRows ? playerRows.length : 0 };
-        });
+      return await this._s3db.withTransactionWithRetry(async (t) => {
+        if (playerRows && playerRows.length > 0) {
+          await this._s3db.getModel('Elo_RoundPlayers').bulkCreate(playerRows, { transaction: t });
+        }
+        this.verbose(4, `[DB] Inserted ${playerRows ? playerRows.length : 0} player records for round ${roundHistoryId}`);
+        return { roundHistoryId, playerCount: playerRows ? playerRows.length : 0 };
       });
     } catch (error) {
-      Logger.verbose('EloTracker', 1, `[DB] insertRoundPlayers failed: ${error.message}`);
+      this.verbose(1, `[DB] insertRoundPlayers failed: ${error.message}`);
       return null;
     }
   }

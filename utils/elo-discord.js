@@ -698,8 +698,10 @@ export const EloDiscord = {
                 return;
               }
 
-              await this.db.models.PlayerStats.destroy({ where: {} });
-              await this.db.models.RoundHistory.destroy({ where: {} });
+              const _PlayerStats = this.db.getModel('Elo_PlayerStats');
+              const _RoundHistory = this.db.getModel('Elo_RoundHistory');
+              if (_PlayerStats) await _PlayerStats.destroy({ where: {} });
+              if (_RoundHistory) await _RoundHistory.destroy({ where: {} });
               this.eloCache.clear();
               await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildAdminConfirmEmbed('ELO Reset', 'All ratings and round history wiped.')] });
             } catch (err) {
@@ -808,7 +810,7 @@ export const EloDiscord = {
         }
 
         try {
-          const player = await this.db.models.PlayerStats.findOne({ where: { steamID } });
+          const player = await this.db.getModel('Elo_PlayerStats')?.findOne({ where: { steamID } });
 
           if (!player) {
             const replyMsg = await message.reply('⚠️ No ELO record found for that SteamID. Make sure you have played at least one round on the server. This message will be deleted in 5 seconds.');
@@ -906,7 +908,7 @@ export const EloDiscord = {
       }
 
       if (!sub || sub === 'me') {
-        const player = await this.db.models.PlayerStats.findOne({ where: { discordID: message.author.id } });
+        const player = await this.db.getModel('Elo_PlayerStats')?.findOne({ where: { discordID: message.author.id } });
         if (!player) {
           await message.reply('No linked ELO record found. Please use `!elo link <Your17DigitSteamID>` to link your account first!');
           return;
