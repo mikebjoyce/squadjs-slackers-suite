@@ -592,15 +592,15 @@ export const EloDiscord = {
 
       // S³ ClansService delegation — uses this._s3 (set by elo-tracker.js mount())
       this._extractRawPrefix = (name) => {
-        if (this._s3?.services?.clans) {
-          return this._s3.services.clans.extractRawPrefix(name);
+        if (this._s3?.clans?.isReady?.()) {
+          return this._s3.clans.extractRawPrefix(name);
         }
         Logger.verbose('EloTracker', 1, 'Clans service unavailable — cannot extract clan prefix');
         return null;
       };
       this._normalizeTag = (raw) => {
-        if (this._s3?.services?.clans) {
-          return this._s3.services.clans.normalizeTag(raw);
+        if (this._s3?.clans?.isReady?.()) {
+          return this._s3.clans.normalizeTag(raw);
         }
         Logger.verbose('EloTracker', 1, 'Clans service unavailable — cannot normalize clan tag');
         return null;
