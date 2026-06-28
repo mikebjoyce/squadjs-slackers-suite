@@ -120,6 +120,16 @@ function createQueryInterface(sequelize, db, transaction) {
       await qi.createTable(tableName, attributes, { ...options, transaction });
     },
 
+    /**
+     * List existing table names in a dialect-agnostic way.
+     * Use this instead of raw sqlite_master queries.
+     * @returns {Promise<string[]>}
+     */
+    async showAllTables() {
+      const qi = sequelize.getQueryInterface();
+      return qi.showAllTables({ transaction });
+    },
+
     async rawQuery(sql, replacements = {}) {
       const result = await sequelize.query(sql, {
         replacements,

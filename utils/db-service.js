@@ -356,6 +356,16 @@ export default class DBService {
     return DBService.ensureSqlitePragmas(this.sequelize);
   }
 
+  /**
+   * Retrieve a previously-defined model by name.
+   * Returns null if the model has not been defined yet.
+   * @param {string} name - Model name (e.g. 'Elo_PlayerStats')
+   * @returns {import('sequelize').Model|null}
+   */
+  getModel(name) {
+    return this.models?.[name] ?? null;
+  }
+
   defineModel(name, schema, modelOptions = {}) {
     if (!this.sequelize || typeof this.sequelize.define !== 'function') {
       throw new Error('defineModel called without a valid sequelize connector.');
