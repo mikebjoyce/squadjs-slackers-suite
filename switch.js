@@ -388,7 +388,7 @@ export default class Switch extends DiscordBasePlugin {
                     type: s3db.getDataTypes().DATE,
                     allowNull: true
                 }
-            });
+            }, { timestamps: false });
 
             s3db.defineModel('SwitchPlugin_Endmatches', {
                 id: {
@@ -409,7 +409,7 @@ export default class Switch extends DiscordBasePlugin {
                     type: s3db.getDataTypes().DATE,
                     defaultValue: s3db.getDataTypes().NOW
                 }
-            });
+            }, { timestamps: false });
 
             // Register expected version + v1 migration (creates both tables idempotently)
             s3db.registerExpectedVersion('switch', 1);
@@ -419,8 +419,7 @@ export default class Switch extends DiscordBasePlugin {
                     description: 'Create SwitchPlugin_PlayerCooldowns and SwitchPlugin_Endmatches',
                     up: async (qi) => {
                         // Check which tables already exist (safe for already-running installs)
-                        const existingRaw = await qi.rawQuery("SELECT name FROM sqlite_master WHERE type='table'");
-                        const existing = (Array.isArray(existingRaw) ? existingRaw : []).map(r => r.name);
+                        const existing = await qi.showAllTables();
 
                         if (!existing.includes('SwitchPlugin_PlayerCooldowns')) {
                             await qi.createTable('SwitchPlugin_PlayerCooldowns', {
