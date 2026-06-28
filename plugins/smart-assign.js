@@ -121,16 +121,15 @@
  *
  * ─── CONFIGURATION ───────────────────────────────────────────────
  *
- * database: Sequelize connector name (default: 'sqlite').
+ * DB connector: Inherited from S³ DBService (no standalone database option).
  * logPath: Path for JSONL event logging (default: './smart-assign-log.jsonl').
  * enableSmartAssign: Toggle auto-assignment logic (default: true).
  * enableEventLogging: Toggle JSONL event logging (default: true).
- * ignoredGameModes: Array of modes to skip logic on (default: ['Seed', 'Jensen']).
- * enableClanGrouping: Toggle clan-mate grouping logic (default: true).
- * clanGroupMinSize: Minimum clan size for grouping (default: 2).
- * clanGroupCaseSensitive: Case-sensitive clan tag matching (default: false).
  * enableDatabaseLogging: If true, mirrors JSONL event data into database tables
  *   for querying (default: false).
+ * handshakeWithSwitch: Enable SA-Switch handshake for queued swaps (default: false).
+ * handshakeScoreThreshold: Scoring threshold for eloGated handshake (default: 0.5).
+ * handshakeMode: Handshake mode — "eloGated" or "queueDrain" (default: 'eloGated').
  *
  * ─── AUTHOR ──────────────────────────────────────────────────────
  *
@@ -161,12 +160,6 @@ export default class SmartAssign extends BasePlugin {
 
   static get optionsSpecification() {
     return {
-      database: {
-        required: true,
-        connector: 'sequelize',
-        description: 'Sequelize connector name (SQLite, MySQL, PostgreSQL, etc.). Defaults to "sqlite".',
-        default: 'sqlite'
-      },
       enableSmartAssign: {
         required: false,
         description: 'If true, runs the assignment algorithm and moves players. If false, only logs real server events.',
@@ -215,8 +208,7 @@ export default class SmartAssign extends BasePlugin {
   constructor(server, options, connectors) {
     super(server, options, connectors);
 
-    const dbConnector = (connectors && connectors[options.database]) || null;
-    this.db = new SADatabase(dbConnector, {
+    this.db = new SADatabase({
       enableDatabaseLogging: this.options.enableDatabaseLogging === true
     });
     this._s3 = null;  // Runtime discovery of SlackersSquadServices
@@ -311,13 +303,84 @@ export default class SmartAssign extends BasePlugin {
     Logger.verbose('SmartAssign', 2, '[S3] S³ is fully mounted — proceeding with migration registration.');
 
     // ═══════════════════════════════════════════════════════════════
-    // SCHEMA MIGRATION: Register SA v2 to drop 4 orphan tables (7.4j)
+    // 8.2a: Define SA model on S³ connector + inject s3db into SADatabase
+    // ═══════════════════════════════════════════════════════════════
+    const s3db = this._s3.db;
+    if (s3db?.isReady()) {
+      // Define SA_AssignmentLog model (idempotent — defineModel caches)
+      s3db.defineModel('SA_AssignmentLog', {
+        id: { type: s3db.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
+        matchId: { type: s3db.getDataTypes().STRING, allowNull: true },
+        roundStartTime: { type: s3db.getDataTypes().BIGINT, allowNull: true },
+        ts: { type: s3db.getDataTypes().BIGINT, allowNull: false },
+        eventType: {
+          type: s3db.getDataTypes().STRING,
+          allowNull: false,
+          validate: {
+            isIn: [['MOVE_SUCCESS', 'MOVE_FAILED', 'MOVE_RETRY']]
+          }
+        },
+        eosID: { type: s3db.getDataTypes().STRING, allowNull: true },
+        steamID: { type: s3db.getDataTypes().STRING, allowNull: true },
+        name: { type: s3db.getDataTypes().STRING, allowNull: true },
+        targetTeamID: { type: s3db.getDataTypes().INTEGER, allowNull: true },
+        reason: { type: s3db.getDataTypes().STRING, allowNull: true },
+        attempt: { type: s3db.getDataTypes().INTEGER, allowNull: true },
+        method: { type: s3db.getDataTypes().STRING, allowNull: true },
+        metadata: { type: s3db.getDataTypes().JSON, allowNull: true }
+      }, {
+        tableName: 'SA_AssignmentLog',
+        timestamps: false,
+        indexes: [
+          { name: 'idx_sa_al_matchId', fields: ['matchId'] },
+          { name: 'idx_sa_al_eventType', fields: ['eventType'] },
+          { name: 'idx_sa_al_ts', fields: ['ts'] }
+        ]
+      });
+
+      // Inject S³ DBService into SADatabase delegate
+      this.db._s3db = s3db;
+
+      Logger.verbose('SmartAssign', 2, '[8.2] SA_AssignmentLog model defined on S³ connector.');
+    } else {
+      Logger.verbose('SmartAssign', 1, '[8.2] S³ DB not ready — SA_AssignmentLog model not defined.');
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // SCHEMA MIGRATION: Register SA v1 (create SA_AssignmentLog) + v2 (drop 4 orphan tables)
     // ═══════════════════════════════════════════════════════════════
     try {
-      const s3db = this._s3.db;
       if (s3db?.isReady() && s3db.migrationEngine) {
         s3db.registerExpectedVersion('smart-assign', 2);
+
         s3db.migrationEngine.registerMigrations('smart-assign', [
+          {
+            version: 1,
+            description: 'Create SA_AssignmentLog table (replaces old SmartAssignReconnectMemory, SmartAssignState, SA_RoundSummary, SA_PlayerEvent)',
+            up: async (qi) => {
+              const existing = await qi.showAllTables();
+              if (!existing.includes('SA_AssignmentLog')) {
+                await qi.createTable('SA_AssignmentLog', {
+                  id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+                  matchId: { type: qi.DataTypes.STRING, allowNull: true },
+                  roundStartTime: { type: qi.DataTypes.BIGINT, allowNull: true },
+                  ts: { type: qi.DataTypes.BIGINT, allowNull: false },
+                  eventType: { type: qi.DataTypes.STRING, allowNull: false },
+                  eosID: { type: qi.DataTypes.STRING, allowNull: true },
+                  steamID: { type: qi.DataTypes.STRING, allowNull: true },
+                  name: { type: qi.DataTypes.STRING, allowNull: true },
+                  targetTeamID: { type: qi.DataTypes.INTEGER, allowNull: true },
+                  reason: { type: qi.DataTypes.STRING, allowNull: true },
+                  attempt: { type: qi.DataTypes.INTEGER, allowNull: true },
+                  method: { type: qi.DataTypes.STRING, allowNull: true },
+                  metadata: { type: qi.DataTypes.JSON, allowNull: true }
+                }, { timestamps: false });
+              }
+            },
+            down: async (qi) => {
+              await qi.dropTable('SA_AssignmentLog');
+            }
+          },
           {
             version: 2,
             description: 'Drop 4 orphan tables (SmartAssignReconnectMemory, SmartAssignState, SA_RoundSummary, SA_PlayerEvent) — replaced by S³ LoggingService + SA_AssignmentLog.',
@@ -349,25 +412,25 @@ export default class SmartAssign extends BasePlugin {
         // Re-verify schema versions now that SA has registered, then run the migration
         const recheck = await s3db.verifySchemaVersions();
         if (!recheck.upToDate) {
-          Logger.verbose('SmartAssign', 1, `[7.4j] SA has ${recheck.pending.length} pending migration(s) — applying now.`);
+          Logger.verbose('SmartAssign', 1, `[8.2] SA has ${recheck.pending.length} pending migration(s) — applying now.`);
           const result = await s3db.migrationEngine.runMigrations('smart-assign');
-          Logger.verbose('SmartAssign', 1, `[7.4j] SA v2 migration complete: applied=${result.applied}, skipped=${result.skipped}.`);
+          Logger.verbose('SmartAssign', 1, `[8.2] SA migration(s) complete: applied=${result.applied}, skipped=${result.skipped}.`);
 
           // Re-verify again after migration to confirm up-to-date status
           const postCheck = await s3db.verifySchemaVersions();
           if (!postCheck.upToDate) {
-            Logger.verbose('SmartAssign', 1, `[7.4j] WARNING: ${postCheck.pending.length} migration(s) still pending after run.`);
+            Logger.verbose('SmartAssign', 1, `[8.2] WARNING: ${postCheck.pending.length} migration(s) still pending after run.`);
           } else {
-            Logger.verbose('SmartAssign', 2, '[7.4j] SA schema is now up to date (v2).');
+            Logger.verbose('SmartAssign', 2, '[8.2] SA schema is now up to date (v2).');
           }
         } else {
-          Logger.verbose('SmartAssign', 2, '[7.4j] SA schema already up to date.');
+          Logger.verbose('SmartAssign', 2, '[8.2] SA schema already up to date.');
         }
       } else {
-        Logger.verbose('SmartAssign', 1, '[7.4j] S³ DB or migrationEngine not available — skipping migration registration.');
+        Logger.verbose('SmartAssign', 1, '[8.2] S³ DB or migrationEngine not available — skipping migration registration.');
       }
     } catch (err) {
-      Logger.verbose('SmartAssign', 1, `[7.4j] Migration registration error: ${err.message}`);
+      Logger.verbose('SmartAssign', 1, `[8.2] Migration registration error: ${err.message}`);
     }
 
     // Switch plugin discovery for handshake integration (7.1c)

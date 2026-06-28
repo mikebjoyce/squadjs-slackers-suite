@@ -5,19 +5,27 @@
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Persistent storage for SmartAssign assignment events. Replaced the
- * previous all-purpose database utility (round state, reconnect memory,
- * full event logging) with a single focused table — SA_AssignmentLog —
- * that records only assignment decisions (MOVE_SUCCESS, MOVE_FAILED,
- * MOVE_RETRY). Generic player lifecycle events (JOIN, LEAVE, TEAM_CHANGE,
- * ROUND_SNAPSHOT) are delegated to S³'s LoggingService.
+ * S³-delegated persistence layer for SmartAssign assignment events.
+ * All DB access is routed through S³'s DBService (this._s3db) using
+ * getModel for model access and withTransactionWithRetry for transaction
+ * safety. The standalone Sequelize connector and raw sync() calls have
+ * been removed per Stage 8.2 Strategy A.
+ *
+ * Replaced the previous all-purpose database utility (round state,
+ * reconnect memory, full event logging) with a single focused table —
+ * SA_AssignmentLog — that records only assignment decisions
+ * (MOVE_SUCCESS, MOVE_FAILED, MOVE_RETRY). Generic player lifecycle
+ * events (JOIN, LEAVE, TEAM_CHANGE, ROUND_SNAPSHOT) are delegated to
+ * S³'s LoggingService.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * SADatabase (class)
- *   Constructor accepts (sequelize, enableDatabaseLogging).
+ *   Constructor accepts (options).
  *   Key public methods:
  *     logAssignmentEvent(event)  — Writes one assignment event to DB.
+ *     isReady()                  — Returns true when S³ DBService is mounted.
+ *     getModel(name)             — Accessor for Sequelize model via S³.
  *
  * ─── DEPRECATED / REMOVED ────────────────────────────────────────
  *
@@ -29,111 +37,87 @@
  *   insertRoundWithEvents() — replaced by logAssignmentEvent()
  *   cleanupOldData()        — no longer needed
  *
+ * The following have been removed (Stage 8.2 Strategy A):
+ *   Standalone sequelize connector    — DB access now delegates to S³ DBService
+ *   _executeWithRetry()               — S³ DBService provides withTransactionWithRetry
+ *   _defineModel() / sync()           — Model defined by smart-assign.js via s3db.defineModel()
+ *   WAL pragma setup                  — S³ DBService handles this on mount
+ *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
  * - All writes are gated behind enableDatabaseLogging (passed from
  *   SmartAssign options). When disabled, logAssignmentEvent is a no-op.
- * - Model is lazily synced on first write.
+ * - Model is defined by smart-assign.js mount() via s3db.defineModel()
+ *   before any DB operations are attempted.
+ * - The SA_AssignmentLog table is created by MigrationEngine v1 migration,
+ *   not by raw sync().
  *
  * ═══════════════════════════════════════════════════════════════
  */
-import Sequelize from 'sequelize';
 import Logger from '../../core/logger.js';
-const { DataTypes } = Sequelize;
 
 export default class SADatabase {
   /**
-   * @param {object} sequelize - Sequelize connector instance
    * @param {object} [options]
    * @param {boolean} [options.enableDatabaseLogging=false] - Gate for DB writes
    */
-  constructor(sequelize, options = {}) {
-    this.sequelize = sequelize;
+  constructor(options = {}) {
+    this._s3db = null; // Injected after S³ discovery (smart-assign.js mount)
     this.enableDatabaseLogging = options.enableDatabaseLogging === true;
-    this.AssignmentLogModel = null;
-    this._syncDone = false;
+  }
 
-    // Promise-chain mutex to serialise SQLite writes and prevent lock contention
-    this._mutex = Promise.resolve();
+  /* ────────────────────────────────────── DELEGATED ACCESSORS ────────────────────────────────────── */
 
-    // Enable WAL mode for better concurrent performance
-    if (this.sequelize && this.sequelize.getDialect?.() === 'sqlite') {
-      this.sequelize.query('PRAGMA journal_mode=WAL;').catch(() => {});
-      this.sequelize.query('PRAGMA synchronous=NORMAL;').catch(() => {});
+  /**
+   * Check whether the S³ DBService is ready.
+   * @returns {boolean}
+   */
+  isReady() {
+    return !!(this._s3db && this._s3db.isReady && this._s3db.isReady());
+  }
+
+  /**
+   * Access a model defined on S³'s connector.
+   * @param {string} name - Model name (e.g. 'SA_AssignmentLog')
+   * @returns {import('sequelize').Model|null}
+   */
+  getModel(name) {
+    if (!this._s3db) return null;
+    return this._s3db.getModel(name) || null;
+  }
+
+  /* ────────────────────────────────────── DELEGATED TRANSACTION WRAPPER ──────────────────────────── */
+
+  /**
+   * Internal helper: execute a function inside S³'s withTransactionWithRetry.
+   * Returns null if the DB is not ready or the operation fails.
+   * @param {Function} fn - Async function receiving (transaction)
+   * @returns {Promise<*>}
+   */
+  async _withDb(fn) {
+    if (!this.isReady()) return null;
+    try {
+      return await this._s3db.withTransactionWithRetry(fn);
+    } catch (err) {
+      if (!this._isLockError(err)) {
+        Logger.verbose('SmartAssign', 1, `[DB] Error in _withDb: ${err.message}`);
+      }
+      return null;
     }
   }
 
-  /* ────────────────────────────────────── RETRY / MUTEX ────────────────────────────────────── */
-
-  async _executeWithRetry(logicFn, attempts = 5) {
-    const runAttempt = async () => {
-      for (let i = 1; i <= attempts; i++) {
-        try {
-          return await logicFn();
-        } catch (err) {
-          const isLocked = err.message && (
-            err.message.includes('SQLITE_BUSY') ||
-            err.message.includes('database is locked') ||
-            err.message.includes('Lock wait timeout exceeded') ||
-            err.name === 'SequelizeTimeoutError'
-          );
-          if (isLocked && i < attempts) {
-            const jitter = Math.random() * 500;
-            await new Promise(resolve => setTimeout(resolve, 200 + jitter));
-          } else {
-            throw err;
-          }
-        }
-      }
-    };
-
-    // Serialize writes via promise-chain mutex for SQLite
-    if (this.sequelize && this.sequelize.getDialect?.() === 'sqlite') {
-      const resultPromise = this._mutex.then(() => runAttempt());
-      this._mutex = resultPromise.catch(() => {});
-      return resultPromise;
-    }
-
-    return runAttempt();
-  }
-
-  /* ────────────────────────────────────── MODEL DEFINITION ────────────────────────────────────── */
-
-  _defineModel() {
-    if (this.AssignmentLogModel) return;
-
-    this.AssignmentLogModel = this.sequelize.define(
-      'SA_AssignmentLog',
-      {
-        id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-        matchId: { type: DataTypes.STRING, allowNull: true },
-        roundStartTime: { type: DataTypes.BIGINT, allowNull: true },
-        ts: { type: DataTypes.BIGINT, allowNull: false },
-        eventType: {
-          type: DataTypes.STRING,
-          allowNull: false,
-          validate: {
-            isIn: [['MOVE_SUCCESS', 'MOVE_FAILED', 'MOVE_RETRY']]
-          }
-        },
-        eosID: { type: DataTypes.STRING, allowNull: true },
-        steamID: { type: DataTypes.STRING, allowNull: true },
-        name: { type: DataTypes.STRING, allowNull: true },
-        targetTeamID: { type: DataTypes.INTEGER, allowNull: true },
-        reason: { type: DataTypes.STRING, allowNull: true },
-        attempt: { type: DataTypes.INTEGER, allowNull: true },
-        method: { type: DataTypes.STRING, allowNull: true },
-        metadata: { type: DataTypes.JSON, allowNull: true }
-      },
-      {
-        tableName: 'SA_AssignmentLog',
-        timestamps: false,
-        indexes: [
-          { name: 'idx_sa_al_matchId', fields: ['matchId'] },
-          { name: 'idx_sa_al_eventType', fields: ['eventType'] },
-          { name: 'idx_sa_al_ts', fields: ['ts'] }
-        ]
-      }
+  /**
+   * Detect SQLite locking errors from Sequelize error objects.
+   * @param {Error} err
+   * @returns {boolean}
+   */
+  _isLockError(err) {
+    const message = String(err?.message || '');
+    return (
+      message.includes('SQLITE_BUSY') ||
+      message.includes('database is locked') ||
+      message.includes('Lock wait timeout exceeded') ||
+      err?.name === 'SequelizeTimeoutError'
     );
   }
 
@@ -158,25 +142,16 @@ export default class SADatabase {
    * @param {object}  [event.metadata]    - Extra context stored as JSON
    */
   async logAssignmentEvent(event) {
-    if (!this.enableDatabaseLogging || !this.sequelize) return;
-
-    // Lazy model definition + sync on first write
-    if (!this.AssignmentLogModel) {
-      this._defineModel();
-    }
-    if (!this._syncDone) {
-      try {
-        await this.AssignmentLogModel.sync();
-        this._syncDone = true;
-      } catch (err) {
-        Logger.verbose('SmartAssign', 1, `[DB] Failed to sync SA_AssignmentLog: ${err.message}`);
-        return;
-      }
-    }
+    if (!this.enableDatabaseLogging || !this.isReady()) return;
 
     try {
-      await this._executeWithRetry(async () => {
-        await this.AssignmentLogModel.create({
+      await this._withDb(async (t) => {
+        const model = this._s3db.getModel('SA_AssignmentLog');
+        if (!model) {
+          Logger.verbose('SmartAssign', 1, '[DB] SA_AssignmentLog model not found on S³ connector. Skipping write.');
+          return;
+        }
+        await model.create({
           matchId: event.matchId || null,
           roundStartTime: event.roundStartTime || null,
           ts: event.ts || Date.now(),
@@ -189,7 +164,7 @@ export default class SADatabase {
           attempt: event.attempt != null ? Number(event.attempt) : null,
           method: event.method || null,
           metadata: event.metadata || null
-        });
+        }, { transaction: t });
       });
     } catch (err) {
       Logger.verbose('SmartAssign', 1, `[DB] logAssignmentEvent failed: ${err.message}`);
