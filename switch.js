@@ -1,5 +1,5 @@
 import Sequelize from 'sequelize';
-import DiscordBasePlugin from './discord-base-plugin.js';
+import S3DiscordPluginBase from './s3-discord-plugin-base.js';
 import { setTimeout as delay } from "timers/promises";
 const { Op } = Sequelize;
 
@@ -148,7 +148,7 @@ const { Op } = Sequelize;
  * GitHub:          https://github.com/mikebjoyce/squadjs-switch-teambalancer-aware
  *
  */
-export default class Switch extends DiscordBasePlugin {
+export default class Switch extends S3DiscordPluginBase {
     static version = '2.0.0';
 
     static get description() {
@@ -161,11 +161,11 @@ export default class Switch extends DiscordBasePlugin {
 
     static get optionsSpecification() {
         return {
-            discordClient: {
-                required: true,
-                description: 'Discord connector name.',
-                connector: 'discord',
-                default: 'discord'
+            ...this.parentOptionsSpecification,
+            channelID: {
+                required: false,
+                description: 'Discord channel ID (mapped from discordChannelID for base class compatibility)',
+                default: ''
             },
             commandPrefix: {
                 required: false,
@@ -310,8 +310,7 @@ export default class Switch extends DiscordBasePlugin {
         this._lastTeamSnapshot = null;      // { t1: number, t2: number } — previous poll's team counts for stability check
         this._switchedOnJoin = new Set();
         this._queueProcessing = false;      // Re-entrancy guard for _processQueue
-        this._s3 = null;                    // Reference to SlackersSquadServices (runtime discovery)
-        this._s3db = null;                  // Cached S³ DBService reference
+        // _s3 and _s3db are initialized by S3PluginBase — do NOT override here
         
         this._liberalModes = [];
 
@@ -335,152 +334,15 @@ export default class Switch extends DiscordBasePlugin {
         }
     }
 
-    _resolveS3() {
-        if (!this.server.plugins) {
-            throw new Error('[S3] server.plugins not available — cannot discover SlackersSquadServices. Ensure it is installed and loaded before Switch.');
-        }
-        const s3 = this.server.plugins.find(p => p.constructor.name === 'SlackersSquadServices');
-        if (!s3) {
-            throw new Error('[S3] SlackersSquadServices is required for Switch to function. Ensure it is in config.json before Switch and restart.');
-        }
-        this._s3 = s3;
-        this.verbose(1, '[S3] Discovered SlackersSquadServices for Switch.');
-    }
-
     async mount() {
-        this._resolveS3();
+        await super.mount();
 
-        // 7.4k-3: Wait for S³ to finish mounting before accessing its services
-        await this._s3.ready();
-        this.verbose(1, '[S3] S³ is fully mounted — proceeding.');
-
-        // ═══════════════════════════════════════════════════════════════
-        // 7.4l: SCHEMA MIGRATION — Define models + register Switch v1
-        // ═══════════════════════════════════════════════════════════════
-        const s3db = this._s3.db;
-        if (s3db?.isReady() && s3db.migrationEngine) {
-            this._s3db = s3db;
-
-            // Define models on S³ connector (idempotent — defineModel caches)
-            s3db.defineModel('SwitchPlugin_PlayerCooldowns', {
-                eosID: {
-                    type: s3db.getDataTypes().STRING,
-                    primaryKey: true,
-                    allowNull: false
-                },
-                steamID: {
-                    type: s3db.getDataTypes().STRING,
-                    allowNull: true
-                },
-                playerName: {
-                    type: s3db.getDataTypes().STRING,
-                    allowNull: true
-                },
-                lastSwitchTimestamp: {
-                    type: s3db.getDataTypes().DATE,
-                    allowNull: true
-                },
-                firstSeenTimestamp: {
-                    type: s3db.getDataTypes().DATE,
-                    allowNull: true
-                },
-                scrambleLockdownExpiry: {
-                    type: s3db.getDataTypes().DATE,
-                    allowNull: true
-                }
-            }, { timestamps: false });
-
-            s3db.defineModel('SwitchPlugin_Endmatches', {
-                id: {
-                    type: s3db.getDataTypes().INTEGER,
-                    primaryKey: true,
-                    autoIncrement: true
-                },
-                name: {
-                    type: s3db.getDataTypes().STRING
-                },
-                steamID: {
-                    type: s3db.getDataTypes().STRING
-                },
-                eosID: {
-                    type: s3db.getDataTypes().STRING
-                },
-                created_at: {
-                    type: s3db.getDataTypes().DATE,
-                    defaultValue: s3db.getDataTypes().NOW
-                }
-            }, { timestamps: false });
-
-            // Register expected version + v1 migration (creates both tables idempotently)
-            s3db.registerExpectedVersion('switch', 1);
-            s3db.migrationEngine.registerMigrations('switch', [
-                {
-                    version: 1,
-                    description: 'Create SwitchPlugin_PlayerCooldowns and SwitchPlugin_Endmatches',
-                    up: async (qi) => {
-                        // Check which tables already exist (safe for already-running installs)
-                        const existing = await qi.showAllTables();
-
-                        if (!existing.includes('SwitchPlugin_PlayerCooldowns')) {
-                            await qi.createTable('SwitchPlugin_PlayerCooldowns', {
-                                eosID: { type: qi.DataTypes.STRING, primaryKey: true, allowNull: false },
-                                steamID: { type: qi.DataTypes.STRING, allowNull: true },
-                                playerName: { type: qi.DataTypes.STRING, allowNull: true },
-                                lastSwitchTimestamp: { type: qi.DataTypes.DATE, allowNull: true },
-                                firstSeenTimestamp: { type: qi.DataTypes.DATE, allowNull: true },
-                                scrambleLockdownExpiry: { type: qi.DataTypes.DATE, allowNull: true }
-                            });
-                        }
-
-                        if (!existing.includes('SwitchPlugin_Endmatches')) {
-                            await qi.createTable('SwitchPlugin_Endmatches', {
-                                id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-                                name: { type: qi.DataTypes.STRING },
-                                steamID: { type: qi.DataTypes.STRING },
-                                eosID: { type: qi.DataTypes.STRING },
-                                created_at: { type: qi.DataTypes.DATE, defaultValue: qi.DataTypes.NOW }
-                            });
-                        }
-                    },
-                    down: async (qi) => {
-                        await qi.dropTable('SwitchPlugin_PlayerCooldowns');
-                        await qi.dropTable('SwitchPlugin_Endmatches');
-                    }
-                }
-            ]);
-
-            // Re-verify schema versions now that Switch has registered, then run the migration
-            const recheck = await s3db.verifySchemaVersions();
-            if (!recheck.upToDate) {
-                this.verbose(1, `[7.4l] Switch has ${recheck.pending.length} pending migration(s) — applying now.`);
-                const result = await s3db.migrationEngine.runMigrations('switch');
-                this.verbose(1, `[7.4l] Switch v1 migration complete: applied=${result.applied}, skipped=${result.skipped}.`);
-
-                // Re-verify after migration
-                const postCheck = await s3db.verifySchemaVersions();
-                if (!postCheck.upToDate) {
-                    this.verbose(1, `[7.4l] WARNING: ${postCheck.pending.length} migration(s) still pending after run.`);
-                } else {
-                    this.verbose(2, '[7.4l] Switch schema is now up to date (v1).');
-                }
-            } else {
-                this.verbose(2, '[7.4l] Switch schema already up to date.');
-            }
-        } else {
-            this.verbose(1, '[7.4l] S³ DB or migrationEngine not available — cannot register Switch schema. Mounting without DB.');
-        }
-
-        // Register refresh interest with S³ PlayersService for queue processing
-        const mountPlayers = this._s3.players;
-        if (mountPlayers?.isReady() && mountPlayers.registerRefreshInterest) {
-            mountPlayers.registerRefreshInterest('Switch', { maxStalenessMs: 10000 });
-            this.verbose(1, '[S3] Registered Switch refresh interest (maxStalenessMs=10000).');
-        }
-
+        // At this point S³ is discovered, ready, _s3db cached, and _onS3Ready() completed.
+        // Wire event listeners — business logic, not S³ boilerplate.
         this._liberalModes = (this.options.liberalSwitchGameModes || ['Seed', 'Jensen']).map(m => String(m).toLowerCase());
 
         this.server.on('CHAT_MESSAGE', this.onChatMessage);
-        this.server.on('ROUND_ENDED', this.onRoundEnded)
+        this.server.on('ROUND_ENDED', this.onRoundEnded);
         this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
         this.server.on('NEW_GAME', this.onNewGame.bind(this));
         this.server.on('S3_PLAYER_JOINED', this.onS3PlayerJoined);
@@ -491,35 +353,124 @@ export default class Switch extends DiscordBasePlugin {
         }
     }
 
+    /**
+     * _onS3Ready — S³ lifecycle hook (called by S3PluginBase.mount() after _s3.ready()).
+     * Handles DB model definition, migration registration, and refresh interest.
+     * Replaces the old inline mount() S³ boilerplate (~120 lines).
+     */
+    async _onS3Ready() {
+        if (!this._s3db?.isReady?.() || !this._s3db.migrationEngine) {
+            this.verbose(1, '[7.4l] S³ DB or migrationEngine not available — cannot register Switch schema. Mounting without DB.');
+            return;
+        }
+
+        // Define models on S³ connector (idempotent — defineModel caches)
+        this.defineModel('SwitchPlugin_PlayerCooldowns', {
+            eosID: {
+                type: this._s3db.getDataTypes().STRING,
+                primaryKey: true,
+                allowNull: false
+            },
+            steamID: {
+                type: this._s3db.getDataTypes().STRING,
+                allowNull: true
+            },
+            playerName: {
+                type: this._s3db.getDataTypes().STRING,
+                allowNull: true
+            },
+            lastSwitchTimestamp: {
+                type: this._s3db.getDataTypes().DATE,
+                allowNull: true
+            },
+            firstSeenTimestamp: {
+                type: this._s3db.getDataTypes().DATE,
+                allowNull: true
+            },
+            scrambleLockdownExpiry: {
+                type: this._s3db.getDataTypes().DATE,
+                allowNull: true
+            }
+        }, { timestamps: false });
+
+        this.defineModel('SwitchPlugin_Endmatches', {
+            id: {
+                type: this._s3db.getDataTypes().INTEGER,
+                primaryKey: true,
+                autoIncrement: true
+            },
+            name: {
+                type: this._s3db.getDataTypes().STRING
+            },
+            steamID: {
+                type: this._s3db.getDataTypes().STRING
+            },
+            eosID: {
+                type: this._s3db.getDataTypes().STRING
+            },
+            created_at: {
+                type: this._s3db.getDataTypes().DATE,
+                defaultValue: this._s3db.getDataTypes().NOW
+            }
+        }, { timestamps: false });
+
+        // Register expected version + v1 migration
+        this.registerExpectedVersion('switch', 1);
+        this.registerMigrations('switch', [
+            {
+                version: 1,
+                description: 'Create SwitchPlugin_PlayerCooldowns and SwitchPlugin_Endmatches',
+                up: async (qi) => {
+                    const existing = await qi.showAllTables();
+                    if (!existing.includes('SwitchPlugin_PlayerCooldowns')) {
+                        await qi.createTable('SwitchPlugin_PlayerCooldowns', {
+                            eosID: { type: qi.DataTypes.STRING, primaryKey: true, allowNull: false },
+                            steamID: { type: qi.DataTypes.STRING, allowNull: true },
+                            playerName: { type: qi.DataTypes.STRING, allowNull: true },
+                            lastSwitchTimestamp: { type: qi.DataTypes.DATE, allowNull: true },
+                            firstSeenTimestamp: { type: qi.DataTypes.DATE, allowNull: true },
+                            scrambleLockdownExpiry: { type: qi.DataTypes.DATE, allowNull: true }
+                        });
+                    }
+                    if (!existing.includes('SwitchPlugin_Endmatches')) {
+                        await qi.createTable('SwitchPlugin_Endmatches', {
+                            id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+                            name: { type: qi.DataTypes.STRING },
+                            steamID: { type: qi.DataTypes.STRING },
+                            eosID: { type: qi.DataTypes.STRING },
+                            created_at: { type: qi.DataTypes.DATE, defaultValue: qi.DataTypes.NOW }
+                        });
+                    }
+                },
+                down: async (qi) => {
+                    await qi.dropTable('SwitchPlugin_PlayerCooldowns');
+                    await qi.dropTable('SwitchPlugin_Endmatches');
+                }
+            }
+        ]);
+
+        // Run any pending migrations
+        const result = await this.verifyAndRunMigrations('switch');
+        if (result) {
+            this.verbose(1, `[7.4l] Switch v1 migration: applied=${result.applied}, skipped=${result.skipped}.`);
+        } else {
+            this.verbose(3, '[7.4l] Switch schema already up to date.');
+        }
+
+        // Register refresh interest with S³ PlayersService
+        const mountPlayers = this._s3.players;
+        if (mountPlayers?.isReady() && mountPlayers.registerRefreshInterest) {
+            mountPlayers.registerRefreshInterest('Switch', { maxStalenessMs: 10000 });
+            this.verbose(1, '[S3] Registered Switch refresh interest (maxStalenessMs=10000).');
+        }
+    }
+
     async prepareToMount() {
         if (this.options.discordChannelID) {
             this.options.channelID = this.options.discordChannelID;
         }
         await super.prepareToMount();
         // 7.4l: Table sync and ALTER TABLE are removed — handled by S³ MigrationEngine in mount()
-    }
-
-    /* ────────────────────────────────────── DB HELPERS ────────────────────────────────────── */
-
-    /**
-     * Get cached model reference. Guards against null s3db (graceful fallback).
-     */
-    _getModel(name) {
-        return this._s3db?.models?.[name] || null;
-    }
-
-    /**
-     * Execute a DB function with retry+jitter via S³ DBService.
-     * Gracefully returns null if S³ DB is unavailable.
-     */
-    async _withDb(fn) {
-        if (!this._s3db?.isReady?.()) return null;
-        try {
-            return await this._s3db.withTransactionWithRetry(fn);
-        } catch (err) {
-            this.verbose(1, `[DB] Error in _withDb: ${err.message}`);
-            return null;
-        }
     }
 
     /* ────────────────────────────────────── COMMAND HANDLING ────────────────────────────────────── */
@@ -836,18 +787,10 @@ export default class Switch extends DiscordBasePlugin {
                     }
                     break;
                 default:
-                    await this.warn(eosID, [
-                        `Unknown subcommand: "${subCommand}"`,
-                        '',
-                        '=== Switch Commands ===',
-                        '!switch — Request team switch',
-                        '!switch check — Show your eligibility status',
-                        '!switch explain — Explain the rules',
-                        '!switch status <player> — (Admin) Check a player',
-                        '!switch clear <player> — (Admin) Clear player cooldown',
-                        '!switch clearall — (Admin) Clear all cooldowns',
-                        '!switch cancel — Leave the switch queue'
-                    ].join('\n'));
+                    // Show invalid-input notice first, then full help 5s later
+                    this.warn(eosID, `Unknown subcommand: "${subCommand}". Showing help...`);
+                    await delay(5000);
+                    this.warn(eosID, `[Switch] Commands\n!switch         | Request a team switch\n!switch check   | Check your eligibility\n!switch explain | How switching works\n!switch cancel  | Leave the queue`);
                     return;
             }
         } else {
@@ -1395,12 +1338,14 @@ export default class Switch extends DiscordBasePlugin {
 
     async getSecondsFromJoin(eosID) {
         const joinPlayers = this._s3.players;
-        const player = joinPlayers?.isReady() && joinPlayers.getPlayer(eosID);
-        return player?.joinTime ? (Date.now() - player.joinTime) / 1000 : 0;
+        if (!joinPlayers?.isReady()) return 0;
+        const joinTime = joinPlayers.getJoinTime(eosID);
+        return joinTime ? (Date.now() - joinTime) / 1000 : 0;
     }
 
     getSecondsFromMatchStart() {
-        return (Date.now() - +this.server.layerHistory[ 0 ].time) / 1000 || 0;
+        const roundStartTime = this._s3?.gameState?.getRoundStartTime?.();
+        return roundStartTime ? (Date.now() - roundStartTime) / 1000 : 0;
     }
 
     handlePlayerLeave(eosID, teamID, playerName) {
@@ -1542,49 +1487,31 @@ export default class Switch extends DiscordBasePlugin {
     }
 
     async _taggedSwitchPlayer(eosID, source) {
-        const executionTimestamp = Date.now();
-        
-        const player = this.server.players.find(p => p.eosID === eosID);
-        if (!player) {
-          this.verbose(1, `[Switch] WARNING: Player with eosID ${eosID} not found in server.players for source=${source}`);
-          return null;
-        }
-        
-        const currentTeam = player?.teamID;
-        const currentTeamNum = Number(currentTeam);
-        const targetTeam = currentTeamNum === 1 ? 2 : currentTeamNum === 2 ? 1 : null;
-        const steamID = player.steamID;
-        
-        this.verbose(2, `[Switch] EXECUTING: player=${player.name} (eosID=${eosID}, steamID=${steamID}), source=${source}, currentTeam=${currentTeam}, targetTeam=${targetTeam}, timestamp=${executionTimestamp}`);
-        
-        if (targetTeam === null) {
-          this.verbose(1, `[Switch] ERROR: Cannot switch player ${player.name} - currentTeam is null or invalid (value=${currentTeam})`);
-          return null;
-        }
-        
-        const attributionPlayers = this._s3.players;
-        if (attributionPlayers?.isReady() && eosID) {
-          attributionPlayers.recordMove(eosID, targetTeam, source);
-          this.verbose(2, `[Switch] S³ recordMove registered: source=${source}, targetTeam=${targetTeam}`);
+        // Delegate to the base class method which handles retry/verify/recordMove
+        const result = await this._requestTeamChange(eosID, {
+            maxAttempts: 3,
+            retryIntervalMs: 200,
+            timeoutMs: 2000,
+            source: source || 'S3PluginBase'
+        });
+
+        if (result && result.success) {
+            this.verbose(3, `[Switch] RCON SUCCESS: ${result.name} switched to T${result.teamID} (source=${source})`);
+            return result;
         }
 
-        try {
-            const result = await this.server.rcon.execute(`AdminForceTeamChange "${player.name}"`);
-            this.verbose(3, `[Switch] RCON SUCCESS: AdminForceTeamChange returned for ${player.name}`);
-            return result;
-        } catch (err) {
-            this.verbose(1, `[Switch] ERROR: AdminForceTeamChange failed for ${player.name} (eosID=${eosID}): ${err.message}`);
-            throw err;
+        if (result === null) {
+            this.verbose(1, `[Switch] WARNING: Player with eosID ${eosID} not found in server.players for source=${source}`);
+            return null;
         }
+
+        this.verbose(1, `[Switch] ERROR: AdminForceTeamChange failed for ${result?.name || eosID} (source=${source}): all attempts exhausted`);
+        throw new Error(`Team change failed for ${eosID} after ${result?.attempts || 3} attempts (source=${source})`);
     }
 
     switchPlayer(eosID) {
-        const player = this.server.players.find(p => p.eosID === eosID);
-        if (!player) {
-            this.verbose(1, `[Switch] switchPlayer: Player with eosID ${eosID} not found`);
-            return null;
-        }
-        return this.server.rcon.execute(`AdminForceTeamChange "${player.name}"`);
+        // Delegate to the base class method
+        return this._taggedSwitchPlayer(eosID, 'SwitchPlayer');
     }
 
     onNewGame() {
@@ -1645,9 +1572,13 @@ export default class Switch extends DiscordBasePlugin {
         return found.entry;
     }
 
-    async unmount() {
-        const unmountPlayers = this._s3.players;
-        if (unmountPlayers?.isReady() && unmountPlayers.unregisterRefreshInterest) {
+    /**
+     * _onUnmount — S³ lifecycle hook (called by S3PluginBase.unmount()).
+     * Cleans up listener registrations and switch queue.
+     */
+    async _onUnmount() {
+        const unmountPlayers = this._s3?.players;
+        if (unmountPlayers?.isReady && unmountPlayers.unregisterRefreshInterest) {
             unmountPlayers.unregisterRefreshInterest('Switch');
         }
 
@@ -1660,9 +1591,12 @@ export default class Switch extends DiscordBasePlugin {
         this.server.removeListener('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
         if (this.options.discordClient) this.options.discordClient.removeListener('message', this.onDiscordMessage);
         this._clearAllQueueEntries('Plugin unmount');
-        this._s3 = null;
-        this._s3db = null;
         this.verbose(1, 'Switch plugin was un-mounted.');
+    }
+
+    async unmount() {
+        await super.unmount();
+        // _onUnmount() is called by super.unmount() — cleanup happens there
     }
 
     getPlayersByUsername(username) {
@@ -1830,7 +1764,7 @@ export default class Switch extends DiscordBasePlugin {
                     ],
                     timestamp: new Date().toISOString()
                 };
-                await this.sendDiscordMessage({ channel: this.discordChannel, embed });
+                await this.sendDiscordMessage({ embed });
             } catch (discordErr) {
                 this.verbose(1, `[SCRAMBLE_EVENT] Warning: Failed to send Discord notification: ${discordErr.message}`);
             }
@@ -1961,7 +1895,7 @@ export default class Switch extends DiscordBasePlugin {
                     { name: 'Active Locks (Top 10)', value: playerList, inline: false }
                 ]
             };
-            await this.sendDiscordMessage({ channel: message.channel, embed });
+            await message.channel.send({ embeds: [embed] });
         } else if (subCommand === 'check') {
             const ident = args.slice(2).join(' ');
             if (!ident) {
@@ -1999,7 +1933,7 @@ export default class Switch extends DiscordBasePlugin {
                     desc += `⏱️ **Joined:** <t:${Math.floor(new Date(result.firstSeenTimestamp).getTime()/1000)}:f>\n`;
                 }
 
-                await this.sendDiscordMessage({ channel: message.channel, embed: { title: '🔍 Player Status', description: desc, color: 0x3498db } });
+                await message.channel.send({ embeds: [{ title: '🔍 Player Status', description: desc, color: 0x3498db }] });
             }
         } else if (subCommand === 'clear') {
             const ident = args.slice(2).join(' ');
@@ -2039,7 +1973,21 @@ export default class Switch extends DiscordBasePlugin {
                     { name: '!switch help', value: 'Show this help message.' }
                 ]
             };
-            await this.sendDiscordMessage({ channel: message.channel, embed });
+            await message.channel.send({ embeds: [embed] });
+        } else {
+            // Unknown subcommand — show help
+            const embed = {
+                title: '📜 Switch Plugin Commands',
+                description: 'Available commands:',
+                fields: [
+                    { name: '!switch diag', value: 'Show database diagnostics and active locks.' },
+                    { name: '!switch check <ident>', value: 'Check cooldown status for a player.' },
+                    { name: '!switch clear <ident>', value: 'Clear cooldowns for a specific player.' },
+                    { name: '!switch clearall', value: 'Clear all player cooldowns.' },
+                    { name: '!switch help', value: 'Show this help message.' }
+                ]
+            };
+            await message.channel.send({ embeds: [embed] });
         }
     }
 }
