@@ -124,7 +124,7 @@
  */
 
 import { appendFileSync, promises as fsPromises } from 'fs';
-import BasePlugin from './base-plugin.js';
+import S3PluginBase from './s3-plugin-base.js';
 import Logger from '../../core/logger.js';
 import EloDatabase from '../utils/elo-database.js';
 import EloSessionManager from '../utils/elo-session-manager.js';
@@ -132,7 +132,7 @@ import EloCalculator from '../utils/elo-calculator.js';
 import { EloDiscord } from '../utils/elo-discord.js';
 import EloCommands from '../utils/elo-commands.js';
 
-export default class EloTracker extends BasePlugin {
+export default class EloTracker extends S3PluginBase {
   static version = '2.0.0';
 
   static get description() {
@@ -203,7 +203,6 @@ export default class EloTracker extends BasePlugin {
     this.ready = false;
     this._roundStartEmbedPending = null;
     this.lastRoundSnapshot = null;
-    this._s3 = null;                // Reference to SlackersSquadServices (runtime discovery)
     this._scrambleEmbedTimer = null;
 
     // Bound listeners — mirror TeamBalancer pattern exactly
@@ -219,100 +218,74 @@ export default class EloTracker extends BasePlugin {
     this.listeners.onEloAdminCommand = this.onEloAdminCommand.bind(this);
   }
 
-  _resolveS3() {
-    if (!this.server.plugins) {
-      Logger.verbose('EloTracker', 1, '[S3] server.plugins not available — S³ discovery deferred.');
-      return;
-    }
-    const s3 = this.server.plugins.find(p => p.constructor.name === 'SlackersSquadServices');
-    if (s3) {
-      // Runtime discovery matches the TB→EloTracker pattern
-      // (ReferenceScripts/squadjs-team-balancer/plugins/team-balancer.js uses
-      //  this.server.plugins.find(p => p.constructor.name === 'EloTracker'))
-      this._s3 = s3;
-      Logger.verbose('EloTracker', 1, '[S3] Discovered SlackersSquadServices for EloTracker.');
-    } else {
-      this._s3 = null;
-      Logger.verbose('EloTracker', 1, '[S3] SlackersSquadServices not found — using fallback implementations.');
-    }
-  }
+  /// S3PluginBase lifecycle hooks
 
-  async mount() {
+  async _onS3Ready() {
     if (this._isMounted) {
       return;
     }
     Logger.verbose('EloTracker', 1, 'Mounting plugin.');
     this.ready = false;
-    this._resolveS3();
 
-    // 8.2a: Wait for S³ to finish mounting before accessing its DB/migration services
-    if (this._s3) {
-      await this._s3.ready();
-      Logger.verbose('EloTracker', 1, '[8.2] S³ is fully mounted — proceeding with migration registration.');
-    }
+    // Define Elo models on S³ connector (idempotent — defineModel caches)
+    this.defineModel('Elo_PluginState', {
+      id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: false, defaultValue: 1 }
+    }, { timestamps: false });
 
-    // 8.2b: Define Elo models on S³ connector (idempotent — defineModel caches)
-    const s3db = this._s3?.db;
-    if (s3db?.isReady()) {
-      s3db.defineModel('Elo_PluginState', {
-        id: { type: s3db.getDataTypes().INTEGER, primaryKey: true, autoIncrement: false, defaultValue: 1 }
-      }, { timestamps: false });
+    this.defineModel('Elo_PlayerStats', {
+      eosID: { type: this.s3db?.getDataTypes().STRING, primaryKey: true, allowNull: false },
+      steamID: { type: this.s3db?.getDataTypes().STRING, allowNull: true },
+      discordID: { type: this.s3db?.getDataTypes().STRING, allowNull: true },
+      name: { type: this.s3db?.getDataTypes().STRING, allowNull: true },
+      mu: { type: this.s3db?.getDataTypes().FLOAT, defaultValue: 25.0 },
+      sigma: { type: this.s3db?.getDataTypes().FLOAT, defaultValue: 8.333333333333334 },
+      wins: { type: this.s3db?.getDataTypes().INTEGER, defaultValue: 0 },
+      losses: { type: this.s3db?.getDataTypes().INTEGER, defaultValue: 0 },
+      roundsPlayed: { type: this.s3db?.getDataTypes().INTEGER, defaultValue: 0 },
+      lastSeen: { type: this.s3db?.getDataTypes().BIGINT, allowNull: true }
+    }, { timestamps: false, charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' });
 
-      s3db.defineModel('Elo_PlayerStats', {
-        eosID: { type: s3db.getDataTypes().STRING, primaryKey: true, allowNull: false },
-        steamID: { type: s3db.getDataTypes().STRING, allowNull: true },
-        discordID: { type: s3db.getDataTypes().STRING, allowNull: true },
-        name: { type: s3db.getDataTypes().STRING, allowNull: true },
-        mu: { type: s3db.getDataTypes().FLOAT, defaultValue: 25.0 },
-        sigma: { type: s3db.getDataTypes().FLOAT, defaultValue: 8.333333333333334 },
-        wins: { type: s3db.getDataTypes().INTEGER, defaultValue: 0 },
-        losses: { type: s3db.getDataTypes().INTEGER, defaultValue: 0 },
-        roundsPlayed: { type: s3db.getDataTypes().INTEGER, defaultValue: 0 },
-        lastSeen: { type: s3db.getDataTypes().BIGINT, allowNull: true }
-      }, { timestamps: false, charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' });
+    this.defineModel('Elo_RoundHistory', {
+      id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
+      layerName: { type: this.s3db?.getDataTypes().STRING, allowNull: true },
+      winningTeamID: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true },
+      ticketDiff: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true },
+      roundDuration: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true },
+      endedAt: { type: this.s3db?.getDataTypes().BIGINT, allowNull: true },
+      playerCount: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true }
+    }, { timestamps: false });
 
-      s3db.defineModel('Elo_RoundHistory', {
-        id: { type: s3db.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
-        layerName: { type: s3db.getDataTypes().STRING, allowNull: true },
-        winningTeamID: { type: s3db.getDataTypes().INTEGER, allowNull: true },
-        ticketDiff: { type: s3db.getDataTypes().INTEGER, allowNull: true },
-        roundDuration: { type: s3db.getDataTypes().INTEGER, allowNull: true },
-        endedAt: { type: s3db.getDataTypes().BIGINT, allowNull: true },
-        playerCount: { type: s3db.getDataTypes().INTEGER, allowNull: true }
-      }, { timestamps: false });
+    this.defineModel('Elo_RoundPlayers', {
+      id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
+      matchId: { type: this.s3db?.getDataTypes().STRING(20), allowNull: true },
+      roundStartTime: { type: this.s3db?.getDataTypes().BIGINT, allowNull: true },
+      roundHistoryId: { type: this.s3db?.getDataTypes().INTEGER, allowNull: false },
+      eosID: { type: this.s3db?.getDataTypes().STRING, allowNull: false },
+      steamID: { type: this.s3db?.getDataTypes().STRING, allowNull: true },
+      name: { type: this.s3db?.getDataTypes().STRING, allowNull: true },
+      teamID: { type: this.s3db?.getDataTypes().INTEGER, allowNull: false },
+      participationRatio: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false },
+      muBefore: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false },
+      sigmaBefore: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false },
+      rawDeltaMu: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false },
+      rawDeltaSigma: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false },
+      scaledDeltaMu: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false },
+      scaledDeltaSigma: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false },
+      muAfter: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false },
+      sigmaAfter: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false }
+    }, { timestamps: false, tableName: 'Elo_RoundPlayers', charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' });
 
-      s3db.defineModel('Elo_RoundPlayers', {
-        id: { type: s3db.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
-        matchId: { type: s3db.getDataTypes().STRING(20), allowNull: true },
-        roundStartTime: { type: s3db.getDataTypes().BIGINT, allowNull: true },
-        roundHistoryId: { type: s3db.getDataTypes().INTEGER, allowNull: false },
-        eosID: { type: s3db.getDataTypes().STRING, allowNull: false },
-        steamID: { type: s3db.getDataTypes().STRING, allowNull: true },
-        name: { type: s3db.getDataTypes().STRING, allowNull: true },
-        teamID: { type: s3db.getDataTypes().INTEGER, allowNull: false },
-        participationRatio: { type: s3db.getDataTypes().FLOAT, allowNull: false },
-        muBefore: { type: s3db.getDataTypes().FLOAT, allowNull: false },
-        sigmaBefore: { type: s3db.getDataTypes().FLOAT, allowNull: false },
-        rawDeltaMu: { type: s3db.getDataTypes().FLOAT, allowNull: false },
-        rawDeltaSigma: { type: s3db.getDataTypes().FLOAT, allowNull: false },
-        scaledDeltaMu: { type: s3db.getDataTypes().FLOAT, allowNull: false },
-        scaledDeltaSigma: { type: s3db.getDataTypes().FLOAT, allowNull: false },
-        muAfter: { type: s3db.getDataTypes().FLOAT, allowNull: false },
-        sigmaAfter: { type: s3db.getDataTypes().FLOAT, allowNull: false }
-      }, { timestamps: false, tableName: 'Elo_RoundPlayers', charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' });
-    }
-
-    // 8.2c: Inject S³ DBService into EloDatabase delegate
-    if (s3db?.isReady() && this.db) {
-      this.db._s3db = s3db;
+    // Inject S³ DBService into EloDatabase delegate
+    if (this.s3db?.isReady() && this.db) {
+      this.db._s3db = this.s3db;
       this.db.verbose = (level, message) => Logger.verbose('EloTracker', level, message);
     }
 
-    // 8.2d: Register Elo migrations on S³ connector (v1 creates tables, v2 drops roundStartTime)
-    if (s3db?.isReady() && s3db.migrationEngine) {
-      s3db.registerExpectedVersion('elo-tracker', 2);
+    // Register Elo migrations on S³ connector (v1 creates tables, v2 drops roundStartTime)
+    if (this.s3db?.isReady() && this.s3db.migrationEngine) {
+      this.registerExpectedVersion('elo-tracker', 2);
 
-      s3db.migrationEngine.registerMigrations('elo-tracker', [
+      this.registerMigrations('elo-tracker', [
         {
           version: 1,
           description: 'Create Elo_PluginState, Elo_PlayerStats, Elo_RoundHistory, Elo_RoundPlayers',
@@ -397,15 +370,8 @@ export default class EloTracker extends BasePlugin {
         }
       ]);
 
-      // Check for pending migrations and apply them
-      const recheck = await s3db.verifySchemaVersions();
-      if (!recheck.upToDate) {
-        Logger.verbose('EloTracker', 1, `[8.2] Elo has ${recheck.pending.length} pending migration(s) — applying now.`);
-        const result = await s3db.migrationEngine.runMigrations('elo-tracker');
-        Logger.verbose('EloTracker', 1, `[8.2] Elo migration complete: applied=${result.applied}, skipped=${result.skipped}.`);
-      } else {
-        Logger.verbose('EloTracker', 3, '[8.2] Elo schema already up to date.');
-      }
+      // Apply pending migrations
+      await this.verifyAndRunMigrations('elo-tracker');
     } else {
       Logger.verbose('EloTracker', 1, '[8.2] S³ DB or migrationEngine not available — skipping migration registration.');
     }
@@ -487,7 +453,7 @@ export default class EloTracker extends BasePlugin {
     Logger.verbose('EloTracker', 1, 'Plugin mounted and ready.');
   }
 
-  async unmount() {
+  async _onUnmount() {
     if (!this._isMounted) {
       return;
     }

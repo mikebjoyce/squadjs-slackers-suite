@@ -33,8 +33,9 @@
  *   The caller must still register the event listener.
  * - !eloadmin reset resets mu, sigma, wins, losses, and roundsPlayed
  *   to defaults. It does NOT delete the DB record.
- * - !elo with no sub-command falls through to the player lookup
- *   path using the full args string as the identifier.
+ * - !elo with no sub-command shows the caller's own rating.
+ * - !elo <name|steamID> looks up another player.
+ * - Unknown sub-commands show help text (Stage 8.3 fix).
  *
  *   Calculates and displays a "Competitive Skill Rank" (CSR) (μ - 3.0σ)
  *   as the primary player rank to encourage active play.
@@ -69,6 +70,36 @@ const EloCommands = {
       }
       return msg;
     };
+
+    // ─── Helper — shared lookup logic ─────────────────────────────────
+    async function _lookupAndRespond(trackerCtx, player, identifier) {
+      const record = await trackerCtx._findPlayerByIdentifier(identifier);
+      if (!record) {
+        return await trackerCtx.respond(player, [
+          `No ELO record found for: ${identifier}`,
+          'Type !elo help for available commands.'
+        ].join('\n'));
+      }
+
+      const minRounds = trackerCtx.options.minRoundsForLeaderboard;
+      let rankLine;
+      const consRating = record.mu - (EloCalculator.SIGMA_MULTIPLIER * record.sigma);
+      if (record.roundsPlayed < minRounds) {
+        rankLine = `Rank: Provisional (${record.roundsPlayed}/${minRounds} rounds)`;
+      } else {
+        const rank = await trackerCtx.db.getPlayerRank(consRating, minRounds);
+        const total = await trackerCtx.db.getTotalPlayers();
+        rankLine = `Rank: #${rank} (of ${total} total)`;
+      }
+
+      return await trackerCtx.respond(player, [
+        `=== ${record.name} ===`,
+        rankLine,
+        `CSR: ${consRating.toFixed(2)} (μ - 3.0σ)`,
+        `Estimated Skill: ${record.mu.toFixed(2)} μ | Certainty: ${record.sigma.toFixed(2)} σ`,
+        `Record: ${record.wins}W / ${record.losses}L (${record.roundsPlayed} rounds)`
+      ].join('\n'));
+    }
 
     // Public in-game command handler
     // Registered on CHAT_COMMAND:elo
@@ -114,35 +145,21 @@ const EloCommands = {
         }
       }
 
-      // !elo (no args) or !elo <identifier> — lookup
-      const identifier = sub ? args.join(' ') : (player.steamID || player.eosID);
+      // !elo (no args) — self lookup
+      if (!sub) {
+        const identifier = player.steamID || player.eosID;
+        try {
+          return await _lookupAndRespond(this, player, identifier);
+        } catch (err) {
+          Logger.verbose('EloTracker', 1, `[EloCommands] Player lookup failed: ${err.message}`);
+          return await this.respond(player, 'Failed to retrieve player stats.');
+        }
+      }
+
+      // !elo <identifier> — lookup another player by name/steamID
+      const identifier = args.join(' ');
       try {
-        const record = await this._findPlayerByIdentifier(identifier);
-        if (!record) {
-          return await this.respond(player, [
-            `No ELO record found for: ${identifier}`,
-            'Type !elo help for available commands.'
-          ].join('\n'));
-        }
-
-        const minRounds = this.options.minRoundsForLeaderboard;
-        let rankLine;
-        const consRating = record.mu - (EloCalculator.SIGMA_MULTIPLIER * record.sigma);
-        if (record.roundsPlayed < minRounds) {
-          rankLine = `Rank: Provisional (${record.roundsPlayed}/${minRounds} rounds)`;
-        } else {
-          const rank = await this.db.getPlayerRank(consRating, minRounds);
-          const total = await this.db.getTotalPlayers();
-          rankLine = `Rank: #${rank} (of ${total} total)`;
-        }
-
-        return await this.respond(player, [
-          `=== ${record.name} ===`,
-          rankLine,
-          `CSR: ${consRating.toFixed(2)} (μ - 3.0σ)`,
-          `Estimated Skill: ${record.mu.toFixed(2)} μ | Certainty: ${record.sigma.toFixed(2)} σ`,
-          `Record: ${record.wins}W / ${record.losses}L (${record.roundsPlayed} rounds)`
-        ].join('\n'));
+        return await _lookupAndRespond(this, player, identifier);
       } catch (err) {
         Logger.verbose('EloTracker', 1, `[EloCommands] Player lookup failed: ${err.message}`);
         return await this.respond(player, 'Failed to retrieve player stats.');
