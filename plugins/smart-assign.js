@@ -141,13 +141,12 @@
  */
 
 import Logger from '../../core/logger.js';
-import BasePlugin from './base-plugin.js';
-import SADatabase from '../utils/sa-database.js';
+import S3PluginBase from './s3-plugin-base.js';
 import SASwapExecutor from '../utils/sa-swap-executor.js';
 import SAEventLogger from '../utils/sa-event-logger.js';
 import { evaluateTeamAssignment, getRating, getPenalty, computeScore } from '../utils/sa-team-evaluator.js';
 
-export default class SmartAssign extends BasePlugin {
+export default class SmartAssign extends S3PluginBase {
   static version = '1.1.1';
 
   static get description() {
@@ -208,16 +207,17 @@ export default class SmartAssign extends BasePlugin {
   constructor(server, options, connectors) {
     super(server, options, connectors);
 
-    this.db = new SADatabase({
-      enableDatabaseLogging: this.options.enableDatabaseLogging === true
-    });
-    this._s3 = null;  // Runtime discovery of SlackersSquadServices
+    this._saDbLoggingEnabled = this.options.enableDatabaseLogging === true;
     this.executor = new SASwapExecutor(server, {
       retryIntervalMs: 50,
       maxCompletionTimeMs: 3000,
       s3: this._s3  // S³ reference for canAct preemption check in retry branch
     });
-    this.eventLogger = new SAEventLogger(options, this.db);
+    // Build a lightweight DB delegate for SAEventLogger (sa-database.js was inlined here in Stage 8)
+    const dbDelegate = {
+      logAssignmentEvent: (event) => this._saLogAssignmentEvent(event)
+    };
+    this.eventLogger = new SAEventLogger(options, dbDelegate);
 
      this._joiningPlayers = new Set();
      this._sessionJoinTimes = new Map();
@@ -282,52 +282,60 @@ export default class SmartAssign extends BasePlugin {
 
   async mount() {
     await super.mount();
-    Logger.verbose('SmartAssign', 1, 'Mounting SmartAssign plugin.');
 
+    // At this point S³ is discovered, ready, _s3db cached, and _onS3Ready() completed.
+    // Wire event listeners — business logic, not S³ boilerplate.
+    this.server.on('NEW_GAME', this.onNewGame);
+    this.server.on('ROUND_ENDED', this.onRoundEnded);
+    this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
+    this.server.on('S3_PLAYER_JOINED', this.onS3PlayerJoined);
+    this.server.on('S3_PLAYER_LEFT', this.onS3PlayerLeft);
+    this.ready = true;
+    Logger.verbose('SmartAssign', 1, 'SmartAssign mounted successfully.');
+  }
+
+  /**
+   * _onS3Ready — S³ lifecycle hook (called by S3PluginBase.mount() after _s3.ready()).
+   * Handles EloTracker discovery, DB model definition, migration registration,
+   * Switch handshake discovery, refresh interest registration, and restart recovery.
+   * Replaces the old inline mount() S³ boilerplate.
+   */
+  async _onS3Ready() {
+    Logger.verbose('SmartAssign', 1, 'S³ ready — initialising SA services.');
+
+    // EloTracker discovery
     this.eloTracker = this.server.plugins.find((p) => p.constructor.name === 'EloTracker') || null;
     if (this.eloTracker && typeof this.eloTracker.getMu !== 'function') {
       Logger.verbose('SmartAssign', 1, '[SmartAssign] Warning: EloTracker found but getMu() is missing. Falling back to population-only/internal-props.');
     }
 
-    // S³ runtime discovery — required, no fallback
-    const s3 = this.server.plugins.find((p) => p.constructor.name === 'SlackersSquadServices');
-    if (!s3) {
-      throw new Error('[S3] SlackersSquadServices is required for SmartAssign to function. Ensure it is in config.json before SmartAssign and restart.');
-    }
-    this._s3 = s3;
-    this.executor._s3 = s3;  // Update executor's reference for canAct guard
-    Logger.verbose('SmartAssign', 2, '[S3] Discovered SlackersSquadServices for SmartAssign.');
-
-    // 7.4k-3: Wait for S³ to finish mounting before accessing its services
-    await this._s3.ready();
-    Logger.verbose('SmartAssign', 2, '[S3] S³ is fully mounted — proceeding with migration registration.');
+    // Update executor's S³ reference for canAct guard
+    this.executor._s3 = this._s3;
 
     // ═══════════════════════════════════════════════════════════════
-    // 8.2a: Define SA model on S³ connector + inject s3db into SADatabase
+    // Define SA model on S³ connector + inject s3db into SADatabase
     // ═══════════════════════════════════════════════════════════════
-    const s3db = this._s3.db;
-    if (s3db?.isReady()) {
-      // Define SA_AssignmentLog model (idempotent — defineModel caches)
-      s3db.defineModel('SA_AssignmentLog', {
-        id: { type: s3db.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
-        matchId: { type: s3db.getDataTypes().STRING, allowNull: true },
-        roundStartTime: { type: s3db.getDataTypes().BIGINT, allowNull: true },
-        ts: { type: s3db.getDataTypes().BIGINT, allowNull: false },
+    if (this._s3db?.isReady()) {
+      this.defineModel('SA_AssignmentLog', {
+        id: { type: this._s3db.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
+        matchId: { type: this._s3db.getDataTypes().STRING, allowNull: true },
+        roundStartTime: { type: this._s3db.getDataTypes().BIGINT, allowNull: true },
+        ts: { type: this._s3db.getDataTypes().BIGINT, allowNull: false },
         eventType: {
-          type: s3db.getDataTypes().STRING,
+          type: this._s3db.getDataTypes().STRING,
           allowNull: false,
           validate: {
             isIn: [['MOVE_SUCCESS', 'MOVE_FAILED', 'MOVE_RETRY']]
           }
         },
-        eosID: { type: s3db.getDataTypes().STRING, allowNull: true },
-        steamID: { type: s3db.getDataTypes().STRING, allowNull: true },
-        name: { type: s3db.getDataTypes().STRING, allowNull: true },
-        targetTeamID: { type: s3db.getDataTypes().INTEGER, allowNull: true },
-        reason: { type: s3db.getDataTypes().STRING, allowNull: true },
-        attempt: { type: s3db.getDataTypes().INTEGER, allowNull: true },
-        method: { type: s3db.getDataTypes().STRING, allowNull: true },
-        metadata: { type: s3db.getDataTypes().JSON, allowNull: true }
+        eosID: { type: this._s3db.getDataTypes().STRING, allowNull: true },
+        steamID: { type: this._s3db.getDataTypes().STRING, allowNull: true },
+        name: { type: this._s3db.getDataTypes().STRING, allowNull: true },
+        targetTeamID: { type: this._s3db.getDataTypes().INTEGER, allowNull: true },
+        reason: { type: this._s3db.getDataTypes().STRING, allowNull: true },
+        attempt: { type: this._s3db.getDataTypes().INTEGER, allowNull: true },
+        method: { type: this._s3db.getDataTypes().STRING, allowNull: true },
+        metadata: { type: this._s3db.getDataTypes().JSON, allowNull: true }
       }, {
         tableName: 'SA_AssignmentLog',
         timestamps: false,
@@ -338,9 +346,6 @@ export default class SmartAssign extends BasePlugin {
         ]
       });
 
-      // Inject S³ DBService into SADatabase delegate
-      this.db._s3db = s3db;
-
       Logger.verbose('SmartAssign', 2, '[8.2] SA_AssignmentLog model defined on S³ connector.');
     } else {
       Logger.verbose('SmartAssign', 1, '[8.2] S³ DB not ready — SA_AssignmentLog model not defined.');
@@ -350,10 +355,9 @@ export default class SmartAssign extends BasePlugin {
     // SCHEMA MIGRATION: Register SA v1 (create SA_AssignmentLog) + v2 (drop 4 orphan tables)
     // ═══════════════════════════════════════════════════════════════
     try {
-      if (s3db?.isReady() && s3db.migrationEngine) {
-        s3db.registerExpectedVersion('smart-assign', 2);
-
-        s3db.migrationEngine.registerMigrations('smart-assign', [
+      if (this._s3db?.isReady() && this._s3db.migrationEngine) {
+        this.registerExpectedVersion('smart-assign', 2);
+        this.registerMigrations('smart-assign', [
           {
             version: 1,
             description: 'Create SA_AssignmentLog table (replaces old SmartAssignReconnectMemory, SmartAssignState, SA_RoundSummary, SA_PlayerEvent)',
@@ -409,23 +413,7 @@ export default class SmartAssign extends BasePlugin {
             }
           }
         ]);
-        // Re-verify schema versions now that SA has registered, then run the migration
-        const recheck = await s3db.verifySchemaVersions();
-        if (!recheck.upToDate) {
-          Logger.verbose('SmartAssign', 1, `[8.2] SA has ${recheck.pending.length} pending migration(s) — applying now.`);
-          const result = await s3db.migrationEngine.runMigrations('smart-assign');
-          Logger.verbose('SmartAssign', 1, `[8.2] SA migration(s) complete: applied=${result.applied}, skipped=${result.skipped}.`);
-
-          // Re-verify again after migration to confirm up-to-date status
-          const postCheck = await s3db.verifySchemaVersions();
-          if (!postCheck.upToDate) {
-            Logger.verbose('SmartAssign', 1, `[8.2] WARNING: ${postCheck.pending.length} migration(s) still pending after run.`);
-          } else {
-            Logger.verbose('SmartAssign', 2, '[8.2] SA schema is now up to date (v2).');
-          }
-        } else {
-          Logger.verbose('SmartAssign', 2, '[8.2] SA schema already up to date.');
-        }
+        await this.verifyAndRunMigrations('smart-assign');
       } else {
         Logger.verbose('SmartAssign', 1, '[8.2] S³ DB or migrationEngine not available — skipping migration registration.');
       }
@@ -474,43 +462,37 @@ export default class SmartAssign extends BasePlugin {
     if (recoveredStart) {
       Logger.verbose('SmartAssign', 1, `Restart detected. Resuming round from S³ roundStartTime: ${new Date(recoveredStart).toISOString()}`);
     } else {
-      // New round or no data
       Logger.verbose('SmartAssign', 1, 'New round or no persisted S³ state. Starting fresh.');
-
-      // Flush any leftover assignments from a previous crashed session
       await this.eventLogger.flushAssignmentLog();
     }
-
-      this.server.on('NEW_GAME', this.onNewGame);
-      this.server.on('ROUND_ENDED', this.onRoundEnded);
-      this.server.on('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
-
-      // S³ event subscribers (Stage 4 — active assignment path)
-      this.server.on('S3_PLAYER_JOINED', this.onS3PlayerJoined);
-      this.server.on('S3_PLAYER_LEFT', this.onS3PlayerLeft);
-       this.ready = true;
-     Logger.verbose('SmartAssign', 1, 'SmartAssign mounted successfully.');
   }
 
   async unmount() {
     this.ready = false;
+    await super.unmount();
+    // super.unmount() calls _onUnmount() then clears _s3db
+  }
+
+  /**
+   * _onUnmount — S³ lifecycle hook (called by S3PluginBase.unmount()).
+   * Handles cleanup: listener removal, executor cleanup, refresh interest cleanup.
+   */
+  async _onUnmount() {
     this.eventLogger.cleanup();
     await this.eventLogger.flushAssignmentLog();
-    // Unregister S³ refresh interest
     const unmountPlayers = this._s3?.players;
     if (unmountPlayers?.isReady() && unmountPlayers.unregisterRefreshInterest) {
       unmountPlayers.unregisterRefreshInterest('SmartAssign');
     }
-     this.server.removeListener('NEW_GAME', this.onNewGame);
-     this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
-     this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
-     this.server.removeListener('S3_PLAYER_JOINED', this.onS3PlayerJoined);
-     this.server.removeListener('S3_PLAYER_LEFT', this.onS3PlayerLeft);
+    this.server.removeListener('NEW_GAME', this.onNewGame);
+    this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
+    this.server.removeListener('TEAM_BALANCER_SCRAMBLE_EXECUTED', this.onScrambleExecuted);
+    this.server.removeListener('S3_PLAYER_JOINED', this.onS3PlayerJoined);
+    this.server.removeListener('S3_PLAYER_LEFT', this.onS3PlayerLeft);
     this._pendingPlayerMoves.clear();
     this.executor.cleanup();
     Logger.verbose('SmartAssign', 1, 'SmartAssign unmounted.');
-     await super.unmount();
-   }
+  }
 
   // ═══════════════════════════════════════════════════════════════════════════════════
   // EVENT: NEW_GAME (Round Start)
@@ -1124,6 +1106,39 @@ export default class SmartAssign extends BasePlugin {
     }
 
     return { shouldOverride: false, reason: `Scoring threshold not met (base=${baselineScore.toFixed(2)}, virt=${virtualScore.toFixed(2)}, threshold=${threshold})` };
+  }
+
+  /**
+   * Inlined from the former sa-database.js (deleted in Stage 8 cleanup).
+   * Writes a single assignment event to SA_AssignmentLog.
+   * Uses base class methods: this._getModel(), this._withDb().
+   * No-op when enableDatabaseLogging is false.
+   */
+  async _saLogAssignmentEvent(event) {
+    if (!this._saDbLoggingEnabled) return;
+    if (!this._s3db?.isReady()) return;
+
+    await this._withDb(async (t) => {
+      const model = this._getModel('SA_AssignmentLog');
+      if (!model) {
+        Logger.verbose('SmartAssign', 1, '[DB] SA_AssignmentLog model not found on S³ connector. Skipping write.');
+        return;
+      }
+      await model.create({
+        matchId: event.matchId || null,
+        roundStartTime: event.roundStartTime || null,
+        ts: event.ts || Date.now(),
+        eventType: event.eventType,
+        eosID: event.eosID || null,
+        steamID: event.steamID || null,
+        name: event.name || null,
+        targetTeamID: event.targetTeamID != null ? Number(event.targetTeamID) : null,
+        reason: event.reason || null,
+        attempt: event.attempt != null ? Number(event.attempt) : null,
+        method: event.method || null,
+        metadata: event.metadata || null
+      }, { transaction: t });
+    });
   }
 
   async _queryEloDBForTag(eosID) {
