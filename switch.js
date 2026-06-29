@@ -1184,6 +1184,21 @@ export default class Switch extends S3DiscordPluginBase {
             this.verbose(2, `[Queue] Processing already in progress — skipping concurrent invocation.`);
             return;
         }
+
+        // UNIFIED LOCK GATE: If a higher-priority plugin holds a global or per-player lock,
+        // defer queue processing. The canAct call on the first queued player acts as a
+        // proxy for the global lock check — canAct() checks both global and per-player locks
+        // internally. If no queued players, use null to test the global lock alone.
+        const queueLockPlayers = this._s3?.players;
+        if (queueLockPlayers?.isReady?.()) {
+            const anyEosID = this._getQueueSize() > 0
+                ? (this._switchQueue.t1[0]?.eosID || this._switchQueue.t2[0]?.eosID)
+                : null;
+            if (!queueLockPlayers.canAct(anyEosID, 'Switch')) {
+                this.verbose(2, `[Queue] Deferred — higher-priority lock held.`);
+                return;
+            }
+        }
         
         this._queueProcessing = true;
         try {
