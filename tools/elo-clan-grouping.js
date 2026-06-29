@@ -6,21 +6,19 @@
  *
  * ⛔ DEPRECATED as of Stage 2 Phase D (2026-06-22).
  *
- * This module has been superseded by S³ ClansService
- * (SlackersSquadServices/utils/clans-service.js), which provides
- * identical extractRawPrefix(), normalizeTag(), levenshteinDistance(),
- * and extractClanGroups() implementations backed by the project's
- * single-source-of-truth clan extraction logic.
+ * This file is preserved for backward compatibility with existing
+ * CLI tooling and standalone workflows. It is NOT used by the S³
+ * plugin runtime.
  *
- * This copy is RETAINED ONLY for standalone CLI tools and test scripts
- * that run outside the SquadJS plugin process:
+ * Superseded by: S³ ClansService (SlackersSquadServices/utils/clans-service.js)
+ * See: DesignDocs/AI_Agents_Overview.md — Service Access
+ *
+ * To be removed: Stage 9
+ *
+ * RETAINED ONLY for standalone CLI tools and test scripts:
  *   - tools/elo-inspect.js
  *   - tools/elo-clans-audit.js
  *   - testing/test-clan-grouping.js
- *
- * The runtime plugin (utils/elo-discord.js, elo-tracker.js) now uses
- * S³ ClansService via this._s3.services.clans.* with automatic
- * fallback to this module when S³ is not available.
  *
  * DO NOT add new imports of this file in plugin/runtime code.
  * DO NOT modify this file's algorithms — they are frozen for

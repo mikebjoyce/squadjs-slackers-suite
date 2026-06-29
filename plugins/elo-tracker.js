@@ -5,15 +5,18 @@
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Main SquadJS plugin entry point. Orchestrates session tracking,
- * ELO calculation, database persistence, Discord integration, and
- * in-game command handling across the round lifecycle. Provides
- * TrueSkill-based skill ratings that persist across server restarts.
+ * TrueSkill-based player skill rating tracker that persists across
+ * server restarts. Orchestrates session tracking, ELO calculation,
+ * database persistence (Elo_PlayerStats, Elo_RoundHistory,
+ * Elo_RoundPlayers), Discord integration, and in-game command
+ * handling across the round lifecycle. Extends S3PluginBase for S³
+ * service discovery, DB convenience, and readiness gating. Schema
+ * versioning via MigrationEngine.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * EloTracker (default)
- *   Extends BasePlugin. Registers and handles all SquadJS events.
+ *   Extends S3PluginBase. Registers and handles all SquadJS events.
  *   Key public methods:
  *     mount()                     — Initialises DB, session, Discord channels, and listeners.
  *     unmount()                   — Removes all listeners and clears ready state.
@@ -23,8 +26,9 @@
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
- * BasePlugin (./base-plugin.js)
- *   SquadJS base class providing server, options, and connectors.
+ * S3PluginBase (./s3-plugin-base.js)
+ *   S³ plugin base class providing S³ discovery, readiness gating, DB convenience,
+ *   and flat service accessors. Extends SquadJS BasePlugin under the hood.
  * Logger (../../core/logger.js)
  *   Verbose logging throughout all event handlers.
  * EloDatabase (../utils/elo-database.js)

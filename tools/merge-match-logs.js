@@ -1,3 +1,15 @@
+/**
+ * ⚠️ DEPRECATED
+ * This file is preserved for backward compatibility with existing
+ * CLI tooling and standalone workflows. It is NOT used by the S³
+ * plugin runtime.
+ *
+ * Superseded by: S³ backup/export system (s3-export-import.js)
+ * See: SlackersSquadServices/utils/s3-export-import.js
+ *
+ * To be removed: Stage 9
+ */
+
 import { readFileSync, writeFileSync } from 'fs';
 
 // --- Config ---
