@@ -46,15 +46,19 @@
  *
  * - Falls back to no-op mode when no Sequelize connector is available.
  * - SchemaVersion enables per-plugin version tracking (replaces old
- *   flat S3_Migrations table from Stage 7.4b).
+ *   flat S3_Migrations table pattern).
  * - The MigrationEngine does NOT auto-run on startup — migrations are
- *   gated behind Discord confirmation (7.4d).
+ *   gated behind Discord confirmation (7.4d) or the autoMigrate config option.
  * - SQLite operations are serialized through a per-connector mutex to
  *   prevent concurrent write contention.
  * - Retry defaults: 5 attempts, 200ms base delay, 500ms jitter.
  * - Backup/migration assumes a single shared SQLite file. On mount, a
  *   diagnostic checks for multiple SQLite storage paths in the connectors
  *   map and warns if backup/migration coverage is partial. See getDatabasePath().
+ * - getModelNames() returns all Sequelize model names registered with
+ *   defineModel(), used by s3-export-import.js for backup/restore.
+ * - canBackup(connector) returns true for all connectors, enabling the
+ *   connector-agnostic JSON export/import fallback in s3-export-import.js.
  *
  */
 import MigrationEngine from './migration-engine.js';

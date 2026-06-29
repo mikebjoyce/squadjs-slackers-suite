@@ -36,6 +36,9 @@
  * ─── NOTES ───────────────────────────────────────────────────────
  *
  * - Lock priority ordering: TeamBalancer(3) > SmartAssign(2) > Switch(1).
+ * - registerPriority('MyPlugin', 4) allows third-party plugins to
+ *   register a custom priority level — extensible beyond the hardcoded map.
+ *   Plugins that call lock()/canAct() without registering get fallback priority 0.
  * - Null-teamID projection: When teams go null after NEW_GAME, a
  *   projected player list is served with teams flipped 1↔2.
  * - Emitted events: S3_PLAYER_JOINED, S3_PLAYER_LEFT,

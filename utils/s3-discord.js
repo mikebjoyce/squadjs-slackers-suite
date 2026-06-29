@@ -36,8 +36,9 @@
  * - All !s3 commands are gated to the configured admin channel only.
  * - Watch relay intercepts plugin.verbose() using an interceptor
  *   pattern; automatically expires after 5 minutes by default.
- * - s3-commands.js holds all embed builders, test runners, and
- *   command handler logic — this file only wires it to Discord.
+ * - Command handlers, embed builders, and test runners live in
+ *   s3-commands.js (extracted 8.4a) — this file is Discord
+ *   infrastructure only (channel setup, message listener, watch relay).
  *
  */
 import { createCommandHandlers, buildHelpEmbed } from './s3-commands.js';

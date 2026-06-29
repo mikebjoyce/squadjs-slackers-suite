@@ -13,7 +13,7 @@
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * createCommandHandlers(context)
- *   Returns { handlers: Map<string, handlerFn>, runPreflightCheck, runSmokeTest }
+ *   Returns { handlers: Map<string, handlerFn>, runDiagnostic }
  *   where handlerFn is (plugin, message, args) => Promise<void>.
  *
  * Utility:  formatDuration, phaseEmoji, checkmark, truncate
@@ -21,7 +21,16 @@
  *           buildFactionsEmbed, buildPlayersEmbed, buildClansEmbed,
  *           buildLocksEmbed, buildConfigEmbed, buildEventsEmbed,
  *           buildHelpEmbed
- * Tests:    runPreflightCheck, runSmokeTest  (inject sendDiscordMessage)
+ * Tests:    runDiagnostic  (inject sendDiscordMessage)
+ *
+ * ─── DEPRECATED ─────────────────────────────────────────────────
+ *
+ * The watch relay feature (!s3 watch / !s3 unwatch) was not useful
+ * in production testing and is kept only for reference. Search for
+ * the tag "S3_WATCH_DEPRECATED" to find all disabled code blocks.
+ *
+ * The old two-command test surface (!s3 test preflight + !s3 test smoke)
+ * was replaced by a single consolidated !s3 diag command.
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
@@ -503,8 +512,9 @@ export function buildHelpEmbed() {
       {
         name: '🔬 Debug',
         value: [
-          '`!s3 watch <service>` — Relay verbose logs (gameState|players|factions|clans|db)',
-          '`!s3 unwatch` — Stop all watches',
+          // S3_WATCH_DEPRECATED — commented out; watch was not useful in testing.
+          // '`!s3 watch <service>` — Relay verbose logs [...]',
+          // '`!s3 unwatch` — Stop all watches',
           '`!s3 events` — Recent event history (last 20)'
         ].join('\n'),
         inline: false
@@ -527,16 +537,16 @@ export function buildHelpEmbed() {
           '`!s3 migrate pending` — Show pending schema migrations',
           '`!s3 migrate status` — Show schema version status per plugin',
           '`!s3 migrate force [--dry-run]` — Run pending migrations',
+          '`!s3 backup create` — Create a backup now (JSON, connector-agnostic)',
           '`!s3 backup list` — List backups (SQLite + JSON)',
           '`!s3 backup restore <filename>` — Restore from file backup (auto-detects format)'
         ].join('\n'),
         inline: false
       },
       {
-        name: '🧪 Testing',
+        name: '🧪 Diagnostic',
         value: [
-          '`!s3 test preflight` — Run §0 pre-flight checklist',
-          '`!s3 test smoke` — Run Phase 1 smoke tests (read-only)'
+          '`!s3 diag` — Run all service checks (mounts, phase, factions, players, locks)'
         ].join('\n'),
         inline: false
       },
@@ -554,165 +564,90 @@ export function buildHelpEmbed() {
 }
 
 // ============================================================================
-// Automated Test Runners
+// Automated Diagnostic (consolidated — replaces separate preflight + smoke)
 // ============================================================================
 
-export async function runPreflightCheck(plugin, message, sendDiscordMessage) {
-  const services = plugin.services;
-  const results = [];
-
-  // §0 Pre-flight checks
-  const allMounted = [
-    { key: 'serverConfig', label: 'serverConfig mounted', svc: services.serverConfig },
-    { key: 'db', label: 'db mounted', svc: services.db },
-    { key: 'gameState', label: 'gameState mounted', svc: services.gameState },
-    { key: 'factions', label: 'factions mounted', svc: services.factions },
-    { key: 'clans', label: 'clans mounted', svc: services.clans },
-    { key: 'players', label: 'players mounted', svc: services.players }
-  ];
-
-  for (const { key, label, svc } of allMounted) {
-    const mounted = svc?._isMounted ?? svc?.isReady?.() ?? false;
-    results.push({ check: label, pass: mounted, detail: mounted ? 'OK' : 'NOT MOUNTED' });
-  }
-
-  results.push({
-    check: 'Mount order correct',
-    pass: true,
-    detail: 'serverConfig → db → gameState → factions → clans → players (verified at build time)'
-  });
-
-  const allPassed = results.every((r) => r.pass);
-
-  const fields = results.map((r) => ({
-    name: r.check,
-    value: `${checkmark(r.pass)} ${r.detail}`,
-    inline: false
-  }));
-
-  fields.push({
-    name: allPassed ? '✅ Pre-Flight: PASSED' : '❌ Pre-Flight: FAILED',
-    value: allPassed
-      ? 'All checks passed. Ready for Stage 3 testing.'
-      : `${results.filter((r) => !r.pass).length} check(s) failed. Fix before proceeding.`,
-    inline: false
-  });
-
-  await sendDiscordMessage(message.channel, {
-    embeds: [{
-      color: allPassed ? 0x2ecc71 : 0xe74c3c,
-      title: '🧪 S³ Pre-Flight Check (§0)',
-      fields,
-      timestamp: new Date().toISOString()
-    }]
-  }, 'S3', (...args) => plugin.verbose(...args));
-}
-
-export async function runSmokeTest(plugin, message, sendDiscordMessage) {
+/**
+ * Run a consolidated diagnostic across all S³ services.
+ * Combines the old §0 pre-flight checks and §1 smoke tests into a single
+ * embed. All checks are read-only.
+ *
+ * @param {object} plugin - S³ plugin instance
+ * @param {object} message - Discord message
+ * @param {Function} sendDiscordMessage - Message sender
+ */
+export async function runDiagnostic(plugin, message, sendDiscordMessage) {
   const services = plugin.services;
   const gs = services.gameState;
   const factions = services.factions;
   const players = services.players;
   const results = [];
 
-  // §1.1 — Service availability
-  results.push({
-    check: '§1.1 — All services mounted',
-    pass: services.gameState?._isMounted && services.factions?._isMounted &&
-      services.players?._isMounted && services.clans?._isMounted &&
-      services.db?._isMounted && services.serverConfig?._isMounted,
-    detail: '6/6 services'
-  });
+  // ── Service mounts ────────────────────────────────────────────
+  const allMounted = [
+    { label: 'serverConfig mounted', svc: services.serverConfig },
+    { label: 'db mounted', svc: services.db },
+    { label: 'gameState mounted', svc: services.gameState },
+    { label: 'factions mounted', svc: services.factions },
+    { label: 'clans mounted', svc: services.clans },
+    { label: 'players mounted', svc: services.players }
+  ];
 
-  // §1.1 — Game phase readable
+  for (const { label, svc } of allMounted) {
+    const mounted = svc?._isMounted ?? svc?.isReady?.() ?? false;
+    results.push({ label, pass: mounted, detail: mounted ? 'OK' : 'NOT MOUNTED' });
+  }
+
+  // ── Game state ────────────────────────────────────────────────
   const phase = gs?.getPhase?.() ?? null;
-  results.push({
-    check: '§1.1 — Game phase readable',
-    pass: !!phase,
-    detail: `Phase: ${phase ?? 'NULL'}`
-  });
+  results.push({ label: 'Game phase readable', pass: !!phase, detail: `Phase: ${phase ?? 'NULL'}` });
 
-  // §1.3 — Gamemode/layer
   const mode = gs?.getGamemode?.() ?? 'N/A';
-  results.push({
-    check: '§1.3 — Gamemode resolved',
-    pass: mode !== 'Unknown' && mode !== 'N/A',
-    detail: `Mode: ${mode}`
-  });
+  results.push({ label: 'Gamemode resolved', pass: mode !== 'Unknown' && mode !== 'N/A', detail: `Mode: ${mode}` });
 
   const layer = gs?.getLayerName?.() ?? 'N/A';
-  results.push({
-    check: '§1.3 — Layer name resolved',
-    pass: layer !== 'Unknown' && layer !== 'N/A',
-    detail: `Layer: ${layer}`
-  });
+  results.push({ label: 'Layer name resolved', pass: layer !== 'Unknown' && layer !== 'N/A', detail: `Layer: ${layer}` });
 
-  // §1.2 — Faction names
+  // ── Factions ──────────────────────────────────────────────────
   const t1 = factions?.getTeamName?.(1) ?? 'Team 1';
   const t2 = factions?.getTeamName?.(2) ?? 'Team 2';
-  results.push({
-    check: '§1.2 — Team 1 name',
-    pass: t1 !== 'Team 1',
-    detail: t1
-  });
-  results.push({
-    check: '§1.2 — Team 2 name',
-    pass: t2 !== 'Team 2',
-    detail: t2
-  });
+  results.push({ label: 'Team 1 name resolved', pass: t1 !== 'Team 1', detail: t1 });
+  results.push({ label: 'Team 2 name resolved', pass: t2 !== 'Team 2', detail: t2 });
 
-  // §1.4 — Player tracking
+  // ── Players ───────────────────────────────────────────────────
   const allPlayers = players?.getAllPlayers?.() ?? [];
-  results.push({
-    check: '§1.4 — Player registry populated',
-    pass: allPlayers.length > 0,
-    detail: `${allPlayers.length} players tracked`
-  });
+  results.push({ label: 'Player registry populated', pass: allPlayers.length > 0, detail: `${allPlayers.length} players tracked` });
 
   const teamsResolved = players?.areTeamsResolved?.() ?? false;
-  results.push({
-    check: '§1.4 — Teams resolved',
-    pass: teamsResolved,
-    detail: teamsResolved ? 'All players have teamID 1 or 2' : 'Some players still resolving'
-  });
+  results.push({ label: 'Teams resolved', pass: teamsResolved, detail: teamsResolved ? 'All have teamID 1 or 2' : 'Some still resolving' });
 
-  // §1.3 — isIgnoredMode functional
-  results.push({
-    check: '§1.3 — isIgnoredMode() functional',
-    pass: typeof gs?.isIgnoredMode === 'function',
-    detail: `Returns: ${gs?.isIgnoredMode?.() ?? 'N/A'}`
-  });
+  // ── Lock system ───────────────────────────────────────────────
+  results.push({ label: 'Lock system functional', pass: typeof players?.lockGlobal === 'function' && typeof players?.canAct === 'function', detail: 'lock/canAct/unlock APIs available' });
 
-  // Lock system functional
-  results.push({
-    check: 'Lock system functional',
-    pass: typeof players?.lockGlobal === 'function' && typeof players?.canAct === 'function',
-    detail: 'lock/canAct/unlock APIs available'
-  });
-
+  // ── Summary ────────────────────────────────────────────────────
   const passed = results.filter((r) => r.pass).length;
   const total = results.length;
   const allPassed = passed === total;
 
   const fields = results.map((r) => ({
-    name: r.check,
+    name: r.label,
     value: `${checkmark(r.pass)} ${r.detail}`,
     inline: false
   }));
 
   fields.push({
-    name: allPassed ? '✅ Smoke Test: PASSED' : `⚠️ Smoke Test: ${passed}/${total} PASSED`,
+    name: allPassed ? '✅ All Checks Passed' : `⚠️ ${passed}/${total} Passed`,
     value: allPassed
-      ? 'All smoke tests passed. Proceed to Phase 2 integration tests.'
-      : `${total - passed} test(s) failed. Review failures before proceeding.`,
+      ? 'S³ services appear healthy.'
+      : `${total - passed} check(s) failed. Review the results above.`,
     inline: false
   });
 
   await sendDiscordMessage(message.channel, {
     embeds: [{
       color: allPassed ? 0x2ecc71 : 0xf39c12,
-      title: '🧪 S³ Smoke Tests (Phase 1)',
-      description: 'Read-only checks against live service state.',
+      title: '🩺 S³ Diagnostic',
+      description: 'Consolidated service health check (read-only).',
       fields,
       timestamp: new Date().toISOString()
     }]
@@ -730,7 +665,7 @@ export async function runSmokeTest(plugin, message, sendDiscordMessage) {
  * @param {Function} context.sendDiscordMessage - Discord message sender
  * @param {WatchManager} context.watchManager - Watch relay instance
  * @param {object} context.stagedImportRef - { current: null|object } for import staging
- * @returns {{ handlers: Map<string, Function>, runPreflightCheck: Function, runSmokeTest: Function }}
+ * @returns {{ handlers: Map<string, Function>, runDiagnostic: Function }}
  */
 export function createCommandHandlers(context) {
   const { sendDiscordMessage, watchManager, stagedImportRef } = context;
@@ -786,6 +721,12 @@ export function createCommandHandlers(context) {
 
   // ── Debug ─────────────────────────────────────────────────────
 
+  // S3_WATCH_DEPRECATED — watch relay was not useful in production testing.
+  // The WatchManager class still exists in s3-discord.js for reference.
+  // If re-enabled, uncomment the two handler registrations below and the
+  // watch/unwatch lines in buildHelpEmbed().
+  //
+  /*
   handlers.set('watch', async (plugin, message, args) => {
     const validServices = ['gamestate', 'players', 'factions', 'clans', 'db'];
     const target = args[1]?.toLowerCase();
@@ -822,35 +763,12 @@ export function createCommandHandlers(context) {
       }]
     }, 'S3', (...a) => plugin.verbose(...a));
   });
+  */
 
-  // ── Testing ───────────────────────────────────────────────────
+  // ── Diagnostic ────────────────────────────────────────────────
 
-  handlers.set('test', async (plugin, message, args) => {
-    const testSub = args[1]?.toLowerCase();
-
-    if (testSub === 'preflight') {
-      await runPreflightCheck(plugin, message, sendDiscordMessage);
-      return;
-    }
-
-    if (testSub === 'smoke') {
-      await runSmokeTest(plugin, message, sendDiscordMessage);
-      return;
-    }
-
-    if (testSub === 'phase2') {
-      await sendDiscordMessage(message.channel, {
-        embeds: [{
-          color: 0xf39c12,
-          title: '⚠️ Phase 2 Tests Not Yet Implemented',
-          description: '`!s3 test phase2` is planned but not yet built. Phase 2 tests require consumer plugins (TB, SA, Switch, Elo) to be present and active — S³ can verify its own side but cannot trigger TB scrambles or Elo ratings automatically. Manual testing per `DesignDocs/stage3-testing-plan.md` §2 is recommended for now.',
-          timestamp: new Date().toISOString()
-        }]
-      }, 'S3', (...a) => plugin.verbose(...a));
-      return;
-    }
-
-    await message.reply('Usage: `!s3 test <preflight|smoke>`');
+  handlers.set('diag', async (plugin, message, args) => {
+    await runDiagnostic(plugin, message, sendDiscordMessage);
   });
 
   // ── Migrate ───────────────────────────────────────────────────
@@ -974,7 +892,7 @@ export function createCommandHandlers(context) {
       const backups = listBackups();
       if (backups.length === 0) {
         await sendDiscordMessage(message.channel, {
-          embeds: [{ color: 0x95a5a6, title: '📦 No Backups Found', description: 'No database backups have been created yet. Run a migration with `!s3 migrate force` to trigger a backup first.', timestamp: new Date().toISOString() }]
+          embeds: [{ color: 0x95a5a6, title: '📦 No Backups Found', description: 'No database backups have been created yet. Use `!s3 backup create` to create one now, or run a migration with `!s3 migrate force` to trigger a backup first.', timestamp: new Date().toISOString() }]
         }, 'S3', (...a) => plugin.verbose(...a));
         return;
       }
@@ -1093,7 +1011,52 @@ export function createCommandHandlers(context) {
       return;
     }
 
-    await message.reply('Usage: `!s3 backup <list|restore [--confirm] <filename>>`');
+    // ── !s3 backup create ─────────────────────────────────────────
+    if (backupSub === 'create') {
+      const db = plugin.services?.db;
+      if (!db?.isReady()) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xe74c3c, title: '❌ DB Service Not Ready', description: 'The database service is not mounted.', timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      try {
+        const result = await exportToFile(db, null, { tier: 'all', retention: 5 });
+        if (!result) {
+          await sendDiscordMessage(message.channel, {
+            embeds: [{ color: 0xe74c3c, title: '❌ Backup Failed', description: 'Could not create backup. Check disk space and permissions.', timestamp: new Date().toISOString() }]
+          }, 'S3', (...a) => plugin.verbose(...a));
+          return;
+        }
+
+        await sendDiscordMessage(message.channel, {
+          embeds: [{
+            color: 0x2ecc71,
+            title: '✅ Backup Created',
+            description: `Saved \`${result.filename}\` (${result.sizeBytes} bytes) to \`backups/\` directory.`,
+            fields: [{
+              name: 'ℹ️',
+              value: 'Use `!s3 backup list` to see all available backups.',
+              inline: false
+            }],
+            timestamp: new Date().toISOString()
+          }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+      } catch (err) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{
+            color: 0xe74c3c,
+            title: '❌ Backup Failed',
+            description: `**${err.message}**`,
+            timestamp: new Date().toISOString()
+          }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+      }
+      return;
+    }
+
+    await message.reply('Usage: `!s3 backup <create|list|restore [--confirm] <filename>>`');
   });
 
   // ── Database (db) ─────────────────────────────────────────────
@@ -1402,7 +1365,6 @@ export function createCommandHandlers(context) {
 
   return {
     handlers,
-    runPreflightCheck: (plugin, message) => runPreflightCheck(plugin, message, sendDiscordMessage),
-    runSmokeTest: (plugin, message) => runSmokeTest(plugin, message, sendDiscordMessage)
+    runDiagnostic: (plugin, message) => runDiagnostic(plugin, message, sendDiscordMessage)
   };
 }

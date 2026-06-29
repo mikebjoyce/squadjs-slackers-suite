@@ -7,17 +7,21 @@
  *
  * S³ (Slacker's Squad Services) is the centralized service container
  * for shared state across SquadJS plugins. It composes and manages the
- * lifecycle of six services — gameState, serverConfig, db, factions,
- * clans, and players — and delegates SquadJS server events to them.
- * Consumer plugins (TeamBalancer, SmartAssign, Switch, EloTracker)
+ * lifecycle of seven services — serverConfig, db, gameState, factions,
+ * clans, players, and logging — and delegates SquadJS server events to
+ * them. Consumer plugins (TeamBalancer, SmartAssign, Switch, EloTracker)
  * discover S³ at runtime and access services via flat getters.
+ *
+ * Also manages the !s3 admin command surface (backup, export, import,
+ * db operations) through s3-discord.js → s3-commands.js dispatch, and
+ * hosts the MigrationEngine for version-ordered schema migrations.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * SlackersSquadServices (default)
  *   Extends BasePlugin. Key public methods:
- *     prepareToMount()           — Instantiates all 6 service instances.
- *     mount()                    — Mounts services in order (serverConfig→db→gameState→factions→clans→players),
+ *     prepareToMount()           — Instantiates all 7 service instances.
+ *     mount()                    — Mounts services in order (serverConfig→db→gameState→factions→clans→players→logging),
  *                                   binds server events, registers Discord !s3 commands.
  *     unmount()                  — Unbinds events, unmounts services in reverse order, cleans up Discord.
  *     handleNewGame(data)         — Delegates NEW_GAME to gameState and factions.
@@ -27,13 +31,14 @@
  *     handleUpdatedPlayerInfo(d)  — Delegates UPDATED_PLAYER_INFORMATION to gameState, factions, players.
  *     handlePlayerConnected(d)    — Delegates PLAYER_CONNECTED to players.
  *
- *   Flat accessors (Stage 5.2a):
+ *   Flat accessors:
  *     get gameState()             — Returns this.services.gameState.
  *     get serverConfig()          — Returns this.services.serverConfig.
  *     get db()                    — Returns this.services.db.
  *     get factions()              — Returns this.services.factions.
  *     get clans()                 — Returns this.services.clans.
  *     get players()               — Returns this.services.players.
+ *     get logging()               — Returns this.services.logging.
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *

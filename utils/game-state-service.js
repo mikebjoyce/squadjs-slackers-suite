@@ -49,6 +49,11 @@
  *   warns about lost sub-state visibility.
  * - Timer-based ENDGAME progression is approximate — actual voting may
  *   end early if enough players cast votes.
+ * - _transitionRecoveredStateToLive() backfills roundStartTime and
+ *   matchId to prevent null returns when a recovered round is invalidated.
+ * - _validateRecoveredState layer-name comparison normalises names
+ *   (strips underscores and hyphens) to avoid false divergences from
+ *   SquadJS layer-name format mismatches.
  *
  */
 

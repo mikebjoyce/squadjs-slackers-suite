@@ -56,10 +56,15 @@
  *
  * ─── NOTES ──────────────────────────────────────────────────────
  *
- * - This file replaces the old S3_Migrations table approach in
- *   db-service.js (7.4b). The new SchemaVersion table is per-plugin.
- * - 7.4d (Discord confirmation) and 7.4e (file backup) are stubbed;
- *   their integration points are marked with TODO comments.
+ * - This file replaces the old S3_Migrations table approach.
+ *   The new SchemaVersion table is per-plugin.
+ * - 7.4d (Discord confirmation) is stubbed; integration points are
+ *   marked with TODO comments.
+ * - 8.4b (connector-agnostic export fallback): When SQLite file-copy
+ *   backup is unavailable (non-SQLite connectors), the engine falls
+ *   back to JSON export/import via s3-export-import.js (exportToFile /
+ *   restoreFromFile). This ensures pre-migration backups work on
+ *   Postgres, MySQL, or any other Sequelize dialect.
  * - migrations must be idempotent where possible.
  *
  */
