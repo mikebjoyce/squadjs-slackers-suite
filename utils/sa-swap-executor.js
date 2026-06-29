@@ -172,8 +172,8 @@ export default class SASwapExecutor {
           }
 
           // Check if this move has been preempted by a higher-priority lock (e.g., TB scramble)
-          if (moveData.eosID && this._s3?.services?.players?.canAct) {
-            if (!this._s3.services.players.canAct(moveData.eosID, 'SmartAssign')) {
+          if (moveData.eosID && this._s3?.players?.canAct) {
+            if (!this._s3.players.canAct(moveData.eosID, 'SmartAssign')) {
               Logger.verbose('SmartAssign', 1, `[SwapExecutor] ${moveData.playerName} preempted by higher-priority lock — aborting retry.`);
               this.callbacks.onFailed?.({ playerKey, playerName: moveData.playerName, reason: 'PreemptedByLock' });
               playersToRemove.push(playerKey);

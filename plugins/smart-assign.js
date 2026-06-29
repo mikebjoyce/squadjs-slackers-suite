@@ -554,6 +554,12 @@ export default class SmartAssign extends S3PluginBase {
       this._pendingPlayerMoves.delete(pid);
     }
 
+    // Release per-player lock — this move failed
+    const unlockPlayers = this._s3?.players;
+    if (unlockPlayers?.isReady() && pid) {
+      unlockPlayers.unlock(pid, 'SmartAssign');
+    }
+
     const p = this.server.players.find((x) => (x.eosID || x.steamID) === pid) || { steamID: pid, name: playerName || 'Unknown' };
     Logger.verbose('SmartAssign', 1, `[SmartAssign] Abandoned move for ${p.name} (${pid}) - ${reason}`);
     this.logEvent('MOVE_FAILED', p, { reason }, false);
@@ -572,6 +578,12 @@ export default class SmartAssign extends S3PluginBase {
         this._pendingVeterans[move.targetTeam] = Math.max(0, this._pendingVeterans[move.targetTeam] - 1);
       }
       this._pendingPlayerMoves.delete(pid);
+    }
+
+    // Release per-player lock — this move succeeded
+    const unlockPlayers = this._s3?.players;
+    if (unlockPlayers?.isReady() && pid) {
+      unlockPlayers.unlock(pid, 'SmartAssign');
     }
 
     const p = this.server.players.find((x) => (x.eosID || x.steamID) === pid || x.name === data.name);
@@ -750,6 +762,26 @@ export default class SmartAssign extends S3PluginBase {
               this._pendingVeterans[finalTargetTeam]++;
             }
 
+            // Acquire per-player lock before queueing RCON move.
+            // This blocks lower-priority plugins (e.g., Switch) from acting on this player
+            // via manual !switch while the move is in progress.
+            const perPlayerLockPlayers = this._s3?.players;
+            let perPlayerLockAcquired = false;
+            if (perPlayerLockPlayers?.isReady() && playerKey) {
+              perPlayerLockAcquired = perPlayerLockPlayers.lock(playerKey, 'SmartAssign', 5000);
+              if (!perPlayerLockAcquired) {
+                Logger.verbose('SmartAssign', 1, `[SmartAssign] Cannot acquire per-player lock for ${player.name} — preempted by higher-priority actor. Skipping move.`);
+                // Roll back pending assignment counters since we're aborting
+                this._pendingAssignments[finalTargetTeam] = Math.max(0, this._pendingAssignments[finalTargetTeam] - 1);
+                this._pendingMu[finalTargetTeam] = Math.max(0, this._pendingMu[finalTargetTeam] - pendingPlayerMu);
+                if (isVeteran) {
+                  this._pendingVeterans[finalTargetTeam] = Math.max(0, this._pendingVeterans[finalTargetTeam] - 1);
+                }
+                this._pendingPlayerMoves.delete(playerKey);
+                return;
+              }
+            }
+
             this._pendingPlayerMoves.set(playerKey, { targetTeam: finalTargetTeam, mu: pendingPlayerMu, isVeteran });
 
             this.executor.queueMove(playerKey, player.name, player.eosID, finalTargetTeam);
@@ -799,7 +831,26 @@ export default class SmartAssign extends S3PluginBase {
     const previousTeamID = data?.previousTeamID ?? null;
     Logger.verbose('SmartAssign', 3, `[S3] JOIN: ${player.name || player.eosID} team=${player.teamID}, previousTeamID=${previousTeamID}`);
 
-    await this.handlePlayerJoin(player, previousTeamID);
+    // Acquire global lock before processing — blocks lower-priority plugins (e.g., Switch)
+    // from processing queue ticks while SA evaluates this join.
+    // If false, a higher-priority plugin (e.g., TeamBalancer) is already acting — bail.
+    const lockPlayers = this._s3?.players;
+    let globalLockAcquired = false;
+    if (lockPlayers?.isReady()) {
+      globalLockAcquired = lockPlayers.lockGlobal('SmartAssign', 5000);
+      if (!globalLockAcquired) {
+        Logger.verbose('SmartAssign', 1, `[SmartAssign] Cannot acquire global lock — higher-priority plugin active. Skipping join for ${player.name}.`);
+        return;
+      }
+    }
+
+    try {
+      await this.handlePlayerJoin(player, previousTeamID);
+    } finally {
+      if (globalLockAcquired) {
+        lockPlayers.unlockGlobal('SmartAssign');
+      }
+    }
   }
 
   async onS3PlayerLeft(data) {
@@ -811,9 +862,27 @@ export default class SmartAssign extends S3PluginBase {
   }
 
   async handlePlayerLeave(player) {
-    this._sessionJoinTimes.delete(player.eosID || player.steamID);
+    const playerKey = player.eosID || player.steamID;
+    this._sessionJoinTimes.delete(playerKey);
 
-    Logger.verbose('SmartAssign', 3, `[LEAVE] Player disconnected: ${player.name} (${player.steamID}) from Team ${player.teamID}`);
+    Logger.verbose('SmartAssign', 3, `[LEAVE] Player disconnected: ${player.name} (${playerKey}) from Team ${player.teamID}`);
+
+    // If this player has a pending move, release locks and clean up pending state
+    if (playerKey && this._pendingPlayerMoves.has(playerKey)) {
+      const disconnectMove = this._pendingPlayerMoves.get(playerKey);
+      this._pendingAssignments[disconnectMove.targetTeam] = Math.max(0, this._pendingAssignments[disconnectMove.targetTeam] - 1);
+      this._pendingMu[disconnectMove.targetTeam] = Math.max(0, this._pendingMu[disconnectMove.targetTeam] - disconnectMove.mu);
+      if (disconnectMove.isVeteran) {
+        this._pendingVeterans[disconnectMove.targetTeam] = Math.max(0, this._pendingVeterans[disconnectMove.targetTeam] - 1);
+      }
+      this._pendingPlayerMoves.delete(playerKey);
+
+      // Release per-player lock on disconnect
+      const disconnectUnlockPlayers = this._s3?.players;
+      if (disconnectUnlockPlayers?.isReady()) {
+        disconnectUnlockPlayers.unlock(playerKey, 'SmartAssign');
+      }
+    }
 
     // Generic LEAVE logging removed (Stage 7.4i) — S³ LoggingService handles
     // via S3_PLAYER_LEFT. SA only logs assignment-specific events.
