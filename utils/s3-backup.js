@@ -45,6 +45,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import DBService from './db-service.js';
 
 /**
  * Format byte count to a human-readable string.
@@ -63,6 +64,23 @@ function timestampString(ts) {
   const pad = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-` +
     `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+/**
+ * Check if the given connector can be backed up.
+ * 
+ * SQLite: file-copy backup via createBackup().
+ * Non-SQLite (Postgres, MySQL): JSON export fallback via s3-export-import.js.
+ * Returns true for all connectors — the backup system handles format dispatch
+ * transparently, attempting file copy first and falling back to JSON export.
+ * 
+ * @param {object} connector - Sequelize connector instance
+ * @returns {boolean}
+ */
+export function canBackup(connector) {
+  // 8.4b: All connectors are backup-capable — JSON export works on any Sequelize dialect.
+  // The SQLite-only gate was removed when exportToFile() was added as a fallback.
+  return true;
 }
 
 /**
@@ -139,9 +157,11 @@ export function createBackup(dbPath, backupDir = null, retention = 5) {
 
 /**
  * List available backups sorted newest-first.
+ * Includes both SQLite file backups (dbname-YYYY-MM-DD-HHmmss.sqlite)
+ * and JSON backups (s3backup-YYYY-MM-DD-HHmmss.json).
  *
  * @param {string} [backupDir] - Backup directory (default: './backups')
- * @returns {Array<{ filename: string, timestamp: number, sizeBytes: number, sizeFormatted: string, age: string }>}
+ * @returns {Array<{ filename: string, timestamp: number, sizeBytes: number, sizeFormatted: string, age: string, format: string }>}
  */
 export function listBackups(backupDir = null) {
   const resolvedDir = backupDir || path.resolve(process.cwd(), 'backups');
@@ -165,13 +185,25 @@ export function listBackups(backupDir = null) {
     }
     if (!stat.isFile()) continue;
 
-    // Only include files matching our naming pattern (dbname-YYYY-MM-DD-HHmmss.ext)
+    let ts = null;
+    let format = 'unknown';
+
+    // Pattern 1: SQLite file backup — dbname-YYYY-MM-DD-HHmmss.ext
     const ext = path.extname(file);
     const base = path.basename(file, ext);
-    const dateMatch = base.match(/-(\d{4}-\d{2}-\d{2}-\d{6})$/);
-    if (!dateMatch) continue;
+    const sqliteMatch = base.match(/-(\d{4}-\d{2}-\d{2}-\d{6})$/);
+    if (sqliteMatch) {
+      ts = parseTimestamp(sqliteMatch[1]);
+      format = 'sqlite';
+    }
 
-    const ts = parseTimestamp(dateMatch[1]);
+    // Pattern 2: JSON backup — s3backup-YYYY-MM-DD-HHmmss.json
+    const jsonMatch = file.match(/^s3backup-(\d{4}-\d{2}-\d{2}-\d{6})\.json$/);
+    if (jsonMatch) {
+      ts = parseTimestamp(jsonMatch[1]);
+      format = 'json';
+    }
+
     if (ts === null) continue;
 
     const ageMs = Date.now() - stat.mtimeMs;
@@ -184,7 +216,8 @@ export function listBackups(backupDir = null) {
       sizeFormatted: formatSize(stat.size),
       age: ageMinutes < 60
         ? `${ageMinutes}m`
-        : `${Math.floor(ageMinutes / 60)}h ${ageMinutes % 60}m`
+        : `${Math.floor(ageMinutes / 60)}h ${ageMinutes % 60}m`,
+      format
     });
   }
 

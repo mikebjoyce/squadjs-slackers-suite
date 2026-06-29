@@ -137,7 +137,7 @@ async function setupMigrationPrompt(plugin, pending) {
 
   if (!discordClient || !channelID) {
     plugin.verbose(1, '[S3 Migration] Discord not configured — cannot prompt for migration approval. Migrations remain pending.');
-    plugin.verbose(1, '[S3 Migration] Use `!s3 migrate force` (once Discord is available) or set `S3_MIGRATE_AUTO=1` env var and restart.');
+    plugin.verbose(1, '[S3 Migration] Use `!s3 migrate force` (once Discord is available) or set `autoMigrate: true` in S³ config and restart.');
     return;
   }
 

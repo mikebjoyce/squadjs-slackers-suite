@@ -821,8 +821,11 @@ export default class GameStateService {
     this.resolving = false;
     this.lastPhaseChangeAt = now;
     this.lastNewGameAt = null;
-    this.roundStartTime = null;
-    this.matchId = null;
+    // Backfill roundStartTime — we're mid-round with active players, and no NEW_GAME
+    // will fire to set this. Without a backfill, getRoundStartTime() returns null and
+    // consumers (Switch, Elo, etc.) get 0 for seconds-from-match-start.
+    this.roundStartTime = Date.now();
+    this.matchId = Math.floor(this.roundStartTime / 1000).toString(36).slice(-8);
     this._recoveredStateActive = false;
     await this._persistState();
     this.verboseLogger(1, `[GameState] Recovered state invalidated -> LIVE (${reason}).`);
@@ -846,9 +849,17 @@ export default class GameStateService {
 
     if (this._isKnownLayerName(serverLayerName)) {
       const recoveredLayerName = this.lastKnownGoodLayer?.name;
-      if (this._isKnownLayerName(recoveredLayerName) && recoveredLayerName !== serverLayerName) {
-        await this._transitionRecoveredStateToLive(`${source}:layer_divergence`, now);
-        return;
+      if (this._isKnownLayerName(recoveredLayerName)) {
+        // Normalize both names for comparison — SquadJS handleLayerInfoUpdated may store
+        // spaces (e.g. "Manicouagan Skirmish v3") while raw server info from
+        // handleServerInfoUpdated may use underscores ("Manicouagan_Skirmish_v3").
+        // Strip underscores and hyphens from both sides before comparing so minor
+        // formatting differences don't trigger a false-positive layer_divergence.
+        const normalizeForCompare = (name) => String(name).replace(/[_-]/g, '').toLowerCase();
+        if (normalizeForCompare(recoveredLayerName) !== normalizeForCompare(serverLayerName)) {
+          await this._transitionRecoveredStateToLive(`${source}:layer_divergence`, now);
+          return;
+        }
       }
 
       this._recoveredStateActive = false;

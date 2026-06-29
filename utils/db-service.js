@@ -269,11 +269,12 @@ export default class DBService {
     // Initialise SchemaVersion table (per-plugin version tracking, replaces old S3_Migrations)
     await this._initSchemaVersionModel();
 
-    // 7.4e: Extract SQLite storage path from connector config for backup.
-    // The connector may be a raw config object (e.g. { dialect, storage })
-    // returned via the string-key resolver branch, OR a fully-initialised
-    // Sequelize instance (which nests storage under .config.storage).
-    this._dbPath = this.sequelize?.config?.storage || this.sequelize?.storage || null;
+    // 7.4e / 8.4b: Resolve the SQLite storage path from the raw connector config.
+    // Used for fast file-copy backup optimization. The connectors map always
+    // holds the raw config from config.json. Non-SQLite connectors (Postgres,
+    // MySQL) have no `storage` property → null → MigrationEngine falls back to
+    // connector-agnostic JSON export (s3-export-import.js) for pre-migration backup.
+    this._dbPath = this.connectors?.[this._databaseOption]?.storage || null;
 
     // 7.4k-2: Multi-SQLite diagnostic — warn if connectors map contains
     // multiple SQLite storage paths. Backup/migration only covers the
@@ -284,7 +285,6 @@ export default class DBService {
     this._migrationEngine = new MigrationEngine({
       dbService: this,
       verboseLogger: this.verboseLogger,
-      server: this.server,
       dbPath: this._dbPath
     });
 
@@ -366,6 +366,14 @@ export default class DBService {
     return this.models?.[name] ?? null;
   }
 
+  /**
+   * Get all defined model names.
+   * @returns {string[]}
+   */
+  getModelNames() {
+    return Object.keys(this.models);
+  }
+
   defineModel(name, schema, modelOptions = {}) {
     if (!this.sequelize || typeof this.sequelize.define !== 'function') {
       throw new Error('defineModel called without a valid sequelize connector.');
@@ -400,7 +408,7 @@ export default class DBService {
     }
 
     this._expectedVersions.set(pluginName, version);
-    this.verboseLogger(3, `[DB] Registered expected version v${version} for "${pluginName}".`);
+    this.verboseLogger(4, `[DB] Registered expected version v${version} for "${pluginName}".`);
   }
 
   /**
@@ -558,7 +566,10 @@ export default class DBService {
 
     if (result.upToDate) {
       if (this._expectedVersions.size > 0) {
-        this.verboseLogger(3, '[DB] All plugin schema versions are up to date.');
+        const versions = [...this._expectedVersions.entries()]
+          .map(([name, ver]) => `${name} v${ver}`)
+          .join(', ');
+        this.verboseLogger(3, `[DB] All schema versions current: ${versions}.`);
       } else {
         this.verboseLogger(3, '[DB] No plugin schema versions registered yet — deferring version check.');
       }

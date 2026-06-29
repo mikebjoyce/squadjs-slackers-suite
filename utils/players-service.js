@@ -22,6 +22,7 @@
  *   Attribution:  recordMove()
  *   Reconnects:   rememberReconnect(), getReconnect(), peekReconnect(),
  *                 clearReconnects()
+ *   Sessions:     getJoinTime(eosID)
  *   Refresh:      registerRefreshInterest(), unregisterRefreshInterest(),
  *                 requestRefresh(), refreshNow(), refreshNowImmediate()
  *   Lifecycle:    mount(), unmount(), isReady(),
@@ -45,6 +46,9 @@
  *   intervals are registered.
  * - Reconnect memory is DB-backed when DBService is available, with
  *   in-memory fallback and periodic pruning.
+ * - Session tracking (8.1f): S3_PlayerSessions table persists per-player
+ *   sessionStart time across SquadJS restarts. joinTime is hydrated from
+ *   this table after initial sync. Sessions expire after 30 min of inactivity.
  *
  */
 
@@ -63,6 +67,8 @@ const DEFAULT_REFRESH_MIN_INTERVAL_MS = 3000;   // hard floor — no faster than
 const DEFAULT_REFRESH_MAX_INTERVAL_MS = 60000;   // hard ceiling — natural SquadJS tick rate
 const DEFAULT_REFRESH_DEBOUNCE_WINDOW_MS = 250; // coalesce window for requestRefresh()
 const DEFAULT_REFRESH_NOW_FLOOR_MS = 1000;      // minimum gap for refreshNow() before re-calling RCON
+const DEFAULT_SESSION_EXPIRY_MS = 30 * 60 * 1000; // 30 min — how long without activity before a session expires
+const DEFAULT_SESSION_UPDATE_INTERVAL_MS = 5 * 60 * 1000; // 5 min — how often to refresh lastActivity in DB
 
 export default class PlayersService {
   constructor({
@@ -75,7 +81,9 @@ export default class PlayersService {
     refreshMinIntervalMs = DEFAULT_REFRESH_MIN_INTERVAL_MS,
     refreshMaxIntervalMs = DEFAULT_REFRESH_MAX_INTERVAL_MS,
     refreshDebounceWindowMs = DEFAULT_REFRESH_DEBOUNCE_WINDOW_MS,
-    refreshNowFloorMs = DEFAULT_REFRESH_NOW_FLOOR_MS
+    refreshNowFloorMs = DEFAULT_REFRESH_NOW_FLOOR_MS,
+    sessionExpiryMs = DEFAULT_SESSION_EXPIRY_MS,
+    sessionUpdateIntervalMs = DEFAULT_SESSION_UPDATE_INTERVAL_MS
   } = {}) {
     this.parent = parent;
     this.server = server;
@@ -88,6 +96,8 @@ export default class PlayersService {
     this.refreshMaxIntervalMs = Number.isFinite(refreshMaxIntervalMs) ? Math.max(this.refreshMinIntervalMs, refreshMaxIntervalMs) : DEFAULT_REFRESH_MAX_INTERVAL_MS;
     this.refreshDebounceWindowMs = Number.isFinite(refreshDebounceWindowMs) ? Math.max(50, refreshDebounceWindowMs) : DEFAULT_REFRESH_DEBOUNCE_WINDOW_MS;
     this.refreshNowFloorMs = Number.isFinite(refreshNowFloorMs) ? Math.max(500, refreshNowFloorMs) : DEFAULT_REFRESH_NOW_FLOOR_MS;
+    this.sessionExpiryMs = Number.isFinite(sessionExpiryMs) ? Math.max(60000, sessionExpiryMs) : DEFAULT_SESSION_EXPIRY_MS;
+    this.sessionUpdateIntervalMs = Number.isFinite(sessionUpdateIntervalMs) ? Math.max(60000, sessionUpdateIntervalMs) : DEFAULT_SESSION_UPDATE_INTERVAL_MS;
 
     this.registry = new Map(); // key (prefer EOS ID; fallback to steamID) -> player state
     // Optional index for legacy/secondary IDs. steamID may be undefined for EOS-only players.
@@ -104,6 +114,11 @@ export default class PlayersService {
     this.reconnectMaxAgeMs = DEFAULT_RECONNECT_MAX_AGE_MS;
     this.reconnectPruneIntervalMs = DEFAULT_RECONNECT_PRUNE_INTERVAL_MS;
     this._lastReconnectPruneAt = 0;
+
+    // Session tracking (8.1f)
+    this.sessionModel = null;
+    this._sessionInitialized = false;
+    this._lastSessionActivityUpdate = 0; // timestamp of last bulk lastActivity write
 
     this._migrationRegistered = false;
     this._isMounted = false;
@@ -125,6 +140,9 @@ export default class PlayersService {
       SmartAssign: 2,
       Switch: 1
     };
+    // Runtime extensible priority map — third-party plugins can register
+    // their own priority via registerPriority(). Defaults to 0 for unregistered sources.
+    this._customPriorities = new Map();
 
     // ---------------------------------------------------------------------------
     // Coalesced refresh manager
@@ -163,6 +181,7 @@ export default class PlayersService {
 
     await this._initReconnectPersistence();
     await this._pruneReconnects(Date.now(), { force: true });
+    await this._initSessionPersistence();
 
     this._isMounted = true;
     this._initialSyncComplete = false;
@@ -288,6 +307,18 @@ export default class PlayersService {
     // Keep call sites blind to projection; always return the most stable data we can provide.
     const active = this._getActiveRegistry();
     return [...active.values()].map((p) => ({ ...p }));
+  }
+
+  /**
+   * Returns the joinTime (session start timestamp) for a player.
+   * This is the DB-persisted value recovered across restarts.
+   * Returns 0 if the player is not tracked or has no session data.
+   * @param {string} eosIDOrSteamID - Player EOS ID or Steam ID
+   * @returns {number} joinTime timestamp in ms, or 0
+   */
+  getJoinTime(eosIDOrSteamID) {
+    const player = this.getPlayer(eosIDOrSteamID);
+    return player?.joinTime || 0;
   }
 
   getSquads() {
@@ -816,6 +847,14 @@ export default class PlayersService {
         hasNullTeams
       });
 
+      // ── Session recovery (8.1f) ──
+      // After initial sync populates the registry with all current server players,
+      // hydrate their joinTime from S3_PlayerSessions (survives SquadJS restarts).
+      // Fire-and-forget — errors are logged internally.
+      this._recoverSessionTimes().catch((err) => {
+        this.verboseLogger(1, `[Players] Session recovery error: ${err.message}`);
+      });
+
       // Build ClansService tag cache from initial player sync (closed loop)
       if (this.parent?.services?.clans) {
         this.parent.services.clans.rebuildFromAllPlayers([...this.registry.values()]);
@@ -871,6 +910,16 @@ export default class PlayersService {
     this._lastTickTeamChangeCount = teamChangeCount;
 
     this.verboseLogger(2, `[Players] Tick: ${joinCount} joined, ${leaveCount} left, ${this.registry.size} tracked`);
+
+    // ── Periodic session activity update (8.1f) ──
+    // Bulk-update lastActivity for all tracked players every sessionUpdateIntervalMs.
+    // This is fire-and-forget and does not block the tick.
+    if (this.sessionModel && now - this._lastSessionActivityUpdate > this.sessionUpdateIntervalMs) {
+      this._lastSessionActivityUpdate = now;
+      this._bulkUpdateSessionActivity(now).catch((err) => {
+        this.verboseLogger(2, `[Players] Session activity update failed: ${err.message}`);
+      });
+    }
 
     // Emit batch-complete signal for consumers
     this.server.emit('S3_PLAYERS_UPDATED', {
@@ -1107,12 +1156,30 @@ export default class PlayersService {
     return normalized || null;
   }
 
+  /**
+   * Register or update a custom priority level for a plugin source.
+   * Allows third-party plugins to participate in the lock system without
+   * hardcoding entries in the PRIORITY map. Existing hardcoded priorities
+   * (TeamBalancer=3, SmartAssign=2, Switch=1) are unaffected — custom
+   * registrations only apply to sources not already in PRIORITY.
+   *
+   * @param {string} source - Plugin/source name (e.g., 'MyPlugin')
+   * @param {number} priority - Priority level (higher = more authority)
+   */
+  registerPriority(source, priority) {
+    const normalized = this._normalizeSource(source);
+    const level = Number.isFinite(priority) ? Math.max(0, priority) : 0;
+    this._customPriorities.set(normalized, level);
+    this.verboseLogger(2, `[Lock] Priority registered: ${normalized}=${level}`);
+  }
+
   _normalizeSource(source) {
     return String(source || 'Unknown');
   }
 
   _priorityOf(source) {
-    return this.PRIORITY[source] || 0;
+    // Check hardcoded PRIORITY first, then custom registrations, fallback 0.
+    return this.PRIORITY[source] ?? this._customPriorities.get(source) ?? 0;
   }
 
   _resolvePlayerKey(eosIDOrSteamID) {
@@ -1331,6 +1398,256 @@ export default class PlayersService {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Session tracking (8.1f) — S3_PlayerSessions table
+  //
+  // The S3_PlayerSessions table persists per-player sessionStart timestamps
+  // across SquadJS restarts. This allows consumer plugins (Switch, EloTracker)
+  // to answer "how long has this player been on the server?" even after a
+  // restart, preventing the time-based switch window from falsely resetting.
+  //
+  // Lifecycle:
+  //   1. Player first detected (never seen before, or 30+ min gap since last activity)
+  //      → INSERT sessionStart = Date.now(), lastActivity = Date.now()
+  //   2. Player still on server (periodic tick)
+  //      → UPDATE lastActivity = Date.now() (every sessionUpdateIntervalMs)
+  //   3. Player leaves, returns within 30 min
+  //      → Keep sessionStart unchanged (recovery path)
+  //   4. Player away 30+ min
+  //      → Next detection: sessionStart = Date.now() (fresh session)
+  //   5. SquadJS restart mid-round
+  //      → _recoverSessionTimes() hydrates registry joinTime from DB
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Initialize the S3_PlayerSessions table via migration + model definition.
+   * Follows the same pattern as _initReconnectPersistence().
+   */
+  async _initSessionPersistence() {
+    const dbService = this._getDbService();
+    if (!dbService) return;
+
+    const connector = dbService.getConnector?.();
+    if (!connector) return;
+
+    // Register the S3_PlayerSessions table migration via MigrationEngine (v2, after S3PlayerReconnects).
+    if (!this._sessionInitialized && dbService.migrationEngine) {
+      this._sessionInitialized = true;
+
+      dbService.migrationEngine.registerMigrations('s3-players', [
+        {
+          version: 2,
+          up: async (qi) => {
+            await qi.rawQuery(`
+              CREATE TABLE IF NOT EXISTS S3_PlayerSessions (
+                eosID VARCHAR(64) PRIMARY KEY,
+                steamID VARCHAR(64) NULL,
+                playerName VARCHAR(255) NULL,
+                sessionStart BIGINT NOT NULL,
+                lastActivity BIGINT NOT NULL
+              );
+            `);
+          },
+          description: 'Create S3_PlayerSessions table for persistent join-time tracking'
+        }
+      ]);
+
+      await dbService.migrationEngine.runMigrations('s3-players');
+    }
+
+    this.sessionModel = dbService.defineModel?.(
+      'S3PlayerSession',
+      {
+        eosID: {
+          type: dbService.getDataTypes().STRING,
+          primaryKey: true
+        },
+        steamID: {
+          type: dbService.getDataTypes().STRING,
+          allowNull: true
+        },
+        playerName: {
+          type: dbService.getDataTypes().STRING,
+          allowNull: true
+        },
+        sessionStart: {
+          type: dbService.getDataTypes().BIGINT,
+          allowNull: false
+        },
+        lastActivity: {
+          type: dbService.getDataTypes().BIGINT,
+          allowNull: false
+        }
+      },
+      {
+        tableName: 'S3_PlayerSessions',
+        timestamps: false
+      }
+    ) || null;
+  }
+
+  /**
+   * Recover session times from S3_PlayerSessions after initial sync.
+   * Called once after _initialSyncComplete is set to true.
+   *
+   * For each player in the registry:
+   *   - If DB row exists and lastActivity is within sessionExpiryMs →
+   *     adopt sessionStart as joinTime
+   *   - If DB row exists but is stale →
+   *     write new sessionStart = now, keep joinTime = now
+   *   - If no DB row →
+   *     write new sessionStart = now, keep joinTime from initial sync
+   */
+  async _recoverSessionTimes() {
+    if (!this.sessionModel) return;
+    const dbService = this._getDbService();
+    if (!dbService?.executeWithRetry) return;
+
+    const now = Date.now();
+    const expiryCutoff = now - this.sessionExpiryMs;
+    const registryPlayers = [...this.registry.entries()];
+    const eosIDs = registryPlayers.map(([, p]) => p.eosID).filter(Boolean);
+
+    if (eosIDs.length === 0) return;
+
+    // Fetch all session rows for currently tracked players.
+    let dbRows = [];
+    try {
+      dbRows = await dbService.executeWithRetry(async () => {
+        const Op = this.sessionModel?.sequelize?.constructor?.Op ||
+          this.sessionModel?.sequelize?.Sequelize?.Op ||
+          dbService.getConnector?.()?.constructor?.Sequelize?.Op ||
+          null;
+        if (Op) {
+          return await this.sessionModel.findAll({
+            where: { eosID: { [Op.in]: eosIDs } }
+          });
+        }
+        // Fallback: fetch one by one if Op not available.
+        const results = [];
+        for (const eosID of eosIDs) {
+          const row = await this.sessionModel.findByPk(eosID);
+          if (row) results.push(row);
+        }
+        return results;
+      });
+    } catch (err) {
+      this.verboseLogger(1, `[Players] Session recovery DB query failed: ${err.message}`);
+      return;
+    }
+
+    // Build lookup map: eosID -> { sessionStart, lastActivity }
+    const sessionMap = new Map();
+    for (const row of dbRows) {
+      const plain = typeof row.toJSON === 'function' ? row.toJSON() : row;
+      if (plain.eosID) {
+        sessionMap.set(plain.eosID, {
+          sessionStart: Number(plain.sessionStart) || 0,
+          lastActivity: Number(plain.lastActivity) || 0
+        });
+      }
+    }
+
+    this.verboseLogger(2, `[Players] Session recovery: ${registryPlayers.length} players, ${sessionMap.size} DB rows`);
+
+    const upsertOps = [];
+
+    for (const [key, state] of registryPlayers) {
+      // Only update if we have an eosID (primary key for sessions table).
+      if (!state.eosID) continue;
+
+      const existing = sessionMap.get(state.eosID);
+
+      if (existing) {
+        if (existing.lastActivity >= expiryCutoff) {
+          // Session is still active — adopt stored sessionStart as joinTime.
+          state.joinTime = existing.sessionStart;
+          this.verboseLogger(3, `[Players] Recovered session for ${state.name || key}: start=${new Date(existing.sessionStart).toISOString()}, lastActivity=${new Date(existing.lastActivity).toISOString()}`);
+        } else {
+          // Session is stale (inactive > sessionExpiryMs) — start fresh.
+          state.joinTime = now;
+          upsertOps.push({
+            eosID: state.eosID,
+            steamID: state.steamID || null,
+            playerName: state.name || null,
+            sessionStart: now,
+            lastActivity: now
+          });
+          this.verboseLogger(2, `[Players] Stale session for ${state.name || key}: lastActivity=${new Date(existing.lastActivity).toISOString()} > ${this.sessionExpiryMs}ms ago, starting fresh`);
+        }
+      } else {
+        // No DB row — first time seeing this player. Write new session.
+        upsertOps.push({
+          eosID: state.eosID,
+          steamID: state.steamID || null,
+          playerName: state.name || null,
+          sessionStart: state.joinTime || now,
+          lastActivity: now
+        });
+        this.verboseLogger(3, `[Players] New session for ${state.name || key}: joinTime=${new Date(state.joinTime).toISOString()}`);
+      }
+    }
+
+    // Write new/updated sessions in batch.
+    if (upsertOps.length > 0) {
+      try {
+        await dbService.executeWithRetry(async () => {
+          for (const op of upsertOps) {
+            await this.sessionModel.upsert(op);
+          }
+        });
+        this.verboseLogger(2, `[Players] Session recovery: upserted ${upsertOps.length} rows`);
+      } catch (err) {
+        this.verboseLogger(1, `[Players] Session recovery upsert failed: ${err.message}`);
+      }
+    }
+  }
+
+  /**
+   * Bulk-update lastActivity for all tracked players.
+   * This runs periodically (every sessionUpdateIntervalMs) to keep the
+   * session expiry window accurate for disconnect-during-restart scenarios.
+   * Fire-and-forget — errors are logged internally.
+   */
+  async _bulkUpdateSessionActivity(now = Date.now()) {
+    if (!this.sessionModel) return;
+    const dbService = this._getDbService();
+    if (!dbService?.executeWithRetry) return;
+
+    const players = [...this.registry.values()].filter(p => p.eosID);
+    if (players.length === 0) return;
+
+    try {
+      const eosIDs = players.map(p => p.eosID);
+      const Op = this.sessionModel?.sequelize?.constructor?.Op ||
+        this.sessionModel?.sequelize?.Sequelize?.Op ||
+        dbService.getConnector?.()?.constructor?.Sequelize?.Op ||
+        null;
+
+      if (Op) {
+        await dbService.executeWithRetry(async () => {
+          await this.sessionModel.update(
+            { lastActivity: now },
+            { where: { eosID: { [Op.in]: eosIDs } } }
+          );
+        });
+      } else {
+        // Fallback: update one by one.
+        await dbService.executeWithRetry(async () => {
+          for (const p of players) {
+            await this.sessionModel.update(
+              { lastActivity: now },
+              { where: { eosID: p.eosID } }
+            );
+          }
+        });
+      }
+      this.verboseLogger(3, `[Players] Session activity updated for ${players.length} players`);
+    } catch (err) {
+      this.verboseLogger(2, `[Players] Session activity bulk update failed: ${err.message}`);
+    }
+  }
+
   _setPlayerLock(key, source, ttlMs) {
     this._clearPlayerLock(key);
 
@@ -1418,53 +1735,16 @@ export default class PlayersService {
     const connector = dbService.getConnector?.();
     if (!connector) return;
 
-    if (!this._migrationRegistered && typeof dbService.registerMigration === 'function') {
+    // Register the S3PlayerReconnects table migration via MigrationEngine (v1, first player migration).
+    if (!this._migrationRegistered && dbService.migrationEngine) {
       this._migrationRegistered = true;
 
-      try {
-        dbService.registerMigration('2026-06-21-002-s3-player-reconnects', async ({ sequelize, transaction }) => {
-          const queryInterface = sequelize.getQueryInterface?.();
-
-          if (queryInterface && typeof queryInterface.describeTable === 'function' && typeof queryInterface.createTable === 'function') {
-            try {
-              await queryInterface.describeTable('S3PlayerReconnects');
-              return;
-            } catch {
-              // Table does not exist, continue.
-            }
-
-            const DataTypes = dbService.getDataTypes();
-            await queryInterface.createTable('S3PlayerReconnects', {
-              eosID: {
-                type: DataTypes.STRING,
-                primaryKey: true
-              },
-              steamID: {
-                type: DataTypes.STRING,
-                allowNull: true
-              },
-              playerName: {
-                type: DataTypes.STRING,
-                allowNull: true
-              },
-              lastTeamID: {
-                type: DataTypes.INTEGER,
-                allowNull: true
-              },
-              lastSeenAt: {
-                type: DataTypes.BIGINT,
-                allowNull: true
-              },
-              updatedAt: {
-                type: DataTypes.BIGINT,
-                allowNull: false
-              }
-            }, { transaction });
-            return;
-          }
-
-          if (typeof sequelize.query === 'function') {
-            await sequelize.query(`
+      dbService.migrationEngine.registerMigrations('s3-players', [
+        {
+          version: 1,
+          up: async (qi) => {
+            // CREATE TABLE IF NOT EXISTS so this is a no-op against existing production tables.
+            await qi.rawQuery(`
               CREATE TABLE IF NOT EXISTS S3PlayerReconnects (
                 eosID VARCHAR(64) PRIMARY KEY,
                 steamID VARCHAR(64) NULL,
@@ -1474,17 +1754,12 @@ export default class PlayersService {
                 updatedAt BIGINT NOT NULL
               );
             `);
-          }
-        });
-      } catch (err) {
-        if (!String(err?.message || '').includes('Duplicate migration id')) {
-          throw err;
+          },
+          description: 'Create S3PlayerReconnects table for reconnect persistence'
         }
-      }
-    }
+      ]);
 
-    if (typeof dbService.runMigrations === 'function') {
-      await dbService.runMigrations();
+      await dbService.migrationEngine.runMigrations('s3-players');
     }
 
     this.reconnectModel = dbService.defineModel?.(

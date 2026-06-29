@@ -348,11 +348,15 @@ export default class S3PluginBase extends BasePlugin {
   // ═══════════════════════════════════════════════════════════════
 
   /**
-   * Requests an RCON team change for a player, with retry and verification.
+   * Requests an RCON team change for a player, with retry and S³-based
+   * verification.
    *
    * Sends AdminForceTeamChange via the SquadJS core wrapper (rcon.switchTeam),
-   * then polls server.players to verify the player landed on the opposite
-   * team. Retries on failure up to maxAttempts, then returns the outcome.
+   * then uses S³'s players service to verify the player landed on the
+   * opposite team. After each RCON attempt, `refreshNowImmediate()` forces
+   * an immediate player-list refresh via S³ so verification reads fresh
+   * data instead of stale cache. Retries on failure up to maxAttempts,
+   * then returns the outcome.
    *
    * This is a single-move, fire-and-forget operation. It does NOT manage
    * queues, sessions, batching, or preemption — those remain the caller's
@@ -361,12 +365,11 @@ export default class S3PluginBase extends BasePlugin {
    * @param {string} eosID - Player's EOS ID.
    * @param {object} [options] - Behaviour tuning.
    * @param {number} [options.maxAttempts=5] - Max RCON send attempts.
-   * @param {number} [options.retryIntervalMs=100] - Delay between attempts (ms).
-   * @param {number} [options.timeoutMs=5000] - Max wall-clock time (ms).
    * @param {boolean} [options.warnPlayer=false] - Send rcon.warn on success.
    * @param {string} [options.warnMessage] - Warning text
    *   (default: 'You have been scrambled').
-   * @param {string} [options.source='S3PluginBase'] - Source for recordMove().
+   * @param {string} [options.source='S3PluginBase'] - Source identifier
+   *   passed to S³'s refreshNowImmediate() and the result object.
    * @returns {Promise<object|null>} Result object, or null if player not found.
    *   - success {boolean}: true if verification passed.
    *   - eosID {string}: The player's EOS ID.
@@ -379,30 +382,30 @@ export default class S3PluginBase extends BasePlugin {
   async _requestTeamChange(eosID, options = {}) {
     const {
       maxAttempts = 5,
-      retryIntervalMs = 100,
-      timeoutMs = 5000,
       warnPlayer = false,
       warnMessage = 'You have been scrambled',
       source = 'S3PluginBase'
     } = options;
 
-    // ── Resolve player ────────────────────────────────────────
-    const player = this.server.players?.find((p) => p.eosID === eosID);
-    if (!player) {
-      this.verbose(2, `[TC] Player ${eosID} not found in server.players — aborting.`);
+    // ── Resolve player via S³ ─────────────────────────────────
+    const playerState = this.players?.getPlayer(eosID);
+    if (!playerState) {
+      this.verbose(2, `[TC] Player ${eosID} not found in S³ registry — aborting.`);
       return null;
     }
 
-    const startTime = Date.now();
-    const targetTeamID = player.teamID === 1 ? 2 : 1;
-    const playerName = player.name;
+    const targetTeamID = playerState.teamID === 1 ? 2 : 1;
+    const playerName = playerState.name;
 
     this.verbose(
       3,
       `[TC] Requesting team change for ${playerName} (${eosID}) -> T${targetTeamID} (source: ${source})`
     );
 
-    // ── Record move via S³ player service ─────────────────────
+    // ── Record move attribution before the first RCON attempt ─
+    // This tells S³'s tick processor which plugin initiated this team
+    // change, so the TEAM_CHANGE event includes the proper source
+    // (e.g. "Player-Self") instead of "Manual/Game".
     try {
       this._s3?.players?.recordMove(eosID, targetTeamID, source);
     } catch (err) {
@@ -410,7 +413,7 @@ export default class S3PluginBase extends BasePlugin {
     }
 
     // ── Helpers ──────────────────────────────────────────────
-    const getCurrent = () => this.server.players?.find((p) => p.eosID === eosID);
+    const getFromS3 = () => this.players?.getPlayer(eosID);
 
     const makeResult = (success, teamID, attempts) => ({
       success,
@@ -425,21 +428,17 @@ export default class S3PluginBase extends BasePlugin {
     let attempts;
 
     for (attempts = 0; attempts < maxAttempts; attempts++) {
-      // Wall-clock timeout
-      if (Date.now() - startTime >= timeoutMs) {
-        this.verbose(2, `[TC] ${playerName} — timeout after ${Date.now() - startTime}ms (${attempts} attempts sent).`);
-        return makeResult(false, null, attempts);
-      }
-
-      // Disconnect check
-      const current = getCurrent();
-      if (!current) {
+      // Disconnect check — if the player isn't in S³'s registry after a
+      // refreshNowImmediate(), they've disconnected. No need to fall back
+      // to server.players as S³'s registry is derived from it.
+      if (!getFromS3()) {
         this.verbose(2, `[TC] ${playerName} disconnected during retry — aborting.`);
         return makeResult(false, null, attempts);
       }
 
       // Already on target team?
-      if (String(current.teamID) === String(targetTeamID)) {
+      const current = getFromS3();
+      if (current && String(current.teamID) === String(targetTeamID)) {
         this.verbose(3, `[TC] ${playerName} already on target team T${targetTeamID}.`);
         return makeResult(true, targetTeamID, attempts);
       }
@@ -452,14 +451,15 @@ export default class S3PluginBase extends BasePlugin {
         this.verbose(2, `[TC] Attempt ${attempts + 1} RCON failed for ${playerName}: ${err.message}`);
       }
 
-      // Wait before next check (skip after last attempt — we'll do a final check)
-      if (attempts < maxAttempts - 1) {
-        await new Promise((r) => setTimeout(r, retryIntervalMs));
+      // Force-refresh S³ player registry after the RCON command so the
+      // next iteration (or the final check) sees up-to-date team data.
+      if (this.players?.refreshNowImmediate) {
+        await this.players.refreshNowImmediate(source).catch(() => {});
       }
     }
 
     // ── Final check after all attempts ────────────────────────
-    const final = getCurrent();
+    const final = getFromS3();
     if (final && String(final.teamID) === String(targetTeamID)) {
       this.verbose(3, `[TC] ✅ ${playerName} verified on T${targetTeamID} after ${attempts} attempts.`);
 

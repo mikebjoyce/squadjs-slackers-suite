@@ -21,12 +21,6 @@
  *   than phantom rollback of already-applied changes.
  * - The engine NEVER auto-triggers migrations on startup — that is
  *   gated behind the Discord confirmation flow (7.4d).
- * - Custom events are emitted for 7.4d integration:
- * Events are emitted on the SquadServer EventEmitter (passed as `server` in
- * constructor options) so any listener plugin can react:
- *     S3_MIGRATION_PENDING   — before each migration runs
- *     S3_MIGRATION_COMPLETE  — after each migration succeeds
- *     S3_MIGRATION_FAILED    — emitted by calling code when a migration throws
  *
  * ─── METHODS ────────────────────────────────────────────────────
  *
@@ -72,6 +66,7 @@
 
 import crypto from 'node:crypto';
 import { createBackup } from './s3-backup.js';
+import { exportToFile as jsonExportToFile } from './s3-export-import.js';
 
 /**
  * Create a QueryInterface object bound to a specific DBService + transaction.
@@ -153,19 +148,17 @@ export default class MigrationEngine {
    * @param {Object} opts
    * @param {import('./db-service.js').default} opts.dbService - DBService instance
    * @param {Function} opts.verboseLogger - SquadJS verbose logger
-   * @param {Object}  [opts.server]       - SquadServer EventEmitter for emitting S3_MIGRATION_* events
    * @param {string}  [opts.dbPath]       - Path to the SQLite database file for backup (7.4e)
    * @param {string}  [opts.backupDir]    - Backup directory override (default: './backups')
    * @param {number}  [opts.backupRetention=5] - Max backups to retain
    */
-   constructor({ dbService, verboseLogger = () => {}, server = null, dbPath = null, backupDir = null, backupRetention = 5 } = {}) {
+   constructor({ dbService, verboseLogger = () => {}, dbPath = null, backupDir = null, backupRetention = 5 } = {}) {
     if (!dbService) {
       throw new Error('MigrationEngine requires a dbService instance.');
     }
 
     this.dbService = dbService;
     this.verboseLogger = verboseLogger;
-    this.server = server;
     this.dbPath = dbPath;
     this.backupDir = backupDir;
     this.backupRetention = backupRetention;
@@ -226,9 +219,20 @@ export default class MigrationEngine {
     }
 
     const prev = this._migrations.get(pluginName) || [];
+
+    // Guard against duplicate registration — if all versions in sorted
+    // are already present in prev, this is a re-registration (e.g. from
+    // PlayersService calling registerMigrations from two init methods).
+    const prevVersions = new Set(prev.map((m) => m.version));
+    const allExist = sorted.every((m) => prevVersions.has(m.version));
+    if (allExist && prev.length > 0) {
+      this.verboseLogger(4, `[MigrationEngine] Skipping re-registration: "${pluginName}" already has ${prev.length} migration(s).`);
+      return;
+    }
+
     this._migrations.set(pluginName, [...prev, ...sorted]);
 
-    this.verboseLogger(3, `[MigrationEngine] Registered ${sorted.length} migration(s) for "${pluginName}".`);
+    this.verboseLogger(4, `[MigrationEngine] Registered ${sorted.length} migration(s) for "${pluginName}".`);
   }
 
   /**
@@ -266,18 +270,45 @@ export default class MigrationEngine {
       return { applied: 0, skipped: pending.length };
     }
 
-    // 7.4e: File backup — copy DB to backups/ before proceeding
+    // 7.4e / 8.4b: Pre-migration backup — produce BOTH formats for portability.
+    // Tier 1: Fast SQLite file copy (if dbPath is available — SQLite only).
+    // Tier 2: Connector-agnostic JSON export (works on all dialects, ensures
+    // cross-connector portability for future Postgres/MySQL migration).
+    // At least one must succeed; if both fail, the migration is aborted.
+    let fileCopyResult = null;
+    let jsonExportResult = null;
+
+    // Tier 1: SQLite file copy (fast, binary-identical)
     if (this.dbPath) {
-      const backupResult = createBackup(this.dbPath, this.backupDir, this.backupRetention);
-      if (backupResult) {
-        this.verboseLogger(2, `[MigrationEngine] Backup created: ${backupResult.filename} (${backupResult.sizeBytes} bytes).`);
-      } else {
-        const msg = `[MigrationEngine] Backup FAILED for "${pluginName}" — aborting migration. Check disk space and permissions.`;
-        this.verboseLogger(1, msg);
-        throw new Error(msg);
+      try {
+        fileCopyResult = createBackup(this.dbPath, this.backupDir, this.backupRetention);
+        if (fileCopyResult) {
+          this.verboseLogger(2, `[MigrationEngine] File backup created: ${fileCopyResult.filename} (${fileCopyResult.sizeBytes} bytes).`);
+        }
+      } catch (err) {
+        this.verboseLogger(1, `[MigrationEngine] File backup failed: ${err.message}`);
+        fileCopyResult = null;
       }
-    } else {
-      this.verboseLogger(3, `[MigrationEngine] No dbPath configured — skipping backup.`);
+    }
+
+    // Tier 2: JSON export (always run — ensures cross-connector portability)
+    try {
+      jsonExportResult = await jsonExportToFile(this.dbService, this.backupDir, {
+        tier: 'all',
+        retention: this.backupRetention
+      });
+      if (jsonExportResult) {
+        this.verboseLogger(2, `[MigrationEngine] JSON backup created: ${jsonExportResult.filename} (${jsonExportResult.sizeBytes} bytes).`);
+      }
+    } catch (err) {
+      this.verboseLogger(1, `[MigrationEngine] JSON backup failed: ${err.message}`);
+      jsonExportResult = null;
+    }
+
+    if (!fileCopyResult && !jsonExportResult) {
+      const msg = `[MigrationEngine] Backup FAILED for "${pluginName}" — aborting migration. Both file copy and JSON export failed. Check disk space, permissions, and DB connectivity.`;
+      this.verboseLogger(1, msg);
+      throw new Error(msg);
     }
 
     this.verboseLogger(2, `[MigrationEngine] Running ${pending.length} migration(s) for "${pluginName}"...`);
@@ -286,34 +317,17 @@ export default class MigrationEngine {
     for (const migration of pending) {
       try {
         await this.dbService.withTransactionWithRetry(async (transaction) => {
-          this.server?.emit('S3_MIGRATION_PENDING', {
-            pluginName,
-            fromVersion: appliedVersion,
-            toVersion: migration.version,
-            description: migration.description || ''
-          });
-
           const qi = createQueryInterface(this.dbService.sequelize, this.dbService, transaction);
 
           await migration.up(qi);
 
           await this._recordVersion(pluginName, migration.version, migration.up, transaction);
 
-          this.server?.emit('S3_MIGRATION_COMPLETE', {
-            pluginName,
-            version: migration.version
-          });
-
           this.verboseLogger(3, `[MigrationEngine] Applied v${migration.version} for "${pluginName}".`);
         });
 
         applied += 1;
       } catch (err) {
-        this.server?.emit('S3_MIGRATION_FAILED', {
-          pluginName,
-          version: migration.version,
-          error: err.message
-        });
         throw err; // Re-throw so the calling code knows the batch failed
       }
     }

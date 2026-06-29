@@ -232,6 +232,12 @@ export default class SlackersSquadServices extends BasePlugin {
         description: 'Path to JSONL file for S³ event mirror. Only used when enableFileLogging is true.',
         default: './s3-log.jsonl',
         type: 'string'
+      },
+      autoMigrate: {
+        required: false,
+        type: 'boolean',
+        description: 'When true, pending schema migrations are applied automatically on startup without Discord confirmation. Defaults to false (requires Discord ✅ reaction).',
+        default: false
       }
     };
   }
@@ -538,6 +544,26 @@ export default class SlackersSquadServices extends BasePlugin {
     const pending = db.getPendingMigrations();
     if (!pending || pending.length === 0) {
       this.verbose(3, '[S3 Migration] No pending migrations.');
+      return;
+    }
+
+    // autoMigrate: skip Discord prompt, run directly
+    if (this.options.autoMigrate) {
+      this.verbose(1, `[S3 Migration] autoMigrate is enabled — running ${pending.length} pending migration(s) directly.`);
+      for (const p of pending) {
+        try {
+          const me = db.migrationEngine;
+          if (!me) {
+            this.verbose(1, `[S3 Migration] MigrationEngine not available — cannot migrate "${p.pluginName}".`);
+            continue;
+          }
+          const result = await me.runMigrations(p.pluginName, { force: false });
+          this.verbose(2, `[S3 Migration] "${p.pluginName}": ${result.applied} applied, ${result.skipped} skipped.`);
+        } catch (err) {
+          this.verbose(1, `[S3 Migration] Auto-migration failed for "${p.pluginName}": ${err.message}`);
+        }
+      }
+      db._resolveMigrationGate(true);
       return;
     }
 
