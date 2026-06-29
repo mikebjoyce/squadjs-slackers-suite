@@ -1,10 +1,18 @@
-// DEPRECATED — Stage 5: This script imports from sa-clan-grouper.js which was replaced by S³ ClansService.
-// sa-clan-grouper.js has been deleted. This test/tool script cannot be migrated to S³ and is retained for reference only.
-
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
  * ║                CLAN-TAG-TIMING-TESTER                        ║
+ * ║                    ⚠️ DEPRECATED ⚠️                          ║
  * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ⚠️ DEPRECATED
+ * This file is preserved for backward compatibility with existing
+ * CLI tooling and standalone workflows. It is NOT used by the S³
+ * plugin runtime.
+ *
+ * Superseded by: S³ ClansService (SlackersSquadServices/utils/clans-service.js)
+ * See: DesignDocs/AI_Agents_Overview.md — Service Access
+ *
+ * To be removed: Stage 9
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *

@@ -5,28 +5,29 @@
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Handles custom Elo-based player auto-assignment and records player
- * lifecycle events. Overrides Squad's native team assignment to provide
- * competitive parity via Average-Elo balancing, reconnect memory,
- * and strict population equity rules. Bypasses "Seed" layers natively.
- * Captures Round Snapshots and embedded global populations in events.
+ * Elo-based player auto-assignment with reconnect memory, clan-grouping
+ * awareness, strict population equity, Seed-layer bypass, and per-player
+ * locking via S³ PlayersService. The core pipeline is _saProcessJoin(),
+ * which evaluates team balance and issues RCON moves through an async
+ * swap executor. Extends S3PluginBase for S³ service discovery, DB
+ * convenience, and readiness gating.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * SmartAssign (default)
- *   Extends BasePlugin. Key public methods:
- *     mount()                              — Initialises DB, discovers S³, and registers lifecycle listeners.
- *     unmount()                            — Removes all listeners and cleans up executor and timers.
- *     evaluateTeamAssignment(player, reconnectTeam) — Thin wrapper; builds context and delegates to sa-team-evaluator.
- *     handlePlayerJoin(player)             — Full join pipeline: reconnect, clan grouping, Elo eval, RCON move.
+ *   Extends S3PluginBase. Key public methods:
+ *     _saProcessJoin(player)               — Full join pipeline: reconnect, clan grouping, Elo eval, RCON move.
+ *     _saLogAssignmentEvent(cfg)           — Records assignment events using base class DB methods.
+ *     handlePlayerJoin(player)             — Entry point; acquires per-player lock, delegates to _saProcessJoin.
  *     handlePlayerLeave(player)            — Disconnect handling and reconnect memory persistence.
- *     logEvent(eventType, player, extraData, betweenRounds, serverPlayers) — Records lifecycle events to JSONL with embedded team populations.
+ *     logEvent(eventType, player, ...)     — Records lifecycle events to JSONL with embedded team populations.
  *     finalizeRoundLog()                   — Writes buffered events to disk and finalises the round log.
  *
- * ─── DEPENDENCIES ────────────────────────────────────────────────
+ * ─── DEPENDENCIES ──────────────────────────────────────────────────────
  *
- * SADatabase (../utils/sa-database.js)
- *   Sequelize-based persistence layer for reconnect memory and round state.
+ * S3PluginBase (./s3-plugin-base.js)
+ *   S³ plugin base class providing S³ discovery, readiness gating, DB convenience,
+ *   and flat service accessors. Extends SquadJS BasePlugin under the hood.
  * SASwapExecutor (../utils/sa-swap-executor.js)
  *   RCON move queue using "One-Hit & Verify" logic for fast, bounce-loop-free team switches.
  * SAEventLogger (../utils/sa-event-logger.js)
