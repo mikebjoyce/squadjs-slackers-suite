@@ -14,13 +14,15 @@ const { Op } = Sequelize;
  * scramble-aware lockout, and persistent join-timer tracking across
  * server restarts. Integrates with TeamBalancer to lock switching
  * after scrambles and with SlackersSquadServices for player state
- * tracking and attribution. Supports in-game chat commands and
- * Discord admin commands.
+ * tracking and attribution. Uses _requestTeamChange() retry/verify
+ * from S3DiscordPluginBase, and getSecondsFromJoin() /
+ * getSecondsFromMatchStart() for join-time awareness. Supports
+ * in-game chat commands and Discord admin commands.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * Switch (default)
- *   Extends DiscordBasePlugin. Key public methods:
+ *   Extends S3DiscordPluginBase. Key public methods:
  *     mount()                          — Registers event listeners, discovers S³, registers migrations.
  *     unmount()                        — Removes listeners, clears queue, unregisters S³ interest.
  *     switchPlayer(eosID)              — Executes AdminForceTeamChange via RCON for one player.
