@@ -834,7 +834,6 @@ export default class Switch extends S3DiscordPluginBase {
                 this.verbose(2, `[Liberal Mode] ${playerName} - relaxed switch restrictions active (Seed/Jensen).`);
             }
 
-             const eosID = info.player?.eosID;
              if (!eosID) {
                  this.verbose(1, `[PlayerCooldowns] Missing eosID for player ${playerName}, skipping switch validation`);
                  return;
