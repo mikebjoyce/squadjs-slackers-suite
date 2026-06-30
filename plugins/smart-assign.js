@@ -54,7 +54,7 @@
  *               getGamemode(), isIgnoredMode(), isFactionVoteInProgress(),
  *               getRoundSnapshot() — round lifecycle and game-mode detection.
  *   - players:   getAllPlayers(), getReconnect(), recordMove(),
- *               rememberReconnect(), requestRefresh(),
+ *               rememberReconnect(),
  *               unregisterRefreshInterest() — player state and move tracking.
  *   - clans:     isEnabled(), extractRawPrefix(), normalizeTag(),
  *               getPlayerTagCache() — clan tag grouping lookups.
@@ -448,8 +448,8 @@ export default class SmartAssign extends S3PluginBase {
     // Register refresh interest with S³ PlayersService for fast join detection
     const mountPlayers = this._s3?.players;
     if (mountPlayers?.isReady() && mountPlayers.registerRefreshInterest) {
-      mountPlayers.registerRefreshInterest('SmartAssign', { maxStalenessMs: 5000 });
-      Logger.verbose('SmartAssign', 2, '[S3] Registered SmartAssign refresh interest (maxStalenessMs=5000).');
+      mountPlayers.registerRefreshInterest('SmartAssign', { maxStalenessMs: 20000 });
+      Logger.verbose('SmartAssign', 2, '[S3] Registered SmartAssign refresh interest (maxStalenessMs=20000).');
     }
 
     // DB maintenance: SA_AssignmentLog is lazily synced on first write.
