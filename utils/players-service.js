@@ -1423,8 +1423,9 @@ export default class PlayersService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Initialize the S3_PlayerSessions table via migration + model definition.
-   * Follows the same pattern as _initReconnectPersistence().
+   * Initialize the S3_PlayerSessions model definition (the v2 table migration is
+   * registered and run in _initReconnectPersistence() alongside v1, so both
+   * "s3-players" migrations are applied in a single call — avoiding duplicate logs).
    */
   async _initSessionPersistence() {
     const dbService = this._getDbService();
@@ -1432,31 +1433,6 @@ export default class PlayersService {
 
     const connector = dbService.getConnector?.();
     if (!connector) return;
-
-    // Register the S3_PlayerSessions table migration via MigrationEngine (v2, after S3PlayerReconnects).
-    if (!this._sessionInitialized && dbService.migrationEngine) {
-      this._sessionInitialized = true;
-
-      dbService.migrationEngine.registerMigrations('s3-players', [
-        {
-          version: 2,
-          up: async (qi) => {
-            await qi.rawQuery(`
-              CREATE TABLE IF NOT EXISTS S3_PlayerSessions (
-                eosID VARCHAR(64) PRIMARY KEY,
-                steamID VARCHAR(64) NULL,
-                playerName VARCHAR(255) NULL,
-                sessionStart BIGINT NOT NULL,
-                lastActivity BIGINT NOT NULL
-              );
-            `);
-          },
-          description: 'Create S3_PlayerSessions table for persistent join-time tracking'
-        }
-      ]);
-
-      await dbService.migrationEngine.runMigrations('s3-players');
-    }
 
     this.sessionModel = dbService.defineModel?.(
       'S3PlayerSession',
@@ -1738,7 +1714,9 @@ export default class PlayersService {
     const connector = dbService.getConnector?.();
     if (!connector) return;
 
-    // Register the S3PlayerReconnects table migration via MigrationEngine (v1, first player migration).
+    // Register BOTH s3-players migrations in a single call (v1: S3PlayerReconnects, v2: S3_PlayerSessions).
+    // Previously _initReconnectPersistence registered v1 and _initSessionPersistence registered v2
+    // separately, causing duplicate "Registered 1 migration(s) for s3-players" log lines.
     if (!this._migrationRegistered && dbService.migrationEngine) {
       this._migrationRegistered = true;
 
@@ -1759,6 +1737,21 @@ export default class PlayersService {
             `);
           },
           description: 'Create S3PlayerReconnects table for reconnect persistence'
+        },
+        {
+          version: 2,
+          up: async (qi) => {
+            await qi.rawQuery(`
+              CREATE TABLE IF NOT EXISTS S3_PlayerSessions (
+                eosID VARCHAR(64) PRIMARY KEY,
+                steamID VARCHAR(64) NULL,
+                playerName VARCHAR(255) NULL,
+                sessionStart BIGINT NOT NULL,
+                lastActivity BIGINT NOT NULL
+              );
+            `);
+          },
+          description: 'Create S3_PlayerSessions table for persistent join-time tracking'
         }
       ]);
 
