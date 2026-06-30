@@ -36,8 +36,13 @@
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
- * - Polling is gated to the LIVE phase only — faction abbreviations are
- *   meaningless during STAGING (teams resolving) and ENDGAME (voting).
+ * - Polling runs whenever the abbreviation cache is incomplete AND the
+ *   resolving flag is false. The resolving flag is set true on NEW_GAME
+ *   (after match start) and cleared once all players have valid team IDs.
+ *   During resolving, player roles may carry stale faction data from the
+ *   previous round — polling is safely skipped. Once teams settle,
+ *   polling runs regardless of phase (STAGING or LIVE), so seed-mode
+ *   rounds (which never transition to LIVE) still get abbreviations.
  * - Polling stops automatically once both teams' abbreviations are cached.
  * - Cache clears on every NEW_GAME event.
  * - Falls back to generic "Team N" when abbreviation is not yet cached.
@@ -197,18 +202,22 @@ export default class FactionsService {
     return firstPlayer ? Number(firstPlayer.teamID) || null : null;
   }
 
-  // LIVE-gating rationale: faction abbreviations (e.g. "US", "RUS", "GB", "CAF") are only
-  // meaningful during active gameplay. During STAGING (teams resolving, map loading) and
-  // ENDGAME (scoreboard, voting), player roles may not be loaded yet or may reflect the
-  // previous round's factions. Polling is therefore restricted to the LIVE phase only.
-  // Once both teams are resolved (cache complete), polling stops automatically — no need
-  // to keep scanning every interval. A NEW_GAME event clears the cache and polling resumes
-  // when LIVE is reached again.
+  // Gate polling on the resolving flag rather than isLive(). The resolving flag is
+  // set to true on NEW_GAME (after match start) and cleared once all players have
+  // valid team IDs. During the resolving window, player roles may carry stale
+  // faction data from the previous round — skip polling until teams settle.
+  // Once resolving=false, poll regardless of phase (STAGING or LIVE), so seed-mode
+  // rounds (which never transition to LIVE) still get faction abbreviations.
   _ensurePollingState() {
-    const live = this.gameState.isLive();
     const hasBoth = this._hasBothTeams();
 
-    if (!live || hasBoth) {
+    if (hasBoth) {
+      this.stopPollingTeamAbbreviations();
+      return;
+    }
+
+    // Skip during the null-teamID window — roles may be from the previous round
+    if (this.gameState.resolving) {
       this.stopPollingTeamAbbreviations();
       return;
     }
@@ -230,7 +239,9 @@ export default class FactionsService {
   }
 
   pollTeamAbbreviations() {
-    if (!this.gameState.isLive()) return;
+    // Double-check: skip if still in resolving window (guard against race where
+    // interval fires between resolving=false and a subsequent NEW_GAME)
+    if (this.gameState.resolving) return;
 
     const wasComplete = this._hasBothTeams();
     const discovered = this.extractTeamAbbreviationsFromRoles();
