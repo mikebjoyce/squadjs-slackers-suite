@@ -272,46 +272,6 @@ export function registerS3DiscordCommands(plugin) {
 
   let discordChannel = null;
 
-  // Initialize event log
-  if (!plugin._s3EventLog) {
-    plugin._s3EventLog = [];
-  }
-
-  // Hook into server events to record event history
-  function recordEvent(eventName, detail = '') {
-    if (!plugin._s3EventLog) plugin._s3EventLog = [];
-    plugin._s3EventLog.push({
-      event: eventName,
-      detail,
-      timestamp: Date.now()
-    });
-    // Keep last 100 events
-    if (plugin._s3EventLog.length > 100) {
-      plugin._s3EventLog = plugin._s3EventLog.slice(-100);
-    }
-  }
-
-  // Intercept server events for logging
-  const originalBindServerEvents = plugin._bindServerEvents?.bind(plugin);
-  if (originalBindServerEvents) {
-    plugin._bindServerEvents = function () {
-      originalBindServerEvents();
-
-      // Hook event recording
-      const events = [
-        'NEW_GAME', 'ROUND_ENDED', 'UPDATED_LAYER_INFORMATION',
-        'UPDATED_SERVER_INFORMATION', 'UPDATED_PLAYER_INFORMATION', 'PLAYER_CONNECTED'
-      ];
-      for (const evt of events) {
-        if (plugin.server && typeof plugin.server.on === 'function') {
-          plugin.server.on(evt, (...args) => {
-            recordEvent(evt, args[0] ? `data keys: ${Object.keys(args[0]).join(', ')}` : '');
-          });
-        }
-      }
-    };
-  }
-
   // Watch manager
   const watchManager = new WatchManager(plugin);
 

@@ -106,19 +106,20 @@
  * No in-game chat commands.
  *
  * Discord Admin (channelID only):
- *   !s3 status               → Overview: service mount status, game phase, player count.
- *   !s3 services             → Per-service detail.
- *   !s3 gamestate            → Phase, mode, layer name, sub-state.
- *   !s3 factions             → Team 1/2 names, faction IDs.
- *   !s3 players              → Full player list with teamID, clan tag.
+ *   !s3 status               → Overview: service mount status (🟢/🟡/⚫), game phase, players, locks.
+ *   !s3 services             → Per-service detail with internal state emoji.
+ *   !s3 gamestate            → Phase, matchId, roundStartTime, mode, layer, sub-state.
+ *   !s3 factions             → Team 1/2 names, polling status, resolving gate.
+ *   !s3 players              → Full player list with teamID, clan tag, locks.
  *   !s3 clans                → Detected clan groups.
- *   !s3 locks                → Global lock + per-player locks.
+ *   !s3 locks                → Global lock + per-player locks + priority table.
  *   !s3 config               → Server config values.
- *   !s3 watch <svc>          → Relay verbose logs for a service to Discord.
- *   !s3 unwatch              → Stop all active watches.
- *   !s3 events               → Recent event history (last 20).
- *   !s3 test smoke           → Automated smoke tests.
- *   !s3 test preflight       → Validate pre-flight checklist.
+ *   !s3 db status            → Connector type, schema version status per plugin.
+ *   !s3 db export [--logs|--all] [--to-file]  → Export tables as JSON.
+ *   !s3 db import [--confirm] [--dry-run]       → Import from backup.
+ *   !s3 diag                 → Consolidated read-only health check.
+ *   !s3 migrate <pending|status|force>  → Schema migration management.
+ *   !s3 backup <create|list|restore>    → Database backup management.
  *   !s3 help                 → Command reference.
  *
  * ─── AUTHOR ──────────────────────────────────────────────────────
