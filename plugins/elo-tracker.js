@@ -287,10 +287,17 @@ export default class EloTracker extends S3PluginBase {
 
     // Register Elo migrations on S³ connector (v1 creates tables, v2 drops roundStartTime)
     if (this.s3db?.isReady() && this.s3db.migrationEngine) {
-      this.registerExpectedVersion('elo-tracker', 2);
+      this.registerExpectedVersion('elo-tracker', 1);
 
       this.registerMigrations('elo-tracker', [
         {
+          // Merged v1+v2: v1 and v2 were developed as two parts of the same Stage 8
+          // migration pipeline, but always shipped together — no production DB ever
+          // existed at the intermediate v1-only state. v2 previously dropped the
+          // vestigial roundStartTime column from Elo_PluginState (which was never
+          // created by the v1 migration — sync({alter}) added it). The merged
+          // migration creates all 4 tables directly — Elo_PluginState without
+          // roundStartTime is the intended final state.
           version: 1,
           description: 'Create Elo_PluginState, Elo_PlayerStats, Elo_RoundHistory, Elo_RoundPlayers',
           up: async (qi) => {
@@ -356,20 +363,6 @@ export default class EloTracker extends S3PluginBase {
             await qi.dropTable('Elo_RoundHistory');
             await qi.dropTable('Elo_PlayerStats');
             await qi.dropTable('Elo_PluginState');
-          }
-        },
-        {
-          version: 2,
-          description: 'Drop vestigial roundStartTime column from Elo_PluginState (now read from S³ GameStateService)',
-          up: async (qi) => {
-            // Note: if the column was already dropped by Sequelize sync(), removeColumn is a no-op
-            await qi.removeColumn('Elo_PluginState', 'roundStartTime');
-          },
-          down: async (qi) => {
-            await qi.addColumn('Elo_PluginState', 'roundStartTime', {
-              type: qi.DataTypes.BIGINT,
-              allowNull: true
-            });
           }
         }
       ]);
