@@ -24,7 +24,7 @@
  *                 clearReconnects()
  *   Sessions:     getJoinTime(eosID)
  *   Refresh:      registerRefreshInterest(), unregisterRefreshInterest(),
- *                 requestRefresh(), refreshNow(), refreshNowImmediate()
+ *                 requestRefresh(), refresh(), refreshNow()
  *   Lifecycle:    mount(), unmount(), isReady(),
  *                 handlePlayerConnected(), handleUpdatedPlayerInfo()
  *
@@ -151,7 +151,7 @@ export default class PlayersService {
     // Coalesced refresh manager
     //
     // Provides debounced requestRefresh() (fire-and-forget, coalesces burst calls)
-    // and refreshNow() (awaitable, respects 1s floor). Consumers register their
+    // and refresh() (awaitable, respects 1s floor). Consumers register their
     // desired max-staleness interval; the effective interval is the minimum of
     // all registered intervals, clamped to [refreshMinIntervalMs, refreshMaxIntervalMs].
     // When a natural UPDATED_PLAYER_INFORMATION tick arrives, any pending debounce
@@ -424,14 +424,14 @@ export default class PlayersService {
     }, debounceMs);
   }
 
-  async refreshNow(source) {
+  async refresh(source) {
     const normalized = this._normalizeSource(source);
     if (!this._refreshState.registeredIntervals.has(normalized)) return;
 
     const now = Date.now();
     const elapsed = now - this._refreshState.lastRefreshTime;
     if (elapsed < this.refreshNowFloorMs) {
-      this.verboseLogger(3, `[Players] refreshNow skipped: ${elapsed}ms since last (floor=${this.refreshNowFloorMs}ms)`);
+      this.verboseLogger(3, `[Players] refresh skipped: ${elapsed}ms since last (floor=${this.refreshNowFloorMs}ms)`);
       return;
     }
 
@@ -450,9 +450,9 @@ export default class PlayersService {
    * Cancels any pending debounce and immediately calls updatePlayerList().
    * Designed for consumers that need a single post-move verification refresh
    * without maintaining a registered periodic interest (e.g., TeamBalancer's
-   * SwapExecutor after a scramble).
+   * SwapExecutor after a scramble, or S3PluginBase._requestTeamChange).
    */
-  async refreshNowImmediate(source) {
+  async refreshNow(source) {
     const normalized = this._normalizeSource(source);
 
     // Cancel any pending debounce so we don't double-refresh.

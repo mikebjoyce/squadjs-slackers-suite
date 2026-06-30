@@ -33,7 +33,7 @@ function createMockS3(initialTeamID = 1) {
       if (disconnectFlag) return null; // player disconnected
       return eosID === playerData.eosID ? { ...playerData } : null;
     },
-    refreshNowImmediate: async (source) => {
+    refreshNow: async (source) => {
       refreshCallCount++;
       // After refresh, optionally flip the team to simulate RCON taking effect
     },
@@ -79,7 +79,7 @@ async function requestTeamChange(s3, eosID, options = {}) {
       // (in real code this calls rcon.switchTeam)
 
       // Force an immediate refresh of S³ player data
-      await s3.players.refreshNowImmediate(source);
+      await s3.players.refreshNow(source);
 
       // Verify the player landed on the target team
       const updated = s3.players.getPlayer(eosID);
@@ -154,7 +154,7 @@ async function run() {
 test('Player found — sends RCON and verifies via S³', async () => {
   const s3 = createMockS3(1);
   // Simulate RCON success: flip team to 2
-  s3.players.refreshNowImmediate = async (source) => {
+  s3.players.refreshNow = async (source) => {
     s3.players.setPlayerData({ teamID: 2 });
   };
 
@@ -180,14 +180,14 @@ test('S³ refresh is called before verification', async () => {
   const s3 = createMockS3(1);
   let refreshCalls = 0;
 
-  s3.players.refreshNowImmediate = async (source) => {
+  s3.players.refreshNow = async (source) => {
     refreshCalls++;
     s3.players.setPlayerData({ teamID: 2 });
   };
 
   await requestTeamChange(s3, 'EOS:tc001', { maxAttempts: 1 });
 
-  assert.equal(refreshCalls, 1, 'refreshNowImmediate should be called exactly once on success');
+  assert.equal(refreshCalls, 1, 'refreshNow should be called exactly once on success');
 });
 
 test('Retry on failure up to maxAttempts', async () => {
@@ -195,7 +195,7 @@ test('Retry on failure up to maxAttempts', async () => {
   let callCount = 0;
 
   // Simulate RCON taking effect only on the 3rd attempt
-  s3.players.refreshNowImmediate = async (source) => {
+  s3.players.refreshNow = async (source) => {
     callCount++;
     if (callCount >= 3) {
       s3.players.setPlayerData({ teamID: 2 });
@@ -215,7 +215,7 @@ test('All retries exhausted — returns failure result', async () => {
   const s3 = createMockS3(1);
 
   // RCON never takes effect — player stays on team 1
-  s3.players.refreshNowImmediate = async (source) => {
+  s3.players.refreshNow = async (source) => {
     // Team remains 1 — RCON never works
   };
 
@@ -233,7 +233,7 @@ test('Player disconnect mid-retry returns null gracefully', async () => {
 
   // After first refresh attempt, player disconnects
   let refreshCount = 0;
-  s3.players.refreshNowImmediate = async (source) => {
+  s3.players.refreshNow = async (source) => {
     refreshCount++;
     if (refreshCount >= 2) {
       s3.players.setDisconnect(); // player disappears
@@ -253,7 +253,7 @@ test('Player disconnect mid-retry returns null gracefully', async () => {
 test('Success returns correct result shape', async () => {
   const s3 = createMockS3(2); // start on team 2
 
-  s3.players.refreshNowImmediate = async (source) => {
+  s3.players.refreshNow = async (source) => {
     s3.players.setPlayerData({ teamID: 1 }); // flip to team 1
   };
 
@@ -282,7 +282,7 @@ test('Player starting on team 1 targets team 2, and vice versa', async () => {
   const s3 = createMockS3(2);
 
   let targetTeam;
-  s3.players.refreshNowImmediate = async (source) => {
+  s3.players.refreshNow = async (source) => {
     targetTeam = 1;
     s3.players.setPlayerData({ teamID: 1 });
   };
@@ -294,7 +294,7 @@ test('Player starting on team 1 targets team 2, and vice versa', async () => {
   // Player on team 1 → target team 2
   const s3b = createMockS3(1);
 
-  s3b.players.refreshNowImmediate = async (source) => {
+  s3b.players.refreshNow = async (source) => {
     s3b.players.setPlayerData({ teamID: 2 });
   };
 

@@ -353,7 +353,7 @@ export default class S3PluginBase extends BasePlugin {
    *
    * Sends AdminForceTeamChange via the SquadJS core wrapper (rcon.switchTeam),
    * then uses S³'s players service to verify the player landed on the
-   * opposite team. After each RCON attempt, `refreshNowImmediate()` forces
+   * opposite team. After each RCON attempt, `refreshNow()` forces
    * an immediate player-list refresh via S³ so verification reads fresh
    * data instead of stale cache. Retries on failure up to maxAttempts,
    * then returns the outcome.
@@ -369,7 +369,7 @@ export default class S3PluginBase extends BasePlugin {
    * @param {string} [options.warnMessage] - Warning text
    *   (default: 'You have been scrambled').
    * @param {string} [options.source='S3PluginBase'] - Source identifier
-   *   passed to S³'s refreshNowImmediate() and the result object.
+   *   passed to S³'s refreshNow() and the result object.
    * @returns {Promise<object|null>} Result object, or null if player not found.
    *   - success {boolean}: true if verification passed.
    *   - eosID {string}: The player's EOS ID.
@@ -429,7 +429,7 @@ export default class S3PluginBase extends BasePlugin {
 
     for (attempts = 0; attempts < maxAttempts; attempts++) {
       // Disconnect check — if the player isn't in S³'s registry after a
-      // refreshNowImmediate(), they've disconnected. No need to fall back
+      // refreshNow(), they've disconnected. No need to fall back
       // to server.players as S³'s registry is derived from it.
       if (!getFromS3()) {
         this.verbose(2, `[TC] ${playerName} disconnected during retry — aborting.`);
@@ -453,8 +453,8 @@ export default class S3PluginBase extends BasePlugin {
 
       // Force-refresh S³ player registry after the RCON command so the
       // next iteration (or the final check) sees up-to-date team data.
-      if (this.players?.refreshNowImmediate) {
-        await this.players.refreshNowImmediate(source).catch(() => {});
+      if (this.players?.refreshNow) {
+        await this.players.refreshNow(source).catch(() => {});
       }
     }
 
