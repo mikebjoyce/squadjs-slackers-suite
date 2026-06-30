@@ -5,7 +5,7 @@ const { Op } = Sequelize;
 
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SWITCH PLUGIN v2.0.0                       ║
+ * ║                    SWITCH PLUGIN v2.1.0                       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -18,6 +18,13 @@ const { Op } = Sequelize;
  * from S3DiscordPluginBase, and getSecondsFromJoin() /
  * getSecondsFromMatchStart() for join-time awareness. Supports
  * in-game chat commands and Discord admin commands.
+ *
+ * v2.1.0 adds:
+ *   - Broadcast messages at switch window boundaries (NEW_GAME, periodic,
+ *     close, post-scramble).
+ *   - Join-time warning when ChangeTeam is disabled (scoreboard team
+ *     changes are not available — use !switch instead).
+ *   - queueEnabled option (default true) to disable the queue.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
@@ -45,15 +52,23 @@ const { Op } = Sequelize;
  *     onDiscordMessage(message)        — Handles Discord !switch admin commands.
  *     onRoundEnded(info)               — Processes end-of-round switch queue.
  *     onScrambleExecuted(data)         — Applies scramble lockdown to affected players.
- *     onNewGame()                      — Logs new-game transition.
- *     onS3PlayerJoined(data)           — Triggers rejoin auto-switch and queue processing.
+ *     onNewGame()                      — Logs new-game transition, starts broadcast timers.
+ *     onS3PlayerJoined(data)           — Triggers rejoin auto-switch, queue processing, and join warn.
  *     onS3PlayerLeft(data)             — Removes player from queue, triggers queue processing.
  *     onS3PlayerTeamChanged(data)      — Triggers queue processing on team change.
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
- * DiscordBasePlugin (./discord-base-plugin.js)
- *   SquadJS base class providing Discord connector, server, and options.
+ * S3DiscordPluginBase (./s3-discord-plugin-base.js)
+ *   SquadJS base class providing Discord connector, server, options, and S³ lifecycle.
+ *
+ * ─── V2.1.0 NEW OPTIONS ──────────────────────────────────────────
+ *
+ * broadcastSwitchWindowMessages:  Broadcast window open/close/reminder messages (default: true)
+ * switchWindowBroadcastDelaySeconds:  Seconds after match start before first broadcast (default: 60)
+ * switchWindowBroadcastIntervalMinutes:  Minutes between reminder broadcasts (default: 2)
+ * warnOnJoinChangeTeamDisabled:  Warn joining players when ChangeTeam is disabled (default: true)
+ * queueEnabled:  Enable the switch queue (default: true)
  *
  * ─── S³ INTEGRATION ──────────────────────────────────────────────
  *
@@ -80,12 +95,14 @@ const { Op } = Sequelize;
  *               concurrency gating, and stale-data refresh polling.
  *   - gameState: getLayerName(), isEndgameFactionVote() — liberal-mode
  *               detection and faction-vote queue suppression.
+ *   - serverConfig: getAllowTeamChanges() — detects whether scoreboard
+ *               team changes are disabled.
  *
  * Emitted Events:
  *   - None.
  *
  * Listened Events:
- *   - S3_PLAYER_JOINED: triggers rejoin auto-switch and queue processing.
+ *   - S3_PLAYER_JOINED: triggers rejoin auto-switch, queue processing, and join warn.
  *   - S3_PLAYER_LEFT: stores disconnection state; removes player from switch queue.
  *   - S3_PLAYER_TEAM_CHANGED: triggers queue re-evaluation.
  *   - TEAM_BALANCER_SCRAMBLE_EXECUTED: applies scramble lockdown to affected
@@ -113,6 +130,9 @@ const { Op } = Sequelize;
  *   — no more sync({alter}) or drop-and-recreate.
  * - Endmatch switch queue persists across restarts via the
  *   SwitchPlugin_Endmatches table; processed on ROUND_ENDED.
+ * - Broadcast timers and join-warn timeouts are cleaned up in unmount().
+ * - JOIN_WARN_DELAY_MS constant controls the delay before showing
+ *   ChangeTeam-disabled warning to joining players (90s default).
  *
  * ─── COMMANDS ────────────────────────────────────────────────────
  *
@@ -151,7 +171,7 @@ const { Op } = Sequelize;
  *
  */
 export default class Switch extends S3DiscordPluginBase {
-    static version = '2.0.0';
+    static version = '2.1.0';
 
     static get description() {
         return "Switch plugin with persistent join timers";
@@ -160,6 +180,9 @@ export default class Switch extends S3DiscordPluginBase {
     static get defaultEnabled() {
         return true;
     }
+
+    /** Delay in ms before showing ChangeTeam-disabled warning to joining players (90s). */
+    static get JOIN_WARN_DELAY_MS() { return 90000; }
 
     static get optionsSpecification() {
         return {
@@ -270,6 +293,32 @@ export default class Switch extends S3DiscordPluginBase {
                 description: "Additional allowed imbalance slots at the floor player count (default 2). Linearly interpolated between floor and 98 players.",
                 default: 2,
                 type: 'number'
+            },
+            // ── v2.1.0 Options ─────────────────────────────────────
+            broadcastSwitchWindowMessages: {
+                required: false,
+                description: 'Broadcast switch window open/close/reminder messages to the server.',
+                default: true
+            },
+            switchWindowBroadcastDelaySeconds: {
+                required: false,
+                description: 'Seconds after match start before the first broadcast.',
+                default: 60
+            },
+            switchWindowBroadcastIntervalMinutes: {
+                required: false,
+                description: 'Minutes between switch window reminder broadcasts.',
+                default: 2
+            },
+            warnOnJoinChangeTeamDisabled: {
+                required: false,
+                description: 'Warn joining players that scoreboard team changes are disabled and !switch is the alternative.',
+                default: true
+            },
+            queueEnabled: {
+                required: false,
+                description: 'Enable the switch queue. When disabled, !switch only works if a balance slot is immediately available.',
+                default: true
             }
         };
     }
@@ -318,6 +367,19 @@ export default class Switch extends S3DiscordPluginBase {
 
         // Models are now on S³ — accessed via this._s3db.models.SwitchPlugin_PlayerCooldowns etc.
 
+        // v2.1.0: ChangeTeam-disabled flag (queried from S³ serverConfig during _onS3Ready)
+        this._changeTeamDisabled = false;
+
+        // v2.1.0: Broadcast timer handles (cleared in _onUnmount)
+        this._broadcastTimers = {
+            firstBroadcast: null,
+            reminderInterval: null,
+            closeBroadcast: null
+        };
+
+        // v2.1.0: Map of join-warn timeouts per eosID (cleared on disconnect/cleanup)
+        this._joinWarnTimeouts = new Map();
+
         this.broadcast = (msg) => { this.server.rcon.broadcast(msg); };
         this.warn = (id, msg) => {
             if (!id) return;
@@ -357,13 +419,26 @@ export default class Switch extends S3DiscordPluginBase {
 
     /**
      * _onS3Ready — S³ lifecycle hook (called by S3PluginBase.mount() after _s3.ready()).
-     * Handles DB model definition, migration registration, and refresh interest.
-     * Replaces the old inline mount() S³ boilerplate (~120 lines).
+     * Handles DB model definition, migration registration, refresh interest,
+     * and ChangeTeam detection.
      */
     async _onS3Ready() {
         if (!this._s3db?.isReady?.() || !this._s3db.migrationEngine) {
             this.verbose(1, '[7.4l] S³ DB or migrationEngine not available — cannot register Switch schema. Mounting without DB.');
             return;
+        }
+
+        // v2.1.0: Detect whether scoreboard team changes are disabled
+        try {
+            const sc = this._s3?.serverConfig;
+            if (sc?.isReady?.() && typeof sc.getAllowTeamChanges === 'function') {
+                this._changeTeamDisabled = !sc.getAllowTeamChanges();
+                this.verbose(2, `[S3] ChangeTeam detection: ${this._changeTeamDisabled ? 'DISABLED' : 'enabled'}.`);
+            } else {
+                this.verbose(2, '[S3] serverConfig not available — assuming ChangeTeam is enabled.');
+            }
+        } catch (err) {
+            this.verbose(1, `[S3] Failed to query ChangeTeam setting: ${err.message}. Assuming enabled.`);
         }
 
         // Define models on S³ connector (idempotent — defineModel caches)
@@ -473,6 +548,93 @@ export default class Switch extends S3DiscordPluginBase {
         }
         await super.prepareToMount();
         // 7.4l: Table sync and ALTER TABLE are removed — handled by S³ MigrationEngine in mount()
+    }
+
+    /* ── v2.1.0: Broadcast Helpers ────────────────────────────── */
+
+    /**
+     * Start broadcast timers for the switch window.
+     * Called from onNewGame().
+     */
+    _startBroadcastTimers() {
+        if (!this.options.broadcastSwitchWindowMessages) return;
+
+        this._clearBroadcastTimers();
+
+        const windowMs = this.options.switchEnabledMinutes * 60 * 1000;
+        const delayMs = this.options.switchWindowBroadcastDelaySeconds * 1000;
+        const intervalMs = this.options.switchWindowBroadcastIntervalMinutes * 60 * 1000;
+
+        // First broadcast after delay
+        this._broadcastTimers.firstBroadcast = setTimeout(() => {
+            const remainingMin = Math.floor((windowMs - delayMs) / 60000);
+            this.broadcast(`!switch Team switching is open. Use '!switch help' for more information. Window: ~${remainingMin}m.`);
+        }, delayMs);
+
+        // Periodic reminders
+        if (intervalMs > 0) {
+            this._broadcastTimers.reminderInterval = setInterval(() => {
+                const elapsed = Date.now() - this._gameStartTs;
+                const remainingMs = windowMs - elapsed;
+                if (remainingMs <= 0) {
+                    this._clearBroadcastTimers();
+                    return;
+                }
+                const remainingMin = Math.ceil(remainingMs / 60000);
+                this.broadcast(`!switch ~${remainingMin}m remaining to request a team change. Use '!switch check' to see your eligibility.`);
+            }, intervalMs);
+        }
+
+        // Window close broadcast
+        this._broadcastTimers.closeBroadcast = setTimeout(() => {
+            this.broadcast(`!switch Join/match window is now closed.`);
+            this._clearBroadcastTimers();
+        }, windowMs);
+    }
+
+    _clearBroadcastTimers() {
+        if (this._broadcastTimers.firstBroadcast) {
+            clearTimeout(this._broadcastTimers.firstBroadcast);
+            this._broadcastTimers.firstBroadcast = null;
+        }
+        if (this._broadcastTimers.reminderInterval) {
+            clearInterval(this._broadcastTimers.reminderInterval);
+            this._broadcastTimers.reminderInterval = null;
+        }
+        if (this._broadcastTimers.closeBroadcast) {
+            clearTimeout(this._broadcastTimers.closeBroadcast);
+            this._broadcastTimers.closeBroadcast = null;
+        }
+    }
+
+    /* ── v2.1.0: Join-warn helpers ────────────────────────────── */
+
+    /**
+     * Schedule a delayed warning for a player when ChangeTeam is disabled.
+     * Cleared on disconnect via _clearJoinWarnTimeout().
+     */
+    _scheduleJoinWarn(eosID) {
+        if (!this._changeTeamDisabled || !this.options.warnOnJoinChangeTeamDisabled) return;
+        if (this._joinWarnTimeouts.has(eosID)) return; // already scheduled
+
+        const timeout = setTimeout(() => {
+            this._joinWarnTimeouts.delete(eosID);
+            // Verify player is still connected
+            const stillHere = this.server.players.find(p => p.eosID === eosID);
+            if (stillHere) {
+                this.warn(eosID, `Scoreboard team changes are disabled on this server. Use '!switch' to change teams. Use '!switch help' for more information.`);
+            }
+        }, Switch.JOIN_WARN_DELAY_MS);
+
+        this._joinWarnTimeouts.set(eosID, timeout);
+    }
+
+    _clearJoinWarnTimeout(eosID) {
+        const timeout = this._joinWarnTimeouts.get(eosID);
+        if (timeout) {
+            clearTimeout(timeout);
+            this._joinWarnTimeouts.delete(eosID);
+        }
     }
 
     /* ────────────────────────────────────── COMMAND HANDLING ────────────────────────────────────── */
@@ -781,7 +943,9 @@ export default class Switch extends S3DiscordPluginBase {
                     this.warn(eosID, "All player cooldowns cleared.");
                     break;
                 case 'cancel':
-                    if (this._removePlayerFromQueue(info.player?.eosID)) {
+                    if (!this.options.queueEnabled) {
+                        this.warn(eosID, '[Switch Queue] Queue is currently disabled.');
+                    } else if (this._removePlayerFromQueue(info.player?.eosID)) {
                         this.warn(eosID, '[Switch Queue] Removed — you left the queue.');
                         this.verbose(1, `[Queue] ${playerName} cancelled — left the queue.`);
                     } else {
@@ -854,15 +1018,25 @@ export default class Switch extends S3DiscordPluginBase {
                 return;
             }
 
-            const queueSameTeam = this._switchQueue[teamID === 1 ? 't1' : 't2'].length;
-            if (queueSameTeam > 0) {
-                this._enqueuePlayer(info.player, 'Other players are already waiting in the queue.');
-                return;
-            }
+            // v2.1.0: Queue-disabled path — deny early if queue is off and no slot
+            if (!this.options.queueEnabled) {
+                if (availableSwitchSlots <= 0) {
+                    this.warn(eosID, '[Switch] Queue is currently disabled and no slots are available. Try again shortly.');
+                    return;
+                }
+                // If queue disabled but slot available, fall through to switch below
+            } else {
+                // v2.1.0: FIFO check — if players are already waiting, enqueue behind them
+                const queueSameTeam = this._switchQueue[teamID === 1 ? 't1' : 't2'].length;
+                if (queueSameTeam > 0) {
+                    this._enqueuePlayer(info.player, 'Other players are already waiting in the queue.');
+                    return;
+                }
 
-            if (availableSwitchSlots <= 0) {
-                this._enqueuePlayer(info.player, 'Teams are currently full on that side.');
-                return;
+                if (availableSwitchSlots <= 0) {
+                    this._enqueuePlayer(info.player, 'Teams are currently full on that side.');
+                    return;
+                }
             }
 
              let switchSuccess = false;
@@ -1081,7 +1255,14 @@ export default class Switch extends S3DiscordPluginBase {
             refreshPlayers.requestRefresh('Switch', { urgency: 'normal' });
         }
     }
+
     _enqueuePlayer(player, reason) {
+        // v2.1.0: Gate — return early if queue is disabled
+        if (!this.options.queueEnabled) {
+            this.verbose(2, `[Queue] Queue disabled — refusing enqueue for ${player.name}.`);
+            return;
+        }
+
         const { eosID, steamID, name: playerName, teamID } = player;
 
         if (!eosID || !teamID) {
@@ -1181,6 +1362,9 @@ export default class Switch extends S3DiscordPluginBase {
     }
 
     async _processQueue() {
+        // v2.1.0: Queue-disabled gate
+        if (!this.options.queueEnabled) return;
+
         if (this._queueProcessing) {
             this.verbose(2, `[Queue] Processing already in progress — skipping concurrent invocation.`);
             return;
@@ -1365,6 +1549,9 @@ export default class Switch extends S3DiscordPluginBase {
     }
 
     handlePlayerLeave(eosID, teamID, playerName) {
+        // v2.1.0: Clear join-warn timeout on disconnect
+        this._clearJoinWarnTimeout(eosID);
+
         if (this._removePlayerFromQueue(eosID)) {
             this.verbose(2, `[Queue] ${playerName} disconnected — removed from queue.`);
         }
@@ -1532,6 +1719,12 @@ export default class Switch extends S3DiscordPluginBase {
 
     onNewGame() {
         this.verbose(1, '[NEW_GAME] Round started — null-teamID window handled by S³ players service.');
+
+        // v2.1.0: Store game start timestamp for broadcast timing
+        this._gameStartTs = Date.now();
+
+        // v2.1.0: Start broadcast timers
+        this._startBroadcastTimers();
     }
 
     async onS3PlayerJoined(data) {
@@ -1550,6 +1743,9 @@ export default class Switch extends S3DiscordPluginBase {
             }
         }
 
+        // v2.1.0: Schedule delayed join-warn if ChangeTeam is disabled
+        this._scheduleJoinWarn(eosID);
+
         if (!this.s3IsEndgameFactionVote()) {
             await this._processQueue();
         }
@@ -1557,6 +1753,10 @@ export default class Switch extends S3DiscordPluginBase {
 
     async onS3PlayerLeft(data) {
         if (!data?.player?.eosID) return;
+
+        // v2.1.0: Clear join-warn timeout on disconnect
+        this._clearJoinWarnTimeout(data.player.eosID);
+
         this._removePlayerFromQueue(data.player.eosID);
         if (!this.s3IsEndgameFactionVote()) {
             await this._processQueue();
@@ -1590,13 +1790,23 @@ export default class Switch extends S3DiscordPluginBase {
 
     /**
      * _onUnmount — S³ lifecycle hook (called by S3PluginBase.unmount()).
-     * Cleans up listener registrations and switch queue.
+     * Cleans up listener registrations, switch queue, broadcast timers,
+     * and join-warn timeouts.
      */
     async _onUnmount() {
         const unmountPlayers = this._s3?.players;
         if (unmountPlayers?.isReady && unmountPlayers.unregisterRefreshInterest) {
             unmountPlayers.unregisterRefreshInterest('Switch');
         }
+
+        // v2.1.0: Clear broadcast timers
+        this._clearBroadcastTimers();
+
+        // v2.1.0: Clear all pending join-warn timeouts
+        for (const [eosID, timeout] of this._joinWarnTimeouts) {
+            clearTimeout(timeout);
+        }
+        this._joinWarnTimeouts.clear();
 
         this.server.removeListener('CHAT_MESSAGE', this.onChatMessage);
         this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
@@ -1706,6 +1916,12 @@ export default class Switch extends S3DiscordPluginBase {
         this.verbose(2, `[SCRAMBLE_EVENT] onScrambleExecuted called with data: ${JSON.stringify(data)}`);
         
         this._clearAllQueueEntries('Scramble');
+
+        // v2.1.0: Broadcast post-scramble message
+        if (this.options.broadcastSwitchWindowMessages) {
+            const lockdownMin = this.options.scrambleLockdownDurationMinutes;
+            this.broadcast(`A scramble occurred last round. Players from the previous round are locked from switching for ~${lockdownMin}m. Newly joined players may still be eligible — use '!switch check'.`);
+        }
 
         if (!affectedPlayers || affectedPlayers.length === 0) {
             this.verbose(1, `[SCRAMBLE_EVENT] WARNING: affectedPlayers is empty or undefined — queue cleared, but no lockdown records written.`);
