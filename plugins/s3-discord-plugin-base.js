@@ -117,11 +117,15 @@ export default class S3DiscordPluginBase extends S3PluginBase {
 
   /**
    * Sends a message (plain text or embed) to the configured
-   * Discord channel.
+   * Discord channel, with rate-limit resilience.
    *
    * If the message contains an `embed` property, it is converted
    * to an `embeds` array (matching Discord.js v13+ API), a footer
    * is added if missing, and hex colour strings are parsed.
+   *
+   * On HTTP 429 (rate limit), waits for the retry-after period
+   * then retries once. All other errors are logged via verbose
+   * rather than thrown.
    *
    * @param {string|object} message - Text string or embed object.
    */
@@ -141,6 +145,26 @@ export default class S3DiscordPluginBase extends S3PluginBase {
       message = { ...message, embeds: [message.embed] };
     }
 
-    await this.channel.send(message);
+    try {
+      await this.channel.send(message);
+    } catch (error) {
+      if (error.status === 429 || error.httpStatus === 429) {
+        let waitTime = 2000;
+        if (error.retryAfter) {
+          waitTime = error.retryAfter;
+        } else if (error.headers && error.headers['retry-after']) {
+          waitTime = parseFloat(error.headers['retry-after']) * 1000;
+        }
+        this.verbose(1, `Rate limit hit, attempting retry in ${waitTime}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, waitTime));
+        try {
+          await this.channel.send(message);
+        } catch (retryError) {
+          this.verbose(1, `Failed to send Discord message after retry: ${retryError.message}`, retryError);
+        }
+      } else {
+        this.verbose(1, `Failed to send Discord message: ${error.message}`, error);
+      }
+    }
   }
 }
