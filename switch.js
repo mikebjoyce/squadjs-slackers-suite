@@ -534,12 +534,11 @@ export default class Switch extends S3DiscordPluginBase {
             this.verbose(3, '[7.4l] Switch schema already up to date.');
         }
 
-        // Register refresh interest with S³ PlayersService
-        const mountPlayers = this._s3.players;
-        if (mountPlayers?.isReady() && mountPlayers.registerRefreshInterest) {
-            mountPlayers.registerRefreshInterest('Switch', { maxStalenessMs: 10000 });
-            this.verbose(1, '[S3] Registered Switch refresh interest (maxStalenessMs=10000).');
-        }
+        // Refresh interest is registered conditionally — only when the queue becomes
+        // non-empty (see _enqueuePlayer), and unregistered when the queue empties
+        // (see _removePlayerFromQueue). If the queue is disabled, no interest is
+        // registered at all. This avoids polling when no one is waiting.
+        this.verbose(2, '[S3] Switch refresh interest is conditional (poll only when queue active).');
     }
 
     async prepareToMount() {
@@ -960,8 +959,12 @@ export default class Switch extends S3DiscordPluginBase {
                     return;
             }
         } else {
-            await this.server.updateSquadList();
-            await this.server.updatePlayerList();
+            // Use S³'s immediate refresh for a fresh player list instead of raw RCON
+            if (this._s3?.players?.refreshNow) {
+                await this._s3.players.refreshNow('Switch').catch(() => {});
+            } else {
+                await this.server.updatePlayerList();
+            }
 
             if (this.s3IsEndgameFactionVote()) {
                 this.warn(eosID, '[Switch] Team changes are locked during faction voting. Try again when the next round starts.');
@@ -1311,6 +1314,13 @@ export default class Switch extends S3DiscordPluginBase {
             `[Switch Queue]\nAdded to position ${enqueuePos} in the queue.\n~${(windowMs / 60000).toFixed(1)}m remaining | Team ${teamID} → Team ${targetTeam}\n${reason}\nType !switch cancel to leave.`
         );
         this.verbose(1, `[Queue] ${playerName} (T${teamID} → T${targetTeam}) enqueued at position ${enqueuePos}. Queue size: ${this._getQueueSize()}`);
+
+        // Conditional refresh registration: register 5s interest when queue transitions
+        // from empty to non-empty, so _processQueue polls frequently while people wait.
+        if (this._getQueueSize() === 1 && this._s3?.players?.registerRefreshInterest) {
+            this._s3.players.registerRefreshInterest('Switch', { maxStalenessMs: 5000 });
+            this.verbose(2, '[S3] Registered Switch refresh interest (maxStalenessMs=5000) — queue became active.');
+        }
 
         this._requestQueueRefresh();
     }
@@ -1785,6 +1795,12 @@ export default class Switch extends S3DiscordPluginBase {
         if (!found) return null;
         clearInterval(found.entry.warnInterval);
         this._switchQueue[found.subQueue].splice(found.index, 1);
+        // Unregister refresh interest when queue becomes empty — no need to poll
+        // aggressively if no one is waiting. skip if disableInFlight is true.
+        if (this._getQueueSize() === 0 && this._s3?.players?.unregisterRefreshInterest) {
+            this._s3.players.unregisterRefreshInterest('Switch');
+            this.verbose(2, '[S3] Unregistered Switch refresh interest (queue empty).');
+        }
         return found.entry;
     }
 
