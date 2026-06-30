@@ -357,11 +357,15 @@ export default class SmartAssign extends S3PluginBase {
     // ═══════════════════════════════════════════════════════════════
     try {
       if (this._s3db?.isReady() && this._s3db.migrationEngine) {
-        this.registerExpectedVersion('smart-assign', 2);
+        this.registerExpectedVersion('smart-assign', 1);
         this.registerMigrations('smart-assign', [
           {
+            // Merged v1+v2: v1 and v2 were developed as two parts of the same Stage 8
+            // migration pipeline, but always shipped together — no production DB ever
+            // existed at the intermediate v1-only state. The merged migration creates
+            // SA_AssignmentLog AND drops the 4 orphan tables in a single step.
             version: 1,
-            description: 'Create SA_AssignmentLog table (replaces old SmartAssignReconnectMemory, SmartAssignState, SA_RoundSummary, SA_PlayerEvent)',
+            description: 'Create SA_AssignmentLog table + drop 4 orphan tables',
             up: async (qi) => {
               const existing = await qi.showAllTables();
               if (!existing.includes('SA_AssignmentLog')) {
@@ -381,20 +385,12 @@ export default class SmartAssign extends S3PluginBase {
                   metadata: { type: qi.DataTypes.JSON, allowNull: true }
                 }, { timestamps: false });
               }
-            },
-            down: async (qi) => {
-              await qi.dropTable('SA_AssignmentLog');
-            }
-          },
-          {
-            version: 2,
-            description: 'Drop 4 orphan tables (SmartAssignReconnectMemory, SmartAssignState, SA_RoundSummary, SA_PlayerEvent) — replaced by S³ LoggingService + SA_AssignmentLog.',
-            up: async (qi) => {
               for (const table of ['SmartAssignReconnectMemory', 'SmartAssignState', 'SA_RoundSummary', 'SA_PlayerEvent']) {
                 await qi.dropTable(table);
               }
             },
             down: async (qi) => {
+              await qi.dropTable('SA_AssignmentLog');
               await qi.createTable('SmartAssignState', {
                 id: { type: qi.DataTypes.INTEGER, primaryKey: true },
                 roundStartTime: { type: qi.DataTypes.BIGINT, allowNull: true }
