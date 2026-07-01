@@ -100,6 +100,14 @@ export default class DBService {
     this._pendingMigrations = null;     // null = no check done, [] = up-to-date, array = pending
     this._migrationGate = null;         // Promise that consumers await
     this._resolveMigrationGateFn = null; // Resolver for the gate
+
+    // Network backoff — after a network-level DB failure, all calls return null
+    // for a cooldown period rather than retrying on every tick (Item 4).
+    this._networkErrorBackoff = null;   // null = no backoff, timestamp = skip until
+    this._networkErrorBackoffMs = 30000; // 30-second cooldown
+
+    // Unhandled-rejection safety net for Sequelize-internal promise leaks (Item 3)
+    this._unhandledRejectionHandler = null;
   }
 
   static resolveConnector({ sequelize = null, connectors = null, databaseOption = null } = {}) {
@@ -130,6 +138,33 @@ export default class DBService {
       message.includes('Lock wait timeout exceeded') ||
       err?.name === 'SequelizeTimeoutError'
     );
+  }
+
+  /* ───── Item 2 (recovery): retry network errors ───── */
+  static NETWORK_ERROR_SUBSTRINGS = [
+    'ETIMEDOUT',
+    'ECONNREFUSED',
+    'ENOTFOUND',
+    'EHOSTUNREACH',
+    'ECONNRESET',
+    'EPIPE'
+  ];
+
+  static NETWORK_ERROR_NAMES = new Set([
+    'SequelizeConnectionError',
+    'SequelizeConnectionRefusedError',
+    'SequelizeHostNotFoundError',
+    'SequelizeHostNotReachableError',
+    'SequelizeConnectionAcquireTimeoutError'
+  ]);
+
+  static isNetworkError(err) {
+    if (!err) return false;
+    const message = String(err.message || '');
+    if (DBService.NETWORK_ERROR_SUBSTRINGS.some((s) => message.includes(s))) {
+      return true;
+    }
+    return DBService.NETWORK_ERROR_NAMES.has(err?.name);
   }
 
   static isSqlite(connector) {
@@ -189,7 +224,7 @@ export default class DBService {
         try {
           return await logicFn();
         } catch (err) {
-          if (DBService.isLockError(err) && i < attempts) {
+          if ((DBService.isLockError(err) || DBService.isNetworkError(err)) && i < attempts) {
             const jitter = Math.random() * jitterMs;
             await DBService.sleep(baseDelayMs + jitter);
             continue;
@@ -214,7 +249,14 @@ export default class DBService {
       return connector.transaction(transactionOptions, logicFn);
     }
 
-    return connector.transaction(logicFn);
+    // Sequelize on MySQL may leak an unhandled rejection from its connection
+    // pool when the DB is unreachable. The outer promise still rejects correctly
+    // — this catch prevents the duplicate UnhandledPromiseRejectionWarning.
+    const tx = connector.transaction(logicFn);
+    if (tx && typeof tx.catch === 'function') {
+      tx.catch(() => {});
+    }
+    return tx;
   }
 
   static async ensureSqlitePragmas(connector) {
@@ -295,14 +337,33 @@ export default class DBService {
     // Verify schema versions (logs pending migrations but does NOT auto-run)
     await this._verifySchemaVersions();
 
+    // Safety net for Sequelize-internal unhandled rejections (Item 3).
+    // When the DB is unreachable, Sequelize's connection pool may leak
+    // rejections that aren't chained to any consumer promise. This handler
+    // catches those at the process level and logs them at level 4 (debug).
+    this._unhandledRejectionHandler = (reason) => {
+      if (
+        reason &&
+        (DBService.isNetworkError(reason) || reason.name === 'SequelizeConnectionError')
+      ) {
+        this.verboseLogger(4, `[DB] Suppressed unhandled rejection (Sequelize internal): ${reason?.message || reason}`);
+      }
+    };
+    process.on('unhandledRejection', this._unhandledRejectionHandler);
+
     this._isMounted = true;
     this.verboseLogger(2, '[DB] Mounted.');
   }
 
   async unmount() {
+    if (this._unhandledRejectionHandler) {
+      process.removeListener('unhandledRejection', this._unhandledRejectionHandler);
+      this._unhandledRejectionHandler = null;
+    }
     this._migrationEngine = null;
     this._isMounted = false;
     this._dbPath = null;
+    this._networkErrorBackoff = null;
     this.verboseLogger(2, '[DB] Unmounted.');
   }
 
@@ -352,8 +413,42 @@ export default class DBService {
     return DBService.withTransaction(this.sequelize, logicFn, options);
   }
 
+  /* ───── Item 4: network backoff ───── */
+
+  /**
+   * Returns true when a network-level DB failure activated backoff, and the
+   * cooldown period has not yet expired. Consumer callers should check this
+   * before making DB calls to avoid hammering an unreachable database every
+   * refresh tick.
+   */
+  shouldSkipDb() {
+    return this._networkErrorBackoff !== null && Date.now() < this._networkErrorBackoff;
+  }
+
   async withTransactionWithRetry(logicFn, options = {}) {
-    return this.executeWithRetry(() => DBService.withTransaction(this.sequelize, logicFn, options));
+    if (this.shouldSkipDb()) {
+      return null;
+    }
+    try {
+      const result = await this.executeWithRetry(() =>
+        DBService.withTransaction(this.sequelize, logicFn, options)
+      );
+      // Success — clear any active backoff
+      if (this._networkErrorBackoff !== null) {
+        this._networkErrorBackoff = null;
+        this.verboseLogger(3, '[DB] Network backoff cleared — DB is reachable again.');
+      }
+      return result;
+    } catch (err) {
+      if (DBService.isNetworkError(err)) {
+        this._networkErrorBackoff = Date.now() + this._networkErrorBackoffMs;
+        this.verboseLogger(
+          2,
+          `[DB] Network backoff for ${this._networkErrorBackoffMs}ms: ${err.message}`
+        );
+      }
+      throw err;
+    }
   }
 
   async ensureSqlitePragmas() {
