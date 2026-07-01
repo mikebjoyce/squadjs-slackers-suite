@@ -782,6 +782,7 @@ export default class SmartAssign extends S3PluginBase {
             this._pendingPlayerMoves.set(playerKey, { targetTeam: finalTargetTeam, mu: pendingPlayerMu, isVeteran });
 
             this.executor.queueMove(playerKey, player.name, player.eosID, finalTargetTeam);
+            Logger.verbose('SmartAssign', 3, `[SmartAssign] Move queued: ${player.name} (Team ${player.teamID} -> Team ${finalTargetTeam}, reason: ${reason})`);
 
             // S³ attribution: record the move so S³'s S3_PLAYER_TEAM_CHANGED fires with source='SmartAssign'
             const recordPlayers = this._s3?.players;

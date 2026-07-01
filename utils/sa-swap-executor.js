@@ -112,7 +112,7 @@ export default class SASwapExecutor {
       startTime: Date.now()
     });
 
-    Logger.verbose('SmartAssign', 4, `[SwapExecutor] Queued move for ${playerName} (${playerKey}) -> ${targetTeamID}`);
+    Logger.verbose('SmartAssign', 3, `[SwapExecutor] Queued move for ${playerName} (${playerKey}) -> ${targetTeamID}`);
 
     if (!this.retryTimer) {
       this.startMonitoring();
@@ -183,6 +183,7 @@ export default class SASwapExecutor {
 
           // Delegate to the base class method which handles retry/verify/warn
           if (this._requestTeamChange) {
+            Logger.verbose('SmartAssign', 2, `[SwapExecutor] Sending RCON move for ${moveData.playerName} (${playerKey}) -> Team ${moveData.targetTeamID}`);
             const result = await this._requestTeamChange(moveData.eosID || playerKey, {
               maxAttempts: 6,
               retryIntervalMs: 500,
@@ -191,7 +192,7 @@ export default class SASwapExecutor {
             });
 
             if (result && result.success) {
-              Logger.verbose('SmartAssign', 4, `[SwapExecutor] Success verified for ${moveData.playerName}`);
+              Logger.verbose('SmartAssign', 2, `[SwapExecutor] RCON move SUCCESS: ${moveData.playerName} verified on Team ${result.teamID}`);
               this.callbacks.onSuccess?.({
                 playerKey,
                 eosID: result.eosID,
