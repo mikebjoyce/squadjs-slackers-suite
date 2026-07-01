@@ -159,7 +159,7 @@ export default class SASwapExecutor {
           // correctly before we could act), skip the RCON command entirely.
           const player = this.server.players.find((p) => (p.eosID || p.steamID) === playerKey);
           if (player && String(player.teamID) === String(moveData.targetTeamID)) {
-            Logger.verbose('SmartAssign', 4, `[SwapExecutor] ${moveData.playerName} already on target team. No RCON needed.`);
+            Logger.verbose('SmartAssign', 3, `[SwapExecutor] ${moveData.playerName} already on target team. No RCON needed.`);
             this.recentlyCompletedMoves.set(playerKey, { targetTeamID: moveData.targetTeamID, time: now });
             this.callbacks.onSuccess?.({
               playerKey,

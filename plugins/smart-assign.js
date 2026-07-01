@@ -809,6 +809,10 @@ export default class SmartAssign extends S3PluginBase {
                 Logger.verbose('SmartAssign', 2, `[Handshake] forceQueueSwap error: ${fqsErr.message}. Joining player move is unaffected.`);
               }
             }
+          } else if (finalTargetTeam !== null) {
+            Logger.verbose('SmartAssign', 3, `[SmartAssign] No move needed: ${player.name} already on Team ${finalTargetTeam} (reason: ${reason})`);
+          } else {
+            Logger.verbose('SmartAssign', 3, `[SmartAssign] No move queued: ${player.name} — finalTargetTeam is null (reason: ${reason})`);
           }
         } finally {
           release();
