@@ -365,6 +365,8 @@ export default class Switch extends S3DiscordPluginBase {
         // v2.0.0: Map of join-warn timeouts per eosID (cleared on disconnect/cleanup)
         this._joinWarnTimeouts = new Map();
 
+        this._scrambleHappened = false;   // set by onScrambleExecuted, consumed by onNewGame
+
         this.broadcast = (msg) => { this.server.rcon.broadcast(msg); };
         this.warn = (id, msg) => {
             if (!id) return;
@@ -589,6 +591,22 @@ export default class Switch extends S3DiscordPluginBase {
             clearTimeout(this._broadcastTimers.closeBroadcast);
             this._broadcastTimers.closeBroadcast = null;
         }
+    }
+
+    /**
+     * Start periodic liberal-mode (Seed/Jensen) broadcast timer.
+     * Runs every 5 minutes while the round is active.
+     * Called from onNewGame() when isLiberalMode() is true.
+     */
+    _startLiberalBroadcastTimers() {
+        if (!this.options.broadcastSwitchWindowMessages) return;
+
+        this._clearBroadcastTimers();
+
+        // Hardcoded 5-minute interval as requested
+        this._broadcastTimers.reminderInterval = setInterval(() => {
+            this.broadcast(`!switch has no cooldown on Seed or Jensens. Use '!switch help' for more info.`);
+        }, 5 * 60 * 1000);
     }
 
     /* ── v2.0.0: Join-warn helpers ────────────────────────────── */
@@ -1120,6 +1138,7 @@ export default class Switch extends S3DiscordPluginBase {
 
     async onRoundEnded(dt) {
         this._lastTeamSnapshot = null;
+        this._scrambleHappened = false;
         this.verbose(2, `[Queue] Round ended — queue preserved (${this._getQueueSize()} entries remain).`);
         await this.cleanup();
         await this.doSwitchMatchend();
@@ -1718,8 +1737,19 @@ export default class Switch extends S3DiscordPluginBase {
         // v2.0.0: Store game start timestamp for broadcast timing
         this._gameStartTs = Date.now();
 
-        // v2.0.0: Start broadcast timers
-        this._startBroadcastTimers();
+        // v2.0.0: Branch on scramble/liberal/normal broadcast
+        if (this._scrambleHappened) {
+            this._scrambleHappened = false;
+            const lockdownMin = this.options.scrambleLockdownDurationMinutes;
+            this.broadcast(`A scramble happened last round. Returning players are locked ~${lockdownMin}m but new arrivals can still switch. Use '!switch check' to see your status.`);
+            return; // scramble message replaces all broadcast timers for this round
+        }
+
+        if (this.isLiberalMode()) {
+            this._startLiberalBroadcastTimers();
+        } else {
+            this._startBroadcastTimers();
+        }
     }
 
     async onS3PlayerJoined(data) {
@@ -1808,6 +1838,8 @@ export default class Switch extends S3DiscordPluginBase {
             clearTimeout(timeout);
         }
         this._joinWarnTimeouts.clear();
+
+        this._scrambleHappened = false;
 
         this.server.removeListener('CHAT_MESSAGE', this.onChatMessage);
         this.server.removeListener('ROUND_ENDED', this.onRoundEnded);
@@ -1918,11 +1950,8 @@ export default class Switch extends S3DiscordPluginBase {
         
         this._clearAllQueueEntries('Scramble');
 
-        // v2.0.0: Broadcast post-scramble message
-        if (this.options.broadcastSwitchWindowMessages) {
-            const lockdownMin = this.options.scrambleLockdownDurationMinutes;
-            this.broadcast(`A scramble occurred last round. Players from the previous round are locked from switching for ~${lockdownMin}m. Newly joined players may still be eligible — use '!switch check'.`);
-        }
+        // v2.0.0: Defer post-scramble broadcast to next NEW_GAME
+        this._scrambleHappened = true;
 
         if (!affectedPlayers || affectedPlayers.length === 0) {
             this.verbose(1, `[SCRAMBLE_EVENT] WARNING: affectedPlayers is empty or undefined — queue cleared, but no lockdown records written.`);
