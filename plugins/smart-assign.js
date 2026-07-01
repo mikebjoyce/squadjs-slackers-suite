@@ -23,11 +23,12 @@
  *     logEvent(eventType, player, ...)     — Records lifecycle events to JSONL with embedded team populations.
  *     finalizeRoundLog()                   — Writes buffered events to disk and finalises the round log.
  *
- * ─── DEPENDENCIES ──────────────────────────────────────────────────────
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
- * S3PluginBase (./s3-plugin-base.js)
+ * S3PluginBase (provided by SlackersSquadServices)
  *   S³ plugin base class providing S³ discovery, readiness gating, DB convenience,
  *   and flat service accessors. Extends SquadJS BasePlugin under the hood.
+ *   The plugin extends S3PluginBase which is injected by the S³ plugin system.
  * SASwapExecutor (../utils/sa-swap-executor.js)
  *   RCON move queue using "One-Hit & Verify" logic for fast, bounce-loop-free team switches.
  * SAEventLogger (../utils/sa-event-logger.js)
@@ -59,16 +60,14 @@
  *   - clans:     isEnabled(), extractRawPrefix(), normalizeTag(),
  *               getPlayerTagCache() — clan tag grouping lookups.
  *
- * Internal Callbacks (from SASwapExecutor, Stage 6.1a):
- *   - onFailed:  Invoked on RCON switch timeout, preemption, or disconnect.
- *   - onSuccess: Invoked when RCON switch is verified.
- *   - onRetry:   Invoked on each RCON retry attempt.
- *   These replaced server.emit('SMART_ASSIGN_MOVE_*', ...) with direct callback wiring.
+ * Emitted Events:
+ *   - None.
  *
  * Listened Events:
  *   - S3_PLAYER_JOINED: Triggers the full join assignment pipeline.
  *   - S3_PLAYER_LEFT:   Triggers disconnect handling and reconnect memory save.
  *   - S3_ROUND_LIVE:    Fires round snapshot with full player roster.
+ *   - TEAM_BALANCER_SCRAMBLE_EXECUTED: Detects scrambles for coordination.
  *   Team change events (S3_PLAYER_TEAM_CHANGED) are no longer listened to
  *   by SA — they are handled by S³ LoggingService for persistence.
  *
@@ -227,34 +226,34 @@ export default class SmartAssign extends S3PluginBase {
      this._pendingAssignments = { 1: 0, 2: 0 };
      this._pendingMu = { 1: 0, 2: 0 };
      this._pendingVeterans = { 1: 0, 2: 0 };
-      this._pendingPlayerMoves = new Map(); // Map<playerKey, { targetTeam, mu, isVeteran }>
-      this.ready = false;
+     this._pendingPlayerMoves = new Map(); // Map<playerKey, { targetTeam, mu, isVeteran }>
+     this.ready = false;
      this._isFinalizingRound = false;
-      this._joinMutex = Promise.resolve();  // Serializes concurrent join evaluations
+     this._joinMutex = Promise.resolve();  // Serializes concurrent join evaluations
 
-       this.eloTracker = null;
+     this.eloTracker = null;
 
-       // Handshake with Switch plugin (7.1c — SA-Switch handshake)
-       this._switchPlugin = null;       // Discovered at mount, null if absent/incompatible
-       this._handshakeEnabled = false;  // Reflects toggle AND plugin availability
+     // Handshake with Switch plugin (7.1c — SA-Switch handshake)
+     this._switchPlugin = null;       // Discovered at mount, null if absent/incompatible
+     this._handshakeEnabled = false;  // Reflects toggle AND plugin availability
 
-       this._warnFlags = { eloNotReadyWarned: false };
+     this._warnFlags = { eloNotReadyWarned: false };
 
-      // State bindings
-      this.onNewGame = this.onNewGame.bind(this);
-      this.onRoundEnded = this.onRoundEnded.bind(this);
-      this.onScrambleExecuted = this.onScrambleExecuted.bind(this);
-      this.onMoveFailed = this.onMoveFailed.bind(this);
-      this.onMoveSuccess = this.onMoveSuccess.bind(this);
-      this.onMoveRetry = this.onMoveRetry.bind(this);
-      // Wire executor callbacks (Stage 6.1a) — replaces server.emit() round-trip with direct invocation
-      this.executor.callbacks = {
-        onFailed: this.onMoveFailed,
-        onSuccess: this.onMoveSuccess,
-        onRetry: this.onMoveRetry
-      };
-      this.onS3PlayerJoined = this.onS3PlayerJoined.bind(this);
-       this.onS3PlayerLeft = this.onS3PlayerLeft.bind(this);
+     // State bindings
+     this.onNewGame = this.onNewGame.bind(this);
+     this.onRoundEnded = this.onRoundEnded.bind(this);
+     this.onScrambleExecuted = this.onScrambleExecuted.bind(this);
+     this.onMoveFailed = this.onMoveFailed.bind(this);
+     this.onMoveSuccess = this.onMoveSuccess.bind(this);
+     this.onMoveRetry = this.onMoveRetry.bind(this);
+     // Wire executor callbacks (Stage 6.1a) — replaces server.emit() round-trip with direct invocation
+     this.executor.callbacks = {
+       onFailed: this.onMoveFailed,
+       onSuccess: this.onMoveSuccess,
+       onRetry: this.onMoveRetry
+     };
+     this.onS3PlayerJoined = this.onS3PlayerJoined.bind(this);
+     this.onS3PlayerLeft = this.onS3PlayerLeft.bind(this);
   }
 
   /**
@@ -1112,15 +1111,10 @@ export default class SmartAssign extends S3PluginBase {
     // - candidate moved to their targetTeamID
     // - joining player moved to candidateCurrent
     // This means we need the state AFTER both moves
-    
-    // The virtual state for scoring: we need Mu arrays reflecting both moves.
-    // Starting from base state (neither candidate nor joining player):
-    // - Move candidate → candidateTarget
-    // - Move joining player → candidateCurrent
-    
-    let scoreT1Mus, scoreT2Mus, scoreT1Vets, scoreT2Vets, scoreT1Count, scoreT2Count;
 
-    // Start fresh: base state (neither player)
+    let scoreT1Mus, scoreT2Mus, scoreT1Vets, scoreT2Vets, scoreT1Count;
+
+    // Start fresh: base state (neither candidate nor joining player):
     scoreT1Count = baseT1Count;
     scoreT2Count = baseT2Count;
     scoreT1MuSum = baseT1MuSum;
@@ -1273,25 +1267,25 @@ export default class SmartAssign extends S3PluginBase {
     this.eventLogger.logEvent(eventType, player, extraData, betweenRounds, this.server.players);
   }
 
-    async flushAssignmentLog() {
-      if (this._isFinalizingRound) {
-        Logger.verbose('SmartAssign', 2, '[Flush] Concurrent flush blocked — already in progress.');
-        return;
-      }
-       this._isFinalizingRound = true;
-        try {
-           // Provide round context to event logger for metadata enrichment
-           const roundStartTime = this.previousRoundStartTime ?? this._s3?.gameState?.getRoundStartTime?.() ?? Date.now();
-           const matchId = this.previousMatchId ?? this._s3?.gameState?.getMatchId?.() ?? null;
-           await this.eventLogger.flushAssignmentLog();
-           // Clear captured values after flush
-           this.previousRoundStartTime = null;
-           this.previousMatchId = null;
-           this.previousRoundLayerName = null;
-           this.previousRoundGamemode = null;
-      } finally {
-        this._isFinalizingRound = false;
-      }
+  async flushAssignmentLog() {
+    if (this._isFinalizingRound) {
+      Logger.verbose('SmartAssign', 2, '[Flush] Concurrent flush blocked — already in progress.');
+      return;
     }
-
+     this._isFinalizingRound = true;
+     try {
+        // Provide round context to event logger for metadata enrichment
+        const roundStartTime = this.previousRoundStartTime ?? this._s3?.gameState?.getRoundStartTime?.() ?? Date.now();
+        const matchId = this.previousMatchId ?? this._s3?.gameState?.getMatchId?.() ?? null;
+        await this.eventLogger.flushAssignmentLog();
+        // Clear captured values after flush
+        this.previousRoundStartTime = null;
+        this.previousMatchId = null;
+        this.previousRoundLayerName = null;
+        this.previousRoundGamemode = null;
+     } finally {
+       this._isFinalizingRound = false;
+     }
   }
+
+}

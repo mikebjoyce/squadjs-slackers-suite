@@ -120,7 +120,6 @@ squad-server/
 ├── plugins/
 │   └── smart-assign.js
 ├── utils/
-│   ├── sa-database.js
 │   ├── sa-swap-executor.js
 │   ├── sa-event-logger.js
 │   └── sa-team-evaluator.js
@@ -150,7 +149,7 @@ The Switch Handshake feature allows SmartAssign to optionally include Switch-que
 ### Configuration
 
 | Option | Type | Required | Default | Description |
---------|------|----------|---------|-------------|
+|--------|------|----------|---------|-------------|
 | `handshakeWithSwitch` | boolean | No | `false` | Enable handshake with Switch queue (requires Switch plugin v2.0.0+). |
 | `handshakeScoreThreshold` | number | No | `0.5` | How much worse the swap score can be vs baseline before rejecting (lower = stricter, `eloGated` mode only). |
 | `handshakeMode` | string | No | `"eloGated"` | `"eloGated"` — scoring gates the swap; `"queueDrain"` — swap if hard constraints pass, ignore scoring. |

@@ -22,23 +22,14 @@
  *     logEvent(eventType, player, extraData, betweenRounds, serverPlayers)
  *       — Writes one JSONL line + optional DB row per assignment event.
  *     flushAssignmentLog()
- *       — No-op in this design (events are written immediately).
- *       Retained for interface compatibility.
+ *       — Flushes pending writes; no-op in this design (events written immediately).
  *     cleanup()
  *       — Cleans up any pending state on plugin unmount.
  *
- * ─── REVISION HISTORY ────────────────────────────────────────────
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
- * Stage 7.4i (2026-06-26):
- *   - Narrowed to assignment-only events (MOVE_SUCCESS, MOVE_FAILED,
- *     MOVE_RETRY). Other event types silently dropped.
- *   - Changed from round-wrapper JSONL to per-event JSONL with inline
- *     round context. Each line is independently joinable via matchId.
- *   - Removed temp file batching, batch flush timer, and
- *     finalizeRoundLog() → replaced with immediate per-event writes
- *     and flushAssignmentLog() (no-op).
- *   - DB writes go to SA_AssignmentLog via SADatabase.logAssignmentEvent()
- *     instead of the old SA_RoundSummary/SA_PlayerEvent tables.
+ * Logger (../../core/logger.js)
+ *   SquadJS verbose logging for error/warning output.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
@@ -47,6 +38,9 @@
  *   SADatabase so writes are only gated once.
  * - The logPath file accumulates per-event JSONL lines over time.
  *   Each line is a self-contained object with round context.
+ * - Assignment events (MOVE_SUCCESS, MOVE_FAILED, MOVE_RETRY) are
+ *   written to JSONL + DB. Non-assignment events (JOIN, LEAVE,
+ *   TEAM_CHANGE, ROUND_SNAPSHOT) are handled by S³'s LoggingService.
  *
  * ═══════════════════════════════════════════════════════════════
  */
