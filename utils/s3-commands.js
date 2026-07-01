@@ -348,8 +348,9 @@ export function buildServicesEmbed(plugin) {
   } else {
     const enabled = clans.isEnabled?.() ?? false;
     if (enabled) {
-      const groups = clans.extractClanGroups?.(players?.getAllPlayers?.() ?? []) ?? [];
-      entries.push(`🟢 **Clans** — ${groups.length} group(s) found (min ${clans.options?.minSize ?? 2}, max ${clans.options?.maxSize ?? 18})`);
+      const groups = clans.extractClanGroups?.(players?.getAllPlayers?.() ?? []) ?? {};
+      const groupCount = Object.keys(groups).length;
+      entries.push(`🟢 **Clans** — ${groupCount} group(s) found (min ${clans.options?.minSize ?? 2}, max ${clans.options?.maxSize ?? 18})`);
     } else {
       entries.push(`⚫ **Clans** — disabled in config`);
     }
@@ -540,11 +541,21 @@ export function buildClansEmbed(plugin) {
   }
 
   const players = plugin.services.players?.getAllPlayers?.() ?? [];
-  const groups = clans.extractClanGroups?.(players) ?? [];
+  const groups = clans.extractClanGroups?.(players) ?? {};
+
+  // Build eosID → name map for display
+  const nameMap = new Map();
+  for (const p of players) {
+    if (p.eosID && p.name) nameMap.set(p.eosID, p.name);
+  }
+
+  // Convert object { TAG: [eosID,...] } to sorted entries (largest first)
+  const groupEntries = Object.entries(groups)
+    .sort(([, a], [, b]) => b.length - a.length);
 
   const fields = [
     { name: 'Total Players Scanned', value: `${players.length}`, inline: true },
-    { name: 'Clan Groups Found', value: `${groups.length}`, inline: true },
+    { name: 'Clan Groups Found', value: `${groupEntries.length}`, inline: true },
     {
       name: 'Config',
       value: `minSize: ${clans.options?.minSize ?? 2}, maxSize: ${clans.options?.maxSize ?? 18}, caseSensitive: ${clans.options?.caseSensitive ?? false}`,
@@ -552,14 +563,15 @@ export function buildClansEmbed(plugin) {
     }
   ];
 
-  if (groups.length > 0) {
-    const groupLines = groups.slice(0, 15).map((g) => {
-      const members = g.players?.map((p) => truncate(p.name, 16)).join(', ') ?? '';
-      return `**${g.tag}** (${g.players?.length ?? 0}): ${truncate(members, 80)}`;
+  if (groupEntries.length > 0) {
+    const showCount = Math.min(groupEntries.length, 15);
+    const groupLines = groupEntries.slice(0, showCount).map(([tag, eosIDs]) => {
+      const members = eosIDs.map((id) => truncate(nameMap.get(id) ?? id, 16)).join(', ');
+      return `**${tag}** (${eosIDs.length}): ${truncate(members, 80)}`;
     });
 
     fields.push({
-      name: `Clan Groups (showing ${Math.min(groups.length, 15)} of ${groups.length})`,
+      name: `Clan Groups (showing ${showCount} of ${groupEntries.length})`,
       value: truncate(groupLines.join('\n'), 1024),
       inline: false
     });
