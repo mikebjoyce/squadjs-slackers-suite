@@ -273,14 +273,25 @@ export default class ClansService {
   }
 
   buildPlayerTagCache(players, options = {}) {
-    const { caseSensitive } = this.getGroupingOptions(options);
+    const { caseSensitive, ignoreList } = this.getGroupingOptions(options);
     const cache = new Map();
+
+    const normalizedIgnores = caseSensitive
+      ? new Set(ignoreList)
+      : new Set(ignoreList.map((t) => this.normalizeTag(t)).filter(Boolean));
 
     for (const player of players || []) {
       if (!player?.eosID) continue;
 
       const raw = this.extractRawPrefix(player.name);
-      const tag = raw ? (caseSensitive ? raw : this.normalizeTag(raw)) : null;
+      let tag = raw ? (caseSensitive ? raw : this.normalizeTag(raw)) : null;
+
+      // Filter out ignored clan tags — set cache entry to null so
+      // the player is treated as clanless for all downstream lookups.
+      if (tag && normalizedIgnores.has(tag)) {
+        tag = null;
+      }
+
       cache.set(player.eosID, tag);
     }
 
@@ -292,9 +303,18 @@ export default class ClansService {
       return null;
     }
 
-    const { minSize } = this.getGroupingOptions(options);
+    const { minSize, caseSensitive, ignoreList } = this.getGroupingOptions(options);
     const joinerTag = playerTagCache.get(joiningPlayer.eosID);
     if (!joinerTag) return null;
+
+    // Defense-in-depth: if the joiner's tag is on the ignore list,
+    // refuse to route them — even if a stale cache missed the filter.
+    if (ignoreList.length > 0) {
+      const normalizedIgnores = caseSensitive
+        ? new Set(ignoreList)
+        : new Set(ignoreList.map((t) => this.normalizeTag(t)).filter(Boolean));
+      if (normalizedIgnores.has(joinerTag)) return null;
+    }
 
     const teamCounts = { 1: 0, 2: 0 };
     let clanMates = 0;
@@ -328,7 +348,19 @@ export default class ClansService {
   addPlayerToCache(eosID, name) {
     if (!eosID || !name) return;
     const raw = this.extractRawPrefix(name);
-    const tag = raw ? (this.options.caseSensitive ? raw : this.normalizeTag(raw)) : null;
+    let tag = raw ? (this.options.caseSensitive ? raw : this.normalizeTag(raw)) : null;
+
+    // Filter out ignored clan tags — set cache entry to null so
+    // the player is treated as clanless for all downstream lookups.
+    if (tag && this.options.ignoreList?.length > 0) {
+      const normalizedIgnores = this.options.caseSensitive
+        ? new Set(this.options.ignoreList)
+        : new Set(this.options.ignoreList.map((t) => this.normalizeTag(t)).filter(Boolean));
+      if (normalizedIgnores.has(tag)) {
+        tag = null;
+      }
+    }
+
     this._playerTagCache.set(eosID, tag);
   }
 

@@ -454,7 +454,10 @@ export default class GameStateService {
 
     if (!this._isKnownLayerName(incomingName)) return;
 
-    if (this.lastKnownGoodLayer?.name === incomingName) return;
+    // Normalize both names for comparison — SquadJS uses different formats in
+    // different events (spaces vs underscores, e.g. "Tallil Outskirts Invasion v1"
+    // vs "Tallil_Invasion_v1"). Normalize before comparing to avoid cache thrashing.
+    if (this._normalizeLayerName(this.lastKnownGoodLayer?.name) === this._normalizeLayerName(incomingName)) return;
 
     await this.resolveLayerInfo(info.currentLayer, 'handleServerInfoUpdated');
   }
@@ -800,6 +803,15 @@ export default class GameStateService {
     return !!normalized && normalized.toLowerCase() !== 'unknown';
   }
 
+  // Normalize a layer name for comparison. SquadJS uses different string formats
+  // across events (spaces vs underscores/hyphens, e.g. "Tallil Outskirts Invasion v1"
+  // vs "Tallil_Invasion_v1"). Stripping non-alphanumerics gives a format-agnostic
+  // fingerprint for identity checks.
+  _normalizeLayerName(name) {
+    if (!name) return '';
+    return String(name).replace(/[_\-\s]/g, '').toLowerCase();
+  }
+
   _isRecoveredRoundTooOld(now = Date.now()) {
     if (!this.lastNewGameAt) return false;
     // Seed and Training modes have no meaningful round lifecycle — players join/leave
@@ -859,13 +871,7 @@ export default class GameStateService {
     if (this._isKnownLayerName(serverLayerName)) {
       const recoveredLayerName = this.lastKnownGoodLayer?.name;
       if (this._isKnownLayerName(recoveredLayerName)) {
-        // Normalize both names for comparison — SquadJS handleLayerInfoUpdated may store
-        // spaces (e.g. "Manicouagan Skirmish v3") while raw server info from
-        // handleServerInfoUpdated may use underscores ("Manicouagan_Skirmish_v3").
-        // Strip underscores and hyphens from both sides before comparing so minor
-        // formatting differences don't trigger a false-positive layer_divergence.
-        const normalizeForCompare = (name) => String(name).replace(/[_\-\s]/g, '').toLowerCase();
-        if (normalizeForCompare(recoveredLayerName) !== normalizeForCompare(serverLayerName)) {
+        if (this._normalizeLayerName(recoveredLayerName) !== this._normalizeLayerName(serverLayerName)) {
           await this._transitionRecoveredStateToLive(`${source}:layer_divergence`, now);
           return;
         }
