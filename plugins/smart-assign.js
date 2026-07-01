@@ -1252,7 +1252,8 @@ export default class SmartAssign extends S3PluginBase {
       playerTagCache: tagCache,
       clanGroupOptions: {
         minSize: this._s3?.clans?.options?.minSize || 2,
-        caseSensitive: this._s3?.clans?.options?.caseSensitive || false
+        caseSensitive: this._s3?.clans?.options?.caseSensitive || false,
+        ignoreList: this._s3?.clans?.options?.ignoreList || []
       },
       warnFlags: this._warnFlags,
       maxTeamSize: this?._s3?.serverConfig?.isReady()
