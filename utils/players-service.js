@@ -808,7 +808,15 @@ export default class PlayersService {
       const previousTeamID = result.previousTeamID;
       const nextTeamID = result.state.teamID;
 
+      // ── Null-teamID projection gate ──
+      // During the round-transition projection window, raw teamIDs are untrustworthy
+      // (some players already report post-swap teams while others are still null).
+      // Comparing pre-swap registry values against partially-resolved server data
+      // produces false 1→2 / 2→1 floods. Suppress all S3_PLAYER_TEAM_CHANGED
+      // emissions while projection is active; genuine changes during this window
+      // are deferred and emitted by _reconcileProjection() on tear-down.
       if (
+        !this._projectedPlayers &&
         String(previousTeamID) !== String(nextTeamID) &&
         this._isRealTeam(previousTeamID) &&
         this._isRealTeam(nextTeamID)
@@ -1115,8 +1123,14 @@ export default class PlayersService {
   }
 
   _reconcileProjection() {
-    // Log-only reconciliation when the null window resolves.
-    // We do not issue corrective RCON commands here; this is diagnostics only.
+    // When the null window resolves, emit deferred S3_PLAYER_TEAM_CHANGED events
+    // for any players whose actual team differs from the projected (flipped) team.
+    // These represent genuine mid-window swaps — not the round-transition 1↔2 flip.
+    //
+    // We do NOT issue corrective RCON commands here; this is diagnostics + deferred
+    // emission only. Projected-vs-actual matches (the common case) are silently correct.
+    let deferredCount = 0;
+
     for (const [key, projected] of this._projectedPlayers.entries()) {
       const actual = this.registry.get(key);
       if (!actual || !this._isRealTeam(actual.teamID)) continue;
@@ -1127,7 +1141,21 @@ export default class PlayersService {
           2,
           `[Players Projection] ${name} projected team ${projected.teamID} -> actual ${actual.teamID}`
         );
+
+        // Emit deferred team-change — this player genuinely swapped during the
+        // projection window (not just the round-transition 1↔2 flip).
+        this.server.emit('S3_PLAYER_TEAM_CHANGED', {
+          player: { ...actual },
+          previousTeamID: projected.teamID,
+          teamID: actual.teamID,
+          source: 'Deferred/Projection'
+        });
+        deferredCount++;
       }
+    }
+
+    if (deferredCount > 0) {
+      this.verboseLogger(2, `[Players Projection] ${deferredCount} deferred TEAM_CHANGE(s) emitted.`);
     }
   }
 
@@ -1266,6 +1294,19 @@ export default class PlayersService {
 
       const playerName = joined.name || key;
       this.verboseLogger(1, `[Players] NEW player: ${playerName} (eosID=${joined.eosID}, steamID=${joined.steamID}, teamID=${joined.teamID}, source=${source})`);
+
+      // ── Session row creation (Bug 2 fix) ──
+      // Ensure every player in the registry has a S3_PlayerSessions row.
+      // Previously, only _recoverSessionTimes() (post-initial-sync) wrote
+      // session rows. Players joining after initial sync never got a row,
+      // which broke _bulkUpdateSessionActivity (uses UPDATE, not UPSERT)
+      // and prevented session recovery across restarts. Now we upsert on
+      // first detection so the row always exists.
+      if (joined.eosID && this.sessionModel) {
+        this._upsertSessionRow(joined.eosID, joined.steamID, playerName, joined.joinTime || now, now).catch((err) => {
+          this.verboseLogger(2, `[Players] Session row upsert failed for ${playerName}: ${err.message}`);
+        });
+      }
 
       if (emitJoin) {
         // Synchronous in-memory peek for reconnect data to provide previousTeamID
@@ -1580,6 +1621,27 @@ export default class PlayersService {
         this.verboseLogger(1, `[Players] Session recovery upsert failed: ${err.message}`);
       }
     }
+  }
+
+  /**
+   * Upsert a single session row (used by _registerPlayer on first detection
+   * and by _recoverSessionTimes for batch recovery). Fire-and-forget from
+   * _registerPlayer; awaited in _recoverSessionTimes.
+   */
+  async _upsertSessionRow(eosID, steamID, playerName, sessionStart, lastActivity) {
+    if (!this.sessionModel) return;
+    const dbService = this._getDbService();
+    if (!dbService?.executeWithRetry) return;
+
+    await dbService.executeWithRetry(async () => {
+      await this.sessionModel.upsert({
+        eosID,
+        steamID: steamID || null,
+        playerName: playerName || null,
+        sessionStart,
+        lastActivity
+      });
+    });
   }
 
   /**
