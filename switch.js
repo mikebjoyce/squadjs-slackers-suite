@@ -1118,22 +1118,30 @@ export default class Switch extends S3DiscordPluginBase {
     }
 
      async doSwitchMatchend() {
-         const Endmatches = this._getModel('SwitchPlugin_Endmatches');
-         if (!Endmatches) return;
-         const players = await Endmatches.findAll();
-         if (players.length == 0) return;
-         players.forEach((pl) => {
-             this.warn(pl.steamID ? pl.eosID || pl.steamID : pl.eosID, '[Switch] Round ending — you will be switched in 15 seconds.');
-         });
-         await delay(15 * 1000);
-         await Promise.all(players.map(async (pl) => {
-             await this._taggedSwitchPlayer(pl.eosID || pl.steamID, 'Admin-Force');
-             return await Endmatches.destroy({
-                 where: {
-                     id: pl.id
-                 }
+         try {
+             const Endmatches = this._getModel('SwitchPlugin_Endmatches');
+             if (!Endmatches) return;
+             const players = await Endmatches.findAll();
+             if (players.length == 0) return;
+             players.forEach((pl) => {
+                 this.warn(pl.steamID ? pl.eosID || pl.steamID : pl.eosID, '[Switch] Round ending — you will be switched in 15 seconds.');
              });
-         }));
+             await delay(15 * 1000);
+             await Promise.all(players.map(async (pl) => {
+                 try {
+                     await this._taggedSwitchPlayer(pl.eosID || pl.steamID, 'Admin-Force');
+                     return await Endmatches.destroy({
+                         where: {
+                             id: pl.id
+                         }
+                     });
+                 } catch (innerErr) {
+                     this.verbose(1, `[Switch] Matchend switch failed for ${pl.eosID || pl.steamID}: ${innerErr.message || innerErr}`);
+                 }
+             }));
+         } catch (err) {
+             this.verbose(1, `[Switch] doSwitchMatchend failed: ${err.message || err}`);
+         }
      }
 
     async onRoundEnded(dt) {
@@ -1141,7 +1149,11 @@ export default class Switch extends S3DiscordPluginBase {
         this._scrambleHappened = false;
         this.verbose(2, `[Queue] Round ended — queue preserved (${this._getQueueSize()} entries remain).`);
         await this.cleanup();
-        await this.doSwitchMatchend();
+        try {
+            await this.doSwitchMatchend();
+        } catch (err) {
+            this.verbose(1, `[Switch] onRoundEnded matchend processing failed: ${err.message || err}`);
+        }
         this._switchedOnJoin.clear();
     }
 
