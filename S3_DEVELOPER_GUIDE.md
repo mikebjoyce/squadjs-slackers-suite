@@ -2,7 +2,7 @@
 
 > **Canonical reference for building SquadJS plugins that consume S³ (Slacker's Squad Services).**
 >
-> **Last reviewed:** 2026-06-28
+> **Last reviewed:** 2026-07-01, verified against source.
 
 ---
 
@@ -69,7 +69,7 @@ S³ (Slacker's Squad Services) is the centralised service container for shared s
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-Consumer plugins discover S³ at runtime and access services through **flat getters** guarded by `isReady()` checks. Stage 8 introduced `S3PluginBase` and `S3DiscordPluginBase` — optional base classes that automate discovery, readiness gating, database boilerplate, and team-change RCON retry, eliminating ~50 lines of repetitive mount() logic per plugin. See [§8](#8-s%C2%B3-plugin-base-class-guide).
+Consumer plugins discover S³ at runtime and access services through **flat getters** guarded by `isReady()` checks. `S3PluginBase` and `S3DiscordPluginBase` are optional base classes that automate discovery, readiness gating, database boilerplate, and team-change RCON retry, eliminating ~50 lines of repetitive mount() logic per plugin. See [§8](#8-s%C2%B3-plugin-base-class-guide).
 
 ---
 
@@ -113,8 +113,9 @@ Centralises Sequelize connector management, schema version tracking, and migrati
 | `withTransaction(fn)` | `(Function) => Promise<*>` | Function result | Within a Sequelize transaction |
 | `withTransactionWithRetry(fn)` | `(Function) => Promise<*>` | Function result | Transaction + retry combined |
 | `getDatabasePath()` | `() => string\|null` | File path or null | SQLite only |
-| `canBackup()` | `() => boolean` | boolean | True if file-copy backup supported (SQLite) |
-| `getModels()` | `() => object` | All defined models | Keyed by model name |
+| `models` | property | `object` | All defined models, keyed by name. Direct property, not a getter method. |
+
+> **Note:** `canBackup(connector)` is **not** a `DBService` method — it's a standalone export from `s3-backup.js` that always returns `true` (all Sequelize dialects get JSON-export fallback; the SQLite-only gate was removed). If you need this on a `DBService` instance, import it separately: `import { canBackup } from './s3-backup.js'`.
 
 **Static methods (for advanced use):**
 - `DBService.isSqlite(connector)` — detect dialect
@@ -194,7 +195,7 @@ Tracks player state (name, team, squad, join time), manages per-player and globa
 | `unregisterRefreshInterest(source)` | `void` | Remove refresh interest |
 | `requestRefresh(source, opts?)` | `void` | Request an async refresh |
 | `refreshNow(source)` | `Promise<void>` | Immediate refresh (debounced) |
-| `refreshNowImmediate(source)` | `Promise<void>` | Immediate refresh (no debounce) |
+| `registerPriority(source, priority)` | `void` | Register a custom priority level for lock preemption (see §5.4) |
 | `rememberReconnect(eosID, payload?)` | `Promise<void>` | Record reconnect expectation |
 | `getReconnect(eosID)` | `Promise<object\|null>` | Check pending reconnect |
 | `clearReconnects()` | `Promise<void>` | Clear all reconnect records |
@@ -222,6 +223,8 @@ Detects clan tags from player names, normalises them for comparison, and groups 
 
 This service provides **building blocks** for clan-aware plugin behaviour (team balancing, stacking detection, squad assignment). The actual stacking-prevention decisions are made by consumer plugins using the outputs of `getClanTeamForPlayer()` and `extractClanGroups()`.
 
+**No combined extract+normalise call exists.** Get a usable tag with two calls: `service.normalizeTag(service.extractRawPrefix(name))`.
+
 **Public API:**
 
 | Method | Returns | Notes |
@@ -230,7 +233,6 @@ This service provides **building blocks** for clan-aware plugin behaviour (team 
 | `isEnabled()` | `boolean` | Clan grouping enabled in config |
 | `extractRawPrefix(name)` | `string\|null` | Extract clan tag from player name |
 | `normalizeTag(raw)` | `string` | Normalise for comparison (case, special chars) |
-| `getClanTag(name)` | `string\|null` | Extract + normalise in one call |
 | `levenshteinDistance(a, b)` | `number` | Edit distance for fuzzy matching |
 | `extractClanGroups(players, opts?)` | `object[]` | Grouped clans with members |
 | `buildPlayerTagCache(players, opts?)` | `Map<eosID, tag>` | Pre-computed tag map |
@@ -265,7 +267,7 @@ When both teams have been identified, the cache looks like:
 { 1: 'US', 2: 'RUS' }
 ```
 
-**Lifecycle:** Team abbreviations are polled from player roles during the staging phase. Once both teams are identified, polling stops. On new game, the cache is cleared and polling resumes.
+**Lifecycle:** Polling is gated on `gameState.resolving`, **not** round phase. On `NEW_GAME`, `resolving` goes true and polling stops — player roles may still carry stale data from the previous round. Once all players have valid team IDs, `resolving` clears and polling starts, running in **either** STAGING or LIVE. This is why seed-mode rounds (which never reach LIVE) still resolve faction abbreviations. Once both teams are identified, polling stops until the next `NEW_GAME`.
 
 **Public API:**
 
@@ -505,13 +507,15 @@ S³ emits application-level events that consumer plugins can listen on via `this
 
 | Event | Emitted By | Payload | When |
 |-------|-----------|---------|------|
-| `S3_ROUND_LIVE` | gameState | `{ roundStartTime, matchId, layer, gamemode }` | STAGING → LIVE phase transition (timer elapses or immediate if round already live at mount) |
+| `S3_ROUND_LIVE` | gameState | `{ roundStartTime, matchId, layerName, gamemode }` | STAGING → LIVE phase transition, when the staging timer elapses |
+
+> **⚠️ Not emitted on mid-round mount.** There is a single emit site in `game-state-service.js`, inside the STAGING timer callback. If S³ mounts mid-round (the `roundStartTime` backfill path in `mount()`), no `S3_ROUND_LIVE` event fires for that round — a plugin restarted mid-round and relying on this event for its initial snapshot will miss it entirely until the *next* round. Confirm this is intended before depending on it for anything that must run once per round; otherwise this is a gap worth raising as a fix, not just a doc note.
 
 Listen in `_onS3Ready()` or `mount()`:
 
 ```js
 this.server.on('S3_ROUND_LIVE', (data) => {
-  this.verbose(2, `Round live: ${data.layer} (${data.gamemode})`);
+  this.verbose(2, `Round live: ${data.layerName} (${data.gamemode})`);
 });
 ```
 
@@ -521,19 +525,25 @@ PlayersService fires events via `onPlayerDataChanged()` and `onPlayerConnected()
 
 ### 5.4 — Cross-Plugin Coordination
 
-Smart Assign, Switch, and Team Balancer coordinate through S³'s PlayersService lock system rather than direct inter-plugin messaging. All three use the shared `_requestTeamChange()` base-class method (Stage 8.1e), which records move attribution via `players.recordMove()` before issuing RCON commands.
+Smart Assign, Switch, and Team Balancer coordinate through S³'s PlayersService lock system rather than direct inter-plugin messaging. All three use the shared `_requestTeamChange()` base-class method, which records move attribution via `players.recordMove()` before issuing RCON commands.
 
 #### Priority System
 
-PlayersService enforces a hardcoded priority hierarchy (defined in `players-service.js`):
+PlayersService ships with a default priority hierarchy (`PlayersService.PRIORITY`):
 
 ```
 TeamBalancer(3)  >  SmartAssign(2)  >  Switch(1)
 ```
 
-A higher-priority actor can always preempt a lower-priority one. Equal-priority actors from the same source are allowed; equal-priority actors from different sources are blocked.
+A higher-priority actor can always preempt a lower-priority one. Equal-priority actors from the same source are allowed; equal-priority actors from different sources are blocked. Any source not in the default map resolves to priority `0`.
 
-> **⚠️ Known limitation:** The priority map is currently hardcoded inside `PlayersService.PRIORITY`. There is no mechanism for consumer plugins to register their own priority level or define custom precedence. See [Stage 8.8 — Generic Priority System] for planned work to make this configurable.
+**Third-party plugins register their own priority level** via `players.registerPriority(source, priority)` — no core-file edits required:
+
+```js
+this.players.registerPriority('MyPlugin', 4);  // preempts TeamBalancer
+```
+
+Custom registrations only apply to sources not already hardcoded in `PRIORITY` — you cannot override `TeamBalancer`, `SmartAssign`, or `Switch`'s built-in levels this way.
 
 #### Lock Types
 
@@ -567,11 +577,11 @@ The global lock is released in a `finally` block when the scramble completes (or
 
 **Impact:** A player can type `!switch` while SA's swap executor is retrying to move them. Since SA holds no lock, Switch passes the `canAct()` gate and proceeds with its own team-change logic, potentially conflicting with SA's ongoing move.
 
-**Tracking:** See Stage 8.7 — SA Per-Player Lock Fix.
+**Status:** Open. SmartAssign needs to call `players.lock(eosID, 'SmartAssign', ttlMs)` when it begins a move, not just check `canAct()`.
 
 #### move Attribution
 
-All three plugins use `_requestTeamChange()` (Stage 8.1e), which internally calls `players.recordMove(eosID, targetTeamID, source)` before the first RCON attempt. The `source` parameter identifies the calling plugin (`'SmartAssign'`, `'TeamBalancer'`, or `'Switch'`). This attribution is logged to the DB for audit purposes and is queryable via the `!s3 players` command.
+All three plugins use `_requestTeamChange()`, which internally calls `players.recordMove(eosID, targetTeamID, source)` before the first RCON attempt. The `source` parameter identifies the calling plugin (`'SmartAssign'`, `'TeamBalancer'`, or `'Switch'`). This attribution is logged to the DB for audit purposes and is queryable via the `!s3 players` command.
 
 #### Full Flow During a TB Scramble
 
@@ -889,7 +899,7 @@ Options:
 }
 ```
 
-The method uses the `players` service for player resolution and `refreshNowImmediate()` for verification — queries S³'s player registry, not SquadJS's `server.players` cache, eliminating stale cache false failures.
+After each RCON attempt, the method calls `players.refreshNow(source)` to force a fresh player-list read before checking whether the move landed — verification queries S³'s player registry, not SquadJS's `server.players` cache, eliminating stale-cache false failures.
 
 ### 8.3 — S3DiscordPluginBase API
 
@@ -1037,7 +1047,7 @@ The `qi` (QueryInterface) object passed to each migration function provides thes
 - Migrations run in **ascending version order**
 - Each migration runs in its **own transaction** — a failure at v3 does not roll back v2
 - The startup confirmation flow gates execution (unless `autoMigrate: true` in S³ config)
-- Pre-migration backup always produces **both** SQLite file copy + JSON export (connector-agnostic)
+- Pre-migration backup runs **two tiers**: SQLite file-copy backup only when a `dbPath` is available (SQLite connector), and JSON export **always**, regardless of dialect. Migration aborts only if *both* tiers fail — a Postgres/MySQL deployment with a healthy JSON export still proceeds even though it has no file copy.
 - The `verifyAndRunMigrations()` single-call pattern checks schema versions first, runs only pending migrations, and returns the result
 
 ### 9.5 — S³ Schema Versions Table
@@ -1063,6 +1073,20 @@ node tools/schema-version.mjs check --db-path ./custom.sqlite  # Custom DB path
 
 The tool uses the same `DBService` + `MigrationEngine` infrastructure as the live S³ plugin, bootstrapping a Sequelize connection directly to the database file. It mirrors the migration manifest that each consumer plugin registers at runtime.
 
+### 9.7 — Offline Schema Health Checker
+
+A second, separate CLI tool — `tools/schema-health.js` — checks column-level table health and detects orphan tables (S³-prefixed tables present in the DB but not expected), independent of version tracking:
+
+```
+node tools/schema-health.js
+node tools/schema-health.js --db-path ./custom-path.sqlite
+node tools/schema-health.js --json
+```
+
+Unlike `schema-version.mjs`, it does not consult `build/config.json` for the DB path — only `--db-path` or the hardcoded project-root default.
+
+> **⚠️ Known bug — do not rely on this tool's output yet.** `schema-health.js` currently reports every table as `❌ missing` regardless of actual DB state. `sequelize.query(sql, { type: QueryTypes.SELECT })` returns rows directly, not a `[rows, metadata]` tuple, but the tool destructures it as one (`const [allTablesRaw] = await sequelize.query(...)`). This silently pulls the first row instead of the row array, fails an `Array.isArray` check, and falls back to an empty table list. Fix before use: replace the destructuring with a direct assignment (`const allTablesRaw = await sequelize.query(...)`) in both query call sites. The tool's own failure message also points to a stale path (`build/schema-version.cjs`) — should be `tools/schema-version.mjs`.
+
 ---
 
 ## §10 — Discord Commands & Backup/Import
@@ -1083,10 +1107,8 @@ All commands in the configured `channelID` Discord channel:
 | `!s3 config` | Server config values |
 | `!s3 watch <service>` | Relay verbose logs for a service to Discord |
 | `!s3 unwatch` | Stop all active watches |
-| `!s3 events` | Recent event history (last 20) |
+| `!s3 diag` | Consolidated diagnostic — mounts, phase, factions, players, locks in one pass |
 | `!s3 help` | Command reference |
-| `!s3 test smoke` | Automated smoke tests |
-| `!s3 test preflight` | Validate pre-flight checklist |
 | `!s3 db export [--logs\|--all]` | Export DB as JSON attachment |
 | `!s3 db export --to-file [--all]` | Export to server filesystem backup dir |
 | `!s3 db import [--confirm] [--dry-run]` | Import from attached JSON (two-step) |
@@ -1258,9 +1280,16 @@ S³ must appear **before** consumer plugins:
 | `enableClanTagGrouping` | boolean | `false` | Enable clan grouping |
 | `minClanGroupSize` | number | `2` | Minimum clan group size |
 | `maxClanGroupSize` | number | `18` | Maximum clan group size |
-| `enableDatabaseLogging` | boolean | `false` | Enable S³ logging tables |
-| `enableFileLogging` | boolean | `false` | Enable JSONL log file mirror |
+| `clanTagMaxEditDistance` | number | `1` | Levenshtein distance for merging similar tags |
+| `clanTagCaseSensitive` | boolean | `false` | If false, tags are normalised before grouping |
+| `clanTagIgnoreList` | array | `[]` | Tags excluded from grouping |
+| `clanGroupingPullEntireSquads` | boolean | `false` | Pull full squads when preserving clan groups |
+| `enableDatabaseLogging` | boolean | `false` | Enable `S3_PlayerEvents`/`S3_GameStateEvents`/`S3_PlayerSnapshots` tables. `false` → LoggingService runs no-op. |
+| `enableFileLogging` | boolean | `false` | Mirror each DB log write as a JSONL line at `logPath` |
+| `logPath` | string | `'./s3-log.jsonl'` | JSONL mirror path, used only when `enableFileLogging` is true |
 | `autoMigrate` | boolean | `false` | Auto-apply migrations without Discord confirmation |
+
+> **README.md is out of sync here too** — it's missing `enableDatabaseLogging`, `enableFileLogging`, and `logPath` entirely. This table is now the more complete source; worth back-porting to the README.
 
 ### 12.4 — Build Process
 
@@ -1381,4 +1410,4 @@ Each plugin is in `ReferenceScripts/<plugin-name>/plugins/` in the repository.
 
 ---
 
-> *Developer Guide compiled as Stage 8.5 — documents the S³ architecture as of 2026-06-28.*
+> *Developer Guide — documents the S³ architecture as of 2026-07-01.*
