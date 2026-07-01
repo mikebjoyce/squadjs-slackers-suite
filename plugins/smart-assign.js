@@ -211,7 +211,8 @@ export default class SmartAssign extends S3PluginBase {
     this.executor = new SASwapExecutor(server, {
       retryIntervalMs: 50,
       maxCompletionTimeMs: 3000,
-      s3: this._s3  // S³ reference for canAct preemption check in retry branch
+      s3: this._s3,  // S³ reference for canAct preemption check in retry branch
+      requestTeamChange: this._requestTeamChange?.bind(this)
     });
     // Build a lightweight DB delegate for SAEventLogger (sa-database.js was inlined here in Stage 8)
     const dbDelegate = {
@@ -1112,7 +1113,7 @@ export default class SmartAssign extends S3PluginBase {
     // - joining player moved to candidateCurrent
     // This means we need the state AFTER both moves
 
-    let scoreT1Mus, scoreT2Mus, scoreT1Vets, scoreT2Vets, scoreT1Count;
+    let scoreT1Mus, scoreT2Mus, scoreT1Vets, scoreT2Vets, scoreT1Count, scoreT2Count;
 
     // Start fresh: base state (neither candidate nor joining player):
     scoreT1Count = baseT1Count;
