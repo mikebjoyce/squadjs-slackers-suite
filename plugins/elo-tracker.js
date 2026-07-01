@@ -529,6 +529,11 @@ export default class EloTracker extends S3PluginBase {
       // Non-blocking fetch
       this.db.getPlayerStatsBatch(uncachedIDs)
         .then((dbResults) => {
+          if (!dbResults) {
+            Logger.verbose('EloTracker', 2, '[UPDATED_PLAYER_INFO] DB backoff active — skipping cache population this tick.');
+            return;
+          }
+
           // Re-verify connection state to prevent ghost caching
           const livePlayers = new Set(this.server.players.map(p => p.eosID));
 
