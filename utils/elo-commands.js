@@ -35,7 +35,7 @@
  *   to defaults. It does NOT delete the DB record.
  * - !elo with no sub-command shows the caller's own rating.
  * - !elo <name|steamID> looks up another player.
- * - Unknown sub-commands show help text (Stage 8.3 fix).
+ * - Unknown sub-commands show help text.
  *
  *   Calculates and displays a "Competitive Skill Rank" (CSR) (μ - 3.0σ)
  *   as the primary player rank to encourage active play.
