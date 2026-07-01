@@ -85,7 +85,7 @@ export default class ClansService {
      * Use addPlayerToCache() / getPlayerTagCache() public API instead.
      * Bypassing this (e.g. consumer writes `clans._playerTagCache.set(...)`)
      * couples the consumer to the internal property name and bypasses
-     * future guard logic. See Stage 6.2a.
+     * future guard logic.
      */
     this._playerTagCache = new Map();
   }

@@ -56,8 +56,12 @@
  *   Player tracking, reconnect detection, global/per-player locking.
  * ServerConfigService (../utils/server-config-service.js)
  *   Parses Squad Server.cfg and VoteConfig.cfg at mount time.
+ * LoggingService (../utils/logging-service.js)
+ *   JSONL and DB logging for S³ player/game state events.
  * registerS3DiscordCommands (../utils/s3-discord.js)
  *   Discord !s3 admin command registration and dispatch.
+ * setupMigrationPrompt (../utils/s3-migration-discord.js)
+ *   Discord prompt for pending schema migrations if autoMigrate is false.
  *
  * ─── S³ INTEGRATION ──────────────────────────────────────────────
  *
@@ -264,7 +268,7 @@ export default class SlackersSquadServices extends BasePlugin {
     this._s3DiscordCleanup = null;
     this._migrationDiscordCleanup = null;
 
-    // 7.4k-3: Deferred ready promise — consumer plugins await this._s3.ready() to ensure
+    // Deferred ready promise — consumer plugins await this._s3.ready() to ensure
     // all services, Discord registration, and migration check have completed.
     this._readyPromise = new Promise((resolve) => { this._resolveReady = resolve; });
 
@@ -278,7 +282,7 @@ export default class SlackersSquadServices extends BasePlugin {
     };
   }
 
-  // Flat accessors — Stage 5.2a: consumers use this._s3?.gameState (not this._s3?.services?.gameState)
+  // Flat accessors — consumers use this._s3?.gameState (not this._s3?.services?.gameState)
   // Each returns the underlying service instance (may be null before mount completes).
   get gameState()     { return this.services.gameState; }
   get serverConfig()  { return this.services.serverConfig; }
@@ -292,7 +296,7 @@ export default class SlackersSquadServices extends BasePlugin {
    * Returns a promise that resolves when S³ has fully mounted — all services,
    * Discord registration, and migration check are complete. Consumer plugins
    * (SA, Elo, Switch, TB) should await this before accessing S³ services during
-   * their own mount() to avoid the concurrent-mount race (7.4k-3).
+   * their own mount() to avoid the concurrent-mount race.
    */
   ready() {
     return this._readyPromise;
@@ -397,7 +401,7 @@ export default class SlackersSquadServices extends BasePlugin {
     // Register Discord !s3 commands (gracefully degrades if no discordClient configured)
     this._s3DiscordCleanup = registerS3DiscordCommands(this);
 
-    // 7.4d — Check for pending migrations and prompt via Discord if any
+    // Check for pending migrations and prompt via Discord if any
     this._checkAndPromptMigrations();
 
     this.verbose(1, 'Mounted SlackerSquadServices with gameState, factions, clans, db, players, serverConfig, and logging services.');
@@ -536,7 +540,7 @@ export default class SlackersSquadServices extends BasePlugin {
 
   /**
    * Check for pending schema migrations after Discord is registered, and
-   * post an embed to the admin channel for human confirmation (7.4d).
+   * post an embed to the admin channel for human confirmation if autoMigrate is false.
    * If no migrations are pending, does nothing.
    * If Discord isn't configured, logs a warning about pending migrations.
    */

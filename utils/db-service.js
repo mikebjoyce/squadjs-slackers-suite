@@ -48,7 +48,7 @@
  * - SchemaVersion enables per-plugin version tracking (replaces old
  *   flat S3_Migrations table pattern).
  * - The MigrationEngine does NOT auto-run on startup — migrations are
- *   gated behind Discord confirmation (7.4d) or the autoMigrate config option.
+ *   gated behind Discord confirmation or the autoMigrate config option.
  * - SQLite operations are serialized through a per-connector mutex to
  *   prevent concurrent write contention.
  * - Retry defaults: 5 attempts, 200ms base delay, 500ms jitter.
@@ -94,9 +94,9 @@ export default class DBService {
     this.SchemaVersionsModel = null;
     this._expectedVersions = new Map();
     this._migrationEngine = null;
-    this._dbPath = null; // 7.4e: SQLite file path for backup (resolved on mount)
+    this._dbPath = null; // SQLite file path for backup (resolved on mount)
 
-    // 7.4d — Migration gate: pending list + promise for consumer wait
+    // Migration gate: pending list + promise for consumer wait
     this._pendingMigrations = null;     // null = no check done, [] = up-to-date, array = pending
     this._migrationGate = null;         // Promise that consumers await
     this._resolveMigrationGateFn = null; // Resolver for the gate
@@ -273,14 +273,14 @@ export default class DBService {
     // Initialise SchemaVersion table (per-plugin version tracking, replaces old S3_Migrations)
     await this._initSchemaVersionModel();
 
-    // 7.4e / 8.4b: Resolve the SQLite storage path from the raw connector config.
+    // Resolve the SQLite storage path from the raw connector config.
     // Used for fast file-copy backup optimization. The connectors map always
     // holds the raw config from config.json. Non-SQLite connectors (Postgres,
     // MySQL) have no `storage` property → null → MigrationEngine falls back to
     // connector-agnostic JSON export (s3-export-import.js) for pre-migration backup.
     this._dbPath = this.connectors?.[this._databaseOption]?.storage || null;
 
-    // 7.4k-2: Multi-SQLite diagnostic — warn if connectors map contains
+    // Multi-SQLite diagnostic — warn if connectors map contains
     // multiple SQLite storage paths. Backup/migration only covers the
     // primary connector, so other files' tables would be invisible.
     this._logMultiSqliteWarning();
@@ -455,7 +455,7 @@ export default class DBService {
     return { upToDate: pending.length === 0, pending };
   }
 
-  /* ────────────────────────────────────── 7.4d MIGRATION GATE API ────────────────────────────────────── */
+  /* ────────────────────────────────────── MIGRATION GATE API ────────────────────────────────────── */
 
   /**
    * Check if there are pending schema migrations that require human approval.
@@ -562,7 +562,7 @@ export default class DBService {
    * Verify registered schema versions on mount and log any pending migrations.
    * Stores the result in _pendingMigrations and creates the migration gate
    * promise so consumer plugins can await waitForMigrations().
-   * Does NOT auto-trigger migrations — that is gated behind 7.4d (Discord confirmation).
+   * Does NOT auto-trigger migrations — that is gated behind Discord confirmation.
    * The Discord prompt is fired later (after Discord registers) via _checkAndPromptMigrations().
    */
   async _verifySchemaVersions() {
@@ -581,7 +581,7 @@ export default class DBService {
       return;
     }
 
-    // Store pending migrations for the Discord prompt (7.4d)
+    // Store pending migrations for the Discord prompt
     this._pendingMigrations = result.pending;
 
     // Create migration gate — consumer plugins can await this before sync({ alter: true })
@@ -594,7 +594,7 @@ export default class DBService {
       this.verboseLogger(2, `  "${p.pluginName}": v${p.currentVersion || '(new)'} → v${p.expectedVersion} (${p.behind} behind)`);
     }
 
-    this.verboseLogger(2, '[DB] Migrations are NOT auto-applied. Waiting for Discord confirmation (see 7.4d).');
+    this.verboseLogger(2, '[DB] Migrations are NOT auto-applied. Waiting for Discord confirmation.');
   }
 
   /**

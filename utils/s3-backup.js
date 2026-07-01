@@ -6,7 +6,7 @@
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
  * Performs timestamped file backups of the shared SQLite database
- * before schema migrations (7.4e). Supports configurable retention,
+ * before schema migrations. Supports configurable retention,
  * listing available backups, and manual restore via Discord command.
  *
  * The backup directory defaults to <cwd>/backups/ and is created
@@ -78,7 +78,7 @@ function timestampString(ts) {
  * @returns {boolean}
  */
 export function canBackup(connector) {
-  // 8.4b: All connectors are backup-capable — JSON export works on any Sequelize dialect.
+  // All connectors are backup-capable — JSON export works on any Sequelize dialect.
   // The SQLite-only gate was removed when exportToFile() was added as a fallback.
   return true;
 }

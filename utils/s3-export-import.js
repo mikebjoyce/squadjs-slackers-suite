@@ -17,12 +17,12 @@
  *   All (--all)          — Everything including auto-recoverable plugin
  *     persistence tables.
  *
- * 8.4b additions:
+ * Additions:
  *   exportToFile() — Writes export to a timestamped .s3backup.json file
  *     in the backup directory. Used by MigrationEngine as the fallback
  *     pre-migration backup for non-SQLite connectors.
  *   restoreFromFile() — Reads a backup file, detects format (.sqlite vs
- *     .s3backup.json), and restores via file copy or JSON import.
+ *     .json), and restores via file copy or JSON import.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
@@ -45,11 +45,11 @@
  *     Discord's 25 MB boosted limit. Returns { filename, buffer, sizeBytes }.
  *
  *   exportToFile(dbService, backupDir, { tier, retention })
- *     (8.4b) Writes JSON export to backupDir as a timestamped file.
+ *     Writes JSON export to backupDir as a timestamped file.
  *     Returns { filename, sizeBytes } or null on failure.
  *
  *   restoreFromFile(filename, dbService, backupDir)
- *     (8.4b) Detects backup format (.sqlite → file copy, .json → JSON import)
+ *     Detects backup format (.sqlite → file copy, .json → JSON import)
  *     and restores accordingly. Returns restore result or throws.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
@@ -482,7 +482,7 @@ export async function serializeForAttachment(exportObj) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 8.4b — FILE-BACKED EXPORT/RESTORE
+// FILE-BACKED EXPORT/RESTORE
 // ══════════════════════════════════════════════════════════════════════
 
 /**

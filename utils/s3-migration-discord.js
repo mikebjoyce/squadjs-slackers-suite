@@ -6,7 +6,7 @@
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
  * Provides the Discord-based human confirmation flow for schema
- * migrations (7.4d). When pending migrations are detected on mount,
+ * migrations. When pending migrations are detected on mount,
  * this module posts an embed to the admin channel with ✅/❌ reaction
  * controls. The migration engine is called directly (no events) and
  * the DBService migration gate is resolved on completion/timeout.
