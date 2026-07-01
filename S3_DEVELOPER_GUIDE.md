@@ -447,7 +447,8 @@ unsubscribe();
 
 **Notes:**
 - `onGamePhaseChange` fires on every phase transition including ENDGAME sub-state changes (scoreboard → layerVote → factionVoteTeam1 → factionVoteTeam2 → postVoting).
-- `onLayerGameModeChange` captures previous values before resolving and includes them in the payload.
+- **`prevPhase` in the payload is not reliable.** Every call site sets `this.phase` to the new value *before* calling `_notifyGamePhaseChange(newPhaseString)` — the argument passed is the new phase, not the actual prior one, so `payload.prevPhase` always equals `payload.phase`. This looks like a source bug (parameter name implies a real "previous phase" that never materializes), not intended behavior. Don't rely on `prevPhase` to detect what phase you're transitioning *from* — track it yourself across calls if you need that.
+- `onLayerGameModeChange` captures previous values before resolving and includes them in the payload correctly (this one is not affected by the bug above).
 
 #### PlayersService
 
@@ -457,7 +458,7 @@ unsubscribe();
 | `onPlayerConnected(cb)` | End of `handlePlayerConnected()` after reconnect check | `{ player, isNew, previousTeamID }` |
 
 **Notes:**
-- `onPlayerDataChanged` fires only on non-initial-sync ticks.
+- **`onPlayerDataChanged` fires on every tick, including the initial-sync tick** — there is no gate on `isInitialSync` at the call site. During initial sync, `joinCount`/`leaveCount`/`teamChangeCount` will read `0` (the underlying `S3_PLAYER_JOINED`/`LEFT`/`TEAM_CHANGED` events are suppressed then), but the callback still fires. Don't assume the first invocation reflects a real tick's worth of activity.
 - `onPlayerConnected` fires even for returning players (`isNew=false`).
 
 #### FactionsService
@@ -508,8 +509,15 @@ S³ emits application-level events that consumer plugins can listen on via `this
 | Event | Emitted By | Payload | When |
 |-------|-----------|---------|------|
 | `S3_ROUND_LIVE` | gameState | `{ roundStartTime, matchId, layerName, gamemode }` | STAGING → LIVE phase transition, when the staging timer elapses |
+| `S3_PLAYER_JOINED` | players | `{ player, previousTeamID, source }` | New player registered on a tick (suppressed during initial sync) |
+| `S3_PLAYER_LEFT` | players | `{ player, source }` | Player dropped from registry (present in previous tick, absent in current) |
+| `S3_PLAYER_TEAM_CHANGED` | players | `{ player, previousTeamID, teamID, source }` | Team change detected via tick diff (suppressed during initial sync) |
+| `S3_PLAYER_RECONNECTED` | players | `{ player, previousTeamID, disconnectedAt, reconnectedAt }` | Returning player matched against reconnect memory |
+| `S3_PLAYERS_UPDATED` | players | `{ joinCount, leaveCount, teamChangeCount, playerCount, isInitialSync, projectionActive, source }` | End of **every** `UPDATED_PLAYER_INFORMATION` tick, including the initial-sync tick |
+| `S3_PLAYER_LOCK_CHANGED` | players | `{ key, source, locked, expiresAt }` | Per-player lock acquired or expired |
+| `S3_GLOBAL_LOCK_CHANGED` | players | `{ source, locked, expiresAt }` | Global lock (Team Balancer) acquired or cleared |
 
-> **⚠️ Not emitted on mid-round mount.** There is a single emit site in `game-state-service.js`, inside the STAGING timer callback. If S³ mounts mid-round (the `roundStartTime` backfill path in `mount()`), no `S3_ROUND_LIVE` event fires for that round — a plugin restarted mid-round and relying on this event for its initial snapshot will miss it entirely until the *next* round. Confirm this is intended before depending on it for anything that must run once per round; otherwise this is a gap worth raising as a fix, not just a doc note.
+> **⚠️ Not emitted on mid-round mount.** `S3_ROUND_LIVE` has a single emit site in `game-state-service.js`, inside the STAGING timer callback. If S³ mounts mid-round (the `roundStartTime` backfill path in `mount()`), no `S3_ROUND_LIVE` event fires for that round — a plugin restarted mid-round and relying on this event for its initial snapshot will miss it until the *next* round. Confirm this is intended before depending on it for anything that must run once per round.
 
 Listen in `_onS3Ready()` or `mount()`:
 
@@ -1038,9 +1046,11 @@ The `qi` (QueryInterface) object passed to each migration function provides thes
 ### 9.3 — Version Numbering
 
 - Start at **1** for initial schema
-- Increment by **1** for each schema change (no gaps)
+- Increment by **1** for each schema change — this is convention, **not enforced** by the engine
 - Never reuse a version number
 - If multiple plugins share a table, coordinate version numbers across plugins
+
+**What `registerMigrations()` actually validates:** each version is a positive integer, no duplicate version within one call, and a subsequent `registerMigrations()` call for the same plugin must start above the previous call's max version (`newMin > existingMax`). It does **not** check that versions are contiguous — `[1, 2, 5]` in a single call passes validation with no error or warning. Gaps are a convention worth keeping (makes `behind` counts in migration-status embeds meaningful), but nothing in the code stops you from breaking it.
 
 ### 9.4 — Migration Execution Model
 
