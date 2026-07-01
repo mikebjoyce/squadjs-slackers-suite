@@ -182,7 +182,7 @@ The Switch plugin exposes a public API for external consumers (such as SmartAssi
 
 ### Version Compatibility
 
-- `static version = '2.0.0'` — initial public API with dual-array queue.
+- `static version = '2.0.0'` — public API with dual-array queue and v2.0.0 features.
 - Consumers should check `plugin.constructor.version` (wrapped in try/catch) and require `>= 2.0.0` before using the API.
 
 ### Consumer Discovery
@@ -247,6 +247,16 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 | Option | Description | Default |
 |--------|-------------|---------|
 | `discordChannelID` | Discord channel ID for admin commands and logs | `""` |
+
+### v2.0.0 Features
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `broadcastSwitchWindowMessages` | Broadcast switch window open/close/reminder messages to the server. | `true` |
+| `switchWindowBroadcastDelaySeconds` | Seconds after match start before the first broadcast. | `60` |
+| `switchWindowBroadcastIntervalMinutes` | Minutes between switch window reminder broadcasts. | `2` |
+| `warnOnJoinChangeTeamDisabled` | Warn joining players that scoreboard team changes are disabled and !switch is the alternative. | `true` |
+| `queueEnabled` | Enable the switch queue. When disabled, !switch only works if a balance slot is immediately available. | `true` |
 
 ---
 
