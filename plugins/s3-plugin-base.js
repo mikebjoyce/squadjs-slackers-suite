@@ -402,16 +402,6 @@ export default class S3PluginBase extends BasePlugin {
       `[TC] Requesting team change for ${playerName} (${eosID}) -> T${targetTeamID} (source: ${source})`
     );
 
-    // ── Record move attribution before the first RCON attempt ─
-    // This tells S³'s tick processor which plugin initiated this team
-    // change, so the TEAM_CHANGE event includes the proper source
-    // (e.g. "Player-Self") instead of "Manual/Game".
-    try {
-      this._s3?.players?.recordMove(eosID, targetTeamID, source);
-    } catch (err) {
-      this.verbose(2, `[TC] recordMove warning: ${err.message}`);
-    }
-
     // ── Helpers ──────────────────────────────────────────────
     const getFromS3 = () => this.players?.getPlayer(eosID);
 
@@ -441,6 +431,18 @@ export default class S3PluginBase extends BasePlugin {
       if (current && String(current.teamID) === String(targetTeamID)) {
         this.verbose(3, `[TC] ${playerName} already on target team T${targetTeamID}.`);
         return makeResult(true, targetTeamID, attempts);
+      }
+
+      // ── Record move attribution before each RCON attempt ─
+      // Re-recorded per-attempt because _consumeMoveAttribution deletes
+      // the record on first match. If the Squad server auto-balances the
+      // player back (bounce-back), subsequent retries need a fresh
+      // attribution so TEAM_CHANGE shows the correct source (e.g.
+      // "Player-Queue") instead of "Manual/Game".
+      try {
+        this._s3?.players?.recordMove(eosID, targetTeamID, source);
+      } catch (err) {
+        this.verbose(2, `[TC] recordMove warning: ${err.message}`);
       }
 
       // Send RCON command
