@@ -1299,15 +1299,10 @@ S³ must appear **before** consumer plugins:
 | `logPath` | string | `'./s3-log.jsonl'` | JSONL mirror path, used only when `enableFileLogging` is true |
 | `autoMigrate` | boolean | `false` | Auto-apply migrations without Discord confirmation |
 
-> **README.md is out of sync here too** — it's missing `enableDatabaseLogging`, `enableFileLogging`, and `logPath` entirely. This table is now the more complete source; worth back-porting to the README.
+### 12.4 — File Placement
 
-### 12.4 — Build Process
-
-During development, base class and consumer plugin files live in:
-- `ReferenceScripts/<plugin-name>/plugins/` — consumer plugins
-- `SlackersSquadServices/plugins/` — S³ base classes, S³ plugin itself
-
-At build time, a build script (`build/build.cjs`) copies all plugins into a single `plugins/` directory so SquadJS can resolve sibling imports.
+1. Copy `SlackersSquadServices/plugins/*.js` to your SquadJS `squad-server/plugins/`
+2. Copy `SlackersSquadServices/utils/*.js` to your SquadJS `squad-server/utils/`
 
 **Import path rule:** Always use sibling relative imports (`'./s3-plugin-base.js'`), not deep relative paths (`'../../SlackersSquadServices/plugins/...'`).
 

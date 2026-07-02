@@ -54,6 +54,9 @@
  * - _validateRecoveredState layer-name comparison normalises names
  *   (strips underscores and hyphens) to avoid false divergences from
  *   SquadJS layer-name format mismatches.
+ * - Seed and Training modes use a short 5s staging-to-LIVE timer instead
+ *   of the full stagingDurationMs, since these modes have no meaningful
+ *   STAGING phase and the server sits in pre-round indefinitely.
  *
  */
 
@@ -522,15 +525,15 @@ export default class GameStateService {
     this._clearStagingLiveTimer();
 
     // Seed and Training maps have no meaningful STAGING phase — players join/leave
-    // freely and the server stays in pre-round indefinitely. Skip the forced timer
-    // transition; the next NEW_GAME event will handle phase advancement naturally.
-    if (this.isSeedMode() || this.isTrainingMode()) {
-      this.verboseLogger(2, '[GameState] Seed/Training mode — skipping STAGING timer (phase remains STAGING until NEW_GAME).');
-      return;
-    }
+    // freely and the server stays in pre-round indefinitely. Use a short 5s
+    // effective duration so the phase advances to LIVE instead of getting stuck
+    // at STAGING (Seed rounds are perpetual and never fire another NEW_GAME).
+    const effectiveDuration = (this.isSeedMode() || this.isTrainingMode())
+      ? 5000
+      : this.stagingDurationMs;
 
     const elapsed = Math.max(0, Date.now() - Number(stagingStartedAtMs || Date.now()));
-    const remaining = Math.max(0, this.stagingDurationMs - elapsed);
+    const remaining = Math.max(0, effectiveDuration - elapsed);
 
     this._stagingLiveTimer = setTimeout(async () => {
       if (this.phase !== 'STAGING') return;

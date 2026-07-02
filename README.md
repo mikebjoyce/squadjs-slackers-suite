@@ -135,15 +135,15 @@ this.players.registerPriority('MyPlugin', 4);  // Above TeamBalancer (default: 3
 |----------|------|------------|
 | 1 (Unit) | Individual service tests | `node testing/test-*.js` (9 scripts, 60 tests) |
 | 2 (Integration) | Cross-plugin pipeline tests | `node testing/run-all-tests.js --category 2` (6 scripts, 52 tests) |
-| 3 (Human-led) | Live server validation | Manual — see `DesignDocs/stage8.6-integration-testing.md` |
+| 3 (Human-led) | Live server validation | Manual — run on a live server |
 
-## Development Setup
+## Installation
 
-1. Clone S³ to `SlackersSquadServices/` in the SquadJS `plugins/` directory
-2. Copy `utils/`, `testing/`, `tools/` alongside as shown in the file placement diagram
-3. Add to `config.json` as the first entry in `plugins` array (before any consumer plugin)
-4. Run `node build/build.cjs` to verify schema and check for orphaned tables
-5. For migrations: set `autoMigrate: true` in config to skip the Discord confirmation step
+1. Copy `SlackersSquadServices/plugins/*.js` to your SquadJS `squad-server/plugins/`
+2. Copy `SlackersSquadServices/utils/*.js` to your SquadJS `squad-server/utils/`
+3. (Optional) Copy `SlackersSquadServices/testing/` to your SquadJS `squad-server/testing/` to run the test suite
+4. Add `SlackersSquadServices` to `config.json` as the **first** entry in the `plugins` array — before any consumer plugin that depends on S³
+5. Configure the required connectors (`database`, `discordClient`) in the plugin options
 
 ## Configuration Options
 

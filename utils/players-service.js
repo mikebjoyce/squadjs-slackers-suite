@@ -813,9 +813,11 @@ export default class PlayersService {
       // (some players already report post-swap teams while others are still null).
       // Comparing pre-swap registry values against partially-resolved server data
       // produces false 1→2 / 2→1 floods. Suppress all S3_PLAYER_TEAM_CHANGED
-      // emissions while projection is active; genuine changes during this window
-      // are deferred and emitted by _reconcileProjection() on tear-down.
+      // emissions while projection is active (or on the first tick where null teams
+      // appear but projection hasn't been built yet); genuine changes during this
+      // window are deferred and emitted by _reconcileProjection() on tear-down.
       if (
+        !hasNullTeams &&
         !this._projectedPlayers &&
         String(previousTeamID) !== String(nextTeamID) &&
         this._isRealTeam(previousTeamID) &&
