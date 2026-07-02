@@ -541,8 +541,10 @@ export default class SmartAssign extends S3PluginBase {
     const { playerKey, playerName, reason } = data;
     const pid = playerKey || data.steamID;
 
+    let failedTeamID = null;
     if (pid && this._pendingPlayerMoves.has(pid)) {
       const move = this._pendingPlayerMoves.get(pid);
+      failedTeamID = move.targetTeam;
       this._pendingAssignments[move.targetTeam] = Math.max(0, this._pendingAssignments[move.targetTeam] - 1);
       this._pendingMu[move.targetTeam] = Math.max(0, this._pendingMu[move.targetTeam] - move.mu);
       if (move.isVeteran) {
@@ -558,8 +560,8 @@ export default class SmartAssign extends S3PluginBase {
     }
 
     const p = this.server.players.find((x) => (x.eosID || x.steamID) === pid) || { steamID: pid, name: playerName || 'Unknown' };
-    Logger.verbose('SmartAssign', 1, `[SmartAssign] Abandoned move for ${p.name} (${pid}) - ${reason}`);
-    this.logEvent('MOVE_FAILED', p, { reason }, false);
+    Logger.verbose('SmartAssign', 1, `[SmartAssign] Abandoned move for ${p.name} (${pid}) -> Team ${failedTeamID} — ${reason}`);
+    this.logEvent('MOVE_FAILED', p, { reason, teamID: failedTeamID }, false);
   }
 
   async onMoveSuccess(data) {
@@ -748,8 +750,17 @@ export default class SmartAssign extends S3PluginBase {
             }
           }
 
-          // If the player is currently on the wrong team, queue a team change
-          if (finalTargetTeam !== null && String(player.teamID) !== String(finalTargetTeam)) {
+          // ═══════════════════════════════════════════════════════════════
+          // NULL-TEAMID PROJECTION: Use S³ projected teamID for comparison.
+          // During round-transition, SquadJS may report null teamID for some
+          // players. S³'s PlayersService projects the last stable snapshot
+          // (with teams flipped 1↔2) via getPlayer(), so the comparison
+          // always sees a real 1/2 value — no deadzone for SA or Switch.
+          // ═══════════════════════════════════════════════════════════════
+          const effectiveTeamID = this._s3?.players?.getPlayer?.(player.eosID)?.teamID ?? player.teamID;
+
+          // If the player is currently on the wrong team (per S³ projection), queue a team change
+          if (finalTargetTeam !== null && String(effectiveTeamID) !== String(finalTargetTeam)) {
             this._pendingAssignments[finalTargetTeam]++;
             const pendingPlayerMu = (await getRating(player, this.eloTracker)).mu;
             this._pendingMu[finalTargetTeam] += pendingPlayerMu;
@@ -782,7 +793,7 @@ export default class SmartAssign extends S3PluginBase {
             this._pendingPlayerMoves.set(playerKey, { targetTeam: finalTargetTeam, mu: pendingPlayerMu, isVeteran });
 
             this.executor.queueMove(playerKey, player.name, player.eosID, finalTargetTeam);
-            Logger.verbose('SmartAssign', 3, `[SmartAssign] Move queued: ${player.name} (Team ${player.teamID} -> Team ${finalTargetTeam}, reason: ${reason})`);
+            Logger.verbose('SmartAssign', 3, `[SmartAssign] Move queued: ${player.name} (Team ${effectiveTeamID} -> Team ${finalTargetTeam}, reason: ${reason})`);
 
             // S³ attribution: record the move so S³'s S3_PLAYER_TEAM_CHANGED fires with source='SmartAssign'
             const recordPlayers = this._s3?.players;
@@ -1068,6 +1079,13 @@ export default class SmartAssign extends S3PluginBase {
       if (joinPlayerIsVet) virtT2Vets++;
     }
 
+    // Add candidate to their target team in virtual counts (completes the swap picture)
+    if (candidateTarget === 1) {
+      virtT1Count++;
+    } else {
+      virtT2Count++;
+    }
+
     // F5: Graduated population cap check on virtual state
     const virtTotalPop = virtT1Count + virtT2Count;
     let virtMaxImbalance;
@@ -1241,7 +1259,19 @@ export default class SmartAssign extends S3PluginBase {
         tagCache.set(player.eosID, localTag);
       }
     }
-    return evaluateTeamAssignment(player, this.server, {
+    // ═══════════════════════════════════════════════════════════════
+    // NULL-TEAMID PROJECTION: Route through S³ PlayersService instead
+    // of raw server.players. During round-transition, SquadJS may report
+    // null teamIDs while S³'s getAllPlayers() serves projected data from
+    // the last stable snapshot (teams flipped 1↔2). This ensures the
+    // evaluator's pop-cap + Elo scoring operate on real team assignments,
+    // not a garbled half-null view of the server.
+    // ═══════════════════════════════════════════════════════════════
+    const s3Players = this._s3?.players;
+    const proxyServer = s3Players?.isReady()
+      ? { players: s3Players.getAllPlayers(), currentLayer: this.server.currentLayer }
+      : this.server;
+    return evaluateTeamAssignment(player, proxyServer, {
       reconnectTeam,
       pendingAssignments: this._pendingAssignments,
       pendingMu: this._pendingMu,
