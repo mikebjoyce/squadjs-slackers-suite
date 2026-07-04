@@ -359,7 +359,8 @@ export default class Switch extends S3DiscordPluginBase {
         this._broadcastTimers = {
             firstBroadcast: null,
             reminderInterval: null,
-            closeBroadcast: null
+            closeBroadcast: null,
+            genericInfoTimer: null    // v2.0.0: 25-minute generic info broadcast
         };
 
         // v2.0.0: Map of join-warn timeouts per eosID (cleared on disconnect/cleanup)
@@ -554,7 +555,7 @@ export default class Switch extends S3DiscordPluginBase {
         // First broadcast after delay
         this._broadcastTimers.firstBroadcast = setTimeout(() => {
             const remainingMin = Math.floor((windowMs - delayMs) / 60000);
-            this.broadcast(`!switch Team switching is open. Use '!switch help' for more information. Window: ~${remainingMin}m.`);
+            this.broadcast(`[Switch] Team switching is open. Use '!switch help' for details. Window: ~${remainingMin}m.`);
         }, delayMs);
 
         // Periodic reminders
@@ -567,13 +568,13 @@ export default class Switch extends S3DiscordPluginBase {
                     return;
                 }
                 const remainingMin = Math.ceil(remainingMs / 60000);
-                this.broadcast(`!switch ~${remainingMin}m remaining to request a team change. Use '!switch check' to see your eligibility.`);
+                this.broadcast(`[Switch] ~${remainingMin}m remaining to request a team change. Use '!switch check' to see your eligibility.`);
             }, intervalMs);
         }
 
         // Window close broadcast
         this._broadcastTimers.closeBroadcast = setTimeout(() => {
-            this.broadcast(`!switch Join/match window is now closed.`);
+            this.broadcast(`[Switch] Team switch window is now closed.`);
             this._clearBroadcastTimers();
         }, windowMs);
     }
@@ -591,6 +592,10 @@ export default class Switch extends S3DiscordPluginBase {
             clearTimeout(this._broadcastTimers.closeBroadcast);
             this._broadcastTimers.closeBroadcast = null;
         }
+        if (this._broadcastTimers.genericInfoTimer) {
+            clearInterval(this._broadcastTimers.genericInfoTimer);
+            this._broadcastTimers.genericInfoTimer = null;
+        }
     }
 
     /**
@@ -605,8 +610,48 @@ export default class Switch extends S3DiscordPluginBase {
 
         // Hardcoded 5-minute interval as requested
         this._broadcastTimers.reminderInterval = setInterval(() => {
-            this.broadcast(`!switch has no cooldown on Seed or Jensens. Use '!switch help' for more info.`);
+            this.broadcast(`[Switch] No cooldown restrictions on this game mode. Use '!switch' to change teams anytime.`);
         }, 5 * 60 * 1000);
+    }
+
+    /**
+     * Start post-scramble broadcast timers replacing normal switch window broadcasts.
+     * Runs for the full duration of the round — no window close message.
+     * Called from onNewGame() when this._scrambleHappened is true.
+     */
+    _startPostScrambleBroadcastTimers() {
+        if (!this.options.broadcastSwitchWindowMessages) return;
+
+        this._clearBroadcastTimers();
+
+        const delayMs = this.options.switchWindowBroadcastDelaySeconds * 1000;
+        const intervalMs = this.options.switchWindowBroadcastIntervalMinutes * 60 * 1000;
+
+        // First broadcast after delay
+        this._broadcastTimers.firstBroadcast = setTimeout(() => {
+            this.broadcast(`[Switch] A scramble occurred last round. Returning players cannot change teams this round. New arrivals can still switch — use '!switch check'.`);
+        }, delayMs);
+
+        // Periodic reminders (no window close — lockdown lasts the whole round)
+        if (intervalMs > 0) {
+            this._broadcastTimers.reminderInterval = setInterval(() => {
+                this.broadcast(`[Switch] Scramble lockdown active. Returning players cannot change teams this round. New arrivals can still switch — use '!switch check'.`);
+            }, intervalMs);
+        }
+    }
+
+    /**
+     * Start the 25-minute generic informative broadcast timer.
+     * Runs on all round types (normal, liberal, post-scramble) and coexists
+     * with other broadcast timers. Called from onNewGame() on all paths.
+     */
+    _startGenericInfoTimer() {
+        // No guard on broadcastSwitchWindowMessages — generic info is independent
+        if (this._broadcastTimers.genericInfoTimer) return; // already running
+
+        this._broadcastTimers.genericInfoTimer = setInterval(() => {
+            this.broadcast(`[Switch] Want to change teams? Type '!switch' to request a team change. Use '!switch help' to learn more.`);
+        }, 25 * 60 * 1000);
     }
 
     /* ── v2.0.0: Join-warn helpers ────────────────────────────── */
@@ -624,7 +669,7 @@ export default class Switch extends S3DiscordPluginBase {
             // Verify player is still connected
             const stillHere = this.server.players.find(p => p.eosID === eosID);
             if (stillHere) {
-                this.warn(eosID, `Scoreboard team changes are disabled on this server. Use '!switch' to change teams. Use '!switch help' for more information.`);
+                this.warn(eosID, `[Switch] Scoreboard team changes are disabled on this server. Use '!switch' to change teams. '!switch help' for more info.`);
             }
         }, Switch.JOIN_WARN_DELAY_MS);
 
@@ -1749,19 +1794,18 @@ export default class Switch extends S3DiscordPluginBase {
         // v2.0.0: Store game start timestamp for broadcast timing
         this._gameStartTs = Date.now();
 
-        // v2.0.0: Branch on scramble/liberal/normal broadcast
+        // v2.0.0: Branch on scramble/liberal/normal broadcast, then start generic info timer on all paths
         if (this._scrambleHappened) {
             this._scrambleHappened = false;
-            const lockdownMin = this.options.scrambleLockdownDurationMinutes;
-            this.broadcast(`A scramble happened last round. Returning players are locked ~${lockdownMin}m but new arrivals can still switch. Use '!switch check' to see your status.`);
-            return; // scramble message replaces all broadcast timers for this round
-        }
-
-        if (this.isLiberalMode()) {
+            this._startPostScrambleBroadcastTimers();
+        } else if (this.isLiberalMode()) {
             this._startLiberalBroadcastTimers();
         } else {
             this._startBroadcastTimers();
         }
+
+        // Generic informative broadcast runs every 25 minutes regardless of round type
+        this._startGenericInfoTimer();
     }
 
     async onS3PlayerJoined(data) {
