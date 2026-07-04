@@ -306,8 +306,8 @@ export default class SmartAssign extends S3PluginBase {
 
     // EloTracker discovery
     this.eloTracker = this.server.plugins.find((p) => p.constructor.name === 'EloTracker') || null;
-    if (this.eloTracker && typeof this.eloTracker.getMu !== 'function') {
-      Logger.verbose('SmartAssign', 1, '[SmartAssign] Warning: EloTracker found but getMu() is missing. Falling back to population-only/internal-props.');
+    if (this.eloTracker && typeof this.eloTracker.getRating !== 'function') {
+      Logger.verbose('SmartAssign', 1, '[SmartAssign] Warning: EloTracker found but getRating() is missing. Falling back to population-only/internal-props.');
     }
 
     // Update executor's S³ reference for canAct guard
@@ -1056,7 +1056,7 @@ export default class SmartAssign extends S3PluginBase {
     const joinPlayerIsVet = joinPlayerRating.roundsPlayed >= 10;
 
     // Build virtual: candidate moves to targetTeamID, joining player takes vacated spot
-    // Initialize virtual state = base state + joining player on their chosen baseline team
+    // Initialize virtual state from base counts (excludes joining player and candidate)
     virtT1Count = baseT1Count;
     virtT2Count = baseT2Count;
     virtT1MuSum = baseT1MuSum;
@@ -1066,8 +1066,8 @@ export default class SmartAssign extends S3PluginBase {
     virtT1Mus = [...baseT1Mus];
     virtT2Mus = [...baseT2Mus];
 
-    // Add joining player to their baseline target team
-    if (joiningTarget === 1) {
+    // Add joining player to candidate's current team (the vacated spot)
+    if (candidateCurrent === 1) {
       virtT1Count++;
       virtT1MuSum += joinPlayerRating.mu;
       virtT1Mus.push(joinPlayerRating.mu);
