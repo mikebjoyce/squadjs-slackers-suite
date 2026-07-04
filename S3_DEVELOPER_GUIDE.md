@@ -174,7 +174,7 @@ Tracks round phases (STAGING → LIVE → ENDGAME → RESOLVING), infers gamemod
 | `getMatchId()` | `string\|null` | Layer hash + match counter |
 | `isIgnoredMode()` | `boolean` | Gamemode in ignored list (seed/training/event) |
 | `isSeedMode()` | `boolean` | Game mode contains `'Seed'` |
-| `isTrainingMode()` | `boolean` | Game mode contains `'Training'` |
+| `isTrainingMode()` | `boolean` | Layer or game mode name contains `'Jensen'` |
 | `getEndgameSubState()` | `string\|null` | `'SCOREBOARD'` / `'LAYER_VOTE'` / `'FACTION_VOTE_T1'` / `'FACTION_VOTE_T2'` / `'POST_VOTING'` |
 | `isEndgameScoreboard()` | `boolean` | In scoreboard phase |
 | `isEndgameLayerVote()` | `boolean` | In layer vote phase |

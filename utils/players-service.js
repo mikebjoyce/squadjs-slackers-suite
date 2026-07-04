@@ -696,8 +696,11 @@ export default class PlayersService {
 
     try {
       const reconnect = await this.getReconnect(eosID);
-      if (reconnect) {
-        const secondsAgo = ((Date.now() - (Number(reconnect.lastSeenAt) || 0)) / 1000).toFixed(0);
+      // Guard: skip if reconnect has no valid team (null/0) or zero/absent lastSeenAt.
+      // Corrupted pre-migration rows that survived the stale check with
+      // lastSeenAt=0 and lastTeamID=null must not emit S3_PLAYER_RECONNECTED.
+      if (reconnect && this._isRealTeam(reconnect.lastTeamID) && Number(reconnect.lastSeenAt) > 0) {
+        const secondsAgo = ((Date.now() - Number(reconnect.lastSeenAt)) / 1000).toFixed(0);
         const playerName = playerState?.name || reconnect.playerName || eosID;
         this.verboseLogger(
           1,
@@ -709,6 +712,8 @@ export default class PlayersService {
           disconnectedAt: reconnect.lastSeenAt,
           reconnectedAt: Date.now()
         });
+      } else if (reconnect) {
+        this.verboseLogger(2, `[Players] RECONNECT skipped for ${eosID}: lastTeamID=${reconnect.lastTeamID}, lastSeenAt=${reconnect.lastSeenAt} — corrupted/pre-migration data, will be pruned`);
       }
     } catch (err) {
       this.verboseLogger(1, `[Players] RECONNECT check error for ${eosID}: ${err.message}`);
@@ -1315,7 +1320,7 @@ export default class PlayersService {
         // in the join payload. Only checks the in-memory cache (prune already ran
         // before _registerPlayer is called), avoiding an async DB lookup.
         const reconnectInfo = this._reconnectMemory.get(key) || null;
-        const previousTeamID = reconnectInfo?.lastTeamID ?? null;
+        const previousTeamID = this._isRealTeam(reconnectInfo?.lastTeamID) ? reconnectInfo.lastTeamID : null;
         this.server.emit('S3_PLAYER_JOINED', {
           player: { ...joined },
           previousTeamID,
@@ -1351,7 +1356,7 @@ export default class PlayersService {
 
     if (emitJoin && !state.joinEmitted) {
       const reconnectInfo = this._reconnectMemory.get(key) || null;
-      const previousTeamID = reconnectInfo?.lastTeamID ?? null;
+      const previousTeamID = this._isRealTeam(reconnectInfo?.lastTeamID) ? reconnectInfo.lastTeamID : null;
       this.server.emit('S3_PLAYER_JOINED', {
         player: { ...state },
         previousTeamID,
@@ -1375,16 +1380,16 @@ export default class PlayersService {
 
     for (const [key, record] of this._reconnectMemory.entries()) {
       const updatedAt = Number(record?.updatedAt) || Number(record?.lastSeenAt) || 0;
-      if (updatedAt && updatedAt < cutoff) {
+      if (updatedAt < cutoff) {
         this._reconnectMemory.delete(key);
       }
     }
   }
 
   _isReconnectStale(record, now = Date.now()) {
-    if (!record) return false;
+    if (!record) return true;
     const updatedAt = Number(record?.updatedAt) || Number(record?.lastSeenAt) || 0;
-    if (!updatedAt) return false;
+    if (!updatedAt) return true;
     return updatedAt < (now - this.reconnectMaxAgeMs);
   }
 
