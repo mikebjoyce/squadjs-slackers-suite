@@ -304,6 +304,11 @@ export default class Switch extends S3DiscordPluginBase {
                 required: false,
                 description: 'Enable the switch queue. When disabled, !switch only works if a balance slot is immediately available.',
                 default: true
+            },
+            roundEndSummaryEnabled: {
+                required: false,
+                description: 'Post a Discord embed with round-end queue summary showing self-switches, pair trades, handshake swaps, failures, expiries, disconnects, and cancellations.',
+                default: true
             }
         };
     }
@@ -386,12 +391,37 @@ export default class Switch extends S3DiscordPluginBase {
         }
     }
 
+    /** ── Round-end summary helpers ──────────────────────────── */
+
+    _initRoundStats() {
+        return {
+            selfSwitches: [],       // { name, eosID, fromTeam, toTeam }
+            selfSwitchFailures: [], // { name, eosID, reason }
+            pairTrades: [],         // { p1Name, p2Name, queueSizeAtSwap }
+            soloSwitches: [],       // { name, eosID, queueSizeAtSwap }
+            handshakeSwaps: [],     // { name, eosID, type ('swap'|'consume'), queueSizeAtSwap }
+            queueExpiries: [],      // { name, eosID }
+            queueDisconnects: [],   // { name, eosID }
+            queueCancels: [],       // { name, eosID }
+            stillQueued: [],        // { name, eosID, currentTeamID, targetTeamID, queuedAtGameSecond }
+            maxQueueSize: 0,        // peak _getQueueSize() during the round
+        };
+    }
+
+    _updateMaxQueueSize() {
+        const current = this._getQueueSize();
+        if (current > this._roundStats.maxQueueSize) {
+            this._roundStats.maxQueueSize = current;
+        }
+    }
+
     async mount() {
         await super.mount();
 
         // At this point S³ is discovered, ready, _s3db cached, and _onS3Ready() completed.
         // Wire event listeners — business logic, not S³ boilerplate.
         this._liberalModes = (this.options.liberalSwitchGameModes || ['Seed', 'Jensen']).map(m => String(m).toLowerCase());
+        this._roundStats = this._initRoundStats();
 
         this.server.on('CHAT_MESSAGE', this.onChatMessage);
         this.server.on('ROUND_ENDED', this.onRoundEnded);
@@ -895,7 +925,7 @@ export default class Switch extends S3DiscordPluginBase {
                             const connectionSeconds = await this.getSecondsFromJoin(eosID);
                             const matchSeconds = this.getSecondsFromMatchStart();
                             const limit = this.options.switchEnabledMinutes;
-                            const timeWindowOK = isLiberal || (connectionSeconds / 60 <= limit && matchSeconds / 60 <= limit);
+                            const timeWindowOK = isLiberal || (connectionSeconds / 60 <= limit || matchSeconds / 60 <= limit);
                             let timeWindowMsg = '';
                             if (timeWindowOK) {
                                 timeWindowMsg = 'Open';
@@ -994,6 +1024,9 @@ export default class Switch extends S3DiscordPluginBase {
                         this.warn(eosID, '[Switch Queue] Queue is currently disabled.');
                     } else if (this._removePlayerFromQueue(info.player?.eosID)) {
                         this.warn(eosID, '[Switch Queue] Removed — you left the queue.');
+                        if (this._roundStats) {
+                            this._roundStats.queueCancels.push({ name: playerName, eosID });
+                        }
                         this.verbose(1, `[Queue] ${playerName} cancelled — left the queue.`);
                     } else {
                         this.warn(eosID, '[Switch Queue] You are not currently in the queue.');
@@ -1152,12 +1185,31 @@ export default class Switch extends S3DiscordPluginBase {
                     }
                 }
                 
+                // Track successful self-switch
+                if (this._roundStats) {
+                    this._roundStats.selfSwitches.push({
+                        name: playerName,
+                        eosID,
+                        fromTeam: preSwitchTeam,
+                        toTeam: teamID === 1 ? 2 : 1
+                    });
+                    this._updateMaxQueueSize();
+                }
+
                 this.verbose(1, `[Switch] Executed for ${playerName}.`);
             } else {
                 this.verbose(1, `[Switch] NOT recording cooldown for ${playerName} — switchSuccess=${switchSuccess}`);
             }
         }
         } catch (err) {
+            // Track failed self-switch
+            if (this._roundStats) {
+                this._roundStats.selfSwitchFailures.push({
+                    name: playerName,
+                    eosID,
+                    reason: err.message || 'unknown'
+                });
+            }
             this.verbose(1, `Error in onChatMessage: ${err.stack}`);
         }
     }
@@ -1189,16 +1241,121 @@ export default class Switch extends S3DiscordPluginBase {
          }
      }
 
+    _buildRoundSummaryEmbed() {
+        const s = this._roundStats;
+        const fields = [];
+
+        if (s.selfSwitches.length) {
+            const lines = s.selfSwitches.slice(0, 20).map(p => `${p.name} (T${p.fromTeam}→T${p.toTeam})`);
+            if (s.selfSwitches.length > 20) lines.push(`+ ${s.selfSwitches.length - 20} more...`);
+            fields.push({ name: `✅ Self-Switches (${s.selfSwitches.length})`, value: lines.join('\n'), inline: false });
+        }
+        if (s.pairTrades.length) {
+            const lines = s.pairTrades.slice(0, 10).map(p => `${p.p1Name} ↔ ${p.p2Name} (queue: ${p.queueSizeAtSwap})`);
+            if (s.pairTrades.length > 10) lines.push(`+ ${s.pairTrades.length - 10} more...`);
+            fields.push({ name: `🔁 Pair Trades (${s.pairTrades.length})`, value: lines.join('\n'), inline: false });
+        }
+        if (s.soloSwitches.length) {
+            const lines = s.soloSwitches.slice(0, 10).map(p => `${p.name} (queue: ${p.queueSizeAtSwap})`);
+            if (s.soloSwitches.length > 10) lines.push(`+ ${s.soloSwitches.length - 10} more...`);
+            fields.push({ name: `🔄 Solo Switches (${s.soloSwitches.length})`, value: lines.join('\n'), inline: false });
+        }
+        if (s.handshakeSwaps.length) {
+            const lines = s.handshakeSwaps.slice(0, 10).map(p => `${p.name} (${p.type}, queue: ${p.queueSizeAtSwap})`);
+            if (s.handshakeSwaps.length > 10) lines.push(`+ ${s.handshakeSwaps.length - 10} more...`);
+            fields.push({ name: `🤝 SA Handshake Swaps (${s.handshakeSwaps.length})`, value: lines.join('\n'), inline: false });
+        }
+        if (s.selfSwitchFailures.length) {
+            const lines = s.selfSwitchFailures.slice(0, 10).map(p => `${p.name}: ${p.reason}`);
+            if (s.selfSwitchFailures.length > 10) lines.push(`+ ${s.selfSwitchFailures.length - 10} more...`);
+            fields.push({ name: `❌ Failed Switches (${s.selfSwitchFailures.length})`, value: lines.join('\n'), inline: false });
+        }
+        if (s.queueExpiries.length) {
+            const names = s.queueExpiries.slice(0, 20).map(p => p.name);
+            if (s.queueExpiries.length > 20) names.push(`+ ${s.queueExpiries.length - 20} more...`);
+            fields.push({ name: `⏰ Expired from Queue (${s.queueExpiries.length})`, value: names.join(', '), inline: false });
+        }
+        if (s.queueDisconnects.length) {
+            const names = s.queueDisconnects.slice(0, 20).map(p => p.name);
+            if (s.queueDisconnects.length > 20) names.push(`+ ${s.queueDisconnects.length - 20} more...`);
+            fields.push({ name: `🚪 DC'd in Queue (${s.queueDisconnects.length})`, value: names.join(', '), inline: false });
+        }
+        if (s.queueCancels.length) {
+            const names = s.queueCancels.slice(0, 20).map(p => p.name);
+            if (s.queueCancels.length > 20) names.push(`+ ${s.queueCancels.length - 20} more...`);
+            fields.push({ name: `🚫 Cancelled Queue (${s.queueCancels.length})`, value: names.join(', '), inline: false });
+        }
+        if (s.stillQueued.length) {
+            const lines = s.stillQueued.slice(0, 10).map(p =>
+                `${p.name} (T${p.currentTeamID}→T${p.targetTeamID}, +${p.queuedAtGameSecond}s)`
+            );
+            if (s.stillQueued.length > 10) lines.push(`+ ${s.stillQueued.length - 10} more...`);
+            fields.push({ name: `⏳ Still Queued (${s.stillQueued.length})`, value: lines.join('\n'), inline: false });
+        }
+        if (!fields.length) {
+            fields.push({ name: 'No Activity', value: 'No switch activity this round.', inline: false });
+        }
+
+        // Prepend max queue size as first field
+        fields.unshift({ name: '📊 Max Queue Size', value: String(s.maxQueueSize), inline: true });
+
+        return {
+            title: 'Switch Round Summary',
+            color: 0x3498DB,
+            fields,
+            timestamp: new Date(),
+            footer: { text: `Switch v${Switch.version}` }
+        };
+    }
+
+    async _postRoundSummary() {
+        if (!this.options.roundEndSummaryEnabled) return;
+        try {
+            const embed = this._buildRoundSummaryEmbed();
+            await this.sendDiscordMessage({ embed });
+
+            const s = this._roundStats;
+            this.verbose(1, `[Summary] Round ended: ` +
+                `${s.selfSwitches.length} self, ${s.pairTrades.length} trades, ${s.soloSwitches.length} solo, ` +
+                `${s.handshakeSwaps.length} handshake, ${s.selfSwitchFailures.length} fail, ` +
+                `${s.queueExpiries.length} expired, ${s.queueDisconnects.length} DC, ${s.queueCancels.length} cancel, ` +
+                `${s.stillQueued.length} queued. Max queue: ${s.maxQueueSize}.`
+            );
+        } catch (err) {
+            this.verbose(1, `[Summary] Failed to post round summary: ${err.message}`);
+        }
+    }
+
     async onRoundEnded(dt) {
         this._lastTeamSnapshot = null;
         this._scrambleHappened = false;
+
+        // Capture "still queued" snapshot
+        if (this._roundStats) {
+            this._roundStats.stillQueued = [
+                ...this._switchQueue.t1.map(e => ({
+                    name: e.playerName, eosID: e.eosID,
+                    currentTeamID: e.currentTeamID, targetTeamID: e.targetTeamID,
+                    queuedAtGameSecond: this._gameStartTs ? Math.round((e.queuedAt - this._gameStartTs) / 1000) : 0
+                })),
+                ...this._switchQueue.t2.map(e => ({
+                    name: e.playerName, eosID: e.eosID,
+                    currentTeamID: e.currentTeamID, targetTeamID: e.targetTeamID,
+                    queuedAtGameSecond: this._gameStartTs ? Math.round((e.queuedAt - this._gameStartTs) / 1000) : 0
+                }))
+            ];
+        }
+
         this.verbose(2, `[Queue] Round ended — queue preserved (${this._getQueueSize()} entries remain).`);
+
+        // Run matchend switches, then post summary
         await this.cleanup();
         try {
             await this.doSwitchMatchend();
         } catch (err) {
             this.verbose(1, `[Switch] onRoundEnded matchend processing failed: ${err.message || err}`);
         }
+        await this._postRoundSummary();
         this._switchedOnJoin.clear();
     }
 
@@ -1410,6 +1567,14 @@ export default class Switch extends S3DiscordPluginBase {
         const entry = this._removePlayerFromQueue(eosID);
         if (entry) {
             this.verbose(1, `[Queue] ${entry.playerName} consumed externally via handshake. Queue size: ${this._getQueueSize()}`);
+            if (this._roundStats) {
+                this._roundStats.handshakeSwaps.push({
+                    name: entry.playerName,
+                    eosID: entry.eosID,
+                    type: 'consume',
+                    queueSizeAtSwap: this._getQueueSize()
+                });
+            }
         }
         return entry || null;
     }
@@ -1424,6 +1589,14 @@ export default class Switch extends S3DiscordPluginBase {
 
         try {
             await this._taggedSwitchPlayer(eosID, 'Handshake-Swap');
+            if (this._roundStats) {
+                this._roundStats.handshakeSwaps.push({
+                    name: entry.playerName,
+                    eosID: entry.eosID,
+                    type: 'swap',
+                    queueSizeAtSwap: this._getQueueSize() + 1  // +1 because entry was just removed
+                });
+            }
             this.verbose(1, `[Queue] forceQueueSwap: ${entry.playerName} switched successfully via handshake.`);
             return true;
         } catch (err) {
@@ -1475,6 +1648,9 @@ export default class Switch extends S3DiscordPluginBase {
                     if ((nowTs - entry.queuedAt) >= windowMs) {
                         clearInterval(entry.warnInterval);
                         arr.splice(i, 1);
+                        if (this._roundStats) {
+                            this._roundStats.queueExpiries.push({ name: entry.playerName, eosID: entry.eosID });
+                        }
                         this.warn(entry.eosID, `[Switch Queue] Removed — join/match window closed.\nYour ${this.options.switchEnabledMinutes}m window expired while waiting.\nUse !switch explain for details.`);
                         this.verbose(2, `[Queue] ${entry.playerName} expired and removed from queue.`);
                     }
@@ -1542,6 +1718,15 @@ export default class Switch extends S3DiscordPluginBase {
                     }
                 }
 
+                // Track completed pair trade
+                if (this._roundStats) {
+                    this._roundStats.pairTrades.push({
+                        p1Name: p1.playerName,
+                        p2Name: p2.playerName,
+                        queueSizeAtSwap: this._getQueueSize()
+                    });
+                }
+
                 this.verbose(1, `[Queue] Swapped pair: ${p1.playerName} (T1) <-> ${p2.playerName} (T2)`);
             }
 
@@ -1594,6 +1779,15 @@ export default class Switch extends S3DiscordPluginBase {
                         }
                     }
 
+                    // Track completed solo switch
+                    if (this._roundStats) {
+                        this._roundStats.soloSwitches.push({
+                            name: entry.playerName,
+                            eosID: entry.eosID,
+                            queueSizeAtSwap: this._getQueueSize()
+                        });
+                    }
+
                     this.verbose(1, `[Queue] Solo switch fired for ${entry.playerName} (T${entry.currentTeamID})`);
 
                     break;
@@ -1625,6 +1819,9 @@ export default class Switch extends S3DiscordPluginBase {
 
         if (this._removePlayerFromQueue(eosID)) {
             this.verbose(2, `[Queue] ${playerName} disconnected — removed from queue.`);
+            if (this._roundStats) {
+                this._roundStats.queueDisconnects.push({ name: playerName, eosID });
+            }
         }
         this.verbose(2, `Player disconnected ${playerName}`);
         this.recentDoubleSwitches = this.recentDoubleSwitches.filter(p => p.eosID != eosID);
@@ -1793,6 +1990,9 @@ export default class Switch extends S3DiscordPluginBase {
 
         // v2.0.0: Store game start timestamp for broadcast timing
         this._gameStartTs = Date.now();
+
+        // Reset round stats for the new round
+        this._roundStats = this._initRoundStats();
 
         // v2.0.0: Branch on scramble/liberal/normal broadcast, then start generic info timer on all paths
         if (this._scrambleHappened) {
