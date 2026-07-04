@@ -1136,7 +1136,7 @@ export default class SmartAssign extends S3PluginBase {
     // - joining player moved to candidateCurrent
     // This means we need the state AFTER both moves
 
-    let scoreT1Mus, scoreT2Mus, scoreT1Vets, scoreT2Vets, scoreT1Count, scoreT2Count;
+    let scoreT1MuSum, scoreT2MuSum, scoreT1Mus, scoreT2Mus, scoreT1Vets, scoreT2Vets, scoreT1Count, scoreT2Count;
 
     // Start fresh: base state (neither candidate nor joining player):
     scoreT1Count = baseT1Count;
