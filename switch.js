@@ -1296,7 +1296,8 @@ export default class Switch extends S3DiscordPluginBase {
         if (s.deniedSwitches.length > 0) statsLines.push(`**Denied:** ${s.deniedSwitches.length}`);
         statsLines.push(`**Max Queue Size:** ${s.maxQueueSize}`);
         if (queueDurations.length > 0) statsLines.push(`**Avg Queue Wait:** ${avgStr}`);
-        statsLines.push(`**Team 1 received:** ${toT1}    **Team 2 received:** ${toT2}`);
+        statsLines.push(`**To T1:** ${toT1}`);
+        statsLines.push(`**To T2:** ${toT2}`);
 
         fields.push({ name: '📊 Stats', value: statsLines.join('\n'), inline: false });
 
@@ -1336,7 +1337,7 @@ export default class Switch extends S3DiscordPluginBase {
                 const m = Math.floor(p.queueDurationSeconds / 60);
                 const sec = p.queueDurationSeconds % 60;
                 const dur = m > 0 ? `${m}m ${sec}s` : `${sec}s`;
-                return `${p.name} (→T${p.toTeam}, ${dur})`;
+                return `${p.name} (T${p.currentTeamID || '?'}→T${p.toTeam}, ${dur})`;
             });
             if (s.queueJoinSwaps.length > 10) names.push(`+ ${s.queueJoinSwaps.length - 10} more...`);
             methodLines.push(`**Queue Join Swap (${s.queueJoinSwaps.length})**\n${names.join('\n')}`);
@@ -1591,6 +1592,7 @@ export default class Switch extends S3DiscordPluginBase {
 
         const entry = { eosID, steamID, playerName, currentTeamID: teamID, targetTeamID: targetTeam, queuedAt, warnInterval };
         this._switchQueue[subQueue].push(entry);
+        this._updateMaxQueueSize();
 
         this.warn(eosID,
             `[Switch Queue]\nAdded to position ${enqueuePos} in the queue.\n~${(this._getRemainingWindowMs(eosID) / 60000).toFixed(1)}m remaining | Team ${teamID} → Team ${targetTeam}\n${reason}\nType !switch cancel to leave.`
@@ -1661,6 +1663,7 @@ export default class Switch extends S3DiscordPluginBase {
                     name: entry.playerName,
                     eosID: entry.eosID,
                     type: 'consume',
+                    currentTeamID: entry.currentTeamID,
                     toTeam: entry.targetTeamID,
                     queueDurationSeconds: qDuration
                 });
@@ -1686,6 +1689,7 @@ export default class Switch extends S3DiscordPluginBase {
                     name: entry.playerName,
                     eosID: entry.eosID,
                     type: 'swap',
+                    currentTeamID: entry.currentTeamID,
                     toTeam: entry.targetTeamID,
                     queueDurationSeconds: qDuration
                 });
@@ -1878,6 +1882,7 @@ export default class Switch extends S3DiscordPluginBase {
                         this._roundStats.queueNormal.push({
                             name: entry.playerName,
                             eosID: entry.eosID,
+                            currentTeamID: entry.currentTeamID,
                             toTeam: entry.currentTeamID === 1 ? 2 : 1,
                             queueDurationSeconds: qDuration
                         });
