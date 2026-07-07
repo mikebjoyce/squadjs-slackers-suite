@@ -397,12 +397,12 @@ export default class Switch extends S3DiscordPluginBase {
 
     _initRoundStats() {
         return {
-            instantSwitches: [],    // { name, eosID, fromTeam, toTeam }
-            deniedSwitches: [],     // { name, eosID, reason }
-            queueTeamTrades: [],    // { p1Name, p2Name, queueDurationSeconds }
-            queueNormal: [],        // { name, eosID, queueDurationSeconds }
-            queueJoinSwaps: [],     // { name, eosID, type ('swap'|'consume'), queueDurationSeconds }
-            queueExpiries: [],      // { name, eosID }
+            instantSwitches: [],    // { name, eosID, fromTeam, toTeam, gamePhase }
+            deniedSwitches: [],     // { name, eosID, reason, gamePhase }
+            queueTeamTrades: [],    // { p1Name, p2Name, queueDurationSeconds, gamePhase }
+            queueNormal: [],        // { name, eosID, queueDurationSeconds, gamePhase }
+            queueJoinSwaps: [],     // { name, eosID, type ('swap'|'consume'), queueDurationSeconds, gamePhase }
+            queueExpiries: [],      // { name, eosID, queueDurationSeconds, gamePhase }
             queueDisconnects: [],   // { name, eosID }
             queueCancels: [],       // { name, eosID }
             maxQueueSize: 0,        // peak _getQueueSize() during the round
@@ -1196,11 +1196,13 @@ export default class Switch extends S3DiscordPluginBase {
                 
                 // Track successful instant switch
                 if (this._roundStats) {
+                    const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
                     this._roundStats.instantSwitches.push({
                         name: playerName,
                         eosID,
                         fromTeam: preSwitchTeam,
-                        toTeam: teamID === 1 ? 2 : 1
+                        toTeam: teamID === 1 ? 2 : 1,
+                        gamePhase
                     });
                     this._updateMaxQueueSize();
                 }
@@ -1213,10 +1215,12 @@ export default class Switch extends S3DiscordPluginBase {
         } catch (err) {
             // Track denied switch
             if (this._roundStats) {
+                const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
                 this._roundStats.deniedSwitches.push({
                     name: playerName,
                     eosID,
-                    reason: err.message || 'unknown'
+                    reason: err.message || 'unknown',
+                    gamePhase
                 });
             }
             this.verbose(1, `Error in onChatMessage: ${err.stack}`);
@@ -1249,6 +1253,16 @@ export default class Switch extends S3DiscordPluginBase {
              this.verbose(1, `[Switch] doSwitchMatchend failed: ${err.message || err}`);
          }
      }
+
+    _formatGamePhase(phase) {
+        return phase ? `(${phase})` : '';
+    }
+
+    _formatDuration(seconds) {
+        const m = Math.floor(seconds / 60);
+        const s = seconds % 60;
+        return m > 0 ? `${m}m ${s}s` : `${s}s`;
+    }
 
     _buildRoundSummaryEmbed() {
         const s = this._roundStats;
@@ -1305,7 +1319,9 @@ export default class Switch extends S3DiscordPluginBase {
         const methodLines = [];
 
         if (s.instantSwitches.length) {
-            const names = s.instantSwitches.slice(0, 20).map(p => `${p.name} (T${p.fromTeam}→T${p.toTeam})`);
+            const names = s.instantSwitches.slice(0, 20).map(p => 
+                `${p.name} ${this._formatGamePhase(p.gamePhase)} (T${p.fromTeam}→T${p.toTeam})`
+            );
             if (s.instantSwitches.length > 20) names.push(`+ ${s.instantSwitches.length - 20} more...`);
             methodLines.push(`**Instant Switches (${s.instantSwitches.length})**\n${names.join('\n')}`);
         }
@@ -1315,7 +1331,7 @@ export default class Switch extends S3DiscordPluginBase {
                 const m = Math.floor(p.queueDurationSeconds / 60);
                 const sec = p.queueDurationSeconds % 60;
                 const dur = m > 0 ? `${m}m ${sec}s` : `${sec}s`;
-                return `${p.name} (T${p.currentTeamID || '?'}→T${p.toTeam}, ${dur})`;
+                return `${p.name} ${this._formatGamePhase(p.gamePhase)} (T${p.currentTeamID || '?'}→T${p.toTeam}, ${dur})`;
             });
             if (s.queueNormal.length > 10) names.push(`+ ${s.queueNormal.length - 10} more...`);
             methodLines.push(`**Queue Normal (${s.queueNormal.length})**\n${names.join('\n')}`);
@@ -1326,7 +1342,7 @@ export default class Switch extends S3DiscordPluginBase {
                 const m = Math.floor(p.queueDurationSeconds / 60);
                 const sec = p.queueDurationSeconds % 60;
                 const dur = m > 0 ? `${m}m ${sec}s` : `${sec}s`;
-                return `${p.p1Name} ↔ ${p.p2Name} (T1↔T2, ${dur})`;
+                return `${p.p1Name} ↔ ${p.p2Name} ${this._formatGamePhase(p.gamePhase)} (T1↔T2, ${dur})`;
             });
             if (s.queueTeamTrades.length > 10) names.push(`+ ${s.queueTeamTrades.length - 10} more...`);
             methodLines.push(`**Queue Team Trade (${s.queueTeamTrades.length})**\n${names.join('\n')}`);
@@ -1337,7 +1353,7 @@ export default class Switch extends S3DiscordPluginBase {
                 const m = Math.floor(p.queueDurationSeconds / 60);
                 const sec = p.queueDurationSeconds % 60;
                 const dur = m > 0 ? `${m}m ${sec}s` : `${sec}s`;
-                return `${p.name} (T${p.currentTeamID || '?'}→T${p.toTeam}, ${dur})`;
+                return `${p.name} ${this._formatGamePhase(p.gamePhase)} (T${p.currentTeamID || '?'}→T${p.toTeam}, ${dur})`;
             });
             if (s.queueJoinSwaps.length > 10) names.push(`+ ${s.queueJoinSwaps.length - 10} more...`);
             methodLines.push(`**Queue Join Swap (${s.queueJoinSwaps.length})**\n${names.join('\n')}`);
@@ -1351,13 +1367,17 @@ export default class Switch extends S3DiscordPluginBase {
         const activityLines = [];
 
         if (s.queueExpiries.length) {
-            const names = s.queueExpiries.slice(0, 20).map(p => p.name);
+            const names = s.queueExpiries.slice(0, 20).map(p => 
+                `${p.name} ${this._formatGamePhase(p.gamePhase)} (waited ${this._formatDuration(p.queueDurationSeconds)})`
+            );
             if (s.queueExpiries.length > 20) names.push(`+ ${s.queueExpiries.length - 20} more...`);
             activityLines.push(`**Expired (${s.queueExpiries.length})**\n${names.join('\n')}`);
         }
 
         if (s.deniedSwitches.length) {
-            const names = s.deniedSwitches.slice(0, 10).map(p => `${p.name}: ${p.reason}`);
+            const names = s.deniedSwitches.slice(0, 10).map(p => 
+                `${p.name} ${this._formatGamePhase(p.gamePhase)}: ${p.reason}`
+            );
             if (s.deniedSwitches.length > 10) names.push(`+ ${s.deniedSwitches.length - 10} more...`);
             activityLines.push(`**Denied (${s.deniedSwitches.length})**\n${names.join('\n')}`);
         }
@@ -1544,7 +1564,7 @@ export default class Switch extends S3DiscordPluginBase {
         }
     }
 
-    _enqueuePlayer(player, reason) {
+    async _enqueuePlayer(player, reason) {
         // v2.0.0: Gate — return early if queue is disabled
         if (!this.options.queueEnabled) {
             this.verbose(2, `[Queue] Queue disabled — refusing enqueue for ${player.name}.`);
@@ -1564,7 +1584,7 @@ export default class Switch extends S3DiscordPluginBase {
 
         if (this._findQueueEntry(eosID)) {
             const existing = this._findQueueEntry(eosID).entry;
-            const remaining = (this._getRemainingWindowMs(existing.eosID) / 60000).toFixed(1);
+            const remaining = ((await this._getRemainingWindowMs(existing.eosID)) / 60000).toFixed(1);
             this.warn(eosID,
                 `[Switch Queue]\nYou are already in the queue.\n~${remaining}m remaining | Team ${existing.currentTeamID} → Team ${existing.targetTeamID}\nType !switch cancel to leave.`
             );
@@ -1573,12 +1593,12 @@ export default class Switch extends S3DiscordPluginBase {
 
         const queuedAt = Date.now();
 
-        const warnInterval = setInterval(() => {
+        const warnInterval = setInterval(async () => {
             const found = this._findQueueEntry(eosID);
             if (!found) { clearInterval(warnInterval); return; }
 
             const entry = found.entry;
-            const remaining = (this._getRemainingWindowMs(entry.eosID) / 60000).toFixed(1);
+            const remaining = ((await this._getRemainingWindowMs(entry.eosID)) / 60000).toFixed(1);
 
             const sameTeam = this._switchQueue[entry.currentTeamID === 1 ? 't1' : 't2'];
             const pos = sameTeam.findIndex(e => e.eosID === eosID) + 1;
@@ -1595,7 +1615,7 @@ export default class Switch extends S3DiscordPluginBase {
         this._updateMaxQueueSize();
 
         this.warn(eosID,
-            `[Switch Queue]\nAdded to position ${enqueuePos} in the queue.\n~${(this._getRemainingWindowMs(eosID) / 60000).toFixed(1)}m remaining | Team ${teamID} → Team ${targetTeam}\n${reason}\nType !switch cancel to leave.`
+            `[Switch Queue]\nAdded to position ${enqueuePos} in the queue.\n~${((await this._getRemainingWindowMs(eosID)) / 60000).toFixed(1)}m remaining | Team ${teamID} → Team ${targetTeam}\n${reason}\nType !switch cancel to leave.`
         );
         this.verbose(1, `[Queue] ${playerName} (T${teamID} → T${targetTeam}) enqueued at position ${enqueuePos}. Queue size: ${this._getQueueSize()}`);
 
@@ -1617,13 +1637,13 @@ export default class Switch extends S3DiscordPluginBase {
         this._requestQueueRefresh();
     }
 
-    _getRemainingWindowMs(eosID) {
+    async _getRemainingWindowMs(eosID) {
         // Compute actual remaining time based on join time and match start time,
         // not on when the player queued. The player's window is the longer of their
         // join-based and match-start-based timers.
         const windowMs = this.options.switchEnabledMinutes * 60 * 1000;
         const limitSeconds = this.options.switchEnabledMinutes * 60;
-        const joinSeconds = this.getSecondsFromJoin(eosID);
+        const joinSeconds = await this.getSecondsFromJoin(eosID);
         const matchSeconds = this.getSecondsFromMatchStart();
         const joinRemainingMs = Math.max(0, (limitSeconds - joinSeconds) * 1000);
         const matchRemainingMs = Math.max(0, (limitSeconds - matchSeconds) * 1000);
@@ -1659,13 +1679,15 @@ export default class Switch extends S3DiscordPluginBase {
             this.verbose(1, `[Queue] ${entry.playerName} consumed externally via handshake. Queue size: ${this._getQueueSize()}`);
             if (this._roundStats) {
                 const qDuration = Math.round((Date.now() - entry.queuedAt) / 1000);
+                const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
                 this._roundStats.queueJoinSwaps.push({
                     name: entry.playerName,
                     eosID: entry.eosID,
                     type: 'consume',
                     currentTeamID: entry.currentTeamID,
                     toTeam: entry.targetTeamID,
-                    queueDurationSeconds: qDuration
+                    queueDurationSeconds: qDuration,
+                    gamePhase
                 });
                 this._roundStats.queueDurationsMs.push(qDuration * 1000);
             }
@@ -1685,13 +1707,15 @@ export default class Switch extends S3DiscordPluginBase {
             await this._taggedSwitchPlayer(eosID, 'Handshake-Swap');
             if (this._roundStats) {
                 const qDuration = Math.round((Date.now() - entry.queuedAt) / 1000);
+                const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
                 this._roundStats.queueJoinSwaps.push({
                     name: entry.playerName,
                     eosID: entry.eosID,
                     type: 'swap',
                     currentTeamID: entry.currentTeamID,
                     toTeam: entry.targetTeamID,
-                    queueDurationSeconds: qDuration
+                    queueDurationSeconds: qDuration,
+                    gamePhase
                 });
                 this._roundStats.queueDurationsMs.push(qDuration * 1000);
             }
@@ -1747,7 +1771,14 @@ export default class Switch extends S3DiscordPluginBase {
                         clearInterval(entry.warnInterval);
                         arr.splice(i, 1);
                         if (this._roundStats) {
-                            this._roundStats.queueExpiries.push({ name: entry.playerName, eosID: entry.eosID });
+                            const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
+                            const queueDurationSeconds = Math.round((nowTs - entry.queuedAt) / 1000);
+                            this._roundStats.queueExpiries.push({ 
+                                name: entry.playerName, 
+                                eosID: entry.eosID,
+                                queueDurationSeconds,
+                                gamePhase
+                            });
                         }
                         this.warn(entry.eosID, `[Switch Queue] Removed — join/match window closed.\nYour ${this.options.switchEnabledMinutes}m window expired while waiting.\nUse !switch explain for details.`);
                         this.verbose(2, `[Queue] ${entry.playerName} expired and removed from queue.`);
@@ -1821,12 +1852,14 @@ export default class Switch extends S3DiscordPluginBase {
                     const dur1 = Math.round((Date.now() - p1.queuedAt) / 1000);
                     const dur2 = Math.round((Date.now() - p2.queuedAt) / 1000);
                     const avgDuration = Math.round((dur1 + dur2) / 2);
+                    const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
                     this._roundStats.queueTeamTrades.push({
                         p1Name: p1.playerName,
                         p2Name: p2.playerName,
                         p1ToTeam: p1.targetTeamID,
                         p2ToTeam: p2.targetTeamID,
-                        queueDurationSeconds: avgDuration
+                        queueDurationSeconds: avgDuration,
+                        gamePhase
                     });
                     this._roundStats.queueDurationsMs.push(dur1 * 1000, dur2 * 1000);
                 }
@@ -1879,12 +1912,14 @@ export default class Switch extends S3DiscordPluginBase {
                     // Track completed solo switch
                     if (this._roundStats) {
                         const qDuration = Math.round((Date.now() - entry.queuedAt) / 1000);
+                        const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
                         this._roundStats.queueNormal.push({
                             name: entry.playerName,
                             eosID: entry.eosID,
                             currentTeamID: entry.currentTeamID,
                             toTeam: entry.currentTeamID === 1 ? 2 : 1,
-                            queueDurationSeconds: qDuration
+                            queueDurationSeconds: qDuration,
+                            gamePhase
                         });
                         this._roundStats.queueDurationsMs.push(qDuration * 1000);
                     }
