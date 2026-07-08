@@ -64,7 +64,7 @@
 
 const DEFAULT_ATTRIBUTION_TTL_MS = 90000;
 const DEFAULT_LOCK_TTL_MS = 3000;
-const DEFAULT_RECONNECT_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+const DEFAULT_RECONNECT_MAX_AGE_MS = 1 * 60 * 60 * 1000;
 const DEFAULT_RECONNECT_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 const DEFAULT_REFRESH_MIN_INTERVAL_MS = 3000;   // hard floor — no faster than 3s between RCON calls
 const DEFAULT_REFRESH_MAX_INTERVAL_MS = 60000;   // hard ceiling — natural SquadJS tick rate
@@ -1320,7 +1320,19 @@ export default class PlayersService {
         // in the join payload. Only checks the in-memory cache (prune already ran
         // before _registerPlayer is called), avoiding an async DB lookup.
         const reconnectInfo = this._reconnectMemory.get(key) || null;
-        const previousTeamID = this._isRealTeam(reconnectInfo?.lastTeamID) ? reconnectInfo.lastTeamID : null;
+        let previousTeamID = this._isRealTeam(reconnectInfo?.lastTeamID) ? reconnectInfo.lastTeamID : null;
+
+        // Cross-round reconnect: if the disconnect predates the current round,
+        // teams have swapped sides (1↔2). Flip the reconnect team to match.
+        if (previousTeamID && reconnectInfo?.lastSeenAt) {
+          const gs = this.parent?.services?.gameState;
+          const roundStart = gs?.getRoundStartTime?.();
+          if (roundStart && reconnectInfo.lastSeenAt < roundStart) {
+            previousTeamID = previousTeamID === 1 ? 2 : 1;
+            this.verboseLogger(2, `[Players] Cross-round reconnect flip: ${playerName} team ${reconnectInfo.lastTeamID} → ${previousTeamID}`);
+          }
+        }
+
         this.server.emit('S3_PLAYER_JOINED', {
           player: { ...joined },
           previousTeamID,
@@ -1356,7 +1368,20 @@ export default class PlayersService {
 
     if (emitJoin && !state.joinEmitted) {
       const reconnectInfo = this._reconnectMemory.get(key) || null;
-      const previousTeamID = this._isRealTeam(reconnectInfo?.lastTeamID) ? reconnectInfo.lastTeamID : null;
+      let previousTeamID = this._isRealTeam(reconnectInfo?.lastTeamID) ? reconnectInfo.lastTeamID : null;
+
+      // Cross-round reconnect: if the disconnect predates the current round,
+      // teams have swapped sides (1↔2). Flip the reconnect team to match.
+      if (previousTeamID && reconnectInfo?.lastSeenAt) {
+        const gs = this.parent?.services?.gameState;
+        const roundStart = gs?.getRoundStartTime?.();
+        if (roundStart && reconnectInfo.lastSeenAt < roundStart) {
+          previousTeamID = previousTeamID === 1 ? 2 : 1;
+          const playerName = state.name || key;
+          this.verboseLogger(2, `[Players] Cross-round reconnect flip: ${playerName} team ${reconnectInfo.lastTeamID} → ${previousTeamID}`);
+        }
+      }
+
       this.server.emit('S3_PLAYER_JOINED', {
         player: { ...state },
         previousTeamID,

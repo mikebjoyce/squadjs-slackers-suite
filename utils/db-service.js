@@ -482,7 +482,8 @@ export default class DBService {
       return this.models[name];
     }
 
-    const model = this.sequelize.define(name, schema, modelOptions);
+    const opts = { freezeTableName: true, ...modelOptions };
+    const model = this.sequelize.define(name, schema, opts);
     this.models[name] = model;
     return model;
   }
