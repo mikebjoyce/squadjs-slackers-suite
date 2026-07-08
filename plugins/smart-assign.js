@@ -900,14 +900,6 @@ export default class SmartAssign extends S3PluginBase {
     // Generic LEAVE logging removed (Stage 7.4i) — S³ LoggingService handles
     // via S3_PLAYER_LEFT. SA only logs assignment-specific events.
 
-     // Save to S³ reconnect memory (fire-and-forget) if they were on a valid team
-     const tid = Number(player.teamID);
-     if (tid === 1 || tid === 2) {
-       const reconnectPlayers = this._s3?.players;
-       if (reconnectPlayers?.isReady() && reconnectPlayers.rememberReconnect) {
-         reconnectPlayers.rememberReconnect(player.eosID, { teamID: tid });
-       }
-     }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════════
