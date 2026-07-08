@@ -375,6 +375,9 @@ export default class Switch extends S3DiscordPluginBase {
 
         this._scrambleHappened = false;   // set by onScrambleExecuted, consumed by onNewGame
 
+        // Time limit toggle — loaded from DB in _onS3Ready(), defaults to true.
+        this.timeLimitEnabled = true;
+
         this.broadcast = (msg) => { this.server.rcon.broadcast(msg); };
         this.warn = (id, msg) => {
             if (!id) return;
@@ -511,8 +514,21 @@ export default class Switch extends S3DiscordPluginBase {
             }
         }, { timestamps: false });
 
+        // Settings key-value table for runtime toggles
+        this.defineModel('SwitchPlugin_Settings', {
+            key: {
+                type: this._s3db.getDataTypes().STRING,
+                primaryKey: true,
+                allowNull: false
+            },
+            value: {
+                type: this._s3db.getDataTypes().STRING,
+                allowNull: false
+            }
+        }, { timestamps: false, freezeTableName: true });
+
         // Register expected version + v1 migration
-        this.registerExpectedVersion('switch', 1);
+        this.registerExpectedVersion('switch', 2);
         this.registerMigrations('switch', [
             {
                 version: 1,
@@ -543,6 +559,26 @@ export default class Switch extends S3DiscordPluginBase {
                     await qi.dropTable('SwitchPlugin_PlayerCooldowns');
                     await qi.dropTable('SwitchPlugin_Endmatches');
                 }
+            },
+            {
+                version: 2,
+                description: 'Create SwitchPlugin_Settings table',
+                up: async (qi) => {
+                    const existing = await qi.showAllTables();
+                    if (!existing.includes('SwitchPlugin_Settings')) {
+                        await qi.createTable('SwitchPlugin_Settings', {
+                            key: { type: qi.DataTypes.STRING, primaryKey: true, allowNull: false },
+                            value: { type: qi.DataTypes.STRING, allowNull: false }
+                        });
+                        await qi.bulkInsert('SwitchPlugin_Settings', [{
+                            key: 'timeLimitEnabled',
+                            value: 'true'
+                        }]);
+                    }
+                },
+                down: async (qi) => {
+                    await qi.dropTable('SwitchPlugin_Settings');
+                }
             }
         ]);
 
@@ -554,11 +590,54 @@ export default class Switch extends S3DiscordPluginBase {
             this.verbose(3, '[S3] Switch schema already up to date.');
         }
 
+        // Load persisted settings after table is guaranteed to exist
+        await this._loadTimeLimitSetting();
+
         // Refresh interest is registered conditionally — only when the queue becomes
         // non-empty (see _enqueuePlayer), and unregistered when the queue empties
         // (see _removePlayerFromQueue). If the queue is disabled, no interest is
         // registered at all. This avoids polling when no one is waiting.
         this.verbose(2, '[S3] Switch refresh interest is conditional (poll only when queue active).');
+    }
+
+    /**
+     * Loads the timeLimitEnabled setting from SwitchPlugin_Settings.
+     * Falls back to true (safe default) if the table, row, or DB is unavailable.
+     */
+    async _loadTimeLimitSetting() {
+        try {
+            const Settings = this._getModel('SwitchPlugin_Settings');
+            if (!Settings) {
+                this.verbose(2, '[Switch] SwitchPlugin_Settings model not available — using default (timeLimitEnabled=true).');
+                this.timeLimitEnabled = true;
+                return;
+            }
+            const row = await Settings.findByPk('timeLimitEnabled');
+            this.timeLimitEnabled = row ? row.value === 'true' : true;
+            this.verbose(2, `[Switch] Time limit ${this.timeLimitEnabled ? 'enabled' : 'disabled'} (loaded from DB).`);
+        } catch (err) {
+            this.verbose(1, `[Switch] Failed to load time limit setting: ${err.message}. Using default (enabled=true).`);
+            this.timeLimitEnabled = true;
+        }
+    }
+
+    /**
+     * Persists the timeLimitEnabled toggle to SwitchPlugin_Settings.
+     * Updates the in-memory property. Throws on DB failure so the caller can report the error.
+     */
+    async _saveTimeLimitSetting(enabled) {
+        const Settings = this._getModel('SwitchPlugin_Settings');
+        if (!Settings) {
+            throw new Error('SwitchPlugin_Settings model not available — DB may not be ready.');
+        }
+        await this._withDb(async (t) => {
+            await Settings.upsert(
+                { key: 'timeLimitEnabled', value: String(enabled) },
+                { transaction: t }
+            );
+        });
+        this.timeLimitEnabled = enabled;
+        this.verbose(1, `[Switch] Time limit ${enabled ? 'enabled' : 'disabled'} via Discord admin command.`);
     }
 
     async prepareToMount() {
@@ -1532,7 +1611,7 @@ export default class Switch extends S3DiscordPluginBase {
             return { eligible: false, reason: 'scramble_lock', remaining };
         }
 
-        if (!this.isLiberalMode()) {
+        if (!this.isLiberalMode() && this.timeLimitEnabled) {
             const connectionSeconds = await this.getSecondsFromJoin(eosID);
             const matchSeconds = this.getSecondsFromMatchStart();
             const limit = this.options.switchEnabledMinutes;
@@ -1767,7 +1846,7 @@ export default class Switch extends S3DiscordPluginBase {
                 const arr = this._switchQueue[subQueue];
                 for (let i = arr.length - 1; i >= 0; i--) {
                     const entry = arr[i];
-                    if ((nowTs - entry.queuedAt) >= windowMs) {
+                    if (this.timeLimitEnabled && (nowTs - entry.queuedAt) >= windowMs) {
                         clearInterval(entry.warnInterval);
                         arr.splice(i, 1);
                         if (this._roundStats) {
@@ -2368,6 +2447,14 @@ export default class Switch extends S3DiscordPluginBase {
         
         this._clearAllQueueEntries('Scramble');
 
+        // v2.0.0: During seed rounds, scramble clears the queue but does NOT
+        // apply lockdown or flag _scrambleHappened — normal broadcasts play
+        // when the next (non-seed) round starts.
+        if (this._s3?.gameState?.isSeedMode?.()) {
+            this.verbose(1, `[SCRAMBLE_EVENT] Seed round — queue cleared, no lockdown applied.`);
+            return;
+        }
+
         // v2.0.0: Defer post-scramble broadcast to next NEW_GAME
         this._scrambleHappened = true;
 
@@ -2527,10 +2614,10 @@ export default class Switch extends S3DiscordPluginBase {
 
         // S³ integration check (like TB's testS3Integration)
         try {
-            if (this.s3?.isReady() && this.s3?.gameState && this.s3?.players?.canAct) {
+            if (this._s3?.gameState?.isReady?.() && this._s3?.players?.isReady?.() && this._s3?.players?.canAct) {
                 s3Ok = true;
                 s3Label = 'Ready';
-            } else if (this.s3?.isReady()) {
+            } else if (this._s3?.gameState?.isReady?.() || this._s3?.players?.isReady?.()) {
                 s3Label = 'Partial';
             }
         } catch (err) {
@@ -2711,6 +2798,17 @@ export default class Switch extends S3DiscordPluginBase {
                 });
             }
             await this.safeDiscordReply(message, '🗑️ All player cooldowns cleared.');
+        } else if (subCommand === 'timelimit' && ['on', 'off'].includes(args[2])) {
+            const enabled = args[2] === 'on';
+            try {
+                await this._saveTimeLimitSetting(enabled);
+                const status = enabled ? 'enabled' : 'disabled';
+                await this.safeDiscordReply(message,
+                    `✅ Switch time limit **${status}**. Players ${enabled ? 'must switch within the first minutes of joining or match start' : 'can switch at any time regardless of join/match time'}.`
+                );
+            } catch (err) {
+                await this.safeDiscordReply(message, `❌ Failed to update setting: ${err.message}`);
+            }
         } else if (subCommand === 'help') {
             const embed = {
                 title: '📜 Switch Plugin Commands',
@@ -2720,6 +2818,7 @@ export default class Switch extends S3DiscordPluginBase {
                     { name: '!switch check <ident>', value: 'Check cooldown status for a player.' },
                     { name: '!switch clear <ident>', value: 'Clear cooldowns for a specific player.' },
                     { name: '!switch clearall', value: 'Clear all player cooldowns.' },
+                    { name: '!switch timelimit on|off', value: 'Admin: Toggle join/match time limit for queue entry.' },
                     { name: '!switch help', value: 'Show this help message.' }
                 ]
             };
@@ -2734,6 +2833,7 @@ export default class Switch extends S3DiscordPluginBase {
                     { name: '!switch check <ident>', value: 'Check cooldown status for a player.' },
                     { name: '!switch clear <ident>', value: 'Clear cooldowns for a specific player.' },
                     { name: '!switch clearall', value: 'Clear all player cooldowns.' },
+                    { name: '!switch timelimit on|off', value: 'Admin: Toggle join/match time limit for queue entry.' },
                     { name: '!switch help', value: 'Show this help message.' }
                 ]
             };
