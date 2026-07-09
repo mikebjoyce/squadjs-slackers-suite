@@ -20,7 +20,7 @@
  *   a failure at v3 does not roll back v2. Partial progress is better
  *   than phantom rollback of already-applied changes.
  * - The engine NEVER auto-triggers migrations on startup — that is
- *   gated behind the Discord confirmation flow (7.4d).
+ *   gated behind the Discord confirmation flow (!s3 confirm <token>).
  *
  * ─── METHODS ────────────────────────────────────────────────────
  *
@@ -58,9 +58,9 @@
  *
  * - This file replaces the old S3_Migrations table approach.
  *   The new SchemaVersion table is per-plugin.
- * - 7.4d (Discord confirmation) is stubbed; integration points are
- *   marked with TODO comments.
- * - 8.4b (connector-agnostic export fallback): When SQLite file-copy
+ * - Discord confirmation is handled via confirmToken() gate — the
+ *   engine requires a valid token before executing migrations.
+ * - Connector-agnostic export fallback: When SQLite file-copy
  *   backup is unavailable (non-SQLite connectors), the engine falls
  *   back to JSON export/import via s3-export-import.js (exportToFile /
  *   restoreFromFile). This ensures pre-migration backups work on
@@ -90,9 +90,19 @@ function createQueryInterface(sequelize, db, transaction) {
       await qi.addColumn(tableName, columnName, columnDef, { transaction });
     },
 
-    async removeColumn(tableName, columnName) {
+    async removeColumn(tableName, columnName, options = {}) {
+      if (options.forceDrop) {
+        const qi = sequelize.getQueryInterface();
+        await qi.removeColumn(tableName, columnName, { transaction });
+        return;
+      }
+      // Check existence first — no-op if column already gone
+      const info = await sequelize.getQueryInterface().describeTable(tableName, { transaction });
+      if (!info[columnName]) return;
+      const timestamp = Date.now();
+      const deprecatedName = `${columnName}_deprecated_${timestamp}`;
       const qi = sequelize.getQueryInterface();
-      await qi.removeColumn(tableName, columnName, { transaction });
+      await qi.renameColumn(tableName, columnName, deprecatedName, { transaction });
     },
 
     async changeColumn(tableName, columnName, columnDef) {
@@ -112,12 +122,26 @@ function createQueryInterface(sequelize, db, transaction) {
 
     async dropTable(tableName, options = {}) {
       const qi = sequelize.getQueryInterface();
-      await qi.dropTable(tableName, { ...options, transaction });
+      if (options.forceDrop) {
+        await qi.dropTable(tableName, { transaction });
+        return;
+      }
+      // Check existence first — no-op if already gone (e.g. orphan tables from partial runs)
+      const tables = await sequelize.getQueryInterface().showAllTables({ transaction });
+      if (!tables.includes(tableName)) return;
+      const timestamp = Date.now();
+      const deprecatedName = `${tableName}_deprecated_${timestamp}`;
+      await qi.renameTable(tableName, deprecatedName, { transaction });
     },
 
     async createTable(tableName, attributes, options = {}) {
       const qi = sequelize.getQueryInterface();
       await qi.createTable(tableName, attributes, { ...options, transaction });
+    },
+
+    async bulkInsert(tableName, records, options = {}) {
+      const qi = sequelize.getQueryInterface();
+      await qi.bulkInsert(tableName, records, { ...options, transaction });
     },
 
     /**
@@ -128,6 +152,18 @@ function createQueryInterface(sequelize, db, transaction) {
     async showAllTables() {
       const qi = sequelize.getQueryInterface();
       return qi.showAllTables({ transaction });
+    },
+
+    /**
+     * Describe a table's columns in a dialect-agnostic way.
+     * Returns a map of column name → column metadata.
+     * Use this instead of raw PRAGMA / information_schema queries.
+     * @param {string} tableName
+     * @returns {Promise<Record<string, Object>>}
+     */
+    async describeTable(tableName) {
+      const qi = sequelize.getQueryInterface();
+      return qi.describeTable(tableName, { transaction });
     },
 
     async rawQuery(sql, replacements = {}) {
@@ -153,7 +189,7 @@ export default class MigrationEngine {
    * @param {Object} opts
    * @param {import('./db-service.js').default} opts.dbService - DBService instance
    * @param {Function} opts.verboseLogger - SquadJS verbose logger
-   * @param {string}  [opts.dbPath]       - Path to the SQLite database file for backup (7.4e)
+   * @param {string}  [opts.dbPath]       - Path to the SQLite database file for backup
    * @param {string}  [opts.backupDir]    - Backup directory override (default: './backups')
    * @param {number}  [opts.backupRetention=5] - Max backups to retain
    */
@@ -170,6 +206,15 @@ export default class MigrationEngine {
 
     /** @type {Map<string, Array<{version: number, up: Function, down?: Function}>>} */
     this._migrations = new Map();
+
+    /** Token expected from Discord confirmation prompt. Set by _checkAndPromptMigrations(). */
+    this._confirmToken = null;
+
+    /** True once confirmToken() was called with a matching token, '__auto__', or '__force__'. */
+    this._confirmed = false;
+
+    /** Epoch ms when the current token expires (5 min from generation). */
+    this._tokenExpiresAt = null;
   }
 
   /* ────────────────────────────────────── PUBLIC API ────────────────────────────────────── */
@@ -178,11 +223,12 @@ export default class MigrationEngine {
    * Register a sequence of migrations for a plugin.
    * @param {string} pluginName  - Unique plugin identifier (e.g. 'smart-assign', 's3-core')
    * @param {Array}  migrations  - Array of migration objects:
-   *   [{ version: number, up: async (qi) => void, down?: async (qi) => void }]
+   *   [{ version: number, description: string, up: async (qi) => void, down?: async (qi) => void, touches?: { creates?: string[], columns?: Record<string, string[]> } }]
    *
    * Validates:
    *   - No duplicate version numbers
    *   - Versions are positive integers
+   *   - description is a non-empty string
    *   - up() is a function
    */
   registerMigrations(pluginName, migrations) {
@@ -204,6 +250,43 @@ export default class MigrationEngine {
       seen.add(m.version);
       if (typeof m.up !== 'function') {
         throw new Error(`Migration v${m.version} in "${pluginName}" is missing an up() function.`);
+      }
+
+      // ── description (required) ────────────────────────────────────
+      if (typeof m.description !== 'string' || m.description.trim().length === 0) {
+        throw new Error(
+          `Migration v${m.version} in "${pluginName}" is missing a non-empty description string.`
+        );
+      }
+
+      // ── touches (optional — structural validation) ────────────────
+      if (m.touches !== undefined) {
+        if (typeof m.touches !== 'object' || m.touches === null || Array.isArray(m.touches)) {
+          throw new Error(
+            `Migration v${m.version} in "${pluginName}": touches must be an object if provided.`
+          );
+        }
+        if (m.touches.creates !== undefined) {
+          if (!Array.isArray(m.touches.creates) || !m.touches.creates.every(t => typeof t === 'string')) {
+            throw new Error(
+              `Migration v${m.version} in "${pluginName}": touches.creates must be an array of table name strings.`
+            );
+          }
+        }
+        if (m.touches.columns !== undefined) {
+          if (typeof m.touches.columns !== 'object' || m.touches.columns === null || Array.isArray(m.touches.columns)) {
+            throw new Error(
+              `Migration v${m.version} in "${pluginName}": touches.columns must be a Record<string, string[]>.`
+            );
+          }
+          for (const [tableName, cols] of Object.entries(m.touches.columns)) {
+            if (!Array.isArray(cols) || !cols.every(c => typeof c === 'string')) {
+              throw new Error(
+                `Migration v${m.version} in "${pluginName}": touches.columns["${tableName}"] must be an array of column name strings.`
+              );
+            }
+          }
+        }
       }
     }
 
@@ -241,6 +324,45 @@ export default class MigrationEngine {
   }
 
   /**
+   * Confirm that migrations are authorized to run.
+   * Accepts special tokens '__auto__' (autoMigrate config / bootstrap DDL),
+   * '__force__' (!s3 migrate force), or a plain string token from a Discord prompt.
+   * Synchronous — no async operations required.
+   *
+   * @param {string} token - The token to validate.
+   * @returns {boolean} True if the token was accepted and migrations are now authorized.
+   */
+  confirmToken(token) {
+    // Already confirmed — idempotent
+    if (this._confirmed) return true;
+
+    // Check token expiry first
+    if (this._confirmToken && this._tokenExpiresAt && Date.now() > this._tokenExpiresAt) {
+      this._confirmToken = null;
+      this._tokenExpiresAt = null;
+      return false;
+    }
+
+    // Special tokens always work
+    if (token === '__auto__' || token === '__force__') {
+      this._confirmed = true;
+      this._confirmToken = null;
+      this._tokenExpiresAt = null;
+      return true;
+    }
+
+    // Plain token must match the stored token
+    if (this._confirmToken !== null && token === this._confirmToken) {
+      this._confirmed = true;
+      this._confirmToken = null;
+      this._tokenExpiresAt = null;
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
    * Apply pending migrations for a plugin.
    * Each migration runs in its own transaction — a failure at v3 does
    * not roll back v2.
@@ -248,11 +370,10 @@ export default class MigrationEngine {
    * @param {string}  pluginName  - Plugin to migrate
    * @param {Object}  [options]
    * @param {boolean} [options.dryRun=false] - If true, log what would run without committing
-   * @param {boolean} [options.force=false]  - If true, skip pre-checks (backup still runs)
    * @returns {Promise<{applied: number, skipped: number}>}
    */
   async runMigrations(pluginName, options = {}) {
-    const { dryRun = false, force = false } = options;
+    const { dryRun = false } = options;
 
     if (!this._migrations.has(pluginName)) {
       this.verboseLogger(2, `[MigrationEngine] No migrations registered for "${pluginName}".`);
@@ -271,73 +392,125 @@ export default class MigrationEngine {
       this.verboseLogger(2, `[MigrationEngine] [DRY RUN] "${pluginName}" has ${pending.length} pending migration(s):`);
       for (const m of pending) {
         this.verboseLogger(2, `  v${m.version} — ${m.description || '(no description)'}`);
+        if (m.touches) {
+          if (m.touches.creates && m.touches.creates.length > 0) {
+            for (const tableName of m.touches.creates) {
+              this.verboseLogger(2, `    Creates table: ${tableName}`);
+              if (m.touches.columns?.[tableName]) {
+                this.verboseLogger(2, `    Columns: ${m.touches.columns[tableName].join(', ')}`);
+              }
+            }
+          }
+          if (m.touches.columns) {
+            for (const [tableName, cols] of Object.entries(m.touches.columns)) {
+              if (!m.touches.creates || !m.touches.creates.includes(tableName)) {
+                this.verboseLogger(2, `    Columns (${tableName}): ${cols.join(', ')}`);
+              }
+            }
+          }
+        }
       }
       return { applied: 0, skipped: pending.length };
     }
 
-    // 7.4e / 8.4b: Pre-migration backup — produce BOTH formats for portability.
-    // Tier 1: Fast SQLite file copy (if dbPath is available — SQLite only).
-    // Tier 2: Connector-agnostic JSON export (works on all dialects, ensures
-    // cross-connector portability for future Postgres/MySQL migration).
-    // At least one must succeed; if both fail, the migration is aborted.
-    let fileCopyResult = null;
-    let jsonExportResult = null;
+    // Confirmation gate — must be confirmed before running any migrations
+    if (!this._confirmed) {
+      throw new Error(
+        `Migration not confirmed for "${pluginName}". ` +
+        'Use !s3 confirm <token> or !s3 migrate force, ' +
+        'or set autoMigrate: true in S³ config.'
+      );
+    }
 
-    // Tier 1: SQLite file copy (fast, binary-identical)
-    if (this.dbPath) {
+    // Concurrency guard — prevent double-apply across processes.
+    // SQLite is already serialized by _s3_mutex (acquireAdvisoryLock returns true immediately).
+    // Postgres/MySQL use native advisory locks to serialize per-pluginName.
+    const lockKey = `s3_migrate_${pluginName}`;
+    let locked = false;
+    try {
+      locked = await this.dbService.acquireAdvisoryLock(lockKey, 30000);
+      if (!locked) {
+        throw new Error(
+          `Could not acquire migration lock for "${pluginName}" — another migration may be in progress.`
+        );
+      }
+
+      // Pre-migration backup — produce BOTH formats for portability.
+      // Tier 1: Fast SQLite file copy (if dbPath is available — SQLite only).
+      // Tier 2: Connector-agnostic JSON export (works on all dialects, ensures
+      // cross-connector portability for future Postgres/MySQL migration).
+      // At least one must succeed; if both fail, the migration is aborted.
+      let fileCopyResult = null;
+      let jsonExportResult = null;
+
+      // Tier 1: SQLite file copy (fast, binary-identical)
+      if (this.dbPath) {
+        try {
+          fileCopyResult = createBackup(this.dbPath, this.backupDir, this.backupRetention);
+          if (fileCopyResult) {
+            this.verboseLogger(2, `[MigrationEngine] File backup created: ${fileCopyResult.filename} (${fileCopyResult.sizeBytes} bytes).`);
+          }
+        } catch (err) {
+          this.verboseLogger(1, `[MigrationEngine] File backup failed: ${err.message}`);
+          fileCopyResult = null;
+        }
+      }
+
+      // Tier 2: JSON export (always run — ensures cross-connector portability)
       try {
-        fileCopyResult = createBackup(this.dbPath, this.backupDir, this.backupRetention);
-        if (fileCopyResult) {
-          this.verboseLogger(2, `[MigrationEngine] File backup created: ${fileCopyResult.filename} (${fileCopyResult.sizeBytes} bytes).`);
+        jsonExportResult = await jsonExportToFile(this.dbService, this.backupDir, {
+          tier: 'all',
+          retention: this.backupRetention
+        });
+        if (jsonExportResult) {
+          this.verboseLogger(2, `[MigrationEngine] JSON backup created: ${jsonExportResult.filename} (${jsonExportResult.sizeBytes} bytes).`);
         }
       } catch (err) {
-        this.verboseLogger(1, `[MigrationEngine] File backup failed: ${err.message}`);
-        fileCopyResult = null;
+        this.verboseLogger(1, `[MigrationEngine] JSON backup failed: ${err.message}`);
+        jsonExportResult = null;
       }
-    }
 
-    // Tier 2: JSON export (always run — ensures cross-connector portability)
-    try {
-      jsonExportResult = await jsonExportToFile(this.dbService, this.backupDir, {
-        tier: 'all',
-        retention: this.backupRetention
-      });
-      if (jsonExportResult) {
-        this.verboseLogger(2, `[MigrationEngine] JSON backup created: ${jsonExportResult.filename} (${jsonExportResult.sizeBytes} bytes).`);
+      if (!fileCopyResult && !jsonExportResult) {
+        const msg = `[MigrationEngine] Backup FAILED for "${pluginName}" — aborting migration. Both file copy and JSON export failed. Check disk space, permissions, and DB connectivity.`;
+        this.verboseLogger(1, msg);
+        throw new Error(msg);
       }
-    } catch (err) {
-      this.verboseLogger(1, `[MigrationEngine] JSON backup failed: ${err.message}`);
-      jsonExportResult = null;
-    }
 
-    if (!fileCopyResult && !jsonExportResult) {
-      const msg = `[MigrationEngine] Backup FAILED for "${pluginName}" — aborting migration. Both file copy and JSON export failed. Check disk space, permissions, and DB connectivity.`;
-      this.verboseLogger(1, msg);
-      throw new Error(msg);
-    }
+      this.verboseLogger(2, `[MigrationEngine] Running ${pending.length} migration(s) for "${pluginName}"...`);
 
-    this.verboseLogger(2, `[MigrationEngine] Running ${pending.length} migration(s) for "${pluginName}"...`);
+      let applied = 0;
+      for (const migration of pending) {
+        try {
+          // Step 1: Run up() inside a transaction
+          await this.dbService.withTransactionWithRetry(async (transaction) => {
+            const qi = createQueryInterface(this.dbService.sequelize, this.dbService, transaction);
+            await migration.up(qi);
+          });
 
-    let applied = 0;
-    for (const migration of pending) {
-      try {
-        await this.dbService.withTransactionWithRetry(async (transaction) => {
-          const qi = createQueryInterface(this.dbService.sequelize, this.dbService, transaction);
+          // Step 2: Verify DDL outside transaction, then record version
+          // The verify qi has null transaction so showAllTables/describeTable
+          // see the committed state without dialect-specific transaction issues.
+          const verifyQi = createQueryInterface(this.dbService.sequelize, this.dbService, null);
+          await this._verifyMigrationResult(migration, verifyQi);
 
-          await migration.up(qi);
-
-          await this._recordVersion(pluginName, migration.version, migration.up, transaction);
+          // Verification passed — record the version in a separate transaction
+          await this.dbService.withTransactionWithRetry(async (transaction) => {
+            await this._recordVersion(pluginName, migration.version, migration.up, transaction);
+          });
 
           this.verboseLogger(3, `[MigrationEngine] Applied v${migration.version} for "${pluginName}".`);
-        });
+          applied += 1;
+        } catch (err) {
+          throw err; // Re-throw so the calling code knows the batch failed
+        }
+      }
 
-        applied += 1;
-      } catch (err) {
-        throw err; // Re-throw so the calling code knows the batch failed
+      return { applied, skipped: pending.length - applied };
+    } finally {
+      if (locked) {
+        await this.dbService.releaseAdvisoryLock(lockKey);
       }
     }
-
-    return { applied, skipped: pending.length - applied };
   }
 
   /**
@@ -474,6 +647,50 @@ export default class MigrationEngine {
           description: ''
         },
         { transaction }
+      );
+    }
+  }
+
+  /**
+   * Verify that the DDL declared in migration.touches actually took effect
+   * after up() committed. Runs outside any transaction to avoid dialect-specific
+   * issues with describeTable inside user transactions.
+   *
+   * - If migration.touches is absent, verification is skipped (backward compatible).
+   * - Checks showAllTables() for each entry in touches.creates.
+   * - Checks describeTable() for each column in touches.columns.
+   * - Collects all failures and throws one composite error.
+   *
+   * @param {{ touches?: { creates?: string[], columns?: Record<string, string[]> } }} migration
+   * @param {Object} qi - QueryInterface object (transaction must be null for DDL state checks)
+   * @throws {Error} If any table or column declared in touches is absent from the live schema
+   */
+  async _verifyMigrationResult(migration, qi) {
+    if (!migration.touches) return;
+
+    const failures = [];
+
+    if (migration.touches.creates) {
+      const existing = await qi.showAllTables();
+      for (const tableName of migration.touches.creates) {
+        if (!existing.includes(tableName)) {
+          failures.push(`Table "${tableName}" was not created (permission denied?)`);
+          continue;
+        }
+        if (migration.touches.columns?.[tableName]) {
+          const actual = await qi.sequelize.getQueryInterface().describeTable(tableName);
+          for (const col of migration.touches.columns[tableName]) {
+            if (!actual[col]) {
+              failures.push(`Column "${tableName}.${col}" missing after migration`);
+            }
+          }
+        }
+      }
+    }
+
+    if (failures.length > 0) {
+      throw new Error(
+        `Migration v${migration.version} reported success but verification failed:\n${failures.join('\n')}`
       );
     }
   }

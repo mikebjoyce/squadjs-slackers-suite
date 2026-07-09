@@ -49,7 +49,7 @@
  *   intervals are registered.
  * - Reconnect memory is DB-backed when DBService is available, with
  *   in-memory fallback and periodic pruning.
- * - Session tracking (8.1f): S3_PlayerSessions table persists per-player
+ * - Session tracking: S3_PlayerSessions table persists per-player
  *   sessionStart time across SquadJS restarts. joinTime is hydrated from
  *   this table after initial sync. Sessions expire after 30 min of inactivity.
  *
@@ -118,7 +118,7 @@ export default class PlayersService {
     this.reconnectPruneIntervalMs = DEFAULT_RECONNECT_PRUNE_INTERVAL_MS;
     this._lastReconnectPruneAt = 0;
 
-    // Session tracking (8.1f)
+    // Session tracking
     this.sessionModel = null;
     this._sessionInitialized = false;
     this._lastSessionActivityUpdate = 0; // timestamp of last bulk lastActivity write
@@ -865,7 +865,7 @@ export default class PlayersService {
         hasNullTeams
       });
 
-      // ── Session recovery (8.1f) ──
+      // ── Session recovery ──
       // After initial sync populates the registry with all current server players,
       // hydrate their joinTime from S3_PlayerSessions (survives SquadJS restarts).
       // Fire-and-forget — errors are logged internally.
@@ -929,7 +929,7 @@ export default class PlayersService {
 
     this.verboseLogger(2, `[Players] Tick: ${joinCount} joined, ${leaveCount} left, ${this.registry.size} tracked`);
 
-    // ── Periodic session activity update (8.1f) ──
+    // ── Periodic session activity update ──
     // Bulk-update lastActivity for all tracked players every sessionUpdateIntervalMs.
     // This is fire-and-forget and does not block the tick.
     if (this.sessionModel && now - this._lastSessionActivityUpdate > this.sessionUpdateIntervalMs) {
@@ -1027,7 +1027,7 @@ export default class PlayersService {
   // built from the last stable snapshot, with teams flipped (1↔2) to match the
   // known round-transition swap. This design was originally specified in
   // DesignDocs/player-state-manager-design.md and was subsumed into PlayersService
-  // during Stage 1 implementation (S³ uses one lifecycle, not a separate singleton).
+  // during initial implementation (S³ uses one lifecycle, not a separate singleton).
   //
   // Flow:
   //   1. _refreshProjectionState() — called every UPDATED_PLAYER_INFORMATION tick.
@@ -1444,7 +1444,7 @@ export default class PlayersService {
     if (connector && typeof connector.query === 'function') {
       try {
         await dbService.executeWithRetry(async () => {
-          await connector.query('DELETE FROM S3PlayerReconnects WHERE updatedAt < :cutoff', {
+          await connector.query('DELETE FROM S3_PlayerReconnects WHERE updatedAt < :cutoff', {
             replacements: { cutoff }
           });
         });
@@ -1475,7 +1475,7 @@ export default class PlayersService {
   }
 
   // ---------------------------------------------------------------------------
-  // Session tracking (8.1f) — S3_PlayerSessions table
+  // Session tracking — S3_PlayerSessions table
   //
   // The S3_PlayerSessions table persists per-player sessionStart timestamps
   // across SquadJS restarts. This allows consumer plugins (Switch, EloTracker)
@@ -1507,8 +1507,33 @@ export default class PlayersService {
     const connector = dbService.getConnector?.();
     if (!connector) return;
 
+    // Bootstrap DDL — ensures S3_PlayerSessions exists unconditionally at mount.
+    // Infrastructure table, not a migration — no confirmation needed.
+    await connector.query(`
+      CREATE TABLE IF NOT EXISTS S3_PlayerSessions (
+        eosID VARCHAR(64) PRIMARY KEY,
+        steamID VARCHAR(64) NULL,
+        playerName VARCHAR(255) NULL,
+        sessionStart BIGINT NOT NULL,
+        lastActivity BIGINT NOT NULL
+      );
+    `);
+
+    // Clean up stale session rows (>24h inactive). These are never used for
+    // session recovery — _recoverSessionTimes() treats anything >30min as stale.
+    // Mount-time cleanup is sufficient; no periodic timer needed.
+    try {
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      await connector.query('DELETE FROM S3_PlayerSessions WHERE lastActivity < :cutoff', {
+        replacements: { cutoff }
+      });
+      this.verboseLogger(3, `[Players] Session cleanup: removed rows with lastActivity < ${new Date(cutoff).toISOString()}`);
+    } catch (err) {
+      this.verboseLogger(2, `[Players] Session cleanup failed (non-fatal): ${err.message}`);
+    }
+
     this.sessionModel = dbService.defineModel?.(
-      'S3PlayerSession',
+      'S3_PlayerSession',
       {
         eosID: {
           type: dbService.getDataTypes().STRING,
@@ -1808,50 +1833,63 @@ export default class PlayersService {
     const connector = dbService.getConnector?.();
     if (!connector) return;
 
-    // Register BOTH s3-players migrations in a single call (v1: S3PlayerReconnects, v2: S3_PlayerSessions).
-    // Previously _initReconnectPersistence registered v1 and _initSessionPersistence registered v2
-    // separately, causing duplicate "Registered 1 migration(s) for s3-players" log lines.
-    if (!this._migrationRegistered && dbService.migrationEngine) {
-      this._migrationRegistered = true;
+    // ── Bootstrap DDL ───────────────────────────────────────────────
+    // Infrastructure table — DDL runs unconditionally at mount so the
+    // table always exists before any query. No confirmation needed.
+    // The migration registration below is version-bookkeeping only (no-op up()).
+    await connector.query(`
+      CREATE TABLE IF NOT EXISTS S3_PlayerReconnects (
+        eosID VARCHAR(64) PRIMARY KEY,
+        steamID VARCHAR(64) NULL,
+        playerName VARCHAR(255) NULL,
+        lastTeamID INTEGER NULL,
+        lastSeenAt BIGINT NULL,
+        updatedAt BIGINT NOT NULL
+      );
+    `);
 
+    // ── Migration registration (version-bookkeeping only) ──────────
+    // These are no-op up() functions — the table was created by the
+    // bootstrap DDL above. The migrations exist purely for version
+    // tracking and schema drift detection. The engine's duplicate-
+    // registration guard prevents re-registration on subsequent mounts.
+    if (dbService.migrationEngine) {
       dbService.migrationEngine.registerMigrations('s3-players', [
         {
           version: 1,
-          up: async (qi) => {
-            // CREATE TABLE IF NOT EXISTS so this is a no-op against existing production tables.
-            await qi.rawQuery(`
-              CREATE TABLE IF NOT EXISTS S3PlayerReconnects (
-                eosID VARCHAR(64) PRIMARY KEY,
-                steamID VARCHAR(64) NULL,
-                playerName VARCHAR(255) NULL,
-                lastTeamID INTEGER NULL,
-                lastSeenAt BIGINT NULL,
-                updatedAt BIGINT NOT NULL
-              );
-            `);
+          description: 'S3_PlayerReconnects table (bootstrap — DDL runs unconditionally at mount)',
+          touches: {
+            creates: ['S3_PlayerReconnects'],
+            columns: {
+              S3_PlayerReconnects: ['eosID', 'steamID', 'playerName', 'lastTeamID', 'lastSeenAt', 'updatedAt']
+            }
           },
-          description: 'Create S3PlayerReconnects table for reconnect persistence'
+          up: async () => {} // no-op: table created by bootstrap DDL above
         },
         {
           version: 2,
-          up: async (qi) => {
-            await qi.rawQuery(`
-              CREATE TABLE IF NOT EXISTS S3_PlayerSessions (
-                eosID VARCHAR(64) PRIMARY KEY,
-                steamID VARCHAR(64) NULL,
-                playerName VARCHAR(255) NULL,
-                sessionStart BIGINT NOT NULL,
-                lastActivity BIGINT NOT NULL
-              );
-            `);
+          description: 'S3_PlayerSessions table (bootstrap — DDL runs unconditionally at mount)',
+          touches: {
+            creates: ['S3_PlayerSessions'],
+            columns: {
+              S3_PlayerSessions: ['eosID', 'steamID', 'playerName', 'sessionStart', 'lastActivity']
+            }
           },
-          description: 'Create S3_PlayerSessions table for persistent join-time tracking'
+          up: async () => {} // no-op: table created by bootstrap DDL in _initSessionPersistence
         }
       ]);
-
-      await dbService.migrationEngine.runMigrations('s3-players');
     }
 
+    // ── Register expected version ──────────────────────────────────
+    // Makes s3-players visible in !s3 migrate status / pending.
+    // Safe to call unconditionally — overwrites same value on re-mount.
+    dbService.registerExpectedVersion('s3-players', 2, {
+      models: ['S3PlayerReconnect', 'S3_PlayerSession']
+    });
+
+    // ── Define Sequelize model ─────────────────────────────────────
+    // Runs AFTER bootstrap DDL so the table exists before defineModel.
+    // tableName updated to S3_PlayerReconnects for consistency with other S³ tables.
     this.reconnectModel = dbService.defineModel?.(
       'S3PlayerReconnect',
       {
@@ -1878,10 +1916,10 @@ export default class PlayersService {
         updatedAt: {
           type: dbService.getDataTypes().BIGINT,
           allowNull: false
-          }
+        }
       },
       {
-        tableName: 'S3PlayerReconnects',
+        tableName: 'S3_PlayerReconnects',
         timestamps: false
       }
     ) || null;

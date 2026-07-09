@@ -20,6 +20,8 @@
  *   isReady()                   — Returns true when service is mounted.
  *   getConnector()              — Returns the underlying Sequelize instance.
  *   getConnectorName()          — Returns dialect name or connector label.
+ *   acquireAdvisoryLock(key, timeoutMs) — Acquire cross-process advisory lock
+ *   releaseAdvisoryLock(key)            — Release advisory lock
  *   getDataTypes()              — Resolves Sequelize DataTypes from connector.
  *   getDatabasePath()           — Returns the SQLite file path used for backup.
  *   defineModel(name, schema, opts) — Defines and caches a Sequelize model.
@@ -93,20 +95,22 @@ export default class DBService {
     this._isMounted = false;
     this.SchemaVersionsModel = null;
     this._expectedVersions = new Map();
+    this._pluginModels = new Map();     // pluginName → model name array (for drift detection)
     this._migrationEngine = null;
     this._dbPath = null; // SQLite file path for backup (resolved on mount)
 
     // Migration gate: pending list + promise for consumer wait
     this._pendingMigrations = null;     // null = no check done, [] = up-to-date, array = pending
+    this._lastDriftResult = null;       // result of the last verifyLiveSchema() call (cached for !s3 diag display)
     this._migrationGate = null;         // Promise that consumers await
     this._resolveMigrationGateFn = null; // Resolver for the gate
 
     // Network backoff — after a network-level DB failure, all calls return null
-    // for a cooldown period rather than retrying on every tick (Item 4).
+    // for a cooldown period rather than retrying on every tick.
     this._networkErrorBackoff = null;   // null = no backoff, timestamp = skip until
     this._networkErrorBackoffMs = 30000; // 30-second cooldown
 
-    // Unhandled-rejection safety net for Sequelize-internal promise leaks (Item 3)
+    // Unhandled-rejection safety net for Sequelize-internal promise leaks
     this._unhandledRejectionHandler = null;
   }
 
@@ -140,7 +144,7 @@ export default class DBService {
     );
   }
 
-  /* ───── Item 2 (recovery): retry network errors ───── */
+  /* ───── Network error recovery: retry network errors ───── */
   static NETWORK_ERROR_SUBSTRINGS = [
     'ETIMEDOUT',
     'ECONNREFUSED',
@@ -297,6 +301,15 @@ export default class DBService {
     return this._dbPath;
   }
 
+  /**
+   * Get the last schema drift detection result.
+   * Returns null if no check has been run yet.
+   * @returns {Array<{pluginName: string, table: string, model?: string, missing?: string[], extra?: string[], error?: string}>|null}
+   */
+  getLastDriftResult() {
+    return this._lastDriftResult;
+  }
+
   /* ────────────────────────────────────── LIFECYCLE ────────────────────────────────────── */
 
   async mount() {
@@ -337,7 +350,7 @@ export default class DBService {
     // Verify schema versions (logs pending migrations but does NOT auto-run)
     await this._verifySchemaVersions();
 
-    // Safety net for Sequelize-internal unhandled rejections (Item 3).
+    // Safety net for Sequelize-internal unhandled rejections.
     // When the DB is unreachable, Sequelize's connection pool may leak
     // rejections that aren't chained to any consumer promise. This handler
     // catches those at the process level and logs them at level 4 (debug).
@@ -387,6 +400,129 @@ export default class DBService {
     return this.sequelize ? 'sequelize' : null;
   }
 
+  /**
+   * Acquire an advisory lock scoped to a logical key (e.g. 's3_migrate_s3-players').
+   * Prevents concurrent execution of critical sections across multiple processes.
+   *
+   * - SQLite: already serialized by _s3_mutex — returns true immediately.
+   * - Postgres: uses pg_try_advisory_lock(hashtext(key)) — non-blocking, returns false if held.
+   * - MySQL: uses GET_LOCK(key, timeout) — waits up to timeoutMs.
+   *
+   * @param {string} key        - Logical lock name (e.g. 's3_migrate_s3-players')
+   * @param {number} [timeoutMs=30000] - Max wait time in ms (MySQL only; Postgres is non-blocking)
+   * @returns {Promise<boolean>} True if lock was acquired, false otherwise
+   */
+  async acquireAdvisoryLock(key, timeoutMs = 30000) {
+    if (!this.sequelize || typeof this.sequelize.query !== 'function') {
+      this.verboseLogger(2, `[DB] acquireAdvisoryLock("${key}"): no connector — returning true (no-op mode).`);
+      return true;
+    }
+
+    const dialect = this.getConnectorName();
+
+    // SQLite: already fully serialized by _s3_mutex promise chain.
+    // No additional lock needed — return true immediately.
+    if (dialect === 'sqlite') {
+      return true;
+    }
+
+    // Postgres: pg_try_advisory_lock is non-blocking.
+    // Returns true if lock acquired, false if already held.
+    if (dialect === 'postgres') {
+      try {
+        const [result] = await this.sequelize.query(
+          'SELECT pg_try_advisory_lock(hashtext(:key)) AS acquired',
+          { replacements: { key }, type: this.sequelize.QueryTypes.SELECT }
+        );
+        const acquired = result?.acquired === true;
+        if (!acquired) {
+          this.verboseLogger(2, `[DB] Advisory lock "${key}" already held (Postgres pg_try_advisory_lock returned false).`);
+        }
+        return acquired;
+      } catch (err) {
+        this.verboseLogger(1, `[DB] acquireAdvisoryLock("${key}") Postgres error: ${err.message}`);
+        return false;
+      }
+    }
+
+    // MySQL: GET_LOCK is blocking with timeout.
+    // Returns 1 if lock acquired, 0 if timeout, NULL on error.
+    if (dialect === 'mysql') {
+      try {
+        const [result] = await this.sequelize.query(
+          'SELECT GET_LOCK(:key, :timeout) AS acquired',
+          {
+            replacements: { key, timeout: Math.max(0, Math.floor(timeoutMs / 1000)) },
+            type: this.sequelize.QueryTypes.SELECT
+          }
+        );
+        const acquired = result?.acquired === 1;
+        if (!acquired) {
+          this.verboseLogger(2, `[DB] Advisory lock "${key}" could not be acquired (MySQL GET_LOCK returned ${result?.acquired}).`);
+        }
+        return acquired;
+      } catch (err) {
+        this.verboseLogger(1, `[DB] acquireAdvisoryLock("${key}") MySQL error: ${err.message}`);
+        return false;
+      }
+    }
+
+    // Unknown dialect — log warning, return true (don't block on unknown)
+    this.verboseLogger(1, `[DB] acquireAdvisoryLock("${key}"): unknown dialect "${dialect}" — returning true (unprotected).`);
+    return true;
+  }
+
+  /**
+   * Release an advisory lock previously acquired via acquireAdvisoryLock().
+   *
+   * - SQLite: no-op (mutex auto-releases via promise chain).
+   * - Postgres: pg_advisory_unlock(hashtext(key)).
+   * - MySQL: DO RELEASE_LOCK(key).
+   *
+   * @param {string} key - Logical lock name (must match acquireAdvisoryLock call)
+   * @returns {Promise<void>}
+   */
+  async releaseAdvisoryLock(key) {
+    if (!this.sequelize || typeof this.sequelize.query !== 'function') {
+      return;
+    }
+
+    const dialect = this.getConnectorName();
+
+    // SQLite: no-op — mutex auto-releases via promise chain
+    if (dialect === 'sqlite') {
+      return;
+    }
+
+    // Postgres
+    if (dialect === 'postgres') {
+      try {
+        await this.sequelize.query(
+          'SELECT pg_advisory_unlock(hashtext(:key))',
+          { replacements: { key }, type: this.sequelize.QueryTypes.SELECT }
+        );
+      } catch (err) {
+        this.verboseLogger(2, `[DB] releaseAdvisoryLock("${key}") Postgres error (non-fatal): ${err.message}`);
+      }
+      return;
+    }
+
+    // MySQL
+    if (dialect === 'mysql') {
+      try {
+        await this.sequelize.query(
+          'DO RELEASE_LOCK(:key)',
+          { replacements: { key } }
+        );
+      } catch (err) {
+        this.verboseLogger(2, `[DB] releaseAdvisoryLock("${key}") MySQL error (non-fatal): ${err.message}`);
+      }
+      return;
+    }
+
+    // Unknown dialect — no-op
+  }
+
   getDataTypes() {
     const dataTypes =
       this.sequelize?.constructor?.DataTypes ||
@@ -413,7 +549,7 @@ export default class DBService {
     return DBService.withTransaction(this.sequelize, logicFn, options);
   }
 
-  /* ───── Item 4: network backoff ───── */
+  /* ───── Network backoff ───── */
 
   /**
    * Returns true when a network-level DB failure activated backoff, and the
@@ -488,18 +624,19 @@ export default class DBService {
     return model;
   }
 
-  /* ────────────────────────────────────── SCHEMA VERSION PUBLIC API ────────────────────────────────────── */
+   /* ────────────────────────────────────── SCHEMA VERSION PUBLIC API ────────────────────────────────────── */
 
-  /**
-   * Register a plugin's expected schema version.
-   * Called by consumer plugins during their own mount/init to declare
-   * their expected schema version. This is used by verifySchemaVersions()
-   * to detect pending migrations.
-   *
-   * @param {string} pluginName - Unique plugin identifier
-   * @param {number} version    - Expected schema version (positive integer)
-   */
-  registerExpectedVersion(pluginName, version) {
+   /**
+    * Register a plugin's expected schema version and, optionally, the
+     * Sequelize model names it owns. The model list feeds verifyLiveSchema()
+     * so drift detection can diff rawAttributes against the actual
+     * database columns.
+    *
+    * @param {string} pluginName - Unique plugin identifier
+    * @param {number} version    - Expected schema version (positive integer)
+    * @param {{ models?: string[] }} [options] - Optional models owned by this plugin
+    */
+   registerExpectedVersion(pluginName, version, options = {}) {
     if (!pluginName || typeof pluginName !== 'string') {
       throw new Error('registerExpectedVersion requires a non-empty pluginName string.');
     }
@@ -508,6 +645,9 @@ export default class DBService {
     }
 
     this._expectedVersions.set(pluginName, version);
+    if (options.models) {
+      this._pluginModels.set(pluginName, options.models);
+    }
     this.verboseLogger(4, `[DB] Registered expected version v${version} for "${pluginName}".`);
   }
 
@@ -601,6 +741,80 @@ export default class DBService {
     this.verboseLogger(2, `[DB] Migration gate resolved (wasApplied=${wasApplied}). Consumer plugins unblocked.`);
   }
 
+  /* ────────────────────────────────────── SCHEMA DRIFT DETECTION ────────────────────────────────────── */
+
+  /**
+   * Verify live schema against registered Sequelize model definitions.
+   * Diffs each plugin's registered models' rawAttributes against the actual
+   * database columns via describeTable(). Returns an array of drift entries.
+   * Called on every mount (metadata-only, negligible cost).
+   *
+   * Drift entry shapes:
+   *   { pluginName, table, error }       — describeTable() failure
+   *   { pluginName, table, missing }     — columns expected in model but absent from DB
+   *   { pluginName, table, extra }       — columns in DB but not in model
+   *
+   * @returns {Promise<Array<{pluginName: string, table: string, model?: string, missing?: string[], extra?: string[], error?: string}>>}
+   */
+  async verifyLiveSchema() {
+    if (this._pluginModels.size === 0) {
+      this.verboseLogger(3, '[DB] No plugin models registered for drift detection — skipping verifyLiveSchema.');
+      return [];
+    }
+
+    const drift = [];
+
+    for (const [pluginName, modelNames] of this._pluginModels.entries()) {
+      for (const modelName of modelNames) {
+        const model = this.models[modelName];
+        if (!model) {
+          drift.push({ pluginName, model: modelName, error: 'Model not found in registry' });
+          continue;
+        }
+
+        const tableName = model.tableName || model.name;
+
+        let actualColumns;
+        try {
+          actualColumns = await this.sequelize.getQueryInterface().describeTable(tableName);
+        } catch (err) {
+          drift.push({ pluginName, table: tableName, error: `Cannot describe: ${err.message}` });
+          continue;
+        }
+
+        const expectedColumns = Object.keys(model.rawAttributes);
+        const missing = expectedColumns.filter(col => !actualColumns[col]);
+        const extra = Object.keys(actualColumns).filter(col => !expectedColumns.includes(col));
+
+        if (missing.length > 0) {
+          drift.push({ pluginName, table: tableName, missing });
+        }
+        if (extra.length > 0) {
+          drift.push({ pluginName, table: tableName, extra });
+        }
+      }
+    }
+
+    // Log results
+    if (drift.length === 0) {
+      this.verboseLogger(3, '[DB] Schema drift check passed — all registered models match live database.');
+    } else {
+      for (const entry of drift) {
+        if (entry.error) {
+          this.verboseLogger(1, `[DB] DRIFT: ${entry.pluginName}/${entry.table || entry.model}: ${entry.error}`);
+        }
+        if (entry.missing) {
+          this.verboseLogger(1, `[DB] DRIFT: ${entry.table} missing columns: ${entry.missing.join(', ')}`);
+        }
+        if (entry.extra) {
+          this.verboseLogger(2, `[DB] DRIFT: ${entry.table} has extra columns: ${entry.extra.join(', ')}`);
+        }
+      }
+    }
+
+    return drift;
+  }
+
   /* ────────────────────────────────────── INTERNAL ────────────────────────────────────── */
 
   /**
@@ -663,6 +877,10 @@ export default class DBService {
    */
   async _verifySchemaVersions() {
     const result = await this.verifySchemaVersions();
+
+    // Run live schema drift detection on every mount (metadata-only, negligible cost)
+    const liveDrift = await this.verifyLiveSchema();
+    this._lastDriftResult = liveDrift;
 
     if (result.upToDate) {
       if (this._expectedVersions.size > 0) {

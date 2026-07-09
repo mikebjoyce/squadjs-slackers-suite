@@ -51,13 +51,17 @@ const CATEGORY_TESTS = {
     'test-team-change-retry.js',
     'test-migration-pipeline.js',
     'test-command-routing.js'
+  ],
+  4: [
+    'test-migration-permissions.js'
   ]
 };
 
 const CATEGORY_DESCRIPTIONS = {
   1: 'Category 1 — Standalone (no server needed)',
   2: 'Category 2 — Mock-based (no live server)',
-  3: 'Category 3 — Human-led test plans (listed for reference)'
+  3: 'Category 3 — Human-led test plans (listed for reference)',
+  4: 'Category 4 — Multi-dialect permission tests (requires Docker)'
 };
 
 const CATEGORY_3_PLANS = [

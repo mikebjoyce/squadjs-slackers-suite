@@ -445,6 +445,9 @@ export default class GameStateService {
   }
 
   async handleLayerInfoUpdated() {
+    const incomingName = this._extractLayerName(this.server.currentLayer);
+    if (!this._isKnownLayerName(incomingName)) return;
+    if (this._normalizeLayerName(this.lastKnownGoodLayer?.name) === this._normalizeLayerName(incomingName)) return;
     await this.resolveLayerInfo(this.server.currentLayer, 'handleLayerInfoUpdated');
   }
 
@@ -582,11 +585,15 @@ export default class GameStateService {
     // Timer-based sub-state progression - approximate since SquadJS has no explicit voting events
     // WARNING: These timers are estimates only. Actual voting may end early or extend due to player activity.
     // Reloading during ENDGAME will lose track of voting state entirely.
+    //
+    // Sub-state transitions do NOT fire _notifyGamePhaseChange() — the phase (ENDGAME) hasn't changed.
+    // Only actual phase transitions (handleNewGame, staging timer, handleRoundEnded) notify subscribers.
+    // Consumer plugins use public sub-state getters (isEndgameScoreboard(), etc.) when they need
+    // sub-state detail.
 
     if (this.endgameSubState === 'scoreboard') {
       this.endgameSubState = 'layerVote';
       this.verboseLogger(2, '[GameState] ENDGAME scoreboard elapsed -> layerVote.');
-      this._notifyGamePhaseChange('ENDGAME');
       this._startEndgameTimer(Date.now());
       return;
     }
@@ -594,7 +601,6 @@ export default class GameStateService {
     if (this.endgameSubState === 'layerVote') {
       this.endgameSubState = 'factionVoteTeam1';
       this.verboseLogger(2, '[GameState] ENDGAME layerVote elapsed -> factionVoteTeam1.');
-      this._notifyGamePhaseChange('ENDGAME');
       this._startEndgameTimer(Date.now());
       return;
     }
@@ -602,7 +608,6 @@ export default class GameStateService {
     if (this.endgameSubState === 'factionVoteTeam1') {
       this.endgameSubState = 'factionVoteTeam2';
       this.verboseLogger(2, '[GameState] ENDGAME factionVoteTeam1 elapsed -> factionVoteTeam2.');
-      this._notifyGamePhaseChange('ENDGAME');
       this._startEndgameTimer(Date.now());
       return;
     }
@@ -610,7 +615,6 @@ export default class GameStateService {
     if (this.endgameSubState === 'factionVoteTeam2') {
       this.endgameSubState = 'postVoting';
       this.verboseLogger(2, '[GameState] ENDGAME factionVoteTeam2 elapsed -> postVoting.');
-      this._notifyGamePhaseChange('ENDGAME');
       // Stay in postVoting (passive, no timer) until NEW_GAME clears the ENDGAME phase.
       // postVoting represents the ~10s results-display window before the map rolls.
       // We wait for the server's NEW_GAME event rather than approximating with another timer.

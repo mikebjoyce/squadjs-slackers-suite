@@ -283,7 +283,18 @@ export default class S3PluginBase extends BasePlugin {
     }
     const recheck = await this._s3db.verifySchemaVersions();
     if (!recheck.upToDate) {
-      const result = await this._s3db.migrationEngine.runMigrations(pluginName);
+      const me = this._s3db.migrationEngine;
+      if (me && !me._confirmed) {
+        this.verbose(1, `[${pluginName}] Migrations pending but not confirmed. Use !s3 confirm <token> or set autoMigrate: true in S³ config.`);
+        // Trigger the Discord prompt via S³'s debounced scheduler.
+        // Multiple consumer plugins may call this in rapid succession during
+        // initialisation — the scheduler debounces to avoid duplicate embeds.
+        if (this._s3 && typeof this._s3._scheduleMigrationPrompt === 'function') {
+          this._s3._scheduleMigrationPrompt();
+        }
+        return null;
+      }
+      const result = await (me ? me.runMigrations(pluginName) : null);
       return result;
     }
     return null;

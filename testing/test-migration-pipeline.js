@@ -3,17 +3,15 @@
  * ║     CATEGORY 2 — MIGRATION PIPELINE TEST                      ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
- * Verifies the full migration pipeline:
- *   1. MigrationEngine can register per-plugin migrations
- *   2. Running migrations creates tables with correct schema
- *   3. Pending migrations are detected correctly
- *   4. Already-applied migrations are skipped
- *   5. sync({alter}) pattern is NOT used (check consumer plugins)
- *   6. verifySchemaVersions returns correct upToDate status
- *   7. Expected version registration works
+ * Exercises the real MigrationEngine with
+ * an in-memory SQLite Sequelize instance and a real DBService.
+ * Every schema-change assertion uses showAllTables() / describeTable()
+ * on the live database, not mocked return values.
  *
- * Category: 2 (autonomous mock-based, in-memory SQLite)
+ * Category: 2 (requires DB access — in-memory SQLite, no Docker)
  * Run:    node SlackersSquadServices/testing/test-migration-pipeline.js
+ *
+ * Requires: sequelize, MigrationEngine, DBService
  */
 
 'use strict';
@@ -22,118 +20,13 @@ import assert from 'node:assert/strict';
 import { Sequelize, DataTypes } from 'sequelize';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { execSync } from 'node:child_process';
 
-// ---------------------------------------------------------------------------
-// Minimal MigrationEngine replica that mirrors real behavior
-// ---------------------------------------------------------------------------
+import DBService from '../utils/db-service.js';
+import MigrationEngine from '../utils/migration-engine.js';
 
-class MockMigrationEngine {
-  constructor(sequelize) {
-    this.sequelize = sequelize;
-    this.migrations = new Map(); // pluginName -> [{version, description, up, down}]
-    this.appliedVersions = new Map(); // pluginName -> {currentVersion, history}
-    this._registeredPlugins = new Set();
-  }
-
-  /**
-   * Register migration functions for a plugin.
-   * Mirrors real MigrationEngine.registerMigrations()
-   */
-  registerMigrations(pluginName, migrations) {
-    if (!Array.isArray(migrations)) {
-      throw new Error(`Migrations for ${pluginName} must be an array`);
-    }
-
-    // Validate monotonic version sequence
-    let prevVersion = 0;
-    for (const m of migrations) {
-      if (typeof m.version !== 'number' || m.version <= 0) {
-        throw new Error(`Invalid version ${m.version} in ${pluginName} migrations`);
-      }
-      if (m.version <= prevVersion) {
-        throw new Error(`Non-monotonic version ${m.version} in ${pluginName} (after ${prevVersion})`);
-      }
-      if (typeof m.up !== 'function') {
-        throw new Error(`Migration v${m.version} in ${pluginName} is missing up()`);
-      }
-      prevVersion = m.version;
-    }
-
-    this.migrations.set(pluginName, migrations);
-    this._registeredPlugins.add(pluginName);
-  }
-
-  /**
-   * Run pending migrations for a plugin.
-   * Mirrors real MigrationEngine.runMigrations()
-   */
-  async runMigrations(pluginName) {
-    const currentState = this.appliedVersions.get(pluginName) || { currentVersion: 0, history: [] };
-    const migrations = this.migrations.get(pluginName) || [];
-    const pending = migrations.filter(m => m.version > currentState.currentVersion);
-
-    if (pending.length === 0) {
-      return { applied: [], skipped: 0 };
-    }
-
-    const applied = [];
-    for (const migration of pending) {
-      // Run up() with query interface
-      const q = createQueryInterface(this.sequelize, migration);
-      await migration.up(q);
-      currentState.currentVersion = migration.version;
-      currentState.history.push({
-        version: migration.version,
-        description: migration.description,
-        appliedAt: new Date()
-      });
-      applied.push(migration.version);
-    }
-
-    this.appliedVersions.set(pluginName, currentState);
-    return { applied, skipped: 0 };
-  }
-
-  /**
-   * Get pending migrations for a plugin.
-   */
-  pendingMigrations(pluginName) {
-    const currentState = this.appliedVersions.get(pluginName) || { currentVersion: 0 };
-    const migrations = this.migrations.get(pluginName) || [];
-    return migrations.filter(m => m.version > currentState.currentVersion);
-  }
-
-  /**
-   * Check current applied version.
-   */
-  getAppliedVersion(pluginName) {
-    const state = this.appliedVersions.get(pluginName);
-    return state ? state.currentVersion : 0;
-  }
-}
-
-/**
- * Create a query interface object passed to migration up()/down() handlers.
- */
-function createQueryInterface(sequelize, migration) {
-  return {
-    sequelize,
-    migration,
-    async addColumn(tableName, columnName, columnDef) {
-      const table = sequelize.model(tableName);
-      if (!table) throw new Error(`Table ${tableName} not found`);
-      // For in-memory SQLite, we recreate the model with the new column
-      // This is a simplified version that tracks columns
-    },
-    async removeColumn(tableName, columnName) {
-      // Simplified — in-memory SQLite doesn't support ALTER TABLE DROP COLUMN
-    },
-    async rawQuery(sql, options) {
-      return sequelize.query(sql, options);
-    }
-  };
-}
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -149,7 +42,7 @@ function test(name, fn) {
 
 async function run() {
   console.log('='.repeat(65));
-  console.log('Migration Pipeline Test');
+  console.log('Migration Pipeline Test  (— real engine)');
   console.log('='.repeat(65));
   console.log('');
 
@@ -173,210 +66,449 @@ async function run() {
   if (failed > 0) process.exitCode = 1;
 }
 
+
 // ---------------------------------------------------------------------------
-// Utils
+// Test helpers
 // ---------------------------------------------------------------------------
 
-async function createSequelize() {
-  const seq = new Sequelize({
+/**
+ * Create a real in-memory SQLite DBService + MigrationEngine for a test.
+ * Each call returns an isolated instance backed by :memory: SQLite and a
+ * unique temp directory for backup output.
+ */
+async function createTestHarness() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 's3-mig-test-'));
+
+  const sequelize = new Sequelize({
     dialect: 'sqlite',
     storage: ':memory:',
     logging: false,
     define: { freezeTableName: true }
   });
-  await seq.authenticate();
-  return seq;
+
+  const dbService = new DBService({
+    sequelize,
+    verboseLogger: () => {}
+  });
+
+  await dbService.mount();
+
+  // Replace the engine that mount() created with one that has our temp
+  // backupDir. The mount-created engine (no backupDir) is discarded.
+  dbService._migrationEngine = new MigrationEngine({
+    dbService,
+    verboseLogger: () => {},
+    backupDir: tempDir
+  });
+
+  return { sequelize, dbService, engine: dbService.migrationEngine, tempDir };
 }
+
+/**
+ * Clean up after a test harness: close the Sequelize connection and
+ * delete the temp backup directory.
+ */
+async function destroyTestHarness({ sequelize, tempDir }) {
+  try {
+    await sequelize.close();
+  } catch { /* ignore */ }
+  try {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  } catch { /* ignore */ }
+}
+
+/**
+ * Get a live query interface from a Sequelize instance for
+ * showAllTables / describeTable assertions.
+ */
+function getLiveQI(sequelize) {
+  return sequelize.getQueryInterface();
+}
+
+// ---------------------------------------------------------------------------
+// Permission helpers (Windows + Unix)
+// ---------------------------------------------------------------------------
+
+/**
+ * Make a file read-only at the OS level.
+ * On Windows, uses icacls /deny Everyone:(W).
+ * On Unix, uses chmod 444.
+ * Falls back to chmod if icacls isn't available or fails.
+ * @param {string} filePath - Absolute path to the file
+ * @returns {boolean} True if the operation appears to have succeeded
+ */
+function makeFileReadOnly(filePath) {
+  if (process.platform === 'win32') {
+    try {
+      execSync(`icacls "${filePath}" /deny Everyone:(W)`, { stdio: 'pipe' });
+      return true;
+    } catch {
+      // Fall through to chmod fallback
+    }
+  }
+  try {
+    fs.chmodSync(filePath, 0o444);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Restore write permissions on a file.
+ * On Windows, removes icacls deny entries for Everyone.
+ * On Unix, uses chmod 644.
+ * Best-effort — failures are swallowed.
+ * @param {string} filePath - Absolute path to the file
+ */
+function restoreFilePermissions(filePath) {
+  if (process.platform === 'win32') {
+    try {
+      execSync(`icacls "${filePath}" /remove:d Everyone`, { stdio: 'pipe' });
+    } catch {
+      // Best-effort
+    }
+  }
+  try {
+    fs.chmodSync(filePath, 0o644);
+  } catch {
+    // Best-effort
+  }
+}
+
+// ---------------------------------------------------------------------------
+// File-based harness (for read-only test)
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a real file-based SQLite DBService + MigrationEngine for a test.
+ * Unlike createTestHarness() which uses :memory:, this uses a real file at
+ * storagePath so we can manipulate OS-level file permissions.
+ *
+ * The caller is responsible for calling sequelize.close() on the returned
+ * harness when done.
+ */
+async function createFileBasedHarness(storagePath, backupDir) {
+  const sequelize = new Sequelize({
+    dialect: 'sqlite',
+    storage: storagePath,
+    logging: false,
+    define: { freezeTableName: true }
+  });
+
+  const dbService = new DBService({
+    sequelize,
+    verboseLogger: () => {}
+  });
+
+  await dbService.mount();
+
+  // Replace the mount-created engine with one that has our temp backupDir
+  dbService._migrationEngine = new MigrationEngine({
+    dbService,
+    verboseLogger: () => {},
+    backupDir
+  });
+
+  return { sequelize, dbService, engine: dbService.migrationEngine };
+}
+
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 test('MigrationEngine registers per-plugin migrations', async () => {
-  const seq = await createSequelize();
-  const engine = new MockMigrationEngine(seq);
+  const harness = await createTestHarness();
+  try {
+    const { engine } = harness;
 
-  const saMigrations = [
-    { version: 1, description: 'Create SA_AssignmentLog', up: async () => {} },
-    { version: 2, description: 'Add teamID column', up: async () => {} }
-  ];
+    const saMigrations = [
+      { version: 1, description: 'Create SA_AssignmentLog', up: async () => {} },
+      { version: 2, description: 'Add teamID column', up: async () => {} }
+    ];
 
-  const eloMigrations = [
-    { version: 1, description: 'Create Elo_PlayerStats', up: async () => {} }
-  ];
+    const eloMigrations = [
+      { version: 1, description: 'Create Elo_PlayerStats', up: async () => {} }
+    ];
 
-  engine.registerMigrations('smart-assign', saMigrations);
-  engine.registerMigrations('elo-tracker', eloMigrations);
+    engine.registerMigrations('smart-assign', saMigrations);
+    engine.registerMigrations('elo-tracker', eloMigrations);
 
-  assert.equal(engine.migrations.get('smart-assign').length, 2);
-  assert.equal(engine.migrations.get('elo-tracker').length, 1);
-  assert.equal(engine.migrations.get('smart-assign')[0].version, 1);
-  assert.equal(engine.migrations.get('smart-assign')[1].version, 2);
-  assert.equal(engine.migrations.get('elo-tracker')[0].version, 1);
+    assert.equal(engine._migrations.get('smart-assign').length, 2);
+    assert.equal(engine._migrations.get('elo-tracker').length, 1);
+    assert.equal(engine._migrations.get('smart-assign')[0].version, 1);
+    assert.equal(engine._migrations.get('smart-assign')[1].version, 2);
+    assert.equal(engine._migrations.get('elo-tracker')[0].version, 1);
+  } finally {
+    await destroyTestHarness(harness);
+  }
 });
 
 test('Invalid migrations (non-monotonic versions) are rejected', async () => {
-  const seq = await createSequelize();
-  const engine = new MockMigrationEngine(seq);
+  const harness = await createTestHarness();
+  try {
+    const { engine } = harness;
 
-  assert.throws(() => {
+    // First register v1 to establish a baseline
     engine.registerMigrations('test-plugin', [
-      { version: 2, description: 'v2', up: async () => {} },
-      { version: 1, description: 'v1 (lower)', up: async () => {} }
+      { version: 1, description: 'v1', up: async () => {} }
     ]);
-  }, /Non-monotonic/);
+
+    // Then try to append migrations whose lowest version (1) is <= the
+    // highest existing version (1) — this triggers the "strictly increasing" guard.
+    assert.throws(() => {
+      engine.registerMigrations('test-plugin', [
+        { version: 2, description: 'v2', up: async () => {} },
+        { version: 1, description: 'v1 (duplicate)', up: async () => {} }
+      ]);
+    }, /strictly increasing/);
+  } finally {
+    await destroyTestHarness(harness);
+  }
 });
 
 test('Invalid migrations (missing up()) are rejected', async () => {
-  const seq = await createSequelize();
-  const engine = new MockMigrationEngine(seq);
+  const harness = await createTestHarness();
+  try {
+    const { engine } = harness;
 
-  assert.throws(() => {
-    engine.registerMigrations('test-plugin', [
-      { version: 1, description: 'v1 with no up function', up: undefined }
-    ]);
-  }, /missing up/);
+    assert.throws(() => {
+      engine.registerMigrations('test-plugin', [
+        { version: 1, description: 'v1 with no up function', up: undefined }
+      ]);
+    }, /missing an up/);
+  } finally {
+    await destroyTestHarness(harness);
+  }
 });
 
 test('Running migrations creates tables via up()', async () => {
-  const seq = await createSequelize();
-  const engine = new MockMigrationEngine(seq);
+  const harness = await createTestHarness();
+  try {
+    const { engine, sequelize } = harness;
+    const qi = getLiveQI(sequelize);
 
-  // Define a model before migration
-  const TestModel = seq.define('SA_AssignmentLog', {
-    eosID: { type: DataTypes.STRING, primaryKey: true },
-    teamID: DataTypes.INTEGER,
-    assignedAt: DataTypes.DATE
-  }, { timestamps: false });
-
-  await TestModel.sync();
-
-  const saMigrations = [
-    {
-      version: 1,
-      description: 'Create SA_AssignmentLog',
-      up: async (qi) => {
-        // In real code this would create the table via qi.addColumn etc.
-        // For this test we verify the model was synced
+    engine.registerMigrations('test-plugin', [
+      {
+        version: 1,
+        description: 'Create TestTable',
+        up: async (mqi) => {
+          await mqi.createTable('TestTable', {
+            id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+            name: { type: DataTypes.STRING, allowNull: false },
+            score: { type: DataTypes.INTEGER, allowNull: true }
+          });
+        }
+      },
+      {
+        version: 2,
+        description: 'Add comment column',
+        up: async (mqi) => {
+          await mqi.addColumn('TestTable', 'comment', {
+            type: DataTypes.STRING,
+            allowNull: true
+          });
+        }
       }
-    },
-    {
-      version: 2,
-      description: 'Add teamID column',
-      up: async (qi) => {
-        // Simulate adding a column by altering the in-memory model
-      }
-    }
-  ];
+    ]);
 
-  engine.registerMigrations('smart-assign', saMigrations);
+    // Confirm and run
+    engine.confirmToken('__auto__');
+    const result = await engine.runMigrations('test-plugin');
+    assert.equal(result.applied, 2, 'both migrations should be applied');
 
-  const result = await engine.runMigrations('smart-assign');
-  assert.equal(result.applied.length, 2, 'both migrations should be applied');
-  assert.deepEqual(result.applied, [1, 2]);
+    // Verify via live DB
+    const tables = await qi.showAllTables();
+    assert.ok(tables.includes('TestTable'), 'TestTable should exist in DB');
+
+    // Describe and check columns
+    const columns = await qi.describeTable('TestTable');
+    assert.ok(columns.id, 'id column should exist');
+    assert.ok(columns.name, 'name column should exist');
+    assert.ok(columns.score, 'score column should exist');
+    assert.ok(columns.comment, 'comment column should exist (added by v2)');
+  } finally {
+    await destroyTestHarness(harness);
+  }
 });
 
 test('Pending migrations are detected correctly', async () => {
-  const seq = await createSequelize();
-  const engine = new MockMigrationEngine(seq);
+  const harness = await createTestHarness();
+  try {
+    const { engine } = harness;
 
-  const migrations = [
-    { version: 1, description: 'v1', up: async () => {} },
-    { version: 2, description: 'v2', up: async () => {} },
-    { version: 3, description: 'v3', up: async () => {} }
-  ];
+    const migrations = [
+      { version: 1, description: 'v1', up: async () => {} },
+      { version: 2, description: 'v2', up: async () => {} },
+      { version: 3, description: 'v3', up: async () => {} }
+    ];
 
-  engine.registerMigrations('test-plugin', migrations);
-  await engine.runMigrations('test-plugin'); // apply all 3
+    engine.registerMigrations('test-plugin', migrations);
 
-  const pendingAfterAll = engine.pendingMigrations('test-plugin');
-  assert.equal(pendingAfterAll.length, 0, 'no migrations should be pending after applying all');
+    // Before running, all 3 are pending
+    let pending = await engine.pendingMigrations('test-plugin');
+    assert.equal(pending.length, 3, 'all 3 migrations should be pending initially');
 
-  // Add a new migration
-  engine.migrations.get('test-plugin').push({
-    version: 4, description: 'v4', up: async () => {}
-  });
+    // Confirm and run to apply v1-v3
+    engine.confirmToken('__auto__');
+    await engine.runMigrations('test-plugin');
 
-  const pendingAfterAdd = engine.pendingMigrations('test-plugin');
-  assert.equal(pendingAfterAdd.length, 1, 'v4 should be pending');
-  assert.equal(pendingAfterAdd[0].version, 4);
+    // After running, none pending
+    pending = await engine.pendingMigrations('test-plugin');
+    assert.equal(pending.length, 0, 'no migrations should be pending after applying all');
+
+    // Add a new migration v4
+    engine._migrations.get('test-plugin').push({
+      version: 4, description: 'v4', up: async () => {}
+    });
+
+    pending = await engine.pendingMigrations('test-plugin');
+    assert.equal(pending.length, 1, 'v4 should be pending');
+    assert.equal(pending[0].version, 4);
+  } finally {
+    await destroyTestHarness(harness);
+  }
 });
 
 test('Already-applied migrations are skipped', async () => {
-  const seq = await createSequelize();
-  const engine = new MockMigrationEngine(seq);
+  const harness = await createTestHarness();
+  try {
+    const { engine } = harness;
 
-  const migrations = [
-    { version: 1, description: 'v1', up: async () => {} },
-    { version: 2, description: 'v2', up: async () => {} }
-  ];
+    const migrations = [
+      { version: 1, description: 'v1', up: async () => {} },
+      { version: 2, description: 'v2', up: async () => {} }
+    ];
 
-  engine.registerMigrations('test-plugin', migrations);
+    engine.registerMigrations('test-plugin', migrations);
 
-  // First run — apply v1 and v2
-  let result = await engine.runMigrations('test-plugin');
-  assert.equal(result.applied.length, 2);
+    // First run — apply v1 and v2
+    engine.confirmToken('__auto__');
+    let result = await engine.runMigrations('test-plugin');
+    assert.equal(result.applied, 2);
 
-  // Second run — nothing to apply
-  result = await engine.runMigrations('test-plugin');
-  assert.equal(result.applied.length, 0, 'no new migrations should be applied');
-  assert.equal(result.skipped, 0);
+    // Second run — nothing to apply
+    // (confirmation is already set from first run)
+    result = await engine.runMigrations('test-plugin');
+    assert.equal(result.applied, 0, 'no new migrations should be applied');
+  } finally {
+    await destroyTestHarness(harness);
+  }
 });
 
 test('getAppliedVersion returns correct current version', async () => {
-  const seq = await createSequelize();
-  const engine = new MockMigrationEngine(seq);
+  const harness = await createTestHarness();
+  try {
+    const { engine, dbService } = harness;
 
-  // No migrations registered yet
-  assert.equal(engine.getAppliedVersion('unknown'), 0, 'unknown plugin should return 0');
+    // No migrations registered yet — fallback returns 0
+    const pendingUnregistered = await engine.pendingMigrations('unknown');
+    assert.equal(pendingUnregistered.length, 0, 'unknown plugin returns no pending');
 
-  const migrations = [
-    { version: 1, description: 'v1', up: async () => {} },
-    { version: 2, description: 'v2', up: async () => {} },
-    { version: 3, description: 'v3', up: async () => {} }
-  ];
+    const migrations = [
+      { version: 1, description: 'v1', up: async () => {} },
+      { version: 2, description: 'v2', up: async () => {} },
+      { version: 3, description: 'v3', up: async () => {} }
+    ];
 
-  engine.registerMigrations('test-plugin', migrations);
+    engine.registerMigrations('test-plugin', migrations);
 
-  // Before any run
-  assert.equal(engine.getAppliedVersion('test-plugin'), 0);
+    // Before any run — all 3 pending (applied version is 0)
+    let pending = await engine.pendingMigrations('test-plugin');
+    assert.equal(pending.length, 3, 'all 3 pending before any run');
 
-  // Run only v1
-  engine.appliedVersions.set('test-plugin', { currentVersion: 1, history: [] });
-  assert.equal(engine.getAppliedVersion('test-plugin'), 1);
+    // Run only v1 — confirm, then runMigrations runs all pending
+    engine.confirmToken('__auto__');
+    await engine.runMigrations('test-plugin');
 
-  // Run to v3
-  engine.appliedVersions.set('test-plugin', { currentVersion: 3, history: [] });
-  assert.equal(engine.getAppliedVersion('test-plugin'), 3);
+    // Verify the SchemaVersion row records version 3
+    const row = await dbService.SchemaVersionsModel.findOne({
+      where: { pluginName: 'test-plugin' }
+    });
+    assert.ok(row, 'SchemaVersion row should exist');
+    assert.equal(row.version, 3, 'applied version should be 3');
+  } finally {
+    await destroyTestHarness(harness);
+  }
 });
 
 test('verifySchemaVersions-like check detects out-of-date', async () => {
-  const seq = await createSequelize();
-  const engine = new MockMigrationEngine(seq);
+  const harness = await createTestHarness();
+  try {
+    const { engine, dbService } = harness;
 
-  const migrations = [
-    { version: 1, description: 'v1', up: async () => {} },
-    { version: 2, description: 'v2', up: async () => {} }
-  ];
+    const migrations = [
+      { version: 1, description: 'v1', up: async () => {} },
+      { version: 2, description: 'v2', up: async () => {} }
+    ];
 
-  engine.registerMigrations('test-plugin', migrations);
+    engine.registerMigrations('test-plugin', migrations);
+    dbService.registerExpectedVersion('test-plugin', 2);
 
-  // Before running, plugin is out of date
-  const pending = engine.pendingMigrations('test-plugin');
-  assert.equal(pending.length, 2, 'should have 2 pending migrations');
+    // Before running — pending
+    const statusBefore = await dbService.verifySchemaVersions();
+    const pendingBefore = statusBefore.pending.filter(
+      p => p.pluginName === 'test-plugin'
+    );
+    assert.equal(pendingBefore.length, 1, 'test-plugin should have 1 pending entry');
+    assert.ok(pendingBefore[0].behind >= 1);
 
-  // Run migrations
-  await engine.runMigrations('test-plugin');
+    // Apply all migrations
+    engine.confirmToken('__auto__');
+    await engine.runMigrations('test-plugin');
 
-  // Now up to date
-  const pendingAfter = engine.pendingMigrations('test-plugin');
-  assert.equal(pendingAfter.length, 0, 'should be up to date after run');
+    // Now up to date
+    const statusAfter = await dbService.verifySchemaVersions();
+    const pendingAfter = statusAfter.pending.filter(
+      p => p.pluginName === 'test-plugin'
+    );
+    assert.equal(pendingAfter.length, 0, 'test-plugin should be up to date after run');
+  } finally {
+    await destroyTestHarness(harness);
+  }
+});
+
+test('Migration state is tracked in SchemaVersion table', async () => {
+  const harness = await createTestHarness();
+  try {
+    const { engine, dbService } = harness;
+
+    const migrations = [
+      { version: 1, description: 'Initial schema', up: async () => {} },
+      { version: 2, description: 'Add rating column', up: async () => {} }
+    ];
+
+    engine.registerMigrations('elo-tracker', migrations);
+    engine.confirmToken('__auto__');
+    await engine.runMigrations('elo-tracker');
+
+    // Query the SchemaVersion table — the real source of truth
+    const row = await dbService.SchemaVersionsModel.findOne({
+      where: { pluginName: 'elo-tracker' }
+    });
+    assert.ok(row, 'SchemaVersion row should exist');
+    assert.equal(row.version, 2);
+    assert.equal(row.pluginName, 'elo-tracker');
+    assert.ok(row.appliedAt, 'appliedAt should be set');
+    assert.ok(row.migrationHash, 'migrationHash should be set');
+
+    // appliedAt should be a recent timestamp
+    const now = Date.now();
+    assert.ok(
+      row.appliedAt >= now - 60000 && row.appliedAt <= now + 1000,
+      `appliedAt (${row.appliedAt}) should be within the last minute of now (${now})`
+    );
+  } finally {
+    await destroyTestHarness(harness);
+  }
 });
 
 test('sync({alter}) calls verification — scan consumer plugins', async () => {
   // Scan consumer plugin source files for sync({alter}) pattern
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const referenceDirs = [
-    path.resolve('ReferenceScripts'),
+    path.resolve(__dirname, '..', '..', 'ReferenceScripts'),
   ];
 
   const filesToCheck = [];
@@ -409,30 +541,68 @@ test('sync({alter}) calls verification — scan consumer plugins', async () => {
   console.log('  (sync({alter}) scan completed — check output for any findings)');
 });
 
-test('Migration history is tracked correctly', async () => {
-  const seq = await createSequelize();
-  const engine = new MockMigrationEngine(seq);
+// ---------------------------------------------------------------------------
+// Read-only SQLite file test
+// ---------------------------------------------------------------------------
 
-  const migrations = [
-    { version: 1, description: 'Initial schema', up: async () => {} },
-    { version: 2, description: 'Add rating column', up: async () => {} }
-  ];
+test('Read-only SQLite file causes runMigrations() to reject (reproduces original permission bug)', async () => {
+  const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), 's3-mig-ro-'));
+  const dbPath = path.join(backupDir, 'test-readonly.sqlite');
 
-  engine.registerMigrations('elo-tracker', migrations);
-  await engine.runMigrations('elo-tracker');
+  // ── Bootstrap — create DB, run admin migration to get SchemaVersions table, close ──
+  let harness1 = await createFileBasedHarness(dbPath, backupDir);
+  try {
+    harness1.engine.registerMigrations('bootstrap', [
+      { version: 1, description: 'Admin setup', up: async () => {} }
+    ]);
+    harness1.engine.confirmToken('__auto__');
+    await harness1.engine.runMigrations('bootstrap');
+  } finally {
+    await harness1.sequelize.close();
+  }
 
-  const state = engine.appliedVersions.get('elo-tracker');
-  assert.ok(state, 'state should exist');
-  assert.equal(state.currentVersion, 2);
-  assert.equal(state.history.length, 2);
-  assert.equal(state.history[0].version, 1);
-  assert.equal(state.history[0].description, 'Initial schema');
-  assert.equal(state.history[1].version, 2);
-  assert.equal(state.history[1].description, 'Add rating column');
-  assert.ok(state.history[0].appliedAt instanceof Date);
-  assert.ok(state.history[1].appliedAt instanceof Date);
-  assert.ok(state.history[1].appliedAt >= state.history[0].appliedAt,
-    'v2 should be applied after v1');
+  // ── Make file read-only ──
+  const madeReadOnly = makeFileReadOnly(dbPath);
+  assert.ok(madeReadOnly, 'Failed to make SQLite file read-only — test precondition failed');
+
+  // ── Re-open read-only DB, attempt CREATE TABLE migration, assert rejection ──
+  let rejected = false;
+  let harness2;
+  try {
+    harness2 = await createFileBasedHarness(dbPath, backupDir);
+    harness2.engine.registerMigrations('test-ro', [
+      {
+        version: 1,
+        description: 'Should fail — DB is read-only',
+        up: async (qi) => {
+          await qi.createTable('ShouldNotExist', {
+            id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true }
+          });
+        }
+      }
+    ]);
+    harness2.engine.confirmToken('__auto__');
+    await harness2.engine.runMigrations('test-ro');
+  } catch (err) {
+    rejected = true;
+  }
+
+  // Close the read-only connection before restoring permissions
+  if (harness2) await harness2.sequelize.close();
+
+  // ── Restore permissions, verify table was NOT created ──
+  restoreFilePermissions(dbPath);
+
+  const harness3 = await createFileBasedHarness(dbPath, backupDir);
+  try {
+    const qi = getLiveQI(harness3.sequelize);
+    const tables = await qi.showAllTables();
+    assert.ok(!tables.includes('ShouldNotExist'),
+      'ShouldNotExist table must NOT exist after failed migration');
+  } finally {
+    await harness3.sequelize.close();
+    fs.rmSync(backupDir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

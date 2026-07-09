@@ -68,6 +68,7 @@ class S3PluginBaseDbStub {
     }
     const recheck = await this._s3db.verifySchemaVersions();
     if (!recheck.upToDate) {
+      this._s3db.migrationEngine.confirmToken('__auto__');
       const result = await this._s3db.migrationEngine.runMigrations(pluginName);
       return result;
     }

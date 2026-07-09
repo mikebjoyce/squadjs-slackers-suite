@@ -60,8 +60,11 @@
  *   JSONL and DB logging for S³ player/game state events.
  * registerS3DiscordCommands (../utils/s3-discord.js)
  *   Discord !s3 admin command registration and dispatch.
- * setupMigrationPrompt (../utils/s3-migration-discord.js)
- *   Discord prompt for pending schema migrations if autoMigrate is false.
+ *
+ * buildMigrationEmbed (../utils/s3-migration-discord.js)
+ *   Discord embed builder for migration status display. The confirmation
+ *   flow uses a token-based system (!s3 confirm <token>) handled by
+ *   migration-engine.js (confirmToken gate) and s3-commands.js.
  *
  * ─── S³ INTEGRATION ──────────────────────────────────────────────
  *
@@ -142,8 +145,9 @@ import DBService from '../utils/db-service.js';
 import PlayersService from '../utils/players-service.js';
 import ServerConfigService from '../utils/server-config-service.js';
 import LoggingService from '../utils/logging-service.js';
+import crypto from 'node:crypto';
 import { registerS3DiscordCommands } from '../utils/s3-discord.js';
-import { setupMigrationPrompt } from '../utils/s3-migration-discord.js';
+import { buildMigrationEmbed } from '../utils/s3-migration-discord.js';
 export default class SlackersSquadServices extends BasePlugin {
   static get description() {
     return "Shared Slacker's Squad Services plugin wiring gameState, factions, clans, db, and players modules.";
@@ -267,6 +271,7 @@ export default class SlackersSquadServices extends BasePlugin {
 
     this._s3DiscordCleanup = null;
     this._migrationDiscordCleanup = null;
+    this._migrationPromptTimer = null; // Delay timer used by _scheduleMigrationPrompt()
 
     // Deferred ready promise — consumer plugins await this._s3.ready() to ensure
     // all services, Discord registration, and migration check have completed.
@@ -402,7 +407,7 @@ export default class SlackersSquadServices extends BasePlugin {
     this._s3DiscordCleanup = registerS3DiscordCommands(this);
 
     // Check for pending migrations and prompt via Discord if any
-    this._checkAndPromptMigrations();
+    this._scheduleMigrationPrompt();
 
     this.verbose(1, 'Mounted SlackerSquadServices with gameState, factions, clans, db, players, serverConfig, and logging services.');
 
@@ -411,6 +416,12 @@ export default class SlackersSquadServices extends BasePlugin {
   }
 
   async unmount() {
+    // Clean up migration prompt debounce timer
+    if (this._migrationPromptTimer) {
+      clearTimeout(this._migrationPromptTimer);
+      this._migrationPromptTimer = null;
+    }
+
     // Clean up migration Discord prompt
     if (this._migrationDiscordCleanup) {
       this._migrationDiscordCleanup();
@@ -551,23 +562,47 @@ export default class SlackersSquadServices extends BasePlugin {
       return;
     }
 
-    const pending = db.getPendingMigrations();
+    // Use fresh verifySchemaVersions() instead of cached getPendingMigrations()
+    // so the check reflects all plugins that have registered since mount.
+    const status = await db.verifySchemaVersions();
+    const pending = status.pending;
+
+    // Refresh the cached pending list and create the migration gate so that
+    // getPendingMigrations() and waitForMigrations() return correct data
+    // for any consumer that calls them after this point.
+    db._pendingMigrations = pending;
+    if (pending.length > 0 && !db._migrationGate) {
+      db._migrationGate = new Promise((resolve) => {
+        db._resolveMigrationGateFn = resolve;
+      });
+    }
+
     if (!pending || pending.length === 0) {
       this.verbose(3, '[S3 Migration] No pending migrations.');
+      return;
+    }
+
+    // Idempotency guard: if a valid unexpired token already exists, prompt was already posted
+    const me = db.migrationEngine;
+    if (me && me._confirmToken && me._tokenExpiresAt && Date.now() < me._tokenExpiresAt) {
+      this.verbose(3, '[S3 Migration] Prompt already posted — skipping duplicate.');
       return;
     }
 
     // autoMigrate: skip Discord prompt, run directly
     if (this.options.autoMigrate) {
       this.verbose(1, `[S3 Migration] autoMigrate is enabled — running ${pending.length} pending migration(s) directly.`);
+      const me = db.migrationEngine;
+      if (me) {
+        me.confirmToken('__auto__');
+      }
       for (const p of pending) {
         try {
-          const me = db.migrationEngine;
           if (!me) {
             this.verbose(1, `[S3 Migration] MigrationEngine not available — cannot migrate "${p.pluginName}".`);
             continue;
           }
-          const result = await me.runMigrations(p.pluginName, { force: false });
+          const result = await me.runMigrations(p.pluginName);
           this.verbose(2, `[S3 Migration] "${p.pluginName}": ${result.applied} applied, ${result.skipped} skipped.`);
         } catch (err) {
           this.verbose(1, `[S3 Migration] Auto-migration failed for "${p.pluginName}": ${err.message}`);
@@ -577,11 +612,81 @@ export default class SlackersSquadServices extends BasePlugin {
       return;
     }
 
-    this.verbose(2, `[S3 Migration] ${pending.length} plugin(s) have pending schema migrations. Prompting via Discord...`);
+    // Generate a confirmation token and post embed to Discord admin channel.
+    // The admin types `!s3 confirm <token>` to authorize migrations.
+    const token = crypto.randomBytes(4).toString('hex'); // e.g. "a3f9c2"
 
-    // Fire and forget — the Discord prompt runs async; S³ doesn't block on it
-    setupMigrationPrompt(this, pending).catch((err) => {
-      this.verbose(1, `[S3 Migration] Discord prompt failed: ${err.message}`);
-    });
+    // Store token on the engine with 5-minute expiry
+    if (me) {
+      me._confirmToken = token;
+      me._tokenExpiresAt = Date.now() + 5 * 60 * 1000;
+    }
+
+    // Build token embed using the existing buildMigrationEmbed helper.
+    // The embed already includes generic instructions from buildMigrationEmbed().
+    // Append the token-specific line so the admin knows which token to use.
+    const embed = buildMigrationEmbed(pending, 'pending', null);
+    embed.description += `\nToken: \`${token}\``;
+
+    this.verbose(1, `[S3 Migration] ${pending.length} plugin(s) have pending schema migrations. Generated token: ${token}`);
+
+    // Post embed to the admin Discord channel
+    const discordClient = this.options.discordClient;
+    const channelID = this.options.channelID;
+    if (discordClient && channelID) {
+      try {
+        const channel = await discordClient.channels.fetch(channelID);
+        if (channel) {
+          await channel.send({ embeds: [embed] });
+          this.verbose(1, `[S3 Migration] Token embed posted to Discord — ${pending.length} plugin(s) pending.`);
+        }
+      } catch (err) {
+        this.verbose(1, `[S3 Migration] Failed to post token embed: ${err.message}`);
+        this.verbose(1, `[S3 Migration] Use !s3 migrate force or set autoMigrate: true in S³ config to run migrations.`);
+      }
+    } else {
+      this.verbose(1, `[S3 Migration] Cannot prompt — Discord not configured. ${pending.length} plugin(s) pending. Use !s3 migrate force or autoMigrate: true.`);
+    }
+
+    // Set 5-minute auto-expiry timeout
+    if (me) {
+      setTimeout(() => {
+        if (me._confirmToken === token && !me._confirmed) {
+          me._confirmToken = null;
+          me._tokenExpiresAt = null;
+          this.verbose(1, '[S3 Migration] Token expired — migrations not confirmed. Restart S³ or use !s3 migrate force to regenerate.');
+        }
+      }, 5 * 60 * 1000);
+    }
+  }
+
+  /**
+   * Debounced migration prompt scheduler. Called by consumer plugins via
+   * verifyAndRunMigrations() when they detect pending-but-unconfirmed
+   * migrations. Multiple plugins may call this in rapid succession during
+   * initialisation — the 500ms debounce ensures only one Discord embed is
+   * posted after all plugins have registered their expected versions.
+   *
+   * Idempotency guard: if a valid unexpired token already exists on the
+   * MigrationEngine, the prompt was already posted and this is a no-op.
+   */
+  _scheduleMigrationPrompt() {
+    // Idempotency: if a valid token already exists, prompt was already posted
+    const me = this.services.db?.migrationEngine;
+    if (me && me._confirmToken && me._tokenExpiresAt && Date.now() < me._tokenExpiresAt) {
+      this.verbose(3, '[S3 Migration] Prompt already active — skipping duplicate schedule.');
+      return;
+    }
+
+    // Clear any existing debounce timer
+    if (this._migrationPromptTimer) {
+      clearTimeout(this._migrationPromptTimer);
+    }
+
+    // Debounce: wait 500ms for all consumer plugins to register, then fire
+    this._migrationPromptTimer = setTimeout(() => {
+      this._migrationPromptTimer = null;
+      this._checkAndPromptMigrations();
+    }, 500);
   }
 }

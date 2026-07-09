@@ -32,7 +32,7 @@
  * The old two-command test surface (!s3 test preflight + !s3 test smoke)
  * was replaced by a single consolidated !s3 diag command.
  *
- * The !s3 events command was removed in Stage 8.11 — it only captured
+ * The !s3 events command was removed — it only captured
  * event names and data key names, not actionable internal state.
  *
  * ─── EMOJI SEMANTICS ─────────────────────────────────────────────
@@ -305,7 +305,29 @@ export function buildServicesEmbed(plugin) {
   } else {
     const connector = db.getConnectorName?.() ?? '?';
     const hasPending = (db.getPendingMigrations?.()?.length ?? 0) > 0;
-    const connectorStr = connector === 'none' ? '⚫ No connector' : `🟢 ${connector}`;
+    let connectorStr;
+    if (connector === 'none') {
+      connectorStr = '⚫ No connector';
+    } else {
+      // Check schema drift status
+      const drift = db.getLastDriftResult?.();
+      if (drift == null) {
+        connectorStr = `🟢 ${connector}`; // no check run yet — assume OK
+      } else if (drift.length === 0) {
+        connectorStr = `🟢 ${connector} — No schema drift`;
+      } else if (drift.some(e => e.error)) {
+        connectorStr = `🔴 ${connector} — Cannot verify schema`;
+      } else {
+        // Drift detected — summarise
+        const tableCount = drift.length;
+        const missingCols = drift.filter(e => e.missing).length;
+        const extraCols = drift.filter(e => e.extra).length;
+        const parts = [];
+        if (missingCols > 0) parts.push(`${missingCols} table(s) missing columns`);
+        if (extraCols > 0) parts.push(`${extraCols} table(s) with extra columns`);
+        connectorStr = `🟠 ${connector} — Schema drift: ${parts.join(', ')}`;
+      }
+    }
     entries.push(`🟢 **DB** — ${connectorStr}`);
     entries.push(`   Migrations: ${hasPending ? '🟠 Pending' : '🟢 All current'}`);
     const versionCount = (db._expectedVersions?.size ?? 0);
@@ -723,7 +745,11 @@ export function buildHelpEmbed() {
         value: [
           '`!s3 migrate pending` — Show pending schema migrations',
           '`!s3 migrate status` — Show schema version status per plugin',
+          '`!s3 confirm <token>` — Confirm and run pending migrations from startup prompt',
           '`!s3 migrate force [--dry-run]` — Run pending migrations',
+          '`!s3 migrate preview` — Preview pending migration descriptions/touches',
+          '`!s3 migrate verify` — Run on-demand schema drift check',
+          '`!s3 migrate purge-deprecated` — Clean up deprecated tables/columns',
           '`!s3 backup create` — Create a backup now (JSON, connector-agnostic)',
           '`!s3 backup list` — List backups (SQLite + JSON)',
           '`!s3 backup restore <filename>` — Restore from file backup (auto-detects format)'
@@ -792,6 +818,31 @@ export async function runDiagnostic(plugin, message, sendDiscordMessage) {
       results.push({ label: `${label} mounted`, emoji: '⚪', detail: 'Mounted but disabled in config' });
     } else {
       results.push({ label: `${label} mounted`, emoji, detail });
+    }
+
+    // DB-specific: add schema drift diagnostic line
+    if (label === 'db' && mounted) {
+      const drift = svc.getLastDriftResult?.();
+      if (drift !== null && drift !== undefined) {
+        if (drift.length === 0) {
+          results.push({ label: 'DB schema drift', emoji: '🟢', detail: 'No drift detected' });
+        } else if (drift.some(e => e.error)) {
+          results.push({ label: 'DB schema drift', emoji: '🔴', detail: 'Cannot verify — describeTable failed' });
+        } else {
+          const issueCount = drift.length;
+          const missingCount = drift.filter(e => e.missing).length;
+          const extraCount = drift.filter(e => e.extra).length;
+          let detail;
+          if (missingCount > 0 && extraCount > 0) {
+            detail = `${issueCount} table(s) with drift (${missingCount} missing cols, ${extraCount} extra cols)`;
+          } else if (missingCount > 0) {
+            detail = `${issueCount} table(s) with missing columns`;
+          } else {
+            detail = `${issueCount} table(s) with extra columns`;
+          }
+          results.push({ label: 'DB schema drift', emoji: '🟠', detail });
+        }
+      }
     }
   }
 
@@ -977,7 +1028,9 @@ export function createCommandHandlers(context) {
     const migrateSub = args[1]?.toLowerCase();
 
     if (migrateSub === 'pending') {
-      const pending = plugin.services.db?.getPendingMigrations() ?? null;
+      const db = plugin.services.db;
+      const vs = db ? await db.verifySchemaVersions() : null;
+      const pending = vs?.pending ?? null;
       if (!pending || pending.length === 0) {
         await sendDiscordMessage(message.channel, {
           embeds: [{ color: 0x2ecc71, title: '✅ No Pending Migrations', description: 'All plugin schema versions are up to date.', timestamp: new Date().toISOString() }]
@@ -1024,7 +1077,8 @@ export function createCommandHandlers(context) {
     if (migrateSub === 'force') {
       const db = plugin.services.db;
       const me = db?.migrationEngine;
-      const pending = db?.getPendingMigrations() ?? null;
+      const vs = db ? await db.verifySchemaVersions() : null;
+      const pending = vs?.pending ?? null;
 
       if (!pending || pending.length === 0) {
         await sendDiscordMessage(message.channel, {
@@ -1044,6 +1098,10 @@ export function createCommandHandlers(context) {
       const runningEmbed = buildMigrationEmbed(pending, 'running');
       await sendDiscordMessage(message.channel, { embeds: [runningEmbed] }, 'S3', (...a) => plugin.verbose(...a));
 
+      // '__force__' satisfies the engine's confirmation gate — the admin
+      // explicitly typing !s3 migrate force IS the confirmation.
+      me.confirmToken('__force__');
+
       let totalApplied = 0;
       let totalSkipped = 0;
       let hadError = false;
@@ -1051,7 +1109,7 @@ export function createCommandHandlers(context) {
 
       for (const p of pending) {
         try {
-          const result = await me.runMigrations(p.pluginName, { force: true, dryRun: isDryRun });
+          const result = await me.runMigrations(p.pluginName, { dryRun: isDryRun });
           totalApplied += result.applied || 0;
           totalSkipped += result.skipped || 0;
         } catch (err) {
@@ -1062,12 +1120,53 @@ export function createCommandHandlers(context) {
       }
 
       if (isDryRun) {
+        // Build enriched dry-run output from registered migration metadata
+        const lines = [];
+        for (const p of pending) {
+          const registered = me._migrations.get(p.pluginName);
+          if (!registered || registered.length === 0) continue;
+
+          const pendingMigrations = registered.filter((m) => m.version > p.currentVersion);
+          if (pendingMigrations.length === 0) continue;
+
+          lines.push(`**${p.pluginName}** (v${p.currentVersion} → v${p.expectedVersion}):`);
+          for (const m of pendingMigrations) {
+            const desc = m.description || '(no description)';
+            lines.push(`  **v${m.version}** — ${desc}`);
+
+            if (m.touches) {
+              if (m.touches.creates && m.touches.creates.length > 0) {
+                for (const tableName of m.touches.creates) {
+                  lines.push(`    ↳ Creates table: \`${tableName}\``);
+                  if (m.touches.columns?.[tableName]) {
+                    lines.push(`    ↳ Columns: ${m.touches.columns[tableName].map((c) => `\`${c}\``).join(', ')}`);
+                  }
+                }
+              }
+              if (m.touches.columns) {
+                for (const [tableName, cols] of Object.entries(m.touches.columns)) {
+                  if (!m.touches.creates || !m.touches.creates.includes(tableName)) {
+                    lines.push(`    ↳ Columns (\`${tableName}\`): ${cols.map((c) => `\`${c}\``).join(', ')}`);
+                  }
+                }
+              }
+            }
+          }
+          lines.push(''); // blank line between plugin sections
+        }
+
+        if (lines.length === 0) {
+          await sendDiscordMessage(message.channel, {
+            embeds: [{ color: 0xf39c12, title: '📋 Dry Run Complete', description: 'No preview data available — pending migrations exist but lack description/touches metadata.', timestamp: new Date().toISOString() }]
+          }, 'S3', (...a) => plugin.verbose(...a));
+          return;
+        }
+
         await sendDiscordMessage(message.channel, {
-          embeds: [{ color: 0x3498db, title: '📋 Dry Run Complete', description: `${totalSkipped} migration(s) would be applied. Run without --dry-run to execute.`, timestamp: new Date().toISOString() }]
+          embeds: [{ color: 0x3498db, title: '📋 Dry Run Complete', description: lines.join('\n') + `\nRun without \`--dry-run\` to execute ${totalSkipped} migration(s).`, timestamp: new Date().toISOString() }]
         }, 'S3', (...a) => plugin.verbose(...a));
         return;
       }
-
       db._resolveMigrationGate(!hadError);
 
       if (hadError) {
@@ -1080,7 +1179,375 @@ export function createCommandHandlers(context) {
       return;
     }
 
-    await message.reply('Usage: `!s3 migrate <pending|status|force [--dry-run]>`');
+    // ═══════════════════════════════════════════════════════════════
+    // preview — Show pending migration descriptions and touches
+    // ═══════════════════════════════════════════════════════════════
+    if (migrateSub === 'preview') {
+      const db = plugin.services.db;
+      const me = db?.migrationEngine;
+      const vs = db ? await db.verifySchemaVersions() : null;
+      const pending = vs?.pending ?? null;
+
+      if (!db || !me) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xe74c3c, title: '❌ DB Service Not Available', description: 'The database service has not been initialised.', timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      if (!pending || pending.length === 0) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0x2ecc71, title: '✅ No Pending Migrations', description: 'All plugin schema versions are up to date.', timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      // Build preview lines from registered migration metadata (description + touches)
+      const lines = [];
+      for (const p of pending) {
+        const registered = me._migrations.get(p.pluginName);
+        if (!registered || registered.length === 0) continue;
+
+        const pendingMigrations = registered.filter((m) => m.version > p.currentVersion);
+        if (pendingMigrations.length === 0) continue;
+
+        lines.push(`**${p.pluginName}** (v${p.currentVersion} → v${p.expectedVersion}):`);
+        for (const m of pendingMigrations) {
+          const desc = m.description || '(no description)';
+          lines.push(`  **v${m.version}** — ${desc}`);
+
+          if (m.touches) {
+            if (m.touches.creates && m.touches.creates.length > 0) {
+              for (const tableName of m.touches.creates) {
+                lines.push(`    ↳ Creates table: \`${tableName}\``);
+                if (m.touches.columns?.[tableName]) {
+                  lines.push(`    ↳ Columns: ${m.touches.columns[tableName].map((c) => `\`${c}\``).join(', ')}`);
+                }
+              }
+            }
+            if (m.touches.columns) {
+              for (const [tableName, cols] of Object.entries(m.touches.columns)) {
+                if (!m.touches.creates || !m.touches.creates.includes(tableName)) {
+                  lines.push(`    ↳ Columns (\`${tableName}\`): ${cols.map((c) => `\`${c}\``).join(', ')}`);
+                }
+              }
+            }
+          }
+        }
+        lines.push(''); // blank line between plugin sections
+      }
+
+      if (lines.length === 0) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xf39c12, title: '📋 Migration Preview', description: 'No preview data available — pending migrations exist but lack description/touches metadata.', timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      await sendDiscordMessage(message.channel, {
+        embeds: [{
+          color: 0x3498db,
+          title: '📋 Migration Preview',
+          description: lines.join('\n').trimEnd(),
+          timestamp: new Date().toISOString()
+        }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+      return;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // verify — On-demand schema drift check
+    // ═══════════════════════════════════════════════════════════════
+    if (migrateSub === 'verify') {
+      const db = plugin.services.db;
+
+      if (!db || !db._isMounted) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xe74c3c, title: '❌ DB Service Not Available', description: 'The database service has not been initialised.', timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      const drift = await db.verifyLiveSchema();
+
+      if (!drift || drift.length === 0) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0x2ecc71, title: '🟢 Schema Verification — No Drift Detected', description: 'All registered models match the live database schema.', timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      // Categorise drift entries
+      const errors = drift.filter(d => d.error);
+      const missing = drift.filter(d => d.missing && d.missing.length > 0);
+      const extra = drift.filter(d => d.extra && d.extra.length > 0);
+
+      const lines = [];
+
+      if (errors.length > 0) {
+        lines.push('**❌ Errors**');
+        for (const e of errors) {
+          lines.push(`  • \`${e.table || e.model}\`: ${e.error}`);
+        }
+        lines.push('');
+      }
+
+      if (missing.length > 0) {
+        lines.push('**🗑️ Missing Columns**');
+        for (const m of missing) {
+          lines.push(`  • \`${m.table}\`: ${m.missing.map(c => `\`${c}\``).join(', ')}`);
+        }
+        lines.push('');
+      }
+
+      if (extra.length > 0) {
+        lines.push('**📦 Extra Columns**');
+        for (const x of extra) {
+          lines.push(`  • \`${x.table}\`: ${x.extra.map(c => `\`${c}\``).join(', ')}`);
+        }
+        lines.push('');
+      }
+
+      // Severity: red if errors or missing, orange if extra-only
+      const hasCritical = errors.length > 0 || missing.length > 0;
+      const color = hasCritical ? 0xe74c3c : 0xf39c12;
+
+      await sendDiscordMessage(message.channel, {
+        embeds: [{
+          color,
+          title: '🔍 Schema Verification — Drift Detected',
+          description: lines.join('\n').trimEnd(),
+          timestamp: new Date().toISOString()
+        }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+      return;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // purge-deprecated — Scan for and optionally drop _deprecated_* tables/columns
+    // ═══════════════════════════════════════════════════════════════
+    if (migrateSub === 'purge-deprecated') {
+      const db = plugin.services.db;
+      if (!db || !db._isMounted) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xe74c3c, title: '❌ DB Service Not Available', description: 'The database service has not been initialised.', timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      const isConfirm = args.includes('--confirm');
+      const qi = db.sequelize.getQueryInterface();
+      const deprecatedPattern = /_deprecated_\d{13}$/;
+
+      // ── Scan for deprecated tables ──────────────────────────────
+      let allTables;
+      try {
+        allTables = await qi.showAllTables();
+      } catch (err) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xe74c3c, title: '❌ Scan Failed', description: `Could not list tables: ${err.message}`, timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      const deprecatedTables = allTables.filter(t => deprecatedPattern.test(t));
+
+      // ── Scan for deprecated columns on non-deprecated tables ────
+      /** @type {Array<{table: string, column: string}>} */
+      const deprecatedColumns = [];
+      const nonDeprecatedTables = allTables.filter(t => !deprecatedPattern.test(t));
+
+      for (const tableName of nonDeprecatedTables) {
+        let info;
+        try {
+          info = await qi.describeTable(tableName);
+        } catch {
+          continue; // skip tables we can't describe (e.g. system tables)
+        }
+        for (const colName of Object.keys(info)) {
+          if (deprecatedPattern.test(colName)) {
+            deprecatedColumns.push({ table: tableName, column: colName });
+          }
+        }
+      }
+
+      const totalDeprecated = deprecatedTables.length + deprecatedColumns.length;
+
+      // ── No deprecated objects ───────────────────────────────────
+      if (totalDeprecated === 0) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0x2ecc71, title: '🧹 No Deprecated Objects', description: 'No deprecated tables or columns found.', timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      // ── Report mode (no --confirm) ──────────────────────────────
+      if (!isConfirm) {
+        const lines = [];
+
+        if (deprecatedTables.length > 0) {
+          lines.push(`**📦 Deprecated Tables (${deprecatedTables.length})**`);
+          for (const t of deprecatedTables) {
+            lines.push(`  • \`${t}\``);
+          }
+          lines.push('');
+        }
+
+        if (deprecatedColumns.length > 0) {
+          lines.push(`**📦 Deprecated Columns (${deprecatedColumns.length})**`);
+          for (const { table, column } of deprecatedColumns) {
+            lines.push(`  • \`${table}\`.\`${column}\``);
+          }
+          lines.push('');
+        }
+
+        lines.push(`Type \`!s3 migrate purge-deprecated --confirm\` to permanently delete ${totalDeprecated} deprecated object(s).`);
+
+        await sendDiscordMessage(message.channel, {
+          embeds: [{
+            color: 0x3498db,
+            title: `🧹 Deprecated Objects Found (${totalDeprecated})`,
+            description: lines.join('\n'),
+            timestamp: new Date().toISOString()
+          }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      // ── Purge mode (--confirm) ──────────────────────────────────
+      let purgedTables = 0;
+      let purgedColumns = 0;
+      const errors = [];
+
+      for (const tableName of deprecatedTables) {
+        try {
+          await qi.dropTable(tableName);
+          purgedTables++;
+        } catch (err) {
+          errors.push(`Table \`${tableName}\`: ${err.message}`);
+        }
+      }
+
+      for (const { table, column } of deprecatedColumns) {
+        try {
+          await qi.removeColumn(table, column);
+          purgedColumns++;
+        } catch (err) {
+          errors.push(`Column \`${table}\`.\`${column}\`: ${err.message}`);
+        }
+      }
+
+      const totalPurged = purgedTables + purgedColumns;
+      const lines = [];
+      if (purgedTables > 0) lines.push(`Dropped ${purgedTables} deprecated table(s).`);
+      if (purgedColumns > 0) lines.push(`Dropped ${purgedColumns} deprecated column(s).`);
+      if (errors.length > 0) {
+        lines.push('');
+        lines.push(`**⚠️ Errors (${errors.length})**`);
+        for (const e of errors) lines.push(`  • ${e}`);
+      }
+
+      const color = errors.length > 0 ? 0xf39c12 : 0x2ecc71;
+      const title = errors.length > 0
+        ? `🧹 Purge Complete — ${totalPurged} purged, ${errors.length} error(s)`
+        : `🧹 Purge Complete — ${totalPurged} object(s) purged`;
+
+      await sendDiscordMessage(message.channel, {
+        embeds: [{ color, title, description: lines.join('\n'), timestamp: new Date().toISOString() }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+      return;
+    }
+
+    await message.reply('Usage: `!s3 migrate <pending|status|force [--dry-run]|preview|verify|purge-deprecated>`');
+  });
+
+  // ── Confirm ───────────────────────────────────────────────────
+
+  handlers.set('confirm', async (plugin, message, args) => {
+    const token = args[1];
+    if (!token) {
+      await message.reply(
+        'Usage: `!s3 confirm <token>` — token shown in the startup migration prompt. ' +
+        'Check `!s3 migrate status` to see if migrations are pending.'
+      );
+      return;
+    }
+
+    const db = plugin.services.db;
+    const me = db?.migrationEngine;
+
+    if (!db || !me) {
+      await sendDiscordMessage(message.channel, {
+        embeds: [{
+          color: 0xe74c3c,
+          title: '❌ Migration Engine Not Available',
+          description: 'The database service or migration engine has not been initialised.',
+          timestamp: new Date().toISOString()
+        }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+      return;
+    }
+
+    // Validate token (handles expiry internally)
+    const accepted = me.confirmToken(token);
+    if (!accepted) {
+      await sendDiscordMessage(message.channel, {
+        embeds: [{
+          color: 0xe74c3c,
+          title: '❌ Invalid or Expired Token',
+          description: 'The token did not match the latest migration prompt, or the 5-minute window expired. ' +
+            'Check `!s3 migrate status` for pending migrations and use `!s3 migrate force` to bypass the confirmation flow.',
+          timestamp: new Date().toISOString()
+        }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+      return;
+    }
+
+    // Token accepted — run pending migrations
+    const vs = await db.verifySchemaVersions();
+    const pending = vs.pending ?? [];
+    if (pending.length === 0) {
+      await sendDiscordMessage(message.channel, {
+        embeds: [{
+          color: 0x2ecc71,
+          title: '✅ No Pending Migrations',
+          description: 'Token accepted, but no migrations are pending. All plugin schema versions are up to date.',
+          timestamp: new Date().toISOString()
+        }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+      db._resolveMigrationGate(true);
+      return;
+    }
+
+    const runningEmbed = buildMigrationEmbed(pending, 'running');
+    await sendDiscordMessage(message.channel, { embeds: [runningEmbed] }, 'S3', (...a) => plugin.verbose(...a));
+
+    let totalApplied = 0;
+    let totalSkipped = 0;
+    let hadError = false;
+    let lastError = null;
+
+    for (const p of pending) {
+      try {
+        const result = await me.runMigrations(p.pluginName);
+        totalApplied += result.applied || 0;
+        totalSkipped += result.skipped || 0;
+      } catch (err) {
+        hadError = true;
+        lastError = err.message;
+        break;
+      }
+    }
+
+    db._resolveMigrationGate(!hadError);
+
+    if (hadError) {
+      const failEmbed = buildMigrationEmbed(pending, 'failed', { error: lastError, totalApplied, totalSkipped });
+      await sendDiscordMessage(message.channel, { embeds: [failEmbed] }, 'S3', (...a) => plugin.verbose(...a));
+    } else {
+      const doneEmbed = buildMigrationEmbed(pending, 'complete', { totalApplied, totalSkipped });
+      await sendDiscordMessage(message.channel, { embeds: [doneEmbed] }, 'S3', (...a) => plugin.verbose(...a));
+    }
   });
 
   // ── Backup ────────────────────────────────────────────────────
