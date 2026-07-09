@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                   ELO TRACKER PLUGIN v2.0.0                   ║
+ * ║                   ELO TRACKER PLUGIN v2.1.0                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -20,6 +20,7 @@
  *   Key public methods:
  *     mount()                     — Initialises DB, session, Discord channels, and listeners.
  *     unmount()                   — Removes all listeners and clears ready state.
+ *     getRating(player)           — Synchronous cache read; returns { mu, roundsPlayed }.
  *     getTeamElo(players)         — Returns average mu for a player array.
  *     getRatingsByEosIDs(eosIDs)  — Batch DB lookup; returns Map<eosID, rating>.
  *     buildRoundStartData()       — Builds team balance snapshot for Discord embeds.
@@ -119,6 +120,16 @@
  *     !elo backup                    → Export all player stats as a JSON attachment.
  *     !elo restore                   → Restore from a JSON backup (attach file).
  *
+ * ─── SCHEMA HISTORY ──────────────────────────────────────────────
+ *
+ * v1 — Creates 4 tables (Elo_PluginState, Elo_PlayerStats,
+ *   Elo_RoundHistory, Elo_RoundPlayers). Uses singular table names
+ *   which caused mismatch with Sequelize auto-pluralization.
+ * v2 — Adds matchId column to Elo_RoundHistories
+ *   (pre-existing installs only). Dead singular-table cleanup removed
+ *   — user to manually delete Elo_RoundHistory and Elo_PluginState if
+ *   present on production DB.
+ *
  * ─── AUTHOR ──────────────────────────────────────────────────────
  *
  * Slacker
@@ -137,7 +148,7 @@ import { EloDiscord } from '../utils/elo-discord.js';
 import EloCommands from '../utils/elo-commands.js';
 
 export default class EloTracker extends S3PluginBase {
-  static version = '2.0.0';
+  static version = '2.1.0';
 
   static get description() {
     return 'A SquadJS plugin that tracks player participation across rounds, computes individual ELO ratings using a TrueSkill-based algorithm, and persists all data via Sequelize-compatible databases (SQLite, MySQL, PostgreSQL, etc.).';
@@ -231,10 +242,22 @@ export default class EloTracker extends S3PluginBase {
     Logger.verbose('EloTracker', 1, 'Mounting plugin.');
     this.ready = false;
 
-    // Define Elo models on S³ connector (idempotent — defineModel caches)
+    // ── Elo models (Sequelize) ──────────────────────────────────────────
+    //
+    // Model-name vs table-name convention:
+    //   - `Elo_PluginState` (singular model)  → table `Elo_PluginStates`  (plural)
+    //   - `Elo_PlayerStats`  (already plural) → table `Elo_PlayerStats`   (same)
+    //   - `Elo_RoundHistory` (singular model) → table `Elo_RoundHistories` (plural)
+    //   - `Elo_RoundPlayers` (already plural) → table `Elo_RoundPlayers`   (same)
+    //
+    // The singular-model/plural-table split is historical (pre-freezeTableName era).
+    // `defineModel()` now injects `freezeTableName: true` by default, so the
+    // explicit `tableName` options below are redundant but harmless. They MUST
+    // NOT be removed — existing databases already have the plural table names,
+    // and removing `tableName` would cause Sequelize to look for the singular form.
     this.defineModel('Elo_PluginState', {
       id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: false, defaultValue: 1 }
-    }, { timestamps: false });
+    }, { timestamps: false, tableName: 'Elo_PluginStates' });
 
     this.defineModel('Elo_PlayerStats', {
       eosID: { type: this.s3db?.getDataTypes().STRING, primaryKey: true, allowNull: false },
@@ -247,17 +270,18 @@ export default class EloTracker extends S3PluginBase {
       losses: { type: this.s3db?.getDataTypes().INTEGER, defaultValue: 0 },
       roundsPlayed: { type: this.s3db?.getDataTypes().INTEGER, defaultValue: 0 },
       lastSeen: { type: this.s3db?.getDataTypes().BIGINT, allowNull: true }
-    }, { timestamps: false, charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' });
+    }, { tableName: 'Elo_PlayerStats', timestamps: false, charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' });
 
     this.defineModel('Elo_RoundHistory', {
       id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
+      matchId: { type: this.s3db?.getDataTypes().STRING(20), allowNull: true },
       layerName: { type: this.s3db?.getDataTypes().STRING, allowNull: true },
       winningTeamID: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true },
       ticketDiff: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true },
       roundDuration: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true },
       endedAt: { type: this.s3db?.getDataTypes().BIGINT, allowNull: true },
       playerCount: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true }
-    }, { timestamps: false });
+    }, { timestamps: false, tableName: 'Elo_RoundHistories' });
 
     this.defineModel('Elo_RoundPlayers', {
       id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
@@ -285,26 +309,25 @@ export default class EloTracker extends S3PluginBase {
       this.db.verbose = (level, message) => Logger.verbose('EloTracker', level, message);
     }
 
-    // Register Elo migrations on S³ connector (v1 creates tables, v2 drops roundStartTime)
+    // Register Elo migrations on S³ connector
     if (this.s3db?.isReady() && this.s3db.migrationEngine) {
-      this.registerExpectedVersion('elo-tracker', 1);
+      // These are MODEL names (keys in db.models), not table names.
+      // verifyLiveSchema() follows model.tableName to find the real DB table.
+      // E.g. model 'Elo_PluginState' → model.tableName === 'Elo_PluginStates'.
+      this.registerExpectedVersion('elo-tracker', 2, {
+        models: ['Elo_PluginState', 'Elo_PlayerStats', 'Elo_RoundHistory', 'Elo_RoundPlayers']
+      });
 
       this.registerMigrations('elo-tracker', [
         {
-          // Merged v1+v2: v1 and v2 were developed as two parts of the same Stage 8
-          // migration pipeline, but always shipped together — no production DB ever
-          // existed at the intermediate v1-only state. v2 previously dropped the
-          // vestigial roundStartTime column from Elo_PluginState (which was never
-          // created by the v1 migration — sync({alter}) added it). The merged
-          // migration creates all 4 tables directly — Elo_PluginState without
-          // roundStartTime is the intended final state.
+          // v1: create 4 tables (using plural names matching Sequelize defaults)
           version: 1,
-          description: 'Create Elo_PluginState, Elo_PlayerStats, Elo_RoundHistory, Elo_RoundPlayers',
+          description: 'Create Elo_PluginStates, Elo_PlayerStats, Elo_RoundHistories, Elo_RoundPlayers',
           up: async (qi) => {
             const existing = await qi.showAllTables();
 
-            if (!existing.includes('Elo_PluginState')) {
-              await qi.createTable('Elo_PluginState', {
+            if (!existing.includes('Elo_PluginStates')) {
+              await qi.createTable('Elo_PluginStates', {
                 id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: false, defaultValue: 1 }
               }, { timestamps: false });
             }
@@ -324,8 +347,8 @@ export default class EloTracker extends S3PluginBase {
               }, { timestamps: false, charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' });
             }
 
-            if (!existing.includes('Elo_RoundHistory')) {
-              await qi.createTable('Elo_RoundHistory', {
+            if (!existing.includes('Elo_RoundHistories')) {
+              await qi.createTable('Elo_RoundHistories', {
                 id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
                 layerName: { type: qi.DataTypes.STRING, allowNull: true },
                 winningTeamID: { type: qi.DataTypes.INTEGER, allowNull: true },
@@ -360,9 +383,38 @@ export default class EloTracker extends S3PluginBase {
           },
           down: async (qi) => {
             await qi.dropTable('Elo_RoundPlayers');
-            await qi.dropTable('Elo_RoundHistory');
+            await qi.dropTable('Elo_RoundHistories');
             await qi.dropTable('Elo_PlayerStats');
-            await qi.dropTable('Elo_PluginState');
+            await qi.dropTable('Elo_PluginStates');
+          }
+        },
+        {
+          // v2: add matchId column to Elo_RoundHistories (pre-existing installs only — new installs already have it from v1)
+          version: 2,
+          description: 'Add matchId column to Elo_RoundHistories',
+          touches: {
+            columns: { Elo_RoundHistories: ['matchId'] }
+          },
+          up: async (qi) => {
+            const existing = await qi.showAllTables();
+            if (existing.includes('Elo_RoundHistories')) {
+              const info = await qi.describeTable('Elo_RoundHistories');
+              if (!info.matchId) {
+                await qi.addColumn('Elo_RoundHistories', 'matchId', {
+                  type: qi.DataTypes.STRING(20),
+                  allowNull: true
+                });
+              }
+            }
+          },
+          down: async (qi) => {
+            const existing = await qi.showAllTables();
+            if (existing.includes('Elo_RoundHistories')) {
+              const info = await qi.describeTable('Elo_RoundHistories');
+              if (info.matchId) {
+                await qi.removeColumn('Elo_RoundHistories', 'matchId');
+              }
+            }
           }
         }
       ]);
@@ -370,7 +422,7 @@ export default class EloTracker extends S3PluginBase {
       // Apply pending migrations
       await this.verifyAndRunMigrations('elo-tracker');
     } else {
-      Logger.verbose('EloTracker', 1, '[8.2] S³ DB or migrationEngine not available — skipping migration registration.');
+      Logger.verbose('EloTracker', 1, 'S³ DB or migrationEngine not available — skipping migration registration.');
     }
 
     // Initialize DB models (tables created by MigrationEngine above; initDB will find them)
@@ -819,8 +871,12 @@ export default class EloTracker extends S3PluginBase {
     let roundRecord = null;
     try {
       await this.db.bulkIncrementPlayerStats(dbUpdates);
+
+      const gs = this._s3?.gameState;
+
       roundRecord = await this.db.insertRoundHistory({
         layerName: layerName,
+        matchId: gs?.getMatchId?.() ?? null,
         winningTeamID,
         ticketDiff: ticketDiff,
         roundDuration: roundEndTime - this.session.roundStartTime,
@@ -893,9 +949,9 @@ export default class EloTracker extends S3PluginBase {
     // Fire-and-forget database insert if enabled and roundRecord was created
     if (this.options.enableDatabaseLogging && roundRecord && roundRecord.id) {
       // Read matchId and roundStartTime from S³ GameStateService for cross-plugin consistency
-      const gs = this._s3?.gameState;
-      const roundStartTime = gs?.getRoundStartTime?.() ?? this.session.roundStartTime;
-      const matchId = gs?.getMatchId?.();
+      const gs2 = this._s3?.gameState;
+      const roundStartTime = gs2?.getRoundStartTime?.() ?? this.session.roundStartTime;
+      const matchId = gs2?.getMatchId?.();
 
       const playerRows = matchRecord.players.map(p => ({
         matchId: matchId,
@@ -1049,92 +1105,61 @@ export default class EloTracker extends S3PluginBase {
       tierStats: { vCount, pCount, rCount },
       tierString: `${vCount} Visitors | ${pCount} Prov. | ${rCount} Regs`,
       avgMu: count > 0 ? totalMu / count : defaultMu,
-      avgRegMu: rCount > 0 ? totalRegMu / rCount : null,
-      top15Mu,
-      veterancy
+      avgRegMu: rCount > 0 ? totalRegMu / rCount : defaultMu,
+      veterancy,
+      top15Mu
     };
-  }
-
-  getTeamElo(players) {
-    if (!players || players.length === 0) {
-      return { averageMu: EloCalculator.MU_DEFAULT, playerCount: 0 };
-    }
-    const total = players.reduce((sum, p) => {
-      const cached = this.eloCache.get(p.eosID);
-      return sum + (cached ? cached.mu : EloCalculator.MU_DEFAULT);
-    }, 0);
-    return {
-      averageMu: total / players.length,
-      playerCount: players.length
-    };
-  }
-
-  async getMu(player) {
-    if (!player) return EloCalculator.MU_DEFAULT;
-    
-    // Check cache first
-    const cached = this.eloCache.get(player.eosID);
-    if (cached) return cached.mu;
-    
-    // Cache miss — fetch from database
-    try {
-      const record = await this.db.getPlayerStats(player.eosID);
-      if (record) {
-        // Populate cache for future calls
-        this.eloCache.set(player.eosID, record);
-        return record.mu;
-      }
-    } catch (err) {
-      Logger.verbose('EloTracker', 1, `[getMu] DB fetch failed for ${player.eosID}: ${err.message}`);
-    }
-    
-    // No record found or fetch failed — return default
-    return EloCalculator.MU_DEFAULT;
-  }
-
-  /**
-   * Retrieves player rating (mu and roundsPlayed) from cache or database.
-   * Mirrors getMu() pattern but returns full rating object for skill + veterancy calculations.
-   *
-   * @param {object} player - Player object with eosID
-   * @returns {Promise<object>} { mu, roundsPlayed } — both with defaults if not found
-   */
-  async getRating(player) {
-    if (!player) return { mu: EloCalculator.MU_DEFAULT, roundsPlayed: 0 };
-    
-    // Check cache first
-    const cached = this.eloCache.get(player.eosID);
-    if (cached) return { mu: cached.mu, roundsPlayed: cached.roundsPlayed ?? 0 };
-    
-    // Cache miss — fetch from database
-    try {
-      const record = await this.db.getPlayerStats(player.eosID);
-      if (record) {
-        // Populate cache for future calls
-        this.eloCache.set(player.eosID, record);
-        return { mu: record.mu, roundsPlayed: record.roundsPlayed ?? 0 };
-      }
-    } catch (err) {
-      Logger.verbose('EloTracker', 1, `[getRating] DB fetch failed for ${player.eosID}: ${err.message}`);
-    }
-    
-    // No record found or fetch failed — return defaults
-    return { mu: EloCalculator.MU_DEFAULT, roundsPlayed: 0 };
-  }
-
-  async getRatingsByEosIDs(eosIDs) {
-    const results = await this.db.getPlayerStatsBatch(eosIDs);
-    return new Map(eosIDs.map(id => [
-        id,
-        results.get(id) ?? { mu: EloCalculator.MU_DEFAULT, sigma: EloCalculator.SIGMA_DEFAULT, roundsPlayed: 0 }
-    ]));
   }
 
   async _appendMatchLog(record) {
     try {
-      await fsPromises.appendFile(this.options.eloLogPath, JSON.stringify(record) + '\n', 'utf8');
+      appendFileSync(this.options.eloLogPath, JSON.stringify(record) + '\n', 'utf8');
+      Logger.verbose('EloTracker', 4, `[onRoundEnded] Match log appended to ${this.options.eloLogPath}`);
     } catch (err) {
-      Logger.verbose('EloTracker', 1, `[_appendMatchLog] Failed to write log: ${err.message}`);
+      Logger.verbose('EloTracker', 1, `[onRoundEnded] Error appending to match log: ${err.message}`);
     }
   }
+
+  /**
+   * Synchronous cache read — called by Smart Assign for mu pre-warming and
+   * by sa-team-evaluator as a per-player fallback when batch API is unavailable.
+   * Returns { mu, roundsPlayed } with defaults if player not in cache.
+   */
+  getRating(player) {
+    return this.eloCache.get(player.eosID) ?? { mu: 25.0, roundsPlayed: 0 };
+  }
+
+  /**
+   * External API — called by other plugins (e.g. Smart Assign, Team Balancer) to
+   * read cached player ratings synchronously (no DB round-trip).
+   */
+  getTeamElo(players) {
+    if (players.length === 0) return 0;
+    let totalMu = 0;
+    let count = 0;
+    for (const p of players) {
+      if (p?.eosID) {
+        const cached = this.eloCache.get(p.eosID);
+        if (cached) {
+          totalMu += cached.mu;
+          count++;
+        }
+      }
+    }
+    return count > 0 ? totalMu / count : 0;
+  }
+
+  /**
+   * Batch DB lookup — returns a Map<eosID, rating> for plugins that need
+   * fresh data not in cache (e.g. Smart Assign pre-fetch for team evaluation).
+   * Fallback to per-player lookup if batch fails.
+   */
+  async getRatingsByEosIDs(eosIDs) {
+    if (!eosIDs || eosIDs.length === 0) return new Map();
+    const results = await this.db.getPlayerStatsBatch(eosIDs);
+    return results || new Map();
+  }
+
+  // ----- DEPRECATED (preserved for team-balancer compatibility) -----
+  // Old onNewGame() had roundStartTime tracking; now routes through S³ gameState.
 }
