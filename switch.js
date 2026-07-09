@@ -528,7 +528,9 @@ export default class Switch extends S3DiscordPluginBase {
         }, { timestamps: false, freezeTableName: true });
 
         // Register expected version + v1 migration
-        this.registerExpectedVersion('switch', 2);
+        this.registerExpectedVersion('switch', 2, {
+          models: ['SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_Endmatches', 'SwitchPlugin_Settings']
+        });
         this.registerMigrations('switch', [
             {
                 version: 1,
@@ -2579,7 +2581,7 @@ export default class Switch extends S3DiscordPluginBase {
     /**
      * Builds a diagnostics embed for the !switch diag Discord command.
      * Uses the circle emoji status scheme (🟢 ok / 🔴 broken / 🟠 degraded / ⚫ off)
-     * established in S³ Stage 8.11a for consistent cross-plugin UX.
+     * established in S³ for consistent cross-plugin UX.
      */
     async _buildSwitchDiagEmbed() {
         const VERSION = '2.0.0';
