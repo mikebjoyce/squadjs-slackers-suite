@@ -214,7 +214,7 @@ export default class SmartAssign extends S3PluginBase {
       s3: this._s3,  // S³ reference for canAct preemption check in retry branch
       requestTeamChange: this._requestTeamChange?.bind(this)
     });
-    // Build a lightweight DB delegate for SAEventLogger (sa-database.js was inlined here in Stage 8)
+    // Build a lightweight DB delegate for SAEventLogger (sa-database.js was inlined here)
     const dbDelegate = {
       logAssignmentEvent: (event) => this._saLogAssignmentEvent(event)
     };
@@ -347,9 +347,9 @@ export default class SmartAssign extends S3PluginBase {
         ]
       });
 
-      Logger.verbose('SmartAssign', 2, '[8.2] SA_AssignmentLog model defined on S³ connector.');
+      Logger.verbose('SmartAssign', 2, 'SA_AssignmentLog model defined on S³ connector.');
     } else {
-      Logger.verbose('SmartAssign', 1, '[8.2] S³ DB not ready — SA_AssignmentLog model not defined.');
+      Logger.verbose('SmartAssign', 1, 'S³ DB not ready — SA_AssignmentLog model not defined.');
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -360,7 +360,7 @@ export default class SmartAssign extends S3PluginBase {
         this.registerExpectedVersion('smart-assign', 1);
         this.registerMigrations('smart-assign', [
           {
-            // Merged v1+v2: v1 and v2 were developed as two parts of the same Stage 8
+            // Merged v1+v2: v1 and v2 were developed as two parts of the same migration
             // migration pipeline, but always shipped together — no production DB ever
             // existed at the intermediate v1-only state. The merged migration creates
             // SA_AssignmentLog AND drops the 4 orphan tables in a single step.
@@ -412,10 +412,10 @@ export default class SmartAssign extends S3PluginBase {
         ]);
         await this.verifyAndRunMigrations('smart-assign');
       } else {
-        Logger.verbose('SmartAssign', 1, '[8.2] S³ DB or migrationEngine not available — skipping migration registration.');
+        Logger.verbose('SmartAssign', 1, 'S³ DB or migrationEngine not available — skipping migration registration.');
       }
     } catch (err) {
-      Logger.verbose('SmartAssign', 1, `[8.2] Migration registration error: ${err.message}`);
+      Logger.verbose('SmartAssign', 1, `Migration registration error: ${err.message}`);
     }
 
     // Switch plugin discovery for handshake integration (7.1c)
@@ -1185,7 +1185,7 @@ export default class SmartAssign extends S3PluginBase {
   }
 
   /**
-   * Inlined from the former sa-database.js (deleted in Stage 8 cleanup).
+   * Inlined from the former sa-database.js (deleted during cleanup).
    * Writes a single assignment event to SA_AssignmentLog.
    * Uses base class methods: this._getModel(), this._withDb().
    * No-op when enableDatabaseLogging is false.
