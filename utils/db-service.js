@@ -602,13 +602,24 @@ export default class DBService {
   }
 
   /**
-   * Get all defined model names.
-   * @returns {string[]}
+   * Define a Sequelize model on the S³ connector.
+   *
+   * **model name → table name resolution (in priority order):**
+   *   1. Explicit `tableName` in `modelOptions` (highest — caller controls it)
+   *   2. `freezeTableName: true` (injected by default — model name IS the table name)
+   *   3. Sequelize auto-pluralization (disabled by freezeTableName, never reached)
+   *
+   * This means a caller can use a **singular model name** (e.g. `'Elo_PluginState'`)
+   * while the actual DB table is **plural** (e.g. `'Elo_PluginStates'`) by passing
+   * `{ tableName: 'Elo_PluginStates' }`.  The model is always looked up by its
+   * original `name` argument — never by its table name.
+   *
+   * @param {string} name - Model name (key in `this.models`).  Not necessarily the table name.
+   * @param {object} schema - Sequelize attribute definitions.
+   * @param {object} [modelOptions] - Passed through to `sequelize.define()`.
+   *   `freezeTableName: true` is always prepended; an explicit `tableName` overrides it.
+   * @returns {import('sequelize').Model}
    */
-  getModelNames() {
-    return Object.keys(this.models);
-  }
-
   defineModel(name, schema, modelOptions = {}) {
     if (!this.sequelize || typeof this.sequelize.define !== 'function') {
       throw new Error('defineModel called without a valid sequelize connector.');
@@ -628,13 +639,18 @@ export default class DBService {
 
    /**
     * Register a plugin's expected schema version and, optionally, the
-     * Sequelize model names it owns. The model list feeds verifyLiveSchema()
-     * so drift detection can diff rawAttributes against the actual
-     * database columns.
+    * Sequelize model names it owns. The model list feeds verifyLiveSchema()
+    * so drift detection can diff rawAttributes against the actual
+    * database columns.
+    *
+    * **Important:** `options.models` must be **model names** (first arg to
+    * `defineModel()`), NOT table names. `verifyLiveSchema()` dereferences
+    * them via `this.models[name].tableName` to find the real DB table.
+    * See `defineModel()` for how model names map to table names.
     *
     * @param {string} pluginName - Unique plugin identifier
     * @param {number} version    - Expected schema version (positive integer)
-    * @param {{ models?: string[] }} [options] - Optional models owned by this plugin
+    * @param {{ models?: string[] }} [options] - Model names owned by this plugin
     */
    registerExpectedVersion(pluginName, version, options = {}) {
     if (!pluginName || typeof pluginName !== 'string') {
@@ -766,12 +782,18 @@ export default class DBService {
 
     for (const [pluginName, modelNames] of this._pluginModels.entries()) {
       for (const modelName of modelNames) {
+        // model names come from registerExpectedVersion()'s `models` array
         const model = this.models[modelName];
         if (!model) {
           drift.push({ pluginName, model: modelName, error: 'Model not found in registry' });
           continue;
         }
 
+        // model.tableName is the explicit tableName passed in defineModel() options,
+        // or falls back to the model name (since freezeTableName is injected by default).
+        // This is how the singular-model / plural-table bridge works:
+        //   defineModel('Elo_PluginState', ..., { tableName: 'Elo_PluginStates' })
+        //   → model.tableName = 'Elo_PluginStates', this.models['Elo_PluginState'] = model
         const tableName = model.tableName || model.name;
 
         let actualColumns;
