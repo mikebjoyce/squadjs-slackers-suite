@@ -375,6 +375,9 @@ export default class Switch extends S3DiscordPluginBase {
 
         this._scrambleHappened = false;   // set by onScrambleExecuted, consumed by onNewGame
 
+        // Unsubscribe callback for S³ onLayerGameModeChange (registered in _onS3Ready)
+        this._unsubscribeLayerChange = null;
+
         // Time limit toggle — loaded from DB in _onS3Ready(), defaults to true.
         this.timeLimitEnabled = true;
 
@@ -600,6 +603,13 @@ export default class Switch extends S3DiscordPluginBase {
         // (see _removePlayerFromQueue). If the queue is disabled, no interest is
         // registered at all. This avoids polling when no one is waiting.
         this.verbose(2, '[S3] Switch refresh interest is conditional (poll only when queue active).');
+
+        // Subscribe to S³ layer changes for broadcast timer management.
+        // The callback fires AFTER resolveLayerInfo() commits the new layer —
+        // avoiding the race where onNewGame() reads the stale seed layer name.
+        this._unsubscribeLayerChange = this._s3?.gameState?.onLayerGameModeChange?.(({ layerName, gameMode }) => {
+            this._onLayerChanged(layerName, gameMode);
+        }) || null;
     }
 
     /**
@@ -772,6 +782,35 @@ export default class Switch extends S3DiscordPluginBase {
         this._broadcastTimers.genericInfoTimer = setInterval(() => {
             this.broadcast(`[Switch] Want to change teams? Type '!switch' to request a team change. Use '!switch help' to learn more.`);
         }, 25 * 60 * 1000);
+    }
+
+    /**
+     * Handle authoritative layer/gamemode change events from S³ game-state-service.
+     * Called via the onLayerGameModeChange subscription (registered in _onS3Ready).
+     * Fires AFTER resolveLayerInfo() commits the new layer — no stale data race.
+     *
+     * Clears any active broadcast timers, then starts the appropriate ones
+     * based on the confirmed layer/gamemode and scramble state.
+     */
+    _onLayerChanged(layerName, gameMode) {
+        const isLiberal = this._liberalModes.some(m => {
+            const candidate = String(m).toLowerCase();
+            return (gameMode || '').toLowerCase().includes(candidate) ||
+                   (layerName || '').toLowerCase().includes(candidate);
+        });
+
+        this._clearBroadcastTimers();
+
+        if (this._scrambleHappened) {
+            this._scrambleHappened = false;
+            this._startPostScrambleBroadcastTimers();
+        } else if (isLiberal) {
+            this._startLiberalBroadcastTimers();
+        } else {
+            this._startBroadcastTimers();
+        }
+
+        this._startGenericInfoTimer();
     }
 
     /* ── v2.0.0: Join-warn helpers ────────────────────────────── */
@@ -1512,6 +1551,7 @@ export default class Switch extends S3DiscordPluginBase {
     }
 
     async onRoundEnded(dt) {
+        this._clearBroadcastTimers();
         this._lastTeamSnapshot = null;
         this._scrambleHappened = false;
 
@@ -2214,18 +2254,9 @@ export default class Switch extends S3DiscordPluginBase {
         // Reset round stats for the new round
         this._roundStats = this._initRoundStats();
 
-        // v2.0.0: Branch on scramble/liberal/normal broadcast, then start generic info timer on all paths
-        if (this._scrambleHappened) {
-            this._scrambleHappened = false;
-            this._startPostScrambleBroadcastTimers();
-        } else if (this.isLiberalMode()) {
-            this._startLiberalBroadcastTimers();
-        } else {
-            this._startBroadcastTimers();
-        }
-
-        // Generic informative broadcast runs every 25 minutes regardless of round type
-        this._startGenericInfoTimer();
+        // Broadcast timers are now started by _onLayerChanged() via the
+        // onLayerGameModeChange callback, which fires after game-state-service
+        // has resolved the new layer — avoiding the seed→live race condition.
     }
 
     async onS3PlayerJoined(data) {
@@ -2331,6 +2362,12 @@ export default class Switch extends S3DiscordPluginBase {
 
         // v2.0.0: Clear broadcast timers
         this._clearBroadcastTimers();
+
+        // Unsubscribe from S³ layer change callback
+        if (this._unsubscribeLayerChange) {
+            this._unsubscribeLayerChange();
+            this._unsubscribeLayerChange = null;
+        }
 
         // v2.0.0: Clear all pending join-warn timeouts
         for (const [eosID, timeout] of this._joinWarnTimeouts) {
