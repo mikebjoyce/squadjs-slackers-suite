@@ -668,6 +668,7 @@ export default class Switch extends S3DiscordPluginBase {
      */
     _startBroadcastTimers() {
         if (!this.options.broadcastSwitchWindowMessages) return;
+        if (!this.timeLimitEnabled) return;
 
         this._clearBroadcastTimers();
 
