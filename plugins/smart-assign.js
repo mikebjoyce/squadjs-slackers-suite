@@ -301,7 +301,20 @@ export default class SmartAssign extends S3PluginBase {
    * Switch handshake discovery, refresh interest registration, and restart recovery.
    * Replaces the old inline mount() S³ boilerplate.
    */
+  _checkS3Version() {
+    const required = '1.0.0';
+    const actual = this._s3?.version;
+    if (!actual || actual < required) {
+      throw new Error(
+        `[SmartAssign] Incompatible S³ version: got ${actual || 'unknown'}, need >=${required}. ` +
+        'Please update SlackersSquadServices.'
+      );
+    }
+    Logger.verbose('SmartAssign', 2, `[S3] Version check passed: S³ v${actual} >= required v${required}`);
+  }
+
   async _onS3Ready() {
+    this._checkS3Version();
     Logger.verbose('SmartAssign', 1, 'S³ ready — initialising SA services.');
 
     // EloTracker discovery
