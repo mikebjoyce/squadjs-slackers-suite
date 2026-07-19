@@ -423,6 +423,16 @@ export default class Switch extends S3DiscordPluginBase {
         }
     }
 
+    /**
+     * Track a denied switch in round stats (scramble_lock, time_window, cooldown).
+     * Guarded — no-op if _roundStats is not initialized.
+     */
+    _trackDenial(eosID, playerName, reason) {
+        if (!this._roundStats) return;
+        const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
+        this._roundStats.deniedSwitches.push({ name: playerName, eosID, reason, gamePhase });
+    }
+
     async mount() {
         await super.mount();
 
@@ -1222,12 +1232,15 @@ export default class Switch extends S3DiscordPluginBase {
                 if (eligibility.reason === 'scramble_lock') {
                     this.warn(eosID, `[Switch] Scramble lock active — expires in ${eligibility.remaining}m.\nYour switch window may close before this expires.\nUse !switch check to see your full status.`);
                     this.verbose(1, `[Switch] Denied ${playerName}: Scramble lockdown active.`);
+                    this._trackDenial(eosID, playerName, 'scramble_lock');
                 } else if (eligibility.reason === 'time_window') {
                     this.warn(eosID, `[Switch] Join/match window closed.\nSwitching is only allowed in the first ${this.options.switchEnabledMinutes}m after joining or after\nmatch start — whichever gives you more time.\nUse !switch explain for details.`);
                     this.verbose(1, `[Switch] Denied ${playerName}: Match time limit exceeded.`);
+                    this._trackDenial(eosID, playerName, 'time_window');
                 } else if (eligibility.reason === 'cooldown') {
                     this.warn(eosID, `[Switch] On cooldown — available in ${eligibility.remaining}m.\nUse !switch check to see your full status.`);
                     this.verbose(1, `[Switch] Denied ${playerName}: Cooldown active.`);
+                    this._trackDenial(eosID, playerName, 'cooldown');
                 }
                 return;
             }
@@ -1334,12 +1347,12 @@ export default class Switch extends S3DiscordPluginBase {
             }
         }
         } catch (err) {
-            // Track denied switch
+            // Track denied switch (only for unexpected errors — gameplay denials are tracked inline)
             if (this._roundStats) {
                 const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
                 this._roundStats.deniedSwitches.push({
-                    name: playerName,
-                    eosID,
+                    name: playerName || 'unknown',
+                    eosID: eosID || 'unknown',
                     reason: err.message || 'unknown',
                     gamePhase
                 });
@@ -2053,7 +2066,7 @@ export default class Switch extends S3DiscordPluginBase {
             }
 
         } catch (err) {
-            this.verbose(1, `[Queue] _processQueue error: ${err.message}`);
+            this.verbose(1, `[Queue] Processing error: ${err.stack}`);
         } finally {
             this._queueProcessing = false;
         }
@@ -2759,6 +2772,93 @@ export default class Switch extends S3DiscordPluginBase {
         };
     }
 
+    _parseStatsNum(re, text) {
+        const m = text.match(re);
+        return m ? parseInt(m[1], 10) : 0;
+    }
+
+    _parseRoundStatsField(value) {
+        return {
+            success: this._parseStatsNum(/\*\*Success:\*\*\s*(\d+)/, value),
+            failed: this._parseStatsNum(/\*\*Failed \(expired\):\*\*\s*(\d+)/, value),
+            denied: this._parseStatsNum(/\*\*Denied:\*\*\s*(\d+)/, value),
+            toT1: this._parseStatsNum(/\*\*To T1:\*\*\s*(\d+)/, value),
+            toT2: this._parseStatsNum(/\*\*To T2:\*\*\s*(\d+)/, value)
+        };
+    }
+
+    async _handleStatsCommand(message, args) {
+        const STATS_LOOKBACK_DAYS = 60;
+        const limitArg = args.find(a => a.startsWith('--limit='));
+        const roundLimit = limitArg ? parseInt(limitArg.split('=')[1], 10) : Infinity;
+        const afterDate = new Date(Date.now() - STATS_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+
+        await message.channel.send(`🔍 Scraping switch stats from the last ${STATS_LOOKBACK_DAYS} days${Number.isFinite(roundLimit) ? ` (limit ${roundLimit} rounds)` : ''}...`);
+
+        const totals = { rounds: 0, success: 0, failed: 0, denied: 0, toT1: 0, toT2: 0 };
+        let before = message.id;
+        let keepGoing = true;
+
+        try {
+            while (keepGoing && totals.rounds < roundLimit) {
+                const batch = await message.channel.messages.fetch({ limit: 100, before });
+                if (batch.size === 0) break;
+
+                for (const msg of batch.values()) {
+                    if (msg.createdAt < afterDate) { keepGoing = false; break; }
+
+                    const embed = msg.embeds.find(e => e.title === 'Switch Round Summary');
+                    if (embed) {
+                        const statsField = embed.fields?.find(f => f.name.includes('Stats'));
+                        if (statsField) {
+                            const s = this._parseRoundStatsField(statsField.value);
+                            totals.rounds++;
+                            totals.success += s.success;
+                            totals.failed += s.failed;
+                            totals.denied += s.denied;
+                            totals.toT1 += s.toT1;
+                            totals.toT2 += s.toT2;
+                        }
+                    }
+                    if (totals.rounds >= roundLimit) { keepGoing = false; break; }
+                }
+
+                before = batch.last()?.id;
+                if (batch.size < 100) break;
+                await delay(300);
+            }
+        } catch (err) {
+            this.verbose(1, `[Switch] Stats scrape failed: ${err.message}`);
+            await message.channel.send(`❌ Scrape failed: ${err.message}`);
+            return;
+        }
+
+        const attempted = totals.success + totals.failed;
+        const passRate = attempted > 0 ? ((totals.success / attempted) * 100).toFixed(1) : 'n/a';
+        const failRate = attempted > 0 ? ((totals.failed / attempted) * 100).toFixed(1) : 'n/a';
+
+        const embed = {
+            title: 'Switch Global Stats',
+            color: 0x3498DB,
+            fields: [{
+                name: '📊 Aggregate',
+                value:
+                    `**Rounds Scraped:** ${totals.rounds}\n` +
+                    `**Success:** ${totals.success}\n` +
+                    `**Failed:** ${totals.failed}\n` +
+                    `**Denied:** ${totals.denied} (excluded from pass/fail rate)\n` +
+                    `**Pass Rate:** ${passRate}%\n` +
+                    `**Fail Rate:** ${failRate}%\n` +
+                    `**To T1 / To T2:** ${totals.toT1} / ${totals.toT2}`,
+                inline: false
+            }],
+            timestamp: new Date(),
+            footer: { text: `Switch v${Switch.version}` }
+        };
+
+        await message.channel.send({ embeds: [embed] });
+    }
+
     async onDiscordMessage(message) {
         if (message.author.bot) return;
         if (this.options.channelID && message.channel.id !== this.options.channelID) return;
@@ -2849,6 +2949,9 @@ export default class Switch extends S3DiscordPluginBase {
             } catch (err) {
                 await this.safeDiscordReply(message, `❌ Failed to update setting: ${err.message}`);
             }
+        } else if (subCommand === 'stats') {
+            const args2 = args.slice(2);
+            await this._handleStatsCommand(message, args2);
         } else if (subCommand === 'help') {
             const embed = {
                 title: '📜 Switch Plugin Commands',
@@ -2859,6 +2962,7 @@ export default class Switch extends S3DiscordPluginBase {
                     { name: '!switch clear <ident>', value: 'Clear cooldowns for a specific player.' },
                     { name: '!switch clearall', value: 'Clear all player cooldowns.' },
                     { name: '!switch timelimit on|off', value: 'Admin: Toggle join/match time limit for queue entry.' },
+                    { name: '!switch stats [--limit=N]', value: 'Scrape the last 60 days of round summaries for a global pass/fail rate.' },
                     { name: '!switch help', value: 'Show this help message.' }
                 ]
             };
@@ -2874,6 +2978,7 @@ export default class Switch extends S3DiscordPluginBase {
                     { name: '!switch clear <ident>', value: 'Clear cooldowns for a specific player.' },
                     { name: '!switch clearall', value: 'Clear all player cooldowns.' },
                     { name: '!switch timelimit on|off', value: 'Admin: Toggle join/match time limit for queue entry.' },
+                    { name: '!switch stats [--limit=N]', value: 'Scrape the last 60 days of round summaries for a global pass/fail rate.' },
                     { name: '!switch help', value: 'Show this help message.' }
                 ]
             };
