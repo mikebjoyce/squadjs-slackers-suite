@@ -440,6 +440,7 @@ export default class Switch extends S3DiscordPluginBase {
         // Wire event listeners — business logic, not S³ boilerplate.
         this._liberalModes = (this.options.liberalSwitchGameModes || ['Seed', 'Jensen']).map(m => String(m).toLowerCase());
         this._roundStats = this._initRoundStats();
+        this._restartedThisRound = true;
 
         this.server.on('CHAT_MESSAGE', this.onChatMessage);
         this.server.on('ROUND_ENDED', this.onRoundEnded);
@@ -458,7 +459,20 @@ export default class Switch extends S3DiscordPluginBase {
      * Handles DB model definition, migration registration, refresh interest,
      * and ChangeTeam detection.
      */
+    _checkS3Version() {
+        const required = '1.0.0';
+        const actual = this._s3?.version;
+        if (!actual || actual < required) {
+            throw new Error(
+                `[Switch] Incompatible S³ version: got ${actual || 'unknown'}, need >=${required}. ` +
+                'Please update SlackersSquadServices.'
+            );
+        }
+        this.verbose(2, `[S3] Version check passed: S³ v${actual} >= required v${required}`);
+    }
+
     async _onS3Ready() {
+        this._checkS3Version();
         if (!this._s3db?.isReady?.() || !this._s3db.migrationEngine) {
             this.verbose(1, '[S3] S³ DB or migrationEngine not available — cannot register Switch schema. Mounting without DB.');
             return;
@@ -1437,6 +1451,15 @@ export default class Switch extends S3DiscordPluginBase {
 
         const fields = [];
 
+        // ── Restart warning ──
+        if (this._restartedThisRound) {
+            fields.push({
+                name: '⚠️ Notice',
+                value: 'SquadJS was restarted during this round — switch data may be incomplete.',
+                inline: false
+            });
+        }
+
         // ── Field 1: Stats ──
         const statsLines = [];
         statsLines.push(`**Success:** ${totalSuccess} switch${totalSuccess !== 1 ? 'es' : ''}${totalAttempted > 0 ? ` (${successPct}%)` : ''}`);
@@ -2264,6 +2287,9 @@ export default class Switch extends S3DiscordPluginBase {
 
         // v2.0.0: Store game start timestamp for broadcast timing
         this._gameStartTs = Date.now();
+
+        // Clear restart flag — we're now in a fresh round
+        this._restartedThisRound = false;
 
         // Reset round stats for the new round
         this._roundStats = this._initRoundStats();
