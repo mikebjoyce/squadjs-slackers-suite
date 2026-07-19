@@ -235,7 +235,20 @@ export default class EloTracker extends S3PluginBase {
 
   /// S3PluginBase lifecycle hooks
 
+  _checkS3Version() {
+    const required = '1.0.0';
+    const actual = this._s3?.version;
+    if (!actual || actual < required) {
+      throw new Error(
+        `[EloTracker] Incompatible S³ version: got ${actual || 'unknown'}, need >=${required}. ` +
+        'Please update SlackersSquadServices.'
+      );
+    }
+    Logger.verbose('EloTracker', 2, `[S3] Version check passed: S³ v${actual} >= required v${required}`);
+  }
+
   async _onS3Ready() {
+    this._checkS3Version();
     if (this._isMounted) {
       return;
     }
