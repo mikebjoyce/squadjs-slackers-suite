@@ -157,6 +157,8 @@ export default class SlackersSquadServices extends BasePlugin {
     return false;
   }
 
+  static get version() { return '1.0.0'; }
+
   static get optionsSpecification() {
     return {
       database: {
@@ -289,6 +291,7 @@ export default class SlackersSquadServices extends BasePlugin {
 
   // Flat accessors — consumers use this._s3?.gameState (not this._s3?.services?.gameState)
   // Each returns the underlying service instance (may be null before mount completes).
+  get version()       { return SlackersSquadServices.version; }
   get gameState()     { return this.services.gameState; }
   get serverConfig()  { return this.services.serverConfig; }
   get db()            { return this.services.db; }
