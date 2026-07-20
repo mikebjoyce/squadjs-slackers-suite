@@ -786,9 +786,32 @@ export default class Switch extends S3DiscordPluginBase {
         // Reset round stats for the new round
         this._roundStats = this._initRoundStats();
 
-        // Broadcast timers are now started by _onLayerChanged() via the
-        // onLayerGameModeChange callback, which fires after game-state-service
-        // has resolved the new layer — avoiding the seed→live race condition.
+        // ── Broadcast timer startup (dual-path) ──────────────────────
+        //
+        // Broadcasts are started via TWO paths to cover all scenarios:
+        //
+        // 1. DIRECT CALL (below): Calls _onLayerChanged() immediately using
+        //    the current S³ gameState layer/gamemode. This covers:
+        //    - Normal NEW_GAME events (SquadJS fires NEW_GAME → we start timers)
+        //    - Mid-round SquadJS restarts (S³ has already resolved the layer
+        //      during mount, so getLayerName()/getGamemode() return valid data
+        //      immediately — no need to wait for a subscription to fire)
+        //    - Seed rounds (perpetual rounds that never end; without this call,
+        //      broadcasts would never start after a restart since no future
+        //      NEW_GAME or layer change would trigger the subscription)
+        //
+        // 2. SUBSCRIPTION (registered in _onS3Ready): The onLayerGameModeChange
+        //    callback handles mid-round layer transitions (e.g. seed→live map
+        //    change). When the layer changes mid-round, the subscription fires
+        //    and restarts the appropriate broadcast timers for the new layer.
+        //
+        // Both paths call _onLayerChanged(), which is idempotent — it calls
+        // _clearBroadcastTimers() before starting new ones, so if both fire
+        // for the same layer, the second call is a harmless clear+restart.
+        this._onLayerChanged(
+            this._s3?.gameState?.getLayerName?.() || '',
+            this._s3?.gameState?.getGamemode?.() || ''
+        );
     }
 
     onS3PlayerJoined = async (data) => {
