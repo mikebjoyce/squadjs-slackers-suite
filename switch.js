@@ -404,7 +404,8 @@ export default class Switch extends S3DiscordPluginBase {
     _initRoundStats() {
         return {
             instantSwitches: [],    // { name, eosID, fromTeam, toTeam, gamePhase }
-            deniedSwitches: [],     // { name, eosID, reason, gamePhase }
+            deniedSwitches: [],     // { name, eosID, reason, gamePhase } — one per unique player per round
+            _deniedPlayerSet: new Set(),  // eosIDs already denied this round (dedup)
             queueTeamTrades: [],    // { p1Name, p2Name, queueDurationSeconds, gamePhase }
             queueNormal: [],        // { name, eosID, queueDurationSeconds, gamePhase }
             queueJoinSwaps: [],     // { name, eosID, type ('swap'|'consume'), queueDurationSeconds, gamePhase }
@@ -429,6 +430,10 @@ export default class Switch extends S3DiscordPluginBase {
      */
     _trackDenial(eosID, playerName, reason) {
         if (!this._roundStats) return;
+        // Dedup: only record the first denial per player per round.
+        // Spam !switch on cooldown should not inflate the count.
+        if (this._roundStats._deniedPlayerSet.has(eosID)) return;
+        this._roundStats._deniedPlayerSet.add(eosID);
         const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
         this._roundStats.deniedSwitches.push({ name: playerName, eosID, reason, gamePhase });
     }
@@ -1419,10 +1424,6 @@ export default class Switch extends S3DiscordPluginBase {
         const totalSuccess = s.instantSwitches.length + s.queueNormal.length +
             s.queueTeamTrades.length + s.queueJoinSwaps.length;
         const totalFailed = s.queueExpiries.length;
-        const totalAttempted = totalSuccess + totalFailed;
-
-        const successPct = totalAttempted > 0 ? Math.round((totalSuccess / totalAttempted) * 100) : 0;
-        const failPct = totalAttempted > 0 ? Math.round((totalFailed / totalAttempted) * 100) : 0;
 
         // Average queue wait (only queue-based successes, not instant)
         const queueDurations = s.queueDurationsMs || [];
@@ -1461,10 +1462,29 @@ export default class Switch extends S3DiscordPluginBase {
         }
 
         // ── Field 1: Stats ──
+        const totalDenied = s.deniedSwitches.length;
+        const totalRequests = totalSuccess + totalFailed + totalDenied;
+        const successRate = totalRequests > 0 ? Math.round((totalSuccess / totalRequests) * 100) : 0;
+        const failRate = totalRequests > 0 ? Math.round((totalFailed / totalRequests) * 100) : 0;
+
+        // Denial reason breakdown
+        const denialReasons = {};
+        for (const d of s.deniedSwitches) {
+            denialReasons[d.reason] = (denialReasons[d.reason] || 0) + 1;
+        }
+        const denialBreakdown = Object.entries(denialReasons)
+            .map(([reason, count]) => `${count} ${reason}`)
+            .join(', ');
+
         const statsLines = [];
-        statsLines.push(`**Success:** ${totalSuccess} switch${totalSuccess !== 1 ? 'es' : ''}${totalAttempted > 0 ? ` (${successPct}%)` : ''}`);
-        statsLines.push(`**Failed (expired):** ${totalFailed}${totalAttempted > 0 ? ` (${failPct}%)` : ''}`);
-        if (s.deniedSwitches.length > 0) statsLines.push(`**Denied:** ${s.deniedSwitches.length}`);
+        statsLines.push(`**Requests:** ${totalRequests} (${totalSuccess} succeeded, ${totalDenied} denied, ${totalFailed} failed)`);
+        statsLines.push(`**Success Rate:** ${successRate}%`);
+        if (totalDenied > 0) {
+            statsLines.push(`**Denied:** ${totalDenied} player${totalDenied !== 1 ? 's' : ''} (${denialBreakdown})`);
+        }
+        if (totalFailed > 0) {
+            statsLines.push(`**Fail Rate:** ${failRate}% (${totalFailed} expired)`);
+        }
         statsLines.push(`**Max Queue Size:** ${s.maxQueueSize}`);
         if (queueDurations.length > 0) statsLines.push(`**Avg Queue Wait:** ${avgStr}`);
         statsLines.push(`**To T1:** ${toT1}`);
@@ -1536,7 +1556,7 @@ export default class Switch extends S3DiscordPluginBase {
                 `${p.name} ${this._formatGamePhase(p.gamePhase)}: ${p.reason}`
             );
             if (s.deniedSwitches.length > 10) names.push(`+ ${s.deniedSwitches.length - 10} more...`);
-            activityLines.push(`**Denied (${s.deniedSwitches.length})**\n${names.join('\n')}`);
+            activityLines.push(`**Denied (${s.deniedSwitches.length} unique players)**\n${names.join('\n')}`);
         }
 
         if (s.queueDisconnects.length) {
@@ -1578,7 +1598,7 @@ export default class Switch extends S3DiscordPluginBase {
             const s = this._roundStats;
             this.verbose(1, `[Summary] Round ended: ` +
                 `${s.instantSwitches.length} instant, ${s.queueNormal.length} normal, ${s.queueTeamTrades.length} trades, ` +
-                `${s.queueJoinSwaps.length} join-swaps, ${s.deniedSwitches.length} denied, ` +
+                `${s.queueJoinSwaps.length} join-swaps, ${s.deniedSwitches.length} denied (unique players), ` +
                 `${s.queueExpiries.length} expired, ${s.queueDisconnects.length} DC, ${s.queueCancels.length} cancel. ` +
                 `Max queue: ${s.maxQueueSize}.`
             );
@@ -2804,10 +2824,24 @@ export default class Switch extends S3DiscordPluginBase {
     }
 
     _parseRoundStatsField(value) {
+        // Parse the richer format: "Requests: X (Y succeeded, Z denied, W failed)"
+        const requestsMatch = value.match(/\*\*Requests:\*\*\s*(\d+)\s*\((\d+)\s*succeeded,\s*(\d+)\s*denied,\s*(\d+)\s*failed\)/);
+        let success = 0, failed = 0, denied = 0;
+        if (requestsMatch) {
+            // New format — extract from the Requests line
+            success = parseInt(requestsMatch[2], 10);
+            denied = parseInt(requestsMatch[3], 10);
+            failed = parseInt(requestsMatch[4], 10);
+        } else {
+            // Fallback: old format (pre-dedup, if any older embeds exist)
+            success = this._parseStatsNum(/\*\*Success:\*\*\s*(\d+)/, value);
+            failed = this._parseStatsNum(/\*\*Failed \(expired\):\*\*\s*(\d+)/, value);
+            denied = this._parseStatsNum(/\*\*Denied:\*\*\s*(\d+)/, value);
+        }
         return {
-            success: this._parseStatsNum(/\*\*Success:\*\*\s*(\d+)/, value),
-            failed: this._parseStatsNum(/\*\*Failed \(expired\):\*\*\s*(\d+)/, value),
-            denied: this._parseStatsNum(/\*\*Denied:\*\*\s*(\d+)/, value),
+            success,
+            failed,
+            denied,
             toT1: this._parseStatsNum(/\*\*To T1:\*\*\s*(\d+)/, value),
             toT2: this._parseStatsNum(/\*\*To T2:\*\*\s*(\d+)/, value)
         };
@@ -2859,9 +2893,10 @@ export default class Switch extends S3DiscordPluginBase {
             return;
         }
 
-        const attempted = totals.success + totals.failed;
-        const passRate = attempted > 0 ? ((totals.success / attempted) * 100).toFixed(1) : 'n/a';
-        const failRate = attempted > 0 ? ((totals.failed / attempted) * 100).toFixed(1) : 'n/a';
+        const totalRequests = totals.success + totals.failed + totals.denied;
+        const successRate = totalRequests > 0 ? ((totals.success / totalRequests) * 100).toFixed(1) : 'n/a';
+        const failRate = totalRequests > 0 ? ((totals.failed / totalRequests) * 100).toFixed(1) : 'n/a';
+        const denyRate = totalRequests > 0 ? ((totals.denied / totalRequests) * 100).toFixed(1) : 'n/a';
 
         const embed = {
             title: 'Switch Global Stats',
@@ -2870,10 +2905,9 @@ export default class Switch extends S3DiscordPluginBase {
                 name: '📊 Aggregate',
                 value:
                     `**Rounds Scraped:** ${totals.rounds}\n` +
-                    `**Success:** ${totals.success}\n` +
-                    `**Failed:** ${totals.failed}\n` +
-                    `**Denied:** ${totals.denied} (excluded from pass/fail rate)\n` +
-                    `**Pass Rate:** ${passRate}%\n` +
+                    `**Requests:** ${totalRequests} (${totals.success} succeeded, ${totals.denied} denied, ${totals.failed} failed)\n` +
+                    `**Success Rate:** ${successRate}%\n` +
+                    `**Denial Rate:** ${denyRate}%\n` +
                     `**Fail Rate:** ${failRate}%\n` +
                     `**To T1 / To T2:** ${totals.toT1} / ${totals.toT2}`,
                 inline: false

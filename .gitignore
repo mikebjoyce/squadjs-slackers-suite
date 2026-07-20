@@ -1,4 +1,1 @@
-**.*
-!switch.js
-!README.MD
-!.gitignore
+*.md
