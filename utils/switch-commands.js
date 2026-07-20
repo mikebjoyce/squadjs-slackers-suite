@@ -571,19 +571,18 @@ const SwitchCommands = {
     // ── Discord stats scraper ──────────────────────────────────
 
     plugin._handleStatsCommand = async function (message, args) {
-      const STATS_LOOKBACK_DAYS = 60;
-      const limitArg = args.find(a => a.startsWith('--limit='));
-      const roundLimit = limitArg ? parseInt(limitArg.split('=')[1], 10) : Infinity;
+      const daysArg = args.find(a => /^\d+$/.test(a));
+      const STATS_LOOKBACK_DAYS = daysArg ? parseInt(daysArg, 10) : 60;
       const afterDate = new Date(Date.now() - STATS_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
 
-      await message.channel.send(`🔍 Scraping switch stats from the last ${STATS_LOOKBACK_DAYS} days${Number.isFinite(roundLimit) ? ` (limit ${roundLimit} rounds)` : ''}...`);
+      await message.channel.send(`🔍 Scraping switch stats from the last ${STATS_LOOKBACK_DAYS} days...`);
 
       const totals = { rounds: 0, success: 0, failed: 0, denied: 0, toT1: 0, toT2: 0 };
       let before = message.id;
       let keepGoing = true;
 
       try {
-        while (keepGoing && totals.rounds < roundLimit) {
+        while (keepGoing) {
           const batch = await message.channel.messages.fetch({ limit: 100, before });
           if (batch.size === 0) break;
 
@@ -603,7 +602,6 @@ const SwitchCommands = {
                 totals.toT2 += s.toT2;
               }
             }
-            if (totals.rounds >= roundLimit) { keepGoing = false; break; }
           }
 
           before = batch.last()?.id;
@@ -747,7 +745,7 @@ const SwitchCommands = {
             { name: '!switch clear <ident>', value: 'Clear cooldowns for a specific player.' },
             { name: '!switch clearall', value: 'Clear all player cooldowns.' },
             { name: '!switch timelimit on|off', value: 'Admin: Toggle join/match time limit for queue entry.' },
-            { name: '!switch stats [--limit=N]', value: 'Scrape the last 60 days of round summaries for a global pass/fail rate.' },
+            { name: '!switch stats [days]', value: 'Scrape the last N days of round summaries (default 60).' },
             { name: '!switch help', value: 'Show this help message.' }
           ]
         };
@@ -763,7 +761,7 @@ const SwitchCommands = {
             { name: '!switch clear <ident>', value: 'Clear cooldowns for a specific player.' },
             { name: '!switch clearall', value: 'Clear all player cooldowns.' },
             { name: '!switch timelimit on|off', value: 'Admin: Toggle join/match time limit for queue entry.' },
-            { name: '!switch stats [--limit=N]', value: 'Scrape the last 60 days of round summaries for a global pass/fail rate.' },
+            { name: '!switch stats [days]', value: 'Scrape the last N days of round summaries (default 60).' },
             { name: '!switch help', value: 'Show this help message.' }
           ]
         };
