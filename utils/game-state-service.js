@@ -52,8 +52,10 @@
  * - _transitionRecoveredStateToLive() backfills roundStartTime and
  *   matchId to prevent null returns when a recovered round is invalidated.
  * - _validateRecoveredState layer-name comparison normalises names
- *   (strips underscores and hyphens) to avoid false divergences from
- *   SquadJS layer-name format mismatches.
+ *   (strips all non-alphanumerics) to avoid false divergences from
+ *   SquadJS layer-name format mismatches. Layer divergence is checked
+ *   exclusively in handleLayerInfoUpdated (authoritative format);
+ *   handleServerInfoUpdated only performs timing checks.
  * - Seed and Training modes use a short 5s staging-to-LIVE timer instead
  *   of the full stagingDurationMs, since these modes have no meaningful
  *   STAGING phase and the server sits in pre-round indefinitely.
@@ -447,6 +449,10 @@ export default class GameStateService {
   async handleLayerInfoUpdated() {
     const incomingName = this._extractLayerName(this.server.currentLayer);
     if (!this._isKnownLayerName(incomingName)) return;
+
+    // Crash-recovery: check layer divergence using the authoritative format
+    await this._validateRecoveredState('handleLayerInfoUpdated', { serverLayerName: incomingName });
+
     if (this._normalizeLayerName(this.lastKnownGoodLayer?.name) === this._normalizeLayerName(incomingName)) return;
     await this.resolveLayerInfo(this.server.currentLayer, 'handleLayerInfoUpdated');
   }
@@ -454,18 +460,14 @@ export default class GameStateService {
   async handleServerInfoUpdated(info) {
     if (!info?.currentLayer) return;
 
-    const incomingName = this._extractLayerName(info.currentLayer);
+    await this._validateRecoveredState('handleServerInfoUpdated');
 
-    await this._validateRecoveredState('handleServerInfoUpdated', { serverLayerName: incomingName });
-
-    if (!this._isKnownLayerName(incomingName)) return;
-
-    // Normalize both names for comparison — SquadJS uses different formats in
-    // different events (spaces vs underscores, e.g. "Tallil Outskirts Invasion v1"
-    // vs "Tallil_Invasion_v1"). Normalize before comparing to avoid cache thrashing.
-    if (this._normalizeLayerName(this.lastKnownGoodLayer?.name) === this._normalizeLayerName(incomingName)) return;
-
-    await this.resolveLayerInfo(info.currentLayer, 'handleServerInfoUpdated');
+    // Layer resolution and divergence checks are handled exclusively by
+    // handleLayerInfoUpdated, which carries the authoritative layer name format.
+    // UPDATED_SERVER_INFORMATION uses a different name format (e.g. "Sumari_Seed_v1"
+    // vs "Sumari Bala Seed v1") that conflicts with the authoritative format from
+    // UPDATED_LAYER_INFORMATION. Calling resolveLayerInfo here causes flip-flopping
+    // LAYER_CHANGE events in S3_GameStateEvents as the two events alternate.
   }
 
   async handleUpdatedPlayerInfo() {
@@ -816,7 +818,7 @@ export default class GameStateService {
   // fingerprint for identity checks.
   _normalizeLayerName(name) {
     if (!name) return '';
-    return String(name).replace(/[_\-\s]/g, '').toLowerCase();
+    return String(name).replace(/[^a-z0-9]/g, '').toLowerCase();
   }
 
   _isRecoveredRoundTooOld(now = Date.now()) {

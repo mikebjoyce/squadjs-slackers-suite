@@ -342,9 +342,10 @@ await runTest('fast restart — matchStartTime matches, layer matches — stays 
   // Should stay in LIVE — no divergence detected
   assert.equal(service.getPhase(), 'LIVE');
 
-  // After handleServerInfoUpdated with matching layer, _recoveredStateActive clears
+  // After handleLayerInfoUpdated with matching layer, _recoveredStateActive clears
   assert.equal(service._recoveredStateActive, true); // still active before validation
-  await service.handleServerInfoUpdated({ currentLayer: 'Mutaha_RAAS_v3' });
+  server.currentLayer = 'Mutaha_RAAS_v3';
+  await service.handleLayerInfoUpdated();
   assert.equal(service._recoveredStateActive, false); // cleared by matching layer
 
   await service.unmount();
@@ -379,8 +380,9 @@ await runTest('fast restart — layer divergence → transition to LIVE', async 
   // Still in STAGING on mount — recovery restored the old layer
   assert.equal(service.getPhase(), 'STAGING');
 
-  // handleServerInfoUpdated with a different layer triggers _validateRecoveredState
-  await service.handleServerInfoUpdated({ currentLayer: 'NewLayer_AAS_v2' });
+  // handleLayerInfoUpdated with a different layer triggers _validateRecoveredState
+  server.currentLayer = 'NewLayer_AAS_v2';
+  await service.handleLayerInfoUpdated();
   // Layer divergence should trigger transition to LIVE
   assert.equal(service.getPhase(), 'LIVE');
 

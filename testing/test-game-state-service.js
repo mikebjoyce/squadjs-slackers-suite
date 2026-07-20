@@ -371,13 +371,15 @@ await runTest('invalidates recovered state on authoritative known-layer divergen
   // G2: STAGING with resolving=false transitions to LIVE immediately on recovery
   assert.equal(service2.getPhase(), 'LIVE');
 
-  // Since _recoveredStateActive is already cleared by G2, handleServerInfoUpdated
-  // skips _validateRecoveredState — but layer divergence is detected by
-  // resolveLayerInfo instead, and the layer gets updated.
-  await service2.handleServerInfoUpdated({ currentLayer: 'Unknown' });
+  // Since _recoveredStateActive is already cleared by G2, handleLayerInfoUpdated
+  // skips _validateRecoveredState — but the guard check still runs and
+  // resolveLayerInfo updates the layer.
+  server2.currentLayer = 'Unknown';
+  await service2.handleLayerInfoUpdated();
   assert.equal(service2.getPhase(), 'LIVE');
 
-  await service2.handleServerInfoUpdated({ currentLayer: 'DifferentLayer_AAS_v2' });
+  server2.currentLayer = 'DifferentLayer_AAS_v2';
+  await service2.handleLayerInfoUpdated();
   assert.equal(service2.getPhase(), 'LIVE');
   assert.equal(service2.getLayerName(), 'DifferentLayer_AAS_v2');
 
