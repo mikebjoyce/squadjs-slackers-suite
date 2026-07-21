@@ -602,6 +602,15 @@ export default class DBService {
   }
 
   /**
+   * Return all registered model names.
+   * Used by s3-export-import.js for backup/restore enumeration.
+   * @returns {string[]}
+   */
+  getModelNames() {
+    return Object.keys(this.models);
+  }
+
+  /**
    * Define a Sequelize model on the S³ connector.
    *
    * **model name → table name resolution (in priority order):**
