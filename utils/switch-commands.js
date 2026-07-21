@@ -615,8 +615,9 @@ const SwitchCommands = {
       }
 
       const totalRequests = totals.success + totals.failed + totals.denied;
-      const successRate = totalRequests > 0 ? ((totals.success / totalRequests) * 100).toFixed(1) : 'n/a';
-      const failRate = totalRequests > 0 ? ((totals.failed / totalRequests) * 100).toFixed(1) : 'n/a';
+      const attemptedRequests = totals.success + totals.failed;
+      const successRate = attemptedRequests > 0 ? ((totals.success / attemptedRequests) * 100).toFixed(1) : 'n/a';
+      const failRate = attemptedRequests > 0 ? ((totals.failed / attemptedRequests) * 100).toFixed(1) : 'n/a';
       const denyRate = totalRequests > 0 ? ((totals.denied / totalRequests) * 100).toFixed(1) : 'n/a';
 
       const embed = {
@@ -653,7 +654,7 @@ const SwitchCommands = {
 
       if (command !== '!switch') return;
 
-      if (subCommand === 'diag') {
+      if (subCommand === 'status') {
         const embed = await plugin._buildSwitchDiagEmbed();
         await message.channel.send({ embeds: [embed] });
       } else if (subCommand === 'check') {
@@ -740,7 +741,7 @@ const SwitchCommands = {
           title: '📜 Switch Plugin Commands',
           description: 'Available commands:',
           fields: [
-            { name: '!switch diag', value: 'Show database diagnostics and active locks.' },
+            { name: '!switch status', value: 'Show database diagnostics and active locks.' },
             { name: '!switch check <ident>', value: 'Check cooldown status for a player.' },
             { name: '!switch clear <ident>', value: 'Clear cooldowns for a specific player.' },
             { name: '!switch clearall', value: 'Clear all player cooldowns.' },
@@ -756,7 +757,7 @@ const SwitchCommands = {
           title: '📜 Switch Plugin Commands',
           description: 'Available commands:',
           fields: [
-            { name: '!switch diag', value: 'Show database diagnostics and active locks.' },
+            { name: '!switch status', value: 'Show database diagnostics and active locks.' },
             { name: '!switch check <ident>', value: 'Check cooldown status for a player.' },
             { name: '!switch clear <ident>', value: 'Clear cooldowns for a specific player.' },
             { name: '!switch clearall', value: 'Clear all player cooldowns.' },

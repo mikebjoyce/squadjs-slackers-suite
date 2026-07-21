@@ -359,9 +359,10 @@ const SwitchOutput = {
       // ── Field 1: Stats ──
       const totalDenied = s.deniedSwitches.length;
       const totalRequests = totalSuccess + totalFailed + totalDenied;
-      const successRate = totalRequests > 0 ? Math.round((totalSuccess / totalRequests) * 100) : 0;
+      const attemptedRequests = totalSuccess + totalFailed;
+      const successRate = attemptedRequests > 0 ? Math.round((totalSuccess / attemptedRequests) * 100) : 0;
+      const failRate = attemptedRequests > 0 ? Math.round((totalFailed / attemptedRequests) * 100) : 0;
       const denyRate = totalRequests > 0 ? Math.round((totalDenied / totalRequests) * 100) : 0;
-      const failRate = totalRequests > 0 ? Math.round((totalFailed / totalRequests) * 100) : 0;
 
       // Denial reason breakdown
       const denialReasons = {};
@@ -550,7 +551,7 @@ const SwitchOutput = {
     };
 
     /**
-     * Builds a diagnostics embed for the !switch diag Discord command.
+     * Builds a diagnostics embed for the !switch status Discord command.
      * Uses the circle emoji status scheme (🟢 ok / 🔴 broken / 🟠 degraded / ⚫ off)
      * established in S³ for consistent cross-plugin UX.
      */

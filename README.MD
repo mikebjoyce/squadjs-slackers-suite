@@ -50,6 +50,8 @@ S³ is a **required** supporting plugin that provides centralised shared state a
 
 Switch will fail to mount if S³ is absent — there is no fallback path.
 
+**Requires S³ ≥1.0.0.**
+
 **Setup**: Install S³ in `config.json` before Switch. It must appear in the plugins array before Switch so it is mounted first. No manual configuration beyond installation is needed.
 
 ---
@@ -151,7 +153,7 @@ squad-server/
 | `!switch check <name/steamID>` | Look up another player's cooldown and lock status |
 | `!switch clear <name/steamID>` | Remove all cooldowns and locks for a player |
 | `!switch clearall` | Wipe the entire cooldown database |
-| `!switch diag` | Show DB health, active locks, and top-10 locked players |
+| `!switch status` | Show DB health, active locks, and top-10 locked players |
 | `!switch help` | List all admin commands |
 
 ### Discord Commands
@@ -160,7 +162,7 @@ squad-server/
 
 | Command | Description |
 |---------|-------------|
-| `!switch diag` | Database health + RCON latency + top-10 locked players |
+| `!switch status` | Database health + RCON latency + top-10 locked players |
 | `!switch check <name/steamID>` | Real-time eligibility lookup with Discord timestamps |
 | `!switch clear <name/steamID>` | Remove cooldowns/locks for a player |
 | `!switch clearall` | Wipe entire cooldown database |
