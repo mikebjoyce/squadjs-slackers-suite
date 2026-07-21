@@ -412,8 +412,24 @@ export default class GameStateService {
     this.roundStartTime = Date.now();
     this.matchId = Math.floor(this.roundStartTime / 1000).toString(36).slice(-8);
 
-    if (data?.layer) {
-      await this.resolveLayerInfo(data.layer, 'handleNewGame');
+    // ── LAYER RESOLUTION ON NEW_GAME ──────────────────────────────────
+    // BUG HISTORY (2026-07-21): server.currentLayer was routinely null after
+    // S³ restarts mid-round (SquadJS 4.2.0 behaviour). The original code only
+    // checked data?.layer — if null, the round started with a stale cached
+    // layer from DB recovery (e.g. "Black Coast Invasion v1" from 5 hours ago).
+    //
+    // FIX: Fall back to server.currentLayer when data.layer is null. If both
+    // are null (server just restarted, SquadJS hasn't populated currentLayer
+    // yet), handleServerInfoUpdated will catch the real layer on the next
+    // ~30s UPDATED_SERVER_INFORMATION poll.
+    //
+    // DO NOT rely solely on data.layer — it can be null. DO NOT rely solely
+    // on server.currentLayer — it can be null after restart. Always try both.
+    const layerSource = data?.layer || this.server.currentLayer;
+    this.verboseLogger(2, `[GameState] NEW_GAME: data.layer=${JSON.stringify(data?.layer)}, server.currentLayer=${JSON.stringify(this.server.currentLayer)}, using=${JSON.stringify(layerSource)}`);
+
+    if (layerSource) {
+      await this.resolveLayerInfo(layerSource, 'handleNewGame');
     }
 
     this._startStagingLiveTimer(now);
@@ -447,27 +463,63 @@ export default class GameStateService {
   }
 
   async handleLayerInfoUpdated() {
-    const incomingName = this._extractLayerName(this.server.currentLayer);
-    if (!this._isKnownLayerName(incomingName)) return;
-
-    // Crash-recovery: check layer divergence using the authoritative format
-    await this._validateRecoveredState('handleLayerInfoUpdated', { serverLayerName: incomingName });
-
-    if (this._normalizeLayerName(this.lastKnownGoodLayer?.name) === this._normalizeLayerName(incomingName)) return;
-    await this.resolveLayerInfo(this.server.currentLayer, 'handleLayerInfoUpdated');
+    // ── WHY THIS HANDLER IS NEUTERED ──────────────────────────────────
+    // BUG HISTORY (2026-07-21): This handler originally performed layer
+    // resolution by reading server.currentLayer. However, server.currentLayer
+    // is null when S³ restarts mid-round (SquadJS 4.2.0 does not repopulate
+    // it from RCON on recovery — confirmed via verbose logging). It MAY be
+    // non-null after a fresh NEW_GAME, but we CANNOT trust it because the
+    // conditions under which SquadJS sets it are opaque and unreliable.
+    //
+    // Per the SquadJS plugin creator skill (see references/event-reliability.md
+    // at https://github.com/Hans-Vader/squadjs-plugin-creator-skill),
+    // UPDATED_LAYER_INFORMATION carries NO payload — consumers are told to
+    // "read server.currentLayer". But server.currentLayer is only populated
+    // by UPDATED_SERVER_INFORMATION, not by UPDATED_LAYER_INFORMATION. This
+    // is a SquadJS architecture quirk: the event that tells you "layer info
+    // updated" doesn't actually give you the layer info — you need the OTHER
+    // event for that.
+    //
+    // FIX: Layer resolution moved exclusively to handleServerInfoUpdated,
+    // which receives the actual layer data via info.currentLayer. This handler
+    // now only performs crash-recovery timing checks via _validateRecoveredState.
+    //
+    // DO NOT re-add layer resolution here — server.currentLayer is unreliable.
+    await this._validateRecoveredState('handleLayerInfoUpdated');
   }
 
   async handleServerInfoUpdated(info) {
+    // ── SOLE LAYER RESOLUTION PATH ────────────────────────────────────
+    // BUG HISTORY (2026-07-21): This handler was originally neutered to
+    // prevent "flip-flopping" with handleLayerInfoUpdated (the two events
+    // use different layer name formats — e.g. "Sumari_Seed_v1" vs
+    // "Sumari Bala Seed v1"). However, handleLayerInfoUpdated was later
+    // found to be unreliable (server.currentLayer is null after mid-round
+    // restarts), so neutering this handler meant NO handler could resolve
+    // layers — the layer displayed in !s3 status was permanently stale.
+    //
+    // FIX: This is now the SINGLE source of truth for layer resolution.
+    // It reads info.currentLayer from the UPDATED_SERVER_INFORMATION event
+    // payload — the ONLY place SquadJS reliably delivers layer data
+    // (see https://github.com/Hans-Vader/squadjs-plugin-creator-skill).
+    //
+    // The normalization guard (_normalizeLayerName comparison) prevents
+    // redundant resolveLayerInfo calls when the layer hasn't actually
+    // changed, avoiding the original flip-flop concern.
+    //
+    // DO NOT neuter this handler again without providing an alternative
+    // layer resolution path. handleLayerInfoUpdated CANNOT do it.
     if (!info?.currentLayer) return;
 
     await this._validateRecoveredState('handleServerInfoUpdated');
 
-    // Layer resolution and divergence checks are handled exclusively by
-    // handleLayerInfoUpdated, which carries the authoritative layer name format.
-    // UPDATED_SERVER_INFORMATION uses a different name format (e.g. "Sumari_Seed_v1"
-    // vs "Sumari Bala Seed v1") that conflicts with the authoritative format from
-    // UPDATED_LAYER_INFORMATION. Calling resolveLayerInfo here causes flip-flopping
-    // LAYER_CHANGE events in S3_GameStateEvents as the two events alternate.
+    const incomingName = this._extractLayerName(info.currentLayer);
+    this.verboseLogger(2, `[GameState] UPDATED_SERVER_INFORMATION: info.currentLayer=${JSON.stringify(info.currentLayer)}, extractedName=${incomingName}`);
+
+    if (!this._isKnownLayerName(incomingName)) return;
+    if (this._normalizeLayerName(this.lastKnownGoodLayer?.name) === this._normalizeLayerName(incomingName)) return;
+
+    await this.resolveLayerInfo(info.currentLayer, 'handleServerInfoUpdated');
   }
 
   async handleUpdatedPlayerInfo() {
@@ -856,9 +908,28 @@ export default class GameStateService {
       this.roundStartTime = Date.now();
       this.matchId = Math.floor(this.roundStartTime / 1000).toString(36).slice(-8);
     }
+    // ── CLEAR STALE LAYER CACHES ON RECOVERY INVALIDATION ────────────
+    // BUG HISTORY (2026-07-21): When _transitionRecoveredStateToLive
+    // invalidated a recovered round (e.g. mount:recovered_round_too_old),
+    // it reset phase/timers but LEFT the cached layer intact. The stale
+    // layer from the DB (e.g. "Black Coast Invasion v1" from a round that
+    // ended 5 hours ago) would then be served by getLayerName() and
+    // getGamemode() indefinitely — because handleLayerInfoUpdated was a
+    // permanent no-op (server.currentLayer always null) and handleNewGame
+    // only resolved when data.layer was non-null.
+    //
+    // FIX: Explicitly null out all three layer caches when invalidating
+    // recovered state. The next successful layer resolution (from
+    // handleServerInfoUpdated or handleNewGame) will repopulate them.
+    //
+    // DO NOT remove this clearing — it is the only defense against stale
+    // DB-persisted layer data surviving recovery invalidation.
+    this.layerNameCached = null;
+    this.gameModeCached = null;
+    this.lastKnownGoodLayer = null;
     this._recoveredStateActive = false;
     await this._persistState();
-    this.verboseLogger(1, `[GameState] Recovered state invalidated -> LIVE (${reason}).`);
+    this.verboseLogger(1, `[GameState] Recovered state invalidated -> LIVE (${reason}). Layer caches cleared.`);
     this._notifyGamePhaseChange(prevPhase);
   }
 
