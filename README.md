@@ -57,28 +57,59 @@ All four consumer plugins enforce this at runtime via `_checkS3Version()`, which
 
 ### Quick Start
 
-1. **Copy plugin files** — For each plugin you want to install, copy its `plugins/` and `utils/` directories into your SquadJS `squad-server/` folder:
+**Recommended:** Use the install script to assemble only the plugins you need. S³ is always auto-included since every consumer plugin depends on it.
 
-   ```
-   squad-server/
-   ├── plugins/
-   │   ├── slackers-squad-services.js    (from s3/plugins/)
-   │   ├── s3-plugin-base.js             (from s3/plugins/)
-   │   ├── s3-discord-plugin-base.js     (from s3/plugins/)
-   │   ├── smart-assign.js               (from smart-assign/plugins/)
-   │   ├── switch.js                     (from switch/plugins/)
-   │   ├── elo-tracker.js                (from elo-tracker/plugins/)
-   │   └── team-balancer.js              (from team-balancer/plugins/)
-   └── utils/
-       ├── game-state-service.js         (from s3/utils/)
-       ├── db-service.js                 (from s3/utils/)
-       ├── players-service.js            (from s3/utils/)
-       ├── clans-service.js              (from s3/utils/)
-       ├── factions-service.js           (from s3/utils/)
-       ├── server-config-service.js      (from s3/utils/)
-       ├── logging-service.js            (from s3/utils/)
-       └── ...                           (other S³ utils)
-   ```
+```bash
+# Node.js (cross-platform)
+node install.cjs --plugin=all
+
+# Bash (Linux/macOS/WSL)
+./install.sh --plugin=all
+```
+
+This produces an `out/` folder with the correct `plugins/` and `utils/` layout. Supported flags:
+
+| Flag | Description |
+|---|---|
+| `--plugin=<name>` | Plugin(s) to install: `s3`, `team-balancer`, `elo-tracker`, `smart-assign`, `switch`, or `all` (comma-separated). S3 is always auto-included. |
+| `--output=<path>` | Output directory (default: `./out`) |
+| `--with-tools` | Also copy `tools/` directories |
+| `--with-testing` | Also copy `testing/` directories |
+
+Examples:
+```bash
+node install.cjs --plugin=team-balancer                      # TeamBalancer + S3
+node install.cjs --plugin=switch,smart-assign                # Switch + SmartAssign + S3
+node install.cjs --plugin=all --with-tools                   # Everything including tools
+node install.cjs --plugin=all --output=../squadjs/squad-server  # Write directly to SquadJS
+```
+
+Then copy the contents of `out/` (or your custom output directory) into your SquadJS `squad-server/` folder.
+
+**Manual installation** (if you prefer to copy files by hand):
+
+For each plugin you want to install, copy its `plugins/` and `utils/` directories into your SquadJS `squad-server/` folder:
+
+```
+squad-server/
+├── plugins/
+│   ├── slackers-squad-services.js    (from s3/plugins/)
+│   ├── s3-plugin-base.js             (from s3/plugins/)
+│   ├── s3-discord-plugin-base.js     (from s3/plugins/)
+│   ├── smart-assign.js               (from smart-assign/plugins/)
+│   ├── switch.js                     (from switch/plugins/)
+│   ├── elo-tracker.js                (from elo-tracker/plugins/)
+│   └── team-balancer.js              (from team-balancer/plugins/)
+└── utils/
+    ├── game-state-service.js         (from s3/utils/)
+    ├── db-service.js                 (from s3/utils/)
+    ├── players-service.js            (from s3/utils/)
+    ├── clans-service.js              (from s3/utils/)
+    ├── factions-service.js           (from s3/utils/)
+    ├── server-config-service.js      (from s3/utils/)
+    ├── logging-service.js            (from s3/utils/)
+    └── ...                           (other S³ utils)
+```
 
 2. **Configure connectors** — Add `database` and `discordClient` connectors to your `config.json`:
 
