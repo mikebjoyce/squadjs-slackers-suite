@@ -420,7 +420,7 @@ const CommandHandlers = {
           default: {
             return await this.respond(
               player,
-              'Invalid command. Usage: !teambalancer [status|diag|on|off|help] or !scramble [now|dry|cancel]'
+              'Invalid command. Usage: !teambalancer [status|diag|on|off|help] or !scramble [now|dry|matchend|cancel]'
             );
           }
         }
@@ -458,12 +458,37 @@ const CommandHandlers = {
       const hasNow = args.includes('now');
       const hasDry = args.includes('dry');
       const isCancel = args.includes('cancel');
+      const isMatchEnd = args.includes('matchend');
 
       const steamID = command.steamID;
       const player = command.player;
       const adminName = player?.name || steamID;
 
       try {
+        // Handle "!scramble matchend" — arm a deferred scramble for the end of this round.
+        if (isMatchEnd) {
+          if (hasNow || hasDry) {
+            return await this.respond(player, '"!scramble matchend" cannot be combined with "now" or "dry".');
+          }
+          if (this._scrambleOnRoundEnd) {
+            return await this.respond(player, 'A match-end scramble is already scheduled. It will fire when this round ends.');
+          }
+          await this._setScrambleArm({ name: adminName, eosID: player?.eosID ?? null });
+          Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Match-end scramble armed by ${adminName}`);
+          const response = await this.respond(player, 'Scramble scheduled for the end of this round. It will fire automatically when the round ends.');
+          if (this.discordChannel) {
+            const embed = {
+              color: 0x3498db,
+              title: '🎮 In-Game Command: !scramble matchend',
+              description: `Executed by **${adminName}**`,
+              fields: [{ name: 'Response', value: 'Scramble scheduled for the end of this round.', inline: false }],
+              timestamp: new Date().toISOString()
+            };
+            await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
+          }
+          return response;
+        }
+
         // Handle cancel subcommand
         if (isCancel) {
           this.scrambleConfirmation = null;

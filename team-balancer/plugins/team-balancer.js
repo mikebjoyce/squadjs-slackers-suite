@@ -111,6 +111,7 @@
  *   !scramble                      → Manually trigger scramble with countdown.
  *   !scramble now                  → Immediate scramble (no countdown).
  *   !scramble dry                  → Dry-run scramble (simulation only).
+ *   !scramble matchend             → Schedule a scramble to fire at the end of the current round.
  *   !scramble confirm              → Confirm a pending scramble request.
  *   !scramble cancel               → Cancel a pending scramble countdown.
  *
@@ -448,6 +449,12 @@ export default class TeamBalancer extends S3PluginBase {
 
     this._isMounted = false;
     this._scramblePending = false;
+    // "!scramble matchend" arm. Persisted to the DB (see _setScrambleArm), stamped with S3's
+    // matchId, so it survives a SquadJS restart mid-round: restored in _onS3Ready(), and in
+    // onRoundEnded it fires only if the current round's matchId matches the stamp — a
+    // restart that crosses a round boundary discards the stale arm instead of scrambling the wrong round.
+    this._scrambleOnRoundEnd = false;
+    this._scrambleOnRoundEndBy = null; // { name, eosID, matchId } — arming admin + round fingerprint, for the gate + discard notices
     this._scrambleTimeout = null;
     this._scrambleCountdownTimeout = null;
     this._flippedAfterScramble = false;
@@ -470,6 +477,44 @@ export default class TeamBalancer extends S3PluginBase {
     const gs = this._s3?.gameState;
     if (!gs?.isReady()) return false;
     return gs.isIgnoredMode?.() || false;
+  }
+
+  // Single funnel for arming/disarming the "!scramble matchend" state: updates the in-memory
+  // flags AND persists to the DB so the arm survives a restart. Pass the { name, eosID } of the
+  // arming admin to arm, or null to disarm. Persistence is best-effort (a DB failure is logged,
+  // not thrown) so the in-memory behaviour is never blocked by the database.
+  async _setScrambleArm(armedBy) {
+    if (armedBy) {
+      // Stamp the arm with S3's matchId. onRoundEnded uses it to detect an arm that
+      // a restart carried into a LATER round and discard it instead of scrambling the wrong round.
+      armedBy = { ...armedBy, matchId: this._s3?.gameState?.getMatchId?.() ?? null };
+    }
+    this._scrambleOnRoundEnd = !!armedBy;
+    this._scrambleOnRoundEndBy = armedBy;
+    if (this.db?.saveScrambleArm) {
+      try {
+        await this.db.saveScrambleArm(armedBy);
+      } catch (err) {
+        Logger.verbose('TeamBalancer', 1, `[DB] Failed to persist scramble arm: ${err.message}`);
+      }
+    }
+  }
+
+  // Tell the arming admin (RCON warn) and Discord that their scheduled match-end scramble was dropped.
+  // `reason` completes "…was discarded because <reason>." — keep it a fragment, no trailing period.
+  async _notifyScrambleDiscarded(armedBy, reason) {
+    if (armedBy?.name) {
+      try {
+        await this.server.rcon.warn(armedBy.name, `${this.RconMessages.prefix} Your scheduled end-of-round scramble was discarded because ${reason}. Re-issue "!scramble matchend" during the round if still needed.`);
+      } catch (err) {
+        Logger.verbose('TeamBalancer', 1, `Failed to warn admin about discarded match-end scramble: ${err.message}`);
+      }
+    }
+    if (this.discordChannel) {
+      DiscordHelpers.sendDiscordMessage(this.discordChannel, {
+        content: `⚠️ Scheduled end-of-round scramble (armed by **${armedBy?.name || 'unknown'}**) was discarded — ${reason}.`
+      });
+    }
   }
 
   // 7.4m: Build a compatibility wrapper around S³ DB that matches TBDatabase's API surface.
@@ -531,7 +576,8 @@ export default class TeamBalancer extends S3PluginBase {
               isStale,
               consecutiveWinsTeam: record.consecutiveWinsTeam,
               consecutiveWinsCount: record.consecutiveWinsCount,
-              manuallyDisabled: record.manuallyDisabled || false
+              manuallyDisabled: record.manuallyDisabled || false,
+              scrambleOnRoundEndBy: record.scrambleOnRoundEndBy || null
             };
           });
         } catch (err) {
@@ -539,7 +585,8 @@ export default class TeamBalancer extends S3PluginBase {
           return {
             winStreakTeam: null, winStreakCount: 0, lastSyncTimestamp: null,
             lastScrambleTime: null, isStale: true,
-            consecutiveWinsTeam: null, consecutiveWinsCount: 0, manuallyDisabled: false
+            consecutiveWinsTeam: null, consecutiveWinsCount: 0, manuallyDisabled: false,
+            scrambleOnRoundEndBy: null
           };
         }
       },
@@ -625,6 +672,21 @@ export default class TeamBalancer extends S3PluginBase {
           });
         } catch (err) {
           Logger.verbose('TeamBalancer', 1, `[7.4m] saveManuallyDisabledState failed: ${err.message}`);
+          return null;
+        }
+      },
+
+      saveScrambleArm: async (armedBy) => {
+        try {
+          return await s3db.withTransactionWithRetry(async () => {
+            const record = await TeamBalancerStateModel.findByPk(1);
+            if (!record) return null;
+            record.scrambleOnRoundEndBy = armedBy || null;
+            await record.save();
+            return { scrambleOnRoundEndBy: record.scrambleOnRoundEndBy };
+          });
+        } catch (err) {
+          Logger.verbose('TeamBalancer', 1, `[7.4m] saveScrambleArm failed: ${err.message}`);
           return null;
         }
       },
@@ -717,7 +779,8 @@ export default class TeamBalancer extends S3PluginBase {
         lastScrambleTime: { type: this.s3db.getDataTypes().BIGINT, allowNull: true },
         consecutiveWinsTeam: { type: this.s3db.getDataTypes().INTEGER, allowNull: true },
         consecutiveWinsCount: { type: this.s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
-        manuallyDisabled: { type: this.s3db.getDataTypes().BOOLEAN, allowNull: false, defaultValue: false }
+        manuallyDisabled: { type: this.s3db.getDataTypes().BOOLEAN, allowNull: false, defaultValue: false },
+        scrambleOnRoundEndBy: { type: this.s3db.getDataTypes().JSON, allowNull: true }
       }, { timestamps: false, tableName: 'TeamBalancerState' });
 
       this.defineModel('TB_RoundReport', {
@@ -744,8 +807,8 @@ export default class TeamBalancer extends S3PluginBase {
         scrambleType: { type: this.s3db.getDataTypes().STRING(100), allowNull: true }
       }, { timestamps: false, tableName: 'TB_RoundReport' });
 
-      // Register expected version + v1 migration
-      this.registerExpectedVersion('team-balancer', 1);
+      // Register expected version + v1 + v2 migrations
+      this.registerExpectedVersion('team-balancer', 2);
       this.registerMigrations('team-balancer', [
         {
           version: 1,
@@ -796,6 +859,25 @@ export default class TeamBalancer extends S3PluginBase {
             await qi.dropTable('TeamBalancerState');
             await qi.dropTable('TB_RoundReport');
           }
+        },
+        {
+          version: 2,
+          description: 'Add scrambleOnRoundEndBy JSON column to TeamBalancerState for !scramble matchend persistence',
+          up: async (qi) => {
+            const existing = await qi.showAllTables();
+            if (existing.includes('TeamBalancerState')) {
+              await qi.addColumn('TeamBalancerState', 'scrambleOnRoundEndBy', {
+                type: qi.DataTypes.JSON,
+                allowNull: true
+              });
+            }
+          },
+          down: async (qi) => {
+            const existing = await qi.showAllTables();
+            if (existing.includes('TeamBalancerState')) {
+              await qi.removeColumn('TeamBalancerState', 'scrambleOnRoundEndBy');
+            }
+          }
         }
       ]);
 
@@ -814,6 +896,24 @@ export default class TeamBalancer extends S3PluginBase {
           this.lastSyncTimestamp = dbState.lastSyncTimestamp;
           this.lastScrambleTime = dbState.lastScrambleTime;
           this.manuallyDisabled = dbState.manuallyDisabled || false;
+
+          // Restore "!scramble matchend" arm if it survived a restart. Compare the stored
+          // matchId against S3's current matchId — if they match, the arm is still valid
+          // (same round). If they differ, the restart crossed a round boundary and the arm
+          // is stale — discard it so we don't scramble the wrong round.
+          if (dbState.scrambleOnRoundEndBy) {
+            const currentMatchId = this._s3?.gameState?.getMatchId?.();
+            if (currentMatchId && dbState.scrambleOnRoundEndBy.matchId === currentMatchId) {
+              this._scrambleOnRoundEnd = true;
+              this._scrambleOnRoundEndBy = dbState.scrambleOnRoundEndBy;
+              Logger.verbose('TeamBalancer', 2, `[7.4m] Restored match-end scramble arm (armed by ${dbState.scrambleOnRoundEndBy.name || 'unknown'}, matchId=${currentMatchId}).`);
+            } else {
+              Logger.verbose('TeamBalancer', 2, `[7.4m] Discarding stale match-end scramble arm — stored matchId=${dbState.scrambleOnRoundEndBy.matchId}, current=${currentMatchId}.`);
+              await this._setScrambleArm(null);
+              await this._notifyScrambleDiscarded(dbState.scrambleOnRoundEndBy, 'a server restart carried it past the round it was armed for');
+            }
+          }
+
           Logger.verbose('TeamBalancer', 4, `[7.4m] Restored state: team=${this.winStreakTeam}, count=${this.winStreakCount}, manuallyDisabled=${this.manuallyDisabled}`);
         } else if (dbState) {
           Logger.verbose('TeamBalancer', 4, '[7.4m] State stale; resetting.');
@@ -933,6 +1033,8 @@ export default class TeamBalancer extends S3PluginBase {
     this.stopPollingGameInfo();
     this.stopPollingTeamAbbreviations();
     this._scrambleInProgress = false;
+    this._scrambleOnRoundEnd = false;
+    this._scrambleOnRoundEndBy = null;
     this.ready = false;
     this._isMounted = false;
   }
@@ -1171,6 +1273,7 @@ export default class TeamBalancer extends S3PluginBase {
             { name: 'Scramble Commands', value: '`!scramble` - Trigger scramble (with countdown)\n' +
               '`!scramble now` - Trigger immediate scramble\n' +
               '`!scramble dry` - Run simulation (dry run)\n' +
+              '`!scramble matchend` - Schedule scramble at end of round\n' +
               '`!scramble cancel` - Cancel pending countdown' }
           ]
         };
@@ -1227,6 +1330,23 @@ export default class TeamBalancer extends S3PluginBase {
     const hasNow = args.includes('now');
     const hasDry = args.includes('dry');
     const isCancel = args.includes('cancel');
+    const isMatchEnd = args.includes('matchend');
+
+    if (isMatchEnd) {
+      if (hasNow || hasDry) {
+        await message.reply('❌ "!scramble matchend" cannot be combined with "now" or "dry".');
+        return;
+      }
+      if (this._scrambleOnRoundEnd) {
+        await message.reply('⚠️ A match-end scramble is already scheduled. It will fire when this round ends.');
+        return;
+      }
+      const adminName = message.author?.username || 'unknown';
+      await this._setScrambleArm({ name: adminName, eosID: null });
+      Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Match-end scramble armed by ${adminName} (Discord)`);
+      await message.reply('✅ Scramble scheduled for the end of this round. It will fire automatically when the round ends.');
+      return;
+    }
 
     if (isCancel) {
       this.scrambleConfirmation = null;
@@ -1325,7 +1445,16 @@ export default class TeamBalancer extends S3PluginBase {
       this.gameModeCached = null;
       this.layerNameCached = null;
       this._scrambleInProgress = false;
-      this._scramblePending = false;      
+      this._scramblePending = false;
+
+      // Discard any armed "!scramble matchend" — a new round has started without consuming it.
+      if (this._scrambleOnRoundEnd) {
+        const armedBy = this._scrambleOnRoundEndBy;
+        Logger.verbose('TeamBalancer', 2, `[onNewGame] Discarding match-end scramble arm (armed by ${armedBy?.name || 'unknown'}) — new round started.`);
+        await this._setScrambleArm(null);
+        await this._notifyScrambleDiscarded(armedBy, 'a new round started before the scheduled scramble could fire');
+      }
+
       try {
         const flippedTeam = this.winStreakTeam === 1 ? 2 : this.winStreakTeam === 2 ? 1 : null;
         const flippedConTeam = this.consecutiveWinsTeam === 1 ? 2 : this.consecutiveWinsTeam === 2 ? 1 : null;
@@ -1389,6 +1518,56 @@ export default class TeamBalancer extends S3PluginBase {
 
     try {
       Logger.verbose('TeamBalancer', 4, `Round ended event received: ${JSON.stringify(data)}`);
+
+      // ── "!scramble matchend" stale-arm guard + execution ──────────
+      // Consumed FIRST, before any win-streak/disabled/ignored checks, so it fires
+      // regardless of tracking state, match outcome (incl. draws), or ignored/seed modes.
+      // The arm is stamped with S3's matchId at arm time; compare against the current
+      // round's matchId to detect a restart that crossed a round boundary.
+      if (this._scrambleOnRoundEnd) {
+        const armedBy = this._scrambleOnRoundEndBy;
+        const currentMatchId = this._s3?.gameState?.getMatchId?.();
+        const armedMatchId = armedBy?.matchId ?? null;
+
+        if (currentMatchId && armedMatchId && armedMatchId !== currentMatchId) {
+          // Restart crossed a round boundary — the arm is stale. Discard it and fall
+          // through so THIS round is evaluated normally by the win-streak path below.
+          Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Discarding stale match-end scramble arm: armed for matchId=${armedMatchId} but current round is matchId=${currentMatchId}.`);
+          await this._setScrambleArm(null);
+          await this._notifyScrambleDiscarded(armedBy, 'a server restart carried it past the round it was armed for');
+        } else {
+          // Same round — fire the deferred scramble.
+          await this._setScrambleArm(null);
+
+          // Populate the round report's layer fallback and outcome fields for the finally block.
+          if (this.gameModeCached === null && this.layerNameCached === null && this.lastKnownGoodLayer !== null) {
+            this.gameModeCached = this.lastKnownGoodLayer.gamemode;
+            this.layerNameCached = this.lastKnownGoodLayer.name;
+            roundReport.gameMode = this.gameModeCached;
+            roundReport.layerName = this.layerNameCached;
+          }
+          roundReport.scrambled = true;
+          roundReport.scrambleCondition = 'Match End (Manual)';
+
+          Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Firing match-end scramble (armed by ${armedBy?.name || 'unknown'}).`);
+          const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.scrambleAnnouncement, {
+            team: 'Match End',
+            count: 0,
+            margin: 0,
+            delay: this.options.scrambleAnnouncementDelay
+          })}`;
+          try {
+            await this.server.rcon.broadcast(msg);
+          } catch (err) {
+            Logger.verbose('TeamBalancer', 1, `Failed to broadcast match-end scramble announcement: ${err.message}`);
+          }
+          this.mirrorRconToDiscord(msg, 'warning');
+          this.initiateScramble(false, false).catch(err =>
+            Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
+          );
+          return; // Early return — the finally block still logs this round.
+        }
+      }
 
       if (!this.options.enableWinStreakTracking || this.manuallyDisabled) {
         Logger.verbose('TeamBalancer', 4, 'Win streak tracking disabled, skipping round evaluation.');
