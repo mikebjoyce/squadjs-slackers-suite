@@ -167,8 +167,8 @@ this.players.registerPriority('MyPlugin', 4);  // Above TeamBalancer (default: 3
 
 **Slacker**
 
-- **Discord:** `real_slacker`
-- **GitHub:** https://github.com/mikebjoyce/squadjs-slackers-squad-services
+Discord: `real_slacker`
+GitHub: https://github.com/mikebjoyce
 
 ---
 

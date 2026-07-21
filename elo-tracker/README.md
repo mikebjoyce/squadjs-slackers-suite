@@ -57,7 +57,7 @@ A dynamic uncertainty floor (τ/tau) prevents sigma from reaching zero, ensuring
 
 ### TeamBalancer
 
-**[squadjs-team-balancer](https://github.com/mikebjoyce/squadjs-team-balancer)**
+**[squadjs-team-balancer](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/team-balancer)**
 
 When `useEloForBalance: true` is set in TeamBalancer, its scoring function switches to an ELO-weighted branch. It pulls live mu ratings and regular player counts from EloTracker at scramble time, evaluating mu difference, regular parity, and numerical balance (replacing its standard heuristic penalties). This prevents skill stacks from reforming after a scramble.
 
@@ -67,7 +67,7 @@ No additional configuration is needed on the EloTracker side. TeamBalancer finds
 
 ### S³ (Slacker's Squad Services)
 
-**[squadjs-slackers-squad-services](https://github.com/mikebjoyce/squadjs-slackers-squad-services)**
+**[squadjs-slackers-squad-services](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/s3)**
 
 S³ is the centralised service container for shared state across Slacker's Squad plugins. EloTracker uses it as the primary data source for game-state metadata — round start time, layer name, gamemode, and ignored-mode detection.
 

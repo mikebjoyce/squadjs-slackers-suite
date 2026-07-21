@@ -151,7 +151,10 @@ node run-all-tests.js --category 2    # Integration tests
 
 ## Author
 
-**Slacker** — Discord: `real_slacker`
+**Slacker**
+
+Discord: `real_slacker`
+GitHub: https://github.com/mikebjoyce
 
 ---
 

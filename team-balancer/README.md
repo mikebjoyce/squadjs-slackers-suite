@@ -42,7 +42,7 @@ Scramble execution swaps entire squads or unassigned players, balancing team siz
 
 ### EloTracker
 
-**[squadjs-elo-tracker](https://github.com/mikebjoyce/squadjs-elo-tracker)**
+**[squadjs-elo-tracker](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/elo-tracker)**
 
 Tracks per-player TrueSkill ratings (μ/σ) across rounds. When `useEloForBalance` is enabled, its scoring function switches to an ELO-weighted branch. It pulls live mu ratings and regular player counts from EloTracker at scramble time, evaluating a composite ELO difference (Mean and Top-15 players), veteran parity, and numerical balance (replacing its standard heuristic penalties). This prevents skill stacks from reforming after a scramble.
 
@@ -54,7 +54,7 @@ Tracks per-player TrueSkill ratings (μ/σ) across rounds. When `useEloForBalanc
 
 ### Switch Plugin (TeamBalancer-Aware Fork)
 
-**[squadjs-switch-teambalancer-aware](https://github.com/mikebjoyce/squadjs-switch-teambalancer-aware)**
+**[squadjs-switch-teambalancer-aware](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/switch)**
 
 Prevents players from changing teams immediately after a scramble. When TeamBalancer executes a scramble, it fires the `TEAM_BALANCER_SCRAMBLE_EXECUTED` event. The Switch plugin listens for this event and automatically locks all players from switching teams for a configurable duration (default: 20 minutes).
 
@@ -66,7 +66,7 @@ Prevents players from changing teams immediately after a scramble. When TeamBala
 
 ### S³ (Slacker's Squad Services)
 
-**[squadjs-slackers-squad-services](https://github.com/mikebjoyce/squadjs-slackers-squad-services)**
+**[squadjs-slackers-squad-services](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/s3)**
 
 S³ is the centralised service container for shared state across Slacker's Squad plugins. TeamBalancer uses it as the primary data source for player state, squad data, faction names, clan grouping, game-mode detection (including ignored modes), and game-state metadata.
 
@@ -115,7 +115,7 @@ When clan tag grouping is enabled on S³, the scrambler keeps players who share 
 
 **How it works**:
 
-* **Tag detection**: Player names are scanned for a leading clan tag via a five-strategy detector (ported from [squadjs-elo-tracker](https://github.com/mikebjoyce/squadjs-elo-tracker)), tried in order: bracket pairs (`[TAG]`, `【TAG】`, `╔TAG╗`), explicit separators (`TAG | Name`, `TAG // Name`), 2+ space gap, short ASCII ALL-CAPS (`KM Lookout`), and a bare-prefix fallback for Unicode/mixed-case prefixes (`KΛZ Korven`). Names with no visible tag/name boundary (e.g. `ABCJohnSmith`) yield no group.
+* **Tag detection**: Player names are scanned for a leading clan tag via a five-strategy detector (ported from [squadjs-elo-tracker](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/elo-tracker)), tried in order: bracket pairs (`[TAG]`, `╔TAG╗`), explicit separators (`TAG | Name`, `TAG // Name`), 2+ space gap, short ASCII ALL-CAPS (`KM Lookout`), and a bare-prefix fallback for Unicode/mixed-case prefixes (`KeyErrorZ Korven`). Names with no visible tag/name boundary (e.g. `ABCJohnSmith`) yield no group.
 * **Matching**: Case-sensitive by default. Set `clanTagCaseSensitive: false` to normalize via NFD-decompose, lookalike mapping (`λ`→`a`, `я`→`r`, …), and uppercase, collapsing variants like `[Café]` / `[CAFE]` / `[CΛFE]`. Tags within `clanTagMaxEditDistance` Levenshtein distance are iteratively merged so transitive matches (`[AAA] ↔ [AAB] ↔ [ABB]`) collapse into one group.
 * **Virtual squads**: Per team, clan members are folded into a virtual squad anchored on the squad already holding the most clan members (tiebreak: larger size, lower ID). `clanGroupingPullEntireSquads` toggles whether non-clan teammates travel along (default: only clan members are pulled).
 * **Phase behavior**: Phase 1 swaps virtual squads atomically. Phases 2/3 prefer non-clan victims and only break a virtual squad when no other option exists; a soft scoring penalty further discourages re-splitting once decomposition begins.
@@ -363,8 +363,9 @@ TimeBeforeVote=45
 ## Author
 
 **Slacker**
-- **Discord:** `real_slacker`
-- **GitHub:** https://github.com/mikebjoyce/squadjs-team-balancer
+
+Discord: `real_slacker`
+GitHub: https://github.com/mikebjoyce
 
 ---
 

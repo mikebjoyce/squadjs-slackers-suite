@@ -28,7 +28,7 @@ Survives server restarts via any Sequelize-compatible database (SQLite, MySQL, P
 
 ### TeamBalancer
 
-**[squadjs-team-balancer](https://github.com/mikebjoyce/squadjs-team-balancer)**
+**[squadjs-team-balancer](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/team-balancer)**
 
 Provides squad-preserving scramble functionality. When a scramble is executed, TeamBalancer fires the `TEAM_BALANCER_SCRAMBLE_EXECUTED` event. The Switch plugin listens for this event and automatically locks affected players from switching teams for a configurable duration (default: 20 minutes).
 
@@ -40,7 +40,7 @@ Provides squad-preserving scramble functionality. When a scramble is executed, T
 
 ### SlackersSquadServices (S³)
 
-**[SlackersSquadServices](https://github.com/mikebjoyce/SlackersSquadServices)**
+**[SlackersSquadServices](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/s3)**
 
 S³ is a **required** supporting plugin that provides centralised shared state across Slacker's Squad plugins. Switch discovers S³ at mount time and uses it for:
 
@@ -109,17 +109,12 @@ Move the project files into your SquadJS directory:
 ```
 squad-server/
 ├── plugins/
-│   └── discord-base-plugin.js      (if not already present)
-├── squadjs-switch-teambalancer-aware/
 │   └── switch.js
-```
-
-Or, if placing directly in the plugins directory:
-
-```
-squad-server/
-└── plugins/
-    └── switch.js
+├── utils/
+│   ├── switch-db.js
+│   ├── switch-output.js
+│   ├── switch-queue.js
+│   └── switch-commands.js
 ```
 
 ---
@@ -267,9 +262,7 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 **Original Author:** [fantinodavide](https://github.com/fantinodavide)  
 **Modified by:** Slacker  
 **Discord:** `real_slacker`  
-**GitHub:** [squadjs-switch-teambalancer-aware](https://github.com/mikebjoyce/squadjs-switch-teambalancer-aware)
-
-This plugin is a modified fork with added persistence, TeamBalancer integration, S³ support, and expanded admin controls.
+**GitHub:** https://github.com/mikebjoyce
 
 ---
 

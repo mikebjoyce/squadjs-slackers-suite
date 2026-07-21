@@ -32,7 +32,7 @@ Disconnect detection works via delta-diff: every time any player joins and trigg
 
 ### EloTracker
 
-**[squadjs-elo-tracker](https://github.com/mikebjoyce/squadjs-elo-tracker)**
+**[squadjs-elo-tracker](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/elo-tracker)**
 
 Tracks per-player TrueSkill ratings (μ/σ) across rounds. SmartAssign automatically detects if EloTracker is active and uses its live ratings to make skill-based routing decisions. Without it, the plugin falls back to pure population balancing.
 
@@ -40,7 +40,7 @@ Tracks per-player TrueSkill ratings (μ/σ) across rounds. SmartAssign automatic
 
 ### SlackersSquadServices (S³)
 
-**[squadjs-slackers-squad-services](https://github.com/mikebjoyce/squadjs-slackers-squad-services)**
+**[squadjs-slackers-squad-services](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/s3)**
 
 S³ is a **required** supporting plugin that provides shared game state, player management, and clan services to all consumer plugins. SmartAssign consumes `gameState` (round metadata, mode checks), `players` (reconnect memory, move attribution, refresh interest), and `clans` (tag extraction, normalisation, cache) services.
 
@@ -256,8 +256,8 @@ It targets a specific player by EOSID and runs a full lifecycle profile:
 
 **Slacker**
 
-- **Discord:** `real_slacker`
-- **GitHub:** https://github.com/mikebjoyce/squadjs-smart-assign
+Discord: `real_slacker`
+GitHub: https://github.com/mikebjoyce
 
 ---
 

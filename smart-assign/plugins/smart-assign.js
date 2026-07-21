@@ -48,7 +48,7 @@
  * runtime via this.server.plugins and access services through flat
  * getters (e.g. this._s3?.gameState) guarded by isReady() checks.
  *
- * GitHub: https://github.com/mikebjoyce/squadjs-slackers-squad-services
+ * GitHub: https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/s3
  *
  * Consumed Services:
  *   - gameState: getRoundStartTime(), getMatchId(), getLayerName(),
