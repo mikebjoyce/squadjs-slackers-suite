@@ -1,0 +1,576 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║                PLAYER COMMAND & RESPONSE LOGIC                ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * ─── PURPOSE ─────────────────────────────────────────────────────
+ *
+ * Registers in-game and Discord command handlers onto the TeamBalancer
+ * plugin instance. Handles !teambalancer and !scramble commands with
+ * permission enforcement, argument parsing, and response formatting.
+ *
+ * ─── EXPORTS ─────────────────────────────────────────────────────
+ *
+ * CommandHandlers (default)
+ *   Object with a single register(tb) method. Mutates the TeamBalancer
+ *   instance by attaching methods directly onto it:
+ *     respond(player, msg)              — rcon.warn wrapper with logging.
+ *     formatMessage(template, values)   — Simple {key} string interpolation.
+ *     onTeamBalancerCommand(info)       — Handles !teambalancer chat commands.
+ *     onScrambleCommand(info)           — Handles !scramble chat commands.
+ *     onDiscordMessage(message)         — Handles Discord !teambalancer and !scramble commands.
+ *
+ * ─── DEPENDENCIES ────────────────────────────────────────────────
+ *
+ * Logger (../../core/logger.js)
+ *   Verbose logging for command responses and permission failures.
+ * DiscordHelpers (./tb-discord-helpers.js)
+ *   Status and diagnostic embed builders for Discord responses.
+ * TBDiagnostics (./tb-diagnostics.js)
+ *   Diagnostic runner invoked by !teambalancer diag.
+ *
+ * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - Admin permission is checked via server.getAdminPermBySteamID() or
+ *   the discordAdminRoleIDs role check. devMode bypasses both.
+ * - !scramble confirm has a scrambleConfirmationTimeout window. Pending
+ *   state is stored on tb.scrambleConfirmation.
+ * - Discord commands mirror the in-game admin command set. Public
+ *   commands are available to all users in the configured admin channel.
+ * - formatMessage replaces {key} placeholders — not a full template
+ *   engine. Values not found in the params object are left as-is.
+ *
+ * Author:
+ * Discord: `real_slacker`
+ *
+ * ═══════════════════════════════════════════════════════════════
+ */
+
+import Logger from '../../core/logger.js';
+import { DiscordHelpers } from './tb-discord-helpers.js';
+import { TBDiagnostics } from './tb-diagnostics.js';
+
+const CommandHandlers = {
+  register(tb) {
+    tb.respond = async function (player, msg) {
+      const playerName = player?.name || 'Unknown Player';
+      const warnIdentifier = player?.name || player?.steamID;
+      let logMessage = `[TeamBalancer][Response to ${playerName}`;
+      logMessage += ` (${warnIdentifier || 'Unknown'})]\n${msg}`;
+      Logger.verbose('TeamBalancer', 2, logMessage);
+
+      if (warnIdentifier) {
+        try {
+          await this.server.rcon.warn(warnIdentifier, msg);
+        } catch (err) {
+          Logger.verbose('TeamBalancer', 1, `Failed to send RCON warn to ${warnIdentifier}: ${err.message}`);
+        }
+      }
+      return msg;
+    };
+
+    tb.formatMessage = (template, values) => {
+      if (typeof template !== 'string') {
+        Logger.verbose('TeamBalancer', 1, `[Error] formatMessage received invalid template: ${typeof template}`);
+        return '';
+      }
+      for (const key in values) {
+        template = template.split(`{${key}}`).join(values[key]);
+      }
+      return template;
+    };
+
+    tb.RconMessages = {
+      prefix: '[TeamBalancer]',
+      draw: 'Round ended in a Draw!',
+
+      nonDominant: {
+        streakBroken: "{team} ended {loser}'s domination streak | ({margin} tickets)",
+        invasionAttackWin: '{team} defeated defenders | ({margin} tickets)',
+        invasionDefendWin: '{team} held off attackers | ({margin} tickets)',
+
+        narrowVictory: '{team} narrowly defeated {loser} | ({margin} tickets)',
+        marginalVictory: '{team} gained ground on {loser} | ({margin} tickets)',
+        tacticalAdvantage: '{team} pushed through {loser} | ({margin} tickets)',
+        operationalSuperiority: '{team} outmaneuvered {loser} | ({margin} tickets)'
+      },
+
+      dominant: {
+        steamrolled: '{team} steamrolled {loser} | ({margin} tickets)',
+        stomped: '{team} stomped {loser} | ({margin} tickets)',
+        dominantVictory: '{team} dominated {loser} | ({margin} tickets)',
+        invasionAttackStomp: '{team} crushed defenders with force | ({margin} tickets)',
+        invasionDefendStomp: '{team} decisively repelled attackers | ({margin} tickets)'
+      },
+
+      scrambleAnnouncement:
+        '{team} has reached {count} dominant wins ({margin} tickets) | Scrambling in {delay}s...',
+      consecutiveWinsScramble:
+        '{team} has won {count} consecutive rounds | Scrambling in {delay}s...',
+      singleRoundScramble:
+        'Extreme ticket difference detected ({margin} tickets) | Scrambling in {delay}s...',
+      manualScrambleAnnouncement:
+        'Manual team balance triggered by admin | Scrambling in {delay}s...',
+      immediateManualScramble: 'Manual team balance triggered by admin | Scrambling teams...',
+      executeScrambleMessage: 'Executing scramble...',
+      executeDryRunMessage: 'Dry Run: Simulating scramble...',
+      scrambleCompleteMessage: 'Balance has been restored.',
+      scrambleFailedMessage: 'Scramble failed! No valid solution found.',
+      playerScrambledWarning: "You've been scrambled.", 
+      seedScrambleAnnouncement: 'Seed match complete! Scrambling teams in {delay}s...',
+
+      system: {
+        trackingEnabled: 'Team Balancer has been enabled.',
+        trackingDisabled: 'Team Balancer has been disabled.'
+      }
+    };
+
+    tb.onChatMessage = async function (info) {
+      const message = info.message?.trim();
+      // Only respond to the exact '!teambalancer' command without arguments
+      if (!message || message.toLowerCase() !== '!teambalancer') return;
+
+      const steamID = info.steamID;
+      const playerName = info.player?.name || 'Unknown';
+      Logger.verbose('TeamBalancer', 4, `General teambalancer info requested by ${playerName} (${steamID})`);
+
+      const now = Date.now();
+      const timeDifference = now - this.lastScrambleTime;
+      let lastScrambleText;
+
+      if (!this.lastScrambleTime) {
+        lastScrambleText = 'Never';
+      } else {
+        const minutes = Math.floor(timeDifference / 60000);
+        const hours = Math.floor(minutes / 60);
+
+        if (hours > 0) {
+          lastScrambleText = `${hours} hour${hours > 1 ? 's' : ''} ago`;
+        } else {
+          lastScrambleText = `${minutes} minute${minutes !== 1 ? 's' : ''} ago`;
+        }
+      }
+      const statusText = !this.ready
+        ? 'Initializing...'
+        : this.manuallyDisabled
+        ? 'Manually disabled'
+        : this.options.enableWinStreakTracking
+        ? 'Active'
+        : 'Disabled in config';
+
+      const winStreakText =
+        this.winStreakCount > 0
+          ? `${this.getTeamName(this.winStreakTeam)} has ${this.winStreakCount} dominant win(s)`
+          : `No current win streak`;
+
+      const eloTrackerPlugin = this.server.plugins?.find(p => p.constructor.name === 'EloTracker');
+      const eloStatus = this.options?.useEloForBalance ? (eloTrackerPlugin ? 'Active' : 'Unavailable') : 'Disabled';
+
+      // Formatted response for !teambalancer
+      const infoMsg = [
+        `=== TeamBalancer ===`,
+        `Version: ${this.constructor.version}`,
+        `Status: ${statusText}`,
+        `Elo Integration: ${eloStatus}`,
+        `Dominance Streak: ${winStreakText}`,
+        `Last Scramble: ${lastScrambleText}`,
+        `Max Streak Threshold: ${this.options.maxWinStreak} dominant win(s)`
+      ].join('\n');
+
+      Logger.verbose('TeamBalancer', 4, `[TeamBalancer] !teambalancer response sent to ${playerName} (${steamID}):\n${infoMsg}`);
+
+      try {
+        // Use player name (always present for connected players) for the RCON warn
+        await this.server.rcon.warn(playerName, infoMsg);
+      } catch (err) {
+        Logger.verbose('TeamBalancer', 1, `Failed to send info message to ${playerName}: ${err.message || err}`);
+      }
+      return await this.respond(info.player || { steamID: info.steamID, name: playerName }, infoMsg);
+    };
+
+    tb.onChatCommand = async function (command) {
+      Logger.verbose('TeamBalancer', 4, `Chat command received: !teambalancer ${command.message}`);
+
+      // This line ensures commands are only processed from admin chat when devMode is false
+      // The public-facing '!teambalancer' (no args) is handled by onChatMessage.
+      if (!this.options.devMode && command.chat !== 'ChatAdmin') return;
+
+      const message = command.message; // This is the part AFTER !teambalancer
+      const steamID = command.steamID;
+      const player = command.player; // Get the player object
+      const adminName = player?.name || steamID; // Prioritize player name
+
+      // If no subcommand is provided (i.e., just "!teambalancer"),
+      // let onChatMessage handle the public status display.
+      // This prevents an "Invalid command" response for the public status check.
+      if (!message.trim()) {
+        Logger.verbose('TeamBalancer', 4, 'No subcommand provided for !teambalancer (admin chat), letting onChatMessage handle public status.');
+        return;
+      }
+
+      if (!this.ready) {
+        const msg = message.trim().toLowerCase();
+        // Allow 'status' to pass through so admins can see the "INITIALIZING" state
+        if (!msg.startsWith('status')) {
+          return await this.respond(command.player || { steamID: command.steamID }, 'TeamBalancer is still initializing, please try again in a moment.');
+        }
+      }
+
+      const args = message.trim().split(/\s+/);
+      const subcommand = args[0]?.toLowerCase();
+
+      try {
+        switch (subcommand) {
+          case 'on': {
+            if (!this.manuallyDisabled) {
+              return await this.respond(player, 'Win streak tracking is already enabled.');
+            }
+            this.manuallyDisabled = false;
+            try {
+              await this.db.saveManuallyDisabledState(false);
+            } catch (err) {
+              Logger.verbose('TeamBalancer', 1, `[DB] Failed to persist enabled state: ${err.message}`);
+            }
+            Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Win streak tracking enabled by ${adminName}`);
+            const response = await this.respond(player, 'Win streak tracking enabled.');
+            try {
+              await this.server.rcon.broadcast(
+                `${this.RconMessages.prefix} ${this.RconMessages.system.trackingEnabled}`
+              );
+            } catch (err) {
+              Logger.verbose('TeamBalancer', 1, `Failed to broadcast tracking enabled message: ${err.message}`);
+            }
+            if (this.discordChannel) {
+              const embed = {
+                color: 0x3498db,
+                title: '🎮 In-Game Command: !teambalancer on',
+                description: `Executed by **${adminName}**`,
+                fields: [{ name: 'Response', value: 'Win streak tracking enabled.', inline: false }],
+                timestamp: new Date().toISOString()
+              };
+              await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
+            }
+            return response;
+          }
+          case 'off': {
+            if (this.manuallyDisabled) {
+              return await this.respond(player, 'Win streak tracking is already disabled.');
+            }
+            this.manuallyDisabled = true;
+            try {
+              await this.db.saveManuallyDisabledState(true);
+            } catch (err) {
+              Logger.verbose('TeamBalancer', 1, `[DB] Failed to persist disabled state: ${err.message}`);
+            }
+            Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Win streak tracking disabled by ${adminName}`);
+            const response = await this.respond(player, 'Win streak tracking disabled.');
+            try {
+              await this.server.rcon.broadcast(
+                `${this.RconMessages.prefix} ${this.RconMessages.system.trackingDisabled}`
+              );
+            } catch (err) {
+              Logger.verbose('TeamBalancer', 1, `Failed to broadcast tracking disabled message: ${err.message}`);
+            }
+            if (this.discordChannel) {
+              try {
+                const embed = {
+                  color: 0x3498db,
+                  title: '🎮 In-Game Command: !teambalancer off',
+                  description: `Executed by **${adminName}**`,
+                  fields: [{ name: 'Response', value: 'Win streak tracking disabled.', inline: false }],
+                  timestamp: new Date().toISOString()
+                };
+                await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
+              } catch (discordErr) {
+                Logger.verbose('TeamBalancer', 1, `Discord embed failed: ${discordErr.message}`);
+              }
+            }
+            await this.resetStreak('Manual disable');
+            return response;
+          }
+          case 'status': {
+            // Determine the effective plugin status
+            const effectiveStatus = !this.ready
+              ? 'INITIALIZING'
+              : this.manuallyDisabled
+              ? 'DISABLED (manual)'
+              : this.options.enableWinStreakTracking
+              ? 'ENABLED'
+              : 'DISABLED (config)';
+
+            // Win Streak with Threshold
+            const maxStreak = this.options?.maxWinStreak || 2;
+            const winStreakText = this.winStreakTeam
+              ? `${this.getTeamName(this.winStreakTeam)}: ${this.winStreakCount} / ${maxStreak} wins`
+              : `None (Threshold: ${maxStreak} wins)`;
+
+            const maxConsec = this.options.maxConsecutiveWinsWithoutThreshold;
+            const consecText = maxConsec > 0
+              ? (this.consecutiveWinsTeam
+                  ? `${this.getTeamName(this.consecutiveWinsTeam)}: ${this.consecutiveWinsCount} / ${maxConsec} wins`
+                  : `None (Threshold: ${maxConsec} wins)`)
+              : 'Disabled';
+
+            // Format the last scramble timestamp (Relative for in-game)
+            let lastScrambleText = 'Never';
+            if (this.lastScrambleTime) {
+              const diff = Date.now() - this.lastScrambleTime;
+              const mins = Math.floor(diff / 60000);
+              const hours = Math.floor(mins / 60);
+              if (hours > 0) {
+                lastScrambleText = `${hours}h ${mins % 60}m ago`;
+              } else {
+                lastScrambleText = `${mins}m ago`;
+              }
+            }
+
+            // Player Counts
+            const players = this.server.players;
+            const t1Count = players.filter((p) => p.teamID === 1).length;
+            const t2Count = players.filter((p) => p.teamID === 2).length;
+
+            // Layer
+            const currentLayer = this.server.currentLayer?.name || 'Unknown';
+
+            const eloTrackerPlugin = this.server.plugins?.find(p => p.constructor.name === 'EloTracker');
+            const eloStatus = this.options?.useEloForBalance ? (eloTrackerPlugin ? 'Active' : 'Unavailable') : 'Disabled';
+
+            // Formatted response for !teambalancer status
+            const statusMsg = [
+              `--- TeamBalancer Status ---`,
+              `Version: ${this.constructor.version}`,
+              `Plugin Status: ${effectiveStatus}`,
+              `Elo Integration: ${eloStatus}`,
+              `Win Streak: ${winStreakText}`,
+              `Consecutive Wins: ${consecText}`,
+              `Last Scramble: ${lastScrambleText}`,
+              `Players: ${players.length} (T1: ${t1Count} | T2: ${t2Count})`,
+              `Layer: ${currentLayer}`,
+              `---------------------------`
+            ].join('\n');
+
+            const response = await this.respond(player, statusMsg);
+            if (this.discordChannel) {
+              const embed = DiscordHelpers.buildStatusEmbed(this);
+              embed.description = `Executed by **${adminName}**`;
+              await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
+            }
+            return response;
+          }
+          case 'diag': {
+            Logger.verbose('TeamBalancer', 4, 'Diagnostics command received.');
+            await this.server.rcon.warn(player?.name || steamID, 'Running diagnostics... please wait.');
+
+            const diagnostics = new TBDiagnostics(this);
+            const results = await diagnostics.runAll();
+
+            const s3Result = results.find((r) => r.name === 'S³ Integration');
+            const scrambleResult = results.find((r) => r.name === 'Live Scramble Test');
+
+            const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+            // Page 1/3: Diagnostic results
+            await this.respond(player, [
+              `--- [TB Diag] ---`,
+              `S³: ${s3Result.pass ? 'PASS' : 'FAIL'}`,
+              `Scramble: ${scrambleResult.message}`,
+              `State: ${this.manuallyDisabled ? 'DISABLED' : 'ENABLED'}`
+            ].join('\n'));
+            await sleep(5500);
+
+            // Page 2/3: Runtime state + threshold highlights
+            const players = this.server.players;
+            const squads = this.server.squads;
+            const t1Players = players.filter((p) => p.teamID === 1);
+            const t2Players = players.filter((p) => p.teamID === 2);
+            const t1Squads = squads.filter((s) => s.teamID === 1);
+            const t2Squads = squads.filter((s) => s.teamID === 2);
+            const layer = await this.server.currentLayer;
+            const layerName = layer?.name || 'Unknown';
+            const gameMode = this.gameModeCached || 'N/A';
+            const team1Name = this.getTeamName(1);
+            const team2Name = this.getTeamName(2);
+
+            await this.respond(player, [
+              `Scramble Pending: ${this._scramblePending ? 'Yes' : 'No'}`,
+              `Scramble Active: ${this._scrambleInProgress ? 'Yes' : 'No'}`,
+              `Plyrs: ${players.length} (T1: ${t1Players.length} | T2: ${t2Players.length})`,
+              `Squads: ${squads.length} (T1: ${t1Squads.length} | T2: ${t2Squads.length})`,
+              `Layer: ${layerName} / ${gameMode}`
+            ].join('\n'));
+            await sleep(5500);
+
+            // Page 3/3: Key config
+            await this.respond(player, [
+              `Thresholds: ${this.options.maxWinStreak} wins / ${this.options?.minTicketsToCountAsDominantWin || 150} tix`,
+              `Scramble: ${(this.options?.scramblePercentage || 0.5) * 100}% | ${this.options?.scrambleAnnouncementDelay}s | ${this.options?.maxScrambleCompletionTime}ms`,
+              `Teams: ${team1Name} | ${team2Name}`,
+              `1-Round: ${this.options?.enableSingleRoundScramble ? `ON (> ${this.options?.singleRoundScrambleThreshold} tix)` : 'OFF'}`,
+              `Invasion: Atk ${this.options?.invasionAttackTeamThreshold} | Def ${this.options?.invasionDefenceTeamThreshold}`
+            ].join('\n'));
+
+            const targetReportChannel = this.discordReportChannel || this.discordChannel;
+            if (targetReportChannel) {
+              const embeds = DiscordHelpers.buildDiagEmbeds(this, results);
+              embeds[0].description = `Executed by **${adminName}** (In-Game)\n${embeds[0].description}`;
+              await DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds });
+            }
+            return;
+          }
+          default: {
+            return await this.respond(
+              player,
+              'Invalid command. Usage: !teambalancer [status|diag|on|off|help] or !scramble [now|dry|cancel]'
+            );
+          }
+        }
+      } catch (err) {
+        Logger.verbose('TeamBalancer', 1, `[TeamBalancer] Error processing chat command: ${err?.message || err}`);
+        return await this.respond(player, `Error processing command: ${err.message}`);
+      }
+    };
+
+    tb.onScrambleCommand = async function (command) {
+      Logger.verbose('TeamBalancer', 4, `Scramble command received: !scramble ${command.message}`);
+      // This line ensures commands are only processed from admin chat when devMode is false
+      if (!this.options.devMode && command.chat !== 'ChatAdmin') return;
+
+      if (!this.ready) {
+        return await this.respond(command.player || { steamID: command.steamID }, 'TeamBalancer is still initializing, please try again in a moment.');
+      }
+
+      let args = (command.message?.trim().toLowerCase().split(/\s+/) || []).filter(arg => arg);
+      const isConfirm = args.includes('confirm');
+
+      if (isConfirm) {
+        if (!this.scrambleConfirmation) {
+          return await this.respond(player, 'No pending scramble confirmation found.');
+        }
+        const timeoutMs = (this.options.scrambleConfirmationTimeout || 60) * 1000;
+        if (Date.now() - this.scrambleConfirmation.timestamp > timeoutMs) {
+          this.scrambleConfirmation = null;
+          return await this.respond(player, 'Scramble confirmation expired.');
+        }
+        args = this.scrambleConfirmation.args;
+        this.scrambleConfirmation = null;
+      }
+
+      const hasNow = args.includes('now');
+      const hasDry = args.includes('dry');
+      const isCancel = args.includes('cancel');
+
+      const steamID = command.steamID;
+      const player = command.player;
+      const adminName = player?.name || steamID;
+
+      try {
+        // Handle cancel subcommand
+        if (isCancel) {
+          this.scrambleConfirmation = null;
+          const cancelled = await this.cancelPendingScramble(steamID, player, false);
+          if (cancelled) {
+            Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Scramble cancelled by ${adminName}`);
+            const response = await this.respond(player, 'Pending scramble cancelled.');
+            if (this.discordChannel) {
+              const embed = {
+                color: 0x3498db,
+                title: '🎮 In-Game Command: !scramble cancel',
+                description: `Executed by **${adminName}**`,
+                fields: [{ name: 'Response', value: 'Pending scramble cancelled.', inline: false }],
+                timestamp: new Date().toISOString()
+              };
+              await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
+            }
+            return response;
+          } else if (this._scrambleInProgress) {
+            return await this.respond(player, 'Cannot cancel scramble - it is already executing.');
+          } else {
+            return await this.respond(player, 'No pending scramble to cancel.');
+          }
+        }
+
+        // Prevent duplicate scrambles
+        if (this._scramblePending || this._scrambleInProgress) {
+          const status = this._scrambleInProgress ? 'executing' : 'pending';
+          return await this.respond(
+            player,
+            `[WARNING] Scramble already ${status}. Use "!scramble cancel" to cancel pending scrambles.`
+          );
+        }
+
+        // Require confirmation for live scrambles
+        if (this.options.requireScrambleConfirmation && !hasDry && !isConfirm) {
+          this.scrambleConfirmation = { timestamp: Date.now(), args: args };
+          const type = hasNow ? 'IMMEDIATE' : 'scheduled';
+          const timeoutSec = this.options.scrambleConfirmationTimeout || 60;
+          return await this.respond(player, `Please confirm ${type} scramble by typing "!scramble confirm" within ${timeoutSec} seconds.`);
+        }
+
+        // Dry runs are ALWAYS immediate (no countdown for simulations)
+        const immediate = hasDry || hasNow;
+        const isSimulated = hasDry;
+
+        // Broadcast only for LIVE scrambles (dry runs are silent to players)
+        if (!isSimulated) {
+          const broadcastMsg = immediate
+            ? `${this.RconMessages.prefix} ${this.RconMessages.immediateManualScramble}`
+            : `${this.RconMessages.prefix} ${this.formatMessage(
+                this.RconMessages.manualScrambleAnnouncement,
+                { delay: this.options.scrambleAnnouncementDelay }
+              )}`;
+
+          try {
+            await this.server.rcon.broadcast(broadcastMsg);
+          } catch (err) {
+            Logger.verbose('TeamBalancer', 1, `[TeamBalancer] Error broadcasting scramble message: ${err?.message || err}`);
+          }
+        }
+
+        // Log action
+        const actionDesc = isSimulated 
+          ? `dry run scramble${immediate ? ' (immediate)' : ''}`
+          : `live scramble${immediate ? ' (immediate)' : ''}`;
+        Logger.verbose('TeamBalancer', 2, `[TeamBalancer] ${adminName} initiated ${actionDesc}`);
+
+        // Respond to admin
+        let responseMsg;
+        if (isSimulated) {
+          responseMsg = 'Initiating dry run scramble (immediate)...';
+        } else {
+          responseMsg = immediate 
+            ? 'Initiating immediate scramble...'
+            : 'Initiating scramble with countdown...';
+        }
+        if (this.discordChannel) {
+          const embed = {
+            color: 0x3498db,
+            title: `🎮 In-Game Command: !scramble ${immediate ? 'now' : ''} ${isSimulated ? 'dry' : ''}`,
+            description: `Executed by **${adminName}**`,
+            fields: [{ name: 'Response', value: responseMsg, inline: false }],
+            timestamp: new Date().toISOString()
+          };
+          await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
+        }
+        await this.respond(player, responseMsg);
+
+        // Execute
+        const success = await this.initiateScramble(
+          isSimulated,  // dry flag determines simulation
+          immediate,    // dry runs force immediate execution
+          steamID,
+          player
+        );
+
+        if (!success) {
+          return await this.respond(player, 'Failed to initiate scramble - another scramble may be in progress.');
+        }
+        
+        return responseMsg;
+      } catch (err) {
+        Logger.verbose('TeamBalancer', 1, `[TeamBalancer] Error processing scramble command: ${err?.message || err}`);
+        return await this.respond(player, `Error processing command: ${err.message}`);
+      }
+    };
+  }
+};
+export default CommandHandlers;
