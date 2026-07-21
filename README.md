@@ -44,6 +44,8 @@ Tracks per-player TrueSkill ratings (μ/σ) across rounds. SmartAssign automatic
 
 S³ is a **required** supporting plugin that provides shared game state, player management, and clan services to all consumer plugins. SmartAssign consumes `gameState` (round metadata, mode checks), `players` (reconnect memory, move attribution, refresh interest), and `clans` (tag extraction, normalisation, cache) services.
 
+**Requires S³ ≥1.0.0.**
+
 **Setup**: Install the SlackersSquadServices plugin and enable it in your SquadJS config.json before SmartAssign. It must appear in the plugins array before SmartAssign so it is mounted first.
 
 ---
