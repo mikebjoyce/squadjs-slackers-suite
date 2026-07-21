@@ -71,6 +71,8 @@ No additional configuration is needed on the EloTracker side. TeamBalancer finds
 
 S³ is the centralised service container for shared state across Slacker's Squad plugins. EloTracker uses it as the primary data source for game-state metadata — round start time, layer name, gamemode, and ignored-mode detection.
 
+**Requires S³ ≥1.0.0.**
+
 **Why this matters**: Rather than maintaining its own round-time tracking, EloTracker reads ground-truth data from S³'s `gameState` service — `getRoundStartTime()`, `getLayerName()`, `getGamemode()`, and `isIgnoredMode()`. This ensures cross-plugin consistency: SA and TB refer to the same roundStartTime and matchId during team assignment and balancing. EloTracker also listens for `TEAM_BALANCER_SCRAMBLE_EXECUTED` to capture a team-balance snapshot post-scramble for Discord reporting.
 
 **Setup**: Install S³ alongside EloTracker. S³ is auto-discovered at runtime via `this.server.plugins`. If S³ is absent, EloTracker falls back to its own direct SquadJS event data for all services.
