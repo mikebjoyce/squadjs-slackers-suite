@@ -370,7 +370,9 @@ export default class SmartAssign extends S3PluginBase {
     // ═══════════════════════════════════════════════════════════════
     try {
       if (this._s3db?.isReady() && this._s3db.migrationEngine) {
-        this.registerExpectedVersion('smart-assign', 1);
+        this.registerExpectedVersion('smart-assign', 1, {
+          models: ['SA_AssignmentLog']
+        });
         this.registerMigrations('smart-assign', [
           {
             // Merged v1+v2: v1 and v2 were developed as two parts of the same migration

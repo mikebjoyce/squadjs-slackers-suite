@@ -808,7 +808,9 @@ export default class TeamBalancer extends S3PluginBase {
       }, { timestamps: false, tableName: 'TB_RoundReport' });
 
       // Register expected version + v1 + v2 migrations
-      this.registerExpectedVersion('team-balancer', 2);
+      this.registerExpectedVersion('team-balancer', 2, {
+        models: ['TeamBalancerState', 'TB_RoundReport']
+      });
       this.registerMigrations('team-balancer', [
         {
           version: 1,
