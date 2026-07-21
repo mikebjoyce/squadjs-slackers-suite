@@ -360,6 +360,7 @@ const SwitchOutput = {
       const totalDenied = s.deniedSwitches.length;
       const totalRequests = totalSuccess + totalFailed + totalDenied;
       const successRate = totalRequests > 0 ? Math.round((totalSuccess / totalRequests) * 100) : 0;
+      const denyRate = totalRequests > 0 ? Math.round((totalDenied / totalRequests) * 100) : 0;
       const failRate = totalRequests > 0 ? Math.round((totalFailed / totalRequests) * 100) : 0;
 
       // Denial reason breakdown
@@ -376,6 +377,7 @@ const SwitchOutput = {
       statsLines.push(`**Success Rate:** ${successRate}%`);
       if (totalDenied > 0) {
         statsLines.push(`**Denied:** ${totalDenied} player${totalDenied !== 1 ? 's' : ''} (${denialBreakdown})`);
+        statsLines.push(`**Denial Rate:** ${denyRate}%`);
       }
       if (totalFailed > 0) {
         statsLines.push(`**Fail Rate:** ${failRate}% (${totalFailed} expired)`);
