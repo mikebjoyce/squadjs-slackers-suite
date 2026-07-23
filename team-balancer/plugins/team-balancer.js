@@ -815,6 +815,11 @@ export default class TeamBalancer extends S3PluginBase {
         {
           version: 1,
           description: 'Create TeamBalancerState and TB_RoundReport',
+          // NOTE: v1 is the baseline migration for new installs. It MUST include ALL columns
+          // that the current code expects — including columns added in later delta migrations
+          // (like scrambleOnRoundEndBy from v2). If you add a column in a future vN migration,
+          // also add it here so new installs get the full schema from day one. Delta migrations
+          // should guard with describeTable() checks so they are safe no-ops on new installs.
           up: async (qi) => {
             const existing = await qi.showAllTables();
 
@@ -827,7 +832,8 @@ export default class TeamBalancer extends S3PluginBase {
                 lastScrambleTime: { type: qi.DataTypes.BIGINT, allowNull: true },
                 consecutiveWinsTeam: { type: qi.DataTypes.INTEGER, allowNull: true },
                 consecutiveWinsCount: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
-                manuallyDisabled: { type: qi.DataTypes.BOOLEAN, allowNull: false, defaultValue: false }
+                manuallyDisabled: { type: qi.DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+                scrambleOnRoundEndBy: { type: qi.DataTypes.JSON, allowNull: true }
               });
             }
 
@@ -865,13 +871,19 @@ export default class TeamBalancer extends S3PluginBase {
         {
           version: 2,
           description: 'Add scrambleOnRoundEndBy JSON column to TeamBalancerState for !scramble matchend persistence',
+          // NOTE: This is a delta migration for existing installs that only have the v1 schema.
+          // New installs get this column from v1's createTable, so we guard with describeTable()
+          // to make this a safe no-op when the column already exists.
           up: async (qi) => {
             const existing = await qi.showAllTables();
             if (existing.includes('TeamBalancerState')) {
-              await qi.addColumn('TeamBalancerState', 'scrambleOnRoundEndBy', {
-                type: qi.DataTypes.JSON,
-                allowNull: true
-              });
+              const cols = await qi.describeTable('TeamBalancerState');
+              if (!cols.scrambleOnRoundEndBy) {
+                await qi.addColumn('TeamBalancerState', 'scrambleOnRoundEndBy', {
+                  type: qi.DataTypes.JSON,
+                  allowNull: true
+                });
+              }
             }
           },
           down: async (qi) => {

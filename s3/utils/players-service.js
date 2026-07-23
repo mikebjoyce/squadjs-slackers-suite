@@ -1836,7 +1836,9 @@ export default class PlayersService {
     // ── Bootstrap DDL ───────────────────────────────────────────────
     // Infrastructure table — DDL runs unconditionally at mount so the
     // table always exists before any query. No confirmation needed.
-    // The migration registration below is version-bookkeeping only (no-op up()).
+    // The migration registration below also runs idempotent DDL through
+    // the migration engine's query interface so verification passes on
+    // fresh databases (see NOTE below for details).
     await connector.query(`
       CREATE TABLE IF NOT EXISTS S3_PlayerReconnects (
         eosID VARCHAR(64) PRIMARY KEY,
@@ -1848,11 +1850,19 @@ export default class PlayersService {
       );
     `);
 
-    // ── Migration registration (version-bookkeeping only) ──────────
-    // These are no-op up() functions — the table was created by the
-    // bootstrap DDL above. The migrations exist purely for version
-    // tracking and schema drift detection. The engine's duplicate-
-    // registration guard prevents re-registration on subsequent mounts.
+    // ── Migration registration ─────────────────────────────────────
+    // NOTE: The bootstrap DDL above (connector.query) creates tables before
+    // defineModel runs, ensuring the table exists for Sequelize model sync.
+    // However, the migration engine's verification step uses dbService.sequelize
+    // (a different connection than connector.query), which can cause a visibility
+    // race on fresh SQLite databases — the verification's showAllTables() may not
+    // see the table created by the raw connector query.
+    //
+    // To fix this, each migration's up() ALSO runs CREATE TABLE IF NOT EXISTS
+    // through the qi.rawQuery() interface (same Sequelize connection the verifier
+    // reads from). This is idempotent — safe whether the bootstrap DDL already
+    // created the table or not. The engine's duplicate-registration guard prevents
+    // re-registration on subsequent mounts.
     if (dbService.migrationEngine) {
       dbService.migrationEngine.registerMigrations('s3-players', [
         {
@@ -1864,7 +1874,20 @@ export default class PlayersService {
               S3_PlayerReconnects: ['eosID', 'steamID', 'playerName', 'lastTeamID', 'lastSeenAt', 'updatedAt']
             }
           },
-          up: async () => {} // no-op: table created by bootstrap DDL above
+          up: async (qi) => {
+            // Run through qi so verification sees the table on the same connection.
+            // Idempotent — safe if bootstrap DDL already created it.
+            await qi.rawQuery(`
+              CREATE TABLE IF NOT EXISTS S3_PlayerReconnects (
+                eosID VARCHAR(64) PRIMARY KEY,
+                steamID VARCHAR(64) NULL,
+                playerName VARCHAR(255) NULL,
+                lastTeamID INTEGER NULL,
+                lastSeenAt BIGINT NULL,
+                updatedAt BIGINT NOT NULL
+              );
+            `);
+          }
         },
         {
           version: 2,
@@ -1875,7 +1898,19 @@ export default class PlayersService {
               S3_PlayerSessions: ['eosID', 'steamID', 'playerName', 'sessionStart', 'lastActivity']
             }
           },
-          up: async () => {} // no-op: table created by bootstrap DDL in _initSessionPersistence
+          up: async (qi) => {
+            // Run through qi so verification sees the table on the same connection.
+            // Idempotent — safe if bootstrap DDL already created it.
+            await qi.rawQuery(`
+              CREATE TABLE IF NOT EXISTS S3_PlayerSessions (
+                eosID VARCHAR(64) PRIMARY KEY,
+                steamID VARCHAR(64) NULL,
+                playerName VARCHAR(255) NULL,
+                sessionStart BIGINT NOT NULL,
+                lastActivity BIGINT NOT NULL
+              );
+            `);
+          }
         }
       ]);
     }
