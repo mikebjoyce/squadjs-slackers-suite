@@ -80,6 +80,7 @@
  *   - factions:     Faction/team name resolution for teamIDs.
  *   - clans:        Clan tag grouping, normalization, merging.
  *   - players:      Player tracking, reconnect detection, locks.
+ *   - logging:      JSONL and DB logging for S³ player/game state events.
  *
  * Delegated SquadJS Events:
  *   NEW_GAME                  → gameState, factions
@@ -92,7 +93,7 @@
  * ─── NOTES ───────────────────────────────────────────────────────
  *
  * - Service mount order is strict: serverConfig → db → gameState →
- *   factions → clans → players. serverConfig must mount first so
+ *   factions → clans → players → logging. serverConfig must mount first so
  *   vote durations are available before ENDGAME fires.
  * - ignoredGameModes is pushed into GameStateService before its mount
  *   so isIgnoredMode() reads the single source of truth.
@@ -125,8 +126,9 @@
  *   !s3 db export [--logs|--all] [--to-file]  → Export tables as JSON.
  *   !s3 db import [--confirm] [--dry-run]       → Import from backup.
  *   !s3 diag                 → Consolidated read-only health check.
- *   !s3 migrate <pending|status|force>  → Schema migration management.
- *   !s3 backup <create|list|restore>    → Database backup management.
+ *   !s3 migrate <pending|status|force [--dry-run]|preview|verify|purge-deprecated>  → Schema migration management.
+ *   !s3 confirm <token>                 → Confirm and run pending migrations from startup prompt.
+ *   !s3 backup <create|list|restore <filename>>  → Database backup management.
  *   !s3 help                 → Command reference.
  *
  * ─── AUTHOR ──────────────────────────────────────────────────────
@@ -216,7 +218,7 @@ export default class SlackersSquadServices extends BasePlugin {
       clanTagCaseSensitive: {
         required: false,
         type: 'boolean',
-        description: 'When false, clan tags are normalized before grouping (matches current TeamBalancer behavior).',
+        description: 'When false, clan tags are normalized before grouping.',
         default: false
       },
       clanTagIgnoreList: {
@@ -228,8 +230,8 @@ export default class SlackersSquadServices extends BasePlugin {
       clanGroupingPullEntireSquads: {
         required: false,
         type: 'boolean',
-        description: 'Compatibility option for later consumers that may pull full squads when preserving clans.',
-        default: false
+        description: 'When true, clan grouping during scrambles pulls entire squads containing clan members rather than just the clan members themselves.',
+        default: true
       },
       enableDatabaseLogging: {
         required: false,
@@ -252,7 +254,7 @@ export default class SlackersSquadServices extends BasePlugin {
       autoMigrate: {
         required: false,
         type: 'boolean',
-        description: 'When true, pending schema migrations are applied automatically on startup without Discord confirmation. Defaults to false (requires Discord ✅ reaction).',
+        description: 'When true, pending schema migrations are applied automatically on startup without Discord confirmation. Defaults to false.',
         default: false
       }
     };
