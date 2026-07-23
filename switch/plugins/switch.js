@@ -210,7 +210,7 @@ export default class Switch extends S3DiscordPluginBase {
             switchCooldownHours: {
                 required: false,
                 description: "Hours to wait before using again the !switch command",
-                default: 3
+                default: 1.75
             },
             switchCooldownMinutes: {
                 required: false,
@@ -220,12 +220,12 @@ export default class Switch extends S3DiscordPluginBase {
             switchEnabledMinutes: {
                 required: false,
                 description: "Time in minutes in which the switch will be enabled after match start or player join",
-                default: 5
+                default: 10
             },
             doubleSwitchEnabledMinutes: {
                 required: false,
                 description: "Time in minutes in which a double switch will be enabled after match start or player join",
-                default: 5
+                default: 10
             },
             maxUnbalancedSlots: {
                 required: false,

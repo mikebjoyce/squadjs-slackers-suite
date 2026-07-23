@@ -51,7 +51,6 @@
  */
 
 import Logger from '../../core/logger.js';
-import { getClanTeamForPlayer } from './sa-clan-grouper.js';
 
 /**
  * Non-linear penalty curve (matches TeamBalancer).
@@ -130,6 +129,7 @@ const REGULAR_MIN_ROUNDS = 10;  // Veteran threshold
  *     eloTracker: EloTracker | null,
  *     ignoredModes: string[],               // Lowercase gamemode substrings to skip
  *     playerTagCache: Map<eosID, tag|null>, // Clan tag cache (optional)
+ *     clansService: ClansService|null,       // S³ ClansService for clan team lookup
  *     clanGroupOptions: { minSize, caseSensitive }, // Clan grouping options
  *     warnFlags: { eloNotReadyWarned: boolean },
  *     maxTeamSize: number                      // Physical team cap (default 50)
@@ -146,6 +146,7 @@ export async function evaluateTeamAssignment(player, server, context) {
      eloTracker = null,
      ignoredModes = [],
      playerTagCache = null,
+     clansService = null,
      clanGroupOptions = { minSize: 2, caseSensitive: false },
      warnFlags = { eloNotReadyWarned: false },
       maxTeamSize = 50
@@ -168,6 +169,7 @@ export async function evaluateTeamAssignment(player, server, context) {
   }
 
   const hasElo = eloTracker && eloTracker.ready && typeof eloTracker.getRating === 'function';
+  const hasClans = clansService && clansService.isReady?.() && typeof clansService.getClanTeamForPlayer === 'function';
 
   if (eloTracker && !eloTracker.ready) {
     if (!warnFlags.eloNotReadyWarned) {
@@ -293,8 +295,8 @@ export async function evaluateTeamAssignment(player, server, context) {
     // If player is in a clan and ALL clan mates are on one team (not split),
     // route the player there provided the population cap still allows it.
     let debugClanTeam = null;
-    if (playerTagCache) {
-      const clanTeam = getClanTeamForPlayer(player, playerTagCache, server.players, clanGroupOptions);
+    if (playerTagCache && hasClans) {
+      const clanTeam = clansService.getClanTeamForPlayer(player, playerTagCache, server.players, clanGroupOptions);
       debugClanTeam = clanTeam; // Track for debugging
       if (clanTeam) {
         const clanCount = clanTeam === 1 ? t1Count : t2Count;

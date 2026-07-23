@@ -7,18 +7,21 @@
  *
  * Usage:
  *   node install.cjs --plugin=<name> [--output=<path>] [--with-tools] [--with-testing]
+ *                    [--clean] [--force]
  *
  *   --plugin     s3 | team-balancer | elo-tracker | smart-assign | switch | all
  *                (S3 is always auto-included — every consumer plugin depends on it)
  *   --output     Output directory (default: ./out)
  *   --with-tools      Also copy tools/ directories
  *   --with-testing    Also copy testing/ directories
+ *   --clean           Wipe output directory before copying (destructive — use with care)
+ *   --force, -f       Skip overwrite confirmation prompt
  *
  * Examples:
  *   node install.cjs --plugin=s3
  *   node install.cjs --plugin=team-balancer
  *   node install.cjs --plugin=all --with-tools
- *   node install.cjs --plugin=switch,smart-assign --output=../my-squadjs/squad-server
+ *   node install.cjs --plugin=switch,smart-assign --output=../my-squadjs/squad-server --force
  */
 
 'use strict';
@@ -51,6 +54,8 @@ function parseArgs() {
     output: path.join(MONOREPO_ROOT, 'out'),
     withTools: false,
     withTesting: false,
+    clean: false,
+    force: false,
   };
 
   for (const arg of process.argv.slice(2)) {
@@ -63,6 +68,10 @@ function parseArgs() {
       args.withTools = true;
     } else if (arg === '--with-testing') {
       args.withTesting = true;
+    } else if (arg === '--clean') {
+      args.clean = true;
+    } else if (arg === '--force' || arg === '-f') {
+      args.force = true;
     } else if (arg === '--help' || arg === '-h') {
       printHelp();
       process.exit(0);
@@ -82,6 +91,7 @@ SquadJS Slacker's Suite — Install Script
 
 Usage:
   node install.cjs --plugin=<name> [--output=<path>] [--with-tools] [--with-testing]
+                   [--clean] [--force]
 
 Options:
   --plugin=<name>   Plugin(s) to install: s3, team-balancer, elo-tracker,
@@ -90,13 +100,20 @@ Options:
   --output=<path>   Output directory (default: ./out)
   --with-tools      Also copy tools/ directories
   --with-testing    Also copy testing/ directories
+  --clean           Wipe output directory before copying.
+                    WARNING: This deletes ALL files in the output directory,
+                    including non-Slacker files. Only use with a dedicated
+                    output directory, NOT a live SquadJS install.
+  --force, -f       Skip the overwrite confirmation prompt. Required when
+                    the output directory already contains files that would
+                    be overwritten.
   --help, -h        Show this help
 
 Examples:
   node install.cjs --plugin=s3
   node install.cjs --plugin=team-balancer
   node install.cjs --plugin=all --with-tools
-  node install.cjs --plugin=switch,smart-assign --output=../my-squadjs/squad-server
+  node install.cjs --plugin=switch,smart-assign --output=../my-squadjs/squad-server --force
 `);
 }
 
@@ -219,10 +236,59 @@ function collectFiles(plugins, opts) {
 
 // ─── Copy ────────────────────────────────────────────────────────────────────
 
-function copyFiles(files, outputDir) {
-  // Remove existing output directory if present
-  if (fs.existsSync(outputDir)) {
+/**
+ * Check which files would be overwritten in the output directory.
+ * Returns an array of relative paths that already exist at the destination.
+ */
+function findOverwrites(files, outputDir) {
+  const overwrites = [];
+  for (const [relPath] of files) {
+    const dest = path.join(outputDir, relPath);
+    if (fs.existsSync(dest)) {
+      overwrites.push(relPath);
+    }
+  }
+  return overwrites;
+}
+
+/**
+ * Copy files to the output directory.
+ *
+ * @param {Map} files - Map of relativePath → { source, plugin }
+ * @param {string} outputDir - Destination directory
+ * @param {object} opts - { clean, force }
+ * @returns {number} Number of files copied
+ */
+function copyFiles(files, outputDir, opts) {
+  // --clean mode: wipe the entire output directory first (opt-in destructive)
+  if (opts.clean && fs.existsSync(outputDir)) {
+    console.log('--clean specified: removing existing output directory...');
     fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+
+  // Check for files that would be overwritten (only if not using --clean,
+  // since --clean already removed everything)
+  if (!opts.clean) {
+    const overwrites = findOverwrites(files, outputDir);
+
+    if (overwrites.length > 0) {
+      console.log(`The following ${overwrites.length} existing file(s) will be overwritten in ${outputDir}/:`);
+      overwrites.forEach(f => console.log(`  ${f}`));
+      console.log('');
+
+      if (!opts.force) {
+        console.log('To proceed, re-run with --force to overwrite these files,');
+        console.log('or use --clean to wipe the output directory first.');
+        console.log('');
+        console.log('WARNING: --clean will delete ALL files in the output directory,');
+        console.log('including non-Slacker files. Do NOT use --clean when pointing at');
+        console.log('a live SquadJS install.');
+        process.exit(1);
+      }
+
+      console.log('--force specified: proceeding with overwrite...');
+      console.log('');
+    }
   }
 
   let copied = 0;
@@ -256,7 +322,7 @@ function main() {
     process.exit(0);
   }
 
-  const copied = copyFiles(files, args.output);
+  const copied = copyFiles(files, args.output, { clean: args.clean, force: args.force });
 
   console.log(`Done — ${copied} files written to ${args.output}/`);
   console.log('');

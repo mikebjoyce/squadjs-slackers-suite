@@ -1285,11 +1285,11 @@ S³ must appear **before** consumer plugins:
 {
   "plugins": [
     { "plugin": "SlackersSquadServices", "enabled": true,
-      "options": { "database": "sqlite", "channelID": "..." } },
-    { "plugin": "SmartAssign", "enabled": true, "options": { ... } },
-    { "plugin": "Switch", "enabled": true, "options": { ... } },
-    { "plugin": "EloTracker", "enabled": true, "options": { ... } },
-    { "plugin": "TeamBalancer", "enabled": true, "options": { ... } }
+      "database": "sqlite", "channelID": "..." },
+    { "plugin": "SmartAssign", "enabled": true, "teamSelectionMethod": "elo", "minTeamSize": 4, "maxTeamSize": 8, "scrambleCooldown": 300, "autoBalanceDelay": 30, "maxEloDifference": 200, "stagingTimeLimit": 180, "enableTrueSkill": true, "enableScramble": true, "enableAutoBalance": false },
+    { "plugin": "Switch", "enabled": true, "database": "sqlite", "discordClient": "discord", "switchCooldown": 300, "scrambleLockoutDuration": 600, "maxQueueSize": 10, "discordChannelID": "...", "enableDiscordNotifications": true },
+    { "plugin": "EloTracker", "enabled": true, "database": "sqlite", "discordClient": "discord", "discordPublicChannelID": "...", "discordAdminChannelID": "...", "minPlayersForElo": 80, "minRoundsForLeaderboard": 10, "enablePublicIngameCommands": true },
+    { "plugin": "TeamBalancer", "enabled": true, "database": "sqlite", "discordClient": "discord", "minPlayersForScramble": 20, "imbalanceThreshold": 3, "scrambleCooldown": 900, "useEloForBalance": true, "enableAutoScramble": false }
   ]
 }
 ```

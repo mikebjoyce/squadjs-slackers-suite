@@ -7,18 +7,21 @@
 #
 # Usage:
 #   ./install.sh --plugin=<name> [--output=<path>] [--with-tools] [--with-testing]
+#                [--clean] [--force]
 #
 #   --plugin     s3 | team-balancer | elo-tracker | smart-assign | switch | all
 #                (S3 is always auto-included — every consumer plugin depends on it)
 #   --output     Output directory (default: ./out)
 #   --with-tools      Also copy tools/ directories
 #   --with-testing    Also copy testing/ directories
+#   --clean           Wipe output directory before copying (destructive — use with care)
+#   --force, -f       Skip overwrite confirmation prompt
 #
 # Examples:
 #   ./install.sh --plugin=s3
 #   ./install.sh --plugin=team-balancer
 #   ./install.sh --plugin=all --with-tools
-#   ./install.sh --plugin=switch,smart-assign --output=../my-squadjs/squad-server
+#   ./install.sh --plugin=switch,smart-assign --output=../my-squadjs/squad-server --force
 
 set -euo pipefail
 
@@ -35,6 +38,8 @@ PLUGINS_RAW=""
 OUTPUT_DIR="$MONOREPO_ROOT/out"
 WITH_TOOLS=false
 WITH_TESTING=false
+CLEAN=false
+FORCE=false
 
 print_help() {
   cat <<EOF
@@ -43,6 +48,7 @@ SquadJS Slacker's Suite — Install Script
 
 Usage:
   ./install.sh --plugin=<name> [--output=<path>] [--with-tools] [--with-testing]
+               [--clean] [--force]
 
 Options:
   --plugin=<name>   Plugin(s) to install: s3, team-balancer, elo-tracker,
@@ -51,13 +57,20 @@ Options:
   --output=<path>   Output directory (default: ./out)
   --with-tools      Also copy tools/ directories
   --with-testing    Also copy testing/ directories
+  --clean           Wipe output directory before copying.
+                    WARNING: This deletes ALL files in the output directory,
+                    including non-Slacker files. Only use with a dedicated
+                    output directory, NOT a live SquadJS install.
+  --force, -f       Skip the overwrite confirmation prompt. Required when
+                    the output directory already contains files that would
+                    be overwritten.
   --help, -h        Show this help
 
 Examples:
   ./install.sh --plugin=s3
   ./install.sh --plugin=team-balancer
   ./install.sh --plugin=all --with-tools
-  ./install.sh --plugin=switch,smart-assign --output=../my-squadjs/squad-server
+  ./install.sh --plugin=switch,smart-assign --output=../my-squadjs/squad-server --force
 EOF
 }
 
@@ -78,6 +91,12 @@ for arg in "$@"; do
       ;;
     --with-testing)
       WITH_TESTING=true
+      ;;
+    --clean)
+      CLEAN=true
+      ;;
+    --force|-f)
+      FORCE=true
       ;;
     --help|-h)
       print_help
@@ -140,6 +159,7 @@ echo "Plugins selected: ${PLUGINS[*]}"
 echo "Output directory: $OUTPUT_DIR"
 if [[ "$WITH_TOOLS" == true ]]; then echo "  (including tools/)"; fi
 if [[ "$WITH_TESTING" == true ]]; then echo "  (including testing/)"; fi
+if [[ "$CLEAN" == true ]]; then echo "  (--clean: will wipe output directory first)"; fi
 echo ""
 
 # ─── File Discovery & Collision Detection ────────────────────────────────────
@@ -206,9 +226,43 @@ if [[ "$file_count" -eq 0 ]]; then
   exit 0
 fi
 
-# Remove existing output directory if present
-if [[ -d "$OUTPUT_DIR" ]]; then
+# --clean mode: wipe the entire output directory first (opt-in destructive)
+if [[ "$CLEAN" == true && -d "$OUTPUT_DIR" ]]; then
+  echo "--clean specified: removing existing output directory..."
   rm -rf "$OUTPUT_DIR"
+fi
+
+# Check for files that would be overwritten (only if not using --clean,
+# since --clean already removed everything)
+if [[ "$CLEAN" != true ]]; then
+  overwrites=()
+  while IFS='|' read -r _plugin _source_path rel_path; do
+    dest="$OUTPUT_DIR/$rel_path"
+    if [[ -f "$dest" ]]; then
+      overwrites+=("$rel_path")
+    fi
+  done < "$COLLISION_FILE"
+
+  if [[ ${#overwrites[@]} -gt 0 ]]; then
+    echo "The following ${#overwrites[@]} existing file(s) will be overwritten in ${OUTPUT_DIR}/:"
+    for f in "${overwrites[@]}"; do
+      echo "  $f"
+    done
+    echo ""
+
+    if [[ "$FORCE" != true ]]; then
+      echo "To proceed, re-run with --force to overwrite these files,"
+      echo "or use --clean to wipe the output directory first."
+      echo ""
+      echo "WARNING: --clean will delete ALL files in the output directory,"
+      echo "including non-Slacker files. Do NOT use --clean when pointing at"
+      echo "a live SquadJS install."
+      exit 1
+    fi
+
+    echo "--force specified: proceeding with overwrite..."
+    echo ""
+  fi
 fi
 
 copied=0

@@ -1287,6 +1287,7 @@ export default class SmartAssign extends S3PluginBase {
       eloTracker: this.eloTracker,
       ignoredModes: [],
       playerTagCache: tagCache,
+      clansService: this._s3?.clans || null,
       clanGroupOptions: {
         minSize: this._s3?.clans?.options?.minSize || 2,
         caseSensitive: this._s3?.clans?.options?.caseSensitive || false,
