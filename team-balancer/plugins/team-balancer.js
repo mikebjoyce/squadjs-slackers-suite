@@ -272,16 +272,16 @@ export default class TeamBalancer extends S3PluginBase {
         type: 'number'
       },      
       maxConsecutiveWinsWithoutThreshold: {
-        default: 0,
+        default: 3,
         type: 'number',
         description: 'Trigger scramble after X consecutive wins, ignoring ticket thresholds. Set to 0 to disable.'
       },
       enableSingleRoundScramble: {
-        default: false,
+        default: true,
         type: 'boolean'
       },
       singleRoundScrambleThreshold: {
-        default: 250,
+        default: 200,
         type: 'number'
       },
       minTicketsToCountAsDominantWin: {
@@ -293,19 +293,19 @@ export default class TeamBalancer extends S3PluginBase {
         type: 'number'
       },      
       invasionDefenceTeamThreshold: {
-        default: 650,
+        default: 500,
         type: 'number'
-      },      
+      },
       scrambleAnnouncementDelay: {
-        default: 12,
+        default: 25,
         type: 'number'
-      },      
+      },
       scramblePercentage: {
         default: 0.5,
         type: 'number'
       },
         changeTeamRetryInterval: {
-         default: 50,
+         default: 100,
          type: 'number'
        },
       maxScrambleCompletionTime: {
@@ -367,7 +367,7 @@ export default class TeamBalancer extends S3PluginBase {
         description: 'Time in seconds to wait for scramble confirmation.'
       },
       useEloForBalance: {
-        default: false,
+        default: true,
         type: 'boolean',
         description: 'Use EloTracker ratings to influence team balance during scrambles. Requires EloTracker plugin to be active.'
       },

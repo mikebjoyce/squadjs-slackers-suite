@@ -189,7 +189,7 @@ export default class Switch extends S3DiscordPluginBase {
             doubleSwitchCommands: {
                 required: false,
                 description: 'Array of commands that can be sent in every chat to request a double switch',
-                default: [],
+                default: ['!bug', '!stuck', '!doubleswitch'],
                 example: [ '!bug', '!stuck', '!doubleswitch' ]
             },
             doubleSwitchCooldownHours: {
@@ -230,7 +230,7 @@ export default class Switch extends S3DiscordPluginBase {
             maxUnbalancedSlots: {
                 required: false,
                 description: "Number of player of difference between the two teams to allow a team switch",
-                default: 3
+                default: 1
             },
             switchToOldTeamAfterRejoin: {
                 required: false,
@@ -268,19 +268,19 @@ export default class Switch extends S3DiscordPluginBase {
             dynamicBalanceTolerance: {
                 required: false,
                 description: "Enable interpolated extra imbalance tolerance when server is below full capacity (default: off). Scales from floor to 98 players.",
-                default: false,
+                default: true,
                 type: 'boolean'
             },
             dynamicBalancePlayerFloor: {
                 required: false,
                 description: "Total player count at which maximum extra tolerance kicks in (default 90). Below this, full extra slots apply.",
-                default: 90,
+                default: 85,
                 type: 'number'
             },
             dynamicBalanceExtraSlots: {
                 required: false,
                 description: "Additional allowed imbalance slots at the floor player count (default 2). Linearly interpolated between floor and 98 players.",
-                default: 2,
+                default: 3,
                 type: 'number'
             },
             // ── v2.0.0 Options ─────────────────────────────────────

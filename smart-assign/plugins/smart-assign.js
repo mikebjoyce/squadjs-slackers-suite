@@ -168,7 +168,7 @@ export default class SmartAssign extends S3PluginBase {
       enableEventLogging: {
         required: false,
         description: 'Toggle the JSONL event logging output.',
-        default: true,
+        default: false,
         type: 'boolean'
       },
       logPath: {
@@ -186,7 +186,7 @@ export default class SmartAssign extends S3PluginBase {
       handshakeWithSwitch: {
         required: false,
         description: 'Enable handshake with Switch queue (requires Switch plugin v2.0.0+). When enabled, SA may optionally swap a joining player with a Switch-queued player to improve balance satisfaction.',
-        default: false,
+        default: true,
         type: 'boolean'
       },
       handshakeScoreThreshold: {
@@ -198,7 +198,7 @@ export default class SmartAssign extends S3PluginBase {
       handshakeMode: {
         required: false,
         description: 'Handshake mode: "eloGated" (scoring gates the swap) or "queueDrain" (skip scoring, always swap if hard constraints pass).',
-        default: 'eloGated',
+        default: 'queueDrain',
         type: 'string'
       }
     };

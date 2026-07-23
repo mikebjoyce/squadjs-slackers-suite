@@ -193,7 +193,7 @@ export default class SlackersSquadServices extends BasePlugin {
         required: false,
         type: 'boolean',
         description: 'Enable shared clan-tag grouping utilities for consuming modules.',
-        default: false
+        default: true
       },
       minClanGroupSize: {
         required: false,

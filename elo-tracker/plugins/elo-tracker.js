@@ -165,7 +165,7 @@ export default class EloTracker extends S3PluginBase {
       minPlayersForElo: { default: 80, type: 'number' },
       minRoundsForLeaderboard: { default: 10, type: 'number' },
       roundStartEmbedDelayMs: { required: false, default: 180000, type: 'number' },
-      enablePublicIngameCommands: { default: true, type: 'boolean' },
+      enablePublicIngameCommands: { default: false, type: 'boolean' },
       discordClient: {
         required: false,
         connector: 'discord',
@@ -180,7 +180,7 @@ export default class EloTracker extends S3PluginBase {
        enableDatabaseLogging: {
          required: false,
          description: 'If true, mirrors round outcome data into database tables for querying (default: false).',
-         default: false,
+         default: true,
          type: 'boolean'
        }
      };
