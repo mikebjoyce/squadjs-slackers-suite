@@ -1316,6 +1316,7 @@ S³ must appear **before** consumer plugins:
 | `clanTagMaxEditDistance` | number | `1` | Levenshtein distance for merging similar tags |
 | `clanTagCaseSensitive` | boolean | `false` | If false, tags are normalised before grouping |
 | `clanTagIgnoreList` | array | `[]` | Tags excluded from grouping |
+| `clanRecruitSuffixes` | array | `["r", "-r"]` | Suffixes to strip from clan tags when the base tag (without suffix) exists on other players. Enabled by default for common recruit tags (case-insensitive, so "R" and "-R" are also matched). Set to `[]` to disable. Stripping only occurs when the base tag is present on at least one other player in the data set. |
 | `clanGroupingPullEntireSquads` | boolean | `false` | Pull full squads when preserving clan groups |
 | `enableDatabaseLogging` | boolean | `false` | Enable `S3_PlayerEvents`/`S3_GameStateEvents`/`S3_PlayerSnapshots` tables. `false` → LoggingService runs no-op. |
 | `enableFileLogging` | boolean | `false` | Mirror each DB log write as a JSONL line at `logPath` |

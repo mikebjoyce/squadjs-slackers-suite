@@ -227,6 +227,12 @@ export default class SlackersSquadServices extends BasePlugin {
         description: 'Clan tags to exclude from grouping, matched using the same normalization mode as grouping.',
         default: []
       },
+      clanRecruitSuffixes: {
+        required: false,
+        type: 'array',
+        description: 'Suffixes to strip from clan tags when the base tag (without suffix) exists on other players. Enabled by default with ["r", "-r"] for common recruit tags (case-insensitive, so "R" and "-R" are also matched). Set to [] to disable. Stripping only occurs when the base tag is present on at least one other player in the data set.',
+        default: ["r", "-r"]
+      },
       clanGroupingPullEntireSquads: {
         required: false,
         type: 'boolean',
@@ -346,7 +352,8 @@ export default class SlackersSquadServices extends BasePlugin {
         maxEditDistance: this.options.clanTagMaxEditDistance,
         caseSensitive: this.options.clanTagCaseSensitive,
         ignoreList: this.options.clanTagIgnoreList,
-        pullEntireSquads: this.options.clanGroupingPullEntireSquads
+        pullEntireSquads: this.options.clanGroupingPullEntireSquads,
+        recruitSuffixes: this.options.clanRecruitSuffixes
       }
     });
 

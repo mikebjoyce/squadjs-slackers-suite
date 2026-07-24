@@ -160,6 +160,7 @@ this.players.registerPriority('MyPlugin', 4);  // Above TeamBalancer (default: 3
 | `clanTagMaxEditDistance` | no | number | `1` | Levenshtein distance for tag merging |
 | `clanTagCaseSensitive` | no | boolean | `false` | Case-insensitive tag normalisation with lookalike mapping |
 | `clanTagIgnoreList` | no | array | `[]` | Clan tags excluded from grouping |
+| `clanRecruitSuffixes` | no | array | `["r", "-r"]` | Suffixes to strip from clan tags when the base tag (without suffix) exists on other players. Enabled by default for common recruit tags (case-insensitive, so "R" and "-R" are also matched). Set to `[]` to disable. Stripping only occurs when the base tag is present on at least one other player in the data set. |
 | `clanGroupingPullEntireSquads` | no | boolean | `false` | Pull non-clan teammates with clan members |
 | `autoMigrate` | no | boolean | `false` | If `true`, skips Discord confirmation prompt for migrations |
 

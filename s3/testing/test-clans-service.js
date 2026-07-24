@@ -155,6 +155,151 @@ await runTest('service mount/unmount toggles lifecycle state safely', async () =
   assert.equal(service.isEnabled(), false);
 });
 
+// ─── Recruit Suffix Stripping Tests ───────────────────────────────
+
+await runTest('_stripRecruitSuffixIfBaseExists strips suffix when base tag exists', async () => {
+  const service = new ClansService({ options: { recruitSuffixes: ['r'] } });
+  const known = new Set(['ABC']);
+  assert.equal(service._stripRecruitSuffixIfBaseExists('ABCr', known), 'ABC');
+});
+
+await runTest('_stripRecruitSuffixIfBaseExists does NOT strip when base tag absent', async () => {
+  const service = new ClansService({ options: { recruitSuffixes: ['r'] } });
+  const known = new Set(['XYZ']);
+  assert.equal(service._stripRecruitSuffixIfBaseExists('ABCr', known), 'ABCr');
+});
+
+await runTest('_stripRecruitSuffixIfBaseExists handles multiple suffixes (first match wins)', async () => {
+  const service = new ClansService({ options: { recruitSuffixes: ['r', '-r', 'rec'] } });
+  const known = new Set(['ABC']);
+  assert.equal(service._stripRecruitSuffixIfBaseExists('ABCrec', known), 'ABC');
+  assert.equal(service._stripRecruitSuffixIfBaseExists('ABC-r', known), 'ABC');
+  assert.equal(service._stripRecruitSuffixIfBaseExists('ABCr', known), 'ABC');
+});
+
+await runTest('_stripRecruitSuffixIfBaseExists case-insensitive suffix match', async () => {
+  const service = new ClansService({ options: { recruitSuffixes: ['r'] } });
+  const known = new Set(['ABC']);
+  assert.equal(service._stripRecruitSuffixIfBaseExists('ABCR', known), 'ABC');
+  assert.equal(service._stripRecruitSuffixIfBaseExists('abcr', known), 'abc');
+});
+
+await runTest('_stripRecruitSuffixIfBaseExists case-insensitive base tag lookup', async () => {
+  const service = new ClansService({ options: { recruitSuffixes: ['r'] } });
+  const known = new Set(['abc']);
+  assert.equal(service._stripRecruitSuffixIfBaseExists('ABCr', known), 'ABC');
+});
+
+await runTest('_stripRecruitSuffixIfBaseExists no-op when tag equals suffix length', async () => {
+  const service = new ClansService({ options: { recruitSuffixes: ['r'] } });
+  const known = new Set(['ABC']);
+  assert.equal(service._stripRecruitSuffixIfBaseExists('R', known), 'R');
+  assert.equal(service._stripRecruitSuffixIfBaseExists('r', known), 'r');
+});
+
+await runTest('_stripRecruitSuffixIfBaseExists no-op when suffixes array empty', async () => {
+  const service = new ClansService({ options: { recruitSuffixes: [] } });
+  const known = new Set(['ABC']);
+  assert.equal(service._stripRecruitSuffixIfBaseExists('ABCr', known), 'ABCr');
+});
+
+await runTest('_stripRecruitSuffixIfBaseExists no-op when knownBaseTags empty', async () => {
+  const service = new ClansService({ options: { recruitSuffixes: ['r'] } });
+  const known = new Set();
+  assert.equal(service._stripRecruitSuffixIfBaseExists('ABCr', known), 'ABCr');
+});
+
+await runTest('extractClanGroups groups recruit-tagged players with base clan', async () => {
+  const service = new ClansService({ options: { recruitSuffixes: ['r'] } });
+  const players = [
+    { eosID: 'e1', name: '[ABC] Member' },
+    { eosID: 'e2', name: '[ABCr] Recruit' },
+    { eosID: 'e3', name: '[XYZ] Other' }
+  ];
+
+  const groups = service.extractClanGroups(players, {
+    caseSensitive: false,
+    minSize: 2,
+    maxSize: 18
+  });
+
+  // ABC and ABCr should be grouped together as ABC
+  assert.equal(groups.ABC?.length, 2);
+  assert.ok(groups.ABC.includes('e1'));
+  assert.ok(groups.ABC.includes('e2'));
+  // XYZ alone should be filtered out by minSize
+  assert.equal(groups.XYZ, undefined);
+});
+
+await runTest('extractClanGroups does NOT strip suffix when base clan absent', async () => {
+  const service = new ClansService({ options: { recruitSuffixes: ['r'] } });
+  const players = [
+    { eosID: 'e1', name: '[ABCr] Recruit1' },
+    { eosID: 'e2', name: '[ABCr] Recruit2' },
+    { eosID: 'e3', name: '[XYZ] Other' }
+  ];
+
+  const groups = service.extractClanGroups(players, {
+    caseSensitive: false,
+    minSize: 2,
+    maxSize: 18
+  });
+
+  // No base ABC exists, so ABCr stays as ABCR (normalized)
+  assert.equal(groups.ABCR?.length, 2);
+  assert.equal(groups.ABC, undefined);
+});
+
+await runTest('buildPlayerTagCache strips suffix in batch context', async () => {
+  const service = new ClansService({ options: { recruitSuffixes: ['r'] } });
+  const cache = service.buildPlayerTagCache([
+    { eosID: 'e1', name: '[ABC] Member' },
+    { eosID: 'e2', name: '[ABCr] Recruit' },
+    { eosID: 'e3', name: 'NoTagName' }
+  ], { caseSensitive: false });
+
+  assert.equal(cache.get('e1'), 'ABC');
+  assert.equal(cache.get('e2'), 'ABC');
+  assert.equal(cache.get('e3'), null);
+});
+
+await runTest('addPlayerToCache strips suffix when base tag exists in cache', async () => {
+  const service = new ClansService({ options: { recruitSuffixes: ['r'] } });
+
+  // First add a base clan member
+  service.addPlayerToCache('e1', '[ABC] Member');
+  assert.equal(service.getPlayerTag('e1'), 'ABC');
+
+  // Then add a recruit — should be stripped to ABC since ABC exists in cache
+  service.addPlayerToCache('e2', '[ABCr] Recruit');
+  assert.equal(service.getPlayerTag('e2'), 'ABC');
+});
+
+await runTest('addPlayerToCache does NOT strip suffix when base tag absent from cache', async () => {
+  const service = new ClansService({ options: { recruitSuffixes: ['r'] } });
+
+  // Add recruit first — no base ABC in cache yet
+  service.addPlayerToCache('e1', '[ABCr] Recruit');
+  assert.equal(service.getPlayerTag('e1'), 'ABCR');
+
+  // Now add base clan member — they get ABC
+  service.addPlayerToCache('e2', '[ABC] Member');
+  assert.equal(service.getPlayerTag('e2'), 'ABC');
+});
+
+await runTest('addPlayerToCache with multiple suffixes', async () => {
+  const service = new ClansService({ options: { recruitSuffixes: ['r', '-r', 'rec'] } });
+
+  service.addPlayerToCache('e1', '[ABC] Member');
+  assert.equal(service.getPlayerTag('e1'), 'ABC');
+
+  service.addPlayerToCache('e2', '[ABC-r] RecruitDash');
+  assert.equal(service.getPlayerTag('e2'), 'ABC');
+
+  service.addPlayerToCache('e3', '[ABCrec] RecruitLong');
+  assert.equal(service.getPlayerTag('e3'), 'ABC');
+});
+
 if (!process.exitCode) {
   console.log('\nAll clans-service tests passed.');
 }

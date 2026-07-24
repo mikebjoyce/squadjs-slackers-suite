@@ -265,7 +265,7 @@ enableDatabaseLogging               - If true, round reports are also written to
 > **S³-Managed Options**: The following settings are no longer configured on the TeamBalancer plugin. They are now managed by S³:
 >
 > - **`ignoredGameModes`** — Configured on S³'s GameState service via `setIgnoredGameModes()`. TeamBalancer reads the result via `gameState.isIgnoredMode()`.
-> - **`enableClanTagGrouping`**, **`minClanGroupSize`**, **`maxClanGroupSize`**, **`clanTagMaxEditDistance`**, **`clanTagCaseSensitive`**, **`clanGroupingPullEntireSquads`**, **`clanTagIgnoreList`** — Configured on S³'s clans service. TeamBalancer reads grouping options via `clans.extractClanGroups()` which internally calls S³'s `getGroupingOptions()`.
+> - **`enableClanTagGrouping`**, **`minClanGroupSize`**, **`maxClanGroupSize`**, **`clanTagMaxEditDistance`**, **`clanTagCaseSensitive`**, **`clanGroupingPullEntireSquads`**, **`clanTagIgnoreList`**, **`clanRecruitSuffixes`** — Configured on S³'s clans service. TeamBalancer reads grouping options via `clans.extractClanGroups()` which internally calls S³'s `getGroupingOptions()`.
 
 ---
 

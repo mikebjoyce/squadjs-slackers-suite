@@ -54,6 +54,13 @@
  * - Ignore-list filtering supports case-sensitive and case-insensitive modes.
  * - Per-player _playerTagCache supports incremental add/remove/clear
  *   for closed-loop updates from PlayersService.
+ * - Recruit suffix stripping: by default, tags ending with 'r' or '-r'
+ *   are stripped to their base form — but only if the base tag exists
+ *   on at least one other player in the data set. This prevents false
+ *   positives (e.g. clan 'AR' won't be stripped to 'A' unless 'A'
+ *   actually exists). Suffix matching is case-insensitive, so 'R' and
+ *   '-R' are also matched. Configure via S³'s clanRecruitSuffixes option
+ *   (default: ["r", "-r"]). Set to [] to disable.
  *
  */
 export default class ClansService {
@@ -70,7 +77,8 @@ export default class ClansService {
       maxEditDistance: 1,
       caseSensitive: false,
       ignoreList: [],
-      pullEntireSquads: false
+      pullEntireSquads: false,
+      recruitSuffixes: ["r", "-r"]
     };
 
     this.options = {
@@ -122,7 +130,8 @@ export default class ClansService {
       maxSize: resolved.maxSize,
       maxEditDistance: resolved.maxEditDistance,
       caseSensitive: resolved.caseSensitive,
-      ignoreList: Array.isArray(resolved.ignoreList) ? resolved.ignoreList : []
+      ignoreList: Array.isArray(resolved.ignoreList) ? resolved.ignoreList : [],
+      recruitSuffixes: Array.isArray(resolved.recruitSuffixes) ? resolved.recruitSuffixes : []
     };
   }
 
@@ -165,6 +174,41 @@ export default class ClansService {
     return norm || null;
   }
 
+  /**
+   * Strips a recruit suffix from a raw clan tag if the resulting base tag
+   * is known to exist on other players. This allows recruit-tagged players
+   * (e.g. [ABCr]) to be grouped with their base clan ([ABC]).
+   *
+   * @param {string} rawTag - The raw extracted clan tag prefix.
+   * @param {Set<string>} knownBaseTags - Set of normalized (uppercase, ASCII-only)
+   *   tags already known to exist in the current data set.
+   * @returns {string} The stripped tag if a suffix matched and the base tag
+   *   exists in knownBaseTags; otherwise the original rawTag unchanged.
+   */
+  _stripRecruitSuffixIfBaseExists(rawTag, knownBaseTags) {
+    if (!rawTag || typeof rawTag !== 'string') return rawTag;
+    if (!this.options.recruitSuffixes?.length) return rawTag;
+    if (!knownBaseTags?.size) return rawTag;
+
+    const rawUpper = rawTag.toUpperCase();
+
+    for (const suffix of this.options.recruitSuffixes) {
+      if (!suffix || typeof suffix !== 'string') continue;
+      if (rawTag.length <= suffix.length) continue;
+      if (!rawUpper.endsWith(suffix.toUpperCase())) continue;
+
+      const baseTag = rawTag.slice(0, -suffix.length);
+      const baseUpper = baseTag.toUpperCase();
+
+      // Check if baseTag exists in knownBaseTags (case-insensitive)
+      for (const known of knownBaseTags) {
+        if (known.toUpperCase() === baseUpper) return baseTag;
+      }
+    }
+
+    return rawTag;
+  }
+
   levenshteinDistance(a, b) {
     if (a === b) return 0;
     if (!a?.length) return b?.length || 0;
@@ -204,12 +248,25 @@ export default class ClansService {
       ignoreList
     } = this.getGroupingOptions(options);
 
+    // Pass 1: collect all normalized raw prefixes for context-aware suffix stripping
+    const allNormalizedPrefixes = new Set();
+    for (const player of rawPlayers || []) {
+      if (!player?.name || !player?.eosID) continue;
+      const raw = this.extractRawPrefix(player.name);
+      if (!raw) continue;
+      const norm = this.normalizeTag(raw);
+      if (norm) allNormalizedPrefixes.add(norm);
+    }
+
     const groups = {};
     for (const player of rawPlayers || []) {
       if (!player?.name || !player?.eosID) continue;
 
-      const raw = this.extractRawPrefix(player.name);
+      let raw = this.extractRawPrefix(player.name);
       if (!raw) continue;
+
+      // Strip recruit suffix if base tag exists elsewhere
+      raw = this._stripRecruitSuffixIfBaseExists(raw, allNormalizedPrefixes);
 
       const key = caseSensitive ? raw : this.normalizeTag(raw);
       if (!key) continue;
@@ -280,10 +337,26 @@ export default class ClansService {
       ? new Set(ignoreList)
       : new Set(ignoreList.map((t) => this.normalizeTag(t)).filter(Boolean));
 
+    // Pass 1: collect all normalized raw prefixes for context-aware suffix stripping
+    const allNormalizedPrefixes = new Set();
+    for (const player of players || []) {
+      if (!player?.eosID) continue;
+      const raw = this.extractRawPrefix(player.name);
+      if (!raw) continue;
+      const norm = this.normalizeTag(raw);
+      if (norm) allNormalizedPrefixes.add(norm);
+    }
+
     for (const player of players || []) {
       if (!player?.eosID) continue;
 
-      const raw = this.extractRawPrefix(player.name);
+      let raw = this.extractRawPrefix(player.name);
+
+      // Strip recruit suffix if base tag exists elsewhere
+      if (raw) {
+        raw = this._stripRecruitSuffixIfBaseExists(raw, allNormalizedPrefixes);
+      }
+
       let tag = raw ? (caseSensitive ? raw : this.normalizeTag(raw)) : null;
 
       // Filter out ignored clan tags — set cache entry to null so
@@ -347,7 +420,17 @@ export default class ClansService {
 
   addPlayerToCache(eosID, name) {
     if (!eosID || !name) return;
-    const raw = this.extractRawPrefix(name);
+    let raw = this.extractRawPrefix(name);
+
+    // Strip recruit suffix if base tag exists in the existing cache
+    if (raw && this.options.recruitSuffixes?.length) {
+      const existingTags = new Set();
+      for (const v of this._playerTagCache.values()) {
+        if (v) existingTags.add(v);
+      }
+      raw = this._stripRecruitSuffixIfBaseExists(raw, existingTags);
+    }
+
     let tag = raw ? (this.options.caseSensitive ? raw : this.normalizeTag(raw)) : null;
 
     // Filter out ignored clan tags — set cache entry to null so
