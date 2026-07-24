@@ -265,6 +265,12 @@ export default class Switch extends S3DiscordPluginBase {
                 default: 6,
                 type: 'number'
             },
+            liberalSwitchBroadcastIntervalMinutes: {
+                required: false,
+                description: 'Minutes between liberal-mode (Seed/Jensen) broadcast reminders. Set to 0 to disable.',
+                default: 5,
+                type: 'number'
+            },
             dynamicBalanceTolerance: {
                 required: false,
                 description: "Enable interpolated extra imbalance tolerance when server is below full capacity (default: off). Scales from floor to 98 players.",

@@ -185,13 +185,14 @@ const SwitchOutput = {
      */
     plugin._startLiberalBroadcastTimers = function () {
       if (!plugin.options.broadcastSwitchWindowMessages) return;
+      const intervalMs = plugin.options.liberalSwitchBroadcastIntervalMinutes * 60 * 1000;
+      if (intervalMs <= 0) return;  // 0 = disabled
 
       plugin._clearBroadcastTimers();
 
-      // Hardcoded 5-minute interval as requested
       plugin._broadcastTimers.reminderInterval = setInterval(() => {
         plugin.broadcast(`[Switch] No cooldown restrictions on this game mode. Use '!switch' to change teams anytime.`);
-      }, 5 * 60 * 1000);
+      }, intervalMs);
     };
 
     /**
