@@ -2,7 +2,7 @@
 
 > **Canonical reference for building SquadJS plugins that consume S³ (Slacker's Squad Services).**
 >
-> **Last reviewed:** 2026-07-01, verified against source.
+> **Last reviewed:** 2026-07-24, verified against source.
 
 ---
 
@@ -208,10 +208,10 @@ Tracks player state (name, team, squad, join time), manages per-player and globa
 | `areTeamsResolved()` | `boolean` | All players on valid teams (1 or 2) |
 | `recordMove(eosID, teamID, source, options?)` | `void` | Record attribution for team change |
 | `canAct(eosID, source)` | `boolean` | Check if player can be acted upon (not locked by another plugin) |
-| `lock(eosID, source, ttlMs?)` | `Promise<boolean>` | Acquire per-player lock |
-| `unlock(eosID, source)` | `void` | Release per-player lock |
-| `lockGlobal(source, ttlMs?)` | `Promise<boolean>` | Acquire global lock |
-| `unlockGlobal(source)` | `void` | Release global lock |
+| `lock(eosID, source, ttlMs?)` | `boolean` | Acquire per-player lock (returns false if already locked by higher priority) |
+| `unlock(eosID, source)` | `boolean` | Release per-player lock (returns false if no lock or wrong source) |
+| `lockGlobal(source, ttlMs?)` | `boolean` | Acquire global lock (returns false if already held by higher priority) |
+| `unlockGlobal(source)` | `boolean` | Release global lock (returns false if not held) |
 | `isLockedBy(eosID)` | `string\|null` | Who holds the lock |
 | `isGloballyLockedBy()` | `string\|null` | Who holds the global lock |
 | `registerRefreshInterest(source, opts?)` | `void` | Register for periodic player list refresh |
@@ -581,7 +581,7 @@ Custom registrations only apply to sources not already hardcoded in `PRIORITY` �
 | Lock Type | API | Currently Used By | Effect |
 |-----------|-----|-------------------|--------|
 | **Global lock** | `lockGlobal()` / `unlockGlobal()` | Team Balancer (scramble) | Blocks all `canAct()` checks across all players while held |
-| **Per-player lock** | `lock()` / `unlock()` | **Not currently acquired** | Blocks `canAct()` for a specific player; available but unused |
+| **Per-player lock** | `lock()` / `unlock()` | SmartAssign (during active moves) | Blocks `canAct()` for a specific player; acquired before RCON move, released on success/failure/disconnect |
 | **canAct() gate** | `canAct(eosID, source)` | SA (retry loop), Switch (command gate) | Non-mutating check; returns `false` if a higher-priority lock blocks the player |
 
 #### Global Lock (Team Balancer)
@@ -600,15 +600,16 @@ The global lock is released in a `finally` block when the scramble completes (or
 
 - **Switch** checks `canAct(eosID, 'Switch')` at the `!switch` chat command gate, before any eligibility checks. If `canAct()` returns `false`, Switch tells the player *"You are currently being processed — please try again shortly"* and returns immediately — no queue, no balance check, no processing.
 
-#### ⚠️ Known Issue: Smart Assign Does Not Acquire a Per-Player Lock
+#### Per-Player Lock (SmartAssign)
 
-**What should happen:** When SA begins moving a player (inside the swap executor's retry loop), it should acquire a per-player lock via `players.lock(eosID, 'SmartAssign', ttlMs)`. This would set a per-player lock that Switch's `canAct()` gate would detect, causing Switch to deny `!switch` requests for that player during SA's move window (typically 3–6 seconds).
+SmartAssign acquires a per-player lock via `players.lock(playerKey, 'SmartAssign', 5000)` before queueing each RCON move (inside the swap executor's `processRetries()`). This sets a per-player lock that Switch's `canAct()` gate detects, causing Switch to deny `!switch` requests for that player during SA's move window (typically 3–6 seconds).
 
-**What actually happens:** SA currently only *checks* `canAct()` defensively (to detect preemption by TB's global lock) but never *acquires* a per-player lock via `lock()`. As a result, Switch's `canAct()` check sees no lock for the player and allows the `!switch` command to proceed, even when SA is actively trying to swap that player.
+The lock is released in three places:
+- **Move success** (`onMoveSuccess`): released after the move is verified
+- **Move failure** (`onMoveFailure`): released when the move is abandoned (max retries exhausted, or preempted)
+- **Player disconnect** (`onPlayerDisconnect`): cleaned up if the player leaves while a move is pending
 
-**Impact:** A player can type `!switch` while SA's swap executor is retrying to move them. Since SA holds no lock, Switch passes the `canAct()` gate and proceeds with its own team-change logic, potentially conflicting with SA's ongoing move.
-
-**Status:** Open. SmartAssign needs to call `players.lock(eosID, 'SmartAssign', ttlMs)` when it begins a move, not just check `canAct()`.
+If the lock cannot be acquired (e.g., a higher-priority actor like TeamBalancer already holds a lock), SA aborts the move and rolls back pending assignment counters.
 
 #### move Attribution
 
@@ -1439,4 +1440,4 @@ Each plugin is in `ReferenceScripts/<plugin-name>/plugins/` in the repository.
 
 ---
 
-> *Developer Guide — documents the S³ architecture as of 2026-07-01.*
+> *Developer Guide — documents the S³ architecture as of 2026-07-24.*
