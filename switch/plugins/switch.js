@@ -106,7 +106,9 @@ import SwitchCommands from '../utils/switch-commands.js';
  *   pre-scramble imbalance.
  * - Liberal game modes (default: Seed, Jensen) relax cooldown and time
  *   limits. Configured via liberalSwitchGameModes and
- *   liberalSwitchMaxUnbalancedSlots.
+ *   liberalSwitchMaxUnbalancedSlots. Liberal-mode broadcast interval
+ *   is configurable via liberalSwitchBroadcastIntervalMinutes
+ *   (default: 5 min, set to 0 to disable).
  * - Dynamic balance tolerance scales extra imbalance slots linearly
  *   from dynamicBalancePlayerFloor (default 90) up to 98 players.
  * - Switch queue uses a stability gate: solo switches are only

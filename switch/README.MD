@@ -95,6 +95,7 @@ Add the following to your SquadJS `config.json`:
     "scrambleLockdownDurationMinutes": 20,
     "liberalSwitchGameModes": ["Seed", "Jensen"],
     "liberalSwitchMaxUnbalancedSlots": 6,
+    "liberalSwitchBroadcastIntervalMinutes": 5,
     "dynamicBalanceTolerance": false,
     "dynamicBalancePlayerFloor": 90,
     "dynamicBalanceExtraSlots": 2
@@ -230,6 +231,7 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 |--------|-------------|---------|
 | `liberalSwitchGameModes` | Substrings for layers/modes with relaxed switching | `["Seed", "Jensen"]` |
 | `liberalSwitchMaxUnbalancedSlots` | Balance cap during liberal modes | `6` |
+| `liberalSwitchBroadcastIntervalMinutes` | Minutes between liberal-mode broadcast reminders. Set to 0 to disable. | `5` |
 
 ### Dynamic Balance Tolerance
 
