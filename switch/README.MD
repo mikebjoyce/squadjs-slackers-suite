@@ -82,23 +82,24 @@ Add the following to your SquadJS `config.json`:
     "discordChannelID": "",
     "database": "sqlite",
     "commandPrefix": ["!switch", "!change"],
-    "switchCooldownHours": 3,
+    "switchCooldownHours": 1.75,
     "switchCooldownMinutes": 0,
-    "switchEnabledMinutes": 5,
+    "switchEnabledMinutes": 10,
+    "queueTimeoutMinutes": 20,
     "doubleSwitchCommands": ["!bug", "!stuck", "!doubleswitch"],
     "doubleSwitchCooldownHours": 0.5,
     "doubleSwitchDelaySeconds": 1,
-    "doubleSwitchEnabledMinutes": 5,
+    "doubleSwitchEnabledMinutes": 10,
     "endMatchSwitchSlots": 3,
-    "maxUnbalancedSlots": 3,
+    "maxUnbalancedSlots": 1,
     "switchToOldTeamAfterRejoin": false,
     "scrambleLockdownDurationMinutes": 20,
     "liberalSwitchGameModes": ["Seed", "Jensen"],
     "liberalSwitchMaxUnbalancedSlots": 6,
     "liberalSwitchBroadcastIntervalMinutes": 5,
-    "dynamicBalanceTolerance": false,
-    "dynamicBalancePlayerFloor": 90,
-    "dynamicBalanceExtraSlots": 2
+    "dynamicBalanceTolerance": true,
+    "dynamicBalancePlayerFloor": 85,
+    "dynamicBalanceExtraSlots": 3
   }
 ]
 ```
@@ -203,10 +204,11 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 | Option | Description | Default |
 |--------|-------------|---------|
 | `commandPrefix` | Command prefix(es) to trigger switch | `["!switch", "!change"]` |
-| `switchCooldownHours` | Hours before player can switch again | `3` |
+| `switchCooldownHours` | Hours before player can switch again | `1.75` |
 | `switchCooldownMinutes` | Minutes before player can switch again (overrides hours if > 0) | `0` |
-| `switchEnabledMinutes` | Time window (minutes) after join/match start for switching | `5` |
-| `maxUnbalancedSlots` | Max player difference between teams to allow a switch | `3` |
+| `switchEnabledMinutes` | Time window (minutes) after join/match start to request a switch | `10` |
+| `queueTimeoutMinutes` | Minutes a player can wait in the switch queue before removal | `10` |
+| `maxUnbalancedSlots` | Max player difference between teams to allow a switch | `1` |
 | `switchToOldTeamAfterRejoin` | Auto-switch rejoining players to pre-disconnect team | `false` |
 | `scrambleLockdownDurationMinutes` | Duration to block switching after a scramble | `20` |
 
@@ -214,10 +216,10 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `doubleSwitchCommands` | Array of commands that trigger a double-switch | `[]` |
+| `doubleSwitchCommands` | Array of commands that trigger a double-switch | `['!bug', '!stuck', '!doubleswitch']` |
 | `doubleSwitchCooldownHours` | Hours before same player can double-switch again | `0.5` |
 | `doubleSwitchDelaySeconds` | Delay between first and second team switch | `1` |
-| `doubleSwitchEnabledMinutes` | Time window for double-switch after join/match start | `5` |
+| `doubleSwitchEnabledMinutes` | Time window for double-switch after join/match start | `10` |
 
 ### End-of-Match
 
@@ -237,9 +239,9 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `dynamicBalanceTolerance` | Enable interpolated extra tolerance below full capacity | `false` |
-| `dynamicBalancePlayerFloor` | Player count at which max extra slots apply | `90` |
-| `dynamicBalanceExtraSlots` | Additional imbalance slots at floor player count | `2` |
+| `dynamicBalanceTolerance` | Enable interpolated extra tolerance below full capacity | `true` |
+| `dynamicBalancePlayerFloor` | Player count at which max extra slots apply | `85` |
+| `dynamicBalanceExtraSlots` | Additional imbalance slots at floor player count | `3` |
 
 ### Discord
 
@@ -256,6 +258,7 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 | `switchWindowBroadcastIntervalMinutes` | Minutes between switch window reminder broadcasts. | `2` |
 | `warnOnJoinChangeTeamDisabled` | Warn joining players that scoreboard team changes are disabled and !switch is the alternative. | `true` |
 | `queueEnabled` | Enable the switch queue. When disabled, !switch only works if a balance slot is immediately available. | `true` |
+| `roundEndSummaryEnabled` | Post a Discord embed with round-end queue summary showing self-switches, pair trades, handshake swaps, failures, expiries, disconnects, and cancellations. | `true` |
 
 ---
 

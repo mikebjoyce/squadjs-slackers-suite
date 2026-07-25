@@ -222,13 +222,15 @@ const SwitchCommands = {
                 const cooldownHours = plugin.options.switchCooldownMinutes > 0
                   ? (plugin.options.switchCooldownMinutes / 60).toFixed(1)
                   : plugin.options.switchCooldownHours;
-                plugin.warn(eosID, `[Switch] How It Works (1/4)\nSwitching is allowed in the first ${plugin.options.switchEnabledMinutes}m after joining or after match start — whichever gives you more time.`);
+                plugin.warn(eosID, `[Switch] How It Works (1/5)\nYou can request a switch in the first ${plugin.options.switchEnabledMinutes}m after joining or after match start — whichever gives you more time.`);
                 await delay(5000);
-                plugin.warn(eosID, `[Switch] How It Works (2/4)\nIf teams are uneven, you are queued until a slot opens or a swap partner on the other team is found.`);
+                plugin.warn(eosID, `[Switch] How It Works (2/5)\nIf teams are uneven, you are queued until a slot opens or a swap partner on the other team is found.`);
                 await delay(5000);
-                plugin.warn(eosID, `[Switch] How It Works (3/4)\nAfter switching, there is a ${cooldownHours}h cooldown before you can switch again.`);
+                plugin.warn(eosID, `[Switch] How It Works (3/5)\nOnce in the queue, you have ${plugin.options.queueTimeoutMinutes}m before your request expires. Use !switch check to see your status.`);
                 await delay(5000);
-                plugin.warn(eosID, `[Switch] How It Works (4/4)\nAfter a scramble, switches are locked for ${plugin.options.scrambleLockdownDurationMinutes}m.\nUse !switch check to see your current status.`);
+                plugin.warn(eosID, `[Switch] How It Works (4/5)\nAfter switching, there is a ${cooldownHours}h cooldown before you can switch again.`);
+                await delay(5000);
+                plugin.warn(eosID, `[Switch] How It Works (5/5)\nAfter a scramble, switches are locked for ${plugin.options.scrambleLockdownDurationMinutes}m.\nUse !switch check to see your current status.`);
               }
               break;
             case "check":
@@ -316,6 +318,15 @@ const SwitchCommands = {
                   }
 
                   statusMsg += `[${scrambleOK ? 'OK' : 'X '}] Scramble   | ${scrambleMsg}`;
+
+                  // If player is queued, show queue position and timeout
+                  const queueEntry = plugin._findQueueEntry(eosID);
+                  if (queueEntry) {
+                    const pos = plugin._switchQueue[queueEntry.subQueue].findIndex(e => e.eosID === eosID) + 1;
+                    const remainingMs = plugin._getRemainingQueueMs(queueEntry.entry.queuedAt);
+                    const remainingMin = (remainingMs / 60000).toFixed(1);
+                    statusMsg += `\n[  ] Queue      | Position ${pos}, ~${remainingMin}m timeout remaining`;
+                  }
 
                   const allOK = balanceOK && timeWindowOK && cooldownOK && scrambleOK;
                   if (allOK) {
@@ -416,7 +427,7 @@ const SwitchCommands = {
               plugin.verbose(1, `[Switch] Denied ${playerName}: Scramble lockdown active.`);
               plugin._trackDenial(eosID, playerName, 'scramble_lock');
             } else if (eligibility.reason === 'time_window') {
-              plugin.warn(eosID, `[Switch] Join/match window closed.\nSwitching is only allowed in the first ${plugin.options.switchEnabledMinutes}m after joining or after\nmatch start — whichever gives you more time.\nUse !switch explain for details.`);
+              plugin.warn(eosID, `[Switch] Eligibility window closed.\nYou can only request a switch in the first ${plugin.options.switchEnabledMinutes}m after joining or after\nmatch start — whichever gives you more time.\nUse !switch explain for details.`);
               plugin.verbose(1, `[Switch] Denied ${playerName}: Match time limit exceeded.`);
               plugin._trackDenial(eosID, playerName, 'time_window');
             } else if (eligibility.reason === 'cooldown') {

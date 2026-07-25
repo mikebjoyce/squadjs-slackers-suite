@@ -85,33 +85,32 @@ const SwitchQueue = {
         return;
       }
 
-      const windowMs = plugin.options.switchEnabledMinutes * 60 * 1000;
       const targetTeam = teamID === 1 ? 2 : 1;
       const subQueue = teamID === 1 ? 't1' : 't2';
 
       if (plugin._findQueueEntry(eosID)) {
         const existing = plugin._findQueueEntry(eosID).entry;
-        const remaining = ((await plugin._getRemainingWindowMs(existing.eosID)) / 60000).toFixed(1);
+        const remaining = (plugin._getRemainingQueueMs(existing.queuedAt) / 60000).toFixed(1);
         plugin.warn(eosID,
-          `[Switch Queue]\nYou are already in the queue.\n~${remaining}m remaining | Team ${existing.currentTeamID} → Team ${existing.targetTeamID}\nType !switch cancel to leave.`
+          `[Switch Queue]\nYou are already in the queue.\n~${remaining}m queue timeout | Team ${existing.currentTeamID} → Team ${existing.targetTeamID}\nType !switch cancel to leave.`
         );
         return;
       }
 
       const queuedAt = Date.now();
 
-      const warnInterval = setInterval(async () => {
+      const warnInterval = setInterval(() => {
         const found = plugin._findQueueEntry(eosID);
         if (!found) { clearInterval(warnInterval); return; }
 
         const entry = found.entry;
-        const remaining = ((await plugin._getRemainingWindowMs(entry.eosID)) / 60000).toFixed(1);
+        const remaining = (plugin._getRemainingQueueMs(entry.queuedAt) / 60000).toFixed(1);
 
         const sameTeam = plugin._switchQueue[entry.currentTeamID === 1 ? 't1' : 't2'];
         const pos = sameTeam.findIndex(e => e.eosID === eosID) + 1;
 
         plugin.warn(entry.eosID,
-          `[Switch Queue]\nPosition ${pos} in the queue.\n~${remaining}m remaining | Team ${entry.currentTeamID} → Team ${entry.targetTeamID}\nType !switch cancel to leave.`
+          `[Switch Queue]\nPosition ${pos} in the queue.\n~${remaining}m queue timeout | Team ${entry.currentTeamID} → Team ${entry.targetTeamID}\nType !switch cancel to leave.`
         );
       }, 30_000);
 
@@ -122,7 +121,7 @@ const SwitchQueue = {
       plugin._updateMaxQueueSize();
 
       plugin.warn(eosID,
-        `[Switch Queue]\nAdded to position ${enqueuePos} in the queue.\n~${((await plugin._getRemainingWindowMs(eosID)) / 60000).toFixed(1)}m remaining | Team ${teamID} → Team ${targetTeam}\n${reason}\nType !switch cancel to leave.`
+        `[Switch Queue]\nAdded to position ${enqueuePos} in the queue.\n~${(plugin._getRemainingQueueMs(queuedAt) / 60000).toFixed(1)}m queue timeout | Team ${teamID} → Team ${targetTeam}\n${reason}\nType !switch cancel to leave.`
       );
       plugin.verbose(1, `[Queue] ${playerName} (T${teamID} → T${targetTeam}) enqueued at position ${enqueuePos}. Queue size: ${plugin._getQueueSize()}`);
 
@@ -144,19 +143,12 @@ const SwitchQueue = {
       plugin._requestQueueRefresh();
     };
 
-    plugin._getRemainingWindowMs = async function (eosID) {
-      // Compute actual remaining time based on join time and match start time,
-      // not on when the player queued. The player's window is the longer of their
-      // join-based and match-start-based timers.
-      const windowMs = plugin.options.switchEnabledMinutes * 60 * 1000;
-      const limitSeconds = plugin.options.switchEnabledMinutes * 60;
-      const joinSeconds = await plugin.getSecondsFromJoin(eosID);
-      const matchSeconds = plugin.getSecondsFromMatchStart();
-      const joinRemainingMs = Math.max(0, (limitSeconds - joinSeconds) * 1000);
-      const matchRemainingMs = Math.max(0, (limitSeconds - matchSeconds) * 1000);
-      const actualRemainingMs = Math.max(joinRemainingMs, matchRemainingMs);
-      // Cap at windowMs — the initial window is the max possible
-      return Math.min(actualRemainingMs, windowMs);
+    plugin._getRemainingQueueMs = function (queuedAt) {
+      // Compute remaining queue timeout based on when the player entered the queue,
+      // not on join/match time. The queue has its own independent timeout.
+      const queueTimeoutMs = plugin.options.queueTimeoutMinutes * 60 * 1000;
+      const elapsed = Date.now() - queuedAt;
+      return Math.max(0, queueTimeoutMs - elapsed);
     };
 
     plugin._getQueueSize = function () {
@@ -267,14 +259,14 @@ const SwitchQueue = {
           return;
         }
 
-        const windowMs = plugin.options.switchEnabledMinutes * 60 * 1000;
+        const queueTimeoutMs = plugin.options.queueTimeoutMinutes * 60 * 1000;
         const nowTs = Date.now();
 
         for (const subQueue of ['t1', 't2']) {
           const arr = plugin._switchQueue[subQueue];
           for (let i = arr.length - 1; i >= 0; i--) {
             const entry = arr[i];
-            if (plugin.timeLimitEnabled && (nowTs - entry.queuedAt) >= windowMs) {
+            if (plugin.timeLimitEnabled && (nowTs - entry.queuedAt) >= queueTimeoutMs) {
               clearInterval(entry.warnInterval);
               arr.splice(i, 1);
               if (plugin._roundStats) {
@@ -287,7 +279,7 @@ const SwitchQueue = {
                   gamePhase
                 });
               }
-              plugin.warn(entry.eosID, `[Switch Queue] Removed — join/match window closed.\nYour ${plugin.options.switchEnabledMinutes}m window expired while waiting.\nUse !switch explain for details.`);
+              plugin.warn(entry.eosID, `[Switch Queue] Removed — queue timeout reached.\nYour ${plugin.options.queueTimeoutMinutes}m queue timeout expired while waiting.\nUse !switch explain for details.`);
               plugin.verbose(2, `[Queue] ${entry.playerName} expired and removed from queue.`);
             }
           }

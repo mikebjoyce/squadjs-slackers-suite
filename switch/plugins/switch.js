@@ -224,6 +224,11 @@ export default class Switch extends S3DiscordPluginBase {
                 description: "Time in minutes in which the switch will be enabled after match start or player join",
                 default: 10
             },
+            queueTimeoutMinutes: {
+                required: false,
+                description: "Minutes a player can wait in the switch queue before being removed (separate from the eligibility window)",
+                default: 20
+            },
             doubleSwitchEnabledMinutes: {
                 required: false,
                 description: "Time in minutes in which a double switch will be enabled after match start or player join",
