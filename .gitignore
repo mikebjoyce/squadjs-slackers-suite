@@ -27,3 +27,6 @@ desktop.ini
 # Logs
 *.log
 npm-debug.log*
+
+# Test Output
+test-results.json

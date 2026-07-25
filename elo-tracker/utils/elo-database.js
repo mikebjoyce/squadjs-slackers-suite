@@ -218,12 +218,13 @@ export default class EloDatabase {
         });
         if (exact) return exact.toJSON();
 
-        const escaped = id.replace(/%/g, '\\%').replace(/_/g, '\\_');
+        const escaped = id.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+        const literalLike = Sequelize.literal(`name LIKE '%${escaped}%' ESCAPE '\\'`);
         const fuzzy = await this._s3db.getModel('Elo_PlayerStats').findOne({
           where: {
             [Op.or]: [
               { steamID: id },
-              { name: { [Op.like]: `%${escaped}%` } }
+              literalLike
             ]
           },
           transaction: t
