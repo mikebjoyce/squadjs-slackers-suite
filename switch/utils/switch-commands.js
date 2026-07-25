@@ -400,35 +400,10 @@ const SwitchCommands = {
             return;
           }
 
-          const eosID2 = info.player?.eosID;
-          const canActPlayers = plugin._s3.players;
-          if (eosID2 && canActPlayers?.isReady?.() && canActPlayers.canAct) {
-            if (!canActPlayers.canAct(eosID2, 'Switch')) {
-              plugin.warn(eosID, '[Switch] You are currently being processed — please try again shortly.');
-              plugin.verbose(1, `[Switch] Denied ${playerName}: canAct returned false (locked by higher-priority actor).`);
-              return;
-            }
-          }
-
-          const isLiberal = plugin.isLiberalMode();
-          const effectiveCap = isLiberal ? plugin.options.liberalSwitchMaxUnbalancedSlots : null;
-          const availableSwitchSlots = plugin.getSwitchSlotsPerTeam(teamID, effectiveCap);
-
-          const targetTeam = teamID === 1 ? 2 : 1;
-          let teamPlayerCount = [null, 0, 0];
-          for (let p of plugin.server.players) {
-            teamPlayerCount[+p.teamID]++;
-          }
-          const balanceDiff = teamPlayerCount[1] - teamPlayerCount[2];
-          const effectiveMaxSlots = effectiveCap !== null ? effectiveCap : plugin.options.maxUnbalancedSlots;
-
-          plugin.verbose(2, `[Switch Request] ${playerName} (T${teamID} -> T${targetTeam})`);
-          plugin.verbose(2, `[Team Counts] Team 1: ${teamPlayerCount[1]} | Team 2: ${teamPlayerCount[2]} | Balance Diff: ${balanceDiff}`);
-          plugin.verbose(2, `[Switch Slots] Max Unbalance Cap: ${effectiveMaxSlots} | Available Slots: ${availableSwitchSlots}`);
-          if (isLiberal) {
-            plugin.verbose(2, `[Liberal Mode] ${playerName} - relaxed switch restrictions active (Seed/Jensen).`);
-          }
-
+          // Check hard eligibility first (scramble lock, time window, cooldown)
+          // before the soft canAct gate, so permanently-ineligible players get
+          // the correct deny message. canAct failures are transient and will be
+          // handled by enqueuing instead of a dead-end return.
           if (!eosID) {
             plugin.verbose(1, `[PlayerCooldowns] Missing eosID for player ${playerName}, skipping switch validation`);
             return;
@@ -450,6 +425,45 @@ const SwitchCommands = {
               plugin._trackDenial(eosID, playerName, 'cooldown');
             }
             return;
+          }
+
+          // Soft gate: if another plugin holds a lock on this player, enqueue
+          // instead of dead-ending. The queue's periodic _processQueue will pick
+          // them up when the lock releases. If the queue is disabled, fall back
+          // to a generic retry message — _enqueuePlayer silently returns when
+          // queueEnabled is false, which would leave the player with no feedback.
+          const eosID2 = info.player?.eosID;
+          const canActPlayers = plugin._s3.players;
+          if (eosID2 && canActPlayers?.isReady?.() && canActPlayers.canAct) {
+            if (!canActPlayers.canAct(eosID2, 'Switch')) {
+              if (!plugin.options.queueEnabled) {
+                plugin.verbose(1, `[Switch] ${playerName}: canAct returned false — queue disabled, asking retry.`);
+                plugin.warn(eosID, '[Switch] Please try again shortly.');
+                return;
+              }
+              plugin.verbose(1, `[Switch] ${playerName}: canAct returned false — enqueuing.`);
+              await plugin._enqueuePlayer(info.player, 'Your request has been queued.');
+              return;
+            }
+          }
+
+          const isLiberal = plugin.isLiberalMode();
+          const effectiveCap = isLiberal ? plugin.options.liberalSwitchMaxUnbalancedSlots : null;
+          const availableSwitchSlots = plugin.getSwitchSlotsPerTeam(teamID, effectiveCap);
+
+          const targetTeam = teamID === 1 ? 2 : 1;
+          let teamPlayerCount = [null, 0, 0];
+          for (let p of plugin.server.players) {
+            teamPlayerCount[+p.teamID]++;
+          }
+          const balanceDiff = teamPlayerCount[1] - teamPlayerCount[2];
+          const effectiveMaxSlots = effectiveCap !== null ? effectiveCap : plugin.options.maxUnbalancedSlots;
+
+          plugin.verbose(2, `[Switch Request] ${playerName} (T${teamID} -> T${targetTeam})`);
+          plugin.verbose(2, `[Team Counts] Team 1: ${teamPlayerCount[1]} | Team 2: ${teamPlayerCount[2]} | Balance Diff: ${balanceDiff}`);
+          plugin.verbose(2, `[Switch Slots] Max Unbalance Cap: ${effectiveMaxSlots} | Available Slots: ${availableSwitchSlots}`);
+          if (isLiberal) {
+            plugin.verbose(2, `[Liberal Mode] ${playerName} - relaxed switch restrictions active (Seed/Jensen).`);
           }
 
           // v2.0.0: Queue-disabled path — deny early if queue is off and no slot
