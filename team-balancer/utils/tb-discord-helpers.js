@@ -425,7 +425,7 @@ export const DiscordHelpers = {
     return embed;
   },
 
-  buildScrambleCompletedEmbed(totalMoves, movedSuccessfully, failedToMove, disconnected, duration) {
+  buildScrambleCompletedEmbed(totalMoves, movedSuccessfully, failedToMove, disconnected, duration, failedNames = []) {
     const successRate = totalMoves > 0 ? Math.round((movedSuccessfully / totalMoves) * 100) : 100;
 
     const embed = {
@@ -443,6 +443,15 @@ export const DiscordHelpers = {
     };
 
     if (failedToMove > 0) {
+      if (failedNames && failedNames.length > 0) {
+        const nameList = failedNames.slice(0, 20).join('\n');
+        const trailer = failedNames.length > 20 ? `\n+ ${failedNames.length - 20} more...` : '';
+        embed.fields.push({
+          name: `Failed Players (${failedNames.length})`,
+          value: `\`\`\`text\n${nameList}${trailer}\n\`\`\``,
+          inline: false
+        });
+      }
       embed.description = '⚠️ Some players could not be moved. Check logs for details.';
     }
 

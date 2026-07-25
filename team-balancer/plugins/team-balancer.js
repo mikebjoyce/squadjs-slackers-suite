@@ -2376,14 +2376,7 @@ export default class TeamBalancer extends S3PluginBase {
       if (swapPlan && swapPlan.length > 0) {
         Logger.verbose('TeamBalancer', 2, `Dry run: Scrambler returned ${swapPlan.length} player moves (Calculation: ${swapPlan.calculationTime}ms).`);
 
-        if (!isSimulated) {          
-           const affectedPlayers = this.server.players
-  .filter(p => p.eosID)
-  .map(p => ({ eosID: p.eosID, steamID: p.steamID ?? null, name: p.name }));
-          this.server.emit('TEAM_BALANCER_SCRAMBLE_EXECUTED', {
-            affectedPlayers
-          });
-
+        if (!isSimulated) {
           for (const move of swapPlan) {
             const player = this.server.players.find(p => p.eosID === move.eosID);
             if (!player) {
@@ -2397,6 +2390,30 @@ export default class TeamBalancer extends S3PluginBase {
             await this.reliablePlayerMove(move.eosID, move.targetTeamID, isSimulated);
           }
           await this.waitForScrambleToFinish(this.options.maxScrambleCompletionTime);
+
+          // ── Post-scramble lockdown (moved here from pre-execution) ──
+          // The TEAM_BALANCER_SCRAMBLE_EXECUTED event is emitted AFTER all
+          // moves complete rather than before, so we can verify which players
+          // actually moved and exclude failures. The SwapExecutor's verifyMoves()
+          // step identifies two categories:
+          //   • Disconnected players — still locked (dodge prevention)
+          //   • RCON-genuinely-failed players (on server, wrong team) — excluded
+          // Only the latter appear in failedEosIDs; disconnected players
+          // retain their lockdown via Switch's existing PlayerCooldowns row.
+          const sessionReport = this.swapExecutor?.getLastSessionReport?.();
+          const failedEosIDs = new Set(sessionReport?.failedEosIDs || []);
+          const affectedPlayers = [];
+          for (const move of swapPlan) {
+            const player = this.server.players.find(p => p.eosID === move.eosID);
+            if (player && !failedEosIDs.has(move.eosID)) {
+              affectedPlayers.push({ eosID: player.eosID, steamID: player.steamID ?? null, name: player.name });
+            }
+          }
+          if (affectedPlayers.length > 0) {
+            this.server.emit('TEAM_BALANCER_SCRAMBLE_EXECUTED', {
+              affectedPlayers
+            });
+          }
 
           const msg = `${this.RconMessages.prefix} ${this.RconMessages.scrambleCompleteMessage.trim()}`;
           Logger.verbose('TeamBalancer', 4, `Broadcasting: "${msg}"`);
@@ -2581,6 +2598,7 @@ export default class TeamBalancer extends S3PluginBase {
           totalMoves: sessionReport.totalMoves,
           movedSuccessfully: sessionReport.movedSuccessfully,
           failedToMove: sessionReport.failedToMove,
+          failedNames: sessionReport.failedNames || [],
           disconnected: sessionReport.disconnected,
           duration: sessionReport.duration,
           successRate: sessionReport.successRate

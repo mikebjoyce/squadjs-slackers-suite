@@ -60,6 +60,7 @@ export default class SwapExecutor {
     this.isProcessing = false;
     this._completing = false; // Atomic lock to prevent duplicate verifyMoves() calls
     this.sessionMoves = new Map(); // Track all moves for verification
+    this._lastSessionReport = null; // Set by completeSession(), read by getLastSessionReport() for post-scramble TEAM_BALANCER_SCRAMBLE_EXECUTED emission
   }
 
   async queueMove(eosID, targetTeamID, isSimulated = false) {
@@ -73,9 +74,10 @@ export default class SwapExecutor {
       startTime: Date.now()
     });
 
-    this.sessionMoves.set(eosID, { targetTeamID });
+    const p = this.server.players.find(pl => pl.eosID === eosID);
+    this.sessionMoves.set(eosID, { targetTeamID, name: p?.name || 'Unknown' });
 
-    Logger.verbose('TeamBalancer', 4, `[SwapExecutor] Queued move for ${eosID} -> ${targetTeamID}`);
+    Logger.verbose('TeamBalancer', 4, `[SwapExecutor] Queued move for ${p?.name || eosID} -> ${targetTeamID}`);
 
     if (!this.scrambleRetryTimer) {
       this.startMonitoring();
@@ -164,6 +166,11 @@ export default class SwapExecutor {
     * Verifies that players actually ended up on their intended teams.
     * This fetches the live player list from the server after RCON moves are complete,
     * tallying successes/failures, and producing a report to ensure no silent failures.
+    *
+    * Returns `failedEosIDs` containing only players whose RCON move genuinely failed
+    * (still on the wrong team). Disconnected players are NOT included — they still
+    * receive scramble lockdown via the Switch plugin to prevent disconnect-dodging.
+    * TeamBalancer uses this set to exclude only true RCON failures from lockdown.
     */
    async verifyMoves() {
       try {
@@ -179,17 +186,24 @@ export default class SwapExecutor {
         };
       }
 
-      const verified = { moved: 0, failed: 0, disconnected: 0 };
+      const verified = { moved: 0, failed: 0, disconnected: 0, failedNames: [], failedEosIDs: [] };
 
       for (const [eosID, moveData] of this.sessionMoves.entries()) {
         const player = (this.teamBalancer?._s3?.players?.getPlayer(eosID)) || this.server.players.find(p => p.eosID === eosID);
 
         if (!player) {
-          verified.disconnected++; // Player disconnected
+          // Player disconnected mid-scramble. Do NOT push to failedEosIDs —
+          // these players should still receive the scramble lockdown when they
+          // rejoin, preventing players from disconnecting to dodge it.
+          verified.disconnected++;
         } else if (String(player.teamID) === String(moveData.targetTeamID)) {
           verified.moved++; // Successfully on correct team
        } else {
-         verified.failed++; // Still on wrong team
+         // RCON genuinely failed — player is still on the server on their old
+         // team. These are the only players we exclude from scramble lockdown.
+         verified.failed++;
+         verified.failedNames.push(moveData.name || player.name || `EOS:${eosID.slice(0, 8)}`);
+         verified.failedEosIDs.push(eosID);
        }
      }
 
@@ -199,7 +213,9 @@ export default class SwapExecutor {
        totalMoves: this.sessionMoves.size,
        movedSuccessfully: verified.moved,
        failedToMove: verified.failed,
-       disconnected: verified.disconnected
+       disconnected: verified.disconnected,
+       failedNames: verified.failedNames,
+       failedEosIDs: verified.failedEosIDs
      };
    }
 
@@ -217,7 +233,7 @@ export default class SwapExecutor {
     }
 
     const results = await this.verifyMoves();
-    const { totalMoves, movedSuccessfully, failedToMove, disconnected } = results;
+    const { totalMoves, movedSuccessfully, failedToMove, disconnected, failedNames } = results;
     const duration = Date.now() - this.activeSession.startTime;
     const successRate = totalMoves > 0 ? Math.round((movedSuccessfully / totalMoves) * 100) : 100;
 
@@ -227,6 +243,8 @@ export default class SwapExecutor {
       movedSuccessfully,
       failedToMove,
       disconnected,
+      failedNames: failedNames || [],
+      failedEosIDs: results.failedEosIDs || [],
       duration,
       successRate
     };
@@ -243,7 +261,8 @@ export default class SwapExecutor {
         movedSuccessfully,
         failedToMove,
         disconnected,
-        duration
+        duration,
+        failedNames || []
       );
       DiscordHelpers.sendDiscordMessage(this.teamBalancer.discordChannel, { embeds: [embed] });
     }
