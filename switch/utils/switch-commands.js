@@ -380,14 +380,24 @@ const SwitchCommands = {
             case 'cancel':
               if (!plugin.options.queueEnabled) {
                 plugin.warn(eosID, '[Switch Queue] Queue is currently disabled.');
-              } else if (plugin._removePlayerFromQueue(info.player?.eosID)) {
-                plugin.warn(eosID, '[Switch Queue] Removed — you left the queue.');
-                if (plugin._roundStats) {
-                  plugin._roundStats.queueCancels.push({ name: playerName, eosID });
-                }
-                plugin.verbose(1, `[Queue] ${playerName} cancelled — left the queue.`);
               } else {
-                plugin.warn(eosID, '[Switch Queue] You are not currently in the queue.');
+                const cancelEntry = plugin._findQueueEntry(info.player?.eosID);
+                if (plugin._removePlayerFromQueue(info.player?.eosID)) {
+                  plugin.warn(eosID, '[Switch Queue] Removed — you left the queue.');
+                  if (plugin._roundStats && cancelEntry) {
+                    const dur = Math.round((Date.now() - cancelEntry.entry.queuedAt) / 1000);
+                    plugin._roundStats.queueCancels.push({
+                      name: playerName,
+                      eosID,
+                      currentTeamID: cancelEntry.entry.currentTeamID,
+                      toTeam: cancelEntry.entry.targetTeamID,
+                      queueDurationSeconds: dur
+                    });
+                  }
+                  plugin.verbose(1, `[Queue] ${playerName} cancelled — left the queue.`);
+                } else {
+                  plugin.warn(eosID, '[Switch Queue] You are not currently in the queue.');
+                }
               }
               break;
             default:

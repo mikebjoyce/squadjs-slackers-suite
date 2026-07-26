@@ -92,7 +92,7 @@ const SwitchQueue = {
         const existing = plugin._findQueueEntry(eosID).entry;
         const remaining = (plugin._getRemainingQueueMs(existing.queuedAt) / 60000).toFixed(1);
         plugin.warn(eosID,
-          `[Switch Queue]\nYou are already in the queue.\n~${remaining}m queue timeout | Team ${existing.currentTeamID} → Team ${existing.targetTeamID}\nType !switch cancel to leave.`
+          `[Switch Queue]\nYou are already in the queue.\n~${remaining}m auto-expiry | Team ${existing.currentTeamID} → Team ${existing.targetTeamID}\nType !switch cancel to leave.`
         );
         return;
       }
@@ -110,7 +110,7 @@ const SwitchQueue = {
         const pos = sameTeam.findIndex(e => e.eosID === eosID) + 1;
 
         plugin.warn(entry.eosID,
-          `[Switch Queue]\nPosition ${pos} in the queue.\n~${remaining}m queue timeout | Team ${entry.currentTeamID} → Team ${entry.targetTeamID}\nType !switch cancel to leave.`
+          `[Switch Queue]\nPosition ${pos} in the queue.\n~${remaining}m remaining | Team ${entry.currentTeamID} → Team ${entry.targetTeamID}\nType !switch cancel to leave.`
         );
       }, 30_000);
 
@@ -121,7 +121,7 @@ const SwitchQueue = {
       plugin._updateMaxQueueSize();
 
       plugin.warn(eosID,
-        `[Switch Queue]\nAdded to position ${enqueuePos} in the queue.\n~${(plugin._getRemainingQueueMs(queuedAt) / 60000).toFixed(1)}m queue timeout | Team ${teamID} → Team ${targetTeam}\n${reason}\nType !switch cancel to leave.`
+        `[Switch Queue]\nAdded to position ${enqueuePos} in the queue.\n~${(plugin._getRemainingQueueMs(queuedAt) / 60000).toFixed(1)}m auto-expiry | Team ${teamID} → Team ${targetTeam}\n${reason}\nType !switch cancel to leave.`
       );
       plugin.verbose(1, `[Queue] ${playerName} (T${teamID} → T${targetTeam}) enqueued at position ${enqueuePos}. Queue size: ${plugin._getQueueSize()}`);
 
@@ -285,8 +285,17 @@ const SwitchQueue = {
           }
         }
 
+        // Use S³'s authoritative player registry for team counts — handles null-teamID
+        // projection and deduped state, unlike SquadJS's raw server.players array.
+        // _processQueue only runs in response to S3_PLAYERS_UPDATED, which fires AFTER
+        // S³ has committed its internal state from the tick, so the registry is current.
         let t1 = 0, t2 = 0;
-        for (const p of plugin.server.players) {
+        const s3AllPlayers = plugin._s3?.players?.isReady() ? plugin._s3.players.getAllPlayers() : null;
+        if (!s3AllPlayers) {
+          plugin.verbose(2, `[Queue] S³ players not ready — skipping team count.`);
+          return;
+        }
+        for (const p of s3AllPlayers) {
           if (p.teamID === 1) t1++;
           else if (p.teamID === 2) t2++;
         }
@@ -304,25 +313,48 @@ const SwitchQueue = {
           const p1 = t1Candidates[i];
           const p2 = t2Candidates[i];
 
-          const live1 = plugin.server.players.find(p => p.eosID === p1.eosID);
-          const live2 = plugin.server.players.find(p => p.eosID === p2.eosID);
-
-          if (!live1 || live1.teamID !== p1.currentTeamID) {
+          // Use S³'s authoritative player registry for live checks — handles null-teamID
+          // projection and deduped state. _processQueue only runs in response to
+          // S3_PLAYERS_UPDATED, which fires AFTER S³ has committed its internal state
+          // from the tick, so the registry is current.
+          const s3p1 = plugin._s3?.players?.isReady() ? plugin._s3.players.getPlayer(p1.eosID) : null;
+          if (!s3p1) {
+            // Player absent from S³ registry — disconnected
+            plugin._removePlayerFromQueue(p1.eosID);
+            if (plugin._roundStats) {
+              plugin._roundStats.queueDisconnects.push({ name: p1.playerName, eosID: p1.eosID });
+            }
+            plugin.verbose(1, `[Queue] ${p1.playerName} disconnected — removed from queue.`);
+            continue;
+          }
+          if (s3p1.teamID !== p1.currentTeamID) {
             plugin._removePlayerFromQueue(p1.eosID);
             if (plugin._roundStats) {
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
               plugin._roundStats.queueRemovals.push({ name: p1.playerName, eosID: p1.eosID, reason: 'team_changed', gamePhase });
             }
             plugin.verbose(1, `[Queue] ${p1.playerName} team changed externally — removed from queue.`);
+            plugin.warn(p1.eosID, `[Switch Queue] You were removed — your team changed while waiting.\nUse !switch check to see your current status.`);
             continue;
           }
-          if (!live2 || live2.teamID !== p2.currentTeamID) {
+          const s3p2 = plugin._s3?.players?.isReady() ? plugin._s3.players.getPlayer(p2.eosID) : null;
+          if (!s3p2) {
+            // Player absent from S³ registry — disconnected
+            plugin._removePlayerFromQueue(p2.eosID);
+            if (plugin._roundStats) {
+              plugin._roundStats.queueDisconnects.push({ name: p2.playerName, eosID: p2.eosID });
+            }
+            plugin.verbose(1, `[Queue] ${p2.playerName} disconnected — removed from queue.`);
+            continue;
+          }
+          if (s3p2.teamID !== p2.currentTeamID) {
             plugin._removePlayerFromQueue(p2.eosID);
             if (plugin._roundStats) {
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
               plugin._roundStats.queueRemovals.push({ name: p2.playerName, eosID: p2.eosID, reason: 'team_changed', gamePhase });
             }
             plugin.verbose(1, `[Queue] ${p2.playerName} team changed externally — removed from queue.`);
+            plugin.warn(p2.eosID, `[Switch Queue] You were removed — your team changed while waiting.\nUse !switch check to see your current status.`);
             continue;
           }
 
@@ -385,14 +417,27 @@ const SwitchQueue = {
         const firstT2 = plugin._switchQueue.t2[0] || null;
 
         for (const entry of [firstT1, firstT2].filter(Boolean)) {
-          const live = plugin.server.players.find(p => p.eosID === entry.eosID);
-          if (!live || live.teamID !== entry.currentTeamID) {
+          // Use S³'s authoritative player registry — handles null-teamID projection
+          // and deduped state. _processQueue only runs in response to S3_PLAYERS_UPDATED,
+          // which fires AFTER S³ has committed its internal state from the tick.
+          const s3Entry = plugin._s3?.players?.isReady() ? plugin._s3.players.getPlayer(entry.eosID) : null;
+          if (!s3Entry) {
+            // Player absent from S³ registry — disconnected
+            plugin._removePlayerFromQueue(entry.eosID);
+            if (plugin._roundStats) {
+              plugin._roundStats.queueDisconnects.push({ name: entry.playerName, eosID: entry.eosID });
+            }
+            plugin.verbose(1, `[Queue] ${entry.playerName} disconnected — removed from queue.`);
+            continue;
+          }
+          if (s3Entry.teamID !== entry.currentTeamID) {
             plugin._removePlayerFromQueue(entry.eosID);
             if (plugin._roundStats) {
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
               plugin._roundStats.queueRemovals.push({ name: entry.playerName, eosID: entry.eosID, reason: 'team_changed', gamePhase });
             }
             plugin.verbose(1, `[Queue] ${entry.playerName} team changed externally — removed from queue.`);
+            plugin.warn(entry.eosID, `[Switch Queue] You were removed — your team changed while waiting.\nUse !switch check to see your current status.`);
             continue;
           }
 

@@ -465,7 +465,12 @@ const SwitchOutput = {
       }
 
       if (s.queueCancels.length) {
-        const names = s.queueCancels.slice(0, 20).map(p => p.name);
+        const names = s.queueCancels.slice(0, 20).map(p => {
+          const dur = p.queueDurationSeconds != null ? plugin._formatDuration(p.queueDurationSeconds) : '?';
+          const from = p.currentTeamID ? `T${p.currentTeamID}` : '?';
+          const to = p.toTeam ? `T${p.toTeam}` : '?';
+          return `${p.name} (${from}→${to}, ${dur})`;
+        });
         if (s.queueCancels.length > 20) names.push(`+ ${s.queueCancels.length - 20} more...`);
         activityLines.push(`**Cancelled (${s.queueCancels.length})**\n${names.join('\n')}`);
       }
