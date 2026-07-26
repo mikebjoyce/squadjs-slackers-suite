@@ -72,6 +72,7 @@ const DEFAULT_REFRESH_DEBOUNCE_WINDOW_MS = 250; // coalesce window for requestRe
 const DEFAULT_REFRESH_NOW_FLOOR_MS = 1000;      // minimum gap for refreshNow() before re-calling RCON
 const DEFAULT_SESSION_EXPIRY_MS = 30 * 60 * 1000; // 30 min — how long without activity before a session expires
 const DEFAULT_SESSION_UPDATE_INTERVAL_MS = 5 * 60 * 1000; // 5 min — how often to refresh lastActivity in DB
+const DEFAULT_RCON_RECOVERY_GRACE_MS = 30000; // 30s — suppress leave detection for this long after an RCON_ERROR
 
 export default class PlayersService {
   constructor({
@@ -171,6 +172,16 @@ export default class PlayersService {
       handleUpdatedPlayerInfo: this.handleUpdatedPlayerInfo.bind(this),
       handlePlayerConnected: this.handlePlayerConnected.bind(this)
     };
+
+    // RCON recovery tracking: SquadJS emits RCON_ERROR when RCON operations fail
+    // (e.g. socket drop). We suppress leave detection for a grace period after
+    // the last error to prevent mass false JOINs when server.players repopulates.
+    this._lastRconErrorTime = 0;
+    this._rconRecoveryGraceMs = DEFAULT_RCON_RECOVERY_GRACE_MS;
+    this._onRconError = () => {
+      this._lastRconErrorTime = Date.now();
+      this.verboseLogger(2, `[Players] RCON_ERROR detected — entering recovery window (${this._rconRecoveryGraceMs}ms leave suppression)`);
+    };
   }
 
   async mount() {
@@ -189,6 +200,9 @@ export default class PlayersService {
     this._isMounted = true;
     this._initialSyncComplete = false;
 
+    // Wire RCON_ERROR listener for reconnect recovery
+    this.server.on('RCON_ERROR', this._onRconError);
+
     // Start periodic refresh timer if any consumer registered interest before mount.
     if (this._refreshState.effectiveInterval) {
       this._startPeriodicRefresh();
@@ -203,6 +217,9 @@ export default class PlayersService {
     // Stop periodic refresh timer and cancel any pending debounce.
     this._stopPeriodicRefresh();
 
+    // Remove RCON_ERROR listener
+    this.server.removeListener('RCON_ERROR', this._onRconError);
+
     for (const lock of this.playerLocks.values()) {
       if (lock?.timeout) clearTimeout(lock.timeout);
     }
@@ -213,6 +230,7 @@ export default class PlayersService {
 
     this._isMounted = false;
     this._initialSyncComplete = false;
+    this._lastRconErrorTime = 0;
     this.verboseLogger(2, '[Players] Unmounted.');
   }
 
@@ -881,34 +899,57 @@ export default class PlayersService {
       return;
     }
 
-    for (const [key, tracked] of this.registry.entries()) {
-      if (current.has(key)) continue;
+    // ── RCON Recovery Guard ──────────────────────────────────────────
+    // When SquadJS's RCON socket drops and reconnects mid-game, SquadJS emits
+    // RCON_ERROR events during the outage, then briefly serves empty/partial
+    // server.players on the first tick after reconnect. The leave loop below
+    // would delete all registry entries, causing mass false S3_PLAYER_JOINED
+    // events on the next tick when the full player list repopulates.
+    //
+    // Detection: if RCON_ERROR fired within the recovery grace period, suppress
+    // the leave loop. The registry stays intact, and _registerPlayer() will
+    // recognize returning players as existing (team-change check) instead of
+    // new (JOIN emitted). Players genuinely gone during the outage are cleaned
+    // up once the grace period expires.
+    const isRconRecovery = !isInitialSync
+      && this._lastRconErrorTime > 0
+      && (now - this._lastRconErrorTime) < this._rconRecoveryGraceMs;
 
-      this.registry.delete(key);
-      this._deindexPlayer(tracked, key);
+    if (!isRconRecovery) {
+      for (const [key, tracked] of this.registry.entries()) {
+        if (current.has(key)) continue;
 
-      leaveCount++;
+        this.registry.delete(key);
+        this._deindexPlayer(tracked, key);
 
-      const playerName = tracked.name || key;
-      this.verboseLogger(1, `[Players] Player LEFT: ${playerName} (eosID=${tracked.eosID}, steamID=${tracked.steamID}, teamID=${tracked.teamID})`);
+        leaveCount++;
 
-      this.server.emit('S3_PLAYER_LEFT', {
-        player: { ...tracked },
-        source: 'S3PlayersRegistry'
-      });
+        const playerName = tracked.name || key;
+        this.verboseLogger(1, `[Players] Player LEFT: ${playerName} (eosID=${tracked.eosID}, steamID=${tracked.steamID}, teamID=${tracked.teamID})`);
 
-      // Remove from ClansService tag cache (closed loop)
-      if (this.parent?.services?.clans) {
-        this.parent.services.clans.removePlayerFromCache(tracked?.eosID);
+        this.server.emit('S3_PLAYER_LEFT', {
+          player: { ...tracked },
+          source: 'S3PlayersRegistry'
+        });
+
+        // Remove from ClansService tag cache (closed loop)
+        if (this.parent?.services?.clans) {
+          this.parent.services.clans.removePlayerFromCache(tracked?.eosID);
+        }
+
+        // Fire-and-forget: remember this player for reconnect detection on return
+        this.rememberReconnect(tracked.eosID, {
+          steamID: tracked.steamID,
+          playerName: tracked.name,
+          lastTeamID: tracked.teamID,
+          lastSeenAt: tracked.lastSeenAt || now
+        });
       }
-
-      // Fire-and-forget: remember this player for reconnect detection on return
-      this.rememberReconnect(tracked.eosID, {
-        steamID: tracked.steamID,
-        playerName: tracked.name,
-        lastTeamID: tracked.teamID,
-        lastSeenAt: tracked.lastSeenAt || now
-      });
+    } else {
+      this.verboseLogger(
+        1,
+        `[Players] RCON recovery active — skipping leave detection (last RCON error ${Math.round((now - this._lastRconErrorTime) / 1000)}s ago, registry=${this.registry.size})`
+      );
     }
 
     this._refreshProjectionState({
