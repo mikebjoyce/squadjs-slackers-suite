@@ -135,9 +135,15 @@ const SwitchQueue = {
         // Also listen to S3_PLAYERS_UPDATED for periodic processing heartbeat
         // while the queue is non-empty. This hooks into S3's existing refresh polling
         // rather than creating a separate timer.
-        plugin.server.on('S3_PLAYERS_UPDATED', plugin._onPlayerInfoUpdated);
-        plugin._periodicProcessingActive = true;
-        plugin.verbose(2, '[S3] Started periodic queue processing via S3_PLAYERS_UPDATED events.');
+        // Guard: only register if not already active to prevent listener accumulation.
+        // Without this guard, rapid queue transitions (empty→non-empty→empty→non-empty)
+        // would stack multiple S3_PLAYERS_UPDATED listeners, causing the
+        // MaxListenersExceededWarning and duplicate _processQueue invocations.
+        if (!plugin._periodicProcessingActive) {
+          plugin.server.on('S3_PLAYERS_UPDATED', plugin._onPlayerInfoUpdated);
+          plugin._periodicProcessingActive = true;
+          plugin.verbose(2, '[S3] Started periodic queue processing via S3_PLAYERS_UPDATED events.');
+        }
       }
 
       plugin._requestQueueRefresh();
@@ -235,21 +241,11 @@ const SwitchQueue = {
         return;
       }
 
-      // UNIFIED LOCK GATE: If a higher-priority plugin holds a global or per-player lock,
-      // defer queue processing. The canAct call on the first queued player acts as a
-      // proxy for the global lock check — canAct() checks both global and per-player locks
-      // internally. If no queued players, use null to test the global lock alone.
-      const queueLockPlayers = plugin._s3?.players;
-      if (queueLockPlayers?.isReady?.()) {
-        const anyEosID = plugin._getQueueSize() > 0
-          ? (plugin._switchQueue.t1[0]?.eosID || plugin._switchQueue.t2[0]?.eosID)
-          : null;
-        if (!queueLockPlayers.canAct(anyEosID, 'Switch')) {
-          plugin.verbose(2, `[Queue] Deferred — higher-priority lock held.`);
-          return;
-        }
-      }
-
+      // NOTE: The old top-level canAct(null, 'Switch') gate was removed here because it
+      // blocked ALL queue operations (expiry, disconnect cleanup, pair evaluation) whenever
+      // a higher-priority plugin (e.g. SmartAssign) held a global lock. Queue maintenance
+      // must always run — only the actual RCON switch calls need lock checks, which are
+      // performed per-player just before _taggedSwitchPlayer() below.
       plugin._queueProcessing = true;
       try {
         if (plugin.s3IsEndgameFactionVote()) {
@@ -358,6 +354,17 @@ const SwitchQueue = {
             continue;
           }
 
+          // Per-player lock gate: only proceed if neither player is locked by a higher-priority
+          // plugin (e.g. SmartAssign). Unlike the old top-level canAct(null) check which blocked
+          // the entire queue, this only defers the specific pair — other queue operations
+          // (expiry, disconnect removal, other pairs) continue unaffected.
+          // canAct(eosID, 'Switch') checks both the global lock AND per-player locks.
+          if (!plugin._s3?.players?.canAct?.(p1.eosID, 'Switch') ||
+              !plugin._s3?.players?.canAct?.(p2.eosID, 'Switch')) {
+            plugin.verbose(2, `[Queue] Pair trade deferred for ${p1.playerName}/${p2.playerName} — higher-priority lock held.`);
+            continue;
+          }
+
           plugin._removePlayerFromQueue(p1.eosID);
           plugin._removePlayerFromQueue(p2.eosID);
 
@@ -444,6 +451,15 @@ const SwitchQueue = {
           const effectiveCap = plugin.isLiberalMode() ? plugin.options.liberalSwitchMaxUnbalancedSlots : null;
           const slots = plugin.getSwitchSlotsPerTeam(entry.currentTeamID, effectiveCap);
           if (slots > 0) {
+            // Per-player lock gate: only proceed if this specific player is not locked by a
+            // higher-priority plugin. The old top-level canAct(null) check blocked the entire
+            // queue — this only defers the solo switch for this player while other queue
+            // operations continue. canAct(eosID, 'Switch') checks both global and per-player locks.
+            if (!plugin._s3?.players?.canAct?.(entry.eosID, 'Switch')) {
+              plugin.verbose(2, `[Queue] Solo switch deferred for ${entry.playerName} — higher-priority lock held.`);
+              break;
+            }
+
             plugin._removePlayerFromQueue(entry.eosID);
 
             plugin.warn(entry.eosID, '[Switch Queue] Balance slot opened — switching now.');
