@@ -9,7 +9,7 @@ import SwitchCommands from '../utils/switch-commands.js';
 
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SWITCH PLUGIN v2.0.0                       ║
+ * ║                    SWITCH PLUGIN v2.1.0                       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -162,7 +162,7 @@ import SwitchCommands from '../utils/switch-commands.js';
  *
  */
 export default class Switch extends S3DiscordPluginBase {
-    static version = '2.0.0';
+    static version = '2.1.0';
 
     static get description() {
         return "Switch plugin with persistent join timers";

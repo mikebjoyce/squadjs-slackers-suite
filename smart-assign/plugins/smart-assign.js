@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v2.0.0                   ║
+ * ║                  SMART ASSIGN PLUGIN v2.1.0                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -147,7 +147,7 @@ import SAEventLogger from '../utils/sa-event-logger.js';
 import { evaluateTeamAssignment, getRating, getPenalty, computeScore } from '../utils/sa-team-evaluator.js';
 
 export default class SmartAssign extends S3PluginBase {
-  static version = '1.1.1';
+  static version = '2.1.0';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
