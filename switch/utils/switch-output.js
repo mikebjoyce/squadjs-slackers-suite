@@ -83,11 +83,11 @@ const SwitchOutput = {
         instantSwitches: [],    // { name, eosID, fromTeam, toTeam, gamePhase }
         deniedSwitches: [],     // { name, eosID, reason, gamePhase } — one per unique player per round
         _deniedPlayerSet: new Set(),  // eosIDs already denied this round (dedup)
-        queueTeamTrades: [],    // { p1Name, p2Name, queueDurationSeconds, gamePhase }
+        queueTeamTrades: [],    // { p1Name, p2Name, p1FromTeam, p1ToTeam, p2FromTeam, p2ToTeam, p1DurationSeconds, p2DurationSeconds, gamePhase }
         queueNormal: [],        // { name, eosID, queueDurationSeconds, gamePhase }
         queueJoinSwaps: [],     // { name, eosID, type ('swap'|'consume'), queueDurationSeconds, gamePhase }
         queueExpiries: [],      // { name, eosID, queueDurationSeconds, gamePhase }
-        queueDisconnects: [],   // { name, eosID }
+        queueDisconnects: [],   // { name, eosID, currentTeamID, targetTeamID, queueDurationSeconds, gamePhase }
         queueCancels: [],       // { name, eosID }
         queueRemovals: [],      // { name, eosID, reason, gamePhase } — removed due to team change / other
         maxQueueSize: 0,        // peak _getQueueSize() during the round
@@ -415,10 +415,9 @@ const SwitchOutput = {
 
       if (s.queueTeamTrades.length) {
         const names = s.queueTeamTrades.slice(0, 10).map(p => {
-          const m = Math.floor(p.queueDurationSeconds / 60);
-          const sec = p.queueDurationSeconds % 60;
-          const dur = m > 0 ? `${m}m ${sec}s` : `${sec}s`;
-          return `${p.p1Name} ↔ ${p.p2Name} ${plugin._formatGamePhase(p.gamePhase)} (T1↔T2, ${dur})`;
+          const d1 = plugin._formatDuration(p.p1DurationSeconds);
+          const d2 = plugin._formatDuration(p.p2DurationSeconds);
+          return `${p.p1Name} ${plugin._formatGamePhase(p.gamePhase)} (T${p.p1FromTeam}→T${p.p1ToTeam}, ${d1}) ↔ ${p.p2Name} (T${p.p2FromTeam}→T${p.p2ToTeam}, ${d2})`;
         });
         if (s.queueTeamTrades.length > 10) names.push(`+ ${s.queueTeamTrades.length - 10} more...`);
         methodLines.push(`**Queue Team Trade (${s.queueTeamTrades.length})**\n${names.join('\n')}`);
@@ -459,7 +458,12 @@ const SwitchOutput = {
       }
 
       if (s.queueDisconnects.length) {
-        const names = s.queueDisconnects.slice(0, 20).map(p => p.name);
+        const names = s.queueDisconnects.slice(0, 20).map(p => {
+          const dur = p.queueDurationSeconds != null ? plugin._formatDuration(p.queueDurationSeconds) : '?';
+          const from = p.currentTeamID ? `T${p.currentTeamID}` : '?';
+          const to = p.targetTeamID ? `T${p.targetTeamID}` : '?';
+          return `${p.name} (${from}→${to}, ${dur})`;
+        });
         if (s.queueDisconnects.length > 20) names.push(`+ ${s.queueDisconnects.length - 20} more...`);
         activityLines.push(`**DC'd in Queue (${s.queueDisconnects.length})**\n${names.join('\n')}`);
       }

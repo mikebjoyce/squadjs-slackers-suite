@@ -318,7 +318,16 @@ const SwitchQueue = {
             // Player absent from S³ registry — disconnected
             plugin._removePlayerFromQueue(p1.eosID);
             if (plugin._roundStats) {
-              plugin._roundStats.queueDisconnects.push({ name: p1.playerName, eosID: p1.eosID });
+              const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
+              const queueDurationSeconds = Math.round((Date.now() - p1.queuedAt) / 1000);
+              plugin._roundStats.queueDisconnects.push({
+                name: p1.playerName,
+                eosID: p1.eosID,
+                currentTeamID: p1.currentTeamID,
+                targetTeamID: p1.targetTeamID,
+                queueDurationSeconds,
+                gamePhase
+              });
             }
             plugin.verbose(1, `[Queue] ${p1.playerName} disconnected — removed from queue.`);
             continue;
@@ -338,7 +347,16 @@ const SwitchQueue = {
             // Player absent from S³ registry — disconnected
             plugin._removePlayerFromQueue(p2.eosID);
             if (plugin._roundStats) {
-              plugin._roundStats.queueDisconnects.push({ name: p2.playerName, eosID: p2.eosID });
+              const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
+              const queueDurationSeconds = Math.round((Date.now() - p2.queuedAt) / 1000);
+              plugin._roundStats.queueDisconnects.push({
+                name: p2.playerName,
+                eosID: p2.eosID,
+                currentTeamID: p2.currentTeamID,
+                targetTeamID: p2.targetTeamID,
+                queueDurationSeconds,
+                gamePhase
+              });
             }
             plugin.verbose(1, `[Queue] ${p2.playerName} disconnected — removed from queue.`);
             continue;
@@ -397,14 +415,16 @@ const SwitchQueue = {
           if (plugin._roundStats) {
             const dur1 = Math.round((Date.now() - p1.queuedAt) / 1000);
             const dur2 = Math.round((Date.now() - p2.queuedAt) / 1000);
-            const avgDuration = Math.round((dur1 + dur2) / 2);
             const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
             plugin._roundStats.queueTeamTrades.push({
               p1Name: p1.playerName,
               p2Name: p2.playerName,
+              p1FromTeam: p1.currentTeamID,
               p1ToTeam: p1.targetTeamID,
+              p2FromTeam: p2.currentTeamID,
               p2ToTeam: p2.targetTeamID,
-              queueDurationSeconds: avgDuration,
+              p1DurationSeconds: dur1,
+              p2DurationSeconds: dur2,
               gamePhase
             });
             plugin._roundStats.queueDurationsMs.push(dur1 * 1000, dur2 * 1000);
@@ -432,7 +452,16 @@ const SwitchQueue = {
             // Player absent from S³ registry — disconnected
             plugin._removePlayerFromQueue(entry.eosID);
             if (plugin._roundStats) {
-              plugin._roundStats.queueDisconnects.push({ name: entry.playerName, eosID: entry.eosID });
+              const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
+              const queueDurationSeconds = Math.round((Date.now() - entry.queuedAt) / 1000);
+              plugin._roundStats.queueDisconnects.push({
+                name: entry.playerName,
+                eosID: entry.eosID,
+                currentTeamID: entry.currentTeamID,
+                targetTeamID: entry.targetTeamID,
+                queueDurationSeconds,
+                gamePhase
+              });
             }
             plugin.verbose(1, `[Queue] ${entry.playerName} disconnected — removed from queue.`);
             continue;
