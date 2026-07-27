@@ -219,7 +219,12 @@ export default class EloDatabase {
         if (exact) return exact.toJSON();
 
         const escaped = id.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
-        const literalLike = Sequelize.literal(`name LIKE '%${escaped}%' ESCAPE '\\'`);
+        // ⚠️ ESCAPE '\\\\' — JavaScript '\\\\' produces string '\\', which SQL
+        // interprets as a single literal backslash (the LIKE escape character).
+        // Using '\\' (double) would produce a single '\' in SQL, which escapes
+        // the closing quote and causes a syntax error — silently swallowed by
+        // the catch block as "No ELO record found." Keep it quadruple.
+        const literalLike = Sequelize.literal(`name LIKE '%${escaped}%' ESCAPE '\\\\'`);
         const fuzzy = await this._s3db.getModel('Elo_PlayerStats').findOne({
           where: {
             [Op.or]: [
