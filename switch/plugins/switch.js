@@ -102,8 +102,9 @@ import SwitchCommands from '../utils/switch-commands.js';
  * - Forked from the original SquadJS Switch plugin by fantinodavide.
  *   Original author credit retained.
  * - Scramble lockdown skips players still within their switch-enabled
- *   window (join or match start), since they had no time to exploit
- *   pre-scramble imbalance.
+ *   window (join or match start) and players who were actively queued
+ *   for a switch, since they had no opportunity to exploit pre-scramble
+ *   imbalance.
  * - Liberal game modes (default: Seed, Jensen) relax cooldown and time
  *   limits. Configured via liberalSwitchGameModes and
  *   liberalSwitchMaxUnbalancedSlots. Liberal-mode broadcast interval
@@ -787,6 +788,13 @@ export default class Switch extends S3DiscordPluginBase {
     onNewGame = async () => {
         this.verbose(1, '[NEW_GAME] Round started — null-teamID window handled by S³ players service.');
 
+        // Clear the queue — round transition invalidates all stored teamIDs
+        this._clearAllQueueEntries('New round');
+        // Schedule a delayed notification for former queued players
+        this._scheduledClearNotification = setTimeout(() => {
+            this.verbose(1, '[NEW_GAME] Queue cleared — players notified.');
+        }, 30_000);
+
         // Post summary for the round that just ended, BEFORE resetting stats
         await this._postRoundSummary();
 
@@ -894,6 +902,12 @@ export default class Switch extends S3DiscordPluginBase {
         }
         this._joinWarnTimeouts.clear();
 
+        // Clear any pending scheduled notification timer
+        if (this._scheduledClearNotification) {
+            clearTimeout(this._scheduledClearNotification);
+            this._scheduledClearNotification = null;
+        }
+
         this._scrambleHappened = false;
 
         this.server.removeListener('CHAT_MESSAGE', this.onChatMessage);
@@ -941,10 +955,35 @@ export default class Switch extends S3DiscordPluginBase {
         return ret[ 0 ];
     }
 
+    /**
+     * onScrambleExecuted — Handles TEAM_BALANCER_SCRAMBLE_EXECUTED event.
+     *
+     * Flow:
+     *   1. Snapshot queued player eosIDs (they're exempt from lockdown)
+     *   2. Clear the switch queue (team state is invalidated by the scramble)
+     *   3. Seed round guard — clear queue but skip lockdown entirely
+     *   4. Per-player exemption checks (in order):
+     *      a. Missing eosID → skip (can't write lockdown without identifier)
+     *      b. Within switch-eligibility window → skip (had no time to exploit imbalance)
+     *      c. Was in switch queue before scramble → skip (already waiting, not exploiting)
+     *   5. Write scrambleLockdownExpiry records to DB for remaining players
+     *   6. Post Discord notification with lockdown summary
+     */
     onScrambleExecuted = async (data) => {
         const { affectedPlayers } = data;
         this.verbose(2, `[SCRAMBLE_EVENT] onScrambleExecuted called with data: ${JSON.stringify(data)}`);
         
+        // Snapshot queued player eosIDs before clearing — these players
+        // were already waiting to switch before the scramble and should
+        // not receive a scramble lockdown on top of losing their queue spot.
+        const queuedEosIDs = new Set([
+            ...this._switchQueue.t1.map(e => e.eosID),
+            ...this._switchQueue.t2.map(e => e.eosID)
+        ]);
+        this.verbose(2, `[SCRAMBLE_EVENT] Queued players before scramble: ${queuedEosIDs.size}`);
+        
+        // Queue is always cleared on scramble regardless of affectedPlayers —
+        // team state is invalidated either way, so stored teamIDs are stale.
         this._clearAllQueueEntries('Scramble');
 
         // v2.0.0: During seed rounds, scramble clears the queue but does NOT
@@ -968,6 +1007,8 @@ export default class Switch extends S3DiscordPluginBase {
             this.verbose(2, `  [${i}] steamID=${p.steamID}, name=${p.name}`);
         });
 
+        // Players within their switch-eligibility window haven't had time to
+        // exploit pre-scramble imbalance, so they're exempt from lockdown.
         const switchWindowMs = this.options.switchEnabledMinutes * 60 * 1000;
         const lockoutPlayers = [];
         for (const p of affectedPlayers) {
@@ -975,11 +1016,19 @@ export default class Switch extends S3DiscordPluginBase {
                 this.verbose(1, `[SCRAMBLE_EVENT] Skipping ${p.name} — missing eosID`);
                 continue;
             }
+            // NOTE: getSecondsFromJoin may hit the DB per player. For large scrambles
+            // this is N sequential awaits — acceptable because scrambles are infrequent
+            // and player counts are bounded (~100).
             const joinSeconds = await this.getSecondsFromJoin(p.eosID);
             const matchSeconds = this.getSecondsFromMatchStart();
+            // Convert joinSeconds/matchSeconds (s) to ms for comparison with switchWindowMs
             const withinWindow = (joinSeconds * 1000) < switchWindowMs || (matchSeconds * 1000) < switchWindowMs;
             if (withinWindow) {
                 this.verbose(2, `[SCRAMBLE_EVENT] Skipping lockdown for ${p.name} — within switch window (join: ${joinSeconds.toFixed(1)}s, match: ${matchSeconds.toFixed(1)}s)`);
+                continue;
+            }
+            if (queuedEosIDs.has(p.eosID)) {
+                this.verbose(2, `[SCRAMBLE_EVENT] Skipping lockdown for ${p.name} — was in switch queue before scramble.`);
                 continue;
             }
             lockoutPlayers.push(p);
@@ -990,7 +1039,7 @@ export default class Switch extends S3DiscordPluginBase {
         this.verbose(2, `[SCRAMBLE_EVENT] Lockdown duration: ${this.options.scrambleLockdownDurationMinutes}min | Expiry: ${expiry.toISOString()}`);
 
         if (lockoutPlayers.length === 0) {
-            this.verbose(1, `[SCRAMBLE_EVENT] All ${affectedPlayers.length} affected players are within the switch window — no lockdown records written.`);
+            this.verbose(1, `[SCRAMBLE_EVENT] All ${affectedPlayers.length} affected players were exempt from lockdown (switch window, queued, or missing eosID) — no lockdown records written.`);
             return;
         }
 
@@ -1006,6 +1055,7 @@ export default class Switch extends S3DiscordPluginBase {
             const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
             if (PlayerCooldowns) {
                 await this._withDb(async (t) => {
+                    // Write in chunks of 10 to avoid SQLite parameter limits and keep transactions short
                     const chunkSize = 10;
                     for (let i = 0; i < records.length; i += chunkSize) {
                         const chunk = records.slice(i, i + chunkSize);
@@ -1026,6 +1076,7 @@ export default class Switch extends S3DiscordPluginBase {
                     description: `${records.length} players have been locked from switching for the next ${this.options.scrambleLockdownDurationMinutes} minutes.`,
                     fields: [
                         { name: 'Lockdown Duration', value: `${this.options.scrambleLockdownDurationMinutes} minutes`, inline: true },
+                        // Discord relative timestamp (e.g. "in 20 minutes")
                         { name: 'Expires At', value: `<t:${Math.floor(expiry.getTime() / 1000)}:R>`, inline: true },
                         { name: 'Players Affected', value: String(records.length), inline: true }
                     ],

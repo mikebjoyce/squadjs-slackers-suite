@@ -338,8 +338,8 @@ const SwitchQueue = {
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
               plugin._roundStats.queueRemovals.push({ name: p1.playerName, eosID: p1.eosID, reason: 'team_changed', gamePhase });
             }
-            plugin.verbose(1, `[Queue] ${p1.playerName} team changed externally — removed from queue.`);
-            plugin.warn(p1.eosID, `[Switch Queue] You were removed — your team changed while waiting.\nUse !switch check to see your current status.`);
+            plugin.verbose(1, `[Queue] ${p1.playerName} team changed — removed from queue (now on target team T${s3p1.teamID}).`);
+            plugin.warn(p1.eosID, `[Switch Queue] You are now on team ${s3p1.teamID}.\nYour switch request is complete.`);
             continue;
           }
           const s3p2 = plugin._s3?.players?.isReady() ? plugin._s3.players.getPlayer(p2.eosID) : null;
@@ -367,8 +367,8 @@ const SwitchQueue = {
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
               plugin._roundStats.queueRemovals.push({ name: p2.playerName, eosID: p2.eosID, reason: 'team_changed', gamePhase });
             }
-            plugin.verbose(1, `[Queue] ${p2.playerName} team changed externally — removed from queue.`);
-            plugin.warn(p2.eosID, `[Switch Queue] You were removed — your team changed while waiting.\nUse !switch check to see your current status.`);
+            plugin.verbose(1, `[Queue] ${p2.playerName} team changed — removed from queue (now on target team T${s3p2.teamID}).`);
+            plugin.warn(p2.eosID, `[Switch Queue] You are now on team ${s3p2.teamID}.\nYour switch request is complete.`);
             continue;
           }
 
@@ -472,8 +472,8 @@ const SwitchQueue = {
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
               plugin._roundStats.queueRemovals.push({ name: entry.playerName, eosID: entry.eosID, reason: 'team_changed', gamePhase });
             }
-            plugin.verbose(1, `[Queue] ${entry.playerName} team changed externally — removed from queue.`);
-            plugin.warn(entry.eosID, `[Switch Queue] You were removed — your team changed while waiting.\nUse !switch check to see your current status.`);
+            plugin.verbose(1, `[Queue] ${entry.playerName} team changed — removed from queue (now on target team T${s3Entry.teamID}).`);
+            plugin.warn(entry.eosID, `[Switch Queue] You are now on team ${s3Entry.teamID}.\nYour switch request is complete.`);
             continue;
           }
 

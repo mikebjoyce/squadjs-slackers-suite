@@ -68,7 +68,10 @@ const SwitchCommands = {
         const eosID = info.player?.eosID;
         const steamID = info.player?.steamID;
         const playerName = info.player?.name;
-        const teamID = info.player?.teamID;
+        // Use S³ authoritative registry for teamID (includes null-teamID projection during STAGING)
+        // Falls back to raw CHAT_MESSAGE event data if S³ isn't ready.
+        const s3Player = plugin._s3?.players?.isReady() ? plugin._s3.players.getPlayer(eosID) : null;
+        const teamID = s3Player?.teamID ?? info.player?.teamID;
         const message = info.message.toLowerCase();
 
         if (!eosID && !steamID) {
