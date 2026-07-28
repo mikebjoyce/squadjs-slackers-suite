@@ -9,7 +9,7 @@ import SwitchCommands from '../utils/switch-commands.js';
 
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SWITCH PLUGIN v2.1.0                       ║
+ * ║                    SWITCH PLUGIN v2.1.1                       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ import SwitchCommands from '../utils/switch-commands.js';
  *
  */
 export default class Switch extends S3DiscordPluginBase {
-    static version = '2.1.0';
+    static version = '2.1.1';
 
     static get description() {
         return "Switch plugin with persistent join timers";
@@ -349,6 +349,7 @@ export default class Switch extends S3DiscordPluginBase {
         this.recentSwitches = [];
         this.recentDoubleSwitches = [];
         this._switchedOnJoin = new Set();
+        this._reconnectLockoutClearTimeouts = new Map();
 
         this.broadcast = (msg) => { this.server.rcon.broadcast(msg); };
         this.warn = (id, msg) => {
@@ -613,14 +614,69 @@ export default class Switch extends S3DiscordPluginBase {
         return roundStartTime ? (Date.now() - roundStartTime) / 1000 : 0;
     }
 
+    /**
+     * Clears cooldown and scramble lockdown for a reconnecting player
+     * found on the wrong team. Called immediately (no delay) so the
+     * player can !switch back without restriction.
+     */
+    async _clearReconnectLockouts(eosID, name, previousTeamID) {
+        const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+        if (!PlayerCooldowns) return;
+
+        const row = await PlayerCooldowns.findByPk(eosID);
+        if (!row) return;
+
+        const hadCooldown = row.lastSwitchTimestamp != null;
+        const now = Date.now();
+        const hadScrambleLock = row.scrambleLockdownExpiry != null
+            && new Date(row.scrambleLockdownExpiry).getTime() > now;
+
+        if (!hadCooldown && !hadScrambleLock) return;
+
+        await this._withDb(async (t) => {
+            await PlayerCooldowns.update(
+                { lastSwitchTimestamp: null, scrambleLockdownExpiry: null },
+                { where: { eosID }, transaction: t }
+            );
+        });
+
+        const reason = [hadCooldown && 'cooldown', hadScrambleLock && 'scramble lock']
+            .filter(Boolean).join(' and ');
+        this.verbose(1,
+            `[Reconnect] ${name || eosID}: cleared ${reason} — stranded on current team, previous was T${previousTeamID}`
+        );
+    }
+
     handlePlayerLeave(eosID, teamID, playerName) {
         // v2.0.0: Clear join-warn timeout on disconnect
         this._clearJoinWarnTimeout(eosID);
 
+        // v2.0.0: Clear reconnect-lockout-clear message timeout
+        const rlTimeout = this._reconnectLockoutClearTimeouts.get(eosID);
+        if (rlTimeout) {
+            clearTimeout(rlTimeout);
+            this._reconnectLockoutClearTimeouts.delete(eosID);
+        }
+
+        // v2.1.1: Capture full queue entry data BEFORE removal so the
+        // round-summary embed shows team IDs and wait duration instead
+        // of falling back to "?" placeholders.  _findQueueEntry returns
+        // the live entry while it still exists in the queue; after
+        // _removePlayerFromQueue it would already be null.
+        const queueEntry = this._findQueueEntry(eosID)?.entry;
         if (this._removePlayerFromQueue(eosID)) {
             this.verbose(2, `[Queue] ${playerName} disconnected — removed from queue.`);
-            if (this._roundStats) {
-                this._roundStats.queueDisconnects.push({ name: playerName, eosID });
+            if (this._roundStats && queueEntry) {
+                const queueDurationSeconds = Math.round((Date.now() - queueEntry.queuedAt) / 1000);
+                const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
+                this._roundStats.queueDisconnects.push({
+                    name: playerName,
+                    eosID,
+                    currentTeamID: queueEntry.currentTeamID,
+                    targetTeamID: queueEntry.targetTeamID,
+                    queueDurationSeconds,
+                    gamePhase
+                });
             }
         }
         this.verbose(2, `Player disconnected ${playerName}`);
@@ -851,6 +907,37 @@ export default class Switch extends S3DiscordPluginBase {
             }
         }
 
+        // ── Reconnect lockout clearing ──────────────────────────────
+        // When a reconnecting player is placed on a different team than
+        // their previous one, immediately clear any active cooldown/
+        // scramble-lock so they aren't stranded. Show a delayed message
+        // (30s) prompting them to !switch back. Only fires when both
+        // teams are real (1 or 2) — guards against null-teamID during
+        // the staging window.
+        const isRealTeam = (t) => t === 1 || t === 2;
+        const isReconnectOnWrongTeam = isRealTeam(previousTeamID)
+            && isRealTeam(teamID)
+            && teamID !== previousTeamID;
+
+        if (isReconnectOnWrongTeam && !this._reconnectLockoutClearTimeouts.has(eosID)) {
+            this._clearReconnectLockouts(eosID, name, previousTeamID).catch(err => {
+                this.verbose(1, `[Reconnect] Lockout clear failed for ${name || eosID}: ${err.message}`);
+            });
+
+            const msgTimeout = setTimeout(() => {
+                this._reconnectLockoutClearTimeouts.delete(eosID);
+                const s3p = this._s3?.players?.isReady()
+                    ? this._s3.players.getPlayer(eosID) : null;
+                if (s3p && s3p.teamID != null && s3p.teamID !== previousTeamID) {
+                    this.warn(eosID,
+                        `You reconnected to a different team. ` +
+                        `Your switch restrictions have been cleared — type !switch to return to your previous team.`
+                    );
+                }
+            }, 30_000);
+            this._reconnectLockoutClearTimeouts.set(eosID, msgTimeout);
+        }
+
         // v2.0.0: Schedule delayed join-warn if ChangeTeam is disabled
         this._scheduleJoinWarn(eosID);
 
@@ -901,6 +988,12 @@ export default class Switch extends S3DiscordPluginBase {
             clearTimeout(timeout);
         }
         this._joinWarnTimeouts.clear();
+
+        // v2.0.0: Clear all pending reconnect-lockout-clear message timeouts
+        for (const [eosID, timeout] of this._reconnectLockoutClearTimeouts) {
+            clearTimeout(timeout);
+        }
+        this._reconnectLockoutClearTimeouts.clear();
 
         // Clear any pending scheduled notification timer
         if (this._scheduledClearNotification) {
