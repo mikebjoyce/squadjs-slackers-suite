@@ -566,7 +566,7 @@ const SwitchOutput = {
      * established in S³ for consistent cross-plugin UX.
      */
     plugin._buildSwitchDiagEmbed = async function () {
-      const VERSION = '2.0.0';
+      const VERSION = plugin.constructor.version;
 
       // ── System health checks ──
       let dbOk = false, dbLabel = 'Unknown';
