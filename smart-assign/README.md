@@ -4,11 +4,13 @@
 
 ## Overview
 
-This plugin overrides Squad's native team assignment mechanics to provide smart, fair, and fast team placements. When a player connects, the plugin evaluates the current Elo distribution and population difference between both teams and assigns the player to whichever team produces the most balanced match. All team changes are executed via RCON using a One-Hit & Verify approach, with a hard 3-second timeout ensuring predictable behaviour.
+This plugin corrects Squad's native team auto-assignment to provide smart, fair, and fast team placements. When a player connects, the plugin evaluates the current Elo distribution and population difference between both teams and assigns the player to whichever team produces the most balanced match. All team changes are executed via RCON using a One-Hit & Verify approach, with a hard 3-second timeout ensuring predictable behaviour.
 
 The core timing challenge — Squad's RCON player list only refreshes every ~30 seconds — is solved by triggering the RCON move command directly from the Log Parser event (which fires within ~100ms of join), and then force-polling the player list after the command lands to verify the result. This approach typically achieves verified join-swaps in 1–2 seconds, with a hard 3-second completion guarantee.
 
-Disconnect detection works via delta-diff: every time any player joins and triggers a forced RCON refresh, the player list is compared against the known state, which catches departures from other players as a side-effect — effectively solving disconnect lag without relying on the unreliable `PLAYER_DISCONNECTED` log event.
+SmartAssign runs on top of S³ (SlackersSquadServices), which must be installed and mounted first. S³ owns the shared player registry, game state, clan services, per-player locking, and reconnect memory — SmartAssign consumes these services via S³'s flat accessor pattern (`this._s3?.players`, `this._s3?.gameState`, `this._s3?.clans`).
+
+Player disconnects are detected by S³'s PlayersService, which emits `S3_PLAYER_LEFT` events that SmartAssign consumes to persist reconnect state and handle cleanup. The delta-diff approach originally described here has been moved into S³'s tick-based player-list diffing — SmartAssign no longer manages its own disconnect detection.
 
 ---
 
@@ -28,9 +30,9 @@ Disconnect detection works via delta-diff: every time any player joins and trigg
 
 ---
 
-## Compatible / Recommended Plugins
+## Dependencies
 
-### EloTracker
+### Optional / Recommended: EloTracker
 
 **[squadjs-elo-tracker](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/elo-tracker)**
 
@@ -38,7 +40,7 @@ Tracks per-player TrueSkill ratings (μ/σ) across rounds. SmartAssign automatic
 
 **Setup**: Install the EloTracker plugin and enable it in your SquadJS config.json. SmartAssign discovers it at runtime — no additional configuration is required.
 
-### SlackersSquadServices (S³)
+### Required: SlackersSquadServices (S³)
 
 **[squadjs-slackers-squad-services](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/s3)**
 
@@ -52,26 +54,9 @@ S³ is a **required** supporting plugin that provides shared game state, player 
 
 ## Commands
 
-**In-game chat:** None. SmartAssign operates automatically during player joins with no manual intervention required.
+SmartAssign has no in-game or Discord commands of its own — it operates fully autonomously during player joins with no manual intervention required.
 
-**Discord Admin (via SlackersSquadServices):** When used with the S³ plugin, the following admin commands are available in a configured Discord channel:
-
-- `!s3 status` — Overview: service mount status, game phase, player count.
-- `!s3 services` — Per-service detail.
-- `!s3 gamestate` — Phase, mode, layer name, sub-state.
-- `!s3 factions` — Team 1/2 names, faction IDs.
-- `!s3 players` — Full player list with teamID, clan tag.
-- `!s3 clans` — Detected clan groups.
-- `!s3 locks` — Global lock + per-player locks.
-- `!s3 config` — Server config values.
-- `!s3 watch <svc>` — Relay verbose logs for a service to Discord.
-- `!s3 unwatch` — Stop all active watches.
-- `!s3 events` — Recent event history (last 20).
-- `!s3 test smoke` — Automated smoke tests.
-- `!s3 test preflight` — Validate pre-flight checklist.
-- `!s3 help` — Command reference.
-
-> **Note:** Discord commands require the `discordClient` connector and `channelID` to be configured in the S³ plugin options.
+Discord admin commands for monitoring and diagnostics (server status, player lists, locks, backups, etc.) are provided by the S³ plugin. See [S³ Command System](../s3/README.md#s3-command-system) for the full command reference.
 
 ---
 
