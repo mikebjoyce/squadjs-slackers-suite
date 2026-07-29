@@ -81,9 +81,9 @@ for arg in "$@"; do
       ;;
     --output=*)
       OUTPUT_DIR="${arg#--output=}"
-      # Resolve relative paths
+      # Resolve relative paths against current working directory
       if [[ "$OUTPUT_DIR" != /* ]]; then
-        OUTPUT_DIR="$MONOREPO_ROOT/$OUTPUT_DIR"
+        OUTPUT_DIR="$(pwd)/$OUTPUT_DIR"
       fi
       ;;
     --with-tools)
@@ -159,7 +159,6 @@ echo "Plugins selected: ${PLUGINS[*]}"
 echo "Output directory: $OUTPUT_DIR"
 if [[ "$WITH_TOOLS" == true ]]; then echo "  (including tools/)"; fi
 if [[ "$WITH_TESTING" == true ]]; then echo "  (including testing/)"; fi
-if [[ "$CLEAN" == true ]]; then echo "  (--clean: will wipe output directory first)"; fi
 echo ""
 
 # ─── File Discovery & Collision Detection ────────────────────────────────────
@@ -270,7 +269,7 @@ while IFS='|' read -r _plugin source_path rel_path; do
   dest="$OUTPUT_DIR/$rel_path"
   mkdir -p "$(dirname "$dest")"
   cp "$source_path" "$dest"
-  ((copied++))
+  ((++copied))
 done < "$COLLISION_FILE"
 
 echo "Done — $copied files written to $OUTPUT_DIR/"

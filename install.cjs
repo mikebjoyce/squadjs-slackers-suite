@@ -35,10 +35,6 @@ const MONOREPO_ROOT = __dirname;
 
 const ALL_PLUGINS = ['s3', 'team-balancer', 'elo-tracker', 'smart-assign', 'switch'];
 
-// S3 base class files that consumer plugins depend on at runtime.
-// These live in s3/plugins/ alongside the main S3 plugin entry point.
-const S3_BASE_CLASS_FILES = ['s3-plugin-base.js', 's3-discord-plugin-base.js'];
-
 // Directories to copy per plugin (testing and tools are opt-in).
 const ALWAYS_DIRS = ['plugins', 'utils'];
 const OPT_IN_DIRS = ['testing', 'tools'];
