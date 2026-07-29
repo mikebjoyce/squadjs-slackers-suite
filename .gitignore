@@ -1,6 +1,9 @@
 # Design docs (not for version control)
 docs/
 
+# Database backups (runtime files)
+backups/
+
 # Install script output
 out/
 
