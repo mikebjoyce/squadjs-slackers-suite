@@ -130,10 +130,10 @@ squad-server/
 
 4. **Configure plugin options** — Each plugin has its own options. See the individual plugin READMEs for details:
    - [S³ Configuration](s3/README.md#configuration-options)
-   - [SmartAssign](smart-assign/README.md)
+   - [SmartAssign](smart-assign/README.md#configuration-options)
    - [Switch](switch/README.MD#configuration-options)
-   - [EloTracker](elo-tracker/README.md)
-   - [TeamBalancer](team-balancer/README.md)
+   - [EloTracker](elo-tracker/README.md#configuration-options)
+   - [TeamBalancer](team-balancer/README.md#configuration-options)
 
 ## For Plugin Developers
 

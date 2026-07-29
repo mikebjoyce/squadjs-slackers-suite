@@ -217,50 +217,37 @@ Admin Commands:
 
 ## Configuration Options
 
-```text
-Core Settings:
-database                            - Sequelize database connector (SQLite, MySQL, PostgreSQL, etc.). Defaults to 'sqlite' if unspecified.
-enableWinStreakTracking             - Enable/disable automatic win streak tracking.
-enableSeedAutoScramble              - Auto-scramble teams at the end of a Seed round (default: true).
-
-Win Streak:
-maxWinStreak                        - Dominant wins in a row to trigger scramble (default: 2).
-maxConsecutiveWinsWithoutThreshold  - Any consecutive wins to trigger scramble; 0 = disabled (default: 0).
-enableSingleRoundScramble           - Scramble after a single round with extreme ticket margin.
-singleRoundScrambleThreshold        - Ticket margin for single-round trigger (default: 250).
-minTicketsToCountAsDominantWin      - Min ticket diff for a dominant win in Standard modes (default: 150).
-invasionAttackTeamThreshold         - Ticket diff for Invasion attackers to count as dominant (default: 300).
-invasionDefenceTeamThreshold        - Ticket diff for Invasion defenders to count as dominant (default: 650).
-
-Scramble Execution:
-scrambleAnnouncementDelay           - Seconds before scramble executes after announcement (default: 12).
-scramblePercentage                  - Fraction of players to move (default: 0.5).
-changeTeamRetryInterval             - RCON retry interval in ms (default: 50).
-maxScrambleCompletionTime           - Max time in ms for all swaps to complete (default: 15000).
-warnOnSwap                          - RCON warn players when swapped.
-requireScrambleConfirmation         - Require !scramble confirm before executing manual scrambles.
-scrambleConfirmationTimeout         - Seconds to wait for confirmation (default: 60).
-
-Messaging & Display:
-showWinStreakMessages               - Broadcast win streak updates after each round.
-useGenericTeamNamesInBroadcasts     - Use "Team 1"/"Team 2" instead of faction names.
-
-Discord Integration:
-discordClient                       - Discord connector name.
-discordAdminChannelID               - Channel for admin commands.
-discordReportChannelID              - Channel for automated reports (win streaks, scramble plans, errors). Defaults to admin channel if unset.
-discordAdminRoleIDs                 - Array of Role IDs required for Discord admin commands (empty = all in channel).
-mirrorRconBroadcasts                - Mirror RCON broadcasts to Discord.
-postScrambleDetails                 - Post detailed swap plan to Discord after scramble.
-
-Advanced:
-useEloForBalance                    - Weight scrambles by EloTracker mu ratings. Requires EloTracker plugin. Falls back to numerical balance if EloTracker is absent.
-
-Dev:
-devMode                             - Allow commands from any player regardless of admin status.
-reportLogPath                       - Path to the JSONL log file for round reports (default: 'team-balancer-reports.jsonl').
-enableDatabaseLogging               - If true, round reports are also written to the database in addition to the JSONL log (default: false).
-```
+| Option | Required | Type | Default | Description |
+|--------|----------|------|---------|-------------|
+| `database` | yes | string | `"sqlite"` | Sequelize connector name for persistence (SQLite, MySQL, PostgreSQL, etc.) |
+| `enableWinStreakTracking` | no | boolean | `true` | Enable/disable automatic win streak tracking |
+| `enableSeedAutoScramble` | no | boolean | `true` | Auto-scramble teams at the end of a Seed round |
+| `maxWinStreak` | no | number | `2` | Dominant wins in a row to trigger a scramble |
+| `maxConsecutiveWinsWithoutThreshold` | no | number | `0` | Any consecutive wins to trigger scramble; `0` = disabled |
+| `enableSingleRoundScramble` | no | boolean | `false` | Scramble after a single round with extreme ticket margin |
+| `singleRoundScrambleThreshold` | no | number | `250` | Ticket margin for single-round scramble trigger |
+| `minTicketsToCountAsDominantWin` | no | number | `150` | Minimum ticket difference for a dominant win in Standard modes |
+| `invasionAttackTeamThreshold` | no | number | `300` | Ticket difference for Invasion attackers to count as dominant |
+| `invasionDefenceTeamThreshold` | no | number | `650` | Ticket difference for Invasion defenders to count as dominant |
+| `scrambleAnnouncementDelay` | no | number | `12` | Seconds before scramble executes after announcement |
+| `scramblePercentage` | no | number | `0.5` | Fraction of players to move (0.0–1.0) |
+| `changeTeamRetryInterval` | no | number | `50` | RCON retry interval in ms |
+| `maxScrambleCompletionTime` | no | number | `15000` | Maximum time in ms for all swaps to complete |
+| `warnOnSwap` | no | boolean | `true` | Send RCON warning to players when swapped |
+| `requireScrambleConfirmation` | no | boolean | `true` | Require `!scramble confirm` before executing manual scrambles |
+| `scrambleConfirmationTimeout` | no | number | `60` | Seconds to wait for scramble confirmation |
+| `showWinStreakMessages` | no | boolean | `true` | Broadcast win streak updates after each round |
+| `useGenericTeamNamesInBroadcasts` | no | boolean | `false` | Use "Team 1"/"Team 2" instead of faction names in broadcasts |
+| `discordClient` | no | string | — | Discord connector name for Discord integration |
+| `discordAdminChannelID` | no | string | `""` | Discord channel ID for admin commands |
+| `discordReportChannelID` | no | string | `""` | Discord channel ID for automated reports (defaults to admin channel if unset) |
+| `discordAdminRoleIDs` | no | array | `[]` | Array of Discord role IDs required for admin commands (empty = all in channel) |
+| `mirrorRconBroadcasts` | no | boolean | `true` | Mirror RCON broadcasts to Discord |
+| `postScrambleDetails` | no | boolean | `true` | Post detailed swap plan to Discord after scramble |
+| `useEloForBalance` | no | boolean | `false` | Weight scrambles by EloTracker mu ratings (requires EloTracker plugin; falls back to numerical balance if absent) |
+| `devMode` | no | boolean | `false` | Allow commands from any player regardless of admin status |
+| `reportLogPath` | no | string | `"team-balancer-reports.jsonl"` | Path to the JSONL log file for round reports |
+| `enableDatabaseLogging` | no | boolean | `false` | If true, round reports are also written to database tables |
 
 > **S³-Managed Options**: The following settings are no longer configured on the TeamBalancer plugin. They are now managed by S³:
 >
