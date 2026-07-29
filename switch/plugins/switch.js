@@ -9,7 +9,7 @@ import SwitchCommands from '../utils/switch-commands.js';
 
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SWITCH PLUGIN v2.1.1                       ║
+ * ║                    SWITCH PLUGIN v2.1.2                       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ import SwitchCommands from '../utils/switch-commands.js';
  *
  */
 export default class Switch extends S3DiscordPluginBase {
-    static version = '2.1.1';
+    static version = '2.1.2';
 
     static get description() {
         return "Switch plugin with persistent join timers";
@@ -419,10 +419,13 @@ export default class Switch extends S3DiscordPluginBase {
         }
 
         // ── Utility registration (extracted during refactor) ──────────
-        await SwitchDB.register(this);
+        // ★ Attach public API methods FIRST (synchronous, no awaits)
+        //    so other plugins discover them during their _onS3Ready().
         SwitchOutput.register(this);
         SwitchQueue.register(this);
         SwitchCommands.register(this);
+        // Then do async DB registration (can yield safely now)
+        await SwitchDB.register(this);
 
 
         // Refresh interest is registered conditionally — only when the queue becomes
