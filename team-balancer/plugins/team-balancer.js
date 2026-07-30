@@ -1324,6 +1324,19 @@ export default class TeamBalancer extends S3PluginBase {
 
   async handleDiscordScrambleCommand(message) {
     let args = message.content.replace(/^!scramble\s*/i, '').trim().toLowerCase().split(/\s+/).filter(a => a);
+
+    // ─── Unknown arg guard ──────────────────────────────────────────────
+    // Reject any argument that isn't in the whitelist BEFORE touching
+    // scrambleConfirmation state. A typo (e.g. "!scramble confiirm") would
+    // otherwise fall through to the bare-scramble path, overwriting a
+    // pending confirmation and triggering a live broadcast.
+    const VALID_SCRAMBLE_ARGS = ['now', 'dry', 'matchend', 'cancel', 'confirm'];
+    const badArg = args.find(a => !VALID_SCRAMBLE_ARGS.includes(a));
+    if (badArg) {
+      await message.reply(`❌ Unknown argument "${badArg}". Usage: \`!scramble [now|dry|matchend|cancel|confirm]\``);
+      return;
+    }
+
     const isConfirm = args.includes('confirm');
 
     if (isConfirm) {

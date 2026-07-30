@@ -440,6 +440,21 @@ const CommandHandlers = {
       }
 
       let args = (command.message?.trim().toLowerCase().split(/\s+/) || []).filter(arg => arg);
+
+      // ─── Unknown arg guard ──────────────────────────────────────────────
+      // Reject any argument that isn't in the whitelist BEFORE touching
+      // scrambleConfirmation state. A typo (e.g. "!scramble confiirm") would
+      // otherwise fall through to the bare-scramble path, overwriting a
+      // pending confirmation and triggering a live broadcast.
+      const VALID_SCRAMBLE_ARGS = ['now', 'dry', 'matchend', 'cancel', 'confirm'];
+      const badArg = args.find(a => !VALID_SCRAMBLE_ARGS.includes(a));
+      if (badArg) {
+        return await this.respond(
+          command.player,
+          `Unknown argument "${badArg}". Usage: !scramble [now|dry|matchend|cancel|confirm]`
+        );
+      }
+
       const isConfirm = args.includes('confirm');
 
       if (isConfirm) {
