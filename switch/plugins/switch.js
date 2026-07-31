@@ -1093,21 +1093,28 @@ export default class Switch extends S3DiscordPluginBase {
         // v2.0.0: Defer post-scramble broadcast to next NEW_GAME
         this._scrambleHappened = true;
 
-        if (!affectedPlayers || affectedPlayers.length === 0) {
-            this.verbose(1, `[SCRAMBLE_EVENT] WARNING: affectedPlayers is empty or undefined — queue cleared, but no lockdown records written.`);
+        // ── Lockdown applies to ALL server players, not just those moved ──
+        // The scramble invalidates team balance for everyone, so the entire
+        // server (minus exemptions below) gets locked from switching.
+        // We iterate over S³'s authoritative player list (with server.players
+        // fallback) rather than data.affectedPlayers (which is only the subset
+        // physically moved by the swap plan).
+        const allPlayers = this._s3?.players?.isReady?.()
+            ? this._s3.players.getAllPlayers()
+            : this.server.players;
+
+        if (!allPlayers || allPlayers.length === 0) {
+            this.verbose(1, `[SCRAMBLE_EVENT] No players on server — queue cleared, no lockdown records written.`);
             return;
         }
 
-        this.verbose(2, `[SCRAMBLE_EVENT] Processing ${affectedPlayers.length} affected players for lockdown`);
-        affectedPlayers.forEach((p, i) => {
-            this.verbose(2, `  [${i}] steamID=${p.steamID}, name=${p.name}`);
-        });
+        this.verbose(2, `[SCRAMBLE_EVENT] Scramble moved ${affectedPlayers?.length ?? 0} players; applying lockdown evaluation to all ${allPlayers.length} server players.`);
 
         // Players within their switch-eligibility window haven't had time to
         // exploit pre-scramble imbalance, so they're exempt from lockdown.
         const switchWindowMs = this.options.switchEnabledMinutes * 60 * 1000;
         const lockoutPlayers = [];
-        for (const p of affectedPlayers) {
+        for (const p of allPlayers) {
             if (!p.eosID) {
                 this.verbose(1, `[SCRAMBLE_EVENT] Skipping ${p.name} — missing eosID`);
                 continue;
@@ -1135,7 +1142,7 @@ export default class Switch extends S3DiscordPluginBase {
         this.verbose(2, `[SCRAMBLE_EVENT] Lockdown duration: ${this.options.scrambleLockdownDurationMinutes}min | Expiry: ${expiry.toISOString()}`);
 
         if (lockoutPlayers.length === 0) {
-            this.verbose(1, `[SCRAMBLE_EVENT] All ${affectedPlayers.length} affected players were exempt from lockdown (switch window, queued, or missing eosID) — no lockdown records written.`);
+            this.verbose(1, `[SCRAMBLE_EVENT] All ${affectedPlayers?.length ?? 0} affected players were exempt from lockdown (switch window, queued, or missing eosID) — no lockdown records written.`);
             return;
         }
 
