@@ -60,14 +60,14 @@ export default class EloCalculator {
   // For example, to double the scale to 0-100, multiply ALL of these by 2.
   static MU_DEFAULT = 25.0;              // Base skill estimate for new players
   static SIGMA_DEFAULT = 25.0 / 3.0;     // Initial uncertainty (mu / 3)
-  static TAU = 25.0 / 100.0;             // Dynamic uncertainty floor (mu / 100)
+  static TAU = 0.27;                      // Dynamic uncertainty floor. Calibrated 2026-07-30 against 1,448 matches.
   
   static SIGMA_MULTIPLIER = 3.0; // Used for CSR (Competitive Skill Rank) calculation: CSR = mu - 3 * sigma
 
   // Configurable constants (exposed as static properties)
   // Note: These are immutable for the math engine. Changing these requires 
   // proportional changes to all related constants.
-  static BETA = 25.0 / 6.0;              // Skill chain distance (mu / 6). Affects how fast ratings shift.
+  static BETA = 4.85;                     // Skill chain distance. Calibrated 2026-07-30 against 1,448 matches.
   static DRAW_PROBABILITY = 0.01;        // Probability of a draw. (1%)
 
   /**

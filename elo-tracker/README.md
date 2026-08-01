@@ -36,7 +36,7 @@ EloTracker uses a TrueSkill-derived algorithm — the same family of systems use
 | **CSR** | Competitive Skill Rank | Your visible score on the leaderboard. Calculated as **μ - 3.0σ** to encourage active play. |
 | **μ (mu)** | Base Skill | Your estimated true performance level. Starts at **25.0**. |
 | **σ (sigma)** | Uncertainty | The system's confidence in your rating. Starts at **~8.33** and decreases as you play. |
-| **τ (tau)** | Dynamic Floor | Prevents uncertainty from reaching zero, ensuring ratings can always adjust to future performance changes. Starts at **0.25**. |
+| **τ (tau)** | Dynamic Floor | Prevents uncertainty from reaching zero, ensuring ratings can always adjust to future performance changes. Starts at **0.27**. |
 
 ### Calibration Stages
 
@@ -235,6 +235,10 @@ squad-server/
 - `!elo reset confirm` — Wipe **ALL** database ratings.
 
 ---
+
+## Calibration
+
+The BETA and TAU parameters were calibrated against 1,448 historical matches using a grid search with a calibration-error penalty function. See [ELO_CALIBRATION_RESULTS.md](ELO_CALIBRATION_RESULTS.md) for the full methodology and results.
 
 ## Technical Logic
 

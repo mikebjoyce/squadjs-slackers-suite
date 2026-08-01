@@ -4,9 +4,12 @@
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * Calibrates TrueSkill parameters (BETA, TAU) against historical
- * match data via grid search, minimising weighted log-loss.
+ * match data via two-pass grid search, minimising weighted log-loss.
  *
- * Usage: node elo-calibrate.js <matchlog.jsonl> <db-backup.json>
+ * Usage: node elo-calibrate.js <matchlog.jsonl> <db-backup.json> [--lambda=50,100,200]
+ *
+ * --lambda: comma-separated list of calibration penalty strengths (default: 200)
+ *           Higher = more penalty for low prediction variance.
  */
 
 import readline from 'readline';
@@ -17,30 +20,34 @@ const jsonlPath = process.argv[2];
 const dbPath    = process.argv[3];
 
 if (!jsonlPath || !dbPath) {
-  console.error('Usage: node elo-calibrate.js <matchlog.jsonl> <db-backup.json>');
+  console.error('Usage: node elo-calibrate.js <matchlog.jsonl> <db-backup.json> [--lambda=50,100,200]');
   process.exit(1);
 }
 
+// Parse --lambda argument
+const lambdaArg = process.argv.find(a => a.startsWith('--lambda='));
+const LAMBDAS   = lambdaArg
+  ? lambdaArg.split('=')[1].split(',').map(Number)
+  : [200];
+
 // --- Constants ---
-const RATED_MIN_GAMES    = 5;
-const MIN_RATED_PER_TEAM = 3;
-
-// Grid resolution
-const BETA_MIN  = 0.5;
-const BETA_MAX  = 30.0;
-const BETA_STEP = 0.5;   // coarser on wide pass — refine once we see the plateau
-const TAU_MIN   = 0.01;
-const TAU_MAX   = 0.50;
-const TAU_STEP  = 0.02;  // coarser too — same reason
-
-// Calibration regularisation
-// Penalises low prediction variance — counteracts BETA exploiting noisy data by
-// collapsing all predictions toward 0.5 (which reduces log-loss mechanically).
-// A model predicting 0.5 for everything has zero variance → maximum penalty.
-// penalty = LAMBDA / (variance(pTeam1) + EPSILON)
-// LAMBDA scales the penalty magnitude; EPSILON prevents division by zero.
-const CALIBRATION_LAMBDA  = 200;
+const RATED_MIN_GAMES     = 5;
+const MIN_RATED_PER_TEAM  = 3;
 const CALIBRATION_EPSILON = 1e-6;
+
+// Pass 1: wide bounds, coarse steps
+const PASS1_BETA_MIN  = 0.1;
+const PASS1_BETA_MAX  = 50.0;
+const PASS1_BETA_STEP = 1.0;
+const PASS1_TAU_MIN   = 0.01;
+const PASS1_TAU_MAX   = 2.0;
+const PASS1_TAU_STEP  = 0.1;
+
+// Pass 2: narrow around top-3, finer steps
+const PASS2_BETA_STEP = 0.25;
+const PASS2_TAU_STEP  = 0.02;
+const PASS2_BETA_MARGIN = 0.5;  // small for BETA (~0.1 range)
+const PASS2_TAU_MARGIN  = 3.0;  // larger for TAU (~2.0 range)
 
 // --- Load DB synchronously ---
 const db = JSON.parse(fs.readFileSync(dbPath));
@@ -100,7 +107,7 @@ function winProbability(team1, team2, BETA) {
 }
 
 // --- Replay ---
-function replayMatches(matches, BETA, TAU) {
+function replayMatches(matches, BETA, TAU, lambda = 200) {
   EloCalculator.BETA = BETA;
   EloCalculator.TAU  = TAU;
 
@@ -158,9 +165,30 @@ function replayMatches(matches, BETA, TAU) {
     });
   }
 
-  const avgP         = games.reduce((s, g) => s + g.pTeam1, 0) / games.length;
-  const varP         = games.reduce((s, g) => s + Math.pow(g.pTeam1 - avgP, 2), 0) / games.length;
-  const calibPenalty = CALIBRATION_LAMBDA / (varP + CALIBRATION_EPSILON);
+  // Calibration-error penalty: MSE between predicted and actual win rates
+  // across probability buckets. Directly penalizes miscalibration.
+  const N_BUCKETS = 10;
+  const buckets = new Array(N_BUCKETS).fill(null).map(() => ({ count: 0, predSum: 0, actualWins: 0 }));
+  
+  for (const g of games) {
+    const bin = Math.min(N_BUCKETS - 1, Math.floor(g.pTeam1 * N_BUCKETS));
+    buckets[bin].count++;
+    buckets[bin].predSum += g.pTeam1;
+    if (g.outcome === 'team1win') buckets[bin].actualWins++;
+  }
+  
+  let calibMSE = 0;
+  let bucketsWithData = 0;
+  for (const b of buckets) {
+    if (b.count === 0) continue;
+    bucketsWithData++;
+    const avgPred = b.predSum / b.count;
+    const actualRate = b.actualWins / b.count;
+    calibMSE += Math.pow(avgPred - actualRate, 2);
+  }
+  calibMSE = bucketsWithData > 0 ? calibMSE / bucketsWithData : 0;
+  
+  const calibPenalty = lambda * calibMSE * games.length;
   const adjustedLoss = totalLoss + calibPenalty;
 
   return { totalLoss, adjustedLoss, calibPenalty, games };
@@ -204,13 +232,13 @@ function printPredictionCurve(games, spreadKey, label) {
   console.log(`Signal ratio (spread >= 0.5): ${signal} / ${total} (${(signal / total * 100).toFixed(1)}%)`);
 }
 
-// --- Grid search ---
-function gridSearch(matches) {
+// --- Grid search (single pass, lambda-aware) ---
+function runGrid(matches, betaMin, betaMax, betaStep, tauMin, tauMax, tauStep, lambda) {
   const betas = [];
   const taus  = [];
 
-  for (let b = BETA_MIN; b <= BETA_MAX + 1e-9; b += BETA_STEP) betas.push(parseFloat(b.toFixed(2)));
-  for (let t = TAU_MIN;  t <= TAU_MAX  + 1e-9; t += TAU_STEP)  taus.push(parseFloat(t.toFixed(4)));
+  for (let b = betaMin; b <= betaMax + 1e-9; b += betaStep) betas.push(parseFloat(b.toFixed(2)));
+  for (let t = tauMin;  t <= tauMax  + 1e-9; t += tauStep)  taus.push(parseFloat(t.toFixed(4)));
 
   const total   = betas.length * taus.length;
   const results = [];
@@ -219,15 +247,15 @@ function gridSearch(matches) {
   for (const BETA of betas) {
     for (const TAU of taus) {
       n++;
-      process.stdout.write(`\rTesting BETA=${BETA.toFixed(2)} TAU=${TAU.toFixed(4)} (${n}/${total})...`);
-      const { totalLoss, adjustedLoss, calibPenalty, games } = replayMatches(matches, BETA, TAU);
+      process.stdout.write(`\r  Testing BETA=${BETA.toFixed(2)} TAU=${TAU.toFixed(4)} (${n}/${total})...`);
+      const { totalLoss, adjustedLoss, calibPenalty, games } = replayMatches(matches, BETA, TAU, lambda);
       results.push({ BETA, TAU, totalLoss, adjustedLoss, calibPenalty, games });
     }
   }
 
   process.stdout.write('\n');
   results.sort((a, b) => a.adjustedLoss - b.adjustedLoss);
-  return results.slice(0, 10);
+  return results;
 }
 
 // --- Diagnostic ---
@@ -253,8 +281,8 @@ function diagBuckets(games, label) {
   console.log(`Avg predicted P(team1): ${avgP}\n`);
 }
 
-// --- Main ---
-rl.on('close', () => {
+// --- Run calibration for each lambda ---
+function runAll() {
   matches.sort((a, b) => a.endedAt - b.endedAt);
 
   for (const match of matches) {
@@ -267,49 +295,76 @@ rl.on('close', () => {
   console.log(`Loaded ${matches.length} matches, ${playerDB.size} players in DB`);
   console.log(`Weighted: ${weightedCount} rated games (weight=3), ${matches.length - weightedCount} unrated (weight=1)`);
 
-  // Smoke test
+  // Smoke test (always uses default lambda=200 for consistency)
   const { totalLoss: smokeLoss, adjustedLoss: smokeAdjLoss, games: smokeGames } = replayMatches(matches, 25 / 6, 25 / 300);
   const smokeAcc = (smokeGames.filter(g => g.correct).length / smokeGames.length * 100).toFixed(1);
   console.log(`\nSmoke test (default params): loss=${smokeLoss.toFixed(4)}, accuracy=${smokeAcc}%`);
 
-  // Grid search
-  const numBetas = Math.round((BETA_MAX - BETA_MIN) / BETA_STEP) + 1;
-  const numTaus  = Math.round((TAU_MAX  - TAU_MIN)  / TAU_STEP)  + 1;
-  console.log(`\nStarting grid search (${numBetas} × ${numTaus} = ${numBetas * numTaus} candidates)...\n`);
-  const start   = Date.now();
-  const top10   = gridSearch(matches);
-  const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-  console.log(`\nGrid search complete in ${elapsed}s`);
+  // Run for each lambda
+  for (const LAMBDA of LAMBDAS) {
+    console.log(`\n${'═'.repeat(70)}`);
+    console.log(`  LAMBDA = ${LAMBDA}`);
+    console.log(`${'═'.repeat(70)}`);
 
-  console.log(`\n=== TOP 10 PARAMETER SETS (sorted by adjusted loss) ===\n`);
-  console.log(`${'Rank'.padEnd(6)} ${'BETA'.padEnd(8)} ${'TAU'.padEnd(8)} ${'RawLoss'.padEnd(12)} ${'Penalty'.padEnd(12)} ${'AdjLoss'.padEnd(12)} ${'WtGames'}`);
-  console.log('─'.repeat(68));
-  for (let i = 0; i < top10.length; i++) {
-    const r             = top10[i];
-    const weightedGames = r.games.reduce((s, g) => s + g.weight, 0);
-    console.log(
-      `${String(i + 1).padEnd(6)} ${r.BETA.toFixed(2).padEnd(8)} ${r.TAU.toFixed(4).padEnd(8)} ` +
-      `${r.totalLoss.toFixed(2).padEnd(12)} ${r.calibPenalty.toFixed(2).padEnd(12)} ` +
-      `${r.adjustedLoss.toFixed(2).padEnd(12)} ${weightedGames}`
-    );
+    const start = Date.now();
+
+    // --- Pass 1: wide bounds, coarse ---
+    console.log(`\n--- Pass 1: Wide search (BETA ${PASS1_BETA_MIN}–${PASS1_BETA_MAX} step ${PASS1_BETA_STEP}, TAU ${PASS1_TAU_MIN}–${PASS1_TAU_MAX} step ${PASS1_TAU_STEP}) ---`);
+    const pass1Results = runGrid(matches, PASS1_BETA_MIN, PASS1_BETA_MAX, PASS1_BETA_STEP, PASS1_TAU_MIN, PASS1_TAU_MAX, PASS1_TAU_STEP, LAMBDA);
+    const top3 = pass1Results.slice(0, 3);
+
+    console.log(`\n  Pass 1 top 3:`);
+    for (let i = 0; i < top3.length; i++) {
+      console.log(`    #${i + 1}: BETA=${top3[i].BETA.toFixed(2)} TAU=${top3[i].TAU.toFixed(4)} adjLoss=${top3[i].adjustedLoss.toFixed(2)}`);
+    }
+
+    // --- Pass 2: narrow around top-3, finer ---
+    const allPass2 = [];
+    for (const best of top3) {
+      const bMin = Math.max(PASS1_BETA_MIN, best.BETA - PASS2_BETA_MARGIN);
+      const bMax = Math.min(PASS1_BETA_MAX, best.BETA + PASS2_BETA_MARGIN);
+      const tMin = Math.max(PASS1_TAU_MIN, best.TAU - PASS2_TAU_MARGIN);
+      const tMax = Math.min(PASS1_TAU_MAX, best.TAU + PASS2_TAU_MARGIN);
+
+      console.log(`\n--- Pass 2: Fine search around #${top3.indexOf(best) + 1} (BETA ${bMin.toFixed(1)}–${bMax.toFixed(1)} step ${PASS2_BETA_STEP}, TAU ${tMin.toFixed(2)}–${tMax.toFixed(2)} step ${PASS2_TAU_STEP}) ---`);
+      const pass2Results = runGrid(matches, bMin, bMax, PASS2_BETA_STEP, tMin, tMax, PASS2_TAU_STEP, LAMBDA);
+      allPass2.push(...pass2Results);
+    }
+
+    allPass2.sort((a, b) => a.adjustedLoss - b.adjustedLoss);
+    const top10 = allPass2.slice(0, 10);
+
+    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+    console.log(`\n  Two-pass search complete in ${elapsed}s`);
+
+    // --- Results ---
+    console.log(`\n  === TOP 10 (lambda=${LAMBDA}) ===\n`);
+    console.log(`  ${'Rank'.padEnd(6)} ${'BETA'.padEnd(8)} ${'TAU'.padEnd(8)} ${'RawLoss'.padEnd(12)} ${'Penalty'.padEnd(12)} ${'AdjLoss'.padEnd(12)} ${'WtGames'}`);
+    console.log(`  ${'─'.repeat(68)}`);
+    for (let i = 0; i < top10.length; i++) {
+      const r             = top10[i];
+      const weightedGames = r.games.reduce((s, g) => s + g.weight, 0);
+      console.log(
+        `  ${String(i + 1).padEnd(6)} ${r.BETA.toFixed(2).padEnd(8)} ${r.TAU.toFixed(4).padEnd(8)} ` +
+        `${r.totalLoss.toFixed(2).padEnd(12)} ${r.calibPenalty.toFixed(2).padEnd(12)} ` +
+        `${r.adjustedLoss.toFixed(2).padEnd(12)} ${weightedGames}`
+      );
+    }
+    console.log(`\n  Default params: BETA=4.17 TAU=0.0833 → rawLoss=${smokeLoss.toFixed(2)} adjLoss=${smokeAdjLoss.toFixed(2)}`);
+
+    // Diagnostics for top 1
+    console.log(`\n  === DIAGNOSTIC: Prediction Distribution (Top 1) ===\n`);
+    diagBuckets(top10[0].games, `  #1 BETA=${top10[0].BETA} TAU=${top10[0].TAU} (adj=${top10[0].adjustedLoss.toFixed(2)})`);
+
+    // Prediction curves for top 1
+    const printBoth = (games, tag) => {
+      printPredictionCurve(games, 'fullSpread',  `  [Full team avg] ${tag}`);
+      printPredictionCurve(games, 'ratedSpread', `  [Rated only]    ${tag}`);
+    };
+    console.log(`\n  === PREDICTION CURVES (Top 1) ===`);
+    printBoth(top10[0].games, `#1 BETA=${top10[0].BETA} TAU=${top10[0].TAU} (adj=${top10[0].adjustedLoss.toFixed(2)})`);
   }
-  console.log(`\nDefault params: BETA=4.17 TAU=0.0833 → rawLoss=${smokeLoss.toFixed(2)} adjLoss=${smokeAdjLoss.toFixed(2)}`);
-  console.log(`Calibration lambda: ${CALIBRATION_LAMBDA}  (penalty = lambda / (variance(pTeam1) + ε))\n`);
+}
 
-  console.log(`\n=== DIAGNOSTIC: Prediction Distribution (Top 1 vs Default) ===\n`);
-  diagBuckets(top10[0].games, `#1 BETA=${top10[0].BETA} TAU=${top10[0].TAU} (adj=${top10[0].adjustedLoss.toFixed(2)})`);
-  diagBuckets(smokeGames,     `Default BETA=4.17 TAU=0.0833 (adj=${smokeAdjLoss.toFixed(2)})`);
-
-  // Prediction curves — both full-team and rated-only per parameter set
-  const printBoth = (games, tag) => {
-    printPredictionCurve(games, 'fullSpread',  `  [Full team avg] ${tag}`);
-    printPredictionCurve(games, 'ratedSpread', `  [Rated only]    ${tag}`);
-  };
-
-  console.log(`\n=== PREDICTION CURVES ===`);
-  printBoth(smokeGames, `Default BETA=4.17 TAU=0.0833 (adj=${smokeAdjLoss.toFixed(2)})`);
-  for (let i = 0; i < top10.length; i++) {
-    const r = top10[i];
-    printBoth(r.games, `#${i + 1} BETA=${r.BETA} TAU=${r.TAU} (adj=${r.adjustedLoss.toFixed(2)})`);
-  }
-});
+// --- Start ---
+rl.on('close', () => runAll());
