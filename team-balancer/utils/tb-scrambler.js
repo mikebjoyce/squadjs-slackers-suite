@@ -162,7 +162,11 @@ export const Scrambler = {
     // Cross-team consolidation is intentionally NOT performed: clan
     // members already split across teams are treated as two independent
     // groups (per user spec).
-    const virtualSquadsByTag = new Map(); // `${teamID}:${tag}` -> { originalMembers: Set<eosID> }
+    // `${teamID}:${tag}` -> { teamID, tag, originalMembers: Set<eosID>, allMembers: Set<eosID> }
+    // allMembers is the full virtual squad roster (clan members plus anyone who travelled with
+    // them) and is filled in once the anchor is known; it surfaces in the returned plan so the
+    // Discord report can mark who moved as a clan and who was only pulled along.
+    const virtualSquadsByTag = new Map();
     if (clanGroups && Object.keys(clanGroups).length > 0) {
       // Largest clans first so big groups claim their preferred anchors.
       const sortedClans = Object.entries(clanGroups).sort(
@@ -200,6 +204,8 @@ export const Scrambler = {
           // squads the clan spans the penalty applies whenever a final plan
           // separates clan members across teams.
           virtualSquadsByTag.set(`${teamID}:${tag}`, {
+            teamID,
+            tag,
             originalMembers: memberSet
           });
 
@@ -232,6 +238,10 @@ export const Scrambler = {
               }
             }
           }
+
+           // Full roster (clan members + anyone riding along in the anchor squad, or in every
+           // contributing squad when pullEntireSquads is on) for the Discord report.
+           virtualSquadsByTag.get(`${teamID}:${tag}`).allMembers = new Set(newPlayers);
 
            const virtualSquad = {
              ...anchor,
@@ -849,6 +859,20 @@ export const Scrambler = {
 
     const result = Array.from(finalPlayerMovesMap.values());
     result.calculationTime = duration;
+    // Only present when clan grouping actually built virtual squads, so consumers can treat
+    // "property exists" as "the feature was used this round".
+    if (virtualSquadsByTag.size > 0) {
+      // Both lists are derived from allMembers so their union is exactly the virtual squad's
+      // roster. originalMembers is deliberately NOT used as the source: it holds every clan
+      // member on the team, including those sitting in a squad an earlier clan already claimed
+      // as its anchor — those never joined this virtual squad and travel with the foreign clan.
+      result.virtualSquads = [...virtualSquadsByTag.values()].map((vs) => ({
+        teamID: vs.teamID,
+        tag: vs.tag,
+        members: [...vs.allMembers].filter((id) => vs.originalMembers.has(id)),
+        pulled: [...vs.allMembers].filter((id) => !vs.originalMembers.has(id))
+      }));
+    }
     return result; // Return the plan to the TeamBalancer
   }
 };
