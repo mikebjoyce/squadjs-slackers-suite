@@ -186,12 +186,21 @@ export const DiscordHelpers = {
     const f1 = teamBalancer.getTeamName(1);
     const f2 = teamBalancer.getTeamName(2);
 
-    // Build lookup maps
+    // Build lookup maps.
+    // Raw SquadJS squad objects do not have a `.players` property (see API ref §7);
+    // we derive the squad → player relationship from the player side instead.
+    // Each player already carries a squadID, so we index squads by (teamID, squadID)
+    // and then walk the player list to populate squadByEos.
     const playerByEos = new Map(players.map(p => [p.eosID, p]));
     const squadByEos = new Map();
+    const squadById = new Map();
     for (const s of squads) {
-      for (const pid of s.players) {
-        squadByEos.set(pid, s);
+      squadById.set(`${s.teamID}-${s.squadID}`, s);
+    }
+    for (const p of players) {
+      if (p.squadID != null) {
+        const s = squadById.get(`${p.teamID}-${p.squadID}`);
+        if (s) squadByEos.set(p.eosID, s);
       }
     }
 
