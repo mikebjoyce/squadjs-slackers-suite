@@ -184,7 +184,7 @@ Tracks round phases (STAGING → LIVE → ENDGAME → RESOLVING), infers gamemod
 | `isEndgamePostVoting()` | `boolean` | Votes concluded, next game loading |
 | `isEndgameVotingComplete()` | `boolean` | All voting finished |
 | `setIgnoredGameModes(modes)` | `void` | Configures which modes to skip |
-| `onGamePhaseChange(callback)` | `Function` (unsubscribe) | Callback: `(newPhase, prevPhase) => {}` |
+| `onGamePhaseChange(callback)` | `Function` (unsubscribe) | Callback: `({ phase, prevPhase, subPhase, roundStartTime, matchId, layer }) => {}` |
 | `onLayerGameModeChange(callback)` | `Function` (unsubscribe) | Callback: `(layer, gamemode, prevLayer, prevGamemode) => {}` |
 
 ---
@@ -470,8 +470,8 @@ unsubscribe();
 
 **Notes:**
 - `onGamePhaseChange` fires on every phase transition including ENDGAME sub-state changes (scoreboard → layerVote → factionVoteTeam1 → factionVoteTeam2 → postVoting).
-- **`prevPhase` in the payload is not reliable.** Every call site sets `this.phase` to the new value *before* calling `_notifyGamePhaseChange(newPhaseString)` — the argument passed is the new phase, not the actual prior one, so `payload.prevPhase` always equals `payload.phase`. This looks like a source bug (parameter name implies a real "previous phase" that never materializes), not intended behavior. Don't rely on `prevPhase` to detect what phase you're transitioning *from* — track it yourself across calls if you need that.
-- `onLayerGameModeChange` captures previous values before resolving and includes them in the payload correctly (this one is not affected by the bug above).
+- `prevPhase` correctly reflects the phase being transitioned *from* — all call sites now capture the prior phase before mutating `this.phase`. This was fixed in the source (2026-08-03); earlier code had a bug where `payload.prevPhase` always equalled `payload.phase`.
+- `onLayerGameModeChange` captures previous values before resolving and includes them in the payload correctly.
 
 #### PlayersService
 

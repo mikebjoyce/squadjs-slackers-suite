@@ -399,6 +399,7 @@ export default class GameStateService {
 
   async handleNewGame(data) {
     const now = Date.now();
+    const prevPhase = this.phase;
     this._recoveredStateActive = false;
     this._clearEndgameTimer();
     this.endgameSubState = null; // Clear ENDGAME sub-state when entering STAGING
@@ -436,11 +437,12 @@ export default class GameStateService {
     await this._persistState();
 
     this.verboseLogger(2, '[GameState] NEW_GAME -> STAGING (resolving=true).');
-    this._notifyGamePhaseChange('STAGING');
+    this._notifyGamePhaseChange(prevPhase);
   }
 
   async handleRoundEnded() {
     const now = Date.now();
+    const prevPhase = this.phase;
     this._recoveredStateActive = false;
     this._clearStagingLiveTimer();
     this.resolving = false;
@@ -459,7 +461,7 @@ export default class GameStateService {
 
     await this._persistState();
     this.verboseLogger(2, '[GameState] ROUND_ENDED -> ENDGAME(scoreboard).');
-    this._notifyGamePhaseChange('ENDGAME');
+    this._notifyGamePhaseChange(prevPhase);
   }
 
   async handleLayerInfoUpdated() {
@@ -596,12 +598,13 @@ export default class GameStateService {
       if (this.phase !== 'STAGING') return;
       this._recoveredStateActive = false;
 
+      const prevPhase = this.phase;
       this.phase = 'LIVE';
       this.resolving = false;
       this.lastPhaseChangeAt = Date.now();
       await this._persistState();
       this.verboseLogger(2, '[GameState] STAGING timer elapsed -> LIVE.');
-      this._notifyGamePhaseChange('LIVE');
+      this._notifyGamePhaseChange(prevPhase);
 
       // Emit server-wide event so consumer plugins (e.g. SmartAssign snapshot)
       // can capture the full player roster once the round is live and teams resolved.
@@ -822,11 +825,12 @@ export default class GameStateService {
     if (this.phase === 'STAGING' && this.lastNewGameAt) {
       if (this.resolving === false) {
         // Teams were already resolved before crash — skip timer, go straight to LIVE
+        const prevPhase = this.phase;
         this.phase = 'LIVE';
         this._recoveredStateActive = false;
         this.lastPhaseChangeAt = Date.now();
         this.verboseLogger(2, '[GameState] Recovered STAGING with resolving=false -> LIVE (skipping timer).');
-        this._notifyGamePhaseChange('STAGING');
+        this._notifyGamePhaseChange(prevPhase);
       } else {
         this._startStagingLiveTimer(this.lastNewGameAt);
       }
@@ -838,12 +842,13 @@ export default class GameStateService {
     // restarted; consumers see isEnding()=true but isEndgameFactionVote()=false (safe).
     if (this.phase === 'ENDGAME' && this.lastRoundEndedAt) {
       if ((Date.now() - this.lastRoundEndedAt) > 300000) {
+        const prevPhase = this.phase;
         this.phase = 'LIVE';
         this.resolving = false;
         this._recoveredStateActive = false;
         this.lastPhaseChangeAt = Date.now();
         this.verboseLogger(2, '[GameState] Recovered ENDGAME but round stale (>5min) -> LIVE.');
-        this._notifyGamePhaseChange('ENDGAME');
+        this._notifyGamePhaseChange(prevPhase);
       }
       // else: stay in ENDGAME, subState=null, no timer, wait for NEW_GAME
     }
