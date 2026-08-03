@@ -79,6 +79,7 @@ Add the following to your SquadJS `config.json`:
     "plugin": "Switch",
     "enabled": true,
     "discordClient": "discord",
+    "adminCommandChannelID": "",
     "discordChannelID": "",
     "database": "sqlite",
     "commandPrefix": ["!switch", "!change"],
@@ -245,9 +246,12 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 
 ### Discord
 
+The Switch plugin supports splitting Discord traffic across two channels. Round summaries, scramble notifications, and other automated reports always flow to `discordChannelID`. Admin commands (`!switch status/check/clear/clearall/timelimit/stats/help`) are gated to `adminCommandChannelID` when set.
+
 | Option | Description | Default |
 |--------|-------------|---------|
-| `discordChannelID` | Discord channel ID for admin commands and logs | `""` |
+| `discordChannelID` | Discord channel ID for automated reports (round summaries, scramble lockdown notifications). | `""` |
+| `adminCommandChannelID` | Discord channel ID for admin !switch commands. If not set, all traffic goes through `discordChannelID` (single-channel mode). | `""` |
 
 ### v2.0.0 Features
 

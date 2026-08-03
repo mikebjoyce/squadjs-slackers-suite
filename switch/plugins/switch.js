@@ -327,6 +327,11 @@ export default class Switch extends S3DiscordPluginBase {
                 required: false,
                 description: 'Post a Discord embed with round-end queue summary showing self-switches, pair trades, handshake swaps, failures, expiries, disconnects, and cancellations.',
                 default: true
+            },
+            adminCommandChannelID: {
+                required: false,
+                description: 'Discord channel ID for admin commands. If not set, falls back to channelID (single-channel mode).',
+                default: ''
             }
         };
     }
@@ -448,6 +453,17 @@ export default class Switch extends S3DiscordPluginBase {
         }
         await super.prepareToMount();
         // S3: Table sync and ALTER TABLE are removed — handled by S³ MigrationEngine in mount()
+
+        // ── Dual‑channel setup ──────────────────────────────────────
+        // adminCommandChannelID gates the !switch admin command listener
+        // (onDiscordMessage). Round summaries, scramble notifications,
+        // and other automated reports continue flowing to this.channel
+        // (the reporting channel set by channelID/discordChannelID).
+        // Admin commands are self‑routing (they reply to message.channel),
+        // so no dedicated admin channel reference is stored on the instance.
+        // If adminCommandChannelID is not set, both routes converge on the
+        // reporting channel — identical to the old single‑channel behaviour.
+        // ─────────────────────────────────────────────────────────────
     }
 
      async doSwitchMatchend() {

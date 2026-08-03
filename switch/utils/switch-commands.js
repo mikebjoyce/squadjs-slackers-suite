@@ -613,15 +613,24 @@ const SwitchCommands = {
       const STATS_LOOKBACK_DAYS = daysArg ? parseInt(daysArg, 10) : 60;
       const afterDate = new Date(Date.now() - STATS_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
 
+      // Report progress in the admin channel (message.channel)
       await message.channel.send(`🔍 Scraping switch stats from the last ${STATS_LOOKBACK_DAYS} days...`);
 
       const totals = { rounds: 0, success: 0, failed: 0, denied: 0, toT1: 0, toT2: 0 };
-      let before = message.id;
+      let before = undefined; // start from newest message in reporting channel
       let keepGoing = true;
 
       try {
+        // Scrape message history from the *reporting* channel (plugin.channel)
+        // where round-summary embeds are posted, regardless of which channel
+        // the !switch stats command was received in.
+        const reportChan = plugin.channel;
+        if (!reportChan) {
+          await message.channel.send('❌ Reporting channel is not available.');
+          return;
+        }
         while (keepGoing) {
-          const batch = await message.channel.messages.fetch({ limit: 100, before });
+          const batch = await reportChan.messages.fetch({ limit: 100, before });
           if (batch.size === 0) break;
 
           for (const msg of batch.values()) {
@@ -683,7 +692,18 @@ const SwitchCommands = {
 
     plugin.onDiscordMessage = async function (message) {
       if (message.author.bot) return;
-      if (plugin.options.channelID && message.channel.id !== plugin.options.channelID) return;
+
+      // ── Channel gate ──────────────────────────────────────────────
+      // Listens for admin !switch commands in adminCommandChannelID
+      // (if set) or falls back to channelID (single‑channel mode).
+      // Round summaries, scramble notifications, and other automated
+      // reports flow independently via sendDiscordMessage() to this.channel
+      // (the reporting channel) — that path is untouched here.
+      // Admin responses use message.channel.send() / message.reply() so
+      // they self‑route to whichever channel the command was received in.
+      // ───────────────────────────────────────────────────────────────
+      const adminChanId = plugin.options.adminCommandChannelID || plugin.options.channelID;
+      if (adminChanId && message.channel.id !== adminChanId) return;
 
       const content = message.content.trim();
       const args = content.split(' ');
