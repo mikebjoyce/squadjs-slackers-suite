@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                   TEAM BALANCER PLUGIN v4.0.2                 ║
+ * ║                   TEAM BALANCER PLUGIN v4.0.3                 ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -246,7 +246,7 @@ import fs from 'fs';
 import path from 'path';
 
 export default class TeamBalancer extends S3PluginBase {
-  static version = '4.0.2';
+  static version = '4.0.3';
 
   static get description() {
     return 'Tracks dominant wins by team ID and scrambles teams if one team wins too many rounds.';

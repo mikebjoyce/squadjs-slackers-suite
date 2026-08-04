@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                   ELO TRACKER PLUGIN v2.1.1                   ║
+ * ║                   ELO TRACKER PLUGIN v2.1.2                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -148,7 +148,7 @@ import { EloDiscord } from '../utils/elo-discord.js';
 import EloCommands from '../utils/elo-commands.js';
 
 export default class EloTracker extends S3PluginBase {
-  static version = '2.1.1';
+  static version = '2.1.2';
 
   static get description() {
     return 'A SquadJS plugin that tracks player participation across rounds, computes individual ELO ratings using a TrueSkill-based algorithm, and persists all data via Sequelize-compatible databases (SQLite, MySQL, PostgreSQL, etc.).';

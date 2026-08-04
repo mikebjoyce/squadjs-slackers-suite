@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║           SLACKERS SQUAD SERVICES PLUGIN v1.1.0              ║
+ * ║           SLACKERS SQUAD SERVICES PLUGIN v1.1.1              ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -159,7 +159,7 @@ export default class SlackersSquadServices extends BasePlugin {
     return false;
   }
 
-  static get version() { return '1.1.0'; }
+  static get version() { return '1.1.1'; }
 
   static get optionsSpecification() {
     return {
