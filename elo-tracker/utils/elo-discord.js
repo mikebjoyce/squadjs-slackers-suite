@@ -159,20 +159,51 @@ export const EloDiscord = {
       }
     }
 
+    const channelId = channel?.id || 'unknown';
+    const channelName = channel?.name || 'unknown';
+
     const executeSend = async (data, isRetry = false) => {
       try {
         await channel.send(data);
         return true;
       } catch (err) {
         // Rate Limit Handling (429)
-        if (err.status === 429 && !isRetry) {
-          let waitTime = 1000;
-          if (err.retryAfter) waitTime = err.retryAfter;
-          else if (err.headers && err.headers['retry-after']) waitTime = parseFloat(err.headers['retry-after']) * 1000;
+        if (err.status === 429) {
+          // Extract retry-after: Discord.js v13+ puts it on err.retryAfter (ms),
+          // v12 puts it on err.headers['retry-after'] (seconds). Default to 5s if unreadable.
+          let waitTime = 5000;
+          if (typeof err.retryAfter === 'number' && err.retryAfter > 0) {
+            waitTime = err.retryAfter;
+          } else if (err.headers) {
+            // Discord.js v12: headers is an object with a .get() method or direct properties
+            const raw = typeof err.headers.get === 'function'
+              ? err.headers.get('retry-after')
+              : err.headers['retry-after'];
+            if (raw) {
+              const parsed = parseFloat(raw);
+              waitTime = parsed > 0 ? parsed * 1000 : 5000;
+            }
+          }
 
-          Logger.verbose('EloTracker', 1, `Discord 429 Rate Limit hit. Waiting ${waitTime}ms before retry.`);
-          await new Promise((resolve) => setTimeout(resolve, waitTime));
-          return executeSend(data, true);
+          // Detect global vs per-route rate limit
+          const isGlobal = err.headers
+            ? (typeof err.headers.get === 'function'
+                ? err.headers.get('X-RateLimit-Global')
+                : err.headers['X-RateLimit-Global'] || err.headers['x-ratelimit-global'])
+            : false;
+          const scope = isGlobal ? 'GLOBAL' : 'per-route';
+
+          if (!isRetry) {
+            Logger.verbose('EloTracker', 1,
+              `Discord 429 Rate Limit (${scope}) on #${channelName} (${channelId}). Waiting ${waitTime}ms before retry.`);
+            await new Promise((resolve) => setTimeout(resolve, waitTime));
+            return executeSend(data, true);
+          }
+
+          // Retry also hit a 429 — the rate limit is still active
+          Logger.verbose('EloTracker', 1,
+            `Discord 429 Rate Limit (${scope}) on #${channelName} (${channelId}) — retry also failed after ${waitTime}ms wait. Giving up.`);
+          throw err;
         }
 
         // Compatibility: Discord.js v12 Fallback
@@ -190,7 +221,7 @@ export const EloDiscord = {
       await executeSend(payload);
       return true;
     } catch (err) {
-      const errMsg = `Discord send failed: ${err.message}`;
+      const errMsg = `Discord send failed on #${channelName} (${channelId}): ${err.message}`;
       if (!suppressErrors) throw new Error(errMsg);
       Logger.verbose('EloTracker', 1, errMsg);
       return false;

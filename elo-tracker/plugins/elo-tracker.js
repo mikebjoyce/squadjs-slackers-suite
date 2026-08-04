@@ -465,7 +465,7 @@ export default class EloTracker extends S3PluginBase {
       if (this.options.discordAdminChannelID) {
         try {
           this.discordAdminChannel = await this.options.discordClient.channels.fetch(this.options.discordAdminChannelID);
-          Logger.verbose('EloTracker', 1, `Fetched admin Discord channel: ${this.discordAdminChannel.name}`);
+          Logger.verbose('EloTracker', 1, `Fetched admin Discord channel: ${this.discordAdminChannel.name} (ID: ${this.options.discordAdminChannelID})`);
         } catch (err) {
           Logger.verbose('EloTracker', 1, `Could not fetch admin Discord channel (ID: ${this.options.discordAdminChannelID}): ${err.message}`);
         }
@@ -473,7 +473,7 @@ export default class EloTracker extends S3PluginBase {
       if (this.options.discordPublicChannelID) {
         try {
           this.discordPublicChannel = await this.options.discordClient.channels.fetch(this.options.discordPublicChannelID);
-          Logger.verbose('EloTracker', 1, `Fetched public Discord channel: ${this.discordPublicChannel.name}`);
+          Logger.verbose('EloTracker', 1, `Fetched public Discord channel: ${this.discordPublicChannel.name} (ID: ${this.options.discordPublicChannelID})`);
         } catch (err) {
           Logger.verbose('EloTracker', 1, `Could not fetch public Discord channel (ID: ${this.options.discordPublicChannelID}): ${err.message}`);
         }
@@ -481,7 +481,7 @@ export default class EloTracker extends S3PluginBase {
       if (this.options.discordReportChannelID) {
         try {
           this.discordReportChannel = await this.options.discordClient.channels.fetch(this.options.discordReportChannelID);
-          Logger.verbose('EloTracker', 1, `Fetched report Discord channel: ${this.discordReportChannel.name}`);
+          Logger.verbose('EloTracker', 1, `Fetched report Discord channel: ${this.discordReportChannel.name} (ID: ${this.options.discordReportChannelID})`);
         } catch (err) {
           Logger.verbose('EloTracker', 1, `Could not fetch report Discord channel (ID: ${this.options.discordReportChannelID}): ${err.message}`);
         }
@@ -883,7 +883,9 @@ export default class EloTracker extends S3PluginBase {
     // --- DB writes ---
     let roundRecord = null;
     try {
+      Logger.verbose('EloTracker', 2, `[onRoundEnded] Starting bulkIncrementPlayerStats for ${dbUpdates.length} players...`);
       await this.db.bulkIncrementPlayerStats(dbUpdates);
+      Logger.verbose('EloTracker', 2, '[onRoundEnded] bulkIncrementPlayerStats complete. Starting insertRoundHistory...');
 
       const gs = this._s3?.gameState;
 
@@ -896,6 +898,7 @@ export default class EloTracker extends S3PluginBase {
         endedAt: roundEndTime,
         playerCount: eligible.length
       });
+      Logger.verbose('EloTracker', 2, `[onRoundEnded] insertRoundHistory complete (id=${roundRecord?.id}).`);
     } catch (err) {
       Logger.verbose('EloTracker', 1, `[onRoundEnded] DB write failed: ${err.message}`);
     }
@@ -993,8 +996,10 @@ export default class EloTracker extends S3PluginBase {
 
     // --- Discord post ---
     const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
+    Logger.verbose('EloTracker', 2, `[onRoundEnded] Discord target: #${targetReportChannel?.name || 'none'} (${targetReportChannel?.id || 'none'}), reportChannel=${this.discordReportChannel?.id || 'null'}, adminChannel=${this.discordAdminChannel?.id || 'null'}`);
     if (targetReportChannel) {
       try {
+        Logger.verbose('EloTracker', 2, '[onRoundEnded] Building round summary embed...');
         const liveT1 = this._getMatchMetrics(this.server.players.filter(p => p.teamID === 1));
         const liveT2 = this._getMatchMetrics(this.server.players.filter(p => p.teamID === 2));
 
@@ -1012,7 +1017,9 @@ export default class EloTracker extends S3PluginBase {
           liveT2,
           calculationDuration
         });
+        Logger.verbose('EloTracker', 2, '[onRoundEnded] Sending round summary to Discord...');
         await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+        Logger.verbose('EloTracker', 2, '[onRoundEnded] Round summary sent successfully.');
       } catch (err) {
         Logger.verbose('EloTracker', 1, `[onRoundEnded] Discord post failed: ${err.message}`);
       }
