@@ -255,16 +255,19 @@ export default class SwapExecutor {
       Logger.verbose('TeamBalancer', 1, `[SwapExecutor] ${failedToMove} players failed to move; manual action may be required.`);
     }
 
-    if (this.teamBalancer && this.teamBalancer.discordChannel) {
-      const embed = DiscordHelpers.buildScrambleCompletedEmbed(
-        totalMoves,
-        movedSuccessfully,
-        failedToMove,
-        disconnected,
-        duration,
-        failedNames || []
-      );
-      DiscordHelpers.sendDiscordMessage(this.teamBalancer.discordChannel, { embeds: [embed] });
+    if (this.teamBalancer) {
+      const targetReportChannel = this.teamBalancer.discordReportChannel || this.teamBalancer.discordChannel;
+      if (targetReportChannel) {
+        const embed = DiscordHelpers.buildScrambleCompletedEmbed(
+          totalMoves,
+          movedSuccessfully,
+          failedToMove,
+          disconnected,
+          duration,
+          failedNames || []
+        );
+        DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+      }
     }
 
     this.pendingPlayerMoves.clear();
