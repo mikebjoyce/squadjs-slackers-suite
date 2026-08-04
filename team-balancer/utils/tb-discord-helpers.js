@@ -87,6 +87,7 @@ export const DiscordHelpers = {
         { name: 'Elo Integration', value: eloStatus, inline: true },
         { name: 'Dominant Streak', value: winStreakText, inline: true },
         { name: 'Consecutive Streak', value: consecutiveText, inline: true },
+        { name: 'Seed Auto Scramble', value: tb.seedAutoScrambleStatus(), inline: true },
         { name: 'Last Scramble', value: lastScrambleText, inline: false },
         { name: 'Player Count', value: `Total: ${players.length} | T1: ${t1Count} | T2: ${t2Count}`, inline: false }
       ],
@@ -118,7 +119,15 @@ export const DiscordHelpers = {
     const embed1 = {
       color: color,
       title: '🩺 TeamBalancer Diagnostics',
-      description: `**Plugin Status:** ${!tb.ready ? 'INITIALIZING' : tb.manuallyDisabled ? 'DISABLED (Manual)' : 'ENABLED'}`,
+      description: `**Plugin Status:** ${
+        !tb.ready
+          ? 'INITIALIZING'
+          : tb.manuallyDisabled
+          ? 'DISABLED (Manual)'
+          : tb.options?.enableWinStreakTracking
+          ? 'ENABLED'
+          : 'DISABLED (config)'
+      }`,
       fields: [
         // Runtime state (what diag tells you that status doesn't)
         { name: 'Scramble Pending', value: tb._scramblePending ? 'Yes' : 'No', inline: true },
@@ -131,6 +140,7 @@ export const DiscordHelpers = {
         // Key thresholds (what matters for debugging)
         { name: 'Max Win Threshold', value: `${tb.options?.maxWinStreak || 2} wins`, inline: true },
         { name: 'Dominant Threshold', value: `${tb.options?.minTicketsToCountAsDominantWin || 150} tickets`, inline: true },
+        { name: 'Seed Auto Scramble', value: tb.seedAutoScrambleStatus(), inline: true },
         { name: 'Scramble %', value: `${(tb.options?.scramblePercentage || 0.5) * 100}%`, inline: true },
         { name: 'Scramble Delay / Max', value: `${tb.options?.scrambleAnnouncementDelay}s / ${tb.options?.maxScrambleCompletionTime}ms`, inline: false },
         { name: 'Single Round Scramble', value: tb.options?.enableSingleRoundScramble ? `ON (> ${tb.options?.singleRoundScrambleThreshold} tix)` : 'OFF', inline: true },
