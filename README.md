@@ -8,6 +8,8 @@ This repository contains a suite of SquadJS plugins built around **S³ (Slackers
 
 The four consumer plugins — **SmartAssign**, **Switch**, **EloTracker**, and **TeamBalancer** — all depend on S³ and coordinate through its shared services rather than duplicating state or communicating directly.
 
+For the design rationale and architectural decisions behind S³, see **[WHY_S3.md](WHY_S3.md)**.
+
 | Plugin | Directory | Description |
 |--------|-----------|-------------|
 | **S³ (SlackersSquadServices)** | [`s3/`](s3/) | Centralized service container — required by all other plugins |
