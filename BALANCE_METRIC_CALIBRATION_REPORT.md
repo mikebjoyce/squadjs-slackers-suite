@@ -30,16 +30,18 @@
 | CV mean held-out ρ | 0.1016 | 0.1272 | +25% |
 | Chrono held-out ρ | 0.1005 | 0.0837 | −17% |
 
-**Key insight:** The backup's final trained μ is a substantially stronger predictor of ticket margin than point-in-time μBefore. Univariate correlations nearly doubled. The trained ratings filter out per-round noise that μBefore carries — but they also introduce look-ahead bias (the chrono held-out ρ drops because early rounds "know" future outcomes). For calibration purposes (finding which weights best predict outcomes), the cleaner signal from backup ratings is preferred.
+**Key insight:** The backup's final trained μ is a substantially stronger predictor of ticket margin than point-in-time μBefore — univariate correlations nearly doubled. However, this comes with look-ahead bias: the backup-mode weights do not generalize out-of-sample (CV held-out ρ 0.1272 < default in-sample ρ 0.1315; chrono held-out ρ 0.0837 < default 0.1315). The tool's own auto-verdict correctly gates this: "⚠ Defaults already optimal or near-optimal. No changes recommended."
 
-With trained ratings, meanDiff and top15Diff are nearly equally predictive (ratio 1.09× vs 1.37×), which shifts the preferred blend from 0.9/0.1 toward 0.8/0.2.
+**Matchlog mode** (μBefore — what the scrambler actually sees at decision time) is the only mode whose calibrated weights pass both validation gates (CV: 0.1016 > 0.0857 ✓; chrono: 0.1005 > 0.0857 ✓) with 4/5 fold consensus on meanWeight=0.9. **Backup mode is retained as a diagnostic ceiling** — it confirms crossAdvantageMaxReduction=0 and vetW=500 are robust across both sources, but its blend weights should not drive production parameter selection.
+
+With trained ratings, meanDiff and top15Diff are nearly equally predictive (ratio 1.09× vs 1.37×), which shifts the preferred blend from 0.9/0.1 toward 0.8/0.2 — but this shift reflects the changed noise characteristics of the input data, not a more accurate blend for production use.
 
 ## In-Sample Findings (Backup Ratings)
 
 | Parameter | Before | After | Notes |
 |---|---|---|---|
-| `meanWeight` | 0.6 | **0.8** | Grid-search prefers 0.8 with trained ratings |
-| `top15Weight` | 0.4 | **0.2** | Derived (1.0 − meanWeight) |
+| `meanWeight` | 0.6 | **0.8** | Grid-search prefers 0.8 with trained ratings (backup mode only; matchlog mode prefers 0.9 — see Recommendation) |
+| `top15Weight` | 0.4 | **0.2** | Derived (1.0 − meanWeight); matchlog mode: 0.1 |
 | Cross-advantage bonus | 0.30 max | **Removed** | Every positive reduction *lowered* correlation |
 | `veteranPenaltyWeight` | 300 | **500** | Veteran imbalance matters more than previously weighted |
 
@@ -231,7 +233,7 @@ Roughly bell-shaped, slightly right-skewed, spanning only 0.02 ρ units. The nar
 
 1. **The trained-μ signal is real and substantially stronger.** Switching from μBefore to backup μ nearly doubled the univariate correlations (0.0835→0.1221 for meanDiff, 0.0609→0.1123 for top15Diff). The backup's final trained rating filters out per-round noise. However, this comes with look-ahead bias — the chronological holdout suggests the signal doesn't fully generalize forward in time.
 
-2. **The blend optimum is at 0.8/0.2, not 0.9/0.1.** With cleaner ratings, meanDiff and top15Diff are nearly equally predictive (ratio 1.09×), so the grid search prefers a more balanced blend. But the difference between 0.8/0.2 (ρ=0.1373) and 0.7/0.3 (ρ=0.1370) is negligible.
+2. **The blend optimum depends on rating source.** With backup ratings (cleaner signal), meanDiff and top15Diff are nearly equally predictive (ratio 1.09×), so the grid search prefers 0.8/0.2. With matchlog ratings (μBefore — what the scrambler actually sees at decision time), top15Diff is noisier (ratio 1.37×) and the grid search prefers 0.9/0.1. The matchlog-mode weights are the ones that generalize out-of-sample (CV held-out ρ 0.1016 > default 0.0857; chrono held-out ρ 0.1005 > default 0.0857) and are the recommended production values. Backup mode serves as a diagnostic ceiling — it confirms crossAdvantageMaxReduction=0 and vetW=500 are robust, but its blend weights don't generalize (CV held-out ρ 0.1272 < default 0.1315; chrono held-out ρ 0.0837 < default 0.1315) and the tool's own auto-verdict gates this correctly ("⚠ Defaults already optimal or near-optimal. No changes recommended.").
 
 3. **The fitness landscape is a vast, flat mesa, not a peak.** 28.8% of all configurations achieve ρ within 0.005 of the best. 59.1% are within 0.01. The response surface slices show smooth, monotonic trends with no local minima, no multi-modality, and one completely inert parameter (significanceThreshold when crossRed=0). There is no "optimum" to discover — there is a broad region of near-equivalent configurations.
 
@@ -245,9 +247,11 @@ Roughly bell-shaped, slightly right-skewed, spanning only 0.02 ρ units. The nar
 
 ## Recommendation
 
-**Use meanWeight=0.8, crossAdvantageMaxReduction=0.00, veteranPenaltyWeight=500.** The `significanceThreshold` is irrelevant when crossRed=0.00 and can be left at any value.
+**Use meanWeight=0.9, crossAdvantageMaxReduction=0.00, veteranPenaltyWeight=500.** The `significanceThreshold` is irrelevant when crossRed=0.00 and can be left at any value.
 
-These settings represent a point on the broad plateau — they are slightly better than the old defaults (0.6/0.4, crossRed=0.30, vetW=300) but the improvement is small (ρ +0.0058 in-sample). The key actionable finding is removing the cross-advantage bonus, which is unambiguously harmful.
+These are the matchlog-mode weights — the only mode whose calibrated weights pass both validation gates (CV held-out ρ 0.1016 > default 0.0857; chrono held-out ρ 0.1005 > default 0.0857) with 4/5 fold consensus. The backup mode (final trained μ) was consulted as a diagnostic ceiling and confirms crossAdvantageMaxReduction=0 and vetW=500 are robust across both rating sources, but its blend weights (0.8/0.2) do not generalize out-of-sample and fail the tool's own auto-verdict ("⚠ Defaults already optimal or near-optimal. No changes recommended."). Backup mode should be treated as answering "how predictable is margin with perfect information," not "what weights should the scrambler use in production."
+
+These settings represent a point on the broad plateau — they are slightly better than the old defaults (0.6/0.4, crossRed=0.30, vetW=300) but the improvement is small (ρ +0.0213 in-sample for matchlog mode). The key actionable finding is removing the cross-advantage bonus, which is unambiguously harmful.
 
 **Treat the calibrated weights as "demonstrably not worse than defaults," not as a precisely calibrated optimum.** The landscape analysis confirms there is no meaningful optimum to find.
 
