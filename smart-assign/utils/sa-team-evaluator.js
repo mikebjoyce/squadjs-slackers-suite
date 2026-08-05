@@ -8,8 +8,10 @@
  * Pure functional module for team assignment scoring and evaluation.
  * No side effects, no state ownership — all state is passed as arguments.
  * Provides a 3-metric Composite Scoring System aligned with TeamBalancer's
- * algorithm for competitive balance: Mean ELO difference, Top-15 ELO
- * difference (high-skill parity), and Veteran parity (experience distribution).
+ * algorithm for competitive balance: Mean ELO difference (0.9×), Top-15 ELO
+ * difference (0.1×, high-skill parity), and Veteran parity (500× experience distribution).
+ * Weights calibrated via grid search against 1,192 historical rounds
+ * (team-balancer/tools/calibrate-elo-weights.js).
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
@@ -67,8 +69,10 @@ export function getPenalty(diff) {
 
 /**
  * Computes the 3-metric composite score for a given team configuration.
- * Metrics: Mean ELO difference (0.6×), Top-15 ELO difference (0.4×),
- * Veteran parity penalty (300× ratio difference).
+ * Metrics: Mean ELO difference (0.9×), Top-15 ELO difference (0.1×),
+ * Veteran parity penalty (500× ratio difference).
+ * Weights calibrated via grid search against 1,192 historical rounds
+ * (team-balancer/tools/calibrate-elo-weights.js).
  * Exported for reuse by handshake evaluation (virtual swap scoring).
  * Lower score = more balanced.
  *
@@ -99,13 +103,20 @@ export function computeScore(t1Mus, t2Mus, t1Veterans, t2Veterans, t1Count, t2Co
   const top15Diff = Math.abs(top15T1 - top15T2);
 
   // Composite ELO penalty
-  const compositeDiff = 0.6 * meanDiff + 0.4 * top15Diff;
+  // Weights calibrated via grid search against 1,192 historical rounds
+  // (team-balancer/tools/calibrate-elo-weights.js). The 0.9/0.1 blend
+  // is the grid-search preferred direction (4/5 CV folds, chronological
+  // held-out ρ=0.1005 vs default ρ=0.0857). Note: univariate predictiveness
+  // ratio is 1.37× (ρ_mean=0.0835, ρ_top15=0.0609), not 9× — the 0.9/0.1
+  // is a composite-weight ratio, not a predictiveness measure. meanDiff and
+  // top15Diff are collinear (ρ=0.59), so the blend optimum is flat.
+  const compositeDiff = 0.9 * meanDiff + 0.1 * top15Diff;
   const eloBalancePenalty = getPenalty(compositeDiff);
 
   // Metric 3: Veteran parity penalty
   const vet1Ratio = t1Count > 0 ? t1Veterans / t1Count : 0;
   const vet2Ratio = t2Count > 0 ? t2Veterans / t2Count : 0;
-  const veteranPenalty = Math.abs(vet1Ratio - vet2Ratio) * 300;
+  const veteranPenalty = Math.abs(vet1Ratio - vet2Ratio) * 500;
 
   return eloBalancePenalty + veteranPenalty;
 }
@@ -337,10 +348,10 @@ export async function evaluateTeamAssignment(player, server, context) {
     const candidateMusT2 = [...t2Mus, playerMu];
 
     // SCORING FUNCTION: 3-metric composite system aligned with TeamBalancer
-    // Metrics:
-    //   1. meanDiff (weight 0.6x): Average Mu difference between teams
-    //   2. top15Diff (weight 0.4x): Top-15 average Mu difference
-    //   3. veteranPenalty (fixed 300x): Ratio imbalance of experienced players
+    // Metrics (weights calibrated via grid search against 1,192 historical rounds):
+    //   1. meanDiff (weight 0.9x): Average Mu difference between teams
+    //   2. top15Diff (weight 0.1x): Top-15 average Mu difference
+    //   3. veteranPenalty (fixed 500x): Ratio imbalance of experienced players
     const getScore = (candidateMus, opponentMus, candidateVets, opponentVets, candidateCount, opponentCount) => {
       // Metric 1: Mean ELO difference
       const getMean = (mus) => mus.length > 0 ? mus.reduce((a, b) => a + b, 0) / mus.length : 25.0;
@@ -360,13 +371,20 @@ export async function evaluateTeamAssignment(player, server, context) {
       const top15Diff = Math.abs(top15T1 - top15T2);
 
       // Composite ELO penalty (matches TeamBalancer exactly)
-      const compositeDiff = 0.6 * meanDiff + 0.4 * top15Diff;
+      // Weights calibrated via grid search against 1,192 historical rounds
+      // (team-balancer/tools/calibrate-elo-weights.js). The 0.9/0.1 blend
+      // is the grid-search preferred direction (4/5 CV folds, chronological
+      // held-out ρ=0.1005 vs default ρ=0.0857). Note: univariate predictiveness
+      // ratio is 1.37× (ρ_mean=0.0835, ρ_top15=0.0609), not 9× — the 0.9/0.1
+      // is a composite-weight ratio, not a predictiveness measure. meanDiff and
+      // top15Diff are collinear (ρ=0.59), so the blend optimum is flat.
+      const compositeDiff = 0.9 * meanDiff + 0.1 * top15Diff;
       const eloBalancePenalty = getPenalty(compositeDiff);
 
       // Metric 3: Veteran parity penalty
       const vet1Ratio = candidateCount > 0 ? candidateVets / candidateCount : 0;
       const vet2Ratio = opponentCount > 0 ? opponentVets / opponentCount : 0;
-      const veteranPenalty = Math.abs(vet1Ratio - vet2Ratio) * 300;
+      const veteranPenalty = Math.abs(vet1Ratio - vet2Ratio) * 500;
 
       return eloBalancePenalty + veteranPenalty;
     };

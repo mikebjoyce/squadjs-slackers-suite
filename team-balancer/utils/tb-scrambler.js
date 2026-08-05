@@ -400,7 +400,17 @@ export const Scrambler = {
           return 34.0 + (diff - 0.6) * 150;
         };
 
-        const compositeDiff = 0.6 * meanDiff + 0.4 * top15Diff;
+        // Weights calibrated via grid search against 1,192 historical rounds
+        // (team-balancer/tools/calibrate-elo-weights.js). The 0.9/0.1 blend
+        // is the grid-search preferred direction (4/5 CV folds, chronological
+        // held-out ρ=0.1005 vs default ρ=0.0857). Note: univariate predictiveness
+        // ratio is 1.37× (ρ_mean=0.0835, ρ_top15=0.0609), not 9× — the 0.9/0.1
+        // is a composite-weight ratio, not a predictiveness measure. meanDiff and
+        // top15Diff are collinear (ρ=0.59), so the blend optimum is flat and
+        // poorly identified. A cross-advantage bonus (reducing penalty when mean
+        // and top-15 favour different teams) was tested and found to LOWER
+        // correlation — the data rejects it.
+        const compositeDiff = 0.9 * meanDiff + 0.1 * top15Diff;
         const eloBalancePenalty = Math.min(getPenalty(compositeDiff), 480);
 
         combinedScore += eloBalancePenalty;
@@ -418,7 +428,7 @@ export const Scrambler = {
         const reg2 = countRegs('2', movingToT1, movingToT2);
         const vet1 = hypotheticalNewT1 > 0 ? reg1 / hypotheticalNewT1 : 0;
         const vet2 = hypotheticalNewT2 > 0 ? reg2 / hypotheticalNewT2 : 0;
-        const veteranPenalty = Math.abs(vet1 - vet2) * 300;
+        const veteranPenalty = Math.abs(vet1 - vet2) * 500;
         combinedScore += veteranPenalty;
 
         // --- LOCKED SQUAD PENALTY (ELO MODE) ---

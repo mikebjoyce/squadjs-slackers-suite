@@ -92,10 +92,16 @@
  *     3.5. Clan Grouping: If a player is in a clan and ALL clan mates are on one
  *        team, route the player there (provided pop cap allows). Uses lightweight
  *        _playerTagCache for fast tag lookups via S³ ClansService.
- *     4. Elo Balancing: Combines three metrics—Mean ELO difference (0.6x), Top-15
- *        ELO difference (0.4x), and Veteran Parity Penalty (300x)—passed through a
+ *     4. Elo Balancing: Combines three metrics—Mean ELO difference (0.9x), Top-15
+ *        ELO difference (0.1x), and Veteran Parity Penalty (500x)—passed through a
  *        non-linear penalty curve to find the team placement with the lowest
- *        combined score.
+ *        combined score. Weights calibrated via grid search against 1,192 historical
+ *        rounds (team-balancer/tools/calibrate-elo-weights.js). The 0.9/0.1 blend
+ *        is the grid-search preferred direction (4/5 CV folds, held-out ρ=0.1016
+ *        vs default ρ=0.0857). Note: univariate predictiveness ratio is 1.37×
+ *        (ρ_mean=0.0835, ρ_top15=0.0609), not 9× — the weight ratio is a blend
+ *        tuning, not a predictiveness measure. meanDiff and top15Diff are collinear
+ *        (ρ=0.59), so the blend optimum is flat and poorly identified.
  *     5. Reconnect Bias: If reconnect priority is blocked by the cap, applies a
  *        minor score reduction (0.25) toward the previous team to tip near-ties.
  *     6. Reconnect Bonus: Grants an *additional* +1 player imbalance allowance on
