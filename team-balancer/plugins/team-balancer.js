@@ -1840,6 +1840,52 @@ export default class TeamBalancer extends S3PluginBase {
         return;
       }
 
+      // ── Consecutive Wins Tracking ──────────────────────────────
+      // Track every non-ignored win regardless of margin.
+      if (this.consecutiveWinsTeam === winnerID) {
+        this.consecutiveWinsCount++;
+      } else {
+        this.consecutiveWinsTeam = winnerID;
+        this.consecutiveWinsCount = 1;
+      }
+      Logger.verbose('TeamBalancer', 4, `Consecutive wins: Team ${this.consecutiveWinsTeam} has ${this.consecutiveWinsCount} wins.`);
+
+      // Persist consecutive state immediately so it survives a crash before the
+      // dominant path commits.
+      try {
+        const dbRes = await this.db.saveState(this.winStreakTeam, this.winStreakCount, this.consecutiveWinsTeam, this.consecutiveWinsCount);
+        if (dbRes) {
+          this.consecutiveWinsTeam = dbRes.consecutiveWinsTeam;
+          this.consecutiveWinsCount = dbRes.consecutiveWinsCount;
+        }
+      } catch (err) {
+        Logger.verbose('TeamBalancer', 1, `[DB] consecutive saveState failed: ${err.message}`);
+      }
+
+      // ── Consecutive Wins Scramble Check ────────────────────────
+      if (!this._scramblePending && !this._scrambleInProgress) {
+        if (this.options.maxConsecutiveWinsWithoutThreshold > 0 && this.consecutiveWinsCount >= this.options.maxConsecutiveWinsWithoutThreshold) {
+          roundReport.scrambled = true;
+          roundReport.scrambleCondition = 'Consecutive Wins';
+          Logger.verbose('TeamBalancer', 2, `[ConsecutiveWins] Triggered! Count: ${this.consecutiveWinsCount} >= Threshold: ${this.options.maxConsecutiveWinsWithoutThreshold}`);
+          const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.consecutiveWinsScramble, {
+            team: this.getTeamName(winnerID),
+            count: this.consecutiveWinsCount,
+            delay: this.options.scrambleAnnouncementDelay
+          })}`;
+          try {
+            await this.server.rcon.broadcast(msg);
+          } catch (broadcastErr) {
+            Logger.verbose('TeamBalancer', 1, `Failed to broadcast consecutive wins scramble: ${broadcastErr.message}`);
+          }
+          this.mirrorRconToDiscord(msg, 'warning');
+          this.initiateScramble(false, false).catch(err =>
+            Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
+          );
+          return; // Scramble triggered — skip dominant/non-dominant evaluation
+        }
+      }
+
       let broadcastWinnerName = winnerName;
       let broadcastLoserName = loserName;
       if (!this.options.useGenericTeamNamesInBroadcasts) {
@@ -1852,6 +1898,51 @@ export default class TeamBalancer extends S3PluginBase {
       }
 
       const isInvasion = gameMode.includes('invasion');
+
+      // ── Single Round Scramble Check ────────────────────────────
+      // Triggers on a single massive-margin round regardless of streak.
+      if (!this._scramblePending && !this._scrambleInProgress) {
+        if (this.options.enableSingleRoundScramble && !isInvasion && margin >= this.options.singleRoundScrambleThreshold) {
+          roundReport.scrambled = true;
+          roundReport.scrambleCondition = 'Single Round Margin';
+          Logger.verbose('TeamBalancer', 2, `[SingleRoundScramble] Triggered! Margin: ${margin} >= Threshold: ${this.options.singleRoundScrambleThreshold}`);
+          const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.singleRoundScramble, {
+            margin,
+            delay: this.options.scrambleAnnouncementDelay
+          })}`;
+          try {
+            await this.server.rcon.broadcast(msg);
+          } catch (broadcastErr) {
+            Logger.verbose('TeamBalancer', 1, `Failed to broadcast single-round scramble: ${broadcastErr.message}`);
+          }
+          this.mirrorRconToDiscord(msg, 'warning');
+          this.initiateScramble(false, false).catch(err =>
+            Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
+          );
+          return; // Scramble triggered — skip dominant/non-dominant evaluation
+        }
+      }
+
+      // ── Dominant Win Detection ─────────────────────────────────
+      // Determine whether the ticket margin crosses the dominant threshold.
+      const dominantThreshold = this.options.minTicketsToCountAsDominantWin ?? 175;
+      const stompThreshold = Math.floor(dominantThreshold * 1.5);
+
+      if (isInvasion) {
+        const invasionAttackThreshold = this.options.invasionAttackTeamThreshold ?? 300;
+        const invasionDefenceThreshold = this.options.invasionDefenceTeamThreshold ?? 650;
+        if (
+          (winnerID === 1 && margin >= invasionAttackThreshold) ||
+          (winnerID === 2 && margin >= invasionDefenceThreshold)
+        ) {
+          isDominant = true;
+          isStomp = true; // Treat invasion dominant as stomp for messaging
+        }
+      } else {
+        isDominant = margin >= dominantThreshold;
+        isStomp = margin >= stompThreshold;
+      }
+      Logger.verbose('TeamBalancer', 4, `Dominance state: isDominant=${isDominant}, isStomp=${isStomp}`);
 
       const teamNames = { winnerName: broadcastWinnerName, loserName: broadcastLoserName };
       Logger.verbose('TeamBalancer', 4, `Final team names for broadcast: winnerName=${teamNames.winnerName}, loserName=${teamNames.loserName}`);

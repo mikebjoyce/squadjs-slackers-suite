@@ -60,6 +60,8 @@ const mockServer = {
 const mockDbState = {
   winStreakTeam: null,
   winStreakCount: 0,
+  consecutiveWinsTeam: null,
+  consecutiveWinsCount: 0,
   lastSyncTimestamp: Date.now(),
   lastScrambleTime: null,
 };
@@ -72,6 +74,8 @@ const mockModel = {
       save: async function () {
         mockDbState.winStreakTeam = this.winStreakTeam;
         mockDbState.winStreakCount = this.winStreakCount;
+        mockDbState.consecutiveWinsTeam = this.consecutiveWinsTeam;
+        mockDbState.consecutiveWinsCount = this.consecutiveWinsCount;
         mockDbState.lastSyncTimestamp = this.lastSyncTimestamp;
         mockDbState.lastScrambleTime = this.lastScrambleTime;
       },
@@ -84,6 +88,8 @@ const mockModel = {
       save: async function () {
         mockDbState.winStreakTeam = this.winStreakTeam;
         mockDbState.winStreakCount = this.winStreakCount;
+        mockDbState.consecutiveWinsTeam = this.consecutiveWinsTeam;
+        mockDbState.consecutiveWinsCount = this.consecutiveWinsCount;
         mockDbState.lastSyncTimestamp = this.lastSyncTimestamp;
         mockDbState.lastScrambleTime = this.lastScrambleTime;
       },
@@ -112,6 +118,7 @@ const defaultTestOptions = {
   database: 'sqlite',
   enableWinStreakTracking: true,
   maxWinStreak: 2,
+  maxConsecutiveWinsWithoutThreshold: 3,
   enableSingleRoundScramble: false,
   singleRoundScrambleThreshold: 500,
   minTicketsToCountAsDominantWin: 300,
@@ -162,6 +169,7 @@ async function runPluginLogicTests() {
     immediateManualScramble: 'Scrambling now!',
     scrambleAnnouncement: 'Scramble in {delay}s after {count} dominant wins',
     singleRoundScramble: 'Single round scramble triggered.',
+    consecutiveWinsScramble: '{team} has won {count} consecutive rounds | Scrambling in {delay}s...',
     system: { trackingEnabled: 'Tracking enabled', trackingDisabled: 'Tracking disabled' },
     dominant: { stomped: 'Stomp', steamrolled: 'Steamrolled', invasionAttackStomp: 'Atk Stomp', invasionDefendStomp: 'Def Stomp' },
     nonDominant: { streakBroken: 'Streak Broken', invasionAttackWin: 'Atk Win', invasionDefendWin: 'Def Win', narrowVictory: 'Narrow', marginalVictory: 'Marginal', tacticalAdvantage: 'Tactical', operationalSuperiority: 'Operational' }
@@ -318,6 +326,91 @@ async function runPluginLogicTests() {
   delete tb.executeScramble;
   tb.options.scrambleAnnouncementDelay = defaultTestOptions.scrambleAnnouncementDelay;
   clearTimeout(tb._abbreviationPollStartTimeout); // onNewGame schedules abbreviation polling 5 min out
+
+  // --- Phase 3.7: Consecutive Wins Tracking ---
+  console.log('\n[Phase 3.7: Consecutive Wins Tracking]');
+
+  // Consecutive wins increment for every non-ignored win regardless of margin
+  await tb.resetStreak();
+  tb.gameModeCached = 'RAAS';
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 100 }, loser: { tickets: 0 } }); // Non-dominant margin
+  assert(tb.consecutiveWinsCount === 1, 'Consecutive: Non-dominant win increments consecutive count to 1.');
+  assert(tb.consecutiveWinsTeam === 1, 'Consecutive: Team 1 is tracked as consecutive winner.');
+  assert(tb.winStreakCount === 0, 'Consecutive: Dominant streak is NOT incremented for non-dominant win.');
+
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 400 }, loser: { tickets: 0 } }); // Dominant margin
+  assert(tb.consecutiveWinsCount === 2, 'Consecutive: Dominant win by same team increments consecutive count to 2.');
+  assert(tb.winStreakCount === 1, 'Consecutive: Dominant streak IS incremented for dominant win.');
+
+  // Consecutive wins reset when a different team wins
+  await tb.onRoundEnded({ winner: { team: 2, tickets: 50 }, loser: { tickets: 0 } });
+  assert(tb.consecutiveWinsCount === 1, 'Consecutive: Different team win resets consecutive count to 1.');
+  assert(tb.consecutiveWinsTeam === 2, 'Consecutive: Team 2 is now the consecutive winner.');
+  assert(tb.winStreakCount === 0, 'Consecutive: Dominant streak reset by non-dominant opposing win.');
+
+  // Consecutive wins scramble trigger
+  await tb.resetStreak();
+  tb.options.maxConsecutiveWinsWithoutThreshold = 2;
+  tb.gameModeCached = 'RAAS';
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 100 }, loser: { tickets: 0 } });
+  assert(tb.consecutiveWinsCount === 1, 'ConsecScramble: First win sets count to 1.');
+  assert(tb._scramblePending === false, 'ConsecScramble: No scramble after 1 of 2 consecutive wins.');
+
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 100 }, loser: { tickets: 0 } });
+  assert(tb.consecutiveWinsCount === 2, 'ConsecScramble: Second win sets count to 2.');
+  assert(tb._scramblePending === true, 'ConsecScramble: Scramble triggered after 2 consecutive wins.');
+  await tb.cancelPendingScramble(null, null, true);
+  tb.options.maxConsecutiveWinsWithoutThreshold = defaultTestOptions.maxConsecutiveWinsWithoutThreshold;
+
+  // Consecutive wins disabled (threshold = 0)
+  await tb.resetStreak();
+  tb.options.maxConsecutiveWinsWithoutThreshold = 0;
+  tb.gameModeCached = 'RAAS';
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 100 }, loser: { tickets: 0 } });
+  assert(tb.consecutiveWinsCount === 1, 'ConsecDisabled: Count still increments when threshold is 0.');
+  assert(tb._scramblePending === false, 'ConsecDisabled: No scramble when maxConsecutiveWinsWithoutThreshold is 0.');
+  tb.options.maxConsecutiveWinsWithoutThreshold = defaultTestOptions.maxConsecutiveWinsWithoutThreshold;
+
+  // --- Phase 3.8: Dominant Win Detection Regression Guard ---
+  console.log('\n[Phase 3.8: Dominant Win Detection Regression Guard]');
+
+  // This phase exists to catch the exact regression from commit 89b413a:
+  // isDominant was initialized to false but never set to true, making the
+  // dominant path unreachable. These tests verify isDominant is actually
+  // evaluated and the dominant path is reachable.
+
+  await tb.resetStreak();
+  tb.gameModeCached = 'RAAS';
+  tb.options.maxWinStreak = 2;
+
+  // A win above the threshold should be dominant and increment the streak
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 350 }, loser: { tickets: 0 } });
+  assert(tb.winStreakCount === 1, 'Regression: 350-ticket win (threshold=300) increments dominant streak.');
+  assert(tb.consecutiveWinsCount === 1, 'Regression: Consecutive wins also incremented.');
+
+  // A win below the threshold should NOT increment the dominant streak
+  await tb.onRoundEnded({ winner: { team: 2, tickets: 150 }, loser: { tickets: 0 } });
+  assert(tb.winStreakCount === 0, 'Regression: 150-ticket win (below 300 threshold) resets dominant streak.');
+  assert(tb.consecutiveWinsCount === 1, 'Regression: Consecutive wins reset to 1 for new team.');
+
+  // Two dominant wins should trigger a scramble
+  await tb.resetStreak();
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 400 }, loser: { tickets: 0 } });
+  assert(tb.winStreakCount === 1, 'Regression: First dominant win.');
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 400 }, loser: { tickets: 0 } });
+  assert(tb.winStreakCount === 2, 'Regression: Second dominant win.');
+  assert(tb._scramblePending === true, 'Regression: Scramble triggered after 2 dominant wins.');
+  await tb.cancelPendingScramble(null, null, true);
+
+  // Invasion dominant detection
+  await tb.resetStreak();
+  tb.gameModeCached = 'Invasion';
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 350 }, loser: { tickets: 0 } });
+  assert(tb.winStreakCount === 1, 'Regression: Invasion attacker dominant (350 >= 300).');
+
+  await tb.resetStreak();
+  await tb.onRoundEnded({ winner: { team: 2, tickets: 700 }, loser: { tickets: 0 } });
+  assert(tb.winStreakCount === 1, 'Regression: Invasion defender dominant (700 >= 650).');
 
   // --- Final Report ---
   console.log(`\n🏁 All logic tests completed. Result: ${passCount}/${testCount} passed.`);
