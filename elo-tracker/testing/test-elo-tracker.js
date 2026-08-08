@@ -71,7 +71,6 @@ export default async function runTrackerTests(runTest) {
     defaultMu: 25.0,
     defaultSigma: 8.333,
     minPlayersForElo: 5,
-    ignoredGameModes: ['Seed'],
     discordClient: null
   };
 

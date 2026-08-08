@@ -82,10 +82,12 @@
  *     winStreakTeam/winStreakCount  — dominant wins (ticket threshold met).
  *     consecutiveWinsTeam/Count    — any consecutive wins regardless of margin.
  *   Either can trigger a scramble. Resets are independent.
- * - ignoredGameModes matches against both gamemode and layerName
- *   (case-insensitive substring). Default: ["Seed", "Jensen"].
- * - enableSeedAutoScramble: scrambles automatically when a Seed round
- *   ends. Independent of streak logic.
+ * - Ignored game modes for win-streak tracking are delegated to S³'s
+ *   GameStateService (configured via S³'s ignoredGameModes option).
+ * - enableSeedAutoScramble: scrambles automatically when any Seed round
+ *   ends, regardless of ignored game mode settings. Jensen/Training
+ *   rounds are excluded (isSeedMode() returns false). Independent of
+ *   streak logic.
  * - useEloForBalance: pulls mu ratings from a running EloTracker instance
  *   at scramble time. Gracefully falls back to pure numerical balance if
  *   EloTracker is absent or the cache is empty.
@@ -120,7 +122,6 @@
  * Core:
  *   database                           - Sequelize/SQLite connector.
  *   enableWinStreakTracking             - Enable automatic win streak tracking.
- *   ignoredGameModes                   - Modes/maps excluded from tracking (default: ["Seed", "Jensen"]).
  *   enableSeedAutoScramble             - Auto-scramble at end of Seed.
  *
  * Win Streak:
@@ -188,7 +189,6 @@
  *   "enabled": true,
  *   "database": "sqlite",
  *   "enableWinStreakTracking": true,
- *   "ignoredGameModes": ["Seed", "Jensen"],
  *   "enableSeedAutoScramble": true,
  *   "maxWinStreak": 2,
  *   "maxConsecutiveWinsWithoutThreshold": 0,
@@ -237,7 +237,7 @@
 
 import S3PluginBase from './s3-plugin-base.js';
 import { DiscordHelpers } from '../utils/tb-discord-helpers.js';
-import Scrambler, { scrambleAttempts } from '../utils/tb-scrambler.js';
+import Scrambler from '../utils/tb-scrambler.js';
 import SwapExecutor from '../utils/tb-swap-executor.js';
 import CommandHandlers from '../utils/tb-commands.js';
 import Logger from '../../core/logger.js';
@@ -261,11 +261,6 @@ export default class TeamBalancer extends S3PluginBase {
       enableWinStreakTracking: {
         default: true,
         type: 'boolean'
-      },
-      ignoredGameModes: {
-        default: ['Seed', 'Jensen'],
-        type: 'array',
-        description: 'Game modes or map names to ignore for win streak tracking (default: ["Seed", "Jensen"]).'
       },
       enableSeedAutoScramble: {
         default: true,
@@ -744,23 +739,6 @@ export default class TeamBalancer extends S3PluginBase {
   // Training/Jensen detection also available via S³ GameStateService.isTrainingMode()
 
   /**
-   * Whether a Seed round would count as an ignored mode — the second half of the auto-scramble
-   * trigger, answered from the config alone so the status surfaces can be evaluated outside a
-   * round. Probes the gamemode string "seed" with the same lowercase-substring rule
-   * isIgnoredMatch() uses.
-   * Deliberately config-only, so it reports conservatively in one corner case: an entry that
-   * matches the LAYER rather than the mode (ignoredGameModes ["Logar"] on Logar_Seed_v1) does arm
-   * the trigger but is not visible here. Under-reporting one map beats the previous behaviour of
-   * claiming "armed" on every surface for a configuration where nothing can fire.
-   * NOTE: Inverted check — tests whether the literal "seed" contains any config entry to avoid
-   * a false-negative when the entry is a partial match of "seed" (e.g. "Seed"). This means an
-   * entry LIKE "Seed" matches, but a layer-only entry like "Logar" does not — deliberate.
-   */
-  seedIsInIgnoredGameModes() {
-    return this.options.ignoredGameModes.some(m => 'seed'.includes(m.toLowerCase()));
-  }
-
-  /**
    * Suffix for the "!teambalancer off" confirmations. The toggle stops the seed auto-scramble
    * along with streak tracking, so a bare "Win streak tracking disabled." under-reports what the
    * admin just did. One wording, so the confirmations can't drift apart.
@@ -777,11 +755,8 @@ export default class TeamBalancer extends S3PluginBase {
     if (this._scramblePending || this._scrambleInProgress) {
       return ' | A scramble countdown is already running — use !scramble cancel to stop it';
     }
-    // Guarded on the config option alone, deliberately. seedRoundIsIgnored() is a config-only
-    // probe that misses layer-name matches (ignoredGameModes ["Logar"] on Logar_Seed_v1), where
-    // the trigger really was armed and this command really did disarm it — staying silent there
-    // hides a live behaviour change. The wording holds either way: "off while disabled" is true
-    // whether or not the trigger could have fired on this configuration.
+    // The seed auto-scramble trigger fires on any Seed round end (isSeedMode()) regardless of
+    // ignored game mode settings. "off while disabled" is true for any configuration.
     return this.options.enableSeedAutoScramble ? ' | Seed auto-scramble is off too while disabled' : '';
   }
 
@@ -807,7 +782,6 @@ export default class TeamBalancer extends S3PluginBase {
    */
   seedAutoScrambleStatus() {
     if (!this.options.enableSeedAutoScramble) return 'OFF (config)';
-    if (!this.seedIsInIgnoredGameModes()) return 'OFF (Seed not in ignoredGameModes)';
     if (this.manuallyDisabled) return 'OFF (plugin disabled)';
     return 'ON (at Seed round end)';
   }
@@ -1743,21 +1717,14 @@ export default class TeamBalancer extends S3PluginBase {
         }
       }
 
-      // Seed auto-scramble: fires when a Seed round ends, independent of enableWinStreakTracking
-      // and of the round outcome (an admin switching the layer mid-seed ends the round without a
-      // winner). Consumed after the armed match-end scramble so an admin's explicit command wins,
-      // and returns either way so the round is not ALSO reported as a draw or an ignored win
-      // further down.
-      // Gated on manuallyDisabled: "!teambalancer off" is the admin kill switch, and a scramble
-      // firing at the end of the next Seed round after someone turned the plugin off is exactly
-      // the surprise that switch exists to prevent. Note the asymmetry with the config flag above
-      // it — enableWinStreakTracking is about STREAKS and never governed seeding.
-      // Still gated on isIgnoredMatch(): the trigger belongs to Seed rounds that are excluded from
-      // streak tracking. An operator who takes "Seed" out of ignoredGameModes wants those rounds
-      // evaluated like any other, not auto-scrambled.
+      // Seed auto-scramble: fires on any Seed round end, independent of win-streak tracking or
+      // ignored mode settings. isSeedMode() excludes Jensen/Training rounds naturally. Consumed
+      // after the armed match-end scramble so an admin's explicit command wins.
+      // Gated on manuallyDisabled: "!teambalancer off" is the admin kill switch. Note the
+      // asymmetry — enableWinStreakTracking is about STREAKS and never governed seeding.
       // The layer fallback has deliberately NOT run yet — a round whose own layer never resolved
       // must not be shuffled on the strength of the previous round's layer.
-      if (this.isIgnoredMatch() && this._s3?.gameState?.isSeedMode?.() && this.options.enableSeedAutoScramble && !this.manuallyDisabled) {
+      if (this._s3?.gameState?.isSeedMode?.() && this.options.enableSeedAutoScramble && !this.manuallyDisabled) {
         // Don't announce or claim attribution for a scramble initiateScramble would refuse — but a
         // Seed round still never feeds the streak, so clear it on the way out.
         if (this._scramblePending || this._scrambleInProgress) {
@@ -2662,7 +2629,7 @@ export default class TeamBalancer extends S3PluginBase {
       }
       // Write scramble report JSON (includes swap plan and execution results)
       if (swapPlan) {
-        this._writeScrambleReport(swapPlan, swapPlan.calculationTime || 0, isSimulated, preScrambleState, scrambleAttempts);
+        this._writeScrambleReport(swapPlan, swapPlan.calculationTime || 0, isSimulated, preScrambleState);
       }
       // The countdown that armed this run is consumed by now, whatever the outcome (moves made,
       // empty swap plan, or a throw) — so the pending flag ends here, not in resetStreak. Same
@@ -2794,7 +2761,7 @@ export default class TeamBalancer extends S3PluginBase {
           winStreakTeam: this.winStreakTeam,
           winStreakCount: this.winStreakCount
         },
-        scrambleAttempts: attempts || scrambleAttempts || []
+        scrambleAttempts: attempts || []
       };
 
       await fs.promises.writeFile(reportPath, JSON.stringify(report, null, 2));

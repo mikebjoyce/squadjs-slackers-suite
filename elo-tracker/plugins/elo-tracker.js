@@ -78,8 +78,8 @@
  *   Otherwise a fresh round starts.
  * - Rating writes use bulkIncrementPlayerStats(), which INCREMENTS wins,
  *   losses, and roundsPlayed. Pass only the round delta — not cumulative totals.
- * - ignoredGameModes matches against both gamemode and layerName
- *   (case-insensitive substring). Default: ["Seed", "Jensen"].
+ * - Ignored game modes for ELO tracking are delegated to S³'s
+ *   GameStateService (configured via S³'s ignoredGameModes option).
  * - The round start embed posts after roundStartEmbedDelayMs (default 3 min)
  *   via a deferred check on UPDATED_PLAYER_INFORMATION.
  *

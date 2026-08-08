@@ -397,6 +397,14 @@ export default class GameStateService {
     this.verboseLogger(3, `[GameState] Ignored game modes set: ${JSON.stringify(this._ignoredGameModes)}`);
   }
 
+  /**
+   * Get the currently active ignored game modes list.
+   * @returns {string[]} The overridden ignored modes if set by S³, otherwise the defaults.
+   */
+  get ignoredGameModes() {
+    return this._ignoredGameModes ?? this.defaultIgnoredGameModes;
+  }
+
   async handleNewGame(data) {
     const now = Date.now();
     const prevPhase = this.phase;

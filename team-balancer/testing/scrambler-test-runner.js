@@ -42,6 +42,7 @@ import {
   generateScenario_ClanInsideAnothersAnchor,
   generateScenario_ClanSizeOrdering
 } from './mock-data-generator.js';
+import { runCrossClanSquadDecompositionTest } from './test-cross-clan-squad-collision.js';
 
 // Failure tracker — turns observational checks into a real gate (process.exit on regression).
 const _failures = [];
@@ -565,6 +566,8 @@ async function runAllTests() {
   });
 
   await runClanCollisionTest(20);
+
+  await runCrossClanSquadDecompositionTest({ runs: 30 });
 
   await runBulkTests(2500);
   await runClanBulkTest(500);
