@@ -2515,9 +2515,13 @@ export default class TeamBalancer extends S3PluginBase {
       });
 
       const targetReportChannel = this.discordReportChannel || this.discordChannel;
-      if (targetReportChannel && this.options.postScrambleDetails) {
+      // Dry runs (isSimulated=true) post to the admin command channel (this.discordChannel)
+      // so the admin sees the plan inline with their !scramble dry command.
+      // Live scrambles post to the report channel (targetReportChannel) for archival.
+      const postChannel = isSimulated ? this.discordChannel : targetReportChannel;
+      if (postChannel && this.options.postScrambleDetails) {
         const embed = await DiscordHelpers.createScrambleDetailsMessage(swapPlan, isSimulated, this, eloMap);
-        DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+        DiscordHelpers.sendDiscordMessage(postChannel, { embeds: [embed] });
       }
 
       if (swapPlan && swapPlan.length > 0) {
@@ -2600,9 +2604,12 @@ export default class TeamBalancer extends S3PluginBase {
           }
           this.mirrorRconToDiscord(msg, 'warning');
           const targetReportChannel = this.discordReportChannel || this.discordChannel;
-          if (targetReportChannel) {
+          // Same routing as the success path: dry run failures go to the admin command channel
+          // (this.discordChannel), live scramble failures go to the report channel (targetReportChannel).
+          const failChannel = isSimulated ? this.discordChannel : targetReportChannel;
+          if (failChannel) {
             const embed = DiscordHelpers.buildScrambleFailedEmbed('No valid swap solution found.', swapPlan?.calculationTime || 0, this);
-            DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+            DiscordHelpers.sendDiscordMessage(failChannel, { embeds: [embed] });
           }
           // Note: We do NOT reset the streak here, as the imbalance likely persists.
         } else {
