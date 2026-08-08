@@ -427,6 +427,12 @@ export default class SlackersSquadServices extends BasePlugin {
     this._resolveReady();
   }
 
+  /**
+   * NOTE: unmount() is defined here for correctness, but as of SquadJS v4.2.0 RC1
+   * and earlier, the framework never calls plugin.unmount(). This method is kept
+   * for future-proofing — if SquadJS ever implements dynamic mount/unmount,
+   * cleanup will work correctly.
+   */
   async unmount() {
     // Clean up migration prompt debounce timer
     if (this._migrationPromptTimer) {

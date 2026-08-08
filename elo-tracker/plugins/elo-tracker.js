@@ -515,6 +515,12 @@ export default class EloTracker extends S3PluginBase {
     Logger.verbose('EloTracker', 1, 'Plugin mounted and ready.');
   }
 
+  /**
+   * NOTE: _onUnmount() is called by S3PluginBase.unmount(), but as of SquadJS v2.x
+   * the framework never calls plugin.unmount(). This cleanup is kept for
+   * future-proofing — if SquadJS ever implements dynamic mount/unmount,
+   * listeners will be cleaned up correctly.
+   */
   async _onUnmount() {
     if (!this._isMounted) {
       return;

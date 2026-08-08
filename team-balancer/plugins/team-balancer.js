@@ -1119,6 +1119,13 @@ export default class TeamBalancer extends S3PluginBase {
     Logger.verbose('TeamBalancer', 2, '[TeamBalancer] Plugin is now fully ready.');
   }
 
+  /**
+   * NOTE: _onUnmount() is called by S3PluginBase.unmount(), but as of
+   * SquadJS v4.2.0 RC1 and earlier, the framework never calls
+   * plugin.unmount(). This cleanup is kept for future-proofing — if
+   * SquadJS ever implements dynamic mount/unmount, listeners will be
+   * cleaned up correctly.
+   */
   async _onUnmount() {
     if (!this._isMounted) {
       Logger.verbose('TeamBalancer', 1, 'Plugin not mounted, skipping unmount.');

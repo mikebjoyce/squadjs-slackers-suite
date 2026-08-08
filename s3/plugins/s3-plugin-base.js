@@ -191,6 +191,11 @@ export default class S3PluginBase extends BasePlugin {
   /**
    * Unmounts the plugin: clears cached S³ DB reference, then
    * delegates to the subclass _onUnmount() hook.
+   *
+   * NOTE: unmount() is defined here for correctness, but as of SquadJS v4.2.0 RC1
+   * and earlier, the framework never calls plugin.unmount(). This method is kept
+   * for future-proofing — if SquadJS ever implements dynamic mount/unmount,
+   * cleanup will work correctly.
    */
   async unmount() {
     await super.unmount();

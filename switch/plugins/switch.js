@@ -989,6 +989,12 @@ export default class Switch extends S3DiscordPluginBase {
      * _onUnmount — S³ lifecycle hook (called by S3PluginBase.unmount()).
      * Cleans up listener registrations, switch queue, broadcast timers,
      * and join-warn timeouts.
+     *
+     * NOTE: _onUnmount() is called by S3PluginBase.unmount(), but as of
+     * SquadJS v4.2.0 RC1 and earlier, the framework never calls
+     * plugin.unmount(). This cleanup is kept for future-proofing — if
+     * SquadJS ever implements dynamic mount/unmount, listeners will be
+     * cleaned up correctly.
      */
     async _onUnmount() {
         this._stopPeriodicProcessing();

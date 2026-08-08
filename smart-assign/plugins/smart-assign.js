@@ -479,6 +479,12 @@ export default class SmartAssign extends S3PluginBase {
     }
   }
 
+  /**
+   * NOTE: unmount() is defined here for correctness, but as of SquadJS v4.2.0 RC1
+   * and earlier, the framework never calls plugin.unmount(). This method is kept
+   * for future-proofing — if SquadJS ever implements dynamic mount/unmount,
+   * cleanup will work correctly.
+   */
   async unmount() {
     this.ready = false;
     await super.unmount();
