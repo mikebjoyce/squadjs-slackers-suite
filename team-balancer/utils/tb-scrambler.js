@@ -259,21 +259,37 @@ export const Scrambler = {
            for (let i = teamCandidates.length - 1; i >= 0; i--) {
              const s = teamCandidates[i];
              if (s === virtualSquad || !otherSet.has(s)) continue;
-              // Skip virtual squads already built by a prior clan — their members
-              // are already in an atomic unit. Extracting them would decompose the
-              // virtual squad into independent candidates, enabling the swap loop
-              // to select partial squads independently — the "divided!" bug.
-             if (s.isVirtual) continue;
-             if (pullEntireSquads && !claimedAnchorIds.has(s.id)) {
-               teamCandidates.splice(i, 1);
-             } else {
-               const remaining = s.players.filter((p) => !memberSet.has(p));
-               if (remaining.length === 0) {
-                 teamCandidates.splice(i, 1);
-               } else {
-                 teamCandidates[i] = { ...s, players: remaining };
-               }
-             }
+              if (s.isVirtual) {
+                // Merge: absorb this virtual squad's players into ours, then remove it.
+                // We cannot extract individual members without decomposing the other
+                // clan's atomic unit. Merging keeps both clans cohesive and increases
+                // the valid candidate pool vs. skipping + relying on the Infinity penalty.
+                for (const p of s.players) {
+                  if (!seen.has(p)) {
+                    newPlayers.push(p);
+                    seen.add(p);
+                  }
+                }
+                // Update the absorbed clan's allMembers to point to the merged set
+                // so the Discord report correctly shows both clans' rosters.
+                const absorbedEntry = [...virtualSquadsByTag.values()].find(
+                  v => v.teamID === teamID && v.allMembers && [...v.allMembers].some(m => s.players.includes(m))
+                );
+                if (absorbedEntry) absorbedEntry.allMembers = new Set(newPlayers);
+                teamCandidates.splice(i, 1);
+                claimedAnchorIds.add(s.id);
+                continue;
+              }
+              if (pullEntireSquads && !claimedAnchorIds.has(s.id)) {
+                teamCandidates.splice(i, 1);
+              } else {
+                const remaining = s.players.filter((p) => !memberSet.has(p));
+                if (remaining.length === 0) {
+                  teamCandidates.splice(i, 1);
+                } else {
+                  teamCandidates[i] = { ...s, players: remaining };
+                }
+              }
            }
 
           Logger.verbose(
@@ -282,6 +298,16 @@ export const Scrambler = {
             `Clan grouping: Team ${teamID} [${tag}] (${sameTeamMembers.length} members) -> virtual squad anchored on ${anchor.id} (${newPlayers.length} total players, pullEntireSquads=${pullEntireSquads})`
           );
         }
+      }
+      // Recompute allMembers for every virtual squad from the final per-team
+      // candidate lists. A later clan may have extracted members from a physical
+      // squad that contributed to an earlier clan's virtual squad, leaving its
+      // allMembers stale. This fixes false "divided!" labels in the Discord
+      // report without affecting the move plan.
+      for (const [key, vs] of virtualSquadsByTag) {
+        const teamCandidates = vs.teamID === '1' ? t1Candidates : t2Candidates;
+        const candidate = teamCandidates.find(c => c.isVirtual && c.clanTag === vs.tag);
+        if (candidate) vs.allMembers = new Set(candidate.players);
       }
       Logger.verbose(
         'TeamBalancer',
@@ -527,6 +553,25 @@ export const Scrambler = {
         }
       }
 
+      // ─── Squad Integrity Penalty (pullEntireSquads) ─────────────────
+      // When pullEntireSquads is enabled, squads must never be partially
+      // moved. This is structurally enforced (squads are never decomposed
+      // in the swap loop), but this penalty provides defense-in-depth
+      // against future code changes that might accidentally allow partial
+      // squad selection.
+      if (pullEntireSquads) {
+        const movingToT2 = new Set(selectedT1Squads.flatMap((s) => s.players));
+        const movingToT1 = new Set(selectedT2Squads.flatMap((s) => s.players));
+        for (const s of allSquads) {
+          const members = s.players;
+          if (members.length <= 1) continue; // unassigned pseudo-squads are size 1
+          const moved = members.filter(id => movingToT1.has(id) || movingToT2.has(id));
+          if (moved.length > 0 && moved.length < members.length) {
+            return Infinity; // Squad was partially moved — reject this candidate
+          }
+        }
+      }
+
       return combinedScore;
     };
 
@@ -736,11 +781,10 @@ export const Scrambler = {
         }
         if (teams.size > 1) {
           Logger.verbose('TeamBalancer', 1,
-            `CRITICAL: Clan [${vs.tag}] on Team ${vs.teamID} was split across teams in final plan. Aborting scramble to preserve clan cohesion.`
+            `WARNING: Clan [${vs.tag}] on Team ${vs.teamID} was split across teams in final plan. ` +
+            `This indicates a bug in virtual squad construction — please investigate. ` +
+            `Proceeding with scramble to avoid punishing all players.`
           );
-          const res = [];
-          res.calculationTime = Date.now() - startTime;
-          return res;
         }
       }
     }
