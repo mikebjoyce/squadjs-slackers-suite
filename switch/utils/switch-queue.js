@@ -548,6 +548,7 @@ const SwitchQueue = {
               });
               plugin._roundStats.queueDurationsMs.push(qDuration * 1000);
             }
+            }
 
             plugin.verbose(1, `[Queue] ${timedOut ? 'Timeout switch' : 'Solo switch'} fired for ${entry.playerName} (T${entry.currentTeamID})`);
 
