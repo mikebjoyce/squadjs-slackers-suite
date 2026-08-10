@@ -91,6 +91,8 @@ const SwitchOutput = {
         queueCancels: [],       // { name, eosID }
         queueRemovals: [],      // { name, eosID, reason, gamePhase } — removed due to team change / other
         maxQueueSize: 0,        // peak _getQueueSize() during the round
+        queueTimeoutSwitches: [],  // { name, eosID, currentTeamID, toTeam, queueDurationSeconds, gamePhase }
+        wasLiberalMode: false,         // cached at round-end
         queueDurationsMs: [],   // cumulative — used for average wait time
       };
     };
@@ -318,7 +320,7 @@ const SwitchOutput = {
       if (!s) return null;
 
       const totalSuccess = s.instantSwitches.length + s.queueNormal.length +
-        s.queueTeamTrades.length + s.queueJoinSwaps.length;
+        s.queueTeamTrades.length + s.queueJoinSwaps.length + s.queueTimeoutSwitches.length;
       const totalFailed = s.queueExpiries.length;
 
       // Average queue wait (only queue-based successes, not instant)
@@ -339,6 +341,9 @@ const SwitchOutput = {
         if (p.toTeam === 1) toT1++; else toT2++;
       }
       for (const p of s.queueJoinSwaps) {
+        if (p.toTeam === 1) toT1++; else toT2++;
+      }
+      for (const p of s.queueTimeoutSwitches) {
         if (p.toTeam === 1) toT1++; else toT2++;
       }
       for (const p of s.queueTeamTrades) {
@@ -375,6 +380,7 @@ const SwitchOutput = {
         .join(', ');
 
       const statsLines = [];
+      statsLines.push(`**Mode:** ${s.wasLiberalMode ? 'Liberal (Seed/Jensen)' : 'Standard'}`);
       statsLines.push(`**Requests:** ${totalRequests} (${totalSuccess} succeeded, ${totalDenied} denied, ${totalFailed} failed)`);
       statsLines.push(`**Success Rate:** ${successRate}%`);
       if (totalDenied > 0) {
@@ -432,6 +438,17 @@ const SwitchOutput = {
         });
         if (s.queueJoinSwaps.length > 10) names.push(`+ ${s.queueJoinSwaps.length - 10} more...`);
         methodLines.push(`**Queue Join Swap (${s.queueJoinSwaps.length})**\n${names.join('\n')}`);
+      }
+
+      if (s.queueTimeoutSwitches.length) {
+        const names = s.queueTimeoutSwitches.slice(0, 10).map(p => {
+          const m = Math.floor(p.queueDurationSeconds / 60);
+          const sec = p.queueDurationSeconds % 60;
+          const dur = m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+          return `${p.name} ${plugin._formatGamePhase(p.gamePhase)} (T${p.currentTeamID || '?'}→T${p.toTeam}, ${dur})`;
+        });
+        if (s.queueTimeoutSwitches.length > 10) names.push(`+ ${s.queueTimeoutSwitches.length - 10} more...`);
+        methodLines.push(`**Queue Timeout Switch (${s.queueTimeoutSwitches.length})**\n${names.join('\n')}`);
       }
 
       if (methodLines.length > 0) {
@@ -514,7 +531,7 @@ const SwitchOutput = {
         const s = plugin._roundStats;
         plugin.verbose(1, `[Summary] Round ended: ` +
           `${s.instantSwitches.length} instant, ${s.queueNormal.length} normal, ${s.queueTeamTrades.length} trades, ` +
-          `${s.queueJoinSwaps.length} join-swaps, ${s.deniedSwitches.length} denied (unique players), ` +
+          `${s.queueJoinSwaps.length} join-swaps, ${s.queueTimeoutSwitches.length} timeout-switches, ${s.deniedSwitches.length} denied (unique players), ` +
           `${s.queueExpiries.length} expired, ${s.queueDisconnects.length} DC, ${s.queueCancels.length} cancel. ` +
           `Max queue: ${s.maxQueueSize}.`
         );

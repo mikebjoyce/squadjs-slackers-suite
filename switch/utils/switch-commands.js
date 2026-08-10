@@ -608,22 +608,190 @@ const SwitchCommands = {
 
     // ── Discord stats scraper ──────────────────────────────────
 
+    /**
+     * Parse the mode from a round summary embed.
+     *
+     * Reads the "📊 Stats" field and checks the `**Mode:**` line to determine
+     * if the round was played under liberal (Seed/Jensen) rules or standard
+     * rules. Liberal rounds are excluded from the aggregate stats embed
+     * (see `_handleStatsCommand` line 663-666), so correct classification
+     * is essential to avoid polluting standard-round aggregates with
+     * liberal-mode data.
+     *
+     * Format matched:
+     *   `**Mode:** Liberal (Seed/Jensen)`   → 'liberal'
+     *   `**Mode:** Standard`                → 'standard'
+     *   No Stats field / no **Mode:** line  → 'standard' (covers pre-v2.2.0 embeds)
+     *
+     * @param {object} embed — Discord embed object from a "Switch Round Summary" message
+     * @returns {'liberal'|'standard'}
+     */
+    plugin._parseMode = function (embed) {
+      // Locate the 📊 Stats field by name — this is the first field in the embed
+      const statsField = embed.fields?.find(f => f.name?.includes('Stats'));
+      // If the Stats field is entirely absent (e.g. old-format embed or data loss),
+      // default to 'standard' so the round is included rather than silently skipped.
+      if (!statsField?.value) return 'standard';
+      // The embed builder at switch-output.js:383 writes the **Mode:** line as:
+      //   `**Mode:** Liberal (Seed/Jensen)` or `**Mode:** Standard`
+      // We match case-insensitively on "Liberal" to handle any future wording changes.
+      if (/\*\*Mode:\*\*.*Liberal/i.test(statsField.value)) return 'liberal';
+      // Any other value (Standard, missing, unknown) → standard.
+      return 'standard';
+    };
+
+    /**
+     * Parse movement type counts from a round summary embed.
+     *
+     * Reads the "🔄 Switch Methods" field and extracts the parenthetical
+     * count from each sub-section header. Each header is only rendered
+     * by `_buildRoundSummaryEmbed()` when its count is > 0, so a missing
+     * header naturally returns 0 via `_parseStatsNum`'s no-match behaviour.
+     *
+     * Sub-section headers and their embed builder lines:
+     *   `**Instant Switches (N)**`        — switch-output.js:408 (s.instantSwitches.length)
+     *   `**Queue Normal (N)**`            — switch-output.js:419 (s.queueNormal.length)
+     *   `**Queue Team Trade (N)**`        — switch-output.js:429 (s.queueTeamTrades.length)
+     *   `**Queue Join Swap (N)**`         — switch-output.js:440 (s.queueJoinSwaps.length)
+     *   `**Queue Timeout Switch (N)**`    — switch-output.js:451 (s.queueTimeoutSwitches.length)
+     *
+     * @param {object} embed — Discord embed object from a "Switch Round Summary" message
+     * @returns {{ instant: number, queueNormal: number, queueTeamTrade: number, queueJoinSwap: number, queueTimeoutSwitch: number }}
+     */
+    plugin._parseMoveTypes = function (embed) {
+      // The Switch Methods field is only present when there is at least one
+      // successful switch of any type. If absent, all counts default to 0.
+      const field = embed.fields?.find(f => f.name?.includes('Switch Methods'));
+      const v = field?.value || '';
+      return {
+        // Each regex matches the sub-section header format: **{Label} (N)**\n...
+        // The capture group extracts N, and _parseStatsNum handles non-matches → 0.
+        instant:             plugin._parseStatsNum(/\*\*Instant Switches\s*\((\d+)\)/, v),
+        queueNormal:         plugin._parseStatsNum(/\*\*Queue Normal\s*\((\d+)\)/, v),
+        queueTeamTrade:      plugin._parseStatsNum(/\*\*Queue Team Trade\s*\((\d+)\)/, v),
+        queueJoinSwap:       plugin._parseStatsNum(/\*\*Queue Join Swap\s*\((\d+)\)/, v),
+        queueTimeoutSwitch:  plugin._parseStatsNum(/\*\*Queue Timeout Switch\s*\((\d+)\)/, v),
+      };
+    };
+
+    /**
+     * Parse denial reason counts from a round summary embed.
+     *
+     * Reads the "📊 Stats" field and extracts the per-reason breakdown
+     * from the `**Denied:**` line, e.g.:
+     *   `**Denied:** 5 players (3 cooldown, 1 time_window, 1 scramble_lock)`
+     *
+     * The denial breakdown string is built by `_buildRoundSummaryEmbed()` at
+     * switch-output.js:378-380 from `s.deniedSwitches` array, grouping by
+     * `reason` property. The possible reasons are:
+     *   - `cooldown`      — player is within their switch cooldown window
+     *   - `time_window`   — player joined after the switch eligibility window closed
+     *   - `scramble_lock` — player is under scramble lockdown
+     *
+     * If no denials occurred this round, the `**Denied:**` line is absent
+     * (guarded by `if (totalDenied > 0)` at switch-output.js:386), so the
+     * regex won't match and we return zeroes.
+     *
+     * @param {object} embed — Discord embed object from a "Switch Round Summary" message
+     * @returns {{ cooldown: number, time_window: number, scramble_lock: number }}
+     */
+    plugin._parseDenialReasons = function (embed) {
+      // The Stats field is always present for rounds that produced a summary
+      // (it's the first field in the embed), but guard anyway for safety.
+      const statsField = embed.fields?.find(f => f.name?.includes('Stats'));
+      const v = statsField?.value || '';
+      // Match the entire Denied line and capture the parenthesised breakdown.
+      // Pattern breakdown:
+      //   \*\*Denied:\*\*       — literal "**Denied:**"
+      //   \s*\d+\s*players?\s*  — space, count, "player" or "players", space
+      //   \((.+?)\)             — capture the parenthesised breakdown (non-greedy)
+      const denyMatch = v.match(/\*\*Denied:\*\*\s*\d+\s*players?\s*\((.+?)\)/);
+      // No Denied line → no denials this round → return zeroes.
+      if (!denyMatch) return { cooldown: 0, time_window: 0, scramble_lock: 0 };
+      // Capture group 1 contains e.g. "3 cooldown, 1 time_window, 1 scramble_lock"
+      const parts = denyMatch[1];
+      return {
+        // Each sub-regex extracts the number before the reason keyword.
+        // _parseStatsNum returns 0 if the keyword is not found in the breakdown.
+        cooldown:      plugin._parseStatsNum(/(\d+)\s+cooldown/, parts),
+        time_window:   plugin._parseStatsNum(/(\d+)\s+time_window/, parts),
+        scramble_lock: plugin._parseStatsNum(/(\d+)\s+scramble_lock/, parts),
+      };
+    };
+
+    /**
+     * Parse queue outcome counts from a round summary embed.
+     *
+     * Reads the "ℹ️ Queue Activity" field and extracts the parenthetical
+     * count from each non-success outcome header. Each header is only
+     * rendered by `_buildRoundSummaryEmbed()` when its count is > 0,
+     * so missing headers naturally return 0.
+     *
+     * Unlike movement types (which represent successes), queue outcomes
+     * represent terminal states that did NOT result in a switch:
+     *
+     *   `**Expired (N)**`            — queue timeout without timeout-switch enabled
+     *   `**DC'd in Queue (N)**`      — player disconnected while in queue
+     *   `**Cancelled (N)**`          — player manually left the queue
+     *   `**Removed (N)**`            — removed due to team change (scramble, admin, etc.)
+     *
+     * Sub-section header embed builder lines:
+     *   expired   — switch-output.js:466
+     *   dc        — switch-output.js:486
+     *   cancelled — switch-output.js:497
+     *   removed   — switch-output.js:504
+     *
+     * @param {object} embed — Discord embed object from a "Switch Round Summary" message
+     * @returns {{ expired: number, dc: number, cancelled: number, removed: number }}
+     */
+    plugin._parseQueueOutcomes = function (embed) {
+      // The Queue Activity field is only present when there is at least one
+      // non-success queue outcome or denied switch. If absent, all counts default to 0.
+      const field = embed.fields?.find(f => f.name?.includes('Queue Activity'));
+      const v = field?.value || '';
+      return {
+        // Each regex matches the sub-section header format: **{Label} (N)**\n...
+        // The capture group extracts N, and _parseStatsNum handles non-matches → 0.
+        expired:   plugin._parseStatsNum(/\*\*Expired\s*\((\d+)\)/, v),
+        dc:        plugin._parseStatsNum(/\*\*DC'd in Queue\s*\((\d+)\)/, v),
+        cancelled: plugin._parseStatsNum(/\*\*Cancelled\s*\((\d+)\)/, v),
+        removed:   plugin._parseStatsNum(/\*\*Removed\s*\((\d+)\)/, v),
+      };
+    };
+
     plugin._handleStatsCommand = async function (message, args) {
       const daysArg = args.find(a => /^\d+$/.test(a));
       const STATS_LOOKBACK_DAYS = daysArg ? parseInt(daysArg, 10) : 60;
       const afterDate = new Date(Date.now() - STATS_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
 
-      // Report progress in the admin channel (message.channel)
       await message.channel.send(`🔍 Scraping switch stats from the last ${STATS_LOOKBACK_DAYS} days...`);
 
-      const totals = { rounds: 0, success: 0, failed: 0, denied: 0, toT1: 0, toT2: 0 };
-      let before = undefined; // start from newest message in reporting channel
+      // ── Aggregate containers ──
+      const totals = {
+        rounds: 0,
+        standardRounds: 0,
+        liberalRounds: 0,
+        // Summary
+        success: 0, failed: 0, denied: 0, toT1: 0, toT2: 0,
+        maxQueueSize: 0,
+        // Movement types
+        instant: 0, queueNormal: 0, queueTeamTrade: 0, queueJoinSwap: 0, queueTimeoutSwitch: 0,
+        // Denial reasons
+        denialCooldown: 0, denialTimeWindow: 0, denialScrambleLock: 0,
+        // Queue outcomes
+        outcomeExpired: 0, outcomeDC: 0, outcomeCancelled: 0, outcomeRemoved: 0,
+        // All denied from Queue Activity (distinct from denial reasons)
+        deniedInQueueActivity: 0,
+        // Data quality
+        incompleteRounds: 0,
+        totalQueueEntries: 0,
+        queueDurationsMs: []
+      };
+
+      let before = undefined;
       let keepGoing = true;
 
       try {
-        // Scrape message history from the *reporting* channel (plugin.channel)
-        // where round-summary embeds are posted, regardless of which channel
-        // the !switch stats command was received in.
         const reportChan = plugin.channel;
         if (!reportChan) {
           await message.channel.send('❌ Reporting channel is not available.');
@@ -637,23 +805,79 @@ const SwitchCommands = {
             if (msg.createdAt < afterDate) { keepGoing = false; break; }
 
             const embed = msg.embeds.find(e => e.title === 'Switch Round Summary');
-            if (embed) {
-              const statsField = embed.fields?.find(f => f.name.includes('Stats'));
-              if (statsField) {
-                const s = plugin._parseRoundStatsField(statsField.value);
-                totals.rounds++;
-                totals.success += s.success;
-                totals.failed += s.failed;
-                totals.denied += s.denied;
-                totals.toT1 += s.toT1;
-                totals.toT2 += s.toT2;
+            if (!embed) continue;
+
+            totals.rounds++;
+
+            // Determine mode
+            const mode = plugin._parseMode(embed);
+            if (mode === 'liberal') {
+              totals.liberalRounds++;
+              continue; // skip liberal rounds from aggregate
+            }
+            totals.standardRounds++;
+            const isOldFormat = !embed.fields?.find(f => f.name && f.name.includes('Stats'))?.value?.includes('**Mode:**');
+
+            // Parse stats field (high-level numbers)
+            const statsField = embed.fields?.find(f => f.name && f.name.includes('Stats'));
+            if (statsField?.value) {
+              const s = plugin._parseRoundStatsField(statsField.value);
+              totals.success += s.success;
+              totals.failed += s.failed;
+              totals.denied += s.denied;
+              totals.toT1 += s.toT1;
+              totals.toT2 += s.toT2;
+
+              // Extract max queue size
+              const mqMatch = statsField.value.match(/\*\*Max Queue Size:\*\*\s*(\d+)/);
+              if (mqMatch) {
+                const mq = parseInt(mqMatch[1], 10);
+                if (mq > totals.maxQueueSize) totals.maxQueueSize = mq;
               }
+
+              // Extract avg queue wait
+              const wqMatch = statsField.value.match(/\*\*Avg Queue Wait:\*\*\s*(?:(\d+)m )?(\d+)s/);
+              if (wqMatch) {
+                const wm = wqMatch[1] ? parseInt(wqMatch[1], 10) : 0;
+                const ws = parseInt(wqMatch[2], 10);
+                totals.queueDurationsMs.push((wm * 60 + ws) * 1000);
+              }
+            }
+
+            // Parse movement types
+            const moves = plugin._parseMoveTypes(embed);
+            totals.instant += moves.instant;
+            totals.queueNormal += moves.queueNormal;
+            totals.queueTeamTrade += moves.queueTeamTrade;
+            totals.queueJoinSwap += moves.queueJoinSwap;
+            totals.queueTimeoutSwitch += moves.queueTimeoutSwitch;
+
+            // Parse denial reasons from stats field
+            const denialReasons = plugin._parseDenialReasons(embed);
+            totals.denialCooldown += denialReasons.cooldown;
+            totals.denialTimeWindow += denialReasons.time_window;
+            totals.denialScrambleLock += denialReasons.scramble_lock;
+
+            // Parse queue outcomes
+            const outcomes = plugin._parseQueueOutcomes(embed);
+            totals.outcomeExpired += outcomes.expired;
+            totals.outcomeDC += outcomes.dc;
+            totals.outcomeCancelled += outcomes.cancelled;
+            totals.outcomeRemoved += outcomes.removed;
+
+            // Total queue entries per round = all movement types with queue + all queue outcomes
+            totals.totalQueueEntries += moves.queueNormal + moves.queueTeamTrade + moves.queueJoinSwap + moves.queueTimeoutSwitch
+              + outcomes.expired + outcomes.dc + outcomes.cancelled + outcomes.removed;
+
+            // Check for incomplete old-format rounds
+            if (isOldFormat) {
+              totals.incompleteRounds++;
             }
           }
 
           before = batch.last()?.id;
           if (batch.size < 100) break;
-          await delay(300);
+          await plugin.server?.constructor?.delay ? plugin.server.constructor.delay(300) : new Promise(r => setTimeout(r, 300));
         }
       } catch (err) {
         plugin.verbose(1, `[Switch] Stats scrape failed: ${err.message}`);
@@ -661,26 +885,110 @@ const SwitchCommands = {
         return;
       }
 
+      // ── Build embed ──
       const totalRequests = totals.success + totals.failed + totals.denied;
       const attemptedRequests = totals.success + totals.failed;
       const successRate = attemptedRequests > 0 ? ((totals.success / attemptedRequests) * 100).toFixed(1) : 'n/a';
       const failRate = attemptedRequests > 0 ? ((totals.failed / attemptedRequests) * 100).toFixed(1) : 'n/a';
       const denyRate = totalRequests > 0 ? ((totals.denied / totalRequests) * 100).toFixed(1) : 'n/a';
+      const successPctOfTotal = totalRequests > 0 ? ((totals.success / totalRequests) * 100).toFixed(1) : '\u2014';
+      const deniedPctOfTotal = totalRequests > 0 ? ((totals.denied / totalRequests) * 100).toFixed(1) : '\u2014';
+      const failedPctOfTotal = totalRequests > 0 ? ((totals.failed / totalRequests) * 100).toFixed(1) : '\u2014';
+
+      // Average queue wait
+      const avgQueueMs = totals.queueDurationsMs.length > 0
+        ? totals.queueDurationsMs.reduce((a, b) => a + b, 0) / totals.queueDurationsMs.length
+        : 0;
+      const avgMin = Math.floor(avgQueueMs / 60000);
+      const avgSec = Math.round((avgQueueMs % 60000) / 1000);
+      const avgStr = avgMin > 0 ? `${avgMin}m ${avgSec}s` : `${avgSec}s`;
+
+      // Movement type percentages
+      const pct = (n) => totals.standardRounds > 0 && n > 0 ? ` (${((n / totals.success) * 100).toFixed(1)}%)` : '';
+      const dpct = (n) => totals.denied > 0 && n > 0 ? ` (${((n / totals.denied) * 100).toFixed(1)}%)` : '';
+      const qpct = (n) => totals.totalQueueEntries > 0 && n > 0 ? ` (${((n / totals.totalQueueEntries) * 100).toFixed(1)}%)` : '';
+
+      const fields = [];
+
+      // ── Summary field ──
+      const summaryLines = [];
+      summaryLines.push(`**Rounds scraped:** ${totals.standardRounds}`);
+      summaryLines.push('');
+      summaryLines.push(`**Total requests:** ${totalRequests}`);
+      summaryLines.push(`  ✅ Succeeded    ${totals.success}  (${successPctOfTotal}% of total)`);
+      summaryLines.push(`  ⛔ Denied         ${totals.denied}  (${deniedPctOfTotal}% of total)`);
+      summaryLines.push(`  ❌ Failed           ${totals.failed}  (${failedPctOfTotal}% of total)`);
+      summaryLines.push('');
+      summaryLines.push(`**Attempted success rate:** ${successRate}%  (${totals.success} / ${attemptedRequests})`);
+      summaryLines.push('');
+      summaryLines.push(`**Direction:**   → T1   ${totals.toT1}`);
+      summaryLines.push(`                → T2   ${totals.toT2}`);
+      summaryLines.push('');
+      summaryLines.push(`**Max queue size reached:** ${totals.maxQueueSize}`);
+      if (totals.queueDurationsMs.length > 0) summaryLines.push(`**Avg queue wait:** ${avgStr}`);
+
+      fields.push({ name: '📊 Summary', value: summaryLines.join('\n'), inline: false });
+
+      // ── Movement Types field ──
+      if (totals.success > 0) {
+        const moveLines = [];
+        moveLines.push(`Instant            ${totals.instant}${pct(totals.instant)}`);
+        moveLines.push(`Queue Solo         ${totals.queueNormal}${pct(totals.queueNormal)}`);
+        moveLines.push(`Queue Pair Trade   ${totals.queueTeamTrade}${pct(totals.queueTeamTrade)}`);
+        moveLines.push(`Join Swap          ${totals.queueJoinSwap}${pct(totals.queueJoinSwap)}`);
+        moveLines.push(`Timeout Switch     ${totals.queueTimeoutSwitch}${pct(totals.queueTimeoutSwitch)}`);
+        fields.push({ name: `🔄 Movement Types (all ${totals.success} successes)`, value: moveLines.join('\n'), inline: false });
+      }
+
+      // ── Denial Reasons field ──
+      if (totals.denied > 0) {
+        const denialLines = [];
+        denialLines.push(`Cooldown           ${totals.denialCooldown}${dpct(totals.denialCooldown)}`);
+        denialLines.push(`Time Window        ${totals.denialTimeWindow}${dpct(totals.denialTimeWindow)}`);
+        denialLines.push(`Scramble Lock     ${totals.denialScrambleLock}${dpct(totals.denialScrambleLock)}`);
+        fields.push({ name: `⛔ Denial Reasons (all ${totals.denied} denials)`, value: denialLines.join('\n'), inline: false });
+      }
+
+      // ── Queue Outcomes field ──
+      if (totals.totalQueueEntries > 0) {
+        const outcomeLines = [];
+        // Succeeded = all queue-based movement types
+        const succeeded = totals.queueNormal + totals.queueTeamTrade + totals.queueJoinSwap + totals.queueTimeoutSwitch;
+        outcomeLines.push(`Succeeded          ${succeeded}${qpct(succeeded)}`);
+        outcomeLines.push(`Disconnected      ${totals.outcomeDC}${qpct(totals.outcomeDC)}`);
+        outcomeLines.push(`Cancelled          ${totals.outcomeCancelled}${qpct(totals.outcomeCancelled)}`);
+        outcomeLines.push(`Expired              ${totals.outcomeExpired}${qpct(totals.outcomeExpired)}`);
+        outcomeLines.push(`Removed            ${totals.outcomeRemoved}${qpct(totals.outcomeRemoved)}`);
+
+        if (totals.outcomeExpired > 0) {
+          outcomeLines.push('');
+          outcomeLines.push(`\u2020 Expired entries are from rounds where\n  queueTimeoutSwitchEnabled was off.`);
+        }
+
+        fields.push({ name: `📋 Queue Outcomes (all ${totals.totalQueueEntries} queue entries)`, value: outcomeLines.join('\n'), inline: false });
+      }
+
+      // ── Data Quality field (conditional) ──
+      const qualityLines = [];
+      if (totals.liberalRounds > 0) {
+        qualityLines.push(`${totals.liberalRounds} liberal-mode rounds excluded`);
+      }
+      if (totals.incompleteRounds > 0) {
+        qualityLines.push(`${totals.incompleteRounds} rounds had incomplete data (pre-v2.2.0 format)`);
+      }
+      if (qualityLines.length > 0) {
+        fields.push({ name: '⚠️ Data Quality', value: qualityLines.join('\n'), inline: false });
+      }
+
+      if (!fields.length) {
+        fields.push({ name: 'No Data', value: 'No switch round summaries found in the lookback period.', inline: false });
+      }
 
       const embed = {
         title: 'Switch Global Stats',
+        description: `${STATS_LOOKBACK_DAYS}-day aggregate \u00B7 standard-mode rounds`,
         color: 0x3498DB,
-        fields: [{
-          name: '📊 Aggregate',
-          value:
-            `**Rounds Scraped:** ${totals.rounds}\n` +
-            `**Requests:** ${totalRequests} (${totals.success} succeeded, ${totals.denied} denied, ${totals.failed} failed)\n` +
-            `**Success Rate:** ${successRate}%\n` +
-            `**Denial Rate:** ${denyRate}%\n` +
-            `**Fail Rate:** ${failRate}%\n` +
-            `**To T1 / To T2:** ${totals.toT1} / ${totals.toT2}`,
-          inline: false
-        }],
+        fields,
         timestamp: new Date(),
         footer: { text: `Switch v${plugin.constructor.version}` }
       };

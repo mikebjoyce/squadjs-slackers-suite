@@ -1,4 +1,4 @@
-# Switch Plugin v2.1.3
+# Switch Plugin v2.2.0
 
 **Team-change management with database persistence, TeamBalancer integration, and S³-aware player tracking.**
 
@@ -16,10 +16,12 @@ Survives server restarts via any Sequelize-compatible database (SQLite, MySQL, P
 * **Multi-Database Support** — works with SQLite, MySQL, PostgreSQL, and any Sequelize-compatible backend
 * **Scramble Lockout** — blocks affected players from switching for a configurable duration after a TeamBalancer scramble
 * **Switch Queue** — players waiting for a balance slot are queued and automatically switched when a partner or slot opens
+* **Queue Timeout → Force Switch** — players who reach the queue timeout wait limit are force-switched (with a relaxed balance gate and bypass of the 50/50 hard cap) instead of being removed from the queue. Controlled by `queueTimeoutSwitchEnabled` and `queueTimeoutExtraSlots`.
 * **End-of-Match Switches** — queue players for automatic team switching at round end
 * **Double-Switch** — swap to opposite team and back to fix game bugs without changing teams
-* **Liberał Mode Support** — relaxed switching rules during Seed/Jensen rounds
+* **Liberal Mode Support** — relaxed switching rules during Seed/Jensen rounds
 * **Dynamic Balance Tolerance** — interpolated extra imbalance slots when server is below full capacity
+* **Enhanced `!switch stats`** — Discord aggregate embed with per-move-type counts, denial reason breakdowns, queue outcomes, liberal-mode filtering, and data quality warnings
 * **In-Game & Discord Admin Commands** — full admin controls via chat or Discord
 
 ---
@@ -100,7 +102,9 @@ Add the following to your SquadJS `config.json`:
     "liberalSwitchBroadcastIntervalMinutes": 5,
     "dynamicBalanceTolerance": true,
     "dynamicBalancePlayerFloor": 85,
-    "dynamicBalanceExtraSlots": 3
+    "dynamicBalanceExtraSlots": 3,
+    "queueTimeoutSwitchEnabled": true,
+    "queueTimeoutExtraSlots": 2
   }
 ]
 ```
@@ -164,6 +168,8 @@ squad-server/
 | `!switch check <name/steamID>` | Real-time eligibility lookup with Discord timestamps |
 | `!switch clear <name/steamID>` | Remove cooldowns/locks for a player |
 | `!switch clearall` | Wipe entire cooldown database |
+| `!switch timelimit on|off` | Toggle the join/match time limit for queue entry |
+| `!switch stats [days]` | Scrape the last N days of round summaries and show an aggregate embed with movement types, denial reasons, queue outcomes, and data quality info |
 | `!switch help` | List all Discord admin commands |
 
 ---
@@ -182,7 +188,7 @@ The Switch plugin exposes a public API for external consumers (such as SmartAssi
 
 ### Version Compatibility
 
-- `static version = '2.0.0'` — public API with dual-array queue and v2.0.0 features.
+- `static version = '2.2.0'` — public API with dual-array queue, timeout-switch feature, and enhanced stats.
 - Consumers should check `plugin.constructor.version` (wrapped in try/catch) and require `>= 2.0.0` before using the API.
 
 ### Consumer Discovery
@@ -208,10 +214,17 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 | `switchCooldownHours` | Hours before player can switch again | `1.75` |
 | `switchCooldownMinutes` | Minutes before player can switch again (overrides hours if > 0) | `0` |
 | `switchEnabledMinutes` | Time window (minutes) after join/match start to request a switch | `10` |
-| `queueTimeoutMinutes` | Minutes a player can wait in the switch queue before removal | `10` |
+| `queueTimeoutMinutes` | Minutes a player can wait in the switch queue before removal | `20` |
 | `maxUnbalancedSlots` | Max player difference between teams to allow a switch | `1` |
 | `switchToOldTeamAfterRejoin` | Auto-switch rejoining players to pre-disconnect team | `false` |
 | `scrambleLockdownDurationMinutes` | Duration to block switching after a scramble | `20` |
+
+### Queue Timeout Switch (v2.2.0)
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `queueTimeoutSwitchEnabled` | When `true`, players who reach the queue timeout are force-switched instead of removed. When `false`, they are removed from the queue with an expiry message (legacy behaviour). | `true` |
+| `queueTimeoutExtraSlots` | Extra allowed team imbalance slots for timeout-triggered switches. Stacks on top of `maxUnbalancedSlots`, dynamic balance extras, and bypasses the 50/50 hard cap. | `2` |
 
 ### Double-Switch
 

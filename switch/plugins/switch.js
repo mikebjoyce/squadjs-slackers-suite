@@ -9,7 +9,7 @@ import SwitchCommands from '../utils/switch-commands.js';
 
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SWITCH PLUGIN v2.1.3                       ║
+ * ║                    SWITCH PLUGIN v2.2.0                       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ import SwitchCommands from '../utils/switch-commands.js';
  *
  */
 export default class Switch extends S3DiscordPluginBase {
-    static version = '2.1.3';
+    static version = '2.2.0';
 
     static get description() {
         return "Switch plugin with persistent join timers";
@@ -332,6 +332,17 @@ export default class Switch extends S3DiscordPluginBase {
                 required: false,
                 description: 'Discord channel ID for admin commands. If not set, falls back to channelID (single-channel mode).',
                 default: ''
+            },
+            // v2.2.0 Options
+            queueTimeoutSwitchEnabled: {
+                required: false,
+                description: 'When true, players who reach the queue timeout are force-switched instead of removed. When false, they are removed from the queue with an expiry message (legacy behaviour).',
+                default: true
+            },
+            queueTimeoutExtraSlots: {
+                required: false,
+                description: 'Extra allowed team imbalance slots for timeout-triggered switches. Stacks on top of maxUnbalancedSlots and dynamic balance extras.',
+                default: 2
             }
         };
     }
@@ -498,6 +509,11 @@ export default class Switch extends S3DiscordPluginBase {
         this._lastTeamSnapshot = null;
         this._scrambleHappened = false;
 
+        // v2.2.0: Cache liberal mode before round/layer changes
+        if (this._roundStats) {
+            this._roundStats.wasLiberalMode = this.isLiberalMode();
+        }
+
         this.verbose(2, `[Queue] Round ended — queue preserved (${this._getQueueSize()} entries remain).`);
 
         // Run matchend switches only — summary now posts on NEW_GAME
@@ -551,8 +567,19 @@ export default class Switch extends S3DiscordPluginBase {
         return Math.round(interpolated);
     }
 
-     getSwitchSlotsPerTeam(teamID, effectiveCap = null) {
-         const balanceDifference = this.getTeamBalanceDifference();
+    /**
+     * Calculate how many switch slots are available for a given team.
+     *
+     * @param {number} teamID — The team requesting a player to switch to (1 or 2).
+     * @param {number|null} effectiveCap — Override for maxUnbalancedSlots (e.g. liberal mode or timeout).
+     *   When null, uses this.options.maxUnbalancedSlots + dynamic extras.
+     * @param {boolean} skipHardCap — When true, bypasses the 50/50 max team size hard cap.
+     *   Used for queue timeout switches where being 2-3 players over is preferable
+     *   to removing the player from the queue entirely.
+     * @returns {number} — Number of slots available (0 or 1).
+     */
+     getSwitchSlotsPerTeam(teamID, effectiveCap = null, skipHardCap = false) {
+          const balanceDifference = this.getTeamBalanceDifference();
 
          let cap = effectiveCap !== null ? effectiveCap : this.options.maxUnbalancedSlots;
 
@@ -578,7 +605,7 @@ export default class Switch extends S3DiscordPluginBase {
          const maxTeamSize = this?._s3?.serverConfig?.isReady()
            ? Math.floor(this._s3.serverConfig.getMaxPlayers() / 2)
            : 50;
-         if ((teamPlayerCount[receivingTeam] || 0) >= maxTeamSize) return 0;
+         if (!skipHardCap && (teamPlayerCount[receivingTeam] || 0) >= maxTeamSize) return 0;
 
          return 1;
      }

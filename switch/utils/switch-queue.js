@@ -262,7 +262,7 @@ const SwitchQueue = {
           const arr = plugin._switchQueue[subQueue];
           for (let i = arr.length - 1; i >= 0; i--) {
             const entry = arr[i];
-            if (plugin.timeLimitEnabled && (nowTs - entry.queuedAt) >= queueTimeoutMs) {
+            if (!plugin.options.queueTimeoutSwitchEnabled && plugin.timeLimitEnabled && (nowTs - entry.queuedAt) >= queueTimeoutMs) {
               clearInterval(entry.warnInterval);
               arr.splice(i, 1);
               if (plugin._roundStats) {
@@ -477,8 +477,22 @@ const SwitchQueue = {
             continue;
           }
 
-          const effectiveCap = plugin.isLiberalMode() ? plugin.options.liberalSwitchMaxUnbalancedSlots : null;
-          const slots = plugin.getSwitchSlotsPerTeam(entry.currentTeamID, effectiveCap);
+          // v2.2.0: Queue timeout switch — when a player has waited longer than queueTimeoutMinutes,
+          // they are force-switched with a relaxed balance gate instead of being removed from the queue.
+          // The effectiveCap is bumped by queueTimeoutExtraSlots on top of maxUnbalancedSlots + dynamic extras,
+          // and skipHardCap bypasses the 50/50 max-team-size check entirely.
+          // Rationale: being 2-3 players over the 50/50 split is preferable to removing the player from
+          // the queue after they waited the full timeout duration. Without this, the player would have
+          // waited and then been kicked — a poor experience. The extra imbalance is temporary and will
+          // self-correct as players join/leave.
+          const timedOut = plugin.timeLimitEnabled && plugin.options.queueTimeoutSwitchEnabled && (nowTs - entry.queuedAt) >= queueTimeoutMs;
+          let effectiveCap = plugin.isLiberalMode() ? plugin.options.liberalSwitchMaxUnbalancedSlots : null;
+          let skipHardCap = false;
+          if (timedOut) {
+            effectiveCap = plugin.options.maxUnbalancedSlots + plugin.getDynamicExtraSlots() + plugin.options.queueTimeoutExtraSlots;
+            skipHardCap = true;
+          }
+          const slots = plugin.getSwitchSlotsPerTeam(entry.currentTeamID, effectiveCap, skipHardCap);
           if (slots > 0) {
             // Per-player lock gate: only proceed if this specific player is not locked by a
             // higher-priority plugin. The old top-level canAct(null) check blocked the entire
@@ -491,7 +505,7 @@ const SwitchQueue = {
 
             plugin._removePlayerFromQueue(entry.eosID);
 
-            plugin.warn(entry.eosID, '[Switch Queue] Balance slot opened — switching now.');
+            plugin.warn(entry.eosID, timedOut ? '[Switch Queue] Queue timeout — switching now.' : '[Switch Queue] Balance slot opened — switching now.');
             await plugin._taggedSwitchPlayer(entry.eosID, 'Player-Queue');
 
             if (!plugin.isLiberalMode()) {
@@ -514,7 +528,17 @@ const SwitchQueue = {
             if (plugin._roundStats) {
               const qDuration = Math.round((Date.now() - entry.queuedAt) / 1000);
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
-              plugin._roundStats.queueNormal.push({
+              if (timedOut) {
+            plugin._roundStats.queueTimeoutSwitches.push({
+              name: entry.playerName,
+              eosID: entry.eosID,
+              currentTeamID: entry.currentTeamID,
+              toTeam: entry.currentTeamID === 1 ? 2 : 1,
+              queueDurationSeconds: qDuration,
+              gamePhase
+            });
+          } else {
+            plugin._roundStats.queueNormal.push({
                 name: entry.playerName,
                 eosID: entry.eosID,
                 currentTeamID: entry.currentTeamID,
@@ -525,7 +549,7 @@ const SwitchQueue = {
               plugin._roundStats.queueDurationsMs.push(qDuration * 1000);
             }
 
-            plugin.verbose(1, `[Queue] Solo switch fired for ${entry.playerName} (T${entry.currentTeamID})`);
+            plugin.verbose(1, `[Queue] ${timedOut ? 'Timeout switch' : 'Solo switch'} fired for ${entry.playerName} (T${entry.currentTeamID})`);
 
             break;
           }
