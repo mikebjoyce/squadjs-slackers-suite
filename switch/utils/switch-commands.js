@@ -759,6 +759,24 @@ const SwitchCommands = {
       };
     };
 
+    /**
+     * Compute the median of a numeric array using zero-copy sort.
+     * Returns 0 for empty/null input.
+     *
+     * NOTE: Duplicated from switch-output.js. If the algorithm changes,
+     * update both copies.
+     *
+     * @param {number[]|null} arr — array of millisecond durations
+     * @returns {number} median in milliseconds, or 0
+     */
+    plugin._computeMedianFromMs = function (arr) {
+      if (!arr || arr.length === 0) return 0;
+      const sorted = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      if (sorted.length % 2 === 0) return Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+      return sorted[mid];
+    };
+
     plugin._handleStatsCommand = async function (message, args) {
       const daysArg = args.find(a => /^\d+$/.test(a));
       const STATS_LOOKBACK_DAYS = daysArg ? parseInt(daysArg, 10) : 60;
@@ -785,7 +803,9 @@ const SwitchCommands = {
         // Data quality
         incompleteRounds: 0,
         totalQueueEntries: 0,
-        queueDurationsMs: []
+        queueDurationsMs: [],
+        medianDurationsMs: [],  // per-round medians scraped from embeds
+        missingMedian: 0        // rounds without median data (old-format embeds)
       };
 
       let before = undefined;
@@ -835,12 +855,24 @@ const SwitchCommands = {
                 if (mq > totals.maxQueueSize) totals.maxQueueSize = mq;
               }
 
-              // Extract avg queue wait
-              const wqMatch = statsField.value.match(/\*\*Avg Queue Wait:\*\*\s*(?:(\d+)m )?(\d+)s/);
-              if (wqMatch) {
-                const wm = wqMatch[1] ? parseInt(wqMatch[1], 10) : 0;
-                const ws = parseInt(wqMatch[2], 10);
+              // Extract queue wait (new format: mean + median, or old: avg only)
+              const newMatch = statsField.value.match(/\*\*Queue Wait:\*\* mean\s*(?:(\d+)m )?(\d+)s, median\s*(?:(\d+)m )?(\d+)s/);
+              if (newMatch) {
+                const wm = newMatch[1] ? parseInt(newMatch[1], 10) : 0;
+                const ws = parseInt(newMatch[2], 10);
                 totals.queueDurationsMs.push((wm * 60 + ws) * 1000);
+                const mm = newMatch[3] ? parseInt(newMatch[3], 10) : 0;
+                const ms = parseInt(newMatch[4], 10);
+                totals.medianDurationsMs.push((mm * 60 + ms) * 1000);
+              } else {
+                // Old format: "**Avg Queue Wait:** 2m 15s"
+                const oldMatch = statsField.value.match(/\*\*Avg Queue Wait:\*\*\s*(?:(\d+)m )?(\d+)s/);
+                if (oldMatch) {
+                  const wm = oldMatch[1] ? parseInt(oldMatch[1], 10) : 0;
+                  const ws = parseInt(oldMatch[2], 10);
+                  totals.queueDurationsMs.push((wm * 60 + ws) * 1000);
+                  totals.missingMedian++;
+                }
               }
             }
 
@@ -903,6 +935,12 @@ const SwitchCommands = {
       const avgSec = Math.round((avgQueueMs % 60000) / 1000);
       const avgStr = avgMin > 0 ? `${avgMin}m ${avgSec}s` : `${avgSec}s`;
 
+      // Global median queue wait
+      const globalMedianMs = plugin._computeMedianFromMs(totals.medianDurationsMs);
+      const medMin = Math.floor(globalMedianMs / 60000);
+      const medSec = Math.round((globalMedianMs % 60000) / 1000);
+      const medStr = medMin > 0 ? `${medMin}m ${medSec}s` : `${medSec}s`;
+
       // Movement type percentages
       const pct = (n) => totals.standardRounds > 0 && n > 0 ? ` (${((n / totals.success) * 100).toFixed(1)}%)` : '';
       const dpct = (n) => totals.denied > 0 && n > 0 ? ` (${((n / totals.denied) * 100).toFixed(1)}%)` : '';
@@ -913,19 +951,28 @@ const SwitchCommands = {
       // ── Summary field ──
       const summaryLines = [];
       summaryLines.push(`**Rounds scraped:** ${totals.standardRounds}`);
+      if (totals.standardRounds > 0) summaryLines.push(`**Requests/round:** ${(totalRequests / totals.standardRounds).toFixed(1)}`);
       summaryLines.push('');
       summaryLines.push(`**Total requests:** ${totalRequests}`);
       summaryLines.push(`  ✅ Succeeded    ${totals.success}  (${successPctOfTotal}% of total)`);
       summaryLines.push(`  ⛔ Denied         ${totals.denied}  (${deniedPctOfTotal}% of total)`);
       summaryLines.push(`  ❌ Failed           ${totals.failed}  (${failedPctOfTotal}% of total)`);
       summaryLines.push('');
-      summaryLines.push(`**Attempted success rate:** ${successRate}%  (${totals.success} / ${attemptedRequests})`);
+      summaryLines.push(`**Success rate (excl. denials):** ${successRate}%  (${totals.success}/${attemptedRequests})`);
       summaryLines.push('');
-      summaryLines.push(`**Direction:**   → T1   ${totals.toT1}`);
-      summaryLines.push(`                → T2   ${totals.toT2}`);
+      if (totals.success > 0) {
+        summaryLines.push(`**Direction:**`);
+        const dirPct1 = ` (${((totals.toT1 / totals.success) * 100).toFixed(1)}%)`;
+        const dirPct2 = ` (${((totals.toT2 / totals.success) * 100).toFixed(1)}%)`;
+        summaryLines.push(`→ T1: ${totals.toT1}${dirPct1}`);
+        summaryLines.push(`→ T2: ${totals.toT2}${dirPct2}`);
+      }
       summaryLines.push('');
       summaryLines.push(`**Max queue size reached:** ${totals.maxQueueSize}`);
-      if (totals.queueDurationsMs.length > 0) summaryLines.push(`**Avg queue wait:** ${avgStr}`);
+      if (totals.queueDurationsMs.length > 0) {
+        const medianPart = totals.medianDurationsMs.length > 0 ? `, median ${medStr}` : '';
+        summaryLines.push(`**Queue wait:** mean ${avgStr}${medianPart}`);
+      }
 
       fields.push({ name: '📊 Summary', value: summaryLines.join('\n'), inline: false });
 
@@ -975,6 +1022,9 @@ const SwitchCommands = {
       }
       if (totals.incompleteRounds > 0) {
         qualityLines.push(`${totals.incompleteRounds} rounds had incomplete data (pre-v2.2.0 format)`);
+      }
+      if (totals.missingMedian > 0) {
+        qualityLines.push(`${totals.missingMedian} rounds lack median data (pre-median embed format)`);
       }
       if (qualityLines.length > 0) {
         fields.push({ name: '⚠️ Data Quality', value: qualityLines.join('\n'), inline: false });

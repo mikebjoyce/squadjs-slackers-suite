@@ -155,7 +155,7 @@ squad-server/
 | `!switch check <name/steamID>` | Look up another player's cooldown and lock status |
 | `!switch clear <name/steamID>` | Remove all cooldowns and locks for a player |
 | `!switch clearall` | Wipe the entire cooldown database |
-| `!switch status` | Show DB health, active locks, and top-10 locked players |
+| `!switch status` | Show DB health, active locks, and top-5 locked players |
 | `!switch help` | List all admin commands |
 
 ### Discord Commands
@@ -164,7 +164,7 @@ squad-server/
 
 | Command | Description |
 |---------|-------------|
-| `!switch status` | Database health + RCON latency + top-10 locked players |
+| `!switch status` | Database health + RCON latency + top-5 locked players |
 | `!switch check <name/steamID>` | Real-time eligibility lookup with Discord timestamps |
 | `!switch clear <name/steamID>` | Remove cooldowns/locks for a player |
 | `!switch clearall` | Wipe entire cooldown database |

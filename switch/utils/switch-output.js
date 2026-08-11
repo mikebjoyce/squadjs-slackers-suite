@@ -315,6 +315,24 @@ const SwitchOutput = {
       return m > 0 ? `${m}m ${s}s` : `${s}s`;
     };
 
+    /**
+     * Compute the median of a numeric array using zero-copy sort.
+     * Returns 0 for empty/null input.
+     *
+     * NOTE: Duplicated in switch-commands.js. If the algorithm changes,
+     * update both copies.
+     *
+     * @param {number[]|null} arr — array of millisecond durations
+     * @returns {number} median in milliseconds, or 0
+     */
+    plugin._computeMedian = function (arr) {
+      if (!arr || arr.length === 0) return 0;
+      const sorted = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      if (sorted.length % 2 === 0) return Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+      return sorted[mid];
+    };
+
     plugin._buildRoundSummaryEmbed = function () {
       const s = plugin._roundStats;
       if (!s) return null;
@@ -331,6 +349,12 @@ const SwitchOutput = {
       const avgMin = Math.floor(avgQueueSec / 60);
       const avgSec = avgQueueSec % 60;
       const avgStr = avgMin > 0 ? `${avgMin}m ${avgSec}s` : `${avgSec}s`;
+
+      // Median queue wait
+      const medianQueueMs = plugin._computeMedian(queueDurations);
+      const medianMin = Math.floor(medianQueueMs / 60000);
+      const medianSec = Math.round((medianQueueMs % 60000) / 1000);
+      const medianStr = medianMin > 0 ? `${medianMin}m ${medianSec}s` : `${medianSec}s`;
 
       // Per-team destination counts (all success types)
       let toT1 = 0, toT2 = 0;
@@ -391,9 +415,14 @@ const SwitchOutput = {
         statsLines.push(`**Fail Rate:** ${failRate}% (${totalFailed} expired)`);
       }
       statsLines.push(`**Max Queue Size:** ${s.maxQueueSize}`);
-      if (queueDurations.length > 0) statsLines.push(`**Avg Queue Wait:** ${avgStr}`);
-      statsLines.push(`**To T1:** ${toT1}`);
-      statsLines.push(`**To T2:** ${toT2}`);
+      if (queueDurations.length > 0) statsLines.push(`**Queue Wait:** mean ${avgStr}, median ${medianStr}`);
+      if (totalSuccess > 0) {
+        const dirPct1 = ` (${((toT1 / totalSuccess) * 100).toFixed(1)}%)`;
+        const dirPct2 = ` (${((toT2 / totalSuccess) * 100).toFixed(1)}%)`;
+        statsLines.push(`**Direction:**`);
+        statsLines.push(`→ T1: ${toT1}${dirPct1}`);
+        statsLines.push(`→ T2: ${toT2}${dirPct2}`);
+      }
 
       fields.push({ name: '📊 Stats', value: statsLines.join('\n'), inline: false });
 
@@ -631,25 +660,90 @@ const SwitchOutput = {
         `${s3Ok ? '🟢' : s3Label === 'Partial' ? '🟠' : '🔴'} S³ Integration   ${s3Label}`
       ].join('\n');
 
+      // ── Config snapshot ──
+      //
+      // isLiberalMode() internally accesses _s3.gameState — guard against _s3
+      // being unavailable (e.g. S³ unmounted mid-round). Fall back to false.
+      const isLiberal = (plugin._s3 && plugin.isLiberalMode?.()) || false;
+      // 'now' is shared between config timing (switch window) and the cooldown
+      // cutoff computation below. Use a single snapshot to keep them consistent.
+      const now = new Date();
+      const configLines = [];
+
+      if (plugin.timeLimitEnabled && plugin._gameStartTs) {
+        const elapsed = Date.now() - plugin._gameStartTs;
+        const remainingMs = plugin.options.switchEnabledMinutes * 60 * 1000 - elapsed;
+        if (remainingMs <= 0) {
+          configLines.push(`**Switching:** Closed`);
+        } else {
+          const remainingMin = Math.ceil(remainingMs / 60000);
+          configLines.push(`**Switching:** Open (~${remainingMin}m remaining)`);
+        }
+      } else if (plugin.timeLimitEnabled) {
+        configLines.push(`**Switching:** Limit enabled (not yet started)`);
+      } else {
+        configLines.push(`**Switching:** No time limit`);
+      }
+      configLines.push(`**Mode:** ${isLiberal ? 'Liberal (Seed/Jensen)' : 'Standard'}`);
+      // Scramble lockdown is tracked per-player in the DB (scrambleLockdownExpiry).
+      // Show the config duration rather than a transient runtime flag — the flag
+      // is consumed by _onLayerChanged() for broadcast routing and is only briefly
+      // true between round end and layer resolution.
+      const scrambleMinutes = plugin.options.scrambleLockdownDurationMinutes;
+      configLines.push(`**Scramble Lockdown:** ${scrambleMinutes} min per player`);
+      // Cooldown duration is a static config value — show it here alongside
+      // the other durations (Scramble Lockdown, Queue Timeout) for consistency.
+      const cooldownDurationLabel = plugin.options.switchCooldownMinutes > 0
+        ? `${plugin.options.switchCooldownMinutes} min`
+        : `${plugin.options.switchCooldownHours}h`;
+      configLines.push(`**Cooldown Duration:** ${cooldownDurationLabel}`);
+      // "AllowTeamChanges" = RCON AllowTeamChanges setting. When off, players
+      // cannot use the in-game scoreboard to swap teams — they must use !switch.
+      configLines.push(`**AllowTeamChanges:** ${plugin._changeTeamDisabled ? 'Off' : 'On'}`);
+      configLines.push(`**Queue Timeout:** ${plugin.options.queueTimeoutMinutes}m`);
+
       // ── Queue status ──
+      //
+      // Discord embed field values are capped at 1024 characters. To stay well
+      // under that limit, we merge both sub-queues, sort by oldest-first, and
+      // display at most 10 entries with an overflow line for any remainder.
       const t1Count = plugin._switchQueue?.t1?.length ?? 0;
       const t2Count = plugin._switchQueue?.t2?.length ?? 0;
       const totalQueued = t1Count + t2Count;
 
-      // Compute oldest wait time across both queues
-      let oldestWait = null;
-      for (const entry of [...(plugin._switchQueue?.t1 ?? []), ...(plugin._switchQueue?.t2 ?? [])]) {
-        if (oldestWait === null || entry.queuedAt < oldestWait) oldestWait = entry.queuedAt;
-      }
-      const waitStr = oldestWait !== null ? `${Math.round((Date.now() - oldestWait) / 1000)}s` : '\u2014';
+      const queueLines = [];
+      if (totalQueued === 0) {
+        queueLines.push('⚫ Empty');
+      } else {
+        // Use live Date.now() here rather than the shared 'now' snapshot — queue
+        // wait times are relative and should be accurate to the moment of display.
+        const formatWait = (queuedAt) => {
+          const sec = Math.round((Date.now() - queuedAt) / 1000);
+          const m = Math.floor(sec / 60);
+          const s = sec % 60;
+          return m > 0 ? `${m}m ${s}s` : `${s}s`;
+        };
+        // Merge both sub-queues and sort oldest-first for a unified view.
+        const allEntries = [
+          ...(plugin._switchQueue?.t1 ?? []).map(e => ({ ...e, _dir: 'T1 → T2' })),
+          ...(plugin._switchQueue?.t2 ?? []).map(e => ({ ...e, _dir: 'T2 → T1' }))
+        ].sort((a, b) => a.queuedAt - b.queuedAt);
 
-      const queueLines = [
-        `${totalQueued > 0 ? '🟢' : '⚫'} Players in Queue    ${totalQueued > 0 ? `${totalQueued} (t1: ${t1Count}, t2: ${t2Count})` : 'Empty'}`,
-        `   Oldest wait: ${waitStr}`
-      ].join('\n');
+        const display = allEntries.slice(0, 10);
+        for (const entry of display) {
+          queueLines.push(`${entry._dir}: **${entry.playerName}** (${formatWait(entry.queuedAt)})`);
+        }
+        if (allEntries.length > 10) {
+          queueLines.push(`... and ${allEntries.length - 10} more`);
+        }
+      }
 
       // ── Cooldown statistics ──
-      const now = new Date();
+      //
+      // NOTE: This block duplicates much of the query logic in getDiagnosticInfo()
+      // (above). The two methods serve different callers (Discord embed vs. general
+      // health check) and have slightly different output shapes. If the table schema
+      // changes, update both methods.
       const cooldownDurationMs = plugin.options.switchCooldownMinutes > 0
         ? plugin.options.switchCooldownMinutes * 60 * 1000
         : plugin.options.switchCooldownHours * 60 * 60 * 1000;
@@ -657,6 +751,7 @@ const SwitchOutput = {
 
       let standardCooldowns = 0;
       let scrambleLocks = 0;
+      let totalStoredPlayers = 0;
       let playerList = 'None';
 
       try {
@@ -668,6 +763,7 @@ const SwitchOutput = {
           scrambleLocks = await PlayerCooldowns.count({
             where: { scrambleLockdownExpiry: { [Op.gt]: now } }
           });
+          totalStoredPlayers = await PlayerCooldowns.count();
 
           const lockedPlayers = await PlayerCooldowns.findAll({
             where: {
@@ -695,12 +791,15 @@ const SwitchOutput = {
           }
         }
       } catch (err) {
-        // cooldown stats silently degrade — shown as 0/None
+        // Cooldown stats silently degrade — shown as 0/"None". Transient DB
+        // errors (lock contention, connection blips) should not prevent the
+        // rest of the embed from rendering with System Health + Config + Queue.
       }
 
-      const cooldownDurationLabel = plugin.options.switchCooldownMinutes > 0
-        ? `${plugin.options.switchCooldownMinutes} min`
-        : `${plugin.options.switchCooldownHours}h`;
+      const cooldownLines = [];
+      cooldownLines.push(`Standard Cooldowns:    ${standardCooldowns}`);
+      cooldownLines.push(`Scramble Locks:        ${scrambleLocks}`);
+      cooldownLines.push(`Tracked Players:       ${totalStoredPlayers}`);
 
       // ── Color logic ──
       const allOk = dbOk && rconOk && s3Ok;
@@ -713,9 +812,10 @@ const SwitchOutput = {
         color,
         fields: [
           { name: 'System Health', value: healthLines, inline: false },
-          { name: 'Queue Status', value: queueLines, inline: false },
-          { name: 'Cooldown Statistics', value: `Standard Cooldowns:  ${standardCooldowns}\t Duration:  ${cooldownDurationLabel}\nScramble Locks:  ${scrambleLocks}`, inline: false },
-          { name: 'Active Locks', value: playerList, inline: false }
+          { name: '\u{1F4CB} Config', value: configLines.join('\n'), inline: false },
+          { name: `\u{1F465} Queue (${totalQueued})`, value: queueLines.join('\n'), inline: false },
+          { name: '\u{1F550} Cooldown Statistics', value: cooldownLines.join('\n'), inline: false },
+          { name: '\u{1F512} Active Locks (top 5)', value: playerList, inline: false }
         ]
       };
     };
@@ -746,8 +846,11 @@ const SwitchOutput = {
         success,
         failed,
         denied,
-        toT1: plugin._parseStatsNum(/\*\*To T1:\*\*\s*(\d+)/, value),
-        toT2: plugin._parseStatsNum(/\*\*To T2:\*\*\s*(\d+)/, value)
+        // v2.3.0: new format "→ T1: N (X%)" — try first, fall back to old "**To T1:** N"
+        toT1: plugin._parseStatsNum(/→ T1:\s*(\d+)/, value) ||
+              plugin._parseStatsNum(/\*\*To T1:\*\*\s*(\d+)/, value),
+        toT2: plugin._parseStatsNum(/→ T2:\s*(\d+)/, value) ||
+              plugin._parseStatsNum(/\*\*To T2:\*\*\s*(\d+)/, value)
       };
     };
   }
