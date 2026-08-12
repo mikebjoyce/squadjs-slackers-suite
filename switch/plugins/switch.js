@@ -53,7 +53,7 @@ import SwitchExplain from '../utils/switch-explain.js';
  *     onRoundEnded(info)               — Processes end-of-round switch queue.
  *     onScrambleExecuted(data)         — Applies scramble lockdown to affected players.
  *     onNewGame()                      — Logs new-game transition, starts broadcast timers.
- *     onS3PlayerJoined(data)           — Triggers rejoin auto-switch, queue processing, and join warn.
+ *     onS3PlayerJoined(data)           — Triggers queue processing and join warn.
  *     onS3PlayerLeft(data)             — Removes player from queue, triggers queue processing.
  *     onS3PlayerTeamChanged(data)      — Triggers queue processing on team change.
  *
@@ -94,7 +94,7 @@ import SwitchExplain from '../utils/switch-explain.js';
  *   - None.
  *
  * Listened Events:
- *   - S3_PLAYER_JOINED: triggers rejoin auto-switch, queue processing, and join warn.
+ *   - S3_PLAYER_JOINED: triggers queue processing and join warn.
  *   - S3_PLAYER_LEFT: stores disconnection state; removes player from switch queue.
  *   - S3_PLAYER_TEAM_CHANGED: triggers queue re-evaluation.
  *   - TEAM_BALANCER_SCRAMBLE_EXECUTED: applies scramble lockdown to affected
@@ -243,11 +243,6 @@ export default class Switch extends S3DiscordPluginBase {
                 description: "Number of player of difference between the two teams to allow a team switch",
                 default: 1
             },
-            switchToOldTeamAfterRejoin: {
-                required: false,
-                description: "The team of a disconnecting player will be stored and after a new connection, the player will be switched to his old team",
-                default: false
-            },
             discordChannelID: {
                 required: false,
                 description: "Discord channel ID for logs.",
@@ -387,7 +382,6 @@ export default class Switch extends S3DiscordPluginBase {
 
         this.recentSwitches = [];
         this.recentDoubleSwitches = [];
-        this._switchedOnJoin = new Set();
         this._reconnectLockoutClearTimeouts = new Map();
 
         // v2.3.0 Stage 2: Seed presence tracking
@@ -563,7 +557,6 @@ export default class Switch extends S3DiscordPluginBase {
         } catch (err) {
             this.verbose(1, `[Switch] onRoundEnded matchend processing failed: ${err.message || err}`);
         }
-        this._switchedOnJoin.clear();
     }
 
     getTeamBalanceDifference() {
@@ -888,29 +881,6 @@ export default class Switch extends S3DiscordPluginBase {
         this.recentDoubleSwitches = this.recentDoubleSwitches.filter(p => p.eosID != eosID);
     }
 
-    async switchToPreDisconnectionTeam(info) {
-        if (!this.options.switchToOldTeamAfterRejoin) return;
-
-        const eosID = info.player?.eosID;
-        if (!info.player || !eosID) return;
-        const playerName = info.player?.name;
-        const teamID = info.player?.teamID;
-        const previousTeamID = info.previousTeamID;
-
-        if (previousTeamID == null) return;
-
-        const needSwitch = teamID != previousTeamID;
-        this.verbose(2, `${playerName}: Switching to old team: ${needSwitch}`);
-
-         if (needSwitch) {
-             setTimeout(() => {
-                 this._taggedSwitchPlayer(eosID, 'Switch-Rejoin').catch(err => {
-                     this.verbose(1, `Error auto-switching ${playerName} to old team: ${err.message}`);
-                 });
-             }, 5000)
-         }
-    }
-
       async doubleSwitchPlayer(eosID, forced = false, senderSteamID) {
           const playerObj = eosID ? this.server.players.find(p => p.eosID === eosID) : null;
           const playerEosID = playerObj?.eosID || eosID;
@@ -1100,17 +1070,6 @@ export default class Switch extends S3DiscordPluginBase {
         if (!data?.player?.eosID) return;
         const { eosID, name, teamID } = data.player;
         const previousTeamID = data.previousTeamID;
-
-        if (!this._switchedOnJoin.has(eosID)) {
-            this._switchedOnJoin.add(eosID);
-            if (this.options.switchToOldTeamAfterRejoin && previousTeamID != null) {
-                setTimeout(() => {
-                    this.switchToPreDisconnectionTeam({ player: { eosID, name, teamID }, previousTeamID }).catch(err => {
-                        this.verbose(1, `Error auto-switching ${name} to old team: ${err.message}`);
-                    });
-                }, 5000);
-            }
-        }
 
         // ── Reconnect lockout clearing ──────────────────────────────
         // When a reconnecting player is placed on a different team than

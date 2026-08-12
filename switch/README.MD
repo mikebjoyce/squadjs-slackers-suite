@@ -97,7 +97,6 @@ Add the following to your SquadJS `config.json`:
     "doubleSwitchEnabledMinutes": 10,
     "endMatchSwitchSlots": 3,
     "maxUnbalancedSlots": 1,
-    "switchToOldTeamAfterRejoin": false,
     "scrambleLockdownDurationMinutes": 20,
     "liberalSwitchGameModes": ["Seed", "Jensen"],
     "liberalSwitchMaxUnbalancedSlots": 6,
@@ -221,7 +220,6 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 | `switchEnabledMinutes` | Time window (minutes) after join/match start to request a switch | `10` |
 | `queueTimeoutMinutes` | Minutes a player can wait in the switch queue before removal | `20` |
 | `maxUnbalancedSlots` | Max player difference between teams to allow a switch | `1` |
-| `switchToOldTeamAfterRejoin` | Auto-switch rejoining players to pre-disconnect team | `false` |
 | `scrambleLockdownDurationMinutes` | Duration to block switching after a scramble | `20` |
 
 ### Token System (v2.3.0)
