@@ -231,7 +231,7 @@ export default class Switch extends S3DiscordPluginBase {
             queueTimeoutMinutes: {
                 required: false,
                 description: "Minutes a player can wait in the switch queue before being removed (separate from the eligibility window)",
-                default: 20
+                default: 15
             },
             doubleSwitchEnabledMinutes: {
                 required: false,
@@ -262,7 +262,7 @@ export default class Switch extends S3DiscordPluginBase {
             scrambleLockdownDurationMinutes: {
                 required: false,
                 description: "Duration in minutes to block switching after a scramble.",
-                default: 20
+                default: 30
             },
             liberalSwitchGameModes: {
                 required: false,
@@ -279,7 +279,7 @@ export default class Switch extends S3DiscordPluginBase {
             liberalSwitchBroadcastIntervalMinutes: {
                 required: false,
                 description: 'Minutes between liberal-mode (Seed/Jensen) broadcast reminders. Set to 0 to disable.',
-                default: 5,
+                default: 8,
                 type: 'number'
             },
             dynamicBalanceTolerance: {
@@ -309,7 +309,7 @@ export default class Switch extends S3DiscordPluginBase {
             switchWindowBroadcastDelaySeconds: {
                 required: false,
                 description: 'Seconds after match start before the first broadcast.',
-                default: 60
+                default: 30
             },
             switchWindowBroadcastIntervalMinutes: {
                 required: false,
