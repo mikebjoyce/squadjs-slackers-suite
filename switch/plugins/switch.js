@@ -635,10 +635,11 @@ export default class Switch extends S3DiscordPluginBase {
          for (let p of this.server.players)
              teamPlayerCount[+p.teamID]++;
 
-         const receivingTeam = teamID === 1 ? 2 : 1;
-         const maxTeamSize = this?._s3?.serverConfig?.isReady()
-           ? Math.floor(this._s3.serverConfig.getMaxPlayers() / 2)
-           : 50;
+          const receivingTeam = teamID === 1 ? 2 : 1;
+          const effectiveMax = this?._s3?.serverConfig?.isReady()
+            ? this._s3.serverConfig.getMaxPlayers() - this._s3.serverConfig.getNumReservedSlots()
+            : 98;
+          const maxTeamSize = Math.floor(effectiveMax / 2);
          if (!skipHardCap && (teamPlayerCount[receivingTeam] || 0) >= maxTeamSize) return 0;
 
          return 1;

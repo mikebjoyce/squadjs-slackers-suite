@@ -105,6 +105,9 @@ export default class DBService {
     this._migrationGate = null;         // Promise that consumers await
     this._resolveMigrationGateFn = null; // Resolver for the gate
 
+    // Drift alert callback — called when post-migration drift is detected
+    this._driftAlertCallback = null;     // Set by S³ plugin owner to fire Discord notifications
+
     // Network backoff — after a network-level DB failure, all calls return null
     // for a cooldown period rather than retrying on every tick.
     this._networkErrorBackoff = null;   // null = no backoff, timestamp = skip until
@@ -672,8 +675,10 @@ export default class DBService {
     this._expectedVersions.set(pluginName, version);
     if (options.models) {
       this._pluginModels.set(pluginName, options.models);
+      this.verboseLogger(3, `[DB] Registered ${options.models.length} model(s) for drift detection for "${pluginName}": ${options.models.join(', ')}`);
+    } else {
+      this.verboseLogger(3, `[DB] Registered expected version v${version} for "${pluginName}" — no models registered for drift detection.`);
     }
-    this.verboseLogger(4, `[DB] Registered expected version v${version} for "${pluginName}".`);
   }
 
   /**
@@ -752,7 +757,17 @@ export default class DBService {
    * waitForMigrations(). Called by the Discord confirmation handler after
    * migrations complete, are cancelled, or time out.
    *
-   * @param {boolean} [wasApplied=false] - If true, pending migrations were applied
+   * **Always re-runs verifyLiveSchema()** regardless of wasApplied — the initial
+   * drift check during db.mount() ran before any consumer models were registered,
+   * so it could not detect silently-failed migrations. This second pass catches
+   * missing columns on servers where S3_SchemaVersions is already up to date.
+   *
+   * Only invokes drift recovery (rollback + re-gate) when drifts have missing
+   * columns — extra-only drifts (columns in the DB but not in the model) are
+   * informational only and do not block consumer plugins.
+   *
+   * @param {boolean} [wasApplied=false] - If true, pending migrations were applied.
+   *   Drift detection runs unconditionally regardless of this flag.
    */
   _resolveMigrationGate(wasApplied = false) {
     if (this._resolveMigrationGateFn) {
@@ -761,27 +776,129 @@ export default class DBService {
     }
     if (wasApplied) {
       this._pendingMigrations = []; // Clear pending — they're applied now
-      // Re-run live schema verification now that all plugins have registered
-      // their models AND migrations have been applied. The initial verifyLiveSchema()
-      // during mount() ran before any models were registered, so it could not
-      // detect drift. This second pass captures the actual post-migration state.
-      this.verifyLiveSchema().then(drift => {
-        this._lastDriftResult = drift;
-        if (drift.length > 0) {
-          for (const entry of drift) {
-            if (entry.missing) {
-              this.verboseLogger(1, `[DB] POST-MIGRATION DRIFT: ${entry.table} missing columns: ${entry.missing.join(', ')}`);
-            }
-          }
-        }
-      }).catch(err => {
-        this.verboseLogger(1, `[DB] Post-migration drift check failed: ${err.message}`);
-      });
     }
-    this._migrationGate = null;
-    this.verboseLogger(2, `[DB] Migration gate resolved (wasApplied=${wasApplied}). Consumer plugins unblocked.`);
+    // Re-run live schema verification now that all plugins have registered their
+    // models via registerExpectedVersion() during _onS3Ready(). The initial
+    // verifyLiveSchema() during mount() ran before any models were registered, so
+    // it could not detect drift. This second pass captures the actual schema state
+    // regardless of whether migrations were applied — on a server where the
+    // SchemaVersion already matches, the gate resolves with wasApplied=false but
+    // drift may still exist (e.g. from a prior migration that silently failed).
+    //
+    // IMPORTANT: All gate state management (nulling _migrationGate, logging) happens
+    // INSIDE the .then() callback, not after it. verifyLiveSchema() returns a Promise
+    // that resolves asynchronously — setting _migrationGate = null outside the .then()
+    // callback would create a race: consumers calling waitForMigrations() would see
+    // no gate and proceed with sync({ alter: true }) before the drift check completed.
+    // By keeping the close-out inside the callback, consumers remain blocked until
+    // the drift check finishes.
+    this.verifyLiveSchema().then(async drift => {
+      this._lastDriftResult = drift;
+      // Only invoke recovery for missing columns — extra-only drift does not
+      // block the gate. _handleDetectedDrift() re-opens the gate and returns
+      // without closing it; the caller must not fall through to gate-null.
+      const hasMissing = drift.some(e => e.missing);
+      if (hasMissing) {
+        await this._handleDetectedDrift(drift);
+        return;
+      }
+      // No drift detected, or drift with extra columns only.
+      // Close the gate so consumer plugins can proceed with sync({ alter: true }).
+      this._migrationGate = null;
+      this.verboseLogger(2, `[DB] Migration gate resolved (wasApplied=${wasApplied}). Consumer plugins unblocked.`);
+    }).catch(err => {
+      this.verboseLogger(1, `[DB] Post-migration drift check failed: ${err.message}`);
+      // Null the gate so consumers don't hang forever on a transient DB error.
+      // This is a safe fail-open: if we can't verify the schema, let consumers
+      // proceed rather than deadlocking until process restart.
+      this._migrationGate = null;
+    });
   }
 
+  /**
+   * Handle schema drift detected by verifyLiveSchema().
+   * Rolls back S3_SchemaVersions records for affected plugins, creates a new
+   * migration gate so consumer plugins remain blocked, and fires the drift
+   * alert callback (Discord notification) so the admin can re-apply the
+   * idempotent migration via !s3 migrate force.
+   *
+   * Called both from _resolveMigrationGate() (post-migration verification) and
+   * from _checkAndPromptMigrations() (startup drift check when all versions are
+   * up to date).  This ensures drift detection also fires on servers where
+   * S3_SchemaVersions already matches the expected version but the actual DB
+   * columns are missing (e.g. a prior migration's ADD COLUMN silently failed
+   * due to MySQL permissions).
+   *
+   * @param {Array<{pluginName: string, table: string, model?: string, missing?: string[], extra?: string[], error?: string}>} drift
+   */
+  async _handleDetectedDrift(drift) {
+    for (const entry of drift) {
+      if (entry.missing) {
+        this.verboseLogger(1, `[DB] POST-MIGRATION DRIFT: ${entry.table} missing columns: ${entry.missing.join(', ')}`);
+      }
+    }
+    // Only act on missing columns — extra columns are informational only
+    const pluginNames = [...new Set(drift.filter(e => e.missing).map(e => e.pluginName))];
+    if (pluginNames.length === 0) {
+      this.verboseLogger(2, '[DB] Drift detected but only extra columns — no recovery needed.');
+      return;
+    }
+    // Populate pending migrations for the affected plugins so the Discord
+    // prompt renders "v2 → v3" rather than "v-1 → v3". The S3_SchemaVersions
+    // DB row is also rolled back below, so runMigrations() will detect the
+    // gap and re-apply the idempotent migration.
+    this._pendingMigrations = pluginNames.map(pn => ({
+      pluginName: pn,
+      currentVersion: (this._expectedVersions.get(pn) || 1) - 1,
+      expectedVersion: this._expectedVersions.get(pn) || -1,
+      behind: 1
+    }));
+    // Roll back S3_SchemaVersions records so runMigrations() sees a pending
+    // migration and re-applies the idempotent up(). Without this, !s3 migrate
+    // force would skip the migration because the DB still says e.g. v3 is
+    // applied, even though columns are missing.
+    for (const pn of pluginNames) {
+      const prevVersion = Math.max(0, (this._expectedVersions.get(pn) || 1) - 1);
+      if (this.SchemaVersionsModel) {
+        try {
+          const existing = await this.SchemaVersionsModel.findOne({ where: { pluginName: pn } });
+          if (existing) {
+            await existing.update({ version: prevVersion, appliedAt: Date.now(), migrationHash: 'drift-recovery' });
+          } else {
+            await this.SchemaVersionsModel.create({
+              pluginName: pn,
+              version: prevVersion,
+              appliedAt: Date.now(),
+              migrationHash: 'drift-recovery',
+              description: 'Rolled back due to schema drift'
+            });
+          }
+          this.verboseLogger(2, `[DB] Rolled back "${pn}" to v${prevVersion} for drift recovery.`);
+        } catch (rollbackErr) {
+          this.verboseLogger(1, `[DB] Failed to roll back "${pn}" version for drift recovery: ${rollbackErr.message}`);
+        }
+      }
+    }
+    // Create a new gate so consumer plugins stay blocked and the migration
+    // prompt re-appears in Discord for a re-confirmation.
+    this._migrationGate = new Promise((resolve) => {
+      this._resolveMigrationGateFn = resolve;
+    });
+    // Fire external alert callback (e.g. Discord notification handled by S³ plugin)
+    if (typeof this._driftAlertCallback === 'function') {
+      this._driftAlertCallback(drift, pluginNames);
+    }
+    // Gate is re-open — do NOT log "resolved". The admin must re-confirm
+    // (!s3 confirm <token> or !s3 migrate force) which will call
+    // _resolveMigrationGate(wasApplied=true) again.
+    //
+    // Potential retry loop: If the re-applied migration also silently fails
+    // (e.g. persistent MySQL permission denial for ALTER TABLE), drift will
+    // be re-detected and the gate re-opened on this next call. This creates
+    // an intentional retry loop that prompts the admin each round until the
+    // underlying issue (permissions, connectivity) is resolved. The
+    // migration's up() must be idempotent for re-application to succeed.
+  }
   /* ────────────────────────────────────── SCHEMA DRIFT DETECTION ────────────────────────────────────── */
 
   /**
@@ -802,6 +919,13 @@ export default class DBService {
       this.verboseLogger(3, '[DB] No plugin models registered for drift detection — skipping verifyLiveSchema.');
       return [];
     }
+
+    // Log which plugins/models are about to be checked so admins can
+    // confirm drift detection coverage during troubleshooting.
+    const summary = [...this._pluginModels.entries()]
+      .map(([pn, models]) => `${pn} (${models.length} model(s))`)
+      .join(', ');
+    this.verboseLogger(3, `[DB] Running drift detection on ${this._pluginModels.size} plugin(s): ${summary}`);
 
     const drift = [];
 

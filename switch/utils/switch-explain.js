@@ -123,7 +123,7 @@ function _getMaxTeamSize(plugin) {
     if (sc?.isReady?.() && typeof sc.getMaxPlayers === 'function') {
       const maxPlayers = sc.getMaxPlayers();
       const reserved = typeof sc.getNumReservedSlots === 'function' ? sc.getNumReservedSlots() : 0;
-      const effectiveCap = maxPlayers - reserved;
+      const effectiveCap = maxPlayers;
       return { maxPlayers, reserved, effectiveCap, maxTeamSize: Math.floor(effectiveCap / 2) };
     }
   } catch (_) { /* ignore */ }
@@ -258,7 +258,7 @@ function _buildIntroEmbed(plugin) {
     description,
     color: 0x3498DB,
     fields: [
-      { name: 'Commands', value: commandsField + '\n*All three commands are typed in squad chat (press J).*', inline: false },
+      { name: 'Commands', value: commandsField + '\n*All three commands are typed in all or squad chat (press J).*', inline: false },
       { name: 'Key Rule', value: keyRuleField, inline: false }
     ]
   };
@@ -267,7 +267,7 @@ function _buildIntroEmbed(plugin) {
 // ── Embed 2: Balance Rules ──────────────────────────────────────
 
 function _buildBalanceEmbed(plugin) {
-  const { maxTeamSize, maxPlayers, effectiveCap } = _getMaxTeamSize(plugin);
+  const { maxTeamSize, maxPlayers, effectiveCap, reserved } = _getMaxTeamSize(plugin);
   const cap = plugin.options.maxUnbalancedSlots != null ? plugin.options.maxUnbalancedSlots : 1;
   const rows = _buildToleranceTable(plugin);
 
@@ -300,7 +300,7 @@ function _buildBalanceEmbed(plugin) {
   ].join('\n');
 
   const hardCap = [
-    `Each team can hold at most **${maxTeamSize}** players (half of **${effectiveCap}** max slots).`,
+    `Each team can hold at most **${maxTeamSize}** players (half of **${maxPlayers}** total slots, including **${reserved}** reserved).`,
     `You cannot switch to a team that is already at **${maxTeamSize}**.`
   ].join('\n');
 
@@ -417,7 +417,7 @@ function _buildTimeWindowQueueEmbed(plugin) {
     ];
 
     if (timeoutSwitchEnabled) {
-      queueLines.push('When a queued switch expires, you are force-switched with a slightly relaxed balance limit rather than being dropped.');
+      queueLines.push(`If your queue request reaches the **${queueTimeout}-minute** time limit without a normal slot opening, the system will force-switch you with a slightly relaxed balance limit. This is a fallback so you are not left stranded. The normal balance rules are your best path.`);
     } else {
       queueLines.push('When a queued switch expires, you are removed from the queue.');
     }
@@ -453,16 +453,13 @@ function _buildScrambleEmbed(plugin) {
 
   const whatScrambleDoes = [];
   if (tb) {
-    whatScrambleDoes.push('The scrambler keeps squads together. Your squad will not be split up.');
+    whatScrambleDoes.push('The scrambler keeps squads and clans together. Your squad and clan group will not be split up.');
 
     const clanGrouping = tb.options && tb.options.enableClanTagGrouping === true;
     const pullEntireSquads = tb.options && tb.options.clanGroupingPullEntireSquads === true;
 
-    if (clanGrouping) {
-      whatScrambleDoes.push('Clan groups are also kept together.');
-      if (pullEntireSquads) {
-        whatScrambleDoes.push('When a clan group is kept together, the rest of their squad is pulled along with them. No one gets left behind.');
-      }
+    if (clanGrouping && pullEntireSquads) {
+      whatScrambleDoes.push('When a clan group is kept together, the rest of their squad is pulled along with them. No one gets left behind.');
     }
   } else {
     whatScrambleDoes.push('Team balancing configuration was not available at the time this was generated. Check with an admin for scramble details.');
@@ -553,11 +550,7 @@ function _buildTipsEmbed(plugin) {
 
   tips.push("**4. Check before you act.** **`'!switch check'`** tells you exactly what is blocking you: time window, tokens, scramble lock, or balance. This helps you make an informed decision.");
 
-  if (clanGrouping) {
-    tips.push('**5. Squads stay together.** The scrambler preserves squads and clans. Even if a scramble fires, your group will not be split up.');
-  } else {
-    tips.push('**5. Squads stay together.** The scrambler preserves squads. Even if a scramble fires, your group will not be split up.');
-  }
+  tips.push('**5. Squads and clans stay together.** The scrambler preserves squads and clan groups. Even if a scramble fires, your group will not be split up.');
 
   return {
     title: 'Tips for Playing With Friends',

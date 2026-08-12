@@ -250,16 +250,29 @@ export default class S3PluginBase extends BasePlugin {
   }
 
   /**
-   * Registers an expected schema version for this plugin.
+   * Registers an expected schema version for this plugin, along with
+   * optional model names owned by the plugin (used by drift detection).
+   *
+   * IMPORTANT: The 3rd argument (options) MUST be forwarded to the S³ DB
+   * service — consumer plugins pass { models: ['MyModel', ...] } in this
+   * argument. Without it, verifyLiveSchema() cannot find or verify the
+   * plugin's tables, and drift detection silently skips them.
    *
    * @param {string} pluginName - Namespace (e.g. 'elo-tracker').
    * @param {number} version - Expected schema version number.
+   * @param {{ models?: string[] }} [options] - Optional model names owned by
+   *   this plugin, forwarded to DBService for drift detection.
    */
-  registerExpectedVersion(pluginName, version) {
+  registerExpectedVersion(pluginName, version, options) {
     if (!this._s3db || typeof this._s3db.registerExpectedVersion !== 'function') {
       return;
     }
-    this._s3db.registerExpectedVersion(pluginName, version);
+    this._s3db.registerExpectedVersion(pluginName, version, options);
+    // Log model registrations at level 3 so admins can confirm drift
+    // detection coverage during troubleshooting.
+    if (options && Array.isArray(options.models) && options.models.length > 0) {
+      this.verbose(3, `[${pluginName}] Registered ${options.models.length} model(s) for drift detection: ${options.models.join(', ')}`);
+    }
   }
 
   /**
@@ -301,6 +314,21 @@ export default class S3PluginBase extends BasePlugin {
       }
       const result = await (me ? me.runMigrations(pluginName) : null);
       return result;
+    }
+    // Schema versions are up to date — still re-schedule the migration prompt
+    // so _checkAndPromptMigrations() fires the drift check (verifyLiveSchema())
+    // after all consumer plugins have registered their models. The initial
+    // verifyLiveSchema() during db.mount() ran before any models were registered,
+    // so it could not detect drift. This re-schedule ensures the drift check runs
+    // after the last consumer registers, catching silently-failed prior migrations.
+    //
+    // Debounce effect: Each consumer plugin that calls this resets the 500ms
+    // debounce timer via _scheduleMigrationPrompt(), so _checkAndPromptMigrations()
+    // only fires after the LAST consumer finishes registering its expected versions
+    // and models. Typically 4 consumers (Switch, EloTracker, SmartAssign, TeamBalancer)
+    // plus the initial S³ mount call, resulting in 5 resets on a normal boot.
+    if (this._s3 && typeof this._s3._scheduleMigrationPrompt === 'function') {
+      this._s3._scheduleMigrationPrompt();
     }
     return null;
   }

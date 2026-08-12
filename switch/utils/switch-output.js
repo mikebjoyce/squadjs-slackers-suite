@@ -123,10 +123,18 @@ const SwitchOutput = {
     /**
      * Start broadcast timers for the switch window.
      * Called from onNewGame().
+     *
+     * NOTE: Guard against unset _gameStartTs. The S³ onLayerGameModeChange
+     * subscription (in _onLayerChanged) may fire before SquadJS's onNewGame
+     * event sets _gameStartTs, causing Date.now() - undefined = NaN which
+     * broadcasts "~NaNm remaining". When _gameStartTs is unset, this method
+     * silently returns — _onLayerChanged will re-trigger the correct broadcast
+     * path once onNewGame eventually sets _gameStartTs.
      */
     plugin._startBroadcastTimers = function () {
       if (!plugin.options.broadcastSwitchWindowMessages) return;
       if (!plugin.timeLimitEnabled) return;
+      if (!Number.isFinite(plugin._gameStartTs)) return;
 
       plugin._clearBroadcastTimers();
 
@@ -136,6 +144,7 @@ const SwitchOutput = {
 
       // First broadcast after delay
       plugin._broadcastTimers.firstBroadcast = setTimeout(() => {
+        if (!Number.isFinite(plugin._gameStartTs)) return;
         const remainingMin = Math.floor((windowMs - delayMs) / 60000);
         plugin.broadcast(`[Switch] Team switching is open. Use '!switch help' for details. Window: ~${remainingMin}m.`);
       }, delayMs);
@@ -143,6 +152,7 @@ const SwitchOutput = {
       // Periodic reminders
       if (intervalMs > 0) {
         plugin._broadcastTimers.reminderInterval = setInterval(() => {
+          if (!Number.isFinite(plugin._gameStartTs)) return;
           const elapsed = Date.now() - plugin._gameStartTs;
           const remainingMs = windowMs - elapsed;
           if (remainingMs <= 0) {
@@ -438,14 +448,24 @@ const SwitchOutput = {
       const failRate = attemptedRequests > 0 ? Math.round((totalFailed / attemptedRequests) * 100) : 0;
       const denyRate = totalRequests > 0 ? Math.round((totalDenied / totalRequests) * 100) : 0;
 
-      // Denial reason breakdown
+      // Denial reason breakdown — only render known categories. Unrecognized
+      // reason strings (e.g. 'unexpected error' from the onChatMessage catch-all,
+      // or any raw SQL/RCON error messages that bypassed sanitization) are
+      // bucketed as "other" to prevent ugly text from leaking into the embed.
+      const KNOWN_DENIAL_REASONS = ['cooldown', 'time_window', 'scramble_lock'];
       const denialReasons = {};
+      let otherDenialCount = 0;
       for (const d of s.deniedSwitches) {
-        denialReasons[d.reason] = (denialReasons[d.reason] || 0) + 1;
+        if (KNOWN_DENIAL_REASONS.includes(d.reason)) {
+          denialReasons[d.reason] = (denialReasons[d.reason] || 0) + 1;
+        } else {
+          otherDenialCount++;
+        }
       }
-      const denialBreakdown = Object.entries(denialReasons)
-        .map(([reason, count]) => `${count} ${reason}`)
-        .join(', ');
+      const denialParts = Object.entries(denialReasons)
+        .map(([reason, count]) => `${count} ${reason}`);
+      if (otherDenialCount > 0) denialParts.push(`${otherDenialCount} other`);
+      const denialBreakdown = denialParts.join(', ');
 
       const statsLines = [];
       statsLines.push(`**Mode:** ${s.wasLiberalMode ? 'Liberal (Seed/Jensen)' : 'Standard'}`);

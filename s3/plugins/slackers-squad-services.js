@@ -418,6 +418,35 @@ export default class SlackersSquadServices extends BasePlugin {
     // Register Discord !s3 commands (gracefully degrades if no discordClient configured)
     this._s3DiscordCleanup = registerS3DiscordCommands(this);
 
+    // Register drift alert callback — when post-migration schema drift is detected,
+    // DBService fires this to post a warning embed in the admin Discord channel.
+    if (this.services.db) {
+      this.services.db._driftAlertCallback = (drift, pluginNames) => {
+        this.verbose(1, `[S3] Schema drift alert triggered for: ${pluginNames.join(', ')}`);
+        const discordClient = this.options.discordClient;
+        const channelID = this.options.channelID;
+        if (discordClient && channelID) {
+          const missingCols = drift
+            .filter(e => e.missing)
+            .map(e => `- **${e.table}**: ${e.missing.join(', ')}`)
+            .join('\n');
+          discordClient.channels.fetch(channelID).then(channel => {
+            if (channel) {
+              channel.send({
+                embeds: [{
+                  color: 0xe74c3c,
+                  title: '⚠️ Schema Drift Detected',
+                  description: `Columns declared in migrations are missing from the live database.\nUse \`!s3 migrate force\` to re-apply.\n\n${missingCols}`,
+                  timestamp: new Date().toISOString(),
+                  footer: { text: 'S³ Schema Verification' }
+                }]
+              }).catch(() => {});
+            }
+          }).catch(() => {});
+        }
+      };
+    }
+
     // Check for pending migrations and prompt via Discord if any
     this._scheduleMigrationPrompt();
 
@@ -597,6 +626,28 @@ export default class SlackersSquadServices extends BasePlugin {
 
     if (!pending || pending.length === 0) {
       this.verbose(3, '[S3 Migration] No pending migrations.');
+      // Run live schema verification now that all consumer plugins have registered
+      // their models. The initial verifyLiveSchema() during db.mount() ran before
+      // any models were registered, so it could not detect drift. This second pass
+      // captures the actual schema state — on a server where S3_SchemaVersions
+      // already matches the expected version but the actual DB columns are missing
+      // (e.g. a prior migration's ADD COLUMN silently failed due to MySQL permissions),
+      // this will detect the drift and trigger recovery.
+      const drift = await db.verifyLiveSchema();
+      db._lastDriftResult = drift;
+      if (drift.length > 0) {
+        this.verbose(1, `[S3 Migration] Schema drift detected on up-to-date server — ${drift.length} issue(s).`);
+        await db._handleDetectedDrift(drift);
+        // Only re-schedule the migration prompt if the drift includes missing
+        // columns — extra-only drift is informational and does not require
+        // admin intervention. _handleDetectedDrift() only re-opens the migration
+        // gate when missing columns are found; unconditionally re-scheduling
+        // here would create an infinite loop since extra-only drift never
+        // creates a pending migration.
+        if (drift.some(e => e.missing)) {
+          this._scheduleMigrationPrompt();
+        }
+      }
       return;
     }
 
@@ -681,12 +732,20 @@ export default class SlackersSquadServices extends BasePlugin {
   /**
    * Debounced migration prompt scheduler. Called by consumer plugins via
    * verifyAndRunMigrations() when they detect pending-but-unconfirmed
-   * migrations. Multiple plugins may call this in rapid succession during
+   * migrations, AND by the drift-recovery path after _handleDetectedDrift()
+   * repopulates _pendingMigrations for affected plugins.
+   *
+   * Multiple callers may invoke this in rapid succession during
    * initialisation — the 500ms debounce ensures only one Discord embed is
    * posted after all plugins have registered their expected versions.
+   * Each call to verifyAndRunMigrations() from a consumer plugin resets
+   * the timer, so the prompt fires 500ms after the LAST consumer registers.
    *
    * Idempotency guard: if a valid unexpired token already exists on the
    * MigrationEngine, the prompt was already posted and this is a no-op.
+   * The drift-recovery path may still bypass this if the token expired
+   * but the gate is still re-open — _handleDetectedDrift() creates a new
+   * gate and nullifies any stale token, so the next call will proceed.
    */
   _scheduleMigrationPrompt() {
     // Idempotency: if a valid token already exists, prompt was already posted
