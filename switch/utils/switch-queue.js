@@ -216,7 +216,57 @@ const SwitchQueue = {
       plugin.verbose(1, `[Queue] forceQueueSwap: Initiating handshake swap for ${entry.playerName}. Queue size: ${plugin._getQueueSize()}`);
 
       try {
+        plugin.warn(entry.eosID, '[Switch Queue] Swap partner found — switching now.');
         await plugin._taggedSwitchPlayer(eosID, 'Handshake-Swap');
+
+        if (!plugin.isLiberalMode()) {
+          const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
+          if (PlayerCooldowns) {
+            try {
+              await plugin._withDb(async (t) => {
+                // §3.3 of switch-token-system-spec: load → regen → spend → upsert
+                let row = await PlayerCooldowns.findByPk(entry.eosID, { transaction: t });
+                if (!row) {
+                  row = { eosID: entry.eosID, steamID: entry.steamID, playerName: entry.playerName, tokenBalance: plugin.options.maxSwitchTokens, tokenRegenAnchor: null };
+                }
+                plugin._regenTokens(row);
+                plugin._spendToken(row);
+                await PlayerCooldowns.upsert(
+                  { eosID: entry.eosID, steamID: entry.steamID, playerName: entry.playerName, tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor },
+                  { transaction: t }
+                );
+              });
+            } catch (dbErr) {
+              plugin.verbose(1, `[Queue] Token spend failed for ${entry.playerName}: ${dbErr.message}`);
+            }
+          }
+        }
+
+        // Post-switch token notice for handshake swap (gated on showTokenMessaging)
+        if (plugin.options.maxSwitchTokens > 1 && !plugin.isLiberalMode()) {
+          try {
+            const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
+            if (PlayerCooldowns) {
+              const row = await PlayerCooldowns.findByPk(entry.eosID);
+              if (row) {
+                const balance = row.tokenBalance != null ? row.tokenBalance : plugin.options.maxSwitchTokens;
+                if (balance > 0) {
+                  plugin.warn(entry.eosID, `[Switch] Switched! ${balance}/${plugin.options.maxSwitchTokens} tokens remaining.`);
+                } else {
+                  const cooldownDuration = plugin.options.switchCooldownMinutes > 0
+                    ? plugin.options.switchCooldownMinutes * 60 * 1000
+                    : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+                  const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
+                  const remaining = Math.ceil((cooldownDuration - (Date.now() - anchor)) / 60000);
+                  plugin.warn(entry.eosID, `[Switch] Switched! You're out of tokens — next one in ~${remaining}m.`);
+                }
+              }
+            }
+          } catch (e) {
+            plugin.verbose(1, `[Queue] Token notice read failed for ${entry.playerName}: ${e.message}`);
+          }
+        }
+
         if (plugin._roundStats) {
           const qDuration = Math.round((Date.now() - entry.queuedAt) / 1000);
           const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';

@@ -1219,7 +1219,7 @@ const SwitchCommands = {
             if (row.tokenBalance < 1) {
               const cooldownDuration = plugin.options.switchCooldownMinutes > 0 ? plugin.options.switchCooldownMinutes * 60 * 1000 : plugin.options.switchCooldownHours * 60 * 60 * 1000;
               const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
-              const nextToken = new Date(anchor.getTime() + cooldownDuration);
+              const nextToken = new Date(anchor + cooldownDuration);
               desc += `🔴 **Switch Cooldown:** ${row.tokenBalance}/${plugin.options.maxSwitchTokens} tokens, next at <t:${Math.floor(nextToken.getTime() / 1000)}:R>\n`;
             } else {
               desc += `🟢 **Switch Cooldown:** ${row.tokenBalance}/${plugin.options.maxSwitchTokens} tokens\n`;
