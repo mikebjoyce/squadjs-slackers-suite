@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║          SWITCH PLUGIN v2.3.0 — EXPLAIN EMBED GENERATOR       ║
+ * ║          SWITCH PLUGIN v2.3.1 — EXPLAIN EMBED GENERATOR       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -785,10 +785,15 @@ async function _buildSevenDayStatsEmbed(plugin) {
     if (successRate >= 90) {
       lines.push(`**${successRate}%** of attempted switches succeed.`);
     } else if (successRate >= 75) {
-      lines.push(`**${successRate}%** of attempted switches succeed — most requests go through.`);
+      lines.push(`**${successRate}%** of attempted switches succeed, most requests go through.`);
     } else {
       lines.push(`**${successRate}%** of attempted switches succeed.`);
     }
+
+    lines.push('');
+
+    // Qualifier: success rate counts only requests that passed the eligibility gate
+    lines.push('Eligible switches only, requests denied at the eligibility gate (cooldown, time window, etc.) are not counted as attempts.');
 
     lines.push('');
 
@@ -796,7 +801,7 @@ async function _buildSevenDayStatsEmbed(plugin) {
     if (instantRate >= 50) {
       lines.push(`Most switches happen instantly — **${instantRate}%** go through the moment you type \`!switch\`, with no waiting at all.`);
     } else if (instantRate > 0) {
-      lines.push(`**${instantRate}%** of switches happen instantly — the rest use the queue.`);
+      lines.push(`**${instantRate}%** of switches happen instantly, the rest use the queue.`);
     } else {
       lines.push('Switches typically use the queue system.');
     }
@@ -815,11 +820,8 @@ async function _buildSevenDayStatsEmbed(plugin) {
 
     return {
       title: '📊 !switch Reliability — Last 7 Days',
-      description: 'standard-mode rounds · updated every 30 min',
+      description: lines.join('\n'),
       color: 0x3498DB,
-      fields: [
-        { name: '\u200B', value: lines.join('\n'), inline: false }
-      ],
       footer: {
         text: `Switch v${plugin.constructor.version} · updated`
       },

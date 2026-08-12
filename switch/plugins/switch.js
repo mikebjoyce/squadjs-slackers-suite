@@ -12,7 +12,7 @@ import SwitchExplain from '../utils/switch-explain.js';
 
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SWITCH PLUGIN v2.3.0                       ║
+ * ║                    SWITCH PLUGIN v2.3.1                       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -134,9 +134,9 @@ import SwitchExplain from '../utils/switch-explain.js';
  * When explainChannelID is set, _initExplainAutoUpdate() is called
  * during _onS3Ready() after DB registration. It posts (or edits) the
  * full explain embed sequence plus a 7-day reliability stats embed to
- * the designated channel, then starts a 30-minute refresh interval.
- * The message ID is persisted in SwitchPlugin_Settings so it survives
- * SquadJS restarts.
+ * the designated channel. The embed is generated once on SquadJS
+ * startup — no periodic refresh. The message ID is persisted in
+ * SwitchPlugin_Settings so it survives SquadJS restarts.
  *
  * ─── COMMANDS ────────────────────────────────────────────────────
  *
@@ -175,7 +175,7 @@ import SwitchExplain from '../utils/switch-explain.js';
  *
  */
 export default class Switch extends S3DiscordPluginBase {
-    static version = '2.3.0';
+    static version = '2.3.1';
 
     static get description() {
         return "Switch plugin with persistent join timers";
@@ -342,7 +342,7 @@ export default class Switch extends S3DiscordPluginBase {
             },
             explainChannelID: {
                 required: false,
-                description: 'Discord channel ID for auto-updating explain messages with 7-day stats. When set, explain embeds are posted to this channel on mount and refreshed periodically.',
+                description: 'Discord channel ID for auto-updating explain messages with 7-day stats. When set, explain embeds are posted to this channel on SquadJS startup.',
                 default: ''
             },
             // v2.2.0 Options
@@ -403,13 +403,10 @@ export default class Switch extends S3DiscordPluginBase {
         this._wasSeedMode = false;             // track seed→non-seed transitions in _onLayerChanged
 
         // ── Explain auto-update state ────────────────────────────
-        this._explainRefreshInterval = null;
         this._explainMessage = null;       // cached Discord message object for editing
         this._explainMessageID = null;
         this._explainChannelID = null;
-        this._explainRefreshMinutes = 30;
         this._cachedExplainMessageData = null; // { channelID, messageID } loaded from DB
-        this._explainRefreshing = false;   // re-entrancy guard for refresh interval
 
         this.broadcast = (msg) => { this.server.rcon.broadcast(msg); };
         this.warn = (id, msg) => {
@@ -1244,10 +1241,6 @@ export default class Switch extends S3DiscordPluginBase {
         }
 
         // ── Explain auto-update cleanup ──────────────────────────
-        if (this._explainRefreshInterval) {
-            clearInterval(this._explainRefreshInterval);
-            this._explainRefreshInterval = null;
-        }
         this._explainMessage = null;
         this._explainMessageID = null;
         this._explainChannelID = null;
@@ -1585,7 +1578,8 @@ export default class Switch extends S3DiscordPluginBase {
     /**
      * Initialize the explain auto-update feature.
      * Posts (or edits) the full explain embed sequence + 7-day stats embed to
-     * the configured explain channel, then starts a periodic refresh interval.
+     * the configured explain channel. The embed is generated once on SquadJS
+     * startup — no periodic refresh.
      *
      * Called from _onS3Ready() when explainChannelID is configured.
      */
@@ -1652,52 +1646,10 @@ export default class Switch extends S3DiscordPluginBase {
                 this.verbose(1, `[Explain] Posted new explain message ${message.id} in channel ${explainChannelID}.`);
             }
 
-            // Cache the message reference for refresh
+            // Cache the message reference for potential future edit (e.g. on rewrite)
             this._explainMessage = message;
 
-            // Start periodic refresh interval
-            if (this._explainRefreshInterval) {
-                clearInterval(this._explainRefreshInterval);
-            }
-            this._explainRefreshInterval = setInterval(async () => {
-                // Re-entrancy guard: if a previous refresh cycle is still running
-                // (e.g. Discord rate limiting slowed the scrape), skip this tick.
-                // This prevents overlapping scrapes that could compound rate-limit
-                // issues or cause concurrent message edits.
-                if (this._explainRefreshing) return;
-                this._explainRefreshing = true;
-                try {
-                    const refreshedEmbeds = await buildMessage();
-                    if (this._explainMessage) {
-                        await this._explainMessage.edit({ embeds: refreshedEmbeds });
-                        this.verbose(2, '[Explain] Refreshed explain message.');
-                    } else {
-                        // Message reference lost — re-fetch from channel using stored message ID
-                        if (this._explainMessageID && channel) {
-                            try {
-                                const msg = await channel.messages.fetch(this._explainMessageID);
-                                if (msg) {
-                                    this._explainMessage = msg;
-                                    await msg.edit({ embeds: refreshedEmbeds });
-                                    this.verbose(2, '[Explain] Re-fetched and refreshed explain message.');
-                                }
-                            } catch (_) {
-                                this.verbose(1, '[Explain] Stored message no longer exists — stopping refresh.');
-                                if (this._explainRefreshInterval) {
-                                    clearInterval(this._explainRefreshInterval);
-                                    this._explainRefreshInterval = null;
-                                }
-                            }
-                        }
-                    }
-                } catch (err) {
-                    this.verbose(1, `[Explain] Refresh failed: ${err.message}`);
-                } finally {
-                    this._explainRefreshing = false;
-                }
-            }, this._explainRefreshMinutes * 60 * 1000);
-
-            this.verbose(1, `[Explain] Auto-update initialized. Refreshing every ${this._explainRefreshMinutes} minutes.`);
+            this.verbose(1, `[Explain] Auto-update initialized. Message posted/edited in channel ${explainChannelID}.`);
         } catch (err) {
             this.verbose(1, `[Explain] Failed to post/edit explain message: ${err.message}`);
         }
