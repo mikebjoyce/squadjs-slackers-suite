@@ -6,19 +6,27 @@
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
  * Generates the Discord embed sequence for the '!switch explain'
- * admin command. Produces a set of player-facing embeds that explain
- * how team switching works on this server — sourced from live plugin
- * config and decision functions, not hand-written copy.
+ * admin command, plus a second entry point for the 7-day reliability
+ * stats embed used by the auto-updating explain channel feature.
  *
- * Each section is its own embed (its own Discord message). This keeps
- * each message well under Discord's 6000-character per-message embed
- * sum limit, and makes the output easy for admins to forward.
+ * The explain sequence produces 7 player-facing embeds that explain
+ * how team switching works on this server — sourced from live plugin
+ * config and decision functions, not hand-written copy. Each section
+ * is its own embed, keeping each well under Discord's 6000-character
+ * per-message embed sum limit, and making output easy to forward.
+ *
+ * The 7-day stats embed (_buildSevenDayStatsEmbed()) scrapes the
+ * reporting channel for round summaries, aggregates standard-mode
+ * results, and returns a single embed with plain-English sentences
+ * about success rate, instant rate, and typical queue wait times.
+ * It returns null when no data is available (graceful degradation).
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * SwitchExplain (default)
  *   Singleton with a single register(plugin) method.
- *   Attaches _buildExplainMessages() to the plugin instance.
+ *   Attaches _buildExplainMessages() and _buildSevenDayStatsEmbed()
+ *   to the plugin instance.
  *
  * ─── DEPENDENCIES ──────────────────────────────────────────────────
  *
@@ -51,6 +59,25 @@ const SwitchExplain = {
    * @param {object} plugin — the live Switch plugin instance
    */
   register(plugin) {
+    /**
+     * Build a 7-day reliability stats embed from historical round summaries.
+     * Scrapes the reporting channel for "Switch Round Summary" embeds from the
+     * last 7 days, aggregates standard-mode rounds, and returns a single embed
+     * with plain-English sentences.
+     *
+     * Returns null if no data is available (graceful degradation — caller should
+     * drop the stats embed from the message rather than showing an empty embed).
+     *
+     * Dependencies: requires _parseMode, _parseMoveTypes, _parseDenialReasons,
+     * _parseQueueOutcomes, _parseRoundStatsField, and _computeMedianFromMs to
+     * have been registered on the plugin by SwitchCommands.register().
+     *
+     * @returns {object|null} Discord embed object, or null if no data
+     */
+    plugin._buildSevenDayStatsEmbed = async function () {
+      return _buildSevenDayStatsEmbed(plugin);
+    };
+
     /**
      * Build the full explain embed sequence.
      * Returns an array of Discord embed objects, one per section.
@@ -239,8 +266,8 @@ function _buildIntroEmbed(plugin) {
   const scoreboardDisabled = _isScoreboardSwitchDisabled(plugin);
 
   const description = scoreboardDisabled
-    ? 'Scoreboard team switching is disabled on this server. **`\'!switch\'`** is how you change teams. The plugin enforces balance rules to keep teams fair while giving you the best chance to play with your friends.'
-    : '**`\'!switch\'`** is an alternative way to change teams. The plugin enforces balance rules to keep teams fair while giving you the best chance to play with your friends.';
+    ? 'Scoreboard team switching is disabled on this server. **`\'!switch\'`** is how you change teams. The plugin enforces balance rules to keep teams fair while still allowing you to play with your friends.'
+    : '**`\'!switch\'`** is an alternative way to change teams. The plugin enforces balance rules to keep teams fair while still allowing you to play with your friends.';
 
   const commandsField = [
     "**`'!switch'`**        Request a team change",
@@ -562,5 +589,246 @@ function _buildTipsEmbed(plugin) {
   };
 }
 
+
+// ── 7-Day Stats Embed ──────────────────────────────────────────
+
+/**
+ * Build a 7-day reliability stats embed from historical round summaries.
+ * Scrapes the reporting channel for "Switch Round Summary" embeds from the
+ * last 7 days, aggregates standard-mode rounds, and returns a single embed
+ * with plain-English sentences.
+ *
+ * Returns null if no data is available (graceful degradation — caller should
+ * drop the stats embed from the message rather than showing an empty embed).
+ *
+ * @param {object} plugin — the live Switch plugin instance
+ * @returns {object|null} Discord embed object, or null if no data
+ */
+async function _buildSevenDayStatsEmbed(plugin) {
+  try {
+    const channel = plugin.channel;
+    if (!channel) {
+      // No reporting channel configured — round summaries are posted to
+      // channelID, which may differ from explainChannelID. If channelID
+      // is unset, there are no summaries to scrape, so we silently drop
+      // the stats embed. The explain embeds still post fine.
+      plugin.verbose(2, '[Explain] No reporting channel available — 7-day stats embed omitted.');
+      return null;
+    }
+
+    const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+    let lastID = null;
+    let foundAny = false;
+    const totals = {
+      rounds: 0,
+      success: 0,
+      failed: 0,
+      denied: 0,
+      instant: 0,
+      queueNormal: 0,
+      queueTeamTrade: 0,
+      queueJoinSwap: 0,
+      queueTimeoutSwitch: 0,
+      outcomeExpired: 0,
+      outcomeDC: 0,
+      outcomeCancelled: 0,
+      outcomeRemoved: 0,
+      denialCooldown: 0,
+      denialTimeWindow: 0,
+      denialScrambleLock: 0,
+      medianDurationsMs: [],
+      toT1: 0,
+      toT2: 0
+    };
+
+    // Scrape in batches of 100 with 300ms delay between batches
+    for (let i = 0; i < 50; i++) {
+      const options = { limit: 100 };
+      if (lastID) options.before = lastID;
+
+      let messages;
+      try {
+        messages = await channel.messages.fetch(options);
+      } catch (_) {
+        break; // rate limited or channel unavailable
+      }
+
+      if (!messages || messages.size === 0) break;
+
+      for (const [, msg] of messages) {
+        // Stop if we've gone past 7 days
+        if (msg.createdTimestamp < sevenDaysAgo) {
+          foundAny = true; // we found at least something in range
+          // We can't break the outer loop easily, but we'll stop processing
+          continue;
+        }
+
+        if (!msg.embeds || msg.embeds.length === 0) continue;
+
+        for (const embed of msg.embeds) {
+          if (embed.title !== 'Switch Round Summary') continue;
+          foundAny = true;
+
+          // Skip liberal-mode rounds
+          const mode = plugin._parseMode ? plugin._parseMode(embed) : null;
+          if (mode === 'liberal') continue;
+
+          totals.rounds++;
+
+          // Parse stats field — first locate the 📊 Stats field by name, then pass its value
+          const statsField = embed.fields?.find(f => f.name?.includes('Stats'));
+          if (plugin._parseRoundStatsField && statsField?.value) {
+            const stats = plugin._parseRoundStatsField(statsField.value);
+            totals.success += stats.success;
+            totals.failed += stats.failed;
+            totals.denied += stats.denied;
+            totals.toT1 += stats.toT1;
+            totals.toT2 += stats.toT2;
+          }
+
+          // Parse queue wait from the stats field: extract mean and median
+          // for the 7-day aggregate. Matches the format written by
+          // switch-output.js _buildRoundSummaryEmbed():
+          //   "**Queue Wait:** mean 2m 15s, median 3m 10s"
+          if (statsField?.value) {
+            const queueMatch = statsField.value.match(
+              /\*\*Queue Wait:\*\* mean\s*(?:(\d+)m )?(\d+)s, median\s*(?:(\d+)m )?(\d+)s/
+            );
+            if (queueMatch) {
+              const mm = queueMatch[3] ? parseInt(queueMatch[3], 10) : 0;
+              const ms = parseInt(queueMatch[4], 10);
+              totals.medianDurationsMs.push((mm * 60 + ms) * 1000);
+            }
+          }
+
+          // Parse move types
+          if (plugin._parseMoveTypes) {
+            const moves = plugin._parseMoveTypes(embed);
+            totals.instant += moves.instant;
+            totals.queueNormal += moves.queueNormal;
+            totals.queueTeamTrade += moves.queueTeamTrade;
+            totals.queueJoinSwap += moves.queueJoinSwap;
+            totals.queueTimeoutSwitch += moves.queueTimeoutSwitch;
+          }
+
+          // Parse denial reasons
+          if (plugin._parseDenialReasons) {
+            const reasons = plugin._parseDenialReasons(embed);
+            totals.denialCooldown += reasons.cooldown;
+            totals.denialTimeWindow += reasons.time_window;
+            totals.denialScrambleLock += reasons.scramble_lock;
+          }
+
+          // Parse queue outcomes
+          if (plugin._parseQueueOutcomes) {
+            const outcomes = plugin._parseQueueOutcomes(embed);
+            totals.outcomeExpired += outcomes.expired;
+            totals.outcomeDC += outcomes.dc;
+            totals.outcomeCancelled += outcomes.cancelled;
+            totals.outcomeRemoved += outcomes.removed;
+          }
+        }
+      }
+
+      // Track the oldest message ID for the next batch
+      const oldest = messages.last();
+      if (oldest) {
+        lastID = oldest.id;
+        // If the oldest message is older than 7 days, we're done
+        if (oldest.createdTimestamp < sevenDaysAgo) break;
+      } else {
+        break;
+      }
+
+      // Throttle: 300ms between batches
+      await new Promise(r => setTimeout(r, 300));
+    }
+
+    // If no data at all, return null (caller drops the embed)
+    if (!foundAny || totals.rounds === 0) return null;
+
+    // ── Compute statistics ────────────────────────────────────
+    // NOTE: "attempted" includes both successes and failures (switches that
+    // were processed but failed), but NOT denials (switches that were rejected
+    // at the eligibility gate). Denials are excluded because they represent
+    // players who were told "no" before any attempt was made — including them
+    // would make the success rate misleadingly low. The success rate reflects
+    // the system's reliability once a switch request is accepted.
+    const totalAttempted = totals.success + totals.failed;
+    const successRate = totalAttempted > 0 ? Math.round((totals.success / totalAttempted) * 100) : 0;
+    const instantRate = totals.success > 0 ? Math.round((totals.instant / totals.success) * 100) : 0;
+
+    // Median queue wait from accumulated durations
+    const globalMedianMs = plugin._computeMedianFromMs
+      ? plugin._computeMedianFromMs(totals.medianDurationsMs)
+      : 0;
+    const medMin = Math.floor(globalMedianMs / 60000);
+    const medSec = Math.round((globalMedianMs % 60000) / 1000);
+    const medianStr = medMin > 0
+      ? `${medMin} minute${medMin !== 1 ? 's' : ''}`
+      : medSec > 0 ? `${medSec} seconds` : 'N/A';
+
+    // Average queue wait from medianDurationsMs
+    const avgMs = totals.medianDurationsMs.length > 0
+      ? Math.round(totals.medianDurationsMs.reduce((a, b) => a + b, 0) / totals.medianDurationsMs.length)
+      : 0;
+    const avgMin = Math.floor(avgMs / 60000);
+    const avgSec = Math.round((avgMs % 60000) / 1000);
+    const avgStr = avgMin > 0
+      ? `about ${avgMin} minute${avgMin !== 1 ? 's' : ''}`
+      : avgSec > 0 ? `about ${avgSec} seconds` : 'N/A';
+
+    // ── Build plain-English sentences ─────────────────────────
+    const lines = [];
+
+    // Success rate
+    if (successRate >= 90) {
+      lines.push(`**${successRate}%** of attempted switches succeed.`);
+    } else if (successRate >= 75) {
+      lines.push(`**${successRate}%** of attempted switches succeed — most requests go through.`);
+    } else {
+      lines.push(`**${successRate}%** of attempted switches succeed.`);
+    }
+
+    lines.push('');
+
+    // Instant rate
+    if (instantRate >= 50) {
+      lines.push(`Most switches happen instantly — **${instantRate}%** go through the moment you type \`!switch\`, with no waiting at all.`);
+    } else if (instantRate > 0) {
+      lines.push(`**${instantRate}%** of switches happen instantly — the rest use the queue.`);
+    } else {
+      lines.push('Switches typically use the queue system.');
+    }
+
+    lines.push('');
+
+    // Queue wait
+    if (globalMedianMs > 0) {
+      lines.push(`When a queue wait is needed, the typical wait is **${medianStr}**. The average is **${avgStr}**.`);
+      lines.push('');
+    }
+
+    // Summary line
+    const totalSwitches = totals.success;
+    lines.push(`Based on **${totalSwitches}** successful switch${totalSwitches !== 1 ? 'es' : ''} across **${totals.rounds}** round${totals.rounds !== 1 ? 's' : ''}.`);
+
+    return {
+      title: '📊 !switch Reliability — Last 7 Days',
+      description: 'standard-mode rounds · updated every 30 min',
+      color: 0x3498DB,
+      fields: [
+        { name: '\u200B', value: lines.join('\n'), inline: false }
+      ],
+      footer: {
+        text: `Switch v${plugin.constructor.version} · updated`
+      },
+      timestamp: new Date().toISOString()
+    };
+  } catch (err) {
+    plugin.verbose(1, `[Explain] Failed to build 7-day stats embed: ${err.message}`);
+    return null;
+  }
+}
 
 export default SwitchExplain;

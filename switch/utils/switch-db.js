@@ -7,8 +7,9 @@
  *
  * S³ database surface for the Switch plugin: model definitions,
  * migration registration, settings persistence, cooldown cleanup,
- * and player lookup. Extracted from switch.js during the refactor
- * to keep the main plugin focused on orchestration.
+ * player lookup, and explain auto-update message ID persistence.
+ * Extracted from switch.js during the refactor to keep the main
+ * plugin focused on orchestration.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
@@ -16,7 +17,8 @@
  *   Singleton with a single async register(plugin) method.
  *   Must be called during _onS3Ready() after S³ DB is confirmed ready.
  *   Adds to plugin: timeLimitEnabled, _loadTimeLimitSetting,
- *   _saveTimeLimitSetting, cleanup, checkPlayer.
+ *   _saveTimeLimitSetting, _loadExplainMessageId,
+ *   _saveExplainMessageId, cleanup, checkPlayer.
  *   Also calls defineModel(), registerExpectedVersion(),
  *   registerMigrations(), and verifyAndRunMigrations() on the plugin.
  *
@@ -142,7 +144,7 @@ const SwitchDB = {
 
     // ── Migration Registration ─────────────────────────────────
 
-    plugin.registerExpectedVersion('switch', 3, {
+    plugin.registerExpectedVersion('switch', 4, {
       models: ['SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_Endmatches', 'SwitchPlugin_Settings']
     });
     plugin.registerMigrations('switch', [
@@ -289,6 +291,33 @@ const SwitchDB = {
             }
           }
         }
+      },
+      {
+        version: 4,
+        description: 'Add explainMessageId to SwitchPlugin_Settings for explain auto-update persistence',
+        touches: {
+          rows: [
+            { table: 'SwitchPlugin_Settings', key: 'explainMessageId' }
+          ]
+        },
+        up: async (qi) => {
+          const existing = await qi.showAllTables();
+          if (existing.includes('SwitchPlugin_Settings')) {
+            const rows = await qi.sequelize.query(
+              `SELECT key FROM "SwitchPlugin_Settings" WHERE key = 'explainMessageId'`,
+              { type: qi.sequelize.QueryTypes.SELECT, transaction: qi.transaction }
+            );
+            if (!rows || rows.length === 0) {
+              await qi.bulkInsert('SwitchPlugin_Settings', [{
+                key: 'explainMessageId',
+                value: ''
+              }]);
+            }
+          }
+        },
+        down: async (qi) => {
+          await qi.bulkDelete('SwitchPlugin_Settings', { key: 'explainMessageId' });
+        }
       }
     ]);
 
@@ -340,6 +369,57 @@ const SwitchDB = {
       });
       plugin.timeLimitEnabled = enabled;
       plugin.verbose(1, `[Switch] Time limit ${enabled ? 'enabled' : 'disabled'} via Discord admin command.`);
+    };
+
+    /**
+     * Loads the explainMessageId from SwitchPlugin_Settings.
+     * Parses the JSON value { channelID, messageID } and caches it on the plugin instance.
+     * Falls back to null if the setting is missing, empty, or the DB is unavailable.
+     */
+    plugin._loadExplainMessageId = async function () {
+      try {
+        const Settings = plugin._getModel('SwitchPlugin_Settings');
+        if (!Settings) {
+          plugin._cachedExplainMessageData = null;
+          return;
+        }
+        const row = await Settings.findByPk('explainMessageId');
+        if (row && row.value) {
+          try {
+            const parsed = JSON.parse(row.value);
+            if (parsed && parsed.channelID && parsed.messageID) {
+              plugin._cachedExplainMessageData = parsed;
+              plugin.verbose(2, `[Explain] Loaded stored explain message: channel=${parsed.channelID}, message=${parsed.messageID}`);
+              return;
+            }
+          } catch (_) { /* invalid JSON — reset */ }
+        }
+        plugin._cachedExplainMessageData = null;
+      } catch (err) {
+        plugin.verbose(1, `[Explain] Failed to load explain message ID: ${err.message}`);
+        plugin._cachedExplainMessageData = null;
+      }
+    };
+
+    /**
+     * Persists the explain message metadata to SwitchPlugin_Settings.
+     * Stores JSON { channelID, messageID } so the message can be edited in place
+     * across SquadJS restarts.
+     */
+    plugin._saveExplainMessageId = async function (channelID, messageID) {
+      const Settings = plugin._getModel('SwitchPlugin_Settings');
+      if (!Settings) {
+        throw new Error('SwitchPlugin_Settings model not available — DB may not be ready.');
+      }
+      const value = JSON.stringify({ channelID, messageID });
+      await plugin._withDb(async (t) => {
+        await Settings.upsert(
+          { key: 'explainMessageId', value },
+          { transaction: t }
+        );
+      });
+      plugin._cachedExplainMessageData = { channelID, messageID };
+      plugin.verbose(1, `[Explain] Saved explain message: channel=${channelID}, message=${messageID}`);
     };
 
     /**
@@ -411,6 +491,7 @@ const SwitchDB = {
     // ── Load persisted settings ────────────────────────────────
 
     await plugin._loadTimeLimitSetting();
+    await plugin._loadExplainMessageId();
   }
 };
 

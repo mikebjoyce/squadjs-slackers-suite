@@ -129,6 +129,15 @@ import SwitchExplain from '../utils/switch-explain.js';
  * - JOIN_WARN_DELAY_MS constant controls the delay before showing
  *   ChangeTeam-disabled warning to joining players (90s default).
  *
+ * ─── AUTO-UPDATING EXPLAIN CHANNEL ───────────────────────────────
+ *
+ * When explainChannelID is set, _initExplainAutoUpdate() is called
+ * during _onS3Ready() after DB registration. It posts (or edits) the
+ * full explain embed sequence plus a 7-day reliability stats embed to
+ * the designated channel, then starts a 30-minute refresh interval.
+ * The message ID is persisted in SwitchPlugin_Settings so it survives
+ * SquadJS restarts.
+ *
  * ─── COMMANDS ────────────────────────────────────────────────────
  *
  * Public (all players):
@@ -331,6 +340,11 @@ export default class Switch extends S3DiscordPluginBase {
                 description: 'Discord channel ID for admin commands. If not set, falls back to channelID (single-channel mode).',
                 default: ''
             },
+            explainChannelID: {
+                required: false,
+                description: 'Discord channel ID for auto-updating explain messages with 7-day stats. When set, explain embeds are posted to this channel on mount and refreshed periodically.',
+                default: ''
+            },
             // v2.2.0 Options
             queueTimeoutSwitchEnabled: {
                 required: false,
@@ -387,6 +401,15 @@ export default class Switch extends S3DiscordPluginBase {
         // v2.3.0 Stage 2: Seed presence tracking
         this._seedPresenceProcessing = false;  // re-entrancy guard for seed bonus checks
         this._wasSeedMode = false;             // track seed→non-seed transitions in _onLayerChanged
+
+        // ── Explain auto-update state ────────────────────────────
+        this._explainRefreshInterval = null;
+        this._explainMessage = null;       // cached Discord message object for editing
+        this._explainMessageID = null;
+        this._explainChannelID = null;
+        this._explainRefreshMinutes = 30;
+        this._cachedExplainMessageData = null; // { channelID, messageID } loaded from DB
+        this._explainRefreshing = false;   // re-entrancy guard for refresh interval
 
         this.broadcast = (msg) => { this.server.rcon.broadcast(msg); };
         this.warn = (id, msg) => {
@@ -477,6 +500,12 @@ export default class Switch extends S3DiscordPluginBase {
         // Then do async DB registration (can yield safely now)
         await SwitchDB.register(this);
 
+        // ── Auto-update explain channel ──────────────────────────
+        if (this.options.explainChannelID) {
+            await this._initExplainAutoUpdate().catch(err => {
+                this.verbose(1, `[Explain] Auto-update init failed: ${err.message}`);
+            });
+        }
 
         // Refresh interest is registered conditionally — only when the queue becomes
         // non-empty (see _enqueuePlayer), and unregistered when the queue empties
@@ -1214,6 +1243,15 @@ export default class Switch extends S3DiscordPluginBase {
             this._scheduledClearNotification = null;
         }
 
+        // ── Explain auto-update cleanup ──────────────────────────
+        if (this._explainRefreshInterval) {
+            clearInterval(this._explainRefreshInterval);
+            this._explainRefreshInterval = null;
+        }
+        this._explainMessage = null;
+        this._explainMessageID = null;
+        this._explainChannelID = null;
+
         this._scrambleHappened = false;
 
         this.server.removeListener('CHAT_MESSAGE', this.onChatMessage);
@@ -1541,6 +1579,127 @@ export default class Switch extends S3DiscordPluginBase {
             this.verbose(1, `[SeedPresence] Periodic check error: ${err.message}`);
         } finally {
             this._seedPresenceProcessing = false;
+        }
+    };
+
+    /**
+     * Initialize the explain auto-update feature.
+     * Posts (or edits) the full explain embed sequence + 7-day stats embed to
+     * the configured explain channel, then starts a periodic refresh interval.
+     *
+     * Called from _onS3Ready() when explainChannelID is configured.
+     */
+    _initExplainAutoUpdate = async function () {
+        const explainChannelID = this.options.explainChannelID;
+        if (!explainChannelID) return;
+
+        const discordClient = this.options.discordClient;
+        if (!discordClient) {
+            this.verbose(1, '[Explain] No Discord client available — cannot auto-update explain channel.');
+            return;
+        }
+
+        // Fetch the channel
+        let channel;
+        try {
+            channel = await discordClient.channels.fetch(explainChannelID);
+        } catch (err) {
+            this.verbose(1, `[Explain] Could not fetch explain channel ${explainChannelID}: ${err.message}`);
+            return;
+        }
+        if (!channel) return;
+
+        // Build the full embed sequence: 7 explain embeds + optional stats embed
+        const buildMessage = async () => {
+            const explainEmbeds = this._buildExplainMessages();
+            let statsEmbed = null;
+            try {
+                statsEmbed = await this._buildSevenDayStatsEmbed();
+            } catch (err) {
+                this.verbose(1, `[Explain] Stats embed generation failed (will be excluded): ${err.message}`);
+            }
+            const embeds = [...explainEmbeds];
+            if (statsEmbed) embeds.push(statsEmbed);
+            return embeds;
+        };
+
+        // Determine if we should edit an existing message or post a new one
+        const storedData = this._cachedExplainMessageData;
+        let message = null;
+
+        if (storedData && storedData.channelID === explainChannelID && storedData.messageID) {
+            try {
+                message = await channel.messages.fetch(storedData.messageID);
+            } catch (_) {
+                // 404 or other error — message was deleted, will post new
+                message = null;
+            }
+        }
+
+        try {
+            const embeds = await buildMessage();
+
+            if (message) {
+                // Edit existing message in place
+                await message.edit({ embeds });
+                this.verbose(1, `[Explain] Edited existing explain message ${message.id} in channel ${explainChannelID}.`);
+            } else {
+                // Post new message
+                message = await channel.send({ embeds });
+                this._explainMessageID = message.id;
+                this._explainChannelID = explainChannelID;
+                await this._saveExplainMessageId(explainChannelID, message.id);
+                this.verbose(1, `[Explain] Posted new explain message ${message.id} in channel ${explainChannelID}.`);
+            }
+
+            // Cache the message reference for refresh
+            this._explainMessage = message;
+
+            // Start periodic refresh interval
+            if (this._explainRefreshInterval) {
+                clearInterval(this._explainRefreshInterval);
+            }
+            this._explainRefreshInterval = setInterval(async () => {
+                // Re-entrancy guard: if a previous refresh cycle is still running
+                // (e.g. Discord rate limiting slowed the scrape), skip this tick.
+                // This prevents overlapping scrapes that could compound rate-limit
+                // issues or cause concurrent message edits.
+                if (this._explainRefreshing) return;
+                this._explainRefreshing = true;
+                try {
+                    const refreshedEmbeds = await buildMessage();
+                    if (this._explainMessage) {
+                        await this._explainMessage.edit({ embeds: refreshedEmbeds });
+                        this.verbose(2, '[Explain] Refreshed explain message.');
+                    } else {
+                        // Message reference lost — re-fetch from channel using stored message ID
+                        if (this._explainMessageID && channel) {
+                            try {
+                                const msg = await channel.messages.fetch(this._explainMessageID);
+                                if (msg) {
+                                    this._explainMessage = msg;
+                                    await msg.edit({ embeds: refreshedEmbeds });
+                                    this.verbose(2, '[Explain] Re-fetched and refreshed explain message.');
+                                }
+                            } catch (_) {
+                                this.verbose(1, '[Explain] Stored message no longer exists — stopping refresh.');
+                                if (this._explainRefreshInterval) {
+                                    clearInterval(this._explainRefreshInterval);
+                                    this._explainRefreshInterval = null;
+                                }
+                            }
+                        }
+                    }
+                } catch (err) {
+                    this.verbose(1, `[Explain] Refresh failed: ${err.message}`);
+                } finally {
+                    this._explainRefreshing = false;
+                }
+            }, this._explainRefreshMinutes * 60 * 1000);
+
+            this.verbose(1, `[Explain] Auto-update initialized. Refreshing every ${this._explainRefreshMinutes} minutes.`);
+        } catch (err) {
+            this.verbose(1, `[Explain] Failed to post/edit explain message: ${err.message}`);
         }
     };
 

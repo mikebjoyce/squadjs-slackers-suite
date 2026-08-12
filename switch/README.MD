@@ -23,6 +23,7 @@ Survives server restarts via any Sequelize-compatible database (SQLite, MySQL, P
 * **Token Bucket Cooldown** — players hold up to `maxSwitchTokens` (default 2) with individual per-token regeneration; set to 1 for legacy flat-cooldown behavior. Token-aware messaging adapts automatically based on the configured token count.
 * **Seed Bonus Tokens** — players earn bonus switch tokens (stacking above the normal cap) for time spent in seed-mode rounds.
 * **Dynamic Balance Tolerance** — interpolated extra imbalance slots when server is below full capacity
+* **Auto-Updating Explain Channel** — When `explainChannelID` is configured, the full `!switch explain` embed sequence plus a 7-day reliability stats embed is posted to the designated channel on mount and periodically refreshed in-place (every 30 minutes). Players always see current information without manual `!switch explain` re-runs.
 * **Enhanced `!switch stats`** — Discord aggregate embed with per-move-type counts, denial reason breakdowns, queue outcomes, liberal-mode filtering, and data quality warnings
 * **In-Game & Discord Admin Commands** — full admin controls via chat or Discord
 
@@ -176,6 +177,8 @@ squad-server/
 | `!switch stats [days]` | Scrape the last N days of round summaries and show an aggregate embed with movement types, denial reasons, queue outcomes, and data quality info |
 | `!switch help` | List all Discord admin commands |
 
+When `explainChannelID` is set, the full explain embed sequence plus a 7-day reliability stats embed is auto-posted to that channel on mount and refreshed in-place every 30 minutes — admins do not need to manually run `!switch explain` to keep it current.
+
 ---
 
 ## Handshake Integration
@@ -276,6 +279,7 @@ The Switch plugin supports splitting Discord traffic across two channels. Round 
 |--------|-------------|---------|
 | `discordChannelID` | Discord channel ID for automated reports (round summaries, scramble lockdown notifications). | `""` |
 | `adminCommandChannelID` | Discord channel ID for admin !switch commands. If not set, all traffic goes through `discordChannelID` (single-channel mode). | `""` |
+| `explainChannelID` | Discord channel ID for auto-updating explain messages with 7-day stats. When set, the full explain embed sequence plus reliability stats are posted to this channel on mount and refreshed every 30 minutes. | `""` |
 
 ### v2.0.0 Features
 
