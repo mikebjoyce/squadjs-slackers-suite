@@ -160,4 +160,4 @@ GitHub: https://github.com/mikebjoyce
 
 ---
 
-*Built for SquadJS — current as of 2026-07-20*
+*Built for SquadJS — current as of 2026-08-12*

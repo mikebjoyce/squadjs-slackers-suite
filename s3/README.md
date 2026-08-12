@@ -1,4 +1,4 @@
-# SlackersSquadServices (S³) Plugin v1.1.1
+# SlackersSquadServices (S³) Plugin v1.2.0
 
 **Centralised service container for shared state across SquadJS plugins**
 
@@ -173,4 +173,4 @@ GitHub: https://github.com/mikebjoyce
 
 ---
 
-*Built for SquadJS — current as of 2026-06-29*
+*Built for SquadJS — current as of 2026-08-12*
