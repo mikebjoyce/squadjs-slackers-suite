@@ -761,6 +761,22 @@ export default class DBService {
     }
     if (wasApplied) {
       this._pendingMigrations = []; // Clear pending — they're applied now
+      // Re-run live schema verification now that all plugins have registered
+      // their models AND migrations have been applied. The initial verifyLiveSchema()
+      // during mount() ran before any models were registered, so it could not
+      // detect drift. This second pass captures the actual post-migration state.
+      this.verifyLiveSchema().then(drift => {
+        this._lastDriftResult = drift;
+        if (drift.length > 0) {
+          for (const entry of drift) {
+            if (entry.missing) {
+              this.verboseLogger(1, `[DB] POST-MIGRATION DRIFT: ${entry.table} missing columns: ${entry.missing.join(', ')}`);
+            }
+          }
+        }
+      }).catch(err => {
+        this.verboseLogger(1, `[DB] Post-migration drift check failed: ${err.message}`);
+      });
     }
     this._migrationGate = null;
     this.verboseLogger(2, `[DB] Migration gate resolved (wasApplied=${wasApplied}). Consumer plugins unblocked.`);

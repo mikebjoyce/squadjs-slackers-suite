@@ -149,6 +149,12 @@ const SwitchDB = {
       {
         version: 1,
         description: 'Create SwitchPlugin_PlayerCooldowns and SwitchPlugin_Endmatches',
+        // touches added retroactively for DDL verification (migration engine v2.3.0).
+        // Migration logic is unchanged — the touches declaration enables _verifyMigrationResult()
+        // to confirm the tables actually exist after the migration commits.
+        touches: {
+          creates: ['SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_Endmatches']
+        },
         up: async (qi) => {
           const existing = await qi.showAllTables();
           if (!existing.includes('SwitchPlugin_PlayerCooldowns')) {
@@ -179,6 +185,9 @@ const SwitchDB = {
       {
         version: 2,
         description: 'Create SwitchPlugin_Settings table',
+        touches: {
+          creates: ['SwitchPlugin_Settings']
+        },
         up: async (qi) => {
           const existing = await qi.showAllTables();
           if (!existing.includes('SwitchPlugin_Settings')) {
@@ -199,6 +208,17 @@ const SwitchDB = {
       {
         version: 3,
         description: 'Add token bucket + seed bonus columns, truncate existing data (merged from original v3+v4 — never deployed separately)',
+        touches: {
+          columns: {
+            SwitchPlugin_PlayerCooldowns: [
+              'tokenBalance',
+              'tokenRegenAnchor',
+              'seedPresenceStart',
+              'lastSeedBonusRoundID',
+              'seedBonusTokensEarned'
+            ]
+          }
+        },
         up: async (qi) => {
           const existing = await qi.showAllTables();
           if (existing.includes('SwitchPlugin_PlayerCooldowns')) {

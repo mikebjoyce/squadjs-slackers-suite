@@ -259,8 +259,31 @@ export default class MigrationEngine {
         );
       }
 
-      // ── touches (optional — structural validation) ────────────────
-      if (m.touches !== undefined) {
+      // ── touches (required) ────────────────────────────────────────
+      // Every migration MUST declare the tables and columns it creates/alters.
+      // This enables _verifyMigrationResult() to confirm the DDL actually took
+      // effect after the migration commits, catching permission issues that would
+      // otherwise go unnoticed (e.g. silent ADD COLUMN failures when the MySQL
+      // user lacks ALTER TABLE privileges).
+      //
+      // Correct format:
+      //   touches: {
+      //     creates: ['TableA', 'TableB'],                        // new tables
+      //     columns: { TableA: ['col1', 'col2'] }                // columns on existing tables
+      //   }
+      //
+      // A migration that touches no schema (e.g. a pure data migration) should
+      // explicitly set touches: {} to indicate "intentionally no schema changes".
+      if (!m.touches || typeof m.touches !== 'object') {
+        throw new Error(
+          `Migration v${m.version} in "${pluginName}" is missing a "touches" declaration. ` +
+          `Add touches: { creates: ['TableName'], columns: { TableName: ['col1','col2'] } } ` +
+          `or touches: {} if the migration makes no schema changes.`
+        );
+      }
+
+      // ── touches structural validation ────────────────────────────
+      if (m.touches) {
         if (typeof m.touches !== 'object' || m.touches === null || Array.isArray(m.touches)) {
           throw new Error(
             `Migration v${m.version} in "${pluginName}": touches must be an object if provided.`
@@ -291,6 +314,7 @@ export default class MigrationEngine {
     }
 
     // Sort ascending by version
+
     const sorted = [...migrations].sort((a, b) => a.version - b.version);
 
     // Check for gaps only if there are existing registrations

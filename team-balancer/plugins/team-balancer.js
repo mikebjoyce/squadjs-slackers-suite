@@ -914,6 +914,9 @@ export default class TeamBalancer extends S3PluginBase {
         {
           version: 1,
           description: 'Create TeamBalancerState and TB_RoundReport',
+          touches: {
+            creates: ['TeamBalancerState', 'TB_RoundReport']
+          },
           // NOTE: v1 is the baseline migration for new installs. It MUST include ALL columns
           // that the current code expects — including columns added in later delta migrations
           // (like scrambleOnRoundEndBy from v2). If you add a column in a future vN migration,
@@ -970,6 +973,11 @@ export default class TeamBalancer extends S3PluginBase {
         {
           version: 2,
           description: 'Add scrambleOnRoundEndBy JSON column to TeamBalancerState for !scramble matchend persistence',
+          touches: {
+            columns: {
+              TeamBalancerState: ['scrambleOnRoundEndBy']
+            }
+          },
           // NOTE: This is a delta migration for existing installs that only have the v1 schema.
           // New installs get this column from v1's createTable, so we guard with describeTable()
           // to make this a safe no-op when the column already exists.

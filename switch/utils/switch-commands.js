@@ -696,13 +696,22 @@ const SwitchCommands = {
           }
         }
       } catch (err) {
-        // Track denied switch (only for unexpected errors — gameplay denials are tracked inline)
+        // Track denied switch (only for unexpected errors — gameplay denials are tracked inline).
+        // Reason is hardcoded to 'unexpected error' to prevent raw SQL/RCON error messages
+        // (e.g. "Unknown column 'tokenBalance' in 'field list'") from leaking into the
+        // Discord round summary embed. Full error details are logged via verbose() below.
+        // NOTE: This bypasses _trackDenial() — no per-player dedup. If the same player
+        // triggers multiple unexpected errors in one round, they'll appear multiple times.
         if (plugin._roundStats) {
           const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
           plugin._roundStats.deniedSwitches.push({
-            name: playerName || 'unknown',
+            // Use info.player?.name rather than playerName because playerName is declared with
+            // let inside the try block and may be undefined in the catch block if the error
+            // occurred before playerName was assigned (e.g. at the top-level eosID/steamID guard).
+            // info.player is always in scope since it's the function argument.
+            name: info.player?.name || 'unknown',
             eosID: eosID || 'unknown',
-            reason: err.message || 'unknown',
+            reason: 'unexpected error',
             gamePhase
           });
         }

@@ -381,6 +381,9 @@ export default class SmartAssign extends S3PluginBase {
             // SA_AssignmentLog AND drops the 4 orphan tables in a single step.
             version: 1,
             description: 'Create SA_AssignmentLog table + drop 4 orphan tables',
+            touches: {
+              creates: ['SA_AssignmentLog']
+            },
             up: async (qi) => {
               const existing = await qi.showAllTables();
               if (!existing.includes('SA_AssignmentLog')) {

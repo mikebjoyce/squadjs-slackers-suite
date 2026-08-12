@@ -336,6 +336,9 @@ export default class EloTracker extends S3PluginBase {
           // v1: create 4 tables (using plural names matching Sequelize defaults)
           version: 1,
           description: 'Create Elo_PluginStates, Elo_PlayerStats, Elo_RoundHistories, Elo_RoundPlayers',
+          touches: {
+            creates: ['Elo_PluginStates', 'Elo_PlayerStats', 'Elo_RoundHistories', 'Elo_RoundPlayers']
+          },
           up: async (qi) => {
             const existing = await qi.showAllTables();
 
