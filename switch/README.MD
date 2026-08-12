@@ -1,4 +1,4 @@
-# Switch Plugin v2.2.0
+# Switch Plugin v2.3.0
 
 **Team-change management with database persistence, TeamBalancer integration, and S³-aware player tracking.**
 
@@ -20,6 +20,8 @@ Survives server restarts via any Sequelize-compatible database (SQLite, MySQL, P
 * **End-of-Match Switches** — queue players for automatic team switching at round end
 * **Double-Switch** — swap to opposite team and back to fix game bugs without changing teams
 * **Liberal Mode Support** — relaxed switching rules during Seed/Jensen rounds
+* **Token Bucket Cooldown** — players hold up to `maxSwitchTokens` (default 2) with individual per-token regeneration; set to 1 for legacy flat-cooldown behavior. Token-aware messaging adapts automatically based on the configured token count.
+* **Seed Bonus Tokens** — players earn bonus switch tokens (stacking above the normal cap) for time spent in seed-mode rounds.
 * **Dynamic Balance Tolerance** — interpolated extra imbalance slots when server is below full capacity
 * **Enhanced `!switch stats`** — Discord aggregate embed with per-move-type counts, denial reason breakdowns, queue outcomes, liberal-mode filtering, and data quality warnings
 * **In-Game & Discord Admin Commands** — full admin controls via chat or Discord
@@ -104,7 +106,10 @@ Add the following to your SquadJS `config.json`:
     "dynamicBalancePlayerFloor": 85,
     "dynamicBalanceExtraSlots": 3,
     "queueTimeoutSwitchEnabled": true,
-    "queueTimeoutExtraSlots": 2
+    "queueTimeoutExtraSlots": 2,
+    "maxSwitchTokens": 2,
+    "seedTokenBonusAmount": 1,
+    "seedTokenBonusMinutes": 20
   }
 ]
 ```
@@ -188,7 +193,7 @@ The Switch plugin exposes a public API for external consumers (such as SmartAssi
 
 ### Version Compatibility
 
-- `static version = '2.2.0'` — public API with dual-array queue, timeout-switch feature, and enhanced stats.
+- `static version = '2.3.0'` — public API with dual-array queue, timeout-switch feature, token bucket system, seed bonus tokens, and enhanced stats.
 - Consumers should check `plugin.constructor.version` (wrapped in try/catch) and require `>= 2.0.0` before using the API.
 
 ### Consumer Discovery
@@ -211,13 +216,21 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 | Option | Description | Default |
 |--------|-------------|---------|
 | `commandPrefix` | Command prefix(es) to trigger switch | `["!switch", "!change"]` |
-| `switchCooldownHours` | Hours before player can switch again | `1.75` |
-| `switchCooldownMinutes` | Minutes before player can switch again (overrides hours if > 0) | `0` |
+| `switchCooldownHours` | Hours per-token refill interval. Each token regenerates individually after this duration. | `1.75` |
+| `switchCooldownMinutes` | Minutes per-token refill interval (overrides hours if > 0). Set to 0 to use hours only. | `0` |
 | `switchEnabledMinutes` | Time window (minutes) after join/match start to request a switch | `10` |
 | `queueTimeoutMinutes` | Minutes a player can wait in the switch queue before removal | `20` |
 | `maxUnbalancedSlots` | Max player difference between teams to allow a switch | `1` |
 | `switchToOldTeamAfterRejoin` | Auto-switch rejoining players to pre-disconnect team | `false` |
 | `scrambleLockdownDurationMinutes` | Duration to block switching after a scramble | `20` |
+
+### Token System (v2.3.0)
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `maxSwitchTokens` | Maximum number of switch tokens a player can hold. Each switch consumes 1 token; tokens regenerate individually over the cooldown interval. Set to 1 for legacy flat-cooldown behavior. | `2` |
+| `seedTokenBonusAmount` | Tokens granted per qualifying seed session. Added directly to tokenBalance (uncapped), stacking above the normal maximum. | `1` |
+| `seedTokenBonusMinutes` | Minutes a player must be present in a seed-mode round to qualify for the bonus token grant. | `20` |
 
 ### Queue Timeout Switch (v2.2.0)
 

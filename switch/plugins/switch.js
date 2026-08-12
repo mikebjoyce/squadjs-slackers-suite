@@ -1,3 +1,5 @@
+import Sequelize from 'sequelize';
+const { Op } = Sequelize;
 import S3DiscordPluginBase from './s3-discord-plugin-base.js';
 import { setTimeout as delay } from "timers/promises";
 import SwitchDB from '../utils/switch-db.js';
@@ -5,11 +7,12 @@ import SwitchDB from '../utils/switch-db.js';
 import SwitchOutput from '../utils/switch-output.js';
 import SwitchQueue from '../utils/switch-queue.js';
 import SwitchCommands from '../utils/switch-commands.js';
+import SwitchExplain from '../utils/switch-explain.js';
 
 
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SWITCH PLUGIN v2.2.0                       ║
+ * ║                    SWITCH PLUGIN v2.3.0                       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -163,7 +166,7 @@ import SwitchCommands from '../utils/switch-commands.js';
  *
  */
 export default class Switch extends S3DiscordPluginBase {
-    static version = '2.2.0';
+    static version = '2.3.0';
 
     static get description() {
         return "Switch plugin with persistent join timers";
@@ -343,6 +346,26 @@ export default class Switch extends S3DiscordPluginBase {
                 required: false,
                 description: 'Extra allowed team imbalance slots for timeout-triggered switches. Stacks on top of maxUnbalancedSlots and dynamic balance extras.',
                 default: 2
+            },
+            // ── v2.3.0 Options ─────────────────────────────────────
+            maxSwitchTokens: {
+                required: false,
+                description: 'Maximum number of switch tokens a player can hold. Each switch consumes 1 token; tokens regenerate individually over the cooldown interval. Set to 1 for legacy flat-cooldown behavior.',
+                default: 2,
+                type: 'number'
+            },
+            // ── Stage 2: Seed bonus token options ──────────────────
+            seedTokenBonusAmount: {
+                required: false,
+                description: 'Tokens granted per qualifying seed session. Added directly to tokenBalance (uncapped), stacking above the normal maximum.',
+                default: 1,
+                type: 'number'
+            },
+            seedTokenBonusMinutes: {
+                required: false,
+                description: 'Minutes a player must be present in a seed-mode round to qualify for the bonus token grant.',
+                default: 20,
+                type: 'number'
             }
         };
     }
@@ -367,6 +390,10 @@ export default class Switch extends S3DiscordPluginBase {
         this._switchedOnJoin = new Set();
         this._reconnectLockoutClearTimeouts = new Map();
 
+        // v2.3.0 Stage 2: Seed presence tracking
+        this._seedPresenceProcessing = false;  // re-entrancy guard for seed bonus checks
+        this._wasSeedMode = false;             // track seed→non-seed transitions in _onLayerChanged
+
         this.broadcast = (msg) => { this.server.rcon.broadcast(msg); };
         this.warn = (id, msg) => {
             if (!id) return;
@@ -381,6 +408,17 @@ export default class Switch extends S3DiscordPluginBase {
 
         // At this point S³ is discovered, ready, _s3db cached, and _onS3Ready() completed.
         // Wire event listeners — business logic, not S³ boilerplate.
+
+        // ── Option validation (clamp out-of-range values) ────────
+        if (this.options.maxSwitchTokens <= 0) {
+            this.verbose(1, `[Config] maxSwitchTokens=${this.options.maxSwitchTokens} is invalid — forcing to 1 (legacy flat-cooldown mode).`);
+            this.options.maxSwitchTokens = 1;
+        }
+        if (this.options.seedTokenBonusAmount < 0) {
+            this.verbose(1, `[Config] seedTokenBonusAmount=${this.options.seedTokenBonusAmount} is invalid — forcing to 0 (no seed bonus tokens).`);
+            this.options.seedTokenBonusAmount = 0;
+        }
+
         this._liberalModes = (this.options.liberalSwitchGameModes || ['Seed', 'Jensen']).map(m => String(m).toLowerCase());
         this._roundStats = this._initRoundStats();
         this._restartedThisRound = true;
@@ -392,6 +430,7 @@ export default class Switch extends S3DiscordPluginBase {
         this.server.on('S3_PLAYER_JOINED', this.onS3PlayerJoined);
         this.server.on('S3_PLAYER_LEFT', this.onS3PlayerLeft);
         this.server.on('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
+        this.server.on('S3_PLAYERS_UPDATED', this._onSeedPresenceCheck);
         if (this.options.discordClient) {
             this.options.discordClient.on('message', this.onDiscordMessage);
         }
@@ -440,6 +479,7 @@ export default class Switch extends S3DiscordPluginBase {
         SwitchOutput.register(this);
         SwitchQueue.register(this);
         SwitchCommands.register(this);
+        SwitchExplain.register(this);
         // Then do async DB registration (can yield safely now)
         await SwitchDB.register(this);
 
@@ -610,6 +650,98 @@ export default class Switch extends S3DiscordPluginBase {
          return 1;
      }
 
+    /**
+     * Lazy token regeneration — brings a player's token balance current
+     * based on elapsed time since tokenRegenAnchor.
+     *
+     * Algorithm (§3.1 of switch-token-system-spec):
+     *   room = max(0, maxSwitchTokens - tokenBalance)
+     *   if room > 0:
+     *       elapsedMs = now - tokenRegenAnchor
+     *       wholeIntervals = floor(elapsedMs / intervalMs)
+     *       regenerated = min(room, wholeIntervals)
+     *       if regenerated > 0:
+     *           tokenBalance += regenerated
+     *           tokenRegenAnchor += regenerated * intervalMs
+     *   else:
+     *       tokenRegenAnchor = now   # capped — don't accrue regen credit while at/above cap
+     *
+     * Critical: never clamps tokenBalance downward. Only ever adds, gated by room.
+     * This preserves balance sitting above cap from a seeding grant (Stage 2).
+     *
+     * @param {object} row — DB row with tokenBalance and tokenRegenAnchor (mutated in place)
+     * @returns {object} — the same row, mutated
+     */
+    _regenTokens(row) {
+        const maxTokens = this.options.maxSwitchTokens;
+        const intervalMs = this.options.switchCooldownMinutes > 0
+            ? this.options.switchCooldownMinutes * 60 * 1000
+            : this.options.switchCooldownHours * 60 * 60 * 1000;
+
+        // If cooldown is 0 (or negative), the token check in _checkSwitchEligibility()
+        // is never reached — it's gated behind `!this.isLiberalMode() && this.timeLimitEnabled`,
+        // and with no cooldown the time window check also passes. Tokens are effectively
+        // infinite in this configuration, so no regen is needed.
+        if (intervalMs <= 0) return row;
+
+        const now = Date.now();
+        const balance = row.tokenBalance != null ? row.tokenBalance : maxTokens;
+        const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : now;
+
+        const room = Math.max(0, maxTokens - balance);
+        if (room > 0) {
+            const elapsedMs = now - anchor;
+            if (elapsedMs > 0) {
+                const wholeIntervals = Math.floor(elapsedMs / intervalMs);
+                if (wholeIntervals > 0) {
+                    const regenerated = Math.min(room, wholeIntervals);
+                    row.tokenBalance = balance + regenerated;
+                    row.tokenRegenAnchor = new Date(anchor + regenerated * intervalMs);
+                }
+            }
+        } else {
+            // At or above cap — don't accrue regen credit
+            row.tokenRegenAnchor = new Date(now);
+        }
+
+        return row;
+    }
+
+    /**
+     * Spend one token. Runs _regenTokens() first for anchor correctness,
+     * then decrements tokenBalance. If this spend transitions from "at cap"
+     * to "below cap", starts the regen clock.
+     *
+     * The exact-equality check `row.tokenBalance === maxTokens - 1` is intentional:
+     *   - We only start the regen clock when this spend brought balance from
+     *     exactly-at-cap (balance === maxTokens) to below cap (balance === maxTokens - 1).
+     *   - We do NOT use `< maxTokens` because a seeding grant (Stage 2) could push
+     *     balance above cap (e.g. balance 3 with maxTokens=2). Spending from 3→2
+     *     is still at/above cap, so the anchor should NOT reset — the player still
+     *     has their full replenishment rate and shouldn't start a new regen cycle.
+     *   - The `else` path (all other cases) leaves tokenRegenAnchor alone because
+     *     an existing regen cycle is already running from a previous spend that
+     *     did cross the cap boundary.
+     *
+     * @param {object} row — DB row with tokenBalance and tokenRegenAnchor (mutated in place)
+     * @returns {object} — the same row, mutated
+     */
+    _spendToken(row) {
+        this._regenTokens(row);
+        const maxTokens = this.options.maxSwitchTokens;
+        const balance = row.tokenBalance != null ? row.tokenBalance : maxTokens;
+
+        row.tokenBalance = Math.max(0, balance - 1);
+
+        // If this spend brought balance from "at cap" to "below cap", start regen clock
+        if (row.tokenBalance === maxTokens - 1) {
+            row.tokenRegenAnchor = new Date(Date.now());
+        }
+        // Otherwise leave tokenRegenAnchor alone — an existing regen cycle is already running
+
+        return row;
+    }
+
     async _checkSwitchEligibility(player) {
         const eosID = player?.eosID;
         if (!eosID) return { eligible: false, reason: 'missing_eos' };
@@ -618,6 +750,7 @@ export default class Switch extends S3DiscordPluginBase {
         const cooldownData = PlayerCooldowns ? await PlayerCooldowns.findByPk(eosID) : null;
         const now = Date.now();
 
+        // Scramble lock is an independent override — token availability never overrides it
         if (cooldownData && cooldownData.scrambleLockdownExpiry && new Date(cooldownData.scrambleLockdownExpiry).getTime() > now) {
             const remaining = Math.ceil((new Date(cooldownData.scrambleLockdownExpiry).getTime() - now) / 60000);
             return { eligible: false, reason: 'scramble_lock', remaining };
@@ -632,16 +765,24 @@ export default class Switch extends S3DiscordPluginBase {
                 return { eligible: false, reason: 'time_window' };
             }
 
-            const cooldownDuration = this.options.switchCooldownMinutes > 0
-                ? this.options.switchCooldownMinutes * 60 * 1000
-                : this.options.switchCooldownHours * 60 * 60 * 1000;
+            // ── Token bucket check (replaces flat cooldown comparison) ──
+            // Build a plain object (not a Sequelize model instance) and pass it
+            // to _regenTokens(). This is safe because _regenTokens() only reads
+            // and writes .tokenBalance and .tokenRegenAnchor — it never calls
+            // Sequelize methods on the object.
+            const row = cooldownData
+                ? { tokenBalance: cooldownData.tokenBalance, tokenRegenAnchor: cooldownData.tokenRegenAnchor }
+                : { tokenBalance: this.options.maxSwitchTokens, tokenRegenAnchor: null };
 
-            if (cooldownData && cooldownData.lastSwitchTimestamp) {
-                const lastSwitchTime = new Date(cooldownData.lastSwitchTimestamp).getTime();
-                if (now - lastSwitchTime < cooldownDuration) {
-                    const remaining = Math.ceil((cooldownDuration - (now - lastSwitchTime)) / 60000);
-                    return { eligible: false, reason: 'cooldown', remaining };
-                }
+            this._regenTokens(row);
+
+            if (row.tokenBalance < 1) {
+                const intervalMs = this.options.switchCooldownMinutes > 0
+                    ? this.options.switchCooldownMinutes * 60 * 1000
+                    : this.options.switchCooldownHours * 60 * 60 * 1000;
+                const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : now;
+                const remaining = Math.ceil((intervalMs - (now - anchor)) / 60000);
+                return { eligible: false, reason: 'cooldown', remaining };
             }
         }
 
@@ -664,6 +805,14 @@ export default class Switch extends S3DiscordPluginBase {
      * Clears cooldown and scramble lockdown for a reconnecting player
      * found on the wrong team. Called immediately (no delay) so the
      * player can !switch back without restriction.
+     *
+     * NOTE: lastSwitchTimestamp is an obsolete column (kept for
+     * expand-contract migration safety). All write sites now use
+     * tokenBalance/tokenRegenAnchor. The hadCooldown_obsolete check
+     * below reads the old column for completeness during the transition
+     * period, but post-migration-v3 rows will always have
+     * lastSwitchTimestamp === null. The token-aware check using
+     * tokenBalance < maxSwitchTokens is the real cooldown indicator.
      */
     async _clearReconnectLockouts(eosID, name, previousTeamID) {
         const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
@@ -672,24 +821,33 @@ export default class Switch extends S3DiscordPluginBase {
         const row = await PlayerCooldowns.findByPk(eosID);
         if (!row) return;
 
-        const hadCooldown = row.lastSwitchTimestamp != null;
+        const maxTokens = this.options.maxSwitchTokens;
+        const hadCooldown_obsolete = row.lastSwitchTimestamp != null;
+        const hasTokenDebt = row.tokenBalance != null && row.tokenBalance < maxTokens;
         const now = Date.now();
         const hadScrambleLock = row.scrambleLockdownExpiry != null
             && new Date(row.scrambleLockdownExpiry).getTime() > now;
 
-        if (!hadCooldown && !hadScrambleLock) return;
+        if (!hadCooldown_obsolete && !hasTokenDebt && !hadScrambleLock) return;
 
         await this._withDb(async (t) => {
             await PlayerCooldowns.update(
-                { lastSwitchTimestamp: null, scrambleLockdownExpiry: null },
+                {
+                    lastSwitchTimestamp: null,
+                    tokenBalance: maxTokens,
+                    tokenRegenAnchor: null,
+                    scrambleLockdownExpiry: null
+                },
                 { where: { eosID }, transaction: t }
             );
         });
 
-        const reason = [hadCooldown && 'cooldown', hadScrambleLock && 'scramble lock']
-            .filter(Boolean).join(' and ');
+        const reasons = [];
+        if (hadCooldown_obsolete) reasons.push('legacy cooldown');
+        if (hasTokenDebt) reasons.push('token cooldown');
+        if (hadScrambleLock) reasons.push('scramble lock');
         this.verbose(1,
-            `[Reconnect] ${name || eosID}: cleared ${reason} — stranded on current team, previous was T${previousTeamID}`
+            `[Reconnect] ${name || eosID}: cleared ${reasons.join(' and ')} — stranded on current team, previous was T${previousTeamID}`
         );
     }
 
@@ -984,6 +1142,48 @@ export default class Switch extends S3DiscordPluginBase {
             this._reconnectLockoutClearTimeouts.set(eosID, msgTimeout);
         }
 
+        // v2.3.0 Stage 2: If server is in seed mode, set seedPresenceStart for this player
+        // so they can earn a seed bonus token. Preserves existing seedPresenceStart
+        // (e.g. rejoin during same seed session — cumulative time). Does NOT reset
+        // seedBonusTokensEarned — a reconnecting player keeps their pre-disconnect
+        // accumulated count for the current seed session.
+        //
+        // NOTE: The findByPk + conditional create pattern has a theoretical TOCTOU race:
+        // if two S3_PLAYER_JOINED events for the same eosID fire concurrently (e.g. during
+        // rapid reconnect), the second create() would throw a Sequelize UniqueConstraintError.
+        // This is caught by the outer try/catch and is harmless — the second event is a
+        // no-op (the row already exists, and seedPresenceStart was already set by the first).
+        // We accept this race rather than introducing a full findOrCreate/try-catch wrapper
+        // because the window is extremely narrow and the consequence is a single spurious
+        // verbose log line.
+        try {
+            if (this._s3?.gameState?.isSeedMode?.()) {
+                const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+                if (PlayerCooldowns) {
+                    const row = await PlayerCooldowns.findByPk(eosID);
+                    if (!row) {
+                        await PlayerCooldowns.create({
+                            eosID,
+                            steamID: data.player?.steamID || null,
+                            playerName: name,
+                            tokenBalance: this.options.maxSwitchTokens,
+                            seedPresenceStart: new Date()
+                        });
+                        this.verbose(2, `[SeedPresence] ${name}: joined during seed mode — created row with seedPresenceStart.`);
+                    } else if (!row.seedPresenceStart) {
+                        await PlayerCooldowns.update(
+                            { seedPresenceStart: new Date() },
+                            { where: { eosID } }
+                        );
+                        this.verbose(2, `[SeedPresence] ${name}: joined during seed mode — set seedPresenceStart.`);
+                    }
+                    // else: seedPresenceStart already set — cumulative across reconnects
+                }
+            }
+        } catch (err) {
+            this.verbose(1, `[SeedPresence] Error setting seedPresenceStart for ${name || eosID}: ${err.message}`);
+        }
+
         // v2.0.0: Schedule delayed join-warn if ChangeTeam is disabled
         this._scheduleJoinWarn(eosID);
 
@@ -1062,6 +1262,7 @@ export default class Switch extends S3DiscordPluginBase {
         this.server.removeListener('S3_PLAYER_JOINED', this.onS3PlayerJoined);
         this.server.removeListener('S3_PLAYER_LEFT', this.onS3PlayerLeft);
         this.server.removeListener('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
+        this.server.removeListener('S3_PLAYERS_UPDATED', this._onSeedPresenceCheck);
         if (this.options.discordClient) this.options.discordClient.removeListener('message', this.onDiscordMessage);
         this._clearAllQueueEntries('Plugin unmount');
         this.verbose(1, 'Switch plugin was un-mounted.');
@@ -1099,6 +1300,288 @@ export default class Switch extends S3DiscordPluginBase {
 
         return ret[ 0 ];
     }
+
+    // ── Stage 2: Seed bonus token methods ─────────────────────────
+
+    /**
+     * Initialize seedPresenceStart for all currently connected players.
+     * Called when transitioning from non-seed → seed on a layer change (§4.2).
+     * Only sets seedPresenceStart if the player doesn't already have one
+     * (preserves cumulative tracking across reconnects).
+     *
+     * Player source: uses S³'s getAllPlayers() when available (authoritative,
+     * includes null-teamID entries during staging), falls back to
+     * this.server.players. The fallback path is a degraded-mode safety net
+     * that may include stale entries or players with teamID === null during
+     * the staging window — acceptable because the consequence is setting
+     * seedPresenceStart on a temporarily-stale entry, which is harmless
+     * (the entry will either resolve to a real player or be cleaned up on
+     * disconnect).
+     */
+    _initSeedPresenceForAll = async function () {
+        const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+        if (!PlayerCooldowns) return;
+
+        const allPlayers = this._s3?.players?.isReady?.()
+            ? this._s3.players.getAllPlayers()
+            : this.server.players;
+
+        if (!allPlayers || allPlayers.length === 0) return;
+
+        // NOTE: This uses an N+1 query pattern (one findByPk per player) which is
+        // acceptable because layer transitions are infrequent (once per round).
+        // If it becomes a bottleneck, optimize with a bulk findAll + batch upsert.
+        let count = 0;
+        for (const p of allPlayers) {
+            if (!p.eosID) continue;
+            try {
+                const row = await PlayerCooldowns.findByPk(p.eosID);
+                if (!row) {
+                    // New seed session — reset seedBonusTokensEarned counter
+                    await PlayerCooldowns.create({
+                        eosID: p.eosID,
+                        steamID: p.steamID || null,
+                        playerName: p.name,
+                        tokenBalance: this.options.maxSwitchTokens,
+                        seedPresenceStart: new Date(),
+                        seedBonusTokensEarned: 0
+                    });
+                    count++;
+                } else if (!row.seedPresenceStart) {
+                    // Existing row, no active presence — reset counter for new seed session
+                    await PlayerCooldowns.update(
+                        { seedPresenceStart: new Date(), seedBonusTokensEarned: 0 },
+                        { where: { eosID: p.eosID } }
+                    );
+                    count++;
+                }
+                // else: seedPresenceStart already set — cumulative tracking, preserve earned count
+            } catch (err) {
+                this.verbose(1, `[SeedPresence] Error initing seed presence for ${p.name || p.eosID}: ${err.message}`);
+            }
+        }
+        this.verbose(1, `[SeedPresence] Initialized seed presence for ${count} players on seed layer transition.`);
+    };
+
+    /**
+     * Grant a consolation seed bonus token on seed→non-seed transition.
+     * Called when transitioning from seed → non-seed on a layer change (§4.1b).
+     * This is the "short seed round" safety net — players who didn't earn any
+     * bonus tokens via the periodic check still get +1 when the seed round ends.
+     *
+     * Consolation-only: only players with seedBonusTokensEarned == 0 qualify.
+     * Players who already earned via _checkSeedBonusGrants are excluded — no
+     * doubling up. Grants exactly 1 token (not seedTokenBonusAmount, which is
+     * the per-round _cap_ on periodic grants, not a lump sum).
+     *
+     * Sets lastSeedBonusRoundID to the current matchId (preventing repeat grants
+     * within the same seed session), nulls seedPresenceStart (round is over).
+     *
+     * Uses an atomic UPDATE with WHERE clause as the compare-and-swap defense
+     * against the race with _checkSeedBonusGrants (§4.1a path). Both methods
+     * target the same rows (seedPresenceStart != null AND not-yet-granted) but
+     * the atomic WHERE ensures only one can win per row — no double-grant even
+     * if both fire simultaneously for the same matchId. The _seedPresenceProcessing
+     * re-entrancy guard (shared with _onSeedPresenceCheck) further prevents
+     * concurrent DB scans between the two paths.
+     */
+    _grantSeedBonusOnTransition = async function () {
+        if (this._seedPresenceProcessing) return;
+        this._seedPresenceProcessing = true;
+
+        try {
+            const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+            if (!PlayerCooldowns) return;
+
+            const currentMatchId = this._s3?.gameState?.getMatchId?.() || null;
+            const bonusAmount = this.options.seedTokenBonusAmount;
+            if (bonusAmount <= 0) return;
+
+            // Atomic UPDATE: consolation grant — only players who earned ZERO bonus
+            // tokens during the seed round (seedBonusTokensEarned == 0) get the
+            // transition grant. Players who already earned via the periodic check
+            // are excluded — no doubling up.
+            //
+            // seedPresenceStart is nulled (not reset to NOW like the periodic check)
+            // because the seed round is ending — no more presence time to accrue.
+            //
+            // Uses Sequelize.literal for the additive tokenBalance increment since
+            // the addition is safe (integer, no user input).
+            const [grantCount] = await PlayerCooldowns.update(
+                {
+                    tokenBalance: Sequelize.literal('tokenBalance + 1'),
+                    seedBonusTokensEarned: Sequelize.literal('seedBonusTokensEarned + 1'),
+                    seedPresenceStart: null,
+                    lastSeedBonusRoundID: currentMatchId
+                },
+                {
+                    where: {
+                        seedPresenceStart: { [Op.ne]: null },
+                        seedBonusTokensEarned: 0,
+                        [Op.or]: [
+                            { lastSeedBonusRoundID: null },
+                            { lastSeedBonusRoundID: { [Op.ne]: currentMatchId || '' } }
+                        ]
+                    }
+                }
+            );
+
+            if (grantCount > 0) {
+                this.verbose(1, `[SeedPresence] Granted +1 seed bonus token to ${grantCount} players on seed→non-seed transition (consolation).`);
+                // Notify players they earned a bonus token.
+                // NOTE: The follow-up findAll runs outside the atomic UPDATE, so there's
+                // a theoretical race where _checkSeedBonusGrants could modify rows
+                // between the UPDATE and this read. The consequence is a missed notification
+                // (not a missed grant), which is acceptable.
+                try {
+                  const grantedRows = await PlayerCooldowns.findAll({
+                    where: { lastSeedBonusRoundID: currentMatchId },
+                    attributes: ['eosID', 'playerName', 'tokenBalance']
+                  });
+                  for (const row of grantedRows) {
+                    if (row.eosID) {
+                      this.warn(row.eosID,
+                        `[Switch] Seed bonus — you earned +1 switch token for helping seed (round ended). You now have ${row.tokenBalance} tokens.`
+                      );
+                    }
+                  }
+                } catch (notifyErr) {
+                  this.verbose(1, `[SeedPresence] Error notifying players of seed bonus: ${notifyErr.message}`);
+                }
+            }
+        } catch (err) {
+            this.verbose(1, `[SeedPresence] Error granting seed bonus on transition: ${err.message}`);
+        } finally {
+            this._seedPresenceProcessing = false;
+        }
+    };
+
+    /**
+     * Check for seed mode players who have accumulated enough presence time
+     * to qualify for a seed bonus token (§4.1a). Called periodically via
+     * _onSeedPresenceCheck from S3_PLAYERS_UPDATED while in seed mode.
+     *
+     * Grants exactly 1 token per qualifying chunk of presence time. Each grant
+     * increments seedBonusTokensEarned; the WHERE `seedBonusTokensEarned < bonusCap`
+     * condition prevents exceeding the per-round cap (seedTokenBonusAmount).
+     * seedPresenceStart is reset to NOW (not nulled) so the player can earn
+     * another +1 after another thresholdMs of presence — this is the multi-grant
+     * mechanic. seedPresenceStart is only set to null on seed→non-seed transition
+     * (see _grantSeedBonusOnTransition).
+     *
+     * Uses an atomic UPDATE with WHERE clause as the compare-and-swap defense
+     * against the race with _grantSeedBonusOnTransition (§4.1b path). Both methods
+     * target the same rows (seedPresenceStart != null) but the atomic WHERE ensures
+     * only one can win per row — no double-grant even if both fire simultaneously
+     * for the same matchId. The _seedPresenceProcessing re-entrancy guard (shared
+     * via _onSeedPresenceCheck) further prevents concurrent DB scans between the
+     * two paths.
+     *
+     * The WHERE clause filters to rows where seedPresenceStart IS NOT NULL AND
+     * threshold met AND seedBonusTokensEarned < bonusCap AND (lastSeedBonusRoundID
+     * IS NULL OR != currentMatchId). This is a single atomic operation — no per-row
+     * loop, no separate read-then-write race window.
+     */
+    _checkSeedBonusGrants = async function () {
+        const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+        if (!PlayerCooldowns) return;
+
+        const currentMatchId = this._s3?.gameState?.getMatchId?.() || null;
+        const bonusMinutes = this.options.seedTokenBonusMinutes;
+        const bonusCap = this.options.seedTokenBonusAmount;
+        const thresholdMs = bonusMinutes * 60 * 1000;
+        if (bonusCap <= 0) return;
+
+        const now = Date.now();
+
+        try {
+            // Atomic UPDATE: grants +1 token per qualifying chunk of seed presence time.
+            // Each grant increments seedBonusTokensEarned by 1; the WHERE clause
+            // ensures we never exceed the per-round cap (seedTokenBonusAmount).
+            //
+            // seedPresenceStart is reset to NOW (not nulled) so the player can earn
+            // another +1 after another thresholdMs of presence — this is the multi-grant
+            // mechanic. seedPresenceStart is only set to null on seed→non-seed transition
+            // (see _grantSeedBonusOnTransition).
+            //
+            // Uses Sequelize.literal for the additive tokenBalance increment since
+            // the addition is safe (integer, no user input).
+            const [grantCount] = await PlayerCooldowns.update(
+                {
+                    tokenBalance: Sequelize.literal('tokenBalance + 1'),
+                    seedBonusTokensEarned: Sequelize.literal('seedBonusTokensEarned + 1'),
+                    seedPresenceStart: new Date(now),
+                    lastSeedBonusRoundID: currentMatchId
+                },
+                {
+                    where: {
+                        seedPresenceStart: {
+                            [Op.ne]: null,
+                            [Op.lte]: new Date(now - thresholdMs)
+                        },
+                        seedBonusTokensEarned: { [Op.lt]: bonusCap },
+                        [Op.or]: [
+                            { lastSeedBonusRoundID: null },
+                            { lastSeedBonusRoundID: { [Op.ne]: currentMatchId || '' } }
+                        ]
+                    }
+                }
+            );
+
+            if (grantCount > 0) {
+                this.verbose(1, `[SeedPresence] Granted +1 seed bonus token to ${grantCount} players via periodic check.`);
+                // Notify players they earned a bonus token.
+                // NOTE: The follow-up findAll runs outside the atomic UPDATE, so there's
+                // a theoretical race where _grantSeedBonusOnTransition could modify rows
+                // between the UPDATE and this read. The consequence is a missed notification
+                // (not a missed grant), which is acceptable.
+                try {
+                  const grantedRows = await PlayerCooldowns.findAll({
+                    where: { lastSeedBonusRoundID: currentMatchId },
+                    attributes: ['eosID', 'playerName', 'tokenBalance', 'seedBonusTokensEarned']
+                  });
+                  for (const row of grantedRows) {
+                    if (row.eosID) {
+                      this.warn(row.eosID,
+                        `[Switch] Seed bonus — you earned +1 switch token for helping seed. You now have ${row.tokenBalance} tokens (${row.seedBonusTokensEarned}/${bonusCap} bonus tokens earned this round).`
+                      );
+                    }
+                  }
+                } catch (notifyErr) {
+                  this.verbose(1, `[SeedPresence] Error notifying players of seed bonus: ${notifyErr.message}`);
+                }
+            }
+        } catch (err) {
+            this.verbose(1, `[SeedPresence] Error in seed bonus check: ${err.message}`);
+        }
+    };
+
+    /**
+     * Periodic check wrapper for seed bonus grants.
+     * Called from S3_PLAYERS_UPDATED listener (registered unconditionally in mount()).
+     *
+     * The listener is registered unconditionally (not gated on queue state like the
+     * queue's periodic processing) because seed mode can start/stop independently of
+     * queue activity. The isSeedMode() guard below makes it a cheap no-op outside
+     * seed mode — the handler returns immediately without any DB access.
+     *
+     * Uses a re-entrancy guard (_seedPresenceProcessing) to prevent concurrent DB
+     * scans. This guard is shared with _grantSeedBonusOnTransition, so if a
+     * layer-change fires during a periodic check the transition path waits for the
+     * periodic check to finish before proceeding, avoiding unnecessary DB contention.
+     */
+    _onSeedPresenceCheck = async function () {
+        if (this._seedPresenceProcessing) return;
+        if (!this._s3?.gameState?.isSeedMode?.()) return;
+        this._seedPresenceProcessing = true;
+        try {
+            await this._checkSeedBonusGrants();
+        } catch (err) {
+            this.verbose(1, `[SeedPresence] Periodic check error: ${err.message}`);
+        } finally {
+            this._seedPresenceProcessing = false;
+        }
+    };
 
     /**
      * onScrambleExecuted — Handles TEAM_BALANCER_SCRAMBLE_EXECUTED event.

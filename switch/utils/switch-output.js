@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║              SWITCH PLUGIN — OUTPUT LAYER                     ║
+ * ║              SWITCH PLUGIN v2.3.0 — OUTPUT LAYER               ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -178,12 +178,23 @@ const SwitchOutput = {
         clearInterval(plugin._broadcastTimers.genericInfoTimer);
         plugin._broadcastTimers.genericInfoTimer = null;
       }
+      // seedBonusTimer was removed as part of the broadcast consolidation —
+      // the incentive broadcast was merged into the primary 5-minute message.
     };
 
     /**
      * Start periodic liberal-mode (Seed/Jensen) broadcast timer.
      * Runs every 5 minutes while the round is active.
      * Called from onNewGame() when isLiberalMode() is true.
+     *
+     * Seed bonus messaging is gated on isSeedMode() AND seedTokenBonusAmount > 0,
+     * NOT on maxSwitchTokens > 1 — the two are independent config options.
+     * On Jensen/Training (liberal but not seed), the fallback message simply says
+     * switches are unrestricted, without mentioning token earning.
+     *
+     * Previously there was a separate 10-minute "incentive" broadcast for seed
+     * bonus reminders. It was removed as redundant — the primary 5-minute broadcast
+     * now carries the complete seed bonus message.
      */
     plugin._startLiberalBroadcastTimers = function () {
       if (!plugin.options.broadcastSwitchWindowMessages) return;
@@ -192,9 +203,21 @@ const SwitchOutput = {
 
       plugin._clearBroadcastTimers();
 
+      // Broadcast: seed mode status or legacy fallback
+      // Gated on isSeedMode() (not isLiberalMode()) to avoid showing seed bonus
+      // messages during Jensen/Training rounds where the mechanic doesn't apply.
       plugin._broadcastTimers.reminderInterval = setInterval(() => {
-        plugin.broadcast(`[Switch] No cooldown restrictions on this game mode. Use '!switch' to change teams anytime.`);
+        const isSeed = plugin._s3?.gameState?.isSeedMode?.() || false;
+        const bonusAmount = plugin.options.seedTokenBonusAmount;
+        if (isSeed && bonusAmount > 0) {
+          plugin.broadcast(`[Switch] Seed mode — switches are free (no token cost), and you earn +1 bonus switch token for every ${plugin.options.seedTokenBonusMinutes}m of helping seed (up to ${bonusAmount} per round). Use '!switch check' to see your balance.`);
+        } else {
+          plugin.broadcast(`[Switch] No cooldown restrictions on this game mode. Use '!switch' to change teams anytime.`);
+        }
       }, intervalMs);
+
+      // NOTE: A separate 10-minute incentive broadcast was removed as redundant.
+      // The primary 5-minute broadcast above carries the complete seed bonus message.
     };
 
     /**
@@ -258,6 +281,27 @@ const SwitchOutput = {
         return (gameMode || '').toLowerCase().includes(candidate) ||
                (layerName || '').toLowerCase().includes(candidate);
       });
+
+      // v2.3.0 Stage 2: Detect seed→non-seed transitions for bonus token grants
+      const isSeed = plugin._s3?.gameState?.isSeedMode?.() || false;
+      const wasSeed = plugin._wasSeedMode;
+      plugin._wasSeedMode = isSeed;
+
+      // If transitioning from seed to non-seed, grant bonus tokens to all
+      // players who were present during the seed round (§4.1b).
+      if (wasSeed && !isSeed) {
+        plugin._grantSeedBonusOnTransition().catch(err => {
+          plugin.verbose(1, `[SeedPresence] Error granting seed bonus on transition: ${err.message}`);
+        });
+      }
+
+      // If transitioning into seed from non-seed, init seedPresenceStart for all
+      // currently connected players (§4.2).
+      if (!wasSeed && isSeed) {
+        plugin._initSeedPresenceForAll().catch(err => {
+          plugin.verbose(1, `[SeedPresence] Error initing seed presence for all: ${err.message}`);
+        });
+      }
 
       plugin._clearBroadcastTimers();
 
@@ -588,14 +632,13 @@ const SwitchOutput = {
         if (PlayerCooldowns) {
           totalStoredPlayers = await PlayerCooldowns.count();
 
-          const cooldownDurationMs = plugin.options.switchCooldownMinutes > 0 ? plugin.options.switchCooldownMinutes * 60 * 1000 : plugin.options.switchCooldownHours * 60 * 60 * 1000;
-          const cooldownCutoff = new Date(Date.now() - cooldownDurationMs);
+          const maxTokens = plugin.options.maxSwitchTokens;
 
           activeLocks = await PlayerCooldowns.count({
             where: {
               [Op.or]: [
                 { scrambleLockdownExpiry: { [Op.gt]: new Date() } },
-                { lastSwitchTimestamp: { [Op.gt]: cooldownCutoff } }
+                { tokenBalance: { [Op.lt]: maxTokens } }
               ]
             }
           });
@@ -691,12 +734,15 @@ const SwitchOutput = {
       // true between round end and layer resolution.
       const scrambleMinutes = plugin.options.scrambleLockdownDurationMinutes;
       configLines.push(`**Scramble Lockdown:** ${scrambleMinutes} min per player`);
+      // v2.3.0: Show token bucket config
+      const maxTokens = plugin.options.maxSwitchTokens;
+      configLines.push(`**Switch Tokens:** ${maxTokens}`);
       // Cooldown duration is a static config value — show it here alongside
       // the other durations (Scramble Lockdown, Queue Timeout) for consistency.
       const cooldownDurationLabel = plugin.options.switchCooldownMinutes > 0
         ? `${plugin.options.switchCooldownMinutes} min`
         : `${plugin.options.switchCooldownHours}h`;
-      configLines.push(`**Cooldown Duration:** ${cooldownDurationLabel}`);
+      configLines.push(`**Token Refill:** ${cooldownDurationLabel} per token`);
       // "AllowTeamChanges" = RCON AllowTeamChanges setting. When off, players
       // cannot use the in-game scoreboard to swap teams — they must use !switch.
       configLines.push(`**AllowTeamChanges:** ${plugin._changeTeamDisabled ? 'Off' : 'On'}`);
@@ -738,18 +784,18 @@ const SwitchOutput = {
         }
       }
 
-      // ── Cooldown statistics ──
+      // ── Cooldown statistics (token-aware) ──
       //
       // NOTE: This block duplicates much of the query logic in getDiagnosticInfo()
       // (above). The two methods serve different callers (Discord embed vs. general
       // health check) and have slightly different output shapes. If the table schema
       // changes, update both methods.
+      // maxTokens is already declared above in the Config section
       const cooldownDurationMs = plugin.options.switchCooldownMinutes > 0
         ? plugin.options.switchCooldownMinutes * 60 * 1000
         : plugin.options.switchCooldownHours * 60 * 60 * 1000;
-      const cooldownCutoff = new Date(now.getTime() - cooldownDurationMs);
 
-      let standardCooldowns = 0;
+      let playersBelowCap = 0;
       let scrambleLocks = 0;
       let totalStoredPlayers = 0;
       let playerList = 'None';
@@ -757,8 +803,8 @@ const SwitchOutput = {
       try {
         const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
         if (PlayerCooldowns) {
-          standardCooldowns = await PlayerCooldowns.count({
-            where: { lastSwitchTimestamp: { [Op.gt]: cooldownCutoff } }
+          playersBelowCap = await PlayerCooldowns.count({
+            where: { tokenBalance: { [Op.lt]: maxTokens } }
           });
           scrambleLocks = await PlayerCooldowns.count({
             where: { scrambleLockdownExpiry: { [Op.gt]: now } }
@@ -769,10 +815,10 @@ const SwitchOutput = {
             where: {
               [Op.or]: [
                 { scrambleLockdownExpiry: { [Op.gt]: now } },
-                { lastSwitchTimestamp: { [Op.gt]: cooldownCutoff } }
+                { tokenBalance: { [Op.lt]: maxTokens } }
               ]
             },
-            order: [['scrambleLockdownExpiry', 'DESC'], ['lastSwitchTimestamp', 'DESC']],
+            order: [['scrambleLockdownExpiry', 'DESC'], ['tokenBalance', 'ASC']],
             limit: 5
           });
 
@@ -782,9 +828,8 @@ const SwitchOutput = {
               if (p.scrambleLockdownExpiry && p.scrambleLockdownExpiry > now) {
                 parts.push(`🌪️ <t:${Math.floor(p.scrambleLockdownExpiry.getTime() / 1000)}:R>`);
               }
-              if (p.lastSwitchTimestamp && new Date(p.lastSwitchTimestamp.getTime() + cooldownDurationMs) > now) {
-                const expiry = new Date(p.lastSwitchTimestamp.getTime() + cooldownDurationMs);
-                parts.push(`⏳ <t:${Math.floor(expiry.getTime() / 1000)}:R>`);
+              if (p.tokenBalance != null && p.tokenBalance < maxTokens) {
+                parts.push(`🎫 ${p.tokenBalance}/${maxTokens} tokens`);
               }
               return `**${p.playerName || p.steamID}**: ${parts.join(' ')}`;
             }).join('\n');
@@ -797,7 +842,7 @@ const SwitchOutput = {
       }
 
       const cooldownLines = [];
-      cooldownLines.push(`Standard Cooldowns:    ${standardCooldowns}`);
+      cooldownLines.push(`Players Below Cap:    ${playersBelowCap}`);
       cooldownLines.push(`Scramble Locks:        ${scrambleLocks}`);
       cooldownLines.push(`Tracked Players:       ${totalStoredPlayers}`);
 

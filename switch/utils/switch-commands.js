@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║              SWITCH PLUGIN — COMMAND HANDLING                 ║
+ * ║              SWITCH PLUGIN v2.3.0 — COMMAND HANDLING           ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -41,6 +41,7 @@
  */
 
 import { setTimeout as delay } from "timers/promises";
+import SwitchExplain from '../utils/switch-explain.js';
 
 const SwitchCommands = {
   /**
@@ -222,18 +223,31 @@ const SwitchCommands = {
               break;
             case "explain":
               {
+                const showTokenMessaging = plugin.options.maxSwitchTokens > 1;
                 const cooldownHours = plugin.options.switchCooldownMinutes > 0
                   ? (plugin.options.switchCooldownMinutes / 60).toFixed(1)
                   : plugin.options.switchCooldownHours;
-                plugin.warn(eosID, `[Switch] How It Works (1/5)\nYou can request a switch in the first ${plugin.options.switchEnabledMinutes}m after joining or after match start — whichever gives you more time.`);
+                const totalSteps = showTokenMessaging ? 6 : 5;
+                plugin.warn(eosID, `[Switch] How It Works (1/${totalSteps})\nYou can request a switch in the first ${plugin.options.switchEnabledMinutes}m after joining or after match start — whichever gives you more time.`);
                 await delay(5000);
-                plugin.warn(eosID, `[Switch] How It Works (2/5)\nIf teams are uneven, you are queued until a slot opens or a swap partner on the other team is found.`);
+                plugin.warn(eosID, `[Switch] How It Works (2/${totalSteps})\nIf teams are uneven, you are queued until a slot opens or a swap partner on the other team is found.`);
                 await delay(5000);
-                plugin.warn(eosID, `[Switch] How It Works (3/5)\nOnce in the queue, you have ${plugin.options.queueTimeoutMinutes}m before your request expires. Use !switch check to see your status.`);
+                plugin.warn(eosID, `[Switch] How It Works (3/${totalSteps})\nOnce in the queue, you have ${plugin.options.queueTimeoutMinutes}m before your request expires. Use !switch check to see your status.`);
                 await delay(5000);
-                plugin.warn(eosID, `[Switch] How It Works (4/5)\nAfter switching, there is a ${cooldownHours}h cooldown before you can switch again.`);
-                await delay(5000);
-                plugin.warn(eosID, `[Switch] How It Works (5/5)\nAfter a scramble, switches are locked for ${plugin.options.scrambleLockdownDurationMinutes}m.\nUse !switch check to see your current status.`);
+                // Per §3.6 of the spec: when maxSwitchTokens == 1 (legacy flat-cooldown mode),
+          // showTokenMessaging is false and we use the 5-step explain flow identical to
+          // the pre-token version. When maxSwitchTokens > 1, we show the 6-step token-aware flow.
+          if (showTokenMessaging) {
+                  plugin.warn(eosID, `[Switch] How It Works (4/6)\nEach switch costs 1 token. You hold up to ${plugin.options.maxSwitchTokens} tokens, and each refills individually every ${cooldownHours}h. Use !switch check to see your balance.`);
+                  await delay(5000);
+                  plugin.warn(eosID, `[Switch] How It Works (5/6)\nDuring seed rounds, you earn +1 bonus switch token for every ${plugin.options.seedTokenBonusMinutes} minutes of presence (up to ${plugin.options.seedTokenBonusAmount} per round). Bonus tokens stack above your normal ${plugin.options.maxSwitchTokens}-token cap.`);
+                  await delay(5000);
+                  plugin.warn(eosID, `[Switch] How It Works (6/6)\nAfter a scramble, switches are locked for ${plugin.options.scrambleLockdownDurationMinutes}m.\nUse !switch check to see your current status.`);
+                } else {
+                  plugin.warn(eosID, `[Switch] How It Works (4/5)\nAfter switching, there is a ${cooldownHours}h cooldown before you can switch again.`);
+                  await delay(5000);
+                  plugin.warn(eosID, `[Switch] How It Works (5/5)\nAfter a scramble, switches are locked for ${plugin.options.scrambleLockdownDurationMinutes}m.\nUse !switch check to see your current status.`);
+                }
               }
               break;
             case "check":
@@ -252,10 +266,36 @@ const SwitchCommands = {
                   else {
                     const now = new Date();
                     const locked = result.scrambleLockdownExpiry && result.scrambleLockdownExpiry > now;
-                    const cooldownDuration = plugin.options.switchCooldownMinutes > 0 ? plugin.options.switchCooldownMinutes * 60 * 1000 : plugin.options.switchCooldownHours * 60 * 60 * 1000;
-                    const cooldown = result.lastSwitchTimestamp && (new Date(result.lastSwitchTimestamp.getTime() + cooldownDuration) > now);
-                    plugin.warn(eosID, `Status: ${result.playerName || result.steamID} | Locked: ${locked ? 'Yes' : 'No'} | Cooldown: ${cooldown ? 'Yes' : 'No'}`);
-                    plugin.verbose(1, `[Check] Admin check result: player=${result.playerName || result.steamID}, locked=${locked}, cooldown=${cooldown}`);
+                    const showTokenMessaging = plugin.options.maxSwitchTokens > 1;
+
+                    let cooldownMsg;
+                    if (showTokenMessaging) {
+                      const row = {
+                        tokenBalance: result.tokenBalance != null ? result.tokenBalance : plugin.options.maxSwitchTokens,
+                        tokenRegenAnchor: result.tokenRegenAnchor
+                      };
+                      plugin._regenTokens(row);
+                      if (row.tokenBalance < 1) {
+                        const cooldownDuration = plugin.options.switchCooldownMinutes > 0
+                          ? plugin.options.switchCooldownMinutes * 60 * 1000
+                          : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+                        const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
+                        const remaining = Math.ceil((cooldownDuration - (Date.now() - anchor)) / 60000);
+                        cooldownMsg = `Tokens: 0/${plugin.options.maxSwitchTokens}, next in ${remaining}m`;
+                      } else {
+                        cooldownMsg = `Tokens: ${row.tokenBalance}/${plugin.options.maxSwitchTokens}`;
+                      }
+                      plugin.verbose(1, `[Check] Admin check result: player=${result.playerName || result.steamID}, locked=${locked}, tokenBalance=${row.tokenBalance}`);
+                    } else {
+                      const cooldownDuration = plugin.options.switchCooldownMinutes > 0
+                        ? plugin.options.switchCooldownMinutes * 60 * 1000
+                        : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+                      const cooldown = result.lastSwitchTimestamp && (new Date(result.lastSwitchTimestamp.getTime() + cooldownDuration) > now);
+                      cooldownMsg = `Cooldown: ${cooldown ? 'Yes' : 'No'}`;
+                      plugin.verbose(1, `[Check] Admin check result: player=${result.playerName || result.steamID}, locked=${locked}, cooldown=${cooldown}`);
+                    }
+
+                    plugin.warn(eosID, `Status: ${result.playerName || result.steamID} | Locked: ${locked ? 'Yes' : 'No'} | ${cooldownMsg}`);
                   }
                 } else {
                   const eosID = info.player?.eosID;
@@ -287,17 +327,29 @@ const SwitchCommands = {
                     timeWindowMsg = `Closed (${connMin}m join, ${matchMin}m match)`;
                   }
 
+                  const showTokenMessaging = plugin.options.maxSwitchTokens > 1;
                   const cooldownDuration = plugin.options.switchCooldownMinutes > 0
                     ? plugin.options.switchCooldownMinutes * 60 * 1000
                     : plugin.options.switchCooldownHours * 60 * 60 * 1000;
                   let cooldownOK = true;
                   let cooldownMsg = 'Clear';
-                  if (!isLiberal && cooldownData && cooldownData.lastSwitchTimestamp) {
-                    const lastSwitchTime = new Date(cooldownData.lastSwitchTimestamp).getTime();
-                    if (now - lastSwitchTime < cooldownDuration) {
+                  if (!isLiberal) {
+                    // Token-aware cooldown check
+                    const row = cooldownData
+                      ? { tokenBalance: cooldownData.tokenBalance, tokenRegenAnchor: cooldownData.tokenRegenAnchor }
+                      : { tokenBalance: plugin.options.maxSwitchTokens, tokenRegenAnchor: null };
+                    plugin._regenTokens(row);
+                    if (row.tokenBalance < 1) {
                       cooldownOK = false;
-                      const remaining = Math.ceil((cooldownDuration - (now - lastSwitchTime)) / 60000);
-                      cooldownMsg = `${remaining}m remaining`;
+                      const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : now;
+                      const remaining = Math.ceil((cooldownDuration - (now - anchor)) / 60000);
+                      if (showTokenMessaging) {
+                        cooldownMsg = `0/${plugin.options.maxSwitchTokens} tokens, next in ${remaining}m`;
+                      } else {
+                        cooldownMsg = `${remaining}m remaining`;
+                      }
+                    } else if (showTokenMessaging) {
+                      cooldownMsg = `${row.tokenBalance}/${plugin.options.maxSwitchTokens} tokens`;
                     }
                   }
 
@@ -358,7 +410,15 @@ const SwitchCommands = {
                 const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
                 if (PlayerCooldowns) {
                   await plugin._withDb(async (t) => {
-                    await PlayerCooldowns.destroy({ where: { eosID: result.eosID }, transaction: t });
+                    // v2.3.0 §3.4: Refill tokens instead of deleting the row.
+                    // Set tokenBalance to max, reset regen anchor, clear scramble lock.
+                    // seedPresenceStart: null intentionally resets any in-progress seed
+                    // presence tracking — admin clear is a full reset of all eligibility state.
+                    const maxTokens = plugin.options.maxSwitchTokens;
+                    await PlayerCooldowns.upsert(
+                      { eosID: result.eosID, tokenBalance: maxTokens, tokenRegenAnchor: new Date(), scrambleLockdownExpiry: null, seedPresenceStart: null },
+                      { transaction: t }
+                    );
                   });
                 }
                 plugin.warn(eosID, `Cleared cooldowns for ${result.playerName || result.steamID}`);
@@ -444,7 +504,11 @@ const SwitchCommands = {
               plugin.verbose(1, `[Switch] Denied ${playerName}: Match time limit exceeded.`);
               plugin._trackDenial(eosID, playerName, 'time_window');
             } else if (eligibility.reason === 'cooldown') {
-              plugin.warn(eosID, `[Switch] On cooldown — available in ${eligibility.remaining}m.\nUse !switch check to see your full status.`);
+              if (plugin.options.maxSwitchTokens > 1) {
+                plugin.warn(eosID, `[Switch] Out of switch tokens — next one in ${eligibility.remaining}m.\nUse !switch check to see your full status.`);
+              } else {
+                plugin.warn(eosID, `[Switch] On cooldown — available in ${eligibility.remaining}m.\nUse !switch check to see your full status.`);
+              }
               plugin.verbose(1, `[Switch] Denied ${playerName}: Cooldown active.`);
               plugin._trackDenial(eosID, playerName, 'cooldown');
             }
@@ -558,15 +622,24 @@ const SwitchCommands = {
                 if (!eosID) {
                   plugin.verbose(1, `[PlayerCooldowns] Missing eosID for player ${playerName}, skipping cooldown write`);
                 } else {
-                  const now = new Date();
-                  plugin.verbose(1, `[Switch] Writing cooldown for ${playerName} (eosID=${eosID}) at ${now.toISOString()}`);
+                  plugin.verbose(1, `[Switch] Writing token spend for ${playerName} (eosID=${eosID})`);
                   const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
                   if (PlayerCooldowns) {
                     await plugin._withDb(async (t) => {
-                      await PlayerCooldowns.upsert({ eosID, steamID, playerName, lastSwitchTimestamp: now }, { transaction: t });
+                      // §3.3 of switch-token-system-spec: load → regen → spend → upsert
+                      let row = await PlayerCooldowns.findByPk(eosID, { transaction: t });
+                      if (!row) {
+                        row = { eosID, steamID, playerName, tokenBalance: plugin.options.maxSwitchTokens, tokenRegenAnchor: null };
+                      }
+                      plugin._regenTokens(row);
+                      plugin._spendToken(row);
+                      await PlayerCooldowns.upsert(
+                        { eosID, steamID, playerName, tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor },
+                        { transaction: t }
+                      );
                     });
                   }
-                  plugin.verbose(1, `[Switch] Cooldown written successfully for ${playerName}`);
+                  plugin.verbose(1, `[Switch] Token spend written successfully for ${playerName}`);
                 }
               } catch (dbErr) {
                 plugin.verbose(1, `[Switch] Database update failed: ${dbErr.message}`);
@@ -584,6 +657,36 @@ const SwitchCommands = {
                 gamePhase
               });
               plugin._updateMaxQueueSize();
+            }
+
+            // Post-switch token notice (gated on showTokenMessaging)
+            // NOTE: Read-after-write — same rationale as the queue post-switch notices.
+            // The token-spend transaction above has already committed by this point;
+            // this is a fresh read for display purposes only. A missed read (due to
+            // a concurrent modification in the single-digit-ms window) means one
+            // missing notification, which is harmless.
+            if (!isLiberal && plugin.options.maxSwitchTokens > 1) {
+              try {
+                const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
+                if (PlayerCooldowns) {
+                  const row = await PlayerCooldowns.findByPk(eosID);
+                  if (row) {
+                    const balance = row.tokenBalance != null ? row.tokenBalance : plugin.options.maxSwitchTokens;
+                    if (balance > 0) {
+                      plugin.warn(eosID, `[Switch] Switched! ${balance}/${plugin.options.maxSwitchTokens} tokens remaining.`);
+                    } else {
+                      const cooldownDuration = plugin.options.switchCooldownMinutes > 0
+                        ? plugin.options.switchCooldownMinutes * 60 * 1000
+                        : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+                      const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
+                      const remaining = Math.ceil((cooldownDuration - (Date.now() - anchor)) / 60000);
+                      plugin.warn(eosID, `[Switch] Switched! You're out of tokens — next one in ~${remaining}m.`);
+                    }
+                  }
+                }
+              } catch (e) {
+                plugin.verbose(1, `[Switch] Token notice read failed for ${playerName}: ${e.message}`);
+              }
             }
 
             plugin.verbose(1, `[Switch] Executed for ${playerName}.`);
@@ -1086,6 +1189,7 @@ const SwitchCommands = {
           await plugin.safeDiscordReply(message, '⚠️ Ambiguous result: Multiple matches found. Please refine your search string or use a SteamID.');
         } else {
           const now = new Date();
+          const showTokenMessaging = plugin.options.maxSwitchTokens > 1;
           let desc = `**SteamID:** ${result.steamID}\n**Name:** ${result.playerName || 'Unknown'}\n`;
 
           if (result.scrambleLockdownExpiry && result.scrambleLockdownExpiry > now) {
@@ -1094,16 +1198,32 @@ const SwitchCommands = {
             desc += `🟢 **Scramble Lock:** None\n`;
           }
 
-          if (result.lastSwitchTimestamp) {
-            const cooldownDuration = plugin.options.switchCooldownMinutes > 0 ? plugin.options.switchCooldownMinutes * 60 * 1000 : plugin.options.switchCooldownHours * 60 * 60 * 1000;
-            const nextSwitch = new Date(result.lastSwitchTimestamp.getTime() + cooldownDuration);
-            if (nextSwitch > now) {
+          // Token-aware cooldown display
+          const row = {
+            tokenBalance: result.tokenBalance != null ? result.tokenBalance : plugin.options.maxSwitchTokens,
+            tokenRegenAnchor: result.tokenRegenAnchor
+          };
+          plugin._regenTokens(row);
+
+          if (showTokenMessaging) {
+            if (row.tokenBalance < 1) {
+              const cooldownDuration = plugin.options.switchCooldownMinutes > 0 ? plugin.options.switchCooldownMinutes * 60 * 1000 : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+              const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
+              const nextToken = new Date(anchor.getTime() + cooldownDuration);
+              desc += `🔴 **Switch Cooldown:** ${row.tokenBalance}/${plugin.options.maxSwitchTokens} tokens, next at <t:${Math.floor(nextToken.getTime() / 1000)}:R>\n`;
+            } else {
+              desc += `🟢 **Switch Cooldown:** ${row.tokenBalance}/${plugin.options.maxSwitchTokens} tokens\n`;
+            }
+          } else {
+            // Legacy binary display (maxSwitchTokens === 1)
+            if (row.tokenBalance < 1) {
+              const cooldownDuration = plugin.options.switchCooldownMinutes > 0 ? plugin.options.switchCooldownMinutes * 60 * 1000 : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+              const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
+              const nextSwitch = new Date(anchor + cooldownDuration);
               desc += `🔴 **Switch Cooldown:** <t:${Math.floor(nextSwitch.getTime() / 1000)}:R>\n`;
             } else {
               desc += `🟢 **Switch Cooldown:** Ready\n`;
             }
-          } else {
-            desc += `🟢 **Switch Cooldown:** Ready\n`;
           }
 
           if (result.firstSeenTimestamp) {
@@ -1126,7 +1246,14 @@ const SwitchCommands = {
         const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
         if (PlayerCooldowns) {
           await plugin._withDb(async (t) => {
-            await PlayerCooldowns.destroy({ where: { eosID: result.eosID }, transaction: t });
+            // v2.3.0 §3.4: Refill tokens instead of deleting the row.
+            // seedPresenceStart: null intentionally resets any in-progress seed
+            // presence tracking — admin clear is a full reset of all eligibility state.
+            const maxTokens = plugin.options.maxSwitchTokens;
+            await PlayerCooldowns.upsert(
+              { eosID: result.eosID, tokenBalance: maxTokens, tokenRegenAnchor: new Date(), scrambleLockdownExpiry: null, seedPresenceStart: null },
+              { transaction: t }
+            );
           });
         }
         await plugin.safeDiscordReply(message, `✅ Cleared cooldowns for **${result.playerName || result.steamID}**.`);
@@ -1152,6 +1279,23 @@ const SwitchCommands = {
       } else if (subCommand === 'stats') {
         const args2 = args.slice(2);
         await plugin._handleStatsCommand(message, args2);
+      } else if (subCommand === 'explain') {
+        try {
+          const embeds = plugin._buildExplainMessages();
+          if (!embeds || embeds.length === 0) {
+            await plugin.safeDiscordReply(message, 'Could not generate explain content at this time.');
+            return;
+          }
+          for (const embed of embeds) {
+            await message.channel.send({ embeds: [embed] });
+            // Small delay between sends to avoid Discord rate limits
+            // and give messages time to render as separate entries.
+            await new Promise(r => setTimeout(r, 250));
+          }
+        } catch (err) {
+          plugin.verbose(1, `[Explain] Failed to generate explain embeds: ${err.message}`);
+          await plugin.safeDiscordReply(message, `Failed to generate explain output: ${err.message}`);
+        }
       } else if (subCommand === 'help') {
         const embed = {
           title: '📜 Switch Plugin Commands',
@@ -1163,6 +1307,7 @@ const SwitchCommands = {
             { name: '!switch clearall', value: 'Clear all player cooldowns.' },
             { name: '!switch timelimit on|off', value: 'Admin: Toggle join/match time limit for queue entry.' },
             { name: '!switch stats [days]', value: 'Scrape the last N days of round summaries (default 60).' },
+            { name: '!switch explain', value: 'Generate a detailed explanation of how team switching works.' },
             { name: '!switch help', value: 'Show this help message.' }
           ]
         };
@@ -1179,6 +1324,7 @@ const SwitchCommands = {
             { name: '!switch clearall', value: 'Clear all player cooldowns.' },
             { name: '!switch timelimit on|off', value: 'Admin: Toggle join/match time limit for queue entry.' },
             { name: '!switch stats [days]', value: 'Scrape the last N days of round summaries (default 60).' },
+            { name: '!switch explain', value: 'Generate a detailed explanation of how team switching works.' },
             { name: '!switch help', value: 'Show this help message.' }
           ]
         };

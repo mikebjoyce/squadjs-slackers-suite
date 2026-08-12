@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║              SWITCH PLUGIN — DATABASE LAYER                   ║
+ * ║              SWITCH PLUGIN v2.3.0 — DATABASE LAYER             ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -79,6 +79,30 @@ const SwitchDB = {
       scrambleLockdownExpiry: {
         type: plugin._s3db.getDataTypes().DATE,
         allowNull: true
+      },
+      // v2.3.0: Token bucket fields
+      tokenBalance: {
+        type: plugin._s3db.getDataTypes().INTEGER,
+        allowNull: false,
+        defaultValue: 2
+      },
+      tokenRegenAnchor: {
+        type: plugin._s3db.getDataTypes().DATE,
+        allowNull: true
+      },
+      // v2.3.0 Stage 2: Seed bonus token tracking
+      seedPresenceStart: {
+        type: plugin._s3db.getDataTypes().DATE,
+        allowNull: true
+      },
+      lastSeedBonusRoundID: {
+        type: plugin._s3db.getDataTypes().STRING,
+        allowNull: true
+      },
+      seedBonusTokensEarned: {
+        type: plugin._s3db.getDataTypes().INTEGER,
+        allowNull: false,
+        defaultValue: 0
       }
     }, { timestamps: false });
 
@@ -118,7 +142,7 @@ const SwitchDB = {
 
     // ── Migration Registration ─────────────────────────────────
 
-    plugin.registerExpectedVersion('switch', 2, {
+    plugin.registerExpectedVersion('switch', 3, {
       models: ['SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_Endmatches', 'SwitchPlugin_Settings']
     });
     plugin.registerMigrations('switch', [
@@ -170,6 +194,80 @@ const SwitchDB = {
         },
         down: async (qi) => {
           await qi.dropTable('SwitchPlugin_Settings');
+        }
+      },
+      {
+        version: 3,
+        description: 'Add token bucket + seed bonus columns, truncate existing data (merged from original v3+v4 — never deployed separately)',
+        up: async (qi) => {
+          const existing = await qi.showAllTables();
+          if (existing.includes('SwitchPlugin_PlayerCooldowns')) {
+            const columns = await qi.describeTable('SwitchPlugin_PlayerCooldowns');
+            if (!columns.tokenBalance) {
+              await qi.addColumn('SwitchPlugin_PlayerCooldowns', 'tokenBalance', {
+                type: qi.DataTypes.INTEGER,
+                allowNull: false,
+                defaultValue: 2
+              });
+            }
+            if (!columns.tokenRegenAnchor) {
+              await qi.addColumn('SwitchPlugin_PlayerCooldowns', 'tokenRegenAnchor', {
+                type: qi.DataTypes.DATE,
+                allowNull: true
+              });
+            }
+            if (!columns.seedPresenceStart) {
+              await qi.addColumn('SwitchPlugin_PlayerCooldowns', 'seedPresenceStart', {
+                type: qi.DataTypes.DATE,
+                allowNull: true
+              });
+            }
+            if (!columns.lastSeedBonusRoundID) {
+              await qi.addColumn('SwitchPlugin_PlayerCooldowns', 'lastSeedBonusRoundID', {
+                type: qi.DataTypes.STRING,
+                allowNull: true
+              });
+            }
+            if (!columns.seedBonusTokensEarned) {
+              await qi.addColumn('SwitchPlugin_PlayerCooldowns', 'seedBonusTokensEarned', {
+                type: qi.DataTypes.INTEGER,
+                allowNull: false,
+                defaultValue: 0
+              });
+            }
+            // Truncate existing data — players start fresh with max tokens.
+            // Uses bulkDelete with empty where clause for dialect-agnostic
+            // truncation (works on SQLite, PostgreSQL, MySQL).
+            // NOTE: This is destructive and unconditional. The migration engine's
+            // version tracking prevents re-execution, but if this migration is
+            // ever manually re-run, all cooldown state will be lost again.
+            await qi.sequelize.getQueryInterface().bulkDelete('SwitchPlugin_PlayerCooldowns', {}, { transaction: qi.transaction });
+          }
+        },
+        down: async (qi) => {
+          // NOTE: Rollback drops all token/seed columns. Truncated data from the
+          // up migration cannot be recovered — this is intentionally irreversible
+          // by design (the expand-contract pattern drops the old column only when
+          // the "contract" step is ready, but the deleted rows are gone regardless).
+          const existing = await qi.showAllTables();
+          if (existing.includes('SwitchPlugin_PlayerCooldowns')) {
+            const columns = await qi.describeTable('SwitchPlugin_PlayerCooldowns');
+            if (columns.tokenBalance) {
+              await qi.removeColumn('SwitchPlugin_PlayerCooldowns', 'tokenBalance');
+            }
+            if (columns.tokenRegenAnchor) {
+              await qi.removeColumn('SwitchPlugin_PlayerCooldowns', 'tokenRegenAnchor');
+            }
+            if (columns.seedPresenceStart) {
+              await qi.removeColumn('SwitchPlugin_PlayerCooldowns', 'seedPresenceStart');
+            }
+            if (columns.lastSeedBonusRoundID) {
+              await qi.removeColumn('SwitchPlugin_PlayerCooldowns', 'lastSeedBonusRoundID');
+            }
+            if (columns.seedBonusTokensEarned) {
+              await qi.removeColumn('SwitchPlugin_PlayerCooldowns', 'seedBonusTokensEarned');
+            }
+          }
         }
       }
     ]);
@@ -226,16 +324,16 @@ const SwitchDB = {
 
     /**
      * Purges expired cooldown rows from the database.
-     * Removes rows where: no active scramble lockdown, cooldown expired,
-     * and firstSeenTimestamp is older than 24 hours (stale records).
+     * Removes rows where: no active scramble lockdown, player has full tokens
+     * (tokenBalance >= maxSwitchTokens), and firstSeenTimestamp is older than
+     * 24 hours (stale records).
      */
     plugin.cleanup = async function () {
       const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
       if (!PlayerCooldowns) return;
 
-      const switchCooldownMs = plugin.options.switchCooldownMinutes > 0 ? plugin.options.switchCooldownMinutes * 60 * 1000 : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+      const maxTokens = plugin.options.maxSwitchTokens;
       const now = new Date();
-      const switchCutoff = new Date(now.getTime() - switchCooldownMs);
 
       try {
         await plugin._withDb(async (t) => {
@@ -249,10 +347,8 @@ const SwitchDB = {
                   ]
                 },
                 {
-                  [Op.or]: [
-                    { lastSwitchTimestamp: null },
-                    { lastSwitchTimestamp: { [Op.lt]: switchCutoff } }
-                  ]
+                  // Player has full (or more) tokens — no active cooldown
+                  tokenBalance: { [Op.gte]: maxTokens }
                 },
                 {
                   [Op.or]: [
