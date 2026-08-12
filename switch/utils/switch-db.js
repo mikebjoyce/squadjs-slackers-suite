@@ -186,9 +186,12 @@ const SwitchDB = {
       },
       {
         version: 2,
-        description: 'Create SwitchPlugin_Settings table',
+        description: 'Create SwitchPlugin_Settings table with timeLimitEnabled seed row',
         touches: {
-          creates: ['SwitchPlugin_Settings']
+          creates: ['SwitchPlugin_Settings'],
+          rows: {
+            SwitchPlugin_Settings: [{ key: 'key', value: 'timeLimitEnabled' }]
+          }
         },
         up: async (qi) => {
           const existing = await qi.showAllTables();
@@ -295,17 +298,18 @@ const SwitchDB = {
       {
         version: 4,
         description: 'Add explainMessageId to SwitchPlugin_Settings for explain auto-update persistence',
-        // Data-only migration — no schema changes. The original touches
-        // declaration used `{ rows: [...] }` but _verifyMigrationResult()
-        // only validates touches.creates and touches.columns (DDL), not
-        // row-level entries. Empty touches explicitly signals "no schema."
-        touches: {},
-        // Uses model-based access (qi.db.getModel) rather than raw SQL or
-        // qi.bulkInsert. The original committed version used a raw SELECT
-        // with double-quoted table names ("SwitchPlugin_Settings") which is
-        // MySQL-incompatible — MySQL treats double-quoted identifiers as
-        // string literals. Model queries let Sequelize emit dialect-correct
-        // identifiers (backticks for MySQL, double quotes for Postgres).
+        // Data-only migration — inserts a seed row into SwitchPlugin_Settings.
+        // touches.rows enables the migration engine's post-commit verifier and
+        // ongoing drift detection (on every mount) to confirm the row exists.
+        //
+        // The up() uses model-based access (qi.db.getModel) rather than raw SQL
+        // or qi.bulkInsert because Sequelize handles dialect-correct identifier
+        // quoting (backticks for MySQL, double quotes for Postgres).
+        touches: {
+          rows: {
+            SwitchPlugin_Settings: [{ key: 'key', value: 'explainMessageId' }]
+          }
+        },
         up: async (qi) => {
           const existing = await qi.showAllTables();
           if (existing.includes('SwitchPlugin_Settings')) {

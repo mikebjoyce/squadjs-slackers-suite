@@ -260,20 +260,24 @@ export default class MigrationEngine {
       }
 
       // ── touches (required) ────────────────────────────────────────
-      // Every migration MUST declare the tables and columns it creates/alters.
-      // This enables _verifyMigrationResult() to confirm the DDL actually took
-      // effect after the migration commits, catching permission issues that would
-      // otherwise go unnoticed (e.g. silent ADD COLUMN failures when the MySQL
-      // user lacks ALTER TABLE privileges).
+      // Every migration MUST declare the tables, columns, and data rows it
+      // creates/alters/inserts. This enables _verifyMigrationResult() to confirm
+      // the DDL/DML actually took effect after the migration commits, catching
+      // permission issues that would otherwise go unnoticed (e.g. silent ADD
+      // COLUMN failures when the MySQL user lacks ALTER TABLE privileges, or
+      // silent row-insert failures from prior runs lost during a connector switch).
       //
       // Correct format:
       //   touches: {
       //     creates: ['TableA', 'TableB'],                        // new tables
-      //     columns: { TableA: ['col1', 'col2'] }                // columns on existing tables
+      //     columns: { TableA: ['col1', 'col2'] },                // columns on existing tables
+      //     rows: { TableA: [{ key: 'col', value: 'expected' }] } // seed rows (key=col to match, value=expected value)
       //   }
       //
       // A migration that touches no schema (e.g. a pure data migration) should
       // explicitly set touches: {} to indicate "intentionally no schema changes".
+      // However, data-only migrations SHOULD declare touches.rows so drift
+      // detection can confirm the seed rows actually exist on every mount.
       if (!m.touches || typeof m.touches !== 'object') {
         throw new Error(
           `Migration v${m.version} in "${pluginName}" is missing a "touches" declaration. ` +
@@ -306,6 +310,26 @@ export default class MigrationEngine {
             if (!Array.isArray(cols) || !cols.every(c => typeof c === 'string')) {
               throw new Error(
                 `Migration v${m.version} in "${pluginName}": touches.columns["${tableName}"] must be an array of column name strings.`
+              );
+            }
+          }
+        }
+        // ── touches.rows validation ────────────────────────────
+        // Each entry is a tableName → array of { key, value } objects
+        // that must exist in the table after the migration commits.
+        if (m.touches.rows !== undefined) {
+          if (typeof m.touches.rows !== 'object' || m.touches.rows === null || Array.isArray(m.touches.rows)) {
+            throw new Error(
+              `Migration v${m.version} in "${pluginName}": touches.rows must be a Record<string, Array<{key, value}>>.`
+            );
+          }
+          for (const [tableName, rowDefs] of Object.entries(m.touches.rows)) {
+            if (!Array.isArray(rowDefs) || !rowDefs.every(r =>
+              r && typeof r === 'object' && !Array.isArray(r) &&
+              typeof r.key === 'string' && typeof r.value === 'string'
+            )) {
+              throw new Error(
+                `Migration v${m.version} in "${pluginName}": touches.rows["${tableName}"] must be an array of { key: string, value: string } objects.`
               );
             }
           }
@@ -712,10 +736,71 @@ export default class MigrationEngine {
       }
     }
 
+    // ── Verify touches.rows ──────────────────────────────────
+    // For each declared row, query the model to confirm the row exists.
+    // Uses model-based lookup (dialect-agnostic) with null transaction so
+    // the query sees committed state.
+    if (migration.touches.rows) {
+      for (const [tableName, rowDefs] of Object.entries(migration.touches.rows)) {
+        const model = qi.db.getModel(tableName);
+        if (!model) {
+          failures.push(`Row verification: model "${tableName}" not found in registry`);
+          continue;
+        }
+        for (const { key, value } of rowDefs) {
+          const row = await model.findOne({
+            where: { [key]: value },
+            transaction: qi.transaction
+          });
+          if (!row) {
+            failures.push(`Row "${key}=${value}" not found in "${tableName}" after migration`);
+          }
+        }
+      }
+    }
+
     if (failures.length > 0) {
       throw new Error(
         `Migration v${migration.version} reported success but verification failed:\n${failures.join('\n')}`
       );
     }
+  }
+
+  /* ─────────────────────── ROW DRIFT EXPOSURE ─────────────────────── */
+
+  /**
+   * Aggregate all touches.rows declarations from ALL registered migrations
+   * across ALL plugins. Returns a Map<tableName → Array<{ key, value }>>.
+   *
+   * This is consumed by DBService.verifyLiveSchema() so that ongoing drift
+   * detection (on every mount) can confirm seed rows still exist — not just
+   * at migration time, but across restarts, connector changes, and DB restores.
+   *
+   * @returns {Map<string, Array<{key: string, value: string}>>}
+   */
+  getExpectedRows() {
+    const result = new Map();
+    for (const migrations of this._migrations.values()) {
+      for (const m of migrations) {
+        if (m.touches?.rows) {
+          for (const [tableName, rowDefs] of Object.entries(m.touches.rows)) {
+            if (!result.has(tableName)) {
+              result.set(tableName, []);
+            }
+            // Merge in new rows, avoiding duplicates (same key+value)
+            const existing = result.get(tableName);
+            for (const def of rowDefs) {
+              const alreadyExists = existing.some(
+                e => e.key === def.key && e.value === def.value
+              );
+              if (!alreadyExists) {
+                existing.push({ key: def.key, value: def.value });
+              }
+            }
+          }
+        }
+      }
+    }
+    return result;
   }
 }

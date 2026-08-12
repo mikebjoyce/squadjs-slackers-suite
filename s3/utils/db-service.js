@@ -1,4 +1,4 @@
-/**
+ /**
  * ╔═══════════════════════════════════════════════════════════════╗
  * ║               DB SERVICE                                     ║
  * ╚═══════════════════════════════════════════════════════════════╝
@@ -794,10 +794,10 @@ export default class DBService {
     // the drift check finishes.
     this.verifyLiveSchema().then(async drift => {
       this._lastDriftResult = drift;
-      // Only invoke recovery for missing columns — extra-only drift does not
-      // block the gate. _handleDetectedDrift() re-opens the gate and returns
-      // without closing it; the caller must not fall through to gate-null.
-      const hasMissing = drift.some(e => e.missing);
+      // Only invoke recovery for missing columns or missing rows — extra-only
+      // drift does not block the gate. _handleDetectedDrift() re-opens the gate
+      // and returns without closing it; the caller must not fall through to gate-null.
+      const hasMissing = drift.some(e => e.missing || e.missingRows);
       if (hasMissing) {
         await this._handleDetectedDrift(drift);
         return;
@@ -829,16 +829,19 @@ export default class DBService {
    * columns are missing (e.g. a prior migration's ADD COLUMN silently failed
    * due to MySQL permissions).
    *
-   * @param {Array<{pluginName: string, table: string, model?: string, missing?: string[], extra?: string[], error?: string}>} drift
+   * @param {Array<{pluginName: string, table: string, model?: string, missing?: string[], missingRows?: Array<{key: string, value: string}>, extra?: string[], error?: string}>} drift
    */
   async _handleDetectedDrift(drift) {
     for (const entry of drift) {
       if (entry.missing) {
         this.verboseLogger(1, `[DB] POST-MIGRATION DRIFT: ${entry.table} missing columns: ${entry.missing.join(', ')}`);
       }
+      if (entry.missingRows) {
+        this.verboseLogger(1, `[DB] POST-MIGRATION ROW DRIFT: ${entry.table} missing row(s): ${entry.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
+      }
     }
-    // Only act on missing columns — extra columns are informational only
-    const pluginNames = [...new Set(drift.filter(e => e.missing).map(e => e.pluginName))];
+    // Only act on missing columns or missing rows — extra columns are informational only
+    const pluginNames = [...new Set(drift.filter(e => e.missing || e.missingRows).map(e => e.pluginName))];
     if (pluginNames.length === 0) {
       this.verboseLogger(2, '[DB] Drift detected but only extra columns — no recovery needed.');
       return;
@@ -908,11 +911,12 @@ export default class DBService {
    * Called on every mount (metadata-only, negligible cost).
    *
    * Drift entry shapes:
-   *   { pluginName, table, error }       — describeTable() failure
+   *   { pluginName, table, error }       — describeTable() failure or row-verification error
    *   { pluginName, table, missing }     — columns expected in model but absent from DB
+   *   { pluginName, table, missingRows } — seed rows declared via migration touches.rows absent from DB
    *   { pluginName, table, extra }       — columns in DB but not in model
    *
-   * @returns {Promise<Array<{pluginName: string, table: string, model?: string, missing?: string[], extra?: string[], error?: string}>>}
+   * @returns {Promise<Array<{pluginName: string, table: string, model?: string, missing?: string[], missingRows?: Array<{key: string, value: string}>, extra?: string[], error?: string}>>}
    */
   async verifyLiveSchema() {
     if (this._pluginModels.size === 0) {
@@ -966,6 +970,58 @@ export default class DBService {
       }
     }
 
+    // ── Row drift detection ──────────────────────────────────
+    // Check that seed rows declared via migration touches.rows still exist.
+    // This catches silent data loss from prior buggy migrations, connector
+    // switches, or DB restores that wiped data but left the version tracker intact.
+    if (this._migrationEngine) {
+      const expectedRows = this._migrationEngine.getExpectedRows();
+      for (const [tableName, rowDefs] of expectedRows.entries()) {
+        // Find which plugin owns this table by checking _pluginModels.
+        // We need the model name (registered via registerExpectedVersion's models[]).
+        let owningPlugin = null;
+        for (const [pn, modelNames] of this._pluginModels.entries()) {
+          for (const mn of modelNames) {
+            const m = this.models[mn];
+            if (m && (m.tableName || m.name) === tableName) {
+              owningPlugin = pn;
+              break;
+            }
+          }
+          if (owningPlugin) break;
+        }
+        if (!owningPlugin) {
+          // No registered plugin claims this table — skip to avoid false positives
+          continue;
+        }
+
+        // Resolve the model for this table
+        let rowModel = null;
+        for (const mn of (this._pluginModels.get(owningPlugin) || [])) {
+          const m = this.models[mn];
+          if (m && (m.tableName || m.name) === tableName) {
+            rowModel = m;
+            break;
+          }
+        }
+        if (!rowModel) {
+          drift.push({ pluginName: owningPlugin, table: tableName, error: 'Row verification: model not found in registry' });
+          continue;
+        }
+
+        for (const { key, value } of rowDefs) {
+          try {
+            const row = await rowModel.findOne({ where: { [key]: value } });
+            if (!row) {
+              drift.push({ pluginName: owningPlugin, table: tableName, missingRows: [{ key, value }] });
+            }
+          } catch (err) {
+            drift.push({ pluginName: owningPlugin, table: tableName, error: `Row verification failed: ${err.message}` });
+          }
+        }
+      }
+    }
+
     // Log results
     if (drift.length === 0) {
       this.verboseLogger(3, '[DB] Schema drift check passed — all registered models match live database.');
@@ -976,6 +1032,9 @@ export default class DBService {
         }
         if (entry.missing) {
           this.verboseLogger(1, `[DB] DRIFT: ${entry.table} missing columns: ${entry.missing.join(', ')}`);
+        }
+        if (entry.missingRows) {
+          this.verboseLogger(1, `[DB] ROW DRIFT: ${entry.table} missing row(s): ${entry.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
         }
         if (entry.extra) {
           this.verboseLogger(2, `[DB] DRIFT: ${entry.table} has extra columns: ${entry.extra.join(', ')}`);

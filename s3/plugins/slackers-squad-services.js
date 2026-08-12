@@ -426,17 +426,25 @@ export default class SlackersSquadServices extends BasePlugin {
         const discordClient = this.options.discordClient;
         const channelID = this.options.channelID;
         if (discordClient && channelID) {
+          const parts = [];
           const missingCols = drift
             .filter(e => e.missing)
-            .map(e => `- **${e.table}**: ${e.missing.join(', ')}`)
-            .join('\n');
+            .map(e => `- **${e.table}**: ${e.missing.join(', ')}`);
+          if (missingCols.length > 0) parts.push(missingCols.join('\n'));
+          const missingRows = drift
+            .filter(e => e.missingRows)
+            .map(e => `- **${e.table}**: ${e.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
+          if (missingRows.length > 0) parts.push(missingRows.join('\n'));
+          const description = parts.length > 0
+            ? `Schema or data drift detected — expected state is missing from the live database.\nUse \`!s3 migrate force\` to re-apply.\n\n${parts.join('\n')}`
+            : `Schema drift detected — use \`!s3 migrate verify\` for details.`;
           discordClient.channels.fetch(channelID).then(channel => {
             if (channel) {
               channel.send({
                 embeds: [{
                   color: 0xe74c3c,
                   title: '⚠️ Schema Drift Detected',
-                  description: `Columns declared in migrations are missing from the live database.\nUse \`!s3 migrate force\` to re-apply.\n\n${missingCols}`,
+                  description,
                   timestamp: new Date().toISOString(),
                   footer: { text: 'S³ Schema Verification' }
                 }]
@@ -639,12 +647,12 @@ export default class SlackersSquadServices extends BasePlugin {
         this.verbose(1, `[S3 Migration] Schema drift detected on up-to-date server — ${drift.length} issue(s).`);
         await db._handleDetectedDrift(drift);
         // Only re-schedule the migration prompt if the drift includes missing
-        // columns — extra-only drift is informational and does not require
-        // admin intervention. _handleDetectedDrift() only re-opens the migration
-        // gate when missing columns are found; unconditionally re-scheduling
-        // here would create an infinite loop since extra-only drift never
-        // creates a pending migration.
-        if (drift.some(e => e.missing)) {
+        // columns or missing rows — extra-only drift is informational and does
+        // not require admin intervention. _handleDetectedDrift() only re-opens
+        // the migration gate when missing columns or rows are found;
+        // unconditionally re-scheduling here would create an infinite loop
+        // since extra-only drift never creates a pending migration.
+        if (drift.some(e => e.missing || e.missingRows)) {
           this._scheduleMigrationPrompt();
         }
       }
