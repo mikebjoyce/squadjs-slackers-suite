@@ -198,7 +198,8 @@ function _buildToleranceTable(plugin) {
     } else if (totalPlayers <= floor) {
       currentExtra = extraSlots;
     } else {
-      currentExtra = Math.round(extraSlots * (effectiveCap - totalPlayers) / (effectiveCap - floor));
+      const raw = Math.round(extraSlots * (effectiveCap - totalPlayers) / (effectiveCap - floor));
+      currentExtra = raw === 0 && totalPlayers < effectiveCap ? 1 : raw;
     }
 
     if (currentExtra !== prevExtra) {

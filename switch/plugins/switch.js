@@ -604,7 +604,8 @@ export default class Switch extends S3DiscordPluginBase {
         if (totalPlayers <= floor) return extra;
         
         const interpolated = extra * (effectiveCap - totalPlayers) / (effectiveCap - floor);
-        return Math.round(interpolated);
+        const result = Math.round(interpolated);
+        return result === 0 && totalPlayers < effectiveCap ? 1 : result;
     }
 
     /**

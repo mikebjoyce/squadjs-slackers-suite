@@ -65,10 +65,11 @@ const SwitchCommands = {
     // ── In-game chat command handler ───────────────────────────
 
     plugin.onChatMessage = async function (info) {
+      let eosID, steamID, playerName;
       try {
-        const eosID = info.player?.eosID;
-        const steamID = info.player?.steamID;
-        const playerName = info.player?.name;
+        eosID = info.player?.eosID;
+        steamID = info.player?.steamID;
+        playerName = info.player?.name;
         // Use S³ authoritative registry for teamID (includes null-teamID projection during STAGING)
         // Falls back to raw CHAT_MESSAGE event data if S³ isn't ready.
         const s3Player = plugin._s3?.players?.isReady() ? plugin._s3.players.getPlayer(eosID) : null;
