@@ -1296,6 +1296,13 @@ const SwitchCommands = {
             await plugin.safeDiscordReply(message, 'Could not generate explain content at this time.');
             return;
           }
+          // Append 7-day reliability stats embed (gracefully degrades to null if no data)
+          try {
+            const statsEmbed = await plugin._buildSevenDayStatsEmbed();
+            if (statsEmbed) embeds.push(statsEmbed);
+          } catch (_) {
+            // Stats embed is optional — silently skip on failure
+          }
           for (const embed of embeds) {
             await message.channel.send({ embeds: [embed] });
             // Small delay between sends to avoid Discord rate limits

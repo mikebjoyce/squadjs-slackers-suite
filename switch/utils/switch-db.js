@@ -295,28 +295,39 @@ const SwitchDB = {
       {
         version: 4,
         description: 'Add explainMessageId to SwitchPlugin_Settings for explain auto-update persistence',
-        touches: {
-          rows: [
-            { table: 'SwitchPlugin_Settings', key: 'explainMessageId' }
-          ]
-        },
+        // Data-only migration — no schema changes. The original touches
+        // declaration used `{ rows: [...] }` but _verifyMigrationResult()
+        // only validates touches.creates and touches.columns (DDL), not
+        // row-level entries. Empty touches explicitly signals "no schema."
+        touches: {},
+        // Uses model-based access (qi.db.getModel) rather than raw SQL or
+        // qi.bulkInsert. The original committed version used a raw SELECT
+        // with double-quoted table names ("SwitchPlugin_Settings") which is
+        // MySQL-incompatible — MySQL treats double-quoted identifiers as
+        // string literals. Model queries let Sequelize emit dialect-correct
+        // identifiers (backticks for MySQL, double quotes for Postgres).
         up: async (qi) => {
           const existing = await qi.showAllTables();
           if (existing.includes('SwitchPlugin_Settings')) {
-            const rows = await qi.sequelize.query(
-              `SELECT key FROM "SwitchPlugin_Settings" WHERE key = 'explainMessageId'`,
-              { type: qi.sequelize.QueryTypes.SELECT, transaction: qi.transaction }
-            );
-            if (!rows || rows.length === 0) {
-              await qi.bulkInsert('SwitchPlugin_Settings', [{
-                key: 'explainMessageId',
-                value: ''
-              }]);
+            const SettingsModel = qi.db.getModel('SwitchPlugin_Settings');
+            if (SettingsModel) {
+              const row = await SettingsModel.findByPk('explainMessageId', { transaction: qi.transaction });
+              if (!row) {
+                await SettingsModel.create(
+                  { key: 'explainMessageId', value: '' },
+                  { transaction: qi.transaction }
+                );
+              }
             }
           }
         },
         down: async (qi) => {
-          await qi.bulkDelete('SwitchPlugin_Settings', { key: 'explainMessageId' });
+          // Dialect-safe model access — avoids qi.bulkDelete which produces
+          // dialect-inconsistent WHERE clauses on some connectors.
+          const SettingsModel = qi.db.getModel('SwitchPlugin_Settings');
+          if (SettingsModel) {
+            await SettingsModel.destroy({ where: { key: 'explainMessageId' }, transaction: qi.transaction });
+          }
         }
       }
     ]);

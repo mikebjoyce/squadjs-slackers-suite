@@ -305,7 +305,7 @@ function _buildBalanceEmbed(plugin) {
     '**Tolerance** is how much extra gap the server allows beyond the base limit of **1**. At low population, more tolerance is given so switches are easier. As the server fills up, tolerance shrinks to keep teams fair when it matters most.'
   ].join('\n');
 
-  const tableLines = ['```', 'Players         Extra Tolerance    Max Allowed Gap'];
+  const tableLines = ['```', 'Players       Extra Tolerance  Max Allowed Gap'];
   for (const row of rows) {
     const rangePad = row.range.padEnd(14);
     tableLines.push(`${rangePad}${String(row.extra).padEnd(18)}${row.maxGap}`);
