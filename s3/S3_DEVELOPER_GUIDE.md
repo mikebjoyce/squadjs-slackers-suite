@@ -1025,28 +1025,140 @@ Inside `_onS3Ready()`:
 
 1. **Declare expected version:**
    ```js
-   this.registerExpectedVersion('my-plugin', 3);
+   this.registerExpectedVersion('my-plugin', 3, {
+     models: ['MyPlugin_Table']
+   });
    ```
+   The third `opts` argument is optional. When provided with a `models` array, it declares which models this plugin owns — used by drift detection to verify columns at runtime. Without it, drift detection still checks tables/columns declared in migration `touches`, but the explicit model list provides an additional cross-check.
 
 2. **Register migration functions:**
    ```js
    this.registerMigrations('my-plugin', [
      { version: 1, description: 'Initial schema',
+       touches: { creates: ['MyPlugin_Table'] },
        up: async (qi) => { await qi.createTable('MyPlugin_Table', { ... }); },
        down: async (qi) => { await qi.dropTable('MyPlugin_Table'); } },
      { version: 2, description: 'Add rating column',
+       touches: { columns: { MyPlugin_Table: ['rating'] } },
        up: async (qi) => { await qi.addColumn('MyPlugin_Table', 'rating', 'INTEGER'); },
        down: async (qi) => { await qi.removeColumn('MyPlugin_Table', 'rating'); } },
-     { version: 3, description: 'Add index on playerID',
-       up: async (qi) => { await qi.addIndex('MyPlugin_Table', ['playerID']); },
-       down: async (qi) => { await qi.removeIndex('MyPlugin_Table', 'my_plugin_table_player_id'); } }
+     { version: 3, description: 'Add seed row to Settings table',
+       touches: {
+         rows: {
+           MyPlugin_Settings: [{ key: 'key', value: 'someSetting' }]
+         }
+       },
+       up: async (qi) => {
+         const Settings = qi.db.getModel('MyPlugin_Settings');
+         if (Settings) {
+           await Settings.create(
+             { key: 'someSetting', value: 'default' },
+             { transaction: qi.transaction }
+           );
+         }
+       },
+       down: async (qi) => {
+         const Settings = qi.db.getModel('MyPlugin_Settings');
+         if (Settings) {
+           await Settings.destroy(
+             { where: { key: 'someSetting' }, transaction: qi.transaction }
+           );
+         }
+       } }
    ]);
    ```
+   Every migration **must** include a `touches` declaration or the engine throws on `registerMigrations()`. Use `touches: {}` for a migration that intentionally makes no schema changes (e.g. a pure data fixup). See [§9.1.1](#911--the-touches-declaration).
 
 3. **Run pending migrations:**
    ```js
    await this.verifyAndRunMigrations('my-plugin');
    ```
+
+#### 9.1.1 — The `touches` Declaration
+
+Every migration **must** declare which tables, columns, and seed rows it creates or modifies. This enables two verification layers:
+
+- **Post-migration verification** — after each migration commits, `_verifyMigrationResult()` confirms every declared table/column/row actually exists in the live database. Silent failures (e.g. `ADD COLUMN` that fails silently because the MySQL user lacks `ALTER` privileges) are caught immediately.
+- **Ongoing drift detection** — on every S³ mount, the engine aggregates all `touches.rows` via `getExpectedRows()` and checks that the declared seed rows still exist. This catches data loss across connector swaps, DB restores, or manual edits.
+
+**Three sub-fields:**
+
+| Field | Format | Purpose |
+|-------|--------|---------|
+| `creates` | `string[]` — table names that this migration creates | Post-migration verifier checks `showAllTables()` |
+| `columns` | `Record<string, string[]>` — table name → column names added to *existing* tables | Post-migration verifier checks `describeTable()` for each column |
+| `rows` | `Record<string, Array<{key: string, value: string}>>` — table name → seed row matchers. Each entry: `{ key: '<columnName>', value: '<expectedValue>' }` tells the verifier to find a row where `key` column equals `value` | Verified after migration commits, and on every S³ mount via drift detection |
+
+**Examples:**
+
+```js
+// Create a new table — declare creates + any columns added to that table
+{ version: 1,
+  touches: {
+    creates: ['SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_Endmatches']
+  },
+  up: async (qi) => { /* createTable() */ },
+  down: async (qi) => { /* dropTable() */ } }
+
+// Add columns to an existing table — use columns only
+{ version: 2,
+  touches: {
+    columns: {
+      SwitchPlugin_PlayerCooldowns: ['tokenBalance', 'tokenRegenAnchor']
+    }
+  },
+  up: async (qi) => { /* addColumn() */ },
+  down: async (qi) => { /* removeColumn() */ } }
+
+// Data-only migration with seed row — use rows
+{ version: 3,
+  description: 'Insert setting into SwitchPlugin_Settings',
+  touches: {
+    rows: {
+      SwitchPlugin_Settings: [{ key: 'key', value: 'explainMessageId' }]
+    }
+  },
+  up: async (qi) => { /* create row via model */ },
+  down: async (qi) => { /* destroy row via model */ } }
+
+// Migration that touches no schema (data fixup, index rename, etc.)
+{ version: 4,
+  description: 'Recalculate migrated data',
+  touches: {},
+  up: async (qi) => { /* no DDL changes */ },
+  down: async (qi) => { /* no DDL changes */ } }
+```
+
+**Backward compatibility:** Existing migrations that predate the `touches` requirement (pre-v1.2.0) should have `touches` added retroactively when their plugin's migration file is next touched. The Switch plugin's migrations demonstrate this pattern — see `switch-db.js` v1 for a real-world example of retroactive `touches` on old migrations.
+
+#### 9.1.2 — Seed Row Drift Detection (`touches.rows`)
+
+The `rows` sub-field of `touches` enables **seed row drift detection**: the ability to detect when expected seed rows (system settings, configuration defaults, etc.) go missing from the database.
+
+**How it works:**
+1. When a migration declares `touches.rows`, the engine verifies those rows exist **immediately after the migration commits** (in `_verifyMigrationResult()`).
+2. On every S³ mount, `DBService` calls `migrationEngine.getExpectedRows()` to aggregate all `touches.rows` declarations across all plugins.
+3. Each expected row is checked against the live database — if a row is missing, it's reported as drift alongside missing columns.
+
+**When to use `touches.rows`:**
+
+- Seed rows inserted at migration time (e.g. `SwitchPlugin_Settings` with `timeLimitEnabled` and `explainMessageId`)
+- Default configuration rows that should always exist
+- Any row whose absence would indicate silent data loss from a connector swap, manual DB edit, or failed restore
+
+**Format:**
+```js
+touches: {
+  rows: {
+    TableName: [
+      // Each entry: find a row WHERE keyColumn = expectedValue
+      { key: '<columnNameToMatch>', value: '<expectedValue>' }
+    ]
+  }
+}
+```
+
+The `key`/`value` pair is used as a `WHERE` clause: `model.findOne({ where: { [key]: value } })`. Multiple pairs = multiple independent rows expected in the table.
 
 ### 9.2 — Query Interface (qi) API
 
@@ -1067,6 +1179,8 @@ The `qi` (QueryInterface) object passed to each migration function provides thes
 | `db` | property | DBService instance |
 | `transaction` | property | Active Sequelize transaction |
 
+> **Best practice — use model-based access for DML in migrations.** For data-manipulation operations (inserts, upserts, destroys) inside migration `up()`/`down()` handlers, use `qi.db.getModel('ModelName')` to access the Sequelize model and call `create()`/`upsert()`/`destroy()` on it. This is **dialect-safe** — Sequelize handles correct identifier quoting (backticks for MySQL, double quotes for PostgreSQL) and type coercion automatically. Avoid `qi.bulkInsert()` / `qi.bulkDelete()` for data rows, as these can produce dialect-inconsistent SQL. See the Switch plugin migration v4 (`switch-db.js`) for a real-world example of model-based seed row insertion.
+
 ### 9.3 — Version Numbering
 
 - Start at **1** for initial schema
@@ -1083,6 +1197,8 @@ The `qi` (QueryInterface) object passed to each migration function provides thes
 - The startup confirmation flow gates execution (unless `autoMigrate: true` in S³ config)
 - Pre-migration backup runs **two tiers**: SQLite file-copy backup only when a `dbPath` is available (SQLite connector), and JSON export **always**, regardless of dialect. Migration aborts only if *both* tiers fail — a Postgres/MySQL deployment with a healthy JSON export still proceeds even though it has no file copy.
 - The `verifyAndRunMigrations()` single-call pattern checks schema versions first, runs only pending migrations, and returns the result
+
+**Post-migration verification:** After each migration's `up()` commits, the engine calls `_verifyMigrationResult()` with a fresh (non-transactional) `qi` to check that every table, column, and row declared in the migration's `touches` actually exists in the live database. This catches silent failures — such as `ADD COLUMN` that appears to succeed but doesn't take effect because the MySQL user lacks `ALTER` privileges — before the next migration runs. Verification failures produce a composite error listing all missing tables/columns/rows, and the migration batch is aborted.
 
 ### 9.5 — S³ Schema Versions Table
 
@@ -1120,6 +1236,40 @@ node tools/schema-health.js --json
 Unlike `schema-version.mjs`, it does not consult `build/config.json` for the DB path — only `--db-path` or the hardcoded project-root default.
 
 > **⚠️ Known bug — do not rely on this tool's output yet.** `schema-health.js` currently reports every table as `❌ missing` regardless of actual DB state. `sequelize.query(sql, { type: QueryTypes.SELECT })` returns rows directly, not a `[rows, metadata]` tuple, but the tool destructures it as one (`const [allTablesRaw] = await sequelize.query(...)`). This silently pulls the first row instead of the row array, fails an `Array.isArray` check, and falls back to an empty table list. Fix before use: replace the destructuring with a direct assignment (`const allTablesRaw = await sequelize.query(...)`) in both query call sites. The tool's own failure message also points to a stale path (`build/schema-version.cjs`) — should be `tools/schema-version.mjs`.
+
+### 9.8 — Runtime Schema-Drift Verification
+
+S³ provides two Discord commands for live schema verification that complement the `touches` system described in §9.1.1:
+
+#### `!s3 migrate verify`
+
+Checks the live database for schema drift — columns and seed rows declared in migration `touches` that are missing from the actual database tables. This catches silent data loss or structure drift that occurs between SquadJS restarts (e.g., from a manual DB edit, connector swap, or failed restore).
+
+The verification runs automatically on every S³ mount (after all consumer plugins register their models) and on demand via `!s3 migrate verify`. Results include:
+- Whether the schema is up to date
+- A list of missing tables or columns (when `touches.creates` / `touches.columns` declarations don't match the live schema)
+- A list of missing seed rows (when `touches.rows` declarations don't match)
+- Remediation suggestions
+
+#### `!s3 diag`
+
+A consolidated read‑only diagnostic command that surfaces:
+- Service mount status
+- Current game phase, layer, and gamemode
+- Faction abbreviations
+- Player count and lock state
+- **Schema drift status** (same data as `!s3 migrate verify`, folded into the single output)
+
+#### When to Use
+
+| Scenario | Command |
+|----------|---------|
+| Periodic health check during operation | `!s3 diag` |
+| Investigate reported DB issues | `!s3 migrate verify` |
+| After a DB restore or connector change | `!s3 migrate verify` |
+| Pre‑upgrade schema check | `!s3 migrate verify` |
+
+Both commands require S³'s Discord admin channel to be configured (`channelID` in config).
 
 ---
 
@@ -1440,4 +1590,4 @@ Each plugin is in `ReferenceScripts/<plugin-name>/plugins/` in the repository.
 
 ---
 
-> *Developer Guide — documents the S³ architecture as of 2026-07-24.*
+> *Developer Guide — documents the S³ architecture as of 2026-08-12.*
