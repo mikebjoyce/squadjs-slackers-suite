@@ -875,6 +875,14 @@ export default class Switch extends S3DiscordPluginBase {
             );
         });
 
+        // Reset joinTime so the player's switch eligibility window reopens.
+        // Without this, a stale joinTime gates !switch even with a full token balance.
+        try {
+            await this._s3?.players?.resetJoinTime?.(eosID);
+        } catch (err) {
+            this.verbose(1, `[Reconnect] resetJoinTime failed for ${name || eosID}: ${err.message}`);
+        }
+
         const reasons = [];
         if (hadCooldown_obsolete) reasons.push('legacy cooldown');
         if (hasTokenDebt) reasons.push('token cooldown');
@@ -882,6 +890,38 @@ export default class Switch extends S3DiscordPluginBase {
         this.verbose(1,
             `[Reconnect] ${name || eosID}: cleared ${reasons.join(' and ')} — stranded on current team, previous was T${previousTeamID}`
         );
+    }
+
+    /**
+     * Clears only the scramble lockdown for a reconnecting player (any team).
+     * Lightweight — does NOT touch tokens, cooldowns, or joinTime.
+     * Called for ALL reconnects so a player who disconnected before a scramble
+     * and reconnects in a later round isn't locked by a scramble they missed.
+     *
+     * @param {string} eosID — Player's EOS ID
+     * @param {string} name — Player name (for logging)
+     */
+    async _clearReconnectScrambleLock(eosID, name) {
+        const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+        if (!PlayerCooldowns) return;
+
+        const row = await PlayerCooldowns.findByPk(eosID);
+        if (!row) return;
+
+        const now = Date.now();
+        const hadScrambleLock = row.scrambleLockdownExpiry != null
+            && new Date(row.scrambleLockdownExpiry).getTime() > now;
+
+        if (!hadScrambleLock) return;
+
+        await this._withDb(async (t) => {
+            await PlayerCooldowns.update(
+                { scrambleLockdownExpiry: null },
+                { where: { eosID }, transaction: t }
+            );
+        });
+
+        this.verbose(1, `[Reconnect] ${name || eosID}: cleared stale scramble lock (reconnect).`);
     }
 
     /**
@@ -937,6 +977,14 @@ export default class Switch extends S3DiscordPluginBase {
             }
             await PlayerCooldowns.update(fields, { where: { eosID }, transaction: t });
         });
+
+        // Reset joinTime so the player's switch eligibility window reopens.
+        // Without this, a stale joinTime gates !switch even with a fresh token.
+        try {
+            await this._s3?.players?.resetJoinTime?.(eosID);
+        } catch (err) {
+            this.verbose(1, `[_resetPlayerLockouts] resetJoinTime failed for ${eosID}: ${err.message}`);
+        }
 
         this.verbose(1, `[_resetPlayerLockouts] ${eosID}: cleared scramble lock${belowCap ? ' + granted +1 token' : ''}.`);
         return belowCap;
@@ -1169,16 +1217,29 @@ export default class Switch extends S3DiscordPluginBase {
         const previousTeamID = data.previousTeamID;
 
         // ── Reconnect lockout clearing ──────────────────────────────
-        // When a reconnecting player is placed on a different team than
-        // their previous one, immediately clear any active cooldown/
-        // scramble-lock so they aren't stranded. Show a delayed message
-        // (30s) prompting them to !switch back. Only fires when both
-        // teams are real (1 or 2) — guards against null-teamID during
-        // the staging window.
+        // Two-tier reconnect handling:
+        //
+        // 1. ALL reconnects (any team): clear scrambleLockdownExpiry.
+        //    A player who disconnected before a scramble and reconnects
+        //    in a later round should not be locked by a scramble they
+        //    weren't present for. Token top-up is NOT granted here —
+        //    only the lock is cleared.
+        //
+        // 2. Wrong-team reconnects: full remediation (clear cooldowns,
+        //    top up tokens, reset joinTime, show delayed message).
+        //    Only fires when both teams are real (1 or 2) — guards
+        //    against null-teamID during the staging window.
         const isRealTeam = (t) => t === 1 || t === 2;
-        const isReconnectOnWrongTeam = isRealTeam(previousTeamID)
-            && isRealTeam(teamID)
-            && teamID !== previousTeamID;
+        const isReconnect = isRealTeam(previousTeamID) && isRealTeam(teamID);
+        const isReconnectOnWrongTeam = isReconnect && teamID !== previousTeamID;
+
+        if (isReconnect) {
+            // Tier 1: clear scramble lock for ALL reconnects (fire-and-forget).
+            // Uses a lightweight DB update — only touches scrambleLockdownExpiry.
+            this._clearReconnectScrambleLock(eosID, name).catch(err => {
+                this.verbose(1, `[Reconnect] Scramble lock clear failed for ${name || eosID}: ${err.message}`);
+            });
+        }
 
         if (isReconnectOnWrongTeam && !this._reconnectLockoutClearTimeouts.has(eosID)) {
             this._clearReconnectLockouts(eosID, name, previousTeamID).catch(err => {

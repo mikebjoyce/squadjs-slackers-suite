@@ -342,6 +342,39 @@ export default class PlayersService {
     return player?.joinTime || 0;
   }
 
+  /**
+   * Resets a player's joinTime to now, reopening their switch eligibility window.
+   * Called by Switch when granting remediation tokens so the player can actually
+   * use !switch without being gated by a stale connection window.
+   *
+   * Mutates the registry state directly (not the getPlayer() copy) and fire-and-forget
+   * upserts S3_PlayerSessions so a future SquadJS restart doesn't resurrect the old time.
+   *
+   * @param {string} eosIDOrSteamID - Player EOS ID or Steam ID
+   * @returns {boolean} true if the player was found and joinTime was reset
+   */
+  resetJoinTime(eosIDOrSteamID) {
+    const key = this._resolvePlayerKey(eosIDOrSteamID);
+    if (!key) return false;
+
+    // Mutate the live registry state (or projected state during null-window).
+    const state = this.registry.get(key) || this._projectedPlayers?.get(key);
+    if (!state) return false;
+
+    const now = Date.now();
+    state.joinTime = now;
+
+    // Persist so _recoverSessionTimes() on next mount doesn't resurrect the old time.
+    if (state.eosID) {
+      this._upsertSessionRow(state.eosID, state.steamID, state.name, now, now).catch((err) => {
+        this.verboseLogger(2, `[Players] resetJoinTime session upsert failed for ${state.name || key}: ${err.message}`);
+      });
+    }
+
+    this.verboseLogger(2, `[Players] resetJoinTime: ${state.name || key} joinTime reset to now`);
+    return true;
+  }
+
   getSquads() {
     // Returns cached SquadJS squad objects enriched with leader-first player lists.
     // Array of { squadID, teamID, squadName, locked (bool), players: eosID[] }
