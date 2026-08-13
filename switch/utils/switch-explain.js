@@ -266,7 +266,7 @@ function _buildIntroEmbed(plugin) {
   const scoreboardDisabled = _isScoreboardSwitchDisabled(plugin);
 
   const description = scoreboardDisabled
-    ? 'Squad\'s native team change command is disabled on this server.**`\'!switch\'`** is how you change teams. The plugin enforces balance rules to keep teams fair while still allowing you to play with your friends.'
+    ? 'Squad\'s native team change command is disabled on this server. **`\'!switch\'`** is how you change teams. The plugin enforces balance rules to keep teams fair while still allowing you to play with your friends.'
     : '**`\'!switch\'`** is an alternative way to change teams. The plugin enforces balance rules to keep teams fair while still allowing you to play with your friends.';
 
   const commandsField = [
