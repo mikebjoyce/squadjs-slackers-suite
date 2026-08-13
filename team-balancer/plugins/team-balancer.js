@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                   TEAM BALANCER PLUGIN v4.0.4                 ║
+ * ║                   TEAM BALANCER PLUGIN v4.0.5                 ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -246,7 +246,7 @@ import fs from 'fs';
 import path from 'path';
 
 export default class TeamBalancer extends S3PluginBase {
-  static version = '4.0.4';
+  static version = '4.0.5';
 
   static get description() {
     return 'Tracks dominant wins by team ID and scrambles teams if one team wins too many rounds.';
@@ -2562,15 +2562,24 @@ export default class TeamBalancer extends S3PluginBase {
           const sessionReport = this.swapExecutor?.getLastSessionReport?.();
           const failedEosIDs = new Set(sessionReport?.failedEosIDs || []);
           const affectedPlayers = [];
+          const failedPlayers = [];
           for (const move of swapPlan) {
             const player = this.server.players.find(p => p.eosID === move.eosID);
-            if (player && !failedEosIDs.has(move.eosID)) {
+            if (!player) continue;
+            if (failedEosIDs.has(move.eosID)) {
+              failedPlayers.push({ eosID: player.eosID, steamID: player.steamID ?? null, name: player.name });
+            } else {
               affectedPlayers.push({ eosID: player.eosID, steamID: player.steamID ?? null, name: player.name });
             }
           }
-          if (affectedPlayers.length > 0) {
+          // Emit when either list is non-empty. If every move fails, affectedPlayers
+          // is empty but failedPlayers is not — Switch still needs to remediate.
+          // Disconnected players are handled via S³ reconnect memory overwrite in
+          // tb-swap-executor.js — no need to emit them here.
+          if (affectedPlayers.length > 0 || failedPlayers.length > 0) {
             this.server.emit('TEAM_BALANCER_SCRAMBLE_EXECUTED', {
-              affectedPlayers
+              affectedPlayers,
+              failedPlayers
             });
           }
 

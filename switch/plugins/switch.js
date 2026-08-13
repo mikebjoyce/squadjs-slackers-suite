@@ -12,7 +12,7 @@ import SwitchExplain from '../utils/switch-explain.js';
 
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SWITCH PLUGIN v2.3.1                       ║
+ * ║                    SWITCH PLUGIN v2.3.2                       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -175,7 +175,7 @@ import SwitchExplain from '../utils/switch-explain.js';
  *
  */
 export default class Switch extends S3DiscordPluginBase {
-    static version = '2.3.1';
+    static version = '2.3.2';
 
     static get description() {
         return "Switch plugin with persistent join timers";
@@ -267,6 +267,11 @@ export default class Switch extends S3DiscordPluginBase {
                 required: false,
                 description: "Duration in minutes to block switching after a scramble.",
                 default: 30
+            },
+            scrambleLockdownMinPlayers: {
+                required: false,
+                description: "Minimum total players required to apply scramble lockdown. Below this threshold, scrambles clear the queue but do not lock switching.",
+                default: 60
             },
             liberalSwitchGameModes: {
                 required: false,
@@ -771,13 +776,20 @@ export default class Switch extends S3DiscordPluginBase {
         const cooldownData = PlayerCooldowns ? await PlayerCooldowns.findByPk(eosID) : null;
         const now = Date.now();
 
+        // Liberal/seed mode bypasses all cooldown and lock restrictions.
+        // Must be checked BEFORE the scramble lock — otherwise a stale lock
+        // from a prior non-seed round blocks switching during seed.
+        if (this.isLiberalMode()) {
+            return { eligible: true };
+        }
+
         // Scramble lock is an independent override — token availability never overrides it
         if (cooldownData && cooldownData.scrambleLockdownExpiry && new Date(cooldownData.scrambleLockdownExpiry).getTime() > now) {
             const remaining = Math.ceil((new Date(cooldownData.scrambleLockdownExpiry).getTime() - now) / 60000);
             return { eligible: false, reason: 'scramble_lock', remaining };
         }
 
-        if (!this.isLiberalMode() && this.timeLimitEnabled) {
+        if (this.timeLimitEnabled) {
             const connectionSeconds = await this.getSecondsFromJoin(eosID);
             const matchSeconds = this.getSecondsFromMatchStart();
             const limit = this.options.switchEnabledMinutes;
@@ -870,6 +882,64 @@ export default class Switch extends S3DiscordPluginBase {
         this.verbose(1,
             `[Reconnect] ${name || eosID}: cleared ${reasons.join(' and ')} — stranded on current team, previous was T${previousTeamID}`
         );
+    }
+
+    /**
+     * Resets scramble lockdown and ensures the player has at least 1 usable switch token.
+     * Used when a player is stranded through no fault of their own:
+     *   - Scramble RCON move failed (Phase 3)
+     *   - SA couldn't place a reconnecting player on their correct team (Phase 5)
+     *
+     * The +1 token is granted only when the player is below their token cap
+     * (`tokenBalance < maxSwitchTokens`). This keeps the grant bounded — the result
+     * never stacks above the normal cap, unlike the seed-bonus grant path which
+     * intentionally stacks upward. A player already at cap already has a usable
+     * path back via !switch / the queue, so no bonus is handed out.
+     *
+     * The scramble lock is cleared whenever a row exists and either an active lock
+     * or a below-cap balance warrants action.
+     *
+     * Uses Sequelize.literal('tokenBalance + 1') for an atomic increment to avoid
+     * TOCTOU races with concurrent grant paths. Sets tokenRegenAnchor = null on the
+     * grant so the regen clock doesn't immediately consume it — at the cost of
+     * discarding any accrued mid-regen progress toward the next token.
+     *
+     * @param {string} eosID — Player's EOS ID
+     * @returns {Promise<boolean>} true when a +1 token was granted, false otherwise.
+     */
+    async _resetPlayerLockouts(eosID) {
+        const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+        if (!PlayerCooldowns) return false;
+
+        const row = await PlayerCooldowns.findByPk(eosID);
+        if (!row) {
+            this.verbose(2, `[_resetPlayerLockouts] No PlayerCooldowns row for ${eosID} — nothing to reset.`);
+            return false;
+        }
+
+        const now = Date.now();
+        const maxTokens = this.options.maxSwitchTokens;
+        const hadScrambleLock = row.scrambleLockdownExpiry != null
+            && new Date(row.scrambleLockdownExpiry).getTime() > now;
+        const balance = row.tokenBalance != null ? row.tokenBalance : maxTokens;
+        const belowCap = balance < maxTokens;
+
+        if (!hadScrambleLock && !belowCap) {
+            this.verbose(2, `[_resetPlayerLockouts] ${eosID}: no active scramble lock and at token cap — nothing to do.`);
+            return false;
+        }
+
+        await this._withDb(async (t) => {
+            const fields = { scrambleLockdownExpiry: null };
+            if (belowCap) {
+                fields.tokenBalance = Sequelize.literal('tokenBalance + 1');
+                fields.tokenRegenAnchor = null;
+            }
+            await PlayerCooldowns.update(fields, { where: { eosID }, transaction: t });
+        });
+
+        this.verbose(1, `[_resetPlayerLockouts] ${eosID}: cleared scramble lock${belowCap ? ' + granted +1 token' : ''}.`);
+        return belowCap;
     }
 
     handlePlayerLeave(eosID, teamID, playerName) {
@@ -1670,9 +1740,9 @@ export default class Switch extends S3DiscordPluginBase {
      *   6. Post Discord notification with lockdown summary
      */
     onScrambleExecuted = async (data) => {
-        const { affectedPlayers } = data;
+        const { affectedPlayers, failedPlayers } = data;
         this.verbose(2, `[SCRAMBLE_EVENT] onScrambleExecuted called with data: ${JSON.stringify(data)}`);
-        
+
         // Snapshot queued player eosIDs before clearing — these players
         // were already waiting to switch before the scramble and should
         // not receive a scramble lockdown on top of losing their queue spot.
@@ -1691,6 +1761,16 @@ export default class Switch extends S3DiscordPluginBase {
         // when the next (non-seed) round starts.
         if (this._s3?.gameState?.isSeedMode?.()) {
             this.verbose(1, `[SCRAMBLE_EVENT] Seed round — queue cleared, no lockdown applied.`);
+            return;
+        }
+
+        // Low-population guard: don't apply scramble locks when the server is
+        // below the configured threshold. Applying locks on a seeding/low-pop
+        // server may drive players away and cause the server to die further.
+        const totalPlayers = this.server.players.length;
+        const minPlayers = this.options.scrambleLockdownMinPlayers ?? 60;
+        if (totalPlayers < minPlayers) {
+            this.verbose(1, `[SCRAMBLE_EVENT] Server population (${totalPlayers}) below scrambleLockdownMinPlayers (${minPlayers}) — queue cleared, no lockdown applied.`);
             return;
         }
 
@@ -1717,10 +1797,35 @@ export default class Switch extends S3DiscordPluginBase {
         // Players within their switch-eligibility window haven't had time to
         // exploit pre-scramble imbalance, so they're exempt from lockdown.
         const switchWindowMs = this.options.switchEnabledMinutes * 60 * 1000;
+        // Build a Set of eosIDs whose RCON move genuinely failed (player was connected
+        // but the AdminForceTeamChange command failed). These players are exempt from
+        // lockdown and receive a +1 token grant via _resetPlayerLockouts.
+        const failedEosIDs = new Set(
+            (failedPlayers || []).map(p => p.eosID)
+        );
+        this.verbose(2, `[SCRAMBLE_EVENT] Failed-to-move players (RCON failure, not disconnected): ${failedEosIDs.size}`);
+
         const lockoutPlayers = [];
         for (const p of allPlayers) {
             if (!p.eosID) {
                 this.verbose(1, `[SCRAMBLE_EVENT] Skipping ${p.name} — missing eosID`);
+                continue;
+            }
+            // Failed-to-move players: skip lockdown, grant +1 token (when below cap)
+            // so they can rejoin their group. Await the DB write so we only promise
+            // a token that was actually granted.
+            if (failedEosIDs.has(p.eosID)) {
+                this.verbose(2, `[SCRAMBLE_EVENT] Skipping lockdown for ${p.name} — RCON move failed, remediating.`);
+                let granted = false;
+                try {
+                    granted = await this._resetPlayerLockouts(p.eosID);
+                } catch (err) {
+                    this.verbose(1, `[SCRAMBLE_EVENT] _resetPlayerLockouts failed for ${p.name || p.eosID}: ${err.message}`);
+                }
+                this.warn(p.eosID, granted
+                    ? `[Switch] Scramble failed to move you — granted +1 switch token to rejoin your group. Use !switch when ready.`
+                    : `[Switch] Scramble failed to move you — use !switch to rejoin your group.`
+                );
                 continue;
             }
             // NOTE: getSecondsFromJoin may hit the DB per player. For large scrambles
@@ -1800,6 +1905,3 @@ export default class Switch extends S3DiscordPluginBase {
     }
 
 }
-
-
-

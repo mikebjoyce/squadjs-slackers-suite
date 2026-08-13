@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║          SWITCH PLUGIN v2.3.1 — EXPLAIN EMBED GENERATOR       ║
+ * ║          SWITCH PLUGIN v2.3.2 — EXPLAIN EMBED GENERATOR       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -496,20 +496,24 @@ function _buildScrambleEmbed(plugin) {
     `After a scramble, **\`'!switch'\`** is locked for all players for **${lockdownMinutes} minutes**.`,
     'This prevents players from undoing the scramble by switching back.',
     '',
-    'Because the scrambler preserves squads (and clans), your friend group was not split up. The lockout exists to prevent abuse, not to punish.'
+    'The system is designed to help you play with your friends, even when things go wrong. If a scramble fails to move you, or you reconnect to the wrong team, your restrictions are cleared so you can fix it yourself.'
   ];
 
   const lockoutExceptions = [
     'You are **NOT** locked after a scramble if:',
     `- You are still within your **${plugin.options.switchEnabledMinutes || 10}-minute** join/match window.`,
     '- You were already in the switch queue before the scramble fired.',
+    '- The scramble **failed to move you** (RCON error). Your scramble lock is cleared and you may receive a **+1 switch token** so you can use `!switch` immediately to rejoin your group.',
     '- The scramble failed to keep your squad or clan together. In this case, you are given extra leniency to switch back to your group when your join/match window opens.'
   ];
 
   const reconnectText = [
     'If you disconnect and reconnect to a different team after a scramble,',
     'your switch restrictions (including the scramble lockout) are cleared.',
-    "You can use **`'!switch'`** immediately to return to your previous team."
+    "You can use **`'!switch'`** immediately to return to your previous team.",
+    '',
+    'If you reconnect during a faction vote, an ignored game mode, or passive mode,',
+    'your scramble lock is still cleared so you are not stranded. Use `!switch` when the round starts.'
   ];
 
   return {
@@ -578,6 +582,8 @@ function _buildTipsEmbed(plugin) {
   tips.push("**4. Check before you act.** **`'!switch check'`** tells you exactly what is blocking you: time window, tokens, scramble lock, or balance. This helps you make an informed decision.");
 
   tips.push('**5. Squads and clans stay together.** The scrambler preserves squads and clan groups. Even if a scramble fires, your group will not be split up.');
+
+  tips.push('**6. The system has your back.** Even when things go wrong (a scramble fails to move you, or you reconnect to the wrong team), your restrictions are cleared and you may receive bonus tokens so you can fix it yourself. You are never permanently stranded.');
 
   return {
     title: 'Tips for Playing With Friends',

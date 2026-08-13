@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                  SMART ASSIGN PLUGIN v2.1.0                   ║
+ * ║                  SMART ASSIGN PLUGIN v2.1.1                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -73,8 +73,8 @@
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
- * - Code version at `static version` may lag behind the comment header version;
- *   this header reflects the canonical plugin version.
+ * - The comment header version and `static version` are kept in sync — both
+ *   reflect the canonical plugin version (v2.1.1).
  * - Join swaps use Log-Driven triggering: the SteamID arrives from the Log Parser
  *   (~100ms after join), so the RCON command fires before RCON even knows the
  *   player exists. SASwapExecutor's forced post-command poll then verifies the result.
@@ -147,7 +147,7 @@ import SAEventLogger from '../utils/sa-event-logger.js';
 import { evaluateTeamAssignment, getRating, getPenalty, computeScore } from '../utils/sa-team-evaluator.js';
 
 export default class SmartAssign extends S3PluginBase {
-  static version = '2.1.0';
+  static version = '2.1.1';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
@@ -674,18 +674,21 @@ export default class SmartAssign extends S3PluginBase {
        // ═══════════════════════════════════════════════════════════════════════════
        if (this._s3?.gameState?.isEndgameFactionVote?.()) {
          Logger.verbose('SmartAssign', 3, `[Join] S³ gameState: faction vote in progress — skipping assignment for ${player.name}.`);
+         await this._remediateBlockedReconnect(player, reconnectTeam);
          return;
        }
 
        // Check if the current layer/gamemode is ignored (via S³ gameState)
         if (this._s3?.gameState?.isIgnoredMode?.()) {
          Logger.verbose('SmartAssign', 3, `[SmartAssign] Ignored game mode detected. Skipping Elo-based assignment for ${player.name}.`);
+         await this._remediateBlockedReconnect(player, reconnectTeam);
          return;
        }
 
       // Passive mode: skip algorithm and ASSIGNMENT logging entirely
       if (this.options.enableSmartAssign === false) {
         Logger.verbose('SmartAssign', 3, `[SmartAssign] Passive mode: algorithm skipped for ${player.name}.`);
+        await this._remediateBlockedReconnect(player, reconnectTeam);
         return;
       }
 
@@ -924,6 +927,60 @@ export default class SmartAssign extends S3PluginBase {
     // Generic LEAVE logging removed (Stage 7.4i) — S³ LoggingService handles
     // via S3_PLAYER_LEFT. SA only logs assignment-specific events.
 
+  }
+
+  /**
+   * When SA cannot place a reconnecting player on their correct team, reset their
+   * Switch scramble lockdown and top up their token balance (Switch grants +1 only
+   * when below maxSwitchTokens, so the result never stacks above the normal cap).
+   *
+   * Triggered only from the three early-return paths in handlePlayerJoin:
+   *   - Endgame faction-vote window (engine locks team changes)
+   *   - Ignored game mode (SA skips assignment)
+   *   - Passive mode (enableSmartAssign === false)
+   *
+   * Deliberately NOT triggered for "hard cap / team imbalance" outcomes inside
+   * evaluateTeamAssignment — those players can still use !switch / the queue to
+   * rejoin their group, so no automatic token grant is warranted.
+   *
+   * Only applies to reconnecting players: a brand-new join has reconnectTeam === null
+   * and returns early before the cross-plugin call (a fresh arrival has no lockouts to
+   * clear and should not receive a token grant).
+   *
+   * Cross-plugin contract: calls this._switchPlugin._resetPlayerLockouts(eosID), a
+   * method Switch exposes specifically for this remediation path. If Switch renames or
+   * removes it, SA degrades gracefully (logs and skips) rather than throwing.
+   *
+   * @param {object} player — The joining player object (must have eosID)
+   * @param {number|null} reconnectTeam — The player's previous teamID from S³ reconnect memory
+   */
+  async _remediateBlockedReconnect(player, reconnectTeam = null) {
+    if (!player?.eosID) return;
+
+    // Efficiency gate: only reconnecting players can carry lockouts. If S³ has no
+    // prior team for this player, they are a brand-new join with nothing to clear.
+    if (reconnectTeam === null) return;
+
+    // Only remediate when the player actually landed on the wrong team.
+    // A reconnecting player who happens to land on their correct team
+    // (Squad default placement) doesn't need lockout clearing or a token.
+    if (player.teamID === reconnectTeam) return;
+
+    if (!this._switchPlugin) {
+      Logger.verbose('SmartAssign', 3, `[_remediateBlockedReconnect] Switch plugin not available — skipping remediation for ${player.name || player.eosID}.`);
+      return;
+    }
+    if (typeof this._switchPlugin._resetPlayerLockouts !== 'function') {
+      Logger.verbose('SmartAssign', 1, `[_remediateBlockedReconnect] Switch plugin does not expose _resetPlayerLockouts — skipping remediation for ${player.name || player.eosID}.`);
+      return;
+    }
+
+    try {
+      await this._switchPlugin._resetPlayerLockouts(player.eosID);
+      Logger.verbose('SmartAssign', 2, `[_remediateBlockedReconnect] Reset lockouts for ${player.name || player.eosID} (SA blocked from placing on correct team).`);
+    } catch (err) {
+      Logger.verbose('SmartAssign', 1, `[_remediateBlockedReconnect] Failed to reset lockouts for ${player.name || player.eosID}: ${err.message}`);
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════════

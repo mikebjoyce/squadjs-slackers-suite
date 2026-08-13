@@ -1,4 +1,4 @@
-# Switch Plugin v2.3.1
+# Switch Plugin v2.3.2
 
 **Team-change management with database persistence, TeamBalancer integration, and S³-aware player tracking.**
 
@@ -195,7 +195,7 @@ The Switch plugin exposes a public API for external consumers (such as SmartAssi
 
 ### Version Compatibility
 
-- `static version = '2.3.1'` — public API with dual-array queue, timeout-switch feature, token bucket system, seed bonus tokens, and enhanced stats.
+- `static version = '2.3.2'` — public API with dual-array queue, timeout-switch feature, token bucket system, seed bonus tokens, scramble remediation, and enhanced stats.
 - Consumers should check `plugin.constructor.version` (wrapped in try/catch) and require `>= 2.0.0` before using the API.
 
 ### Consumer Discovery
@@ -223,7 +223,8 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 | `switchEnabledMinutes` | Time window (minutes) after join/match start to request a switch | `10` |
 | `queueTimeoutMinutes` | Minutes a player can wait in the switch queue before removal | `20` |
 | `maxUnbalancedSlots` | Max player difference between teams to allow a switch | `1` |
-| `scrambleLockdownDurationMinutes` | Duration to block switching after a scramble | `20` |
+| `scrambleLockdownDurationMinutes` | Duration to block switching after a scramble | `30` |
+| `scrambleLockdownMinPlayers` | Minimum total players required to apply scramble lockdown. Below this threshold, scrambles clear the queue but do not lock switching. | `60` |
 
 ### Token System (v2.3.0)
 
