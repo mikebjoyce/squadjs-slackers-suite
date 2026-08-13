@@ -25,12 +25,61 @@ S³ **must** be mounted before any consumer plugin. In your SquadJS `config.json
 ```json
 {
   "plugins": [
-    { "plugin": "SlackersSquadServices", "enabled": true,
-      "database": "sqlite", "discordClient": "discord", "channelID": "..." },
-    { "plugin": "SmartAssign", "enabled": true, "teamSelectionMethod": "elo", "minTeamSize": 4, "maxTeamSize": 8, "scrambleCooldown": 300, "autoBalanceDelay": 30, "maxEloDifference": 200, "stagingTimeLimit": 180, "enableTrueSkill": true, "enableScramble": true, "enableAutoBalance": false },
-    { "plugin": "Switch", "enabled": true, "database": "sqlite", "discordClient": "discord", "switchCooldown": 300, "scrambleLockoutDuration": 600, "maxQueueSize": 10, "discordChannelID": "...", "enableDiscordNotifications": true },
-    { "plugin": "EloTracker", "enabled": true, "database": "sqlite", "discordClient": "discord", "discordPublicChannelID": "...", "discordAdminChannelID": "...", "minPlayersForElo": 80, "minRoundsForLeaderboard": 10, "enablePublicIngameCommands": true },
-    { "plugin": "TeamBalancer", "enabled": true, "database": "sqlite", "discordClient": "discord", "minPlayersForScramble": 20, "imbalanceThreshold": 3, "scrambleCooldown": 900, "useEloForBalance": true, "enableAutoScramble": false }
+    {
+      "plugin": "SlackersSquadServices",
+      "enabled": true,
+      "database": "sqlite",
+      "discordClient": "discord",
+      "channelID": ""
+    },
+    {
+      "plugin": "SmartAssign",
+      "enabled": true,
+      "enableSmartAssign": true,
+      "enableEventLogging": false,
+      "logPath": "./smart-assign-log.jsonl",
+      "enableDatabaseLogging": false,
+      "handshakeWithSwitch": true,
+      "handshakeScoreThreshold": 0.5,
+      "handshakeMode": "queueDrain"
+    },
+    {
+      "plugin": "Switch",
+      "enabled": true,
+      "database": "sqlite",
+      "discordClient": "discord",
+      "channelID": "",
+      "switchCooldownHours": 1.75,
+      "switchCooldownMinutes": 0,
+      "switchEnabledMinutes": 10,
+      "maxUnbalancedSlots": 1,
+      "scrambleLockdownDurationMinutes": 30,
+      "broadcastSwitchWindowMessages": true,
+      "queueEnabled": true,
+      "discordChannelID": ""
+    },
+    {
+      "plugin": "EloTracker",
+      "enabled": true,
+      "discordClient": "discord",
+      "discordPublicChannelID": "",
+      "discordAdminChannelID": "",
+      "minPlayersForElo": 80,
+      "minRoundsForLeaderboard": 10,
+      "enablePublicIngameCommands": false
+    },
+    {
+      "plugin": "TeamBalancer",
+      "enabled": true,
+      "discordClient": "discord",
+      "enableWinStreakTracking": true,
+      "enableSeedAutoScramble": true,
+      "maxWinStreak": 2,
+      "scrambleAnnouncementDelay": 25,
+      "scramblePercentage": 0.5,
+      "useEloForBalance": true,
+      "discordAdminChannelID": ""
+    }
   ]
 }
 ```
