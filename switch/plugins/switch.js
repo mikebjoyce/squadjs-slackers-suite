@@ -1748,39 +1748,44 @@ export default class Switch extends S3DiscordPluginBase {
             return embeds;
         };
 
-        // Determine if we should edit an existing message or post a new one
+        // Delete all previously tracked messages (best-effort).
+        // Since we send one embed per message, we can't edit the old
+        // messages in place. Deleting them keeps the channel clean.
         const storedData = this._cachedExplainMessageData;
-        let message = null;
-
-        if (storedData && storedData.channelID === explainChannelID && storedData.messageID) {
-            try {
-                message = await channel.messages.fetch(storedData.messageID);
-            } catch (_) {
-                // 404 or other error — message was deleted, will post new
-                message = null;
+        if (storedData && storedData.channelID === explainChannelID && storedData.messageIDs?.length > 0) {
+            for (const msgID of storedData.messageIDs) {
+                try {
+                    await channel.messages.delete(msgID);
+                    this.verbose(2, `[Explain] Deleted old explain message ${msgID}.`);
+                } catch (_) {
+                    // 404 or missing permissions — harmless, continue
+                }
             }
         }
 
         try {
             const embeds = await buildMessage();
 
-            if (message) {
-                // Edit existing message in place
-                await message.edit({ embeds });
-                this.verbose(1, `[Explain] Edited existing explain message ${message.id} in channel ${explainChannelID}.`);
-            } else {
-                // Post new message
-                message = await channel.send({ embeds });
-                this._explainMessageID = message.id;
-                this._explainChannelID = explainChannelID;
-                await this._saveExplainMessageId(explainChannelID, message.id);
-                this.verbose(1, `[Explain] Posted new explain message ${message.id} in channel ${explainChannelID}.`);
+            // Send each embed as its own message (one per message) to stay
+            // under Discord's 6000-character per-message embed sum limit.
+            // This matches the !switch explain command pattern in switch-commands.js.
+            const messageIDs = [];
+            for (const embed of embeds) {
+                const sent = await channel.send({ embeds: [embed] });
+                messageIDs.push(sent.id);
+                // Small delay between sends to avoid Discord rate limits
+                await new Promise(r => setTimeout(r, 250));
             }
 
-            // Cache the message reference for potential future edit (e.g. on rewrite)
-            this._explainMessage = message;
+            // Track all messages for cleanup on next restart
+            if (messageIDs.length > 0) {
+                this._explainMessage = null;  // no longer a single message
+                this._explainMessageID = messageIDs[0];
+                this._explainChannelID = explainChannelID;
+                await this._saveExplainMessageId(explainChannelID, messageIDs);
+            }
 
-            this.verbose(1, `[Explain] Auto-update initialized. Message posted/edited in channel ${explainChannelID}.`);
+            this.verbose(1, `[Explain] Auto-update initialized. Posted ${embeds.length} explain embed(s) in channel ${explainChannelID}.`);
         } catch (err) {
             this.verbose(1, `[Explain] Failed to post/edit explain message: ${err.message}`);
         }

@@ -388,7 +388,12 @@ const SwitchDB = {
 
     /**
      * Loads the explainMessageId from SwitchPlugin_Settings.
-     * Parses the JSON value { channelID, messageID } and caches it on the plugin instance.
+     * Parses the JSON value and caches it on the plugin instance.
+     *
+     * Supports two formats (backward-compatible):
+     *   - New: { channelID, messageIDs: [...] }
+     *   - Old: { channelID, messageID } — upgraded to array on read
+     *
      * Falls back to null if the setting is missing, empty, or the DB is unavailable.
      */
     plugin._loadExplainMessageId = async function () {
@@ -402,10 +407,17 @@ const SwitchDB = {
         if (row && row.value) {
           try {
             const parsed = JSON.parse(row.value);
-            if (parsed && parsed.channelID && parsed.messageID) {
-              plugin._cachedExplainMessageData = parsed;
-              plugin.verbose(2, `[Explain] Loaded stored explain message: channel=${parsed.channelID}, message=${parsed.messageID}`);
-              return;
+            if (parsed && parsed.channelID) {
+              // Upgrade old single-message format to array format
+              if (parsed.messageID && !parsed.messageIDs) {
+                parsed.messageIDs = [parsed.messageID];
+                delete parsed.messageID;
+              }
+              if (parsed.messageIDs && parsed.messageIDs.length > 0) {
+                plugin._cachedExplainMessageData = parsed;
+                plugin.verbose(2, `[Explain] Loaded stored explain messages: channel=${parsed.channelID}, count=${parsed.messageIDs.length}`);
+                return;
+              }
             }
           } catch (_) { /* invalid JSON — reset */ }
         }
@@ -418,23 +430,26 @@ const SwitchDB = {
 
     /**
      * Persists the explain message metadata to SwitchPlugin_Settings.
-     * Stores JSON { channelID, messageID } so the message can be edited in place
-     * across SquadJS restarts.
+     * Stores JSON { channelID, messageIDs: [...] } so all messages can be
+     * deleted on the next SquadJS restart, keeping the explain channel clean.
+     *
+     * @param {string} channelID — Discord channel ID
+     * @param {string[]} messageIDs — Array of message IDs to track
      */
-    plugin._saveExplainMessageId = async function (channelID, messageID) {
+    plugin._saveExplainMessageId = async function (channelID, messageIDs) {
       const Settings = plugin._getModel('SwitchPlugin_Settings');
       if (!Settings) {
         throw new Error('SwitchPlugin_Settings model not available — DB may not be ready.');
       }
-      const value = JSON.stringify({ channelID, messageID });
+      const value = JSON.stringify({ channelID, messageIDs });
       await plugin._withDb(async (t) => {
         await Settings.upsert(
           { key: 'explainMessageId', value },
           { transaction: t }
         );
       });
-      plugin._cachedExplainMessageData = { channelID, messageID };
-      plugin.verbose(1, `[Explain] Saved explain message: channel=${channelID}, message=${messageID}`);
+      plugin._cachedExplainMessageData = { channelID, messageIDs };
+      plugin.verbose(1, `[Explain] Saved explain messages: channel=${channelID}, count=${messageIDs.length}`);
     };
 
     /**
