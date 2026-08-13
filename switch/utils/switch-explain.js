@@ -285,7 +285,7 @@ function _buildIntroEmbed(plugin) {
     description,
     color: 0x3498DB,
     fields: [
-      { name: 'Commands', value: commandsField + '\n*All three commands are typed in all or squad chat (press J).*', inline: false },
+      { name: 'Commands', value: commandsField + '\n*All three commands are typed in all, team or squad chat.*', inline: false },
       { name: 'Key Rule', value: keyRuleField, inline: false }
     ]
   };

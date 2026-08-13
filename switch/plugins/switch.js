@@ -530,6 +530,19 @@ export default class Switch extends S3DiscordPluginBase {
         // registered at all. This avoids polling when no one is waiting.
         this.verbose(2, '[S3] Switch refresh interest is conditional (poll only when queue active).');
 
+        // ── Mid-round restart: backfill _gameStartTs from S³ ──────────
+        // onNewGame() sets _gameStartTs during normal NEW_GAME events, but when
+        // SquadJS restarts mid-round, NEW_GAME never fires and _gameStartTs
+        // stays undefined. The status embed and broadcast timers depend on it
+        // for display. Backfill from S³'s authoritative round start time.
+        if (!Number.isFinite(this._gameStartTs)) {
+            const roundStartTime = this._s3?.gameState?.getRoundStartTime?.();
+            if (roundStartTime) {
+                this._gameStartTs = roundStartTime;
+                this.verbose(2, `[S3] Backfilled _gameStartTs from S³ (mid-round recovery).`);
+            }
+        }
+
         // Subscribe to S³ layer changes for broadcast timer management.
         // The callback fires AFTER resolveLayerInfo() commits the new layer —
         // avoiding the race where onNewGame() reads the stale seed layer name.
@@ -1557,26 +1570,23 @@ export default class Switch extends S3DiscordPluginBase {
      * within the same seed session), nulls seedPresenceStart (round is over).
      *
      * Uses an atomic UPDATE with WHERE clause as the compare-and-swap defense
-     * against the race with _checkSeedBonusGrants (§4.1a path). Both methods
-     * target the same rows (seedPresenceStart != null AND not-yet-granted) but
-     * the atomic WHERE ensures only one can win per row — no double-grant even
-     * if both fire simultaneously for the same matchId. The _seedPresenceProcessing
-     * re-entrancy guard (shared with _onSeedPresenceCheck) further prevents
-     * concurrent DB scans between the two paths.
+     * against the race with _checkSeedBonusGrants (§4.1a path). Both methods target
+     * the same rows but use different WHERE filters (this method requires
+     * seedBonusTokensEarned == 0; the periodic check requires thresholdMs+ of
+     * accrued time). The atomic UPDATE ensures only one can win per row — no
+     * double-grant even if both fire simultaneously. No shared re-entrancy guard
+     * is needed — the transition grant runs independently.
      */
     _grantSeedBonusOnTransition = async function () {
-        if (this._seedPresenceProcessing) return;
-        this._seedPresenceProcessing = true;
+        const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
+        if (!PlayerCooldowns) return;
+
+        const currentMatchId = this._s3?.gameState?.getMatchId?.() || null;
+        const bonusAmount = this.options.seedTokenBonusAmount;
+        const bonusMinutes = this.options.seedTokenBonusMinutes;
+        if (bonusAmount <= 0 || bonusMinutes <= 0) return;
 
         try {
-            const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
-            if (!PlayerCooldowns) return;
-
-            const currentMatchId = this._s3?.gameState?.getMatchId?.() || null;
-            const bonusAmount = this.options.seedTokenBonusAmount;
-            const bonusMinutes = this.options.seedTokenBonusMinutes;
-            if (bonusAmount <= 0 || bonusMinutes <= 0) return;
-
             // Atomic UPDATE: consolation grant — only players who earned ZERO bonus
             // tokens during the seed round (seedBonusTokensEarned == 0) get the
             // transition grant. Players who already earned via the periodic check
@@ -1587,6 +1597,15 @@ export default class Switch extends S3DiscordPluginBase {
             //
             // Uses Sequelize.literal for the additive tokenBalance increment since
             // the addition is safe (integer, no user input).
+            //
+            // NOTE: No shared re-entrancy guard with _onSeedPresenceCheck. The atomic
+            // UPDATE WHERE clauses are the actual race defense — _checkSeedBonusGrants
+            // targets rows with thresholdMs+ accrued time, while this method targets
+            // rows with seedBonusTokensEarned == 0 (players not yet granted). They
+            // operate on different subsets of rows. The _seedPresenceProcessing guard
+            // was removed because it caused silent grant loss when a S3_PLAYERS_UPDATED
+            // tick happened to be processing during a seed→non-seed layer transition
+            // (see _onLayerChanged in switch-output.js).
             const [grantCount] = await PlayerCooldowns.update(
                 {
                     tokenBalance: Sequelize.literal('tokenBalance + 1'),
@@ -1631,8 +1650,6 @@ export default class Switch extends S3DiscordPluginBase {
             }
         } catch (err) {
             this.verbose(1, `[SeedPresence] Error granting seed bonus on transition: ${err.message}`);
-        } finally {
-            this._seedPresenceProcessing = false;
         }
     };
 
@@ -1653,9 +1670,9 @@ export default class Switch extends S3DiscordPluginBase {
      * against the race with _grantSeedBonusOnTransition (§4.1b path). Both methods
      * target the same rows (seedPresenceStart != null) but the atomic WHERE ensures
      * only one can win per row — no double-grant even if both fire simultaneously
-     * for the same matchId. The _seedPresenceProcessing re-entrancy guard (shared
-     * via _onSeedPresenceCheck) further prevents concurrent DB scans between the
-     * two paths.
+     * for the same matchId. No shared re-entrancy guard is needed — the transition
+     * grant (_grantSeedBonusOnTransition) operates independently, and the atomic
+     * WHERE clauses ensure they target different subsets of rows.
      *
      * The WHERE clause filters to rows where seedPresenceStart IS NOT NULL AND
      * threshold met AND seedBonusTokensEarned < bonusCap AND (lastSeedBonusRoundID
@@ -1746,9 +1763,9 @@ export default class Switch extends S3DiscordPluginBase {
      * seed mode — the handler returns immediately without any DB access.
      *
      * Uses a re-entrancy guard (_seedPresenceProcessing) to prevent concurrent DB
-     * scans. This guard is shared with _grantSeedBonusOnTransition, so if a
-     * layer-change fires during a periodic check the transition path waits for the
-     * periodic check to finish before proceeding, avoiding unnecessary DB contention.
+     * scans within this method only. The transition grant (_grantSeedBonusOnTransition)
+     * runs independently without this guard — the atomic UPDATE WHERE clauses
+     * are the actual race defense against double-grants between the two paths.
      */
     _onSeedPresenceCheck = async () => {
         if (this._seedPresenceProcessing) return;
