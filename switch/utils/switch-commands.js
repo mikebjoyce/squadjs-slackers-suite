@@ -337,14 +337,14 @@ const SwitchCommands = {
                   const cooldownDuration = plugin.options.switchCooldownMinutes > 0
                     ? plugin.options.switchCooldownMinutes * 60 * 1000
                     : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+                  const row = cooldownData
+                    ? { tokenBalance: cooldownData.tokenBalance, tokenRegenAnchor: cooldownData.tokenRegenAnchor }
+                    : { tokenBalance: plugin.options.maxSwitchTokens, tokenRegenAnchor: null };
+                  plugin._regenTokens(row);
+
                   let cooldownOK = true;
                   let cooldownMsg = 'Clear';
                   if (!isLiberal) {
-                    // Token-aware cooldown check
-                    const row = cooldownData
-                      ? { tokenBalance: cooldownData.tokenBalance, tokenRegenAnchor: cooldownData.tokenRegenAnchor }
-                      : { tokenBalance: plugin.options.maxSwitchTokens, tokenRegenAnchor: null };
-                    plugin._regenTokens(row);
                     if (row.tokenBalance < 1) {
                       cooldownOK = false;
                       const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : now;
@@ -372,7 +372,7 @@ const SwitchCommands = {
 
                   if (isLiberal) {
                     statusMsg += `[OK] Time       | Seed Mode\n`;
-                    statusMsg += `[OK] Cooldown   | Seed Mode\n`;
+                    statusMsg += `[OK] Cooldown   | Seed Mode${showTokenMessaging ? ` (${row.tokenBalance}/${plugin.options.maxSwitchTokens} tokens)` : ''}\n`;
                   } else {
                     statusMsg += `[${timeWindowOK ? 'OK' : 'X '}] Time       | ${timeWindowMsg}\n`;
                     statusMsg += `[${cooldownOK ? 'OK' : 'X '}] Cooldown   | ${cooldownMsg}\n`;
