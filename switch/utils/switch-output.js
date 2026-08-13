@@ -844,12 +844,17 @@ const SwitchOutput = {
 
           if (lockedPlayers.length > 0) {
             playerList = lockedPlayers.map(p => {
+              // Apply lazy regen in-memory so token counts are live (not stale DB values)
+              const liveRow = { tokenBalance: p.tokenBalance, tokenRegenAnchor: p.tokenRegenAnchor };
+              plugin._regenTokens(liveRow);
               const parts = [];
               if (p.scrambleLockdownExpiry && p.scrambleLockdownExpiry > now) {
                 parts.push(`🌪️ <t:${Math.floor(p.scrambleLockdownExpiry.getTime() / 1000)}:R>`);
               }
-              if (p.tokenBalance != null && p.tokenBalance < maxTokens) {
-                parts.push(`🎫 ${p.tokenBalance}/${maxTokens} tokens`);
+              if (liveRow.tokenBalance < maxTokens) {
+                parts.push(`🎫 ${liveRow.tokenBalance}/${maxTokens} tokens`);
+              } else {
+                parts.push(`🎫 ${liveRow.tokenBalance}/${maxTokens} tokens (full)`);
               }
               return `**${p.playerName || p.steamID}**: ${parts.join(' ')}`;
             }).join('\n');
@@ -861,8 +866,29 @@ const SwitchOutput = {
         // rest of the embed from rendering with System Health + Config + Queue.
       }
 
+      // Recompute playersBelowCap with lazy regen for accuracy
+      let liveBelowCap = 0;
+      try {
+        const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
+        if (PlayerCooldowns) {
+          const allBelowCap = await PlayerCooldowns.findAll({
+            where: { tokenBalance: { [Op.lt]: maxTokens } },
+            attributes: ['tokenBalance', 'tokenRegenAnchor']
+          });
+          for (const row of allBelowCap) {
+            const liveRow = { tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor };
+            plugin._regenTokens(liveRow);
+            if (liveRow.tokenBalance < maxTokens) {
+              liveBelowCap++;
+            }
+          }
+        }
+      } catch (_) {
+        liveBelowCap = playersBelowCap; // fallback to stored count on error
+      }
+
       const cooldownLines = [];
-      cooldownLines.push(`Players Below Cap:    ${playersBelowCap}`);
+      cooldownLines.push(`Players Below Cap:    ${liveBelowCap}`);
       cooldownLines.push(`Scramble Locks:        ${scrambleLocks}`);
       cooldownLines.push(`Tracked Players:       ${totalStoredPlayers}`);
 
@@ -880,7 +906,7 @@ const SwitchOutput = {
           { name: '\u{1F4CB} Config', value: configLines.join('\n'), inline: false },
           { name: `\u{1F465} Queue (${totalQueued})`, value: queueLines.join('\n'), inline: false },
           { name: '\u{1F550} Cooldown Statistics', value: cooldownLines.join('\n'), inline: false },
-          { name: '\u{1F512} Active Locks (top 5)', value: playerList, inline: false }
+          { name: '\u{1F512} Restricted Players (top 5)', value: playerList, inline: false }
         ]
       };
     };
