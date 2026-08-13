@@ -361,8 +361,9 @@ export function createMockDb() {
  * @param {number} [opts.switchCooldownHours=1]   — per-token refill interval (hours)
  * @param {number} [opts.switchCooldownMinutes=0]  — per-token refill interval (minutes, overrides hours)
  * @param {number} [opts.switchEnabledMinutes=10]  — eligibility window duration
- * @param {number} [opts.seedTokenBonusAmount=1]   — per-round seed bonus cap
- * @param {number} [opts.seedTokenBonusMinutes=20] — minutes required for seed bonus
+ * @param {number} [opts.seedTokenBonusAmount=1]      — per-round seed bonus cap
+ * @param {number} [opts.seedTokenBonusMinutes=20]    — minutes required for seed bonus
+ * @param {number} [opts.seedTokenBonusMinPlayers=0]  — minimum players for seed accrual
  * @param {boolean} [opts.timeLimitEnabled=true]   — whether time window + token checks apply
  * @param {boolean} [opts.isLiberalMode=false]     — whether liberal mode (Seed/Jensen) is active
  * @param {MockClock} [clock]                      — if provided, used for Date.now; otherwise new MockClock
@@ -376,6 +377,7 @@ export function createMockHarness(opts = {}, clock = null) {
     switchEnabledMinutes: 10,
     seedTokenBonusAmount: 1,
     seedTokenBonusMinutes: 20,
+    seedTokenBonusMinPlayers: 0,
     timeLimitEnabled: true,
     isLiberalMode: false,
     ...opts
@@ -397,6 +399,9 @@ export function createMockHarness(opts = {}, clock = null) {
   // ── Build plugin stub ───────────────────────────────────────
   const plugin = {
     options,
+    server: {
+      players: []          // tests control this via _setPlayerCount()
+    },
     _s3: {
       gameState: {
         isSeedMode: () => options.isLiberalMode,
@@ -412,10 +417,24 @@ export function createMockHarness(opts = {}, clock = null) {
     // Allow tests to control time-dependent values
     _setJoinSeconds: (s) => { joinSeconds = s; },
     _setMatchSeconds: (s) => { matchSeconds = s; },
+    _setPlayerCount: (n) => {
+      plugin.server.players = Array.from({ length: n }, (_, i) => ({ eosID: `p${i + 1}`, name: `Player ${i + 1}` }));
+    },
     getSecondsFromJoin: async () => joinSeconds,
     getSecondsFromMatchStart: () => matchSeconds,
 
     isLiberalMode: () => options.isLiberalMode,
+
+    // v2.4.0: seed bonus enable/accrual helpers (mirror of plugin logic)
+    _isSeedBonusEnabled: () => options.seedTokenBonusAmount > 0 && options.seedTokenBonusMinutes > 0,
+
+    _isSeedAccrualActive: () => {
+      if (!options.isLiberalMode) return false;
+      if (!(options.seedTokenBonusAmount > 0 && options.seedTokenBonusMinutes > 0)) return false;
+      const minPlayers = options.seedTokenBonusMinPlayers ?? 0;
+      if (minPlayers === 0) return true;
+      return plugin.server.players.length >= minPlayers;
+    },
 
     verbose: (...args) => {
       // No-op in tests — uncomment for debugging

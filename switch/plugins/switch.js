@@ -12,7 +12,7 @@ import SwitchExplain from '../utils/switch-explain.js';
 
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                    SWITCH PLUGIN v2.3.2                       ║
+ * ║                    SWITCH PLUGIN v2.4.0                       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -175,7 +175,7 @@ import SwitchExplain from '../utils/switch-explain.js';
  *
  */
 export default class Switch extends S3DiscordPluginBase {
-    static version = '2.3.2';
+    static version = '2.4.0';
 
     static get description() {
         return "Switch plugin with persistent join timers";
@@ -368,19 +368,25 @@ export default class Switch extends S3DiscordPluginBase {
                 default: 2,
                 type: 'number'
             },
-            // ── Stage 2: Seed bonus token options ──────────────────
-            seedTokenBonusAmount: {
-                required: false,
-                description: 'Tokens granted per qualifying seed session. Added directly to tokenBalance (uncapped), stacking above the normal maximum.',
-                default: 1,
-                type: 'number'
-            },
-            seedTokenBonusMinutes: {
-                required: false,
-                description: 'Minutes a player must be present in a seed-mode round to qualify for the bonus token grant.',
-                default: 20,
-                type: 'number'
-            }
+             // ── Stage 2: Seed bonus token options ──────────────────
+             seedTokenBonusAmount: {
+                 required: false,
+                 description: 'Maximum bonus tokens a player can earn per seed round. Set to 0 to disable seed bonus tokens entirely. Each qualifying interval grants +1 token (see seedTokenBonusMinutes).',
+                 default: 1,
+                 type: 'number'
+             },
+             seedTokenBonusMinutes: {
+                 required: false,
+                 description: 'Minutes a player must be present in a seed-mode round to earn one bonus token. Set to 0 to disable seed bonus tokens entirely.',
+                 default: 20,
+                 type: 'number'
+             },
+             seedTokenBonusMinPlayers: {
+                 required: false,
+                 description: 'Minimum number of players on the server before seed presence time accrues toward bonus tokens. Set to 0 to disable the minimum (time always accrues in seed mode).',
+                 default: 0,
+                 type: 'number'
+             }
         };
     }
 
@@ -403,9 +409,10 @@ export default class Switch extends S3DiscordPluginBase {
         this.recentDoubleSwitches = [];
         this._reconnectLockoutClearTimeouts = new Map();
 
-        // v2.3.0 Stage 2: Seed presence tracking
-        this._seedPresenceProcessing = false;  // re-entrancy guard for seed bonus checks
-        this._wasSeedMode = false;             // track seed→non-seed transitions in _onLayerChanged
+         // v2.3.0 Stage 2: Seed presence tracking
+         this._seedPresenceProcessing = false;  // re-entrancy guard for seed bonus checks
+         this._wasSeedMode = false;             // track seed→non-seed transitions in _onLayerChanged
+         this._seedAccrualActive = false;       // v2.4.0: current seed-presence accrual state (seed mode + enabled + min players)
 
         // ── Explain auto-update state ────────────────────────────
         this._explainMessage = null;       // cached Discord message object for editing
@@ -433,10 +440,18 @@ export default class Switch extends S3DiscordPluginBase {
             this.verbose(1, `[Config] maxSwitchTokens=${this.options.maxSwitchTokens} is invalid — forcing to 1 (legacy flat-cooldown mode).`);
             this.options.maxSwitchTokens = 1;
         }
-        if (this.options.seedTokenBonusAmount < 0) {
-            this.verbose(1, `[Config] seedTokenBonusAmount=${this.options.seedTokenBonusAmount} is invalid — forcing to 0 (no seed bonus tokens).`);
-            this.options.seedTokenBonusAmount = 0;
-        }
+         if (this.options.seedTokenBonusAmount < 0) {
+             this.verbose(1, `[Config] seedTokenBonusAmount=${this.options.seedTokenBonusAmount} is invalid — forcing to 0 (no seed bonus tokens).`);
+             this.options.seedTokenBonusAmount = 0;
+         }
+         if (this.options.seedTokenBonusMinutes < 0) {
+             this.verbose(1, `[Config] seedTokenBonusMinutes=${this.options.seedTokenBonusMinutes} is invalid — forcing to 0 (seed bonus disabled).`);
+             this.options.seedTokenBonusMinutes = 0;
+         }
+         if (this.options.seedTokenBonusMinPlayers < 0) {
+             this.verbose(1, `[Config] seedTokenBonusMinPlayers=${this.options.seedTokenBonusMinPlayers} is invalid — forcing to 0 (no minimum).`);
+             this.options.seedTokenBonusMinPlayers = 0;
+         }
 
         this._liberalModes = (this.options.liberalSwitchGameModes || ['Seed', 'Jensen']).map(m => String(m).toLowerCase());
         this._roundStats = this._initRoundStats();
@@ -1275,7 +1290,7 @@ export default class Switch extends S3DiscordPluginBase {
         // because the window is extremely narrow and the consequence is a single spurious
         // verbose log line.
         try {
-            if (this._s3?.gameState?.isSeedMode?.()) {
+            if (this._s3?.gameState?.isSeedMode?.() && this._isSeedAccrualActive()) {
                 const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
                 if (PlayerCooldowns) {
                     const row = await PlayerCooldowns.findByPk(eosID);
@@ -1427,6 +1442,33 @@ export default class Switch extends S3DiscordPluginBase {
     // ── Stage 2: Seed bonus token methods ─────────────────────────
 
     /**
+     * v2.4.0: Whether the seed bonus token feature is enabled at all.
+     * Disabled when either seedTokenBonusAmount <= 0 or seedTokenBonusMinutes <= 0.
+     * Setting either option to 0 disables seed bonus tokens entirely.
+     */
+    _isSeedBonusEnabled() {
+        return this.options.seedTokenBonusAmount > 0
+            && this.options.seedTokenBonusMinutes > 0;
+    }
+
+    /**
+     * v2.4.0: Whether seed-presence accrual is currently active.
+     * True only when the server is in seed mode, the seed bonus is enabled,
+     * and the server population meets the minimum-player threshold.
+     *
+     * When false, seed presence time does NOT count toward bonus tokens and
+     * no grants fire. A false→true transition resets all seedPresenceStart
+     * timestamps (see _onSeedPresenceCheck → _initSeedPresenceForAll(true)).
+     */
+    _isSeedAccrualActive() {
+        if (!this._s3?.gameState?.isSeedMode?.()) return false;
+        if (!this._isSeedBonusEnabled()) return false;
+        const minPlayers = this.options.seedTokenBonusMinPlayers ?? 0;
+        if (minPlayers === 0) return true;
+        return this.server.players.length >= minPlayers;
+    }
+
+    /**
      * Initialize seedPresenceStart for all currently connected players.
      * Called when transitioning from non-seed → seed on a layer change (§4.2).
      * Only sets seedPresenceStart if the player doesn't already have one
@@ -1441,9 +1483,12 @@ export default class Switch extends S3DiscordPluginBase {
      * (the entry will either resolve to a real player or be cleaned up on
      * disconnect).
      */
-    _initSeedPresenceForAll = async function () {
+    _initSeedPresenceForAll = async function (force = false) {
         const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
         if (!PlayerCooldowns) return;
+
+        // v2.4.0: Skip entirely when the seed bonus is disabled.
+        if (!this._isSeedBonusEnabled()) return;
 
         const allPlayers = this._s3?.players?.isReady?.()
             ? this._s3.players.getAllPlayers()
@@ -1474,6 +1519,17 @@ export default class Switch extends S3DiscordPluginBase {
                     // Existing row, no active presence — reset counter for new seed session
                     await PlayerCooldowns.update(
                         { seedPresenceStart: new Date(), seedBonusTokensEarned: 0 },
+                        { where: { eosID: p.eosID } }
+                    );
+                    count++;
+                } else if (force) {
+                    // v2.4.0: Force reset — accrual just (re)activated. Discard any
+                    // time accrued below the min-player threshold (or while disabled)
+                    // and restart the qualifying clock fresh. Preserves the earned
+                    // count so a player who already capped out this seed session
+                    // isn't reset to 0 and double-granted.
+                    await PlayerCooldowns.update(
+                        { seedPresenceStart: new Date() },
                         { where: { eosID: p.eosID } }
                     );
                     count++;
@@ -1518,7 +1574,8 @@ export default class Switch extends S3DiscordPluginBase {
 
             const currentMatchId = this._s3?.gameState?.getMatchId?.() || null;
             const bonusAmount = this.options.seedTokenBonusAmount;
-            if (bonusAmount <= 0) return;
+            const bonusMinutes = this.options.seedTokenBonusMinutes;
+            if (bonusAmount <= 0 || bonusMinutes <= 0) return;
 
             // Atomic UPDATE: consolation grant — only players who earned ZERO bonus
             // tokens during the seed round (seedBonusTokensEarned == 0) get the
@@ -1613,7 +1670,7 @@ export default class Switch extends S3DiscordPluginBase {
         const bonusMinutes = this.options.seedTokenBonusMinutes;
         const bonusCap = this.options.seedTokenBonusAmount;
         const thresholdMs = bonusMinutes * 60 * 1000;
-        if (bonusCap <= 0) return;
+        if (bonusCap <= 0 || bonusMinutes <= 0) return;
 
         const now = Date.now();
 
@@ -1693,9 +1750,33 @@ export default class Switch extends S3DiscordPluginBase {
      * layer-change fires during a periodic check the transition path waits for the
      * periodic check to finish before proceeding, avoiding unnecessary DB contention.
      */
-    _onSeedPresenceCheck = async function () {
+    _onSeedPresenceCheck = async () => {
         if (this._seedPresenceProcessing) return;
-        if (!this._s3?.gameState?.isSeedMode?.()) return;
+
+        const accrualActive = this._isSeedAccrualActive();
+        const wasAccrualActive = this._seedAccrualActive;
+
+        // False → true transition: accrual just (re)activated (server crossed
+        // above the min-player threshold, or entered seed mode with enough
+        // players). Reset all seedPresenceStart timestamps so time accrued
+        // below the threshold (or while disabled) is discarded and the
+        // qualifying clock restarts fresh.
+        if (accrualActive && !wasAccrualActive) {
+            this._seedAccrualActive = true;
+            this._seedPresenceProcessing = true;
+            try {
+                await this._initSeedPresenceForAll(true);
+            } catch (err) {
+                this.verbose(1, `[SeedPresence] Accrual (re)activation reset failed: ${err.message}`);
+            } finally {
+                this._seedPresenceProcessing = false;
+            }
+            return;
+        }
+
+        this._seedAccrualActive = accrualActive;
+        if (!accrualActive) return;
+
         this._seedPresenceProcessing = true;
         try {
             await this._checkSeedBonusGrants();

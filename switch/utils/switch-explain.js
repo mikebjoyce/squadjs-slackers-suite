@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║          SWITCH PLUGIN v2.3.2 — EXPLAIN EMBED GENERATOR       ║
+ * ║          SWITCH PLUGIN v2.4.0 — EXPLAIN EMBED GENERATOR       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -350,7 +350,9 @@ function _buildTokenEmbed(plugin) {
   const maxTokens = plugin.options.maxSwitchTokens || 2;
   const cooldownStr = _formatCooldown(plugin);
   const seedBonusAmount = plugin.options.seedTokenBonusAmount || 0;
-  const seedBonusMinutes = plugin.options.seedTokenBonusMinutes || 20;
+  const seedBonusMinutes = plugin.options.seedTokenBonusMinutes ?? 20;
+  const seedBonusEnabled = plugin._isSeedBonusEnabled?.() ?? (seedBonusAmount > 0 && seedBonusMinutes > 0);
+  const seedBonusMinPlayers = plugin.options.seedTokenBonusMinPlayers ?? 0;
 
   const tokenPool = [
     `Maximum tokens: **${maxTokens}**`,
@@ -360,9 +362,12 @@ function _buildTokenEmbed(plugin) {
   const poolExplanation = `Tokens refill one at a time, independently. With **${maxTokens}** tokens saved, you can switch ${maxTokens > 1 ? 'up to ' + maxTokens + ' times' : 'once'} before waiting for a refill. This gives you flexibility without allowing unlimited switching.`;
 
   let seedBonusField = null;
-  if (seedBonusAmount > 0) {
+  if (seedBonusEnabled) {
+    const minNote = seedBonusMinPlayers > 0
+      ? ` (only while **${seedBonusMinPlayers}+** players are online)`
+      : '';
     const seedLines = [
-      `During seed rounds, you earn **+${seedBonusAmount}** bonus token for every **${seedBonusMinutes}** minutes you are present.`,
+      `During seed rounds, you earn **+1** bonus token for every **${seedBonusMinutes}** minutes you are present${minNote}.`,
       `You can earn up to **${seedBonusAmount}** bonus token${seedBonusAmount !== 1 ? 's' : ''} per seed round.`,
       `Bonus tokens stack above your normal cap of **${maxTokens}**, so after a full seed round you could hold up to **${maxTokens + seedBonusAmount}** tokens total.`
     ].join('\n');

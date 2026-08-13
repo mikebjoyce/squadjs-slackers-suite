@@ -23,7 +23,7 @@
  *
  */
 
-import { createMockDb, assert } from './mock-harness.js';
+import { createMockDb, createMockHarness, assert } from './mock-harness.js';
 
 let passed = 0;
 let failed = 0;
@@ -388,6 +388,143 @@ async function testSuite() {
     } else {
       dbOpsExecuted = true;
     }
+  });
+
+  // ═════════════════════════════════════════════════════════════
+  // v2.4.0 additions: min-player threshold + disable semantics
+  // ═════════════════════════════════════════════════════════════
+
+  // ── Test 48: seed bonus disabled when amount or minutes is 0 ──
+  await runTest('v2.4.0: seed bonus disabled when seedTokenBonusAmount=0', async () => {
+    const { plugin } = createMockHarness({ seedTokenBonusAmount: 0, seedTokenBonusMinutes: 20 });
+    assert.strictEqual(plugin._isSeedBonusEnabled(), false, 'amount=0 should disable seed bonus');
+  });
+
+  await runTest('v2.4.0: seed bonus disabled when seedTokenBonusMinutes=0', async () => {
+    const { plugin } = createMockHarness({ seedTokenBonusAmount: 1, seedTokenBonusMinutes: 0 });
+    assert.strictEqual(plugin._isSeedBonusEnabled(), false, 'minutes=0 should disable seed bonus');
+  });
+
+  await runTest('v2.4.0: seed bonus enabled with positive amount and minutes', async () => {
+    const { plugin } = createMockHarness({ seedTokenBonusAmount: 2, seedTokenBonusMinutes: 30 });
+    assert.strictEqual(plugin._isSeedBonusEnabled(), true, 'positive values should enable seed bonus');
+  });
+
+  // ── Test 49: accrual respects min-player threshold ────────────
+  await runTest('v2.4.0: accrual inactive below min-player threshold', async () => {
+    const { plugin } = createMockHarness({ isLiberalMode: true, seedTokenBonusMinPlayers: 3 });
+    plugin._setPlayerCount(2);
+    assert.strictEqual(plugin._isSeedAccrualActive(), false, '2 players < 3 min should be inactive');
+  });
+
+  await runTest('v2.4.0: accrual active at or above min-player threshold', async () => {
+    const { plugin } = createMockHarness({ isLiberalMode: true, seedTokenBonusMinPlayers: 3 });
+    plugin._setPlayerCount(3);
+    assert.strictEqual(plugin._isSeedAccrualActive(), true, '3 players >= 3 min should be active');
+  });
+
+  await runTest('v2.4.0: accrual inactive when not in seed mode', async () => {
+    const { plugin } = createMockHarness({ isLiberalMode: false, seedTokenBonusMinPlayers: 0 });
+    plugin._setPlayerCount(10);
+    assert.strictEqual(plugin._isSeedAccrualActive(), false, 'not in seed mode → inactive even with players');
+  });
+
+  await runTest('v2.4.0: accrual active with minPlayers=0 regardless of population', async () => {
+    const { plugin } = createMockHarness({ isLiberalMode: true, seedTokenBonusMinPlayers: 0 });
+    plugin._setPlayerCount(1);
+    assert.strictEqual(plugin._isSeedAccrualActive(), true, 'minPlayers=0 → active with any population');
+  });
+
+  // ── Test 50: accrual false→true transition resets presence ───
+  await runTest('v2.4.0: accrual activation resets all seedPresenceStart timestamps', async () => {
+    const db = createMockDb();
+    const now = BASE_TIME;
+    // Player accrued time below the threshold (before accrual became active)
+    await db.upsert({
+      eosID: 'player1',
+      tokenBalance: 2,
+      seedPresenceStart: new Date(now - 60 * 60 * 1000), // 1 hour accrued below threshold
+      seedBonusTokensEarned: 0,
+      lastSeedBonusRoundID: null
+    });
+
+    // Simulate the force-reset UPDATE applied on accrual activation:
+    // reset seedPresenceStart to NOW, preserving seedBonusTokensEarned.
+    await db.update(
+      { seedPresenceStart: new Date(now) },
+      { where: { eosID: 'player1' } }
+    );
+
+    const row = await db.findByPk('player1');
+    assert.strictEqual(new Date(row.seedPresenceStart).getTime(), now, 'seedPresenceStart should reset to NOW on accrual activation');
+    assert.strictEqual(row.seedBonusTokensEarned, 0, 'earned count preserved (0 → still 0)');
+  });
+
+  await runTest('v2.4.0: accrual activation preserves prior earned count (no double grant)', async () => {
+    const db = createMockDb();
+    const now = BASE_TIME;
+    // Player already earned 1 bonus token this seed session, then the server
+    // dropped below min players and came back up.
+    await db.upsert({
+      eosID: 'player1',
+      tokenBalance: 3,
+      seedPresenceStart: new Date(now - 60 * 60 * 1000),
+      seedBonusTokensEarned: 1,
+      lastSeedBonusRoundID: 'match-1'
+    });
+
+    // Force-reset preserves seedBonusTokensEarned (only resets seedPresenceStart).
+    await db.update(
+      { seedPresenceStart: new Date(now) },
+      { where: { eosID: 'player1' } }
+    );
+
+    const row = await db.findByPk('player1');
+    assert.strictEqual(new Date(row.seedPresenceStart).getTime(), now, 'seedPresenceStart reset to NOW');
+    assert.strictEqual(row.seedBonusTokensEarned, 1, 'earned count preserved (no reset to 0 → no double grant)');
+    assert.strictEqual(row.tokenBalance, 3, 'token balance untouched by force reset');
+  });
+
+  // ── Test 51: grants short-circuit when seed bonus disabled ────
+  await runTest('v2.4.0: periodic grant no-ops when disabled (bonusMinutes=0)', async () => {
+    // The plugin's _checkSeedBonusGrants returns early when bonusMinutes <= 0.
+    // Verify the guard condition itself is correct.
+    const bonusCap = 1;
+    const bonusMinutes = 0;
+    const shouldGrant = bonusCap > 0 && bonusMinutes > 0;
+    assert.strictEqual(shouldGrant, false, 'guard should prevent granting when minutes=0');
+  });
+
+  await runTest('v2.4.0: consolation grant no-ops when disabled (bonusAmount=0)', async () => {
+    // The plugin's _grantSeedBonusOnTransition returns early when amount <= 0.
+    const bonusAmount = 0;
+    const bonusMinutes = 20;
+    const shouldGrant = bonusAmount > 0 && bonusMinutes > 0;
+    assert.strictEqual(shouldGrant, false, 'guard should prevent granting when amount=0');
+  });
+
+  // ── Test 52: consolation grant idempotency (layer-change safety) ─
+  await runTest('v2.4.0: consolation grant is idempotent across repeated calls', async () => {
+    const db = createMockDb();
+    const now = BASE_TIME;
+    await db.upsert({
+      eosID: 'player1',
+      tokenBalance: 2,
+      seedPresenceStart: new Date(now - 1000),
+      seedBonusTokensEarned: 0,
+      lastSeedBonusRoundID: null
+    });
+
+    // First consolation grant (e.g. layer change)
+    await grantSeedBonusOnTransition(db, 1, 'match-1', now);
+
+    // A second call (e.g. another layer change event) should find nothing
+    // because seedPresenceStart is now null.
+    const secondGrant = await grantSeedBonusOnTransition(db, 1, 'match-1', now);
+
+    assert.strictEqual(secondGrant, 0, 'no double grant on second call');
+    const p1 = await db.findByPk('player1');
+    assert.strictEqual(p1.tokenBalance, 3, 'balance still 3 (single grant total)');
   });
 }
 

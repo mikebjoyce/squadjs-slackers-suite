@@ -1,4 +1,4 @@
-# Switch Plugin v2.3.2
+# Switch Plugin v2.4.0
 
 **Team-change management with database persistence, TeamBalancer integration, and S³-aware player tracking.**
 
@@ -21,7 +21,7 @@ Survives server restarts via any Sequelize-compatible database (SQLite, MySQL, P
 * **Double-Switch** — swap to opposite team and back to fix game bugs without changing teams
 * **Liberal Mode Support** — relaxed switching rules during Seed/Jensen rounds
 * **Token Bucket Cooldown** — players hold up to `maxSwitchTokens` (default 2) with individual per-token regeneration; set to 1 for legacy flat-cooldown behavior. Token-aware messaging adapts automatically based on the configured token count.
-* **Seed Bonus Tokens** — players earn bonus switch tokens (stacking above the normal cap) for time spent in seed-mode rounds.
+ * **Seed Bonus Tokens** — players earn bonus switch tokens (stacking above the normal cap) for time spent in seed-mode rounds. Configurable minimum player threshold (`seedTokenBonusMinPlayers`) gates time accrual so low-population servers don't hand out tokens at 2 AM. Set either `seedTokenBonusAmount` or `seedTokenBonusMinutes` to 0 to disable seed bonus tokens entirely.
 * **Dynamic Balance Tolerance** — interpolated extra imbalance slots when server is below full capacity
 * **Auto-Updating Explain Channel** — When `explainChannelID` is configured, the full `!switch explain` embed sequence plus a 7-day reliability stats embed is posted to the designated channel on mount and periodically refreshed in-place (every 30 minutes). Players always see current information without manual `!switch explain` re-runs.
 * **Enhanced `!switch stats`** — Discord aggregate embed with per-move-type counts, denial reason breakdowns, queue outcomes, liberal-mode filtering, and data quality warnings
@@ -109,7 +109,8 @@ Add the following to your SquadJS `config.json`:
     "queueTimeoutExtraSlots": 2,
     "maxSwitchTokens": 2,
     "seedTokenBonusAmount": 1,
-    "seedTokenBonusMinutes": 20
+    "seedTokenBonusMinutes": 20,
+    "seedTokenBonusMinPlayers": 0
   }
 ]
 ```
@@ -195,7 +196,7 @@ The Switch plugin exposes a public API for external consumers (such as SmartAssi
 
 ### Version Compatibility
 
-- `static version = '2.3.2'` — public API with dual-array queue, timeout-switch feature, token bucket system, seed bonus tokens, scramble remediation, and enhanced stats.
+- `static version = '2.4.0'` — seed bonus min-player threshold, seed bonus disable (0-value options), and end-game seed completion grants on top of the v2.3.2 feature set.
 - Consumers should check `plugin.constructor.version` (wrapped in try/catch) and require `>= 2.0.0` before using the API.
 
 ### Consumer Discovery
@@ -226,13 +227,14 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 | `scrambleLockdownDurationMinutes` | Duration to block switching after a scramble | `30` |
 | `scrambleLockdownMinPlayers` | Minimum total players required to apply scramble lockdown. Below this threshold, scrambles clear the queue but do not lock switching. | `60` |
 
-### Token System (v2.3.0)
+### Token System (v2.3.0, seed bonuses enhanced in v2.4.0)
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `maxSwitchTokens` | Maximum number of switch tokens a player can hold. Each switch consumes 1 token; tokens regenerate individually over the cooldown interval. Set to 1 for legacy flat-cooldown behavior. | `2` |
-| `seedTokenBonusAmount` | Tokens granted per qualifying seed session. Added directly to tokenBalance (uncapped), stacking above the normal maximum. | `1` |
-| `seedTokenBonusMinutes` | Minutes a player must be present in a seed-mode round to qualify for the bonus token grant. | `20` |
+| `seedTokenBonusAmount` | Maximum bonus tokens a player can earn per seed round. Each qualifying interval grants +1 token. Set to 0 to disable seed bonus tokens entirely. | `1` |
+| `seedTokenBonusMinutes` | Minutes a player must be present in a seed-mode round to earn one bonus token. Set to 0 to disable seed bonus tokens entirely. | `20` |
+| `seedTokenBonusMinPlayers` | Minimum number of players on the server before seed presence time accrues toward bonus tokens. Set to 0 to disable the minimum (time always accrues in seed mode). | `0` |
 
 ### Queue Timeout Switch (v2.2.0)
 

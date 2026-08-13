@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║              SWITCH PLUGIN v2.3.2 — OUTPUT LAYER               ║
+ * ║              SWITCH PLUGIN v2.4.0 — OUTPUT LAYER               ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -197,7 +197,8 @@ const SwitchOutput = {
      * Runs every 5 minutes while the round is active.
      * Called from onNewGame() when isLiberalMode() is true.
      *
-     * Seed bonus messaging is gated on isSeedMode() AND seedTokenBonusAmount > 0,
+     * Seed bonus messaging is gated on isSeedMode() AND the seed bonus being
+     * enabled (seedTokenBonusAmount > 0 AND seedTokenBonusMinutes > 0),
      * NOT on maxSwitchTokens > 1 — the two are independent config options.
      * On Jensen/Training (liberal but not seed), the fallback message simply says
      * switches are unrestricted, without mentioning token earning.
@@ -216,15 +217,22 @@ const SwitchOutput = {
       // Broadcast: seed mode status or legacy fallback
       // Gated on isSeedMode() (not isLiberalMode()) to avoid showing seed bonus
       // messages during Jensen/Training rounds where the mechanic doesn't apply.
-      plugin._broadcastTimers.reminderInterval = setInterval(() => {
-        const isSeed = plugin._s3?.gameState?.isSeedMode?.() || false;
-        const bonusAmount = plugin.options.seedTokenBonusAmount;
-        if (isSeed && bonusAmount > 0) {
-          plugin.broadcast(`[Switch] Seed mode — switches are free (no token cost), and you earn +1 bonus switch token for every ${plugin.options.seedTokenBonusMinutes}m of helping seed (up to ${bonusAmount} per round). Use '!switch check' to see your balance.`);
-        } else {
-          plugin.broadcast(`[Switch] No cooldown restrictions on this game mode. Use '!switch' to change teams anytime.`);
-        }
-      }, intervalMs);
+       plugin._broadcastTimers.reminderInterval = setInterval(() => {
+         const isSeed = plugin._s3?.gameState?.isSeedMode?.() || false;
+         const bonusAmount = plugin.options.seedTokenBonusAmount;
+         const bonusEnabled = plugin._isSeedBonusEnabled?.() ?? (bonusAmount > 0);
+         const minPlayers = plugin.options.seedTokenBonusMinPlayers ?? 0;
+         if (isSeed && bonusEnabled) {
+           const minNote = minPlayers > 0
+             ? ` (requires ${minPlayers}+ players online)`
+             : '';
+           plugin.broadcast(`[Switch] Seed mode — switches are free (no token cost). You earn +1 bonus switch token for every ${plugin.options.seedTokenBonusMinutes}m of helping seed${minNote}, up to ${bonusAmount} per round. Use '!switch check' to see your balance.`);
+         } else if (isSeed && !bonusEnabled) {
+           plugin.broadcast(`[Switch] Seed mode — switches are free (no token cost). Use '!switch' to change teams anytime.`);
+         } else {
+           plugin.broadcast(`[Switch] No cooldown restrictions on this game mode. Use '!switch' to change teams anytime.`);
+         }
+       }, intervalMs);
 
       // NOTE: A separate 10-minute incentive broadcast was removed as redundant.
       // The primary 5-minute broadcast above carries the complete seed bonus message.
@@ -297,6 +305,10 @@ const SwitchOutput = {
       const wasSeed = plugin._wasSeedMode;
       plugin._wasSeedMode = isSeed;
 
+      // v2.4.0: sync accrual state with the new layer. When active, seed presence
+      // accrues; when inactive (disabled or below min players), the clock is paused.
+      plugin._seedAccrualActive = plugin._isSeedAccrualActive?.() ?? false;
+
       // If transitioning from seed to non-seed, grant bonus tokens to all
       // players who were present during the seed round (§4.1b).
       if (wasSeed && !isSeed) {
@@ -305,9 +317,11 @@ const SwitchOutput = {
         });
       }
 
-      // If transitioning into seed from non-seed, init seedPresenceStart for all
-      // currently connected players (§4.2).
-      if (!wasSeed && isSeed) {
+      // If transitioning into seed from non-seed and accrual is active, init
+      // seedPresenceStart for all currently connected players (§4.2).
+      // When accrual is inactive (below min players), init is deferred to the
+      // accrual activation path in _onSeedPresenceCheck.
+      if (!wasSeed && isSeed && plugin._seedAccrualActive) {
         plugin._initSeedPresenceForAll().catch(err => {
           plugin.verbose(1, `[SeedPresence] Error initing seed presence for all: ${err.message}`);
         });

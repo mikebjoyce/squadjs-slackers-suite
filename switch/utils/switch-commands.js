@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║              SWITCH PLUGIN v2.3.2 — COMMAND HANDLING           ║
+ * ║              SWITCH PLUGIN v2.4.0 — COMMAND HANDLING           ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -241,7 +241,12 @@ const SwitchCommands = {
           if (showTokenMessaging) {
                   plugin.warn(eosID, `[Switch] How It Works (4/6)\nEach switch costs 1 token. You hold up to ${plugin.options.maxSwitchTokens} tokens, and each refills individually every ${cooldownHours}h. Use !switch check to see your balance.`);
                   await delay(5000);
-                  plugin.warn(eosID, `[Switch] How It Works (5/6)\nDuring seed rounds, you earn +1 bonus switch token for every ${plugin.options.seedTokenBonusMinutes} minutes of presence (up to ${plugin.options.seedTokenBonusAmount} per round). Bonus tokens stack above your normal ${plugin.options.maxSwitchTokens}-token cap.`);
+                  const seedBonusEnabled = plugin._isSeedBonusEnabled?.() ?? (plugin.options.seedTokenBonusAmount > 0 && plugin.options.seedTokenBonusMinutes > 0);
+                  const seedMinPlayers = plugin.options.seedTokenBonusMinPlayers ?? 0;
+                  const seedMinNote = seedMinPlayers > 0 ? ` (requires ${seedMinPlayers}+ players online)` : '';
+                  plugin.warn(eosID, seedBonusEnabled
+                    ? `[Switch] How It Works (5/6)\nDuring seed rounds, you earn +1 bonus switch token for every ${plugin.options.seedTokenBonusMinutes} minutes of presence${seedMinNote} (up to ${plugin.options.seedTokenBonusAmount} per round). Bonus tokens stack above your normal ${plugin.options.maxSwitchTokens}-token cap.`
+                    : `[Switch] How It Works (5/6)\nSeed bonus tokens are disabled on this server.`);
                   await delay(5000);
                   plugin.warn(eosID, `[Switch] How It Works (6/6)\nAfter a scramble, switches are locked for ${plugin.options.scrambleLockdownDurationMinutes}m.\nUse !switch check to see your current status.`);
                 } else {
