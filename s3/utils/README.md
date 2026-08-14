@@ -67,4 +67,4 @@ await db.unmount();
 - SQLite connectors get a per-connector promise-chain mutex and WAL PRAGMA bootstrap once.
 - Non-SQLite connectors still get retry+jitter behavior, but no mutex serialization.
 - Migration tracking is provided via `S3_Migrations` + `registerMigration()` / `runMigrations()`.
-- Version numbering is shared with the S³ plugin (currently v1.1.1).
+- Version numbering is shared with the S³ plugin (currently v1.2.1).
