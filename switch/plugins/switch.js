@@ -1536,13 +1536,18 @@ export default class Switch extends S3DiscordPluginBase {
                     );
                     count++;
                 } else if (force) {
-                    // v2.4.0: Force reset — accrual just (re)activated. Discard any
-                    // time accrued below the min-player threshold (or while disabled)
-                    // and restart the qualifying clock fresh. Preserves the earned
-                    // count so a player who already capped out this seed session
-                    // isn't reset to 0 and double-granted.
+                    // v2.4.0: Force reset — accrual just (re)activated (server crossed
+                    // above the min-player threshold, or entered seed mode with enough
+                    // players). Discard any time accrued below the threshold (or while
+                    // disabled) and restart the qualifying clock fresh.
+                    //
+                    // Reset seedBonusTokensEarned to 0 so the per-round cap starts fresh
+                    // for this new seed session. The double-grant defense against granting
+                    // the same player twice in one round is handled by the lastSeedBonusRoundID
+                    // check in the WHERE clauses of _checkSeedBonusGrants and
+                    // _grantSeedBonusOnTransition — NOT by preserving seedBonusTokensEarned.
                     await PlayerCooldowns.update(
-                        { seedPresenceStart: new Date() },
+                        { seedPresenceStart: new Date(), seedBonusTokensEarned: 0 },
                         { where: { eosID: p.eosID } }
                     );
                     count++;
@@ -1633,8 +1638,17 @@ export default class Switch extends S3DiscordPluginBase {
                 // between the UPDATE and this read. The consequence is a missed notification
                 // (not a missed grant), which is acceptable.
                 try {
+                  // NOTE: Filter by seedPresenceStart=null to only find rows this
+                  // method (transition grant) actually modified. _checkSeedBonusGrants
+                  // sets seedPresenceStart=now (non-null), so including the IS NULL
+                  // condition prevents the notification from picking up rows that the
+                  // periodic check touched — avoiding duplicate "you earned a token"
+                  // spam when both methods happen to share the same matchId.
                   const grantedRows = await PlayerCooldowns.findAll({
-                    where: { lastSeedBonusRoundID: currentMatchId },
+                    where: {
+                      lastSeedBonusRoundID: currentMatchId,
+                      seedPresenceStart: null
+                    },
                     attributes: ['eosID', 'playerName', 'tokenBalance']
                   });
                   for (const row of grantedRows) {
@@ -1733,8 +1747,16 @@ export default class Switch extends S3DiscordPluginBase {
                 // between the UPDATE and this read. The consequence is a missed notification
                 // (not a missed grant), which is acceptable.
                 try {
+                  // NOTE: Filter by seedPresenceStart IS NOT NULL to only find rows
+                  // this method (periodic check) actually modified. _grantSeedBonusOnTransition
+                  // sets seedPresenceStart=null, so excluding null rows prevents the
+                  // notification from picking up rows that the transition grant touched —
+                  // avoiding duplicate "you earned a token" spam.
                   const grantedRows = await PlayerCooldowns.findAll({
-                    where: { lastSeedBonusRoundID: currentMatchId },
+                    where: {
+                      lastSeedBonusRoundID: currentMatchId,
+                      seedPresenceStart: { [Op.ne]: null }
+                    },
                     attributes: ['eosID', 'playerName', 'tokenBalance', 'seedBonusTokensEarned']
                   });
                   for (const row of grantedRows) {

@@ -305,10 +305,18 @@ const SwitchOutput = {
       const wasSeed = plugin._wasSeedMode;
       plugin._wasSeedMode = isSeed;
 
-      // v2.4.0: sync accrual state with the new layer. When active, seed presence
-      // accrues; when inactive (disabled or below min players), the clock is paused.
-      plugin._seedAccrualActive = plugin._isSeedAccrualActive?.() ?? false;
-
+      // v2.4.0: _seedAccrualActive sync is NOT done here — it is handled by
+      // _onSeedPresenceCheck on every S3_PLAYERS_UPDATED tick. Redundant sync
+      // here would race with the re-entrancy guard in _onSeedPresenceCheck.
+      //
+      // NOTE: No shared re-entrancy guard with _onSeedPresenceCheck. The atomic
+      // UPDATE WHERE clauses in _checkSeedBonusGrants and _grantSeedBonusOnTransition
+      // are the actual race defense — they operate on different subsets of rows.
+      // A _seedPresenceProcessing guard was tried and removed because it caused
+      // silent grant loss when a periodic tick was processing during a seed→non-seed
+      // layer transition (the guard skipped the transition grant, and _wasSeedMode
+      // was already flipped, so it was never retried).
+      //
       // If transitioning from seed to non-seed, grant bonus tokens to all
       // players who were present during the seed round (§4.1b).
       if (wasSeed && !isSeed) {
@@ -321,7 +329,11 @@ const SwitchOutput = {
       // seedPresenceStart for all currently connected players (§4.2).
       // When accrual is inactive (below min players), init is deferred to the
       // accrual activation path in _onSeedPresenceCheck.
-      if (!wasSeed && isSeed && plugin._seedAccrualActive) {
+      //
+      // _isSeedAccrualActive() is called directly (not via the cached
+      // _seedAccrualActive property) to avoid a race with _onSeedPresenceCheck,
+      // which owns and syncs that property on every S3_PLAYERS_UPDATED tick.
+      if (!wasSeed && isSeed && (plugin._isSeedAccrualActive?.() ?? false)) {
         plugin._initSeedPresenceForAll().catch(err => {
           plugin.verbose(1, `[SeedPresence] Error initing seed presence for all: ${err.message}`);
         });
