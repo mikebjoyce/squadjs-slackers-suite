@@ -766,8 +766,8 @@ async function _buildSevenDayStatsEmbed(plugin) {
     // would make the success rate misleadingly low. The success rate reflects
     // the system's reliability once a switch request is accepted.
     const totalAttempted = totals.success + totals.failed;
-    const successRate = totalAttempted > 0 ? Math.round((totals.success / totalAttempted) * 100) : 0;
-    const instantRate = totals.success > 0 ? Math.round((totals.instant / totals.success) * 100) : 0;
+    const successRate = totalAttempted > 0 ? ((totals.success / totalAttempted) * 100) : 0;
+    const instantRate = totals.success > 0 ? ((totals.instant / totals.success) * 100) : 0;
 
     // Median queue wait from accumulated durations
     const globalMedianMs = plugin._computeMedianFromMs
@@ -794,11 +794,11 @@ async function _buildSevenDayStatsEmbed(plugin) {
 
     // Success rate
     if (successRate >= 90) {
-      lines.push(`**${successRate}%** of attempted switches succeed.`);
+      lines.push(`**${successRate.toFixed(2)}%** of attempted switches succeed.`);
     } else if (successRate >= 75) {
-      lines.push(`**${successRate}%** of attempted switches succeed, most requests go through.`);
+      lines.push(`**${successRate.toFixed(2)}%** of attempted switches succeed, most requests go through.`);
     } else {
-      lines.push(`**${successRate}%** of attempted switches succeed.`);
+      lines.push(`**${successRate.toFixed(2)}%** of attempted switches succeed.`);
     }
 
     lines.push('');
@@ -810,9 +810,9 @@ async function _buildSevenDayStatsEmbed(plugin) {
 
     // Instant rate
     if (instantRate >= 50) {
-      lines.push(`Most switches happen instantly — **${instantRate}%** go through the moment you type \`!switch\`, with no waiting at all.`);
+      lines.push(`Most switches happen instantly — **${instantRate.toFixed(2)}%** go through the moment you type \`!switch\`, with no waiting at all.`);
     } else if (instantRate > 0) {
-      lines.push(`**${instantRate}%** of switches happen instantly, the rest use the queue.`);
+      lines.push(`**${instantRate.toFixed(2)}%** of switches happen instantly, the rest use the queue.`);
     } else {
       lines.push('Switches typically use the queue system.');
     }

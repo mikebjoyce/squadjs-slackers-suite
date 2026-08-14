@@ -882,11 +882,11 @@ export const EloDiscord = {
             },
             {
               name: 'Estimated Skill (μ — "Mu")',
-              value: `Your estimated performance level. Everyone starts at ${initialMu}. This number goes up when you win and decreases when you lose based on the strength of your opponents.`
+              value: `Your estimated performance level. Everyone starts at ${initialMu.toFixed(2)}. This number goes up when you win and decreases when you lose based on the strength of your opponents.`
             },
             {
               name: 'System Certainty (σ — "Sigma")',
-              value: `This is the system's confidence in your rank. It starts at ${initialSigma} and drops as you play more games, making your rank more stable.`
+              value: `This is the system's confidence in your rank. It starts at ${initialSigma.toFixed(2)} and drops as you play more games, making your rank more stable.`
             },
             {
               name: 'The Calibration Goal',
