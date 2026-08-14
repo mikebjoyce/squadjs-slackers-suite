@@ -14,7 +14,7 @@ For the design rationale and architectural decisions behind S³, see **[WHY_S3.m
 |--------|-----------|-------------|
 | **S³ (SlackersSquadServices)** | [`s3/`](s3/) | Centralized service container — required by all other plugins |
 | **SmartAssign** | [`smart-assign/`](smart-assign/) | Automatic team assignment with clan-aware balancing |
-| **Switch** | [`switch/`](switch/) | Team-change management with cooldowns, queues, and scramble lockout |
+| **Switch** | [`switch/`](switch/) | Team-change management with cooldowns, queues, and scramble lockout — [behaviour reference](switch/SWITCH_BEHAVIOUR.md) |
 | **EloTracker** | [`elo-tracker/`](elo-tracker/) | Player rating tracking with round history |
 | **TeamBalancer** | [`team-balancer/`](team-balancer/) | Scramble-based team balancing with clan grouping |
 
@@ -182,7 +182,7 @@ squad-server/
 4. **Configure plugin options** — Each plugin has its own options. See the individual plugin READMEs for details:
    - [S³ Configuration](s3/README.md#configuration-options)
    - [SmartAssign](smart-assign/README.md#configuration-options)
-   - [Switch](switch/README.MD#configuration-options)
+   - [Switch](switch/README.MD#configuration-options) — [Behaviour Reference](switch/SWITCH_BEHAVIOUR.md)
    - [EloTracker](elo-tracker/README.md#configuration-options)
    - [TeamBalancer](team-balancer/README.md#configuration-options)
 

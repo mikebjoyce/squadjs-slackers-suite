@@ -302,7 +302,7 @@ function _buildBalanceEmbed(plugin) {
     'The **gap** is the difference in player count between the two teams.',
     'Example: Team **1** has **42** players, Team **2** has **38**. The gap is **4**.',
     '',
-    '**Tolerance** is how much extra gap the server allows beyond the base limit of **1**. At low population, more tolerance is given so switches are easier. As the server fills up, tolerance shrinks to keep teams fair when it matters most.'
+    `**Tolerance** is how much extra gap the server allows beyond the base limit of **${cap}**. At low population, more tolerance is given so switches are easier. As the server fills up, tolerance shrinks to keep teams fair when it matters most.`
   ].join('\n');
 
   const tableLines = ['```', 'Players       Extra Tolerance   Max Allowed Gap'];
@@ -422,7 +422,7 @@ function _buildCooldownEmbed(plugin) {
 
 function _buildTimeWindowQueueEmbed(plugin) {
   const switchWindow = plugin.options.switchEnabledMinutes || 10;
-  const queueTimeout = plugin.options.queueTimeoutMinutes || 20;
+  const queueTimeout = plugin.options.queueTimeoutMinutes ?? 20;
   const queueEnabled = plugin.options.queueEnabled !== false;
   const timeoutSwitchEnabled = plugin.options.queueTimeoutSwitchEnabled === true;
 
@@ -478,7 +478,7 @@ function _buildTimeWindowQueueEmbed(plugin) {
 // ── Embed 5: Scrambles ──────────────────────────────────────────
 
 function _buildScrambleEmbed(plugin) {
-  const lockdownMinutes = plugin.options.scrambleLockdownDurationMinutes || 20;
+  const lockdownMinutes = plugin.options.scrambleLockdownDurationMinutes ?? 30;
 
   // Check for Team Balancer
   const tb = _getTeamBalancer(plugin);
@@ -541,7 +541,7 @@ function _buildSpecialCasesEmbed(plugin) {
   const liberalCap = plugin.options.liberalSwitchMaxUnbalancedSlots || 6;
 
   const liberalText = [
-    `During **${liberalModes.join('/')}** rounds, switching is relaxed:`,
+    `During **${liberalModes.join(' & ')}** rounds, switching is relaxed:`,
     `- No time window limit. Switch at any point during the round.`,
     `- No token cost. Switches do not consume tokens.`,
     `- More permissive balance limit. Up to **${liberalCap}** players difference is allowed instead of the normal tolerance.`

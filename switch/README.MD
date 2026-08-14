@@ -8,6 +8,8 @@ Manages player team-change requests with cooldown enforcement, scramble-aware lo
 
 Survives server restarts via any Sequelize-compatible database (SQLite, MySQL, PostgreSQL, etc.). Supports in-game chat commands and Discord admin commands with real-time eligibility diagnostics.
 
+> 📖 **Behaviour Reference** — For a detailed explanation of how team switching works (mirroring the `!switch explain` command and Discord explain channel content), see [`SWITCH_BEHAVIOUR.md`](SWITCH_BEHAVIOUR.md).
+
 ---
 
 ## Core Features
@@ -294,6 +296,39 @@ The Switch plugin supports splitting Discord traffic across two channels. Round 
 | `warnOnJoinChangeTeamDisabled` | Warn joining players that scoreboard team changes are disabled and !switch is the alternative. | `true` |
 | `queueEnabled` | Enable the switch queue. When disabled, !switch only works if a balance slot is immediately available. | `true` |
 | `roundEndSummaryEnabled` | Post a Discord embed with round-end queue summary showing self-switches, pair trades, handshake swaps, failures, expiries, disconnects, and cancellations. | `true` |
+
+---
+
+## Tools
+
+The Switch plugin ships with utility scripts in `switch/tools/`.
+
+### Behaviour Documentation Generator
+
+The `generate-behaviour-doc.cjs` script produces an informative markdown document describing how team switching works. The generated text mirrors the `!switch explain` in-game command and Discord explain channel content.
+
+Config values are read from a companion JSON file — edit it to experiment with different settings and see how the behaviour description changes.
+
+**Usage:**
+
+```bash
+# Default (uses switch/tools/behaviour-config.json, writes switch/SWITCH_BEHAVIOUR.md)
+node switch/tools/generate-behaviour-doc.cjs
+
+# Custom config file
+node switch/tools/generate-behaviour-doc.cjs --config my-config.json
+
+# Custom output path
+node switch/tools/generate-behaviour-doc.cjs --output docs/custom-behaviour.md
+
+# Both
+node switch/tools/generate-behaviour-doc.cjs --config my-config.json --output out.md
+
+# Help
+node switch/tools/generate-behaviour-doc.cjs --help
+```
+
+The default config (`behaviour-config.json`) mirrors the plugin's own default values. Create a copy, tweak the numbers, and re-run to preview how the documentation (and thus the player-facing rules) would change.
 
 ---
 

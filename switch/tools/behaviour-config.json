@@ -1,0 +1,50 @@
+{
+  "_description": "Configuration for switch behaviour documentation generator.",
+  "_usage":   "Edit values below, then run: node switch/tools/generate-behaviour-doc.cjs [--config path/to/config.json] [--output path/to/output.md]",
+  "_note":    "CLI flags override file values. Run with --help to see all options.",
+  "_publicFacing": false,
+  "_publicFacing_note": "Set to true to strip admin/dev metadata from the output (config paths, appendix tables, auto-generated disclaimer). Produces a cleaner doc suitable for sharing with the player community.",
+
+  "serverConfig": {
+    "AllowTeamChanges":    false,
+    "MaxPlayers":          100,
+    "NumReservedSlots":    2
+  },
+
+  "commandPrefix":                        ["!switch", "!change"],
+  "doubleSwitchCommands":                 ["!bug", "!stuck", "!doubleswitch"],
+  "doubleSwitchCooldownHours":            0.5,
+  "doubleSwitchDelaySeconds":             1,
+  "endMatchSwitchSlots":                  3,
+  "switchCooldownHours":                  1.75,
+  "switchCooldownMinutes":                0,
+  "switchEnabledMinutes":                 10,
+  "queueTimeoutMinutes":                  15,
+  "doubleSwitchEnabledMinutes":           10,
+  "maxUnbalancedSlots":                   1,
+  "scrambleLockdownDurationMinutes":      30,
+  "scrambleLockdownMinPlayers":           60,
+
+  "liberalSwitchGameModes":               ["Seed", "Jensen"],
+  "liberalSwitchMaxUnbalancedSlots":      6,
+  "liberalSwitchBroadcastIntervalMinutes": 8,
+
+  "dynamicBalanceTolerance":              true,
+  "dynamicBalancePlayerFloor":            85,
+  "dynamicBalanceExtraSlots":             3,
+
+  "maxSwitchTokens":                      2,
+  "seedTokenBonusAmount":                 1,
+  "seedTokenBonusMinutes":                20,
+  "seedTokenBonusMinPlayers":             0,
+
+  "queueTimeoutSwitchEnabled":            true,
+  "queueTimeoutExtraSlots":               2,
+
+  "broadcastSwitchWindowMessages":         true,
+  "switchWindowBroadcastDelaySeconds":     30,
+  "switchWindowBroadcastIntervalMinutes":  2,
+  "warnOnJoinChangeTeamDisabled":          true,
+  "queueEnabled":                          true,
+  "roundEndSummaryEnabled":                true
+}
