@@ -205,7 +205,13 @@ node run-all-tests.js --category 2    # Integration tests
 **Slacker**
 
 Discord: `real_slacker`
+
 GitHub: https://github.com/mikebjoyce
+
+## Thanks
+
+- **Davide Fantino** ([fantinodavide](https://github.com/fantinodavide)) — For the open-source Switch plugin that the v2 Switch is based on.
+- **Hans-Vader** ([Hans-Vader](https://github.com/Hans-Vader)) — For contributions to the Team Balancer plugin.
 
 ---
 
