@@ -321,6 +321,45 @@ export function createMockDb() {
     },
 
     /**
+     * Simulate Sequelize destroy.
+     * Returns the number of deleted rows. Honors the where condition using
+     * _evalCondition (supports nested _and/_or and operator shorthands).
+     */
+    destroy: async (opts = {}) => {
+      const where = opts.where || {};
+      let count = 0;
+      for (const [eosID, row] of store) {
+        if (db._evalCondition(row, where)) {
+          store.delete(eosID);
+          count++;
+        }
+      }
+      return count;
+    },
+
+    /**
+     * Recursively evaluate a Sequelize-style where condition against a row.
+     * Supports string-key operator shorthands (_and, _or, _gte, _lt, _lte,
+     * _ne, _eq, _gt) plus nested Op.or / Op.and. Used by destroy() for
+     * cleanup() regression coverage.
+     */
+    _evalCondition(row, cond) {
+      if (cond && typeof cond === 'object' && cond.constructor === Object) {
+        for (const [k, v] of Object.entries(cond)) {
+          if (k === '_and' || k === 'Op.and') {
+            if (!Array.isArray(v) || !v.every(sub => db._evalCondition(row, sub))) return false;
+          } else if (k === '_or' || k === 'Op.or') {
+            if (!Array.isArray(v) || !v.some(sub => db._evalCondition(row, sub))) return false;
+          } else if (!db._matchCondition(row, k, v)) {
+            return false;
+          }
+        }
+        return true;
+      }
+      return false;
+    },
+
+    /**
      * Clear all rows (for test isolation).
      */
     _clear: () => {

@@ -485,7 +485,14 @@ const SwitchDB = {
                     { firstSeenTimestamp: null },
                     { firstSeenTimestamp: { [Op.lt]: new Date(now.getTime() - (24 * 60 * 60 * 1000)) } }
                   ]
-                }
+                },
+                // Fixed 2026-08-15: never delete rows with active seed presence
+                // or an earned seed bonus, regardless of firstSeenTimestamp.
+                // Seed grants intentionally push tokenBalance above the cap, and
+                // seed-created rows historically had firstSeenTimestamp null —
+                // which made cleanup() delete the bonus before it could be spent.
+                { seedPresenceStart: null },
+                { seedBonusTokensEarned: 0 }
               ]
             },
             transaction: t

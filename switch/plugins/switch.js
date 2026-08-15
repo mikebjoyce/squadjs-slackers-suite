@@ -1313,7 +1313,8 @@ export default class Switch extends S3DiscordPluginBase {
                             steamID: data.player?.steamID || null,
                             playerName: name,
                             tokenBalance: this.options.maxSwitchTokens,
-                            seedPresenceStart: new Date()
+                            seedPresenceStart: new Date(),
+                            firstSeenTimestamp: new Date()
                         });
                         this.verbose(2, `[SeedPresence] ${name}: joined during seed mode — created row with seedPresenceStart.`);
                     } else if (!row.seedPresenceStart) {
@@ -1525,7 +1526,8 @@ export default class Switch extends S3DiscordPluginBase {
                         playerName: p.name,
                         tokenBalance: this.options.maxSwitchTokens,
                         seedPresenceStart: new Date(),
-                        seedBonusTokensEarned: 0
+                        seedBonusTokensEarned: 0,
+                        firstSeenTimestamp: new Date()
                     });
                     count++;
                 } else if (!row.seedPresenceStart) {

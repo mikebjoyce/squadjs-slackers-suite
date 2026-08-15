@@ -526,6 +526,159 @@ async function testSuite() {
     const p1 = await db.findByPk('player1');
     assert.strictEqual(p1.tokenBalance, 3, 'balance still 3 (single grant total)');
   });
+
+  // ═════════════════════════════════════════════════════════════
+  // v2.4.0 fix: cleanup() regression tests (2026-08-15)
+  // ═════════════════════════════════════════════════════════════
+
+  /**
+   * Simulate the cleanup() destroy WHERE clause from switch-db.js.
+   * Mirrors the production logic: deletes rows where ALL of these are true:
+   *   1. No active scramble lockdown
+   *   2. tokenBalance >= maxTokens
+   *   3. firstSeenTimestamp IS NULL OR > 24h old
+   *   4. seedPresenceStart IS NULL (added 2026-08-15)
+   *   5. seedBonusTokensEarned = 0 (added 2026-08-15)
+   */
+  async function runCleanup(db, maxTokens, now) {
+    return db.destroy({
+      where: {
+        _and: [
+          {
+            _or: [
+              { scrambleLockdownExpiry: null },
+              { scrambleLockdownExpiry: { _lt: now } }
+            ]
+          },
+          { tokenBalance: { _gte: maxTokens } },
+          {
+            _or: [
+              { firstSeenTimestamp: null },
+              { firstSeenTimestamp: { _lt: new Date(now - 24 * 60 * 60 * 1000) } }
+            ]
+          },
+          { seedPresenceStart: null },
+          { seedBonusTokensEarned: 0 }
+        ]
+      }
+    });
+  }
+
+  // ── Test 53: cleanup preserves row with earned seed bonus ────
+  await runTest('cleanup: preserves row with seedBonusTokensEarned > 0', async () => {
+    const db = createMockDb();
+    const now = BASE_TIME;
+    await db.upsert({
+      eosID: 'player1',
+      tokenBalance: 3,           // above cap (seed bonus granted)
+      seedPresenceStart: null,   // transition grant nulled it
+      seedBonusTokensEarned: 1,  // earned a bonus this round
+      firstSeenTimestamp: null,  // seed-created rows historically had null
+      scrambleLockdownExpiry: null
+    });
+
+    const deleted = await runCleanup(db, 2, now);
+    assert.strictEqual(deleted, 0, 'row with seedBonusTokensEarned > 0 should survive cleanup');
+    const row = await db.findByPk('player1');
+    assert.ok(row, 'row should still exist');
+    assert.strictEqual(row.tokenBalance, 3, 'token balance preserved');
+  });
+
+  // ── Test 54: cleanup preserves row with active seed presence ─
+  await runTest('cleanup: preserves row with seedPresenceStart set', async () => {
+    const db = createMockDb();
+    const now = BASE_TIME;
+    await db.upsert({
+      eosID: 'player1',
+      tokenBalance: 2,
+      seedPresenceStart: new Date(now - 10 * 60 * 1000),  // active presence
+      seedBonusTokensEarned: 0,
+      firstSeenTimestamp: null,
+      scrambleLockdownExpiry: null
+    });
+
+    const deleted = await runCleanup(db, 2, now);
+    assert.strictEqual(deleted, 0, 'row with seedPresenceStart should survive cleanup');
+    const row = await db.findByPk('player1');
+    assert.ok(row, 'row should still exist');
+  });
+
+  // ── Test 55: cleanup deletes stale row with no seed data ────
+  await runTest('cleanup: deletes stale row (null firstSeenTimestamp, full tokens, no seed data)', async () => {
+    const db = createMockDb();
+    const now = BASE_TIME;
+    await db.upsert({
+      eosID: 'player1',
+      tokenBalance: 2,
+      seedPresenceStart: null,
+      seedBonusTokensEarned: 0,
+      firstSeenTimestamp: null,
+      scrambleLockdownExpiry: null
+    });
+
+    const deleted = await runCleanup(db, 2, now);
+    assert.strictEqual(deleted, 1, 'stale row with no seed data should be deleted');
+    const row = await db.findByPk('player1');
+    assert.strictEqual(row, null, 'row should be gone');
+  });
+
+  // ── Test 56: cleanup preserves below-cap row ────────────────
+  await runTest('cleanup: preserves row with tokenBalance < maxTokens', async () => {
+    const db = createMockDb();
+    const now = BASE_TIME;
+    await db.upsert({
+      eosID: 'player1',
+      tokenBalance: 1,           // below cap
+      seedPresenceStart: null,
+      seedBonusTokensEarned: 0,
+      firstSeenTimestamp: null,
+      scrambleLockdownExpiry: null
+    });
+
+    const deleted = await runCleanup(db, 2, now);
+    assert.strictEqual(deleted, 0, 'below-cap row should survive cleanup');
+    const row = await db.findByPk('player1');
+    assert.ok(row, 'row should still exist');
+  });
+
+  // ── Test 57: cleanup preserves scramble-locked row ──────────
+  await runTest('cleanup: preserves row with active scramble lockdown', async () => {
+    const db = createMockDb();
+    const now = BASE_TIME;
+    await db.upsert({
+      eosID: 'player1',
+      tokenBalance: 2,
+      seedPresenceStart: null,
+      seedBonusTokensEarned: 0,
+      firstSeenTimestamp: null,
+      scrambleLockdownExpiry: new Date(now + 30 * 60 * 1000)  // expires in 30 min
+    });
+
+    const deleted = await runCleanup(db, 2, now);
+    assert.strictEqual(deleted, 0, 'scramble-locked row should survive cleanup');
+    const row = await db.findByPk('player1');
+    assert.ok(row, 'row should still exist');
+  });
+
+  // ── Test 58: cleanup preserves row with firstSeenTimestamp set ─
+  await runTest('cleanup: preserves row with recent firstSeenTimestamp', async () => {
+    const db = createMockDb();
+    const now = BASE_TIME;
+    await db.upsert({
+      eosID: 'player1',
+      tokenBalance: 3,           // above cap (seed bonus)
+      seedPresenceStart: null,
+      seedBonusTokensEarned: 0,
+      firstSeenTimestamp: new Date(now - 60 * 60 * 1000),  // 1 hour ago (within 24h)
+      scrambleLockdownExpiry: null
+    });
+
+    const deleted = await runCleanup(db, 2, now);
+    assert.strictEqual(deleted, 0, 'row with recent firstSeenTimestamp should survive cleanup');
+    const row = await db.findByPk('player1');
+    assert.ok(row, 'row should still exist');
+    assert.strictEqual(row.tokenBalance, 3, 'token balance preserved');
+  });
 }
 
 // ── Run ──────────────────────────────────────────────────────
