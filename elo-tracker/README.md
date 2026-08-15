@@ -127,9 +127,8 @@ Add the following to your `config.json`:
     "minPlayersForElo": 80,
     "minRoundsForLeaderboard": 10,
     "roundStartEmbedDelayMs": 180000,
-    "ignoredGameModes": ["Seed", "Jensen"],
     "enablePublicIngameCommands": true,
-    "enableDatabaseLogging": false
+    "enableDatabaseLogging": true
   }
 ]
 ```
@@ -176,7 +175,7 @@ squad-server/
 | Option | Required | Type | Default | Description |
 |--------|----------|------|---------|-------------|
 | `database` | yes | string | `"sqlite"` | Sequelize connector name for persistence (SQLite, MySQL, PostgreSQL, etc.) |
-| `discordClient` | no | string | — | Discord connector name for Discord integration |
+| `discordClient` | no | string | `"discord"` | Discord connector name for Discord integration |
 | `discordPublicChannelID` | no | string | `""` | Discord channel ID for public commands (`!elo`, `!elo leaderboard`, etc.) |
 | `discordAdminChannelID` | no | string | `""` | Discord channel ID for admin commands (`!elo status`, `!elo backup`, etc.) |
 | `discordReportChannelID` | no | string | `""` | Discord channel ID for automated round reports (defaults to admin channel if unset) |
@@ -186,9 +185,8 @@ squad-server/
 | `minPlayersForElo` | no | number | `80` | Minimum connected players required to calculate ELO updates |
 | `minRoundsForLeaderboard` | no | number | `10` | Minimum rounds played before a player appears on the leaderboard |
 | `roundStartEmbedDelayMs` | no | number | `180000` | Delay in ms before posting the round-start Discord embed (default: 3 minutes) |
-| `ignoredGameModes` | no | array | `["Seed", "Jensen"]` | Array of layer/gamemode substrings where ELO tracking is skipped |
 | `enablePublicIngameCommands` | no | boolean | `false` | Enable public in-game commands (`!elo`, `!elo leaderboard`) |
-| `enableDatabaseLogging` | no | boolean | `false` | If true, round outcome data is also written to database tables |
+| `enableDatabaseLogging` | no | boolean | `true` | If true, round outcome data is also written to database tables |
 
 ---
 

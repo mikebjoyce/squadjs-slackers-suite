@@ -137,15 +137,15 @@ Add to your `config.json`:
   "enableWinStreakTracking": true,
   "enableSeedAutoScramble": true,
   "maxWinStreak": 2,
-  "maxConsecutiveWinsWithoutThreshold": 0,
-  "enableSingleRoundScramble": false,
-  "singleRoundScrambleThreshold": 250,
+  "maxConsecutiveWinsWithoutThreshold": 3,
+  "enableSingleRoundScramble": true,
+  "singleRoundScrambleThreshold": 200,
   "minTicketsToCountAsDominantWin": 150,
   "invasionAttackTeamThreshold": 300,
-  "invasionDefenceTeamThreshold": 650,
-  "scrambleAnnouncementDelay": 12,
+  "invasionDefenceTeamThreshold": 500,
+  "scrambleAnnouncementDelay": 25,
   "scramblePercentage": 0.5,
-  "changeTeamRetryInterval": 50,
+  "changeTeamRetryInterval": 100,
   "maxScrambleCompletionTime": 15000,
   "showWinStreakMessages": true,
   "warnOnSwap": true,
@@ -158,7 +158,7 @@ Add to your `config.json`:
   "discordAdminRoleIDs": [],
   "mirrorRconBroadcasts": true,
   "postScrambleDetails": true,
-  "useEloForBalance": false,
+  "useEloForBalance": true,
   "devMode": false,
   "reportLogPath": "team-balancer-reports.jsonl",
   "enableDatabaseLogging": false
@@ -224,15 +224,15 @@ Admin Commands:
 | `enableWinStreakTracking` | no | boolean | `true` | Enable/disable automatic win streak tracking |
 | `enableSeedAutoScramble` | no | boolean | `true` | Auto-scramble teams at the end of a Seed round |
 | `maxWinStreak` | no | number | `2` | Dominant wins in a row to trigger a scramble |
-| `maxConsecutiveWinsWithoutThreshold` | no | number | `0` | Any consecutive wins to trigger scramble; `0` = disabled |
-| `enableSingleRoundScramble` | no | boolean | `false` | Scramble after a single round with extreme ticket margin |
-| `singleRoundScrambleThreshold` | no | number | `250` | Ticket margin for single-round scramble trigger |
+| `maxConsecutiveWinsWithoutThreshold` | no | number | `3` | Any consecutive wins to trigger scramble; `0` = disabled |
+| `enableSingleRoundScramble` | no | boolean | `true` | Scramble after a single round with extreme ticket margin |
+| `singleRoundScrambleThreshold` | no | number | `200` | Ticket margin for single-round scramble trigger |
 | `minTicketsToCountAsDominantWin` | no | number | `150` | Minimum ticket difference for a dominant win in Standard modes |
 | `invasionAttackTeamThreshold` | no | number | `300` | Ticket difference for Invasion attackers to count as dominant |
-| `invasionDefenceTeamThreshold` | no | number | `650` | Ticket difference for Invasion defenders to count as dominant |
-| `scrambleAnnouncementDelay` | no | number | `12` | Seconds before scramble executes after announcement |
+| `invasionDefenceTeamThreshold` | no | number | `500` | Ticket difference for Invasion defenders to count as dominant |
+| `scrambleAnnouncementDelay` | no | number | `25` | Seconds before scramble executes after announcement |
 | `scramblePercentage` | no | number | `0.5` | Fraction of players to move (0.0–1.0) |
-| `changeTeamRetryInterval` | no | number | `50` | RCON retry interval in ms |
+| `changeTeamRetryInterval` | no | number | `100` | RCON retry interval in ms |
 | `maxScrambleCompletionTime` | no | number | `15000` | Maximum time in ms for all swaps to complete |
 | `warnOnSwap` | no | boolean | `true` | Send RCON warning to players when swapped |
 | `requireScrambleConfirmation` | no | boolean | `true` | Require `!scramble confirm` before executing manual scrambles |
@@ -245,7 +245,7 @@ Admin Commands:
 | `discordAdminRoleIDs` | no | array | `[]` | Array of Discord role IDs required for admin commands (empty = all in channel) |
 | `mirrorRconBroadcasts` | no | boolean | `true` | Mirror RCON broadcasts to Discord |
 | `postScrambleDetails` | no | boolean | `true` | Post detailed swap plan to Discord after scramble |
-| `useEloForBalance` | no | boolean | `false` | Weight scrambles by EloTracker mu ratings (requires EloTracker plugin; falls back to numerical balance if absent) |
+| `useEloForBalance` | no | boolean | `true` | Weight scrambles by EloTracker mu ratings (requires EloTracker plugin; falls back to numerical balance if absent) |
 | `devMode` | no | boolean | `false` | Allow commands from any player regardless of admin status |
 | `reportLogPath` | no | string | `"team-balancer-reports.jsonl"` | Path to the JSONL log file for round reports |
 | `enableDatabaseLogging` | no | boolean | `false` | If true, round reports are also written to database tables |

@@ -93,17 +93,17 @@ Add the following to your SquadJS `config.json`:
     "switchCooldownHours": 1.75,
     "switchCooldownMinutes": 0,
     "switchEnabledMinutes": 10,
-    "queueTimeoutMinutes": 20,
+    "queueTimeoutMinutes": 15,
     "doubleSwitchCommands": ["!bug", "!stuck", "!doubleswitch"],
     "doubleSwitchCooldownHours": 0.5,
     "doubleSwitchDelaySeconds": 1,
     "doubleSwitchEnabledMinutes": 10,
     "endMatchSwitchSlots": 3,
     "maxUnbalancedSlots": 1,
-    "scrambleLockdownDurationMinutes": 20,
+    "scrambleLockdownDurationMinutes": 30,
     "liberalSwitchGameModes": ["Seed", "Jensen"],
     "liberalSwitchMaxUnbalancedSlots": 6,
-    "liberalSwitchBroadcastIntervalMinutes": 5,
+    "liberalSwitchBroadcastIntervalMinutes": 8,
     "dynamicBalanceTolerance": true,
     "dynamicBalancePlayerFloor": 85,
     "dynamicBalanceExtraSlots": 3,
@@ -224,7 +224,7 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 | `switchCooldownHours` | Hours per-token refill interval. Each token regenerates individually after this duration. | `1.75` |
 | `switchCooldownMinutes` | Minutes per-token refill interval (overrides hours if > 0). Set to 0 to use hours only. | `0` |
 | `switchEnabledMinutes` | Time window (minutes) after join/match start to request a switch | `10` |
-| `queueTimeoutMinutes` | Minutes a player can wait in the switch queue before removal | `20` |
+| `queueTimeoutMinutes` | Minutes a player can wait in the switch queue before removal | `15` |
 | `maxUnbalancedSlots` | Max player difference between teams to allow a switch | `1` |
 | `scrambleLockdownDurationMinutes` | Duration to block switching after a scramble | `30` |
 | `scrambleLockdownMinPlayers` | Minimum total players required to apply scramble lockdown. Below this threshold, scrambles clear the queue but do not lock switching. | `60` |
@@ -266,7 +266,7 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 |--------|-------------|---------|
 | `liberalSwitchGameModes` | Substrings for layers/modes with relaxed switching | `["Seed", "Jensen"]` |
 | `liberalSwitchMaxUnbalancedSlots` | Balance cap during liberal modes | `6` |
-| `liberalSwitchBroadcastIntervalMinutes` | Minutes between liberal-mode broadcast reminders. Set to 0 to disable. | `5` |
+| `liberalSwitchBroadcastIntervalMinutes` | Minutes between liberal-mode broadcast reminders. Set to 0 to disable. | `8` |
 
 ### Dynamic Balance Tolerance
 
@@ -291,7 +291,7 @@ The Switch plugin supports splitting Discord traffic across two channels. Round 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `broadcastSwitchWindowMessages` | Broadcast switch window open/close/reminder messages to the server. | `true` |
-| `switchWindowBroadcastDelaySeconds` | Seconds after match start before the first broadcast. | `60` |
+| `switchWindowBroadcastDelaySeconds` | Seconds after match start before the first broadcast. | `30` |
 | `switchWindowBroadcastIntervalMinutes` | Minutes between switch window reminder broadcasts. | `2` |
 | `warnOnJoinChangeTeamDisabled` | Warn joining players that scoreboard team changes are disabled and !switch is the alternative. | `true` |
 | `queueEnabled` | Enable the switch queue. When disabled, !switch only works if a balance slot is immediately available. | `true` |

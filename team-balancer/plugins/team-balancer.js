@@ -126,30 +126,24 @@
  *
  * Win Streak:
  *   maxWinStreak                       - Dominant wins to trigger scramble (default: 2).
- *   maxConsecutiveWinsWithoutThreshold - Any consecutive wins to trigger scramble; 0 = disabled.
+ *   maxConsecutiveWinsWithoutThreshold - Any consecutive wins to trigger scramble; 0 = disabled (default: 3).
  *   minTicketsToCountAsDominantWin     - Ticket threshold for Standard modes (default: 150).
  *   invasionAttackTeamThreshold        - Ticket threshold for Invasion attackers (default: 300).
- *   invasionDefenceTeamThreshold       - Ticket threshold for Invasion defenders (default: 650).
- *   enableSingleRoundScramble          - Scramble on a single massive margin round.
- *   singleRoundScrambleThreshold       - Ticket margin for single-round trigger (default: 250).
+ *   invasionDefenceTeamThreshold       - Ticket threshold for Invasion defenders (default: 500).
+ *   enableSingleRoundScramble          - Scramble on a single massive margin round (default: true).
+ *   singleRoundScrambleThreshold       - Ticket margin for single-round trigger (default: 200).
  *
  * Scramble Execution:
- *   scrambleAnnouncementDelay          - Seconds before scramble executes (default: 12).
+ *   scrambleAnnouncementDelay          - Seconds before scramble executes (default: 25).
  *   scramblePercentage                 - Fraction of players to move (default: 0.5).
- *   changeTeamRetryInterval            - RCON retry interval in ms (default: 50).
+ *   changeTeamRetryInterval            - RCON retry interval in ms (default: 100).
  *   maxScrambleCompletionTime          - Max execution time in ms (default: 15000).
  *   warnOnSwap                         - RCON warn players when swapped.
  *   requireScrambleConfirmation        - Require !scramble confirm for manual scrambles.
  *   scrambleConfirmationTimeout        - Seconds to wait for confirm (default: 60).
  *
- * Clan Tag Grouping:
- *   enableClanTagGrouping              - Keep same-team clan members together (default: false).
- *   minClanGroupSize                   - Min clan members to group (default: 2).
- *   maxClanGroupSize                   - Max clan members to group (default: 18).
- *   clanTagMaxEditDistance             - Levenshtein distance for merging tags (default: 1).
- *   clanTagCaseSensitive               - Case-sensitive tag matching (default: true).
- *   clanGroupingPullEntireSquads       - Pull non-clan teammates with clan (default: false).
- *   clanTagIgnoreList                  - Clan tags to exclude from grouping (default: []).
+ * Clan Tag Grouping (managed by S³):
+ *   (All clan tag options are configured on S³'s clans service, not on TeamBalancer.)
  *
  * Messaging:
  *   showWinStreakMessages              - Broadcast win streak updates.
@@ -164,12 +158,13 @@
  *   postScrambleDetails                - Post detailed swap plan to Discord after scramble.
  *
  * Advanced:
- *   useEloForBalance                   - Weight scrambles by EloTracker mu ratings.
+ *   useEloForBalance                   - Weight scrambles by EloTracker mu ratings (default: true).
  *
  * Dev:
  *   devMode                            - Allow commands from any player regardless of admin status.
  *   reportLogPath                      - Path to the JSONL log file for round reports.
  *   enableDatabaseLogging              - If true, round reports are also written to the database in addition to the JSONL log (default: false).
+ *   scrambleReportPath                 - Directory for per-scramble JSON reports (default: "TeamBalancerScrambleReports/").
  *
  * IMPORTANT: The "database" option specifies which Sequelize connector to use for persistence.
  * Set it to the name of your configured connector (default: "sqlite"). Examples:
@@ -191,22 +186,15 @@
  *   "enableWinStreakTracking": true,
  *   "enableSeedAutoScramble": true,
  *   "maxWinStreak": 2,
- *   "maxConsecutiveWinsWithoutThreshold": 0,
- *   "enableSingleRoundScramble": false,
- *   "singleRoundScrambleThreshold": 250,
+ *   "maxConsecutiveWinsWithoutThreshold": 3,
+ *   "enableSingleRoundScramble": true,
+ *   "singleRoundScrambleThreshold": 200,
  *   "minTicketsToCountAsDominantWin": 150,
  *   "invasionAttackTeamThreshold": 300,
- *   "invasionDefenceTeamThreshold": 650,
- *   "scrambleAnnouncementDelay": 12,
+ *   "invasionDefenceTeamThreshold": 500,
+ *   "scrambleAnnouncementDelay": 25,
  *   "scramblePercentage": 0.5,
- *   "enableClanTagGrouping": false,
- *   "minClanGroupSize": 2,
- *   "maxClanGroupSize": 18,
- *   "clanTagMaxEditDistance": 1,
- *   "clanTagCaseSensitive": true,
- *   "clanGroupingPullEntireSquads": false,
- *   "clanTagIgnoreList": [],
- *   "changeTeamRetryInterval": 50,
+ *   "changeTeamRetryInterval": 100,
  *   "maxScrambleCompletionTime": 15000,
  *   "showWinStreakMessages": true,
  *   "warnOnSwap": true,
@@ -219,7 +207,7 @@
  *   "discordAdminRoleIDs": [],
  *   "mirrorRconBroadcasts": true,
  *   "postScrambleDetails": true,
- *   "useEloForBalance": false,
+ *   "useEloForBalance": true,
  *   "devMode": false,
  *   "reportLogPath": "team-balancer-reports.jsonl",
  *   "enableDatabaseLogging": false
