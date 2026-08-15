@@ -506,9 +506,10 @@ const SwitchOutput = {
       }
       statsLines.push(`**Max Queue Size:** ${s.maxQueueSize}`);
       if (queueDurations.length > 0) statsLines.push(`**Queue Wait:** mean ${avgStr}, median ${medianStr}`);
-      if (totalSuccess > 0) {
-        const dirPct1 = ` (${((toT1 / totalSuccess) * 100).toFixed(1)}%)`;
-        const dirPct2 = ` (${((toT2 / totalSuccess) * 100).toFixed(1)}%)`;
+      const totalMoves = toT1 + toT2;
+      if (totalMoves > 0) {
+        const dirPct1 = ` (${((toT1 / totalMoves) * 100).toFixed(1)}%)`;
+        const dirPct2 = ` (${((toT2 / totalMoves) * 100).toFixed(1)}%)`;
         statsLines.push(`**Direction:**`);
         statsLines.push(`→ T1: ${toT1}${dirPct1}`);
         statsLines.push(`→ T2: ${toT2}${dirPct2}`);

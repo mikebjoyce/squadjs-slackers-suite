@@ -1078,10 +1078,11 @@ const SwitchCommands = {
       summaryLines.push('');
       summaryLines.push(`**Success rate (excl. denials):** ${successRate}%  (${totals.success}/${attemptedRequests})`);
       summaryLines.push('');
-      if (totals.success > 0) {
+      const totalMoves = totals.toT1 + totals.toT2;
+      if (totalMoves > 0) {
         summaryLines.push(`**Direction:**`);
-        const dirPct1 = ` (${((totals.toT1 / totals.success) * 100).toFixed(1)}%)`;
-        const dirPct2 = ` (${((totals.toT2 / totals.success) * 100).toFixed(1)}%)`;
+        const dirPct1 = ` (${((totals.toT1 / totalMoves) * 100).toFixed(1)}%)`;
+        const dirPct2 = ` (${((totals.toT2 / totalMoves) * 100).toFixed(1)}%)`;
         summaryLines.push(`→ T1: ${totals.toT1}${dirPct1}`);
         summaryLines.push(`→ T2: ${totals.toT2}${dirPct2}`);
       }
