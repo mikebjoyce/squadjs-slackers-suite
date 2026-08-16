@@ -63,7 +63,7 @@
  *               getRoundStartTime() — match/mode/round identification.
  *   - factions:  isEnabled(), getTeamName(teamID) — faction name lookup.
  *   - players:   getAllPlayers(), getSquads(), lockGlobal(),
- *               unlockGlobal(), isGloballyLockedBy() — player data
+ *               unlockGlobal() — player data
  *               and concurrency control during scrambles.
  *   - clans:     isEnabled(), extractClanGroups(),
  *               options.pullEntireSquads — clan tag grouping for scrambles.
@@ -2336,14 +2336,28 @@ export default class TeamBalancer extends S3PluginBase {
       return false;
     }
 
-    // Acquire S³ global lock before scramble (prevents SA from acting during TB scramble)
+    // Acquire S³ global lock before scramble (prevents SA from acting during TB scramble).
+    //
+    // IMPORTANT — use lockGlobal() directly, NOT isGloballyLockedBy() as a gate:
+    //
+    //   isGloballyLockedBy() returns truthy for ANY held lock regardless of priority,
+    //   so a lower-priority transient lock (SmartAssign priority 2, e.g. a 5s join
+    //   processing lock) would veto TeamBalancer (priority 3) outright. That is
+    //   never acceptable — a scramble is the highest-priority operation.
+    //
+    //   lockGlobal() implements priority-based preemption: it returns true when
+    //   the caller has priority >= any existing holder, which for TeamBalancer at
+    //   priority 3 means it can always preempt SmartAssign or Switch. It only
+    //   returns false when something of equal-or-higher priority already holds the
+    //   lock (i.e. another TeamBalancer scramble). That is the only condition that
+    //   should prevent a scramble from executing.
     let globalLockAcquired = false;
     if (this._s3?.players?.isReady() && !isSimulated) {
-      if (this._s3.players.isGloballyLockedBy()) {
-        Logger.verbose('TeamBalancer', 1, '[S3] Global lock held — another scramble may be in progress.');
+      const locked = this._s3.players.lockGlobal('TeamBalancer', this.options.maxScrambleCompletionTime + 5000);
+      if (!locked) {
+        Logger.verbose('TeamBalancer', 1, '[S3] Global lock denied — held by equal/higher priority (likely another TB scramble).');
         return false;
       }
-      this._s3.players.lockGlobal('TeamBalancer', this.options.maxScrambleCompletionTime + 5000);
       globalLockAcquired = true;
       Logger.verbose('TeamBalancer', 4, '[S3] Global lock acquired for scramble.');
     }
