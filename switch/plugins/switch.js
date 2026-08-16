@@ -1707,7 +1707,29 @@ export default class Switch extends S3DiscordPluginBase {
 
         const now = Date.now();
 
+        // Single source of truth for the compare-and-swap WHERE so the pre-grant
+        // SELECT and the atomic UPDATE target exactly the same rows.
+        const grantWhere = {
+            seedPresenceStart: {
+                [Op.ne]: null,
+                [Op.lte]: new Date(now - thresholdMs)
+            },
+            seedBonusTokensEarned: { [Op.lt]: bonusCap },
+            [Op.or]: [
+                { lastSeedBonusRoundID: null },
+                { lastSeedBonusRoundID: { [Op.ne]: currentMatchId || '' } }
+            ]
+        };
+
         try {
+            // Capture the players who will actually be granted THIS tick, so the
+            // notification only fires for just-granted players — not every player
+            // who earned a token earlier this round.
+            const qualifying = await PlayerCooldowns.findAll({
+                where: grantWhere,
+                attributes: ['eosID', 'playerName', 'tokenBalance', 'seedBonusTokensEarned']
+            });
+
             // Atomic UPDATE: grants +1 token per qualifying chunk of seed presence time.
             // Each grant increments seedBonusTokensEarned by 1; the WHERE clause
             // ensures we never exceed the per-round cap (seedTokenBonusAmount).
@@ -1726,45 +1748,26 @@ export default class Switch extends S3DiscordPluginBase {
                     seedPresenceStart: new Date(now),
                     lastSeedBonusRoundID: currentMatchId
                 },
-                {
-                    where: {
-                        seedPresenceStart: {
-                            [Op.ne]: null,
-                            [Op.lte]: new Date(now - thresholdMs)
-                        },
-                        seedBonusTokensEarned: { [Op.lt]: bonusCap },
-                        [Op.or]: [
-                            { lastSeedBonusRoundID: null },
-                            { lastSeedBonusRoundID: { [Op.ne]: currentMatchId || '' } }
-                        ]
-                    }
-                }
+                { where: grantWhere }
             );
 
             if (grantCount > 0) {
                 this.verbose(1, `[SeedPresence] Granted +1 seed bonus token to ${grantCount} players via periodic check.`);
-                // Notify players they earned a bonus token.
-                // NOTE: The follow-up findAll runs outside the atomic UPDATE, so there's
+                // Notify only the players captured before the UPDATE — these are the
+                // exact players who just earned a token. Using the pre-grant snapshot
+                // avoids re-warning players who were granted on a previous tick.
+                //
+                // NOTE: The pre-grant findAll runs outside the atomic UPDATE, so there's
                 // a theoretical race where _grantSeedBonusOnTransition could modify rows
-                // between the UPDATE and this read. The consequence is a missed notification
-                // (not a missed grant), which is acceptable.
+                // between the SELECT and the UPDATE. The consequence is a spurious warn
+                // (a player who was transition-granted between the two queries gets warned
+                // even though the periodic UPDATE didn't match them) — a duplicate message,
+                // not a lost grant. This is acceptable.
                 try {
-                  // NOTE: Filter by seedPresenceStart IS NOT NULL to only find rows
-                  // this method (periodic check) actually modified. _grantSeedBonusOnTransition
-                  // sets seedPresenceStart=null, so excluding null rows prevents the
-                  // notification from picking up rows that the transition grant touched —
-                  // avoiding duplicate "you earned a token" spam.
-                  const grantedRows = await PlayerCooldowns.findAll({
-                    where: {
-                      lastSeedBonusRoundID: currentMatchId,
-                      seedPresenceStart: { [Op.ne]: null }
-                    },
-                    attributes: ['eosID', 'playerName', 'tokenBalance', 'seedBonusTokensEarned']
-                  });
-                  for (const row of grantedRows) {
+                  for (const row of qualifying) {
                     if (row.eosID) {
                       this.warn(row.eosID,
-                        `[Switch] Seed bonus — you earned +1 switch token for helping seed. You now have ${row.tokenBalance} tokens (${row.seedBonusTokensEarned}/${bonusCap} bonus tokens earned this round).`
+                        `[Switch] Seed bonus — you earned +1 switch token for helping seed. You now have ${row.tokenBalance + 1} tokens (${row.seedBonusTokensEarned + 1}/${bonusCap} bonus tokens earned this round).`
                       );
                     }
                   }
