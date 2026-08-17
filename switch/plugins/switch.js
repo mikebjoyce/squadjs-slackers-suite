@@ -1037,17 +1037,25 @@ export default class Switch extends S3DiscordPluginBase {
         const queueEntry = this._findQueueEntry(eosID)?.entry;
         if (this._removePlayerFromQueue(eosID)) {
             this.verbose(2, `[Queue] ${playerName} disconnected — removed from queue.`);
+            // Deduplicate by eosID: a player can only DC from the queue once per round.
+            // Without this guard, delayed async cascades (e.g. onChatMessage finishing
+            // after the player already left) can record a second queueDisconnects entry
+            // for the same disconnect, inflating the count in the round summary.
             if (this._roundStats && queueEntry) {
-                const queueDurationSeconds = Math.round((Date.now() - queueEntry.queuedAt) / 1000);
-                const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
-                this._roundStats.queueDisconnects.push({
-                    name: playerName,
-                    eosID,
-                    currentTeamID: queueEntry.currentTeamID,
-                    targetTeamID: queueEntry.targetTeamID,
-                    queueDurationSeconds,
-                    gamePhase
-                });
+                if (this._roundStats.queueDisconnects.some(d => d.eosID === eosID)) {
+                    this.verbose(2, `[Queue] ${playerName} disconnect already recorded — skipping duplicate.`);
+                } else {
+                    const queueDurationSeconds = Math.round((Date.now() - queueEntry.queuedAt) / 1000);
+                    const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
+                    this._roundStats.queueDisconnects.push({
+                        name: playerName,
+                        eosID,
+                        currentTeamID: queueEntry.currentTeamID,
+                        targetTeamID: queueEntry.targetTeamID,
+                        queueDurationSeconds,
+                        gamePhase
+                    });
+                }
             }
         }
         this.verbose(2, `Player disconnected ${playerName}`);

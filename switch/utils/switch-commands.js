@@ -541,6 +541,20 @@ const SwitchCommands = {
             }
           }
 
+          // ── Post-async liveness check ──────────────────────────────
+          // Guard: if the player disconnected while we were waiting on async
+          // operations (e.g. DB queries queued behind a pool exhaustion spike),
+          // don't proceed to enqueue or switch a ghost entry. The most recent
+          // async work was _checkSwitchEligibility (line 502), which may have
+          // blocked on the DB pool for many seconds.
+          const s3PlayerNow = plugin._s3?.players?.isReady()
+            ? plugin._s3.players.getPlayer(eosID)
+            : null;
+          if (!s3PlayerNow) {
+            plugin.verbose(2, `[Switch] ${playerName}: disconnected during async processing — aborting.`);
+            return;
+          }
+
           const isLiberal = plugin.isLiberalMode();
           const effectiveCap = isLiberal ? plugin.options.liberalSwitchMaxUnbalancedSlots : null;
           const availableSwitchSlots = plugin.getSwitchSlotsPerTeam(teamID, effectiveCap);
