@@ -148,7 +148,7 @@ import { EloDiscord } from '../utils/elo-discord.js';
 import EloCommands from '../utils/elo-commands.js';
 
 export default class EloTracker extends S3PluginBase {
-  static version = '2.1.3';
+  static version = '2.1.4';
 
   static get description() {
     return 'A SquadJS plugin that tracks player participation across rounds, computes individual ELO ratings using a TrueSkill-based algorithm, and persists all data via Sequelize-compatible databases (SQLite, MySQL, PostgreSQL, etc.).';
@@ -239,7 +239,14 @@ export default class EloTracker extends S3PluginBase {
     // 1.2.2 — searchPlayer() calls _s3db.caseInsensitiveLikeLiteral(), added in
     // S³ 1.2.2. Against an older S³ that is undefined and the name lookup throws
     // instead of failing at mount where it is diagnosable.
-    const required = '1.2.2';
+    //
+    // 1.2.4 — searchPlayers() also passes that helper `{ exact: true }`, added
+    // in S³ 1.2.4. This one degrades *silently* rather than throwing: an older
+    // S³ ignores the unknown option and returns a substring match, so every
+    // fuzzy hit would be scored as an exact-name match (tier 1) and the ranking
+    // would collapse back to the arbitrary-winner bug it was written to fix.
+    // A mount-time failure is much cheaper than a lookup that quietly lies.
+    const required = '1.2.4';
     const actual = this._s3?.version;
     if (!actual || actual < required) {
       throw new Error(

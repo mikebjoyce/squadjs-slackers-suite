@@ -147,7 +147,7 @@ Centralises Sequelize connector management, schema version tracking, and migrati
 | `escapeValue(value)` | `(*) => string` | Quoted SQL literal | For values inlined into a literal instead of bound |
 | `incrementLiteral(col, n)` | `(string, number?) => Literal` | Sequelize literal | Portable atomic `col + n` for `Model.update()` |
 | `caseInsensitiveLikeOp()` | `() => symbol` | `Op.iLike` / `Op.like` | Case-insensitive substring match on every dialect |
-| `caseInsensitiveLikeLiteral(col, term)` | `(string, string) => Literal` | Sequelize literal | As above, plus a working `ESCAPE` clause and safe value quoting |
+| `caseInsensitiveLikeLiteral(col, term, opts)` | `(string, string, {exact?: boolean}) => Literal` | Sequelize literal | As above, plus a working `ESCAPE` clause and safe value quoting. Pass `{ exact: true }` for a whole-value compare that is still case-insensitive on every dialect — unlike `col = term`, which is case-sensitive on Postgres and on binary-collated MySQL columns |
 
 > **`getConnectorName()` vs `getDialect()`:** `getConnectorName()` returns the connector **label** — the key in the `connectors` map from `config.json`. That's conventionally the dialect name, but a deployment may key its connector `main` or `s3`, in which case the label matches no dialect branch at all. Any code deciding *what SQL to emit* must use `getDialect()`.
 

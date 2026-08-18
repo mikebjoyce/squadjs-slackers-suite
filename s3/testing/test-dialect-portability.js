@@ -401,6 +401,86 @@ for (const { name } of DIALECTS) {
       }
     }));
 
+  test(`[${name}] caseInsensitiveLikeLiteral { exact: true } is whole-value but still case-insensitive`, async () =>
+    withDialect(name, async (db, seq) => {
+      // EloTracker's ranked search uses the exact form to separate a true
+      // name match (tier 1) from a mere substring hit (tier 4). It must NOT
+      // degrade into `col = 'term'`: equality is case-SENSITIVE on Postgres
+      // and on binary-collated MySQL columns, which would silently demote
+      // every differently-cased exact name to a fuzzy match.
+      const M = await makeCooldownsTable(db, seq, 'exact');
+      try {
+        await M.bulkCreate([
+          { eosID: 'a', playerName: 'Cerv' },
+          { eosID: 'b', playerName: 'Cerveira' },
+          { eosID: 'c', playerName: 'Big_Mike' },
+          { eosID: 'd', playerName: 'BigXMike' }
+        ]);
+
+        const findExact = async (term) => {
+          const rows = await M.findAll({
+            where: db.caseInsensitiveLikeLiteral('playerName', term, { exact: true })
+          });
+          return rows.map((r) => r.eosID).sort();
+        };
+
+        // Whole-value: must not pick up the longer name the way %term% would.
+        assert.deepEqual(await findExact('Cerv'), ['a'], 'exact match leaked a substring hit');
+        // …but still case-insensitive on every engine.
+        assert.deepEqual(await findExact('cerv'), ['a'], 'exact match was case-sensitive');
+        assert.deepEqual(await findExact('CERV'), ['a'], 'exact match was case-sensitive');
+        // Wildcards in the term stay literal here too.
+        assert.deepEqual(await findExact('Big_Mike'), ['c'], 'underscore was treated as a wildcard');
+        // No accidental substring behaviour in the other direction.
+        assert.deepEqual(await findExact('erv'), [], 'exact match behaved like a substring match');
+      } finally {
+        await M.drop().catch(() => {});
+      }
+    }));
+
+  test(`[${name}] caseInsensitiveLikeLiteral { trimColumn: true } ignores stored padding`, async () =>
+    withDialect(name, async (db, seq) => {
+      // Squad stores most player names with surrounding whitespace — in one
+      // production export, 10,604 of 11,787 rows. Without TRIM() on the column
+      // an exact-name compare matches essentially nothing in production, which
+      // is invisible in any test fixture that stores tidy names.
+      //
+      // TRIM() is standard SQL, but "standard" is exactly the assumption this
+      // suite exists to check against the real engines rather than assume.
+      const M = await makeCooldownsTable(db, seq, 'trim');
+      try {
+        await M.bulkCreate([
+          { eosID: 'a', playerName: ' Kale' },        // leading space (the common case)
+          { eosID: 'b', playerName: 'Reaper  ' },     // trailing spaces
+          { eosID: 'c', playerName: '  Mr. President  ' },
+          { eosID: 'd', playerName: 'Kalen' }         // must NOT be caught by an exact 'Kale'
+        ]);
+
+        const findExactTrimmed = async (term) => {
+          const rows = await M.findAll({
+            where: db.caseInsensitiveLikeLiteral('playerName', term, { exact: true, trimColumn: true })
+          });
+          return rows.map((r) => r.eosID).sort();
+        };
+
+        assert.deepEqual(await findExactTrimmed('Kale'), ['a'], 'leading space defeated the exact match');
+        assert.deepEqual(await findExactTrimmed('kale'), ['a'], 'trimmed exact match lost case-insensitivity');
+        assert.deepEqual(await findExactTrimmed('Reaper'), ['b'], 'trailing space defeated the exact match');
+        assert.deepEqual(await findExactTrimmed('Mr. President'), ['c'], 'padding on both sides defeated the match');
+        // Still an exact compare, not a prefix one.
+        assert.deepEqual(await findExactTrimmed('Kalen'), ['d'], 'exact compare broke under TRIM');
+
+        // Without trimColumn the padded rows are unreachable — this is the
+        // production defect the option fixes, pinned so it cannot regress.
+        const untrimmed = await M.findAll({
+          where: db.caseInsensitiveLikeLiteral('playerName', 'Kale', { exact: true })
+        });
+        assert.deepEqual(untrimmed.map((r) => r.eosID), [], 'fixture no longer reproduces the padding defect');
+      } finally {
+        await M.drop().catch(() => {});
+      }
+    }));
+
   test(`[${name}] caseInsensitiveLikeLiteral composes inside Op.or`, async () =>
     withDialect(name, async (db, seq) => {
       // EloTracker ORs the name match with a steamID equality; a literal that

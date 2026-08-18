@@ -26,8 +26,11 @@
  *   escapeValue(value)          — Dialect-correct SQL string literal escaping.
  *   incrementLiteral(col, n)    — Portable atomic `col + n` update expression.
  *   caseInsensitiveLikeOp()     — Op.iLike on Postgres, Op.like elsewhere.
- *   caseInsensitiveLikeLiteral(col, term) — Portable case-insensitive LIKE
+ *   caseInsensitiveLikeLiteral(col, term, opts) — Portable case-insensitive LIKE
  *                                  literal with a working ESCAPE clause.
+ *                                  `{ exact: true }` drops the wildcards for a
+ *                                  whole-value compare that stays
+ *                                  case-insensitive on every dialect.
  *   acquireAdvisoryLock(key, timeoutMs) — Acquire cross-process advisory lock
  *   releaseAdvisoryLock(key)            — Release advisory lock
  *   getDataTypes()              — Resolves Sequelize DataTypes from connector.
@@ -553,18 +556,40 @@ export default class DBService {
    * — `'\\'` fails on SQLite with *"ESCAPE expression must be a single
    * character"*. `!` needs no escaping in any of the three.
    *
+   * Pass `{ exact: true }` to drop the surrounding wildcards and compare the
+   * whole column case-insensitively. That is not the same as `col = 'term'`:
+   * equality is case-**sensitive** on Postgres and on any binary-collated MySQL
+   * column, whereas a wildcard-free LIKE/ILIKE stays case-insensitive on all
+   * three engines while still escaping the term literally.
+   *
+   * Pass `{ trimColumn: true }` to compare against `TRIM(col)` rather than the
+   * stored value. Mostly pointless for a substring match, but essential with
+   * `exact`: game clients routinely store names with surrounding whitespace
+   * (in one production Squad data set 10,604 of 11,787 player names had a
+   * leading space), so an exact compare against the raw column silently matches
+   * almost nothing. `TRIM()` is standard SQL and behaves identically on SQLite,
+   * MySQL and Postgres. Note this defeats an index on the column — fine for a
+   * player-name lookup, think twice on a hot path.
+   *
    * @param {string} column - Column to match against (quoted for you).
    * @param {string} term   - Raw user-supplied search term.
+   * @param {object} [opts]
+   * @param {boolean} [opts.exact=false] - Match the whole value instead of a substring.
+   * @param {boolean} [opts.trimColumn=false] - Compare against TRIM(column).
    * @returns {object} A Sequelize literal usable as a `where`, including inside `Op.or`.
    */
-  caseInsensitiveLikeLiteral(column, term) {
+  caseInsensitiveLikeLiteral(column, term, opts = {}) {
     const escaped = String(term)
       .replace(/!/g, '!!')
       .replace(/%/g, '!%')
       .replace(/_/g, '!_');
     const keyword = this.getDialect() === 'postgres' ? 'ILIKE' : 'LIKE';
+    const pattern = opts.exact ? escaped : `%${escaped}%`;
+    const target = opts.trimColumn
+      ? `TRIM(${this.quoteIdentifier(column)})`
+      : this.quoteIdentifier(column);
     const expr =
-      `${this.quoteIdentifier(column)} ${keyword} ${this.escapeValue(`%${escaped}%`)} ESCAPE '!'`;
+      `${target} ${keyword} ${this.escapeValue(pattern)} ESCAPE '!'`;
     const literal = this.sequelize && typeof this.sequelize.literal === 'function'
       ? this.sequelize.literal.bind(this.sequelize)
       : null;

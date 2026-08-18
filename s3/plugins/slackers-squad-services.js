@@ -159,7 +159,7 @@ export default class SlackersSquadServices extends BasePlugin {
     return false;
   }
 
-  static get version() { return '1.2.3'; }
+  static get version() { return '1.2.4'; }
 
   static get optionsSpecification() {
     return {

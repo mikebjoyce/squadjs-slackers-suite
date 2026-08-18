@@ -209,7 +209,7 @@ squad-server/
 **Admin (ChatAdmin channel only):**
 
 - `!eloadmin status` — Plugin status, session count, and round info.
-- `!eloadmin reset <name | steamID>` — Reset a player to default rating.
+- `!eloadmin reset <name | steamID>` — Reset a player to default rating. Requires an **exact** identifier (see [Name Lookup](#name-lookup)); a partial name is refused with the list of candidates.
 
 ### Discord Commands
 
@@ -231,6 +231,46 @@ squad-server/
 - `!elo backup` — Export player stats as JSON.
 - `!elo restore` — Restore from an attached JSON backup.
 - `!elo reset confirm` — Wipe **ALL** database ratings.
+- `!elo reset <name | steamID>` — Reset one player. Like the in-game form, requires an exact identifier.
+
+---
+
+## Name Lookup
+
+Every `!elo <identifier>` path — in game and in Discord — resolves the term
+through one ranked search, so all of them pick the same player.
+
+Candidates fall into tiers, and the best tier present wins outright:
+
+| Tier | Match |
+|------|-------|
+| 0 | Exact `eosID` or `steamID` |
+| 1 | Exact name, case-insensitive (compared against `TRIM(name)` — Squad stores most names with a leading space) |
+| 2 | Exact name once clan tags are stripped (`[NL] Cerv` → `Cerv`) |
+| 3 | Prefix of the raw or tag-stripped name |
+| 4 | Substring anywhere in the name |
+
+Ties **within** a tier are broken by: currently on the server, then most rounds
+played, then most recently seen. Online never beats a better tier.
+
+When the winning match was not exact, the reply names the runners-up
+(`Also matched: Cerveira (2 rds)…`) so an ambiguous term is visible as such
+rather than silently resolving to someone else. Searches are case-insensitive on
+every supported database engine.
+
+Destructive commands (`!eloadmin reset`, `!elo reset <identifier>`) require an
+**unambiguous** match: tier 0–2 **and** nobody else matching at that same tier.
+So `reset cerv` works when one player strips to `Cerv`, but is refused when both
+`[NL] Cerv` and `[US] Cerv` exist — otherwise it would silently wipe whichever
+had more rounds. Anything less lists the candidates and changes nothing.
+
+On the production data set this refuses roughly 3% of full-name resets, all of
+them genuine duplicate names (23 players are named `Reaper`). Use a SteamID for
+those.
+
+> Before this was ranked, the lookup was an unordered `findOne`: any substring
+> hit could win depending on row order, so `!elo cerv` could return a 2-round
+> `Cerveira` instead of the 267-round `[NL] Cerv`.
 
 ---
 

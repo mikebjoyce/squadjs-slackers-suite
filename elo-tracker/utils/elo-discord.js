@@ -26,8 +26,11 @@
  *     buildClanStatsEmbed(...)          — Per-clan stats and roster embed.
  *     buildClansLeaderboardEmbed(...)   — Top-N clan leaderboard embed.
  *     registerDiscordCommands(tracker)
- *       Attaches onDiscordMessage and _findPlayerByIdentifier onto
- *       the tracker instance.
+ *       Attaches onDiscordMessage, _findPlayerCandidates,
+ *       _findPlayerByIdentifier and _getOnlinePlayerIDs onto the
+ *       tracker instance. The two finders are shared with the in-game
+ *       commands in elo-commands.js so every lookup path resolves a
+ *       name identically.
  *
  *   Calculates and displays a "Conservative Rating" (μ - 3σ) 
  *   as the primary player rank to encourage active play.
@@ -36,8 +39,17 @@
  *
  * Logger (../../core/logger.js)
  *   Verbose logging for send failures and rate-limit events.
+ * EloDatabase (./elo-database.js)
+ *   Static formatOtherMatches() for the ambiguous-lookup footer.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
+ *
+ * - The !elo prefix test is case-insensitive and word-bounded, so
+ *   `!Elo`/`!ELO` work (matching in-game, where SquadJS lowercases the
+ *   command before emitting CHAT_COMMAND:*) while `!elophant` does not.
+ * - Name lookups are ranked, not first-hit — see searchPlayers() in
+ *   elo-database.js. `!elo reset <identifier>` additionally requires an
+ *   unambiguous match (EloDatabase.isUnambiguous), since it is destructive.
  *
  * - sendDiscordMessage normalises { embed } → { embeds: [embed] }
  *   for Discord.js v13+ compatibility, then falls back to the legacy
@@ -66,6 +78,7 @@
 
 import Logger from '../../core/logger.js';
 import EloCalculator from './elo-calculator.js';
+import EloDatabase from './elo-database.js';
 
 const formatDuration = (ms) => {
   const seconds = Math.floor((ms / 1000) % 60);
@@ -323,7 +336,13 @@ export const EloDiscord = {
     };
   },
 
-  buildPlayerStatsEmbed(player, rank, totalRanked, totalPlayers, provisional = false, localLeaderboard = null, minRounds = 10) {
+  /**
+   * @param {?string} otherMatches - Optional "Also matched: …" line from
+   *        EloDatabase.formatOtherMatches(), rendered as the embed footer.
+   *        Only supplied by the name-lookup path; self-lookups pass nothing
+   *        because there is no search term to be ambiguous about.
+   */
+  buildPlayerStatsEmbed(player, rank, totalRanked, totalPlayers, provisional = false, localLeaderboard = null, minRounds = 10, otherMatches = null) {
     const { name, mu, sigma, wins, losses, roundsPlayed } = player;
 
     const consRating = mu - (EloCalculator.SIGMA_MULTIPLIER * sigma);
@@ -409,6 +428,7 @@ export const EloDiscord = {
       title: `📊 Player Stats for ${name}`,
       description: description,
       fields: fields,
+      ...(otherMatches ? { footer: { text: otherMatches } } : {}),
       timestamp: new Date().toISOString()
     };
   },
@@ -609,7 +629,13 @@ export const EloDiscord = {
       if (message.author.bot) return;
 
       const content = message.content.trim();
-      if (!content.startsWith('!elo')) return;
+      // Case-insensitive, unlike the plain startsWith('!elo') this replaces:
+      // `!Elo` and `!ELO` were silently ignored in Discord, while the same
+      // typing works in game (SquadJS lowercases the command before emitting
+      // CHAT_COMMAND:*). The trailing (\s|$) also stops unrelated commands that
+      // merely begin with the four letters — `!elophant` used to fall through
+      // to the name lookup and search for a player called "phant".
+      if (!/^!elo(\s|$)/i.test(content)) return;
 
       const isAdminChannel = this.discordAdminChannel &&
         message.channel.id === this.options.discordAdminChannelID;
@@ -701,7 +727,11 @@ export const EloDiscord = {
             return;
           }
 
-          if (identifier === 'confirm') {
+          // Case-insensitive: `!elo reset Confirm` used to miss this branch and
+          // fall through to the single-player reset below, where it searched for
+          // a player literally named "Confirm" — leaving the admin thinking the
+          // wipe had been declined when it was simply never matched.
+          if (identifier.toLowerCase() === 'confirm') {
             if (!this._resetConfirmPending || Date.now() - this._resetConfirmPending.timestamp > 30000) {
               await message.reply('⚠️ No pending reset confirmation, or confirmation expired.');
               this._resetConfirmPending = null;
@@ -750,9 +780,23 @@ export const EloDiscord = {
             roundsPlayed: 0
           };
           try {
-            const player = await this._findPlayerByIdentifier(identifier);
+            // Same strict gate as the in-game !eloadmin reset: destructive and
+            // irreversible, so anything short of an unambiguous match reports
+            // the candidates instead of resetting whichever one ranked highest.
+            const candidates = await this._findPlayerCandidates(identifier);
+            const player = candidates.length ? candidates[0] : null;
             if (!player) {
               await message.reply(`No player found: ${identifier}`);
+              return;
+            }
+            if (!EloDatabase.isUnambiguous(candidates)) {
+              const names = candidates.slice(0, 5)
+                .map((p) => `${String(p.name || '?').trim()} (${p.roundsPlayed || 0} rds)`);
+              await message.reply([
+                `Ambiguous: \`${identifier}\` is not an exact match — nothing was reset.`,
+                `Matched: ${names.join(', ')}`,
+                'Re-run with the full name or a SteamID/EOS ID.'
+              ].join('\n'));
               return;
             }
             await this.db.upsertPlayerStats(player.eosID, defaults);
@@ -1107,8 +1151,11 @@ export const EloDiscord = {
       }
 
       // !elo <identifier> — look up another player
+      // Ranked candidates: [0] is displayed, the rest become the embed footer
+      // so an ambiguous partial name shows what else it could have matched.
       const identifier = args.join(' ');
-      const player = await this._findPlayerByIdentifier(identifier);
+      const candidates = await this._findPlayerCandidates(identifier);
+      const player = candidates.length ? candidates[0] : null;
       if (!player) {
         await message.reply(`No ELO record found for: ${identifier}`);
         return;
@@ -1128,11 +1175,57 @@ export const EloDiscord = {
         localLeaderboard = neighborhood.map((p, i) => ({ ...p, actualRank: offset + 1 + i }));
       }
 
-      await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildPlayerStatsEmbed(player, rank, totalRanked, totalPlayers, provisional, localLeaderboard, minRounds)] });
+      // null unless the search term was an inexact match with runners-up.
+      const otherMatches = EloDatabase.formatOtherMatches(candidates);
+
+      await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildPlayerStatsEmbed(player, rank, totalRanked, totalPlayers, provisional, localLeaderboard, minRounds, otherMatches)] });
     };
 
+    /**
+     * eosIDs + steamIDs of everyone currently on the server, as a Set.
+     *
+     * Handed to the ranked search as an intra-tier tiebreak: when two stored
+     * accounts match a partial name equally well, the one actually in the
+     * match is nearly always the one being asked about. Returns an empty Set
+     * when S³ is unavailable or not ready — the search then falls back to
+     * roundsPlayed/lastSeen ordering, which is still deterministic.
+     */
+    tracker._getOnlinePlayerIDs = function() {
+      try {
+        const players = this._s3?.players;
+        if (!players?.isReady?.()) return new Set();
+        const ids = new Set();
+        for (const p of players.getAllPlayers()) {
+          if (p?.eosID) ids.add(p.eosID);
+          if (p?.steamID) ids.add(p.steamID);
+        }
+        return ids;
+      } catch (err) {
+        Logger.verbose('EloTracker', 1, `[EloDiscord] Online player lookup failed: ${err.message}`);
+        return new Set();
+      }
+    };
+
+    /**
+     * Ranked candidate list for a search term, best match first.
+     * Shared by every lookup path (in-game !elo, Discord !elo, admin reset)
+     * so all three resolve names identically.
+     *
+     * @param {string} identifier
+     * @returns {Promise<Array<Object>>} Ranked rows, each with `_matchTier`.
+     */
+    tracker._findPlayerCandidates = async function(identifier) {
+      return await this.db.searchPlayers(identifier, { onlineIDs: this._getOnlinePlayerIDs() });
+    };
+
+    /**
+     * Best single match for a search term, or null.
+     * @param {string} identifier
+     * @returns {Promise<Object|null>}
+     */
     tracker._findPlayerByIdentifier = async function(identifier) {
-      return await this.db.searchPlayer(identifier);
+      const candidates = await this._findPlayerCandidates(identifier);
+      return candidates.length ? candidates[0] : null;
     };
   }
 }
