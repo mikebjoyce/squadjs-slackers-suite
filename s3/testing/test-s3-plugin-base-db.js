@@ -195,6 +195,7 @@ async function main() {
     plugin.registerMigrations('test-plugin', [{
       version: 1,
       description: 'Initial schema',
+      touches: { creates: ['test_mig_table'] },
       up: async (qi) => {
         migrationRan = true;
         await qi.createTable('test_mig_table', {
@@ -229,6 +230,7 @@ async function main() {
     plugin.registerMigrations('test-plugin', [{
       version: 1,
       description: 'test',
+      touches: {},
       up: async () => {},
       down: async () => {}
     }]);
@@ -246,6 +248,7 @@ async function main() {
     plugin.registerMigrations('test-plugin2', [{
       version: 1,
       description: 'Initial',
+      touches: { creates: ['test_t2'] },
       up: async (qi) => {
         await qi.createTable('test_t2', {
           id: { type: 'INTEGER', primaryKey: true }

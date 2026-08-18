@@ -234,7 +234,7 @@ import fs from 'fs';
 import path from 'path';
 
 export default class TeamBalancer extends S3PluginBase {
-  static version = '4.0.5';
+  static version = '4.0.6';
 
   static get description() {
     return 'Tracks dominant wins by team ID and scrambles teams if one team wins too many rounds.';
