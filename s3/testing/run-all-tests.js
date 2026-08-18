@@ -39,6 +39,7 @@ const CATEGORY_TESTS = {
     'test-s3-discord-plugin-base.js',
     'test-s3-export-import.js',
     'test-s3-commands.js',
+    'test-inspection-embeds.js',
     'test-command-standardization.js',
     'test-migration-backup.js',
     'test-auto-migrate.js',

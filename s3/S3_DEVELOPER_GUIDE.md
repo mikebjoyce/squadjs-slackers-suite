@@ -217,7 +217,7 @@ Tracks player state (name, team, squad, join time), manages per-player and globa
 | `hasPlayer(eosID\|steamID)` | `boolean` | Existence check |
 | `getAllPlayers()` | `object[]` | All tracked player states |
 | `getJoinTime(eosID\|steamID)` | `number\|null` | Epoch MS player joined |
-| `getSquads()` | `object[]` | Squad list from registry |
+| `getSquads()` | `object[]` | Squad list from registry — `{ squadID, teamID, squadName, locked, players }`, leaders first. Membership is keyed by team **and** squad number, since squad numbers restart per team. |
 | `areTeamsResolved()` | `boolean` | All players on valid teams (1 or 2) |
 | `recordMove(eosID, teamID, source, options?)` | `void` | Record attribution for team change |
 | `canAct(eosID, source)` | `boolean` | Check if player can be acted upon (not locked by another plugin) |
@@ -271,6 +271,7 @@ This service provides **building blocks** for clan-aware plugin behaviour (team 
 | `normalizeTag(raw)` | `string` | Normalise for comparison (case, special chars) |
 | `levenshteinDistance(a, b)` | `number` | Edit distance for fuzzy matching |
 | `extractClanGroups(players, opts?)` | `object[]` | Grouped clans with members |
+| `explainClanGroups(players, opts?)` | `{groups, trace, options}` | Same pipeline as `extractClanGroups()`, plus a trace of every exclusion and merge. Diagnostic only — grouping consumers should call `extractClanGroups()`. |
 | `buildPlayerTagCache(players, opts?)` | `Map<eosID, tag>` | Pre-computed tag map |
 | `getClanTeamForPlayer(player, tagCache, serverPlayers, opts?)` | `number\|null` | Target team for clan stacking prevention |
 | `getPlayerTag(eosID)` | `string\|null` | Cached tag for player |
@@ -1351,8 +1352,8 @@ All commands in the configured `channelID` Discord channel:
 | `!s3 services` | Per-service detail with ready state |
 | `!s3 gamestate` | Phase, mode, layer, sub-state, round timing |
 | `!s3 factions` | Team 1/2 abbreviations, faction IDs |
-| `!s3 players` | Full player list with teamID, clan tag, join time |
-| `!s3 clans` | Detected clan groups |
+| `!s3 players` | Population overview embed + one embed per team, broken down by squad with squad leaders marked (👑), squad locks, per-player locks, and an "Unassigned" (not in a squad) bucket |
+| `!s3 clans` | Active clan groups, plus a second embed explaining every exclusion (size bounds, `ignoreList`, unnormalizable tag) and every Levenshtein merge and recruit-suffix strip |
 | `!s3 locks` | Global lock + per-player locks |
 | `!s3 config` | Server config values |
 | `!s3 watch <service>` | Relay verbose logs for a service to Discord |

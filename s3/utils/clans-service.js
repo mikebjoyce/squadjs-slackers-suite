@@ -29,6 +29,9 @@
  *   levenshteinDistance(a, b) — Computes edit distance between tags.
  *   extractClanGroups(rawPlayers, opts) — Groups players by clan tag
  *                              with size filtering and Levenshtein merge.
+ *   explainClanGroups(rawPlayers, opts) — Same pipeline, but also returns a
+ *                              trace of every exclusion and merge. For the
+ *                              `!s3 clans` admin view.
  *   buildPlayerTagCache(players, opts) — Builds eosID→tag map.
  *   getClanTeamForPlayer(joiningPlayer, cache, serverPlayers, opts)
  *                              — Returns team where player's clan
@@ -54,6 +57,9 @@
  * - Ignore-list filtering supports case-sensitive and case-insensitive modes.
  * - Per-player _playerTagCache supports incremental add/remove/clear
  *   for closed-loop updates from PlayersService.
+ * - extractClanGroups() and explainClanGroups() both delegate to the private
+ *   _computeClanGroups(), so the admin diagnostic view cannot drift from the
+ *   grouping that SmartAssign and TeamBalancer consume.
  * - Recruit suffix stripping: by default, tags ending with 'r' or '-r'
  *   are stripped to their base form — but only if the base tag exists
  *   on at least one other player in the data set. This prevents false
@@ -240,6 +246,41 @@ export default class ClansService {
   }
 
   extractClanGroups(rawPlayers, options = {}) {
+    return this._computeClanGroups(rawPlayers, options).groups;
+  }
+
+  /**
+   * Same grouping pipeline as extractClanGroups(), plus a trace explaining
+   * every decision that dropped or merged a tag. Intended for the `!s3 clans`
+   * admin view — grouping consumers should keep calling extractClanGroups().
+   *
+   * @param {Array<{eosID: string, name: string}>} rawPlayers
+   * @param {object} [options] - Grouping option overrides.
+   * @returns {{groups: Object<string, string[]>, trace: object, options: object}}
+   */
+  explainClanGroups(rawPlayers, options = {}) {
+    const { groups, trace } = this._computeClanGroups(rawPlayers, options);
+    return { groups, trace, options: this.getGroupingOptions(options) };
+  }
+
+  /**
+   * Runs the grouping pipeline and returns the surviving groups alongside a
+   * trace of every exclusion and merge.
+   *
+   * Both extractClanGroups() and explainClanGroups() are thin wrappers over
+   * this method, so the `!s3 clans` diagnostic view can never drift from the
+   * grouping SmartAssign and TeamBalancer actually consume.
+   *
+   * Pipeline order matters and is reflected in the trace: extract → strip
+   * recruit suffix → normalize → ignore-list → Levenshtein merge → size bounds.
+   * A tag can therefore be merged and *then* fall outside the size bounds.
+   *
+   * @private
+   * @param {Array<{eosID: string, name: string}>} rawPlayers
+   * @param {object} [options] - Grouping option overrides.
+   * @returns {{groups: Object<string, string[]>, trace: object}}
+   */
+  _computeClanGroups(rawPlayers, options = {}) {
     const {
       minSize,
       maxSize,
@@ -247,6 +288,18 @@ export default class ClansService {
       caseSensitive,
       ignoreList
     } = this.getGroupingOptions(options);
+
+    const trace = {
+      scanned: 0,
+      skipped: [],
+      noTag: [],
+      unnormalizable: [],
+      recruitStripped: [],
+      ignored: [],
+      merged: [],
+      sizeExcluded: [],
+      memberNames: new Map()
+    };
 
     // Pass 1: collect all normalized raw prefixes for context-aware suffix stripping
     const allNormalizedPrefixes = new Set();
@@ -260,16 +313,37 @@ export default class ClansService {
 
     const groups = {};
     for (const player of rawPlayers || []) {
-      if (!player?.name || !player?.eosID) continue;
+      trace.scanned += 1;
 
-      let raw = this.extractRawPrefix(player.name);
-      if (!raw) continue;
+      if (!player?.name || !player?.eosID) {
+        trace.skipped.push({ eosID: player?.eosID ?? null, name: player?.name ?? null });
+        continue;
+      }
+
+      trace.memberNames.set(player.eosID, player.name);
+
+      const original = this.extractRawPrefix(player.name);
+      if (!original) {
+        trace.noTag.push({ eosID: player.eosID, name: player.name });
+        continue;
+      }
 
       // Strip recruit suffix if base tag exists elsewhere
-      raw = this._stripRecruitSuffixIfBaseExists(raw, allNormalizedPrefixes);
+      const raw = this._stripRecruitSuffixIfBaseExists(original, allNormalizedPrefixes);
+      if (raw !== original) {
+        trace.recruitStripped.push({
+          eosID: player.eosID,
+          name: player.name,
+          from: original,
+          to: raw
+        });
+      }
 
       const key = caseSensitive ? raw : this.normalizeTag(raw);
-      if (!key) continue;
+      if (!key) {
+        trace.unnormalizable.push({ eosID: player.eosID, name: player.name, raw });
+        continue;
+      }
 
       if (!groups[key]) groups[key] = new Set();
       groups[key].add(player.eosID);
@@ -286,6 +360,7 @@ export default class ClansService {
 
       for (const tag of Object.keys(groups)) {
         if (normalizedIgnores.has(tag)) {
+          trace.ignored.push({ tag, size: groups[tag].length, members: [...groups[tag]] });
           delete groups[tag];
         }
       }
@@ -299,10 +374,19 @@ export default class ClansService {
 
         for (let i = 0; i < tags.length && !merged; i++) {
           for (let j = i + 1; j < tags.length && !merged; j++) {
-            if (this.levenshteinDistance(tags[i], tags[j]) <= maxEditDistance) {
+            const distance = this.levenshteinDistance(tags[i], tags[j]);
+            if (distance <= maxEditDistance) {
               const [keep, absorb] = groups[tags[i]].length >= groups[tags[j]].length
                 ? [tags[i], tags[j]]
                 : [tags[j], tags[i]];
+
+              trace.merged.push({
+                keep,
+                absorbed: absorb,
+                distance,
+                keepSize: groups[keep].length,
+                absorbedSize: groups[absorb].length
+              });
 
               const seen = new Set(groups[keep]);
               for (const id of groups[absorb]) {
@@ -321,12 +405,21 @@ export default class ClansService {
     }
 
     for (const tag of Object.keys(groups)) {
-      if (groups[tag].length < minSize || groups[tag].length > maxSize) {
+      const size = groups[tag].length;
+      if (size < minSize) {
+        trace.sizeExcluded.push({
+          tag, size, reason: 'minSize', bound: minSize, members: [...groups[tag]]
+        });
+        delete groups[tag];
+      } else if (size > maxSize) {
+        trace.sizeExcluded.push({
+          tag, size, reason: 'maxSize', bound: maxSize, members: [...groups[tag]]
+        });
         delete groups[tag];
       }
     }
 
-    return groups;
+    return { groups, trace };
   }
 
   buildPlayerTagCache(players, options = {}) {

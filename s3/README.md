@@ -105,6 +105,8 @@ The `!s3` admin command surface is organised across:
 
 | Command | Handler | Description |
 |---------|---------|-------------|
+| `!s3 players` | `s3-commands.js` | Population overview + one embed per team, broken down by squad. Marks squad leaders (👑), locked squads, and per-player locks. "Unassigned" means not in a squad. |
+| `!s3 clans` | `s3-commands.js` | Active clan groups, plus a second embed explaining why every other tag was excluded (below `minSize`, above `maxSize`, on `ignoreList`, unnormalizable) and every Levenshtein merge and recruit-suffix strip |
 | `!s3 db` | `s3-commands.js` | Database operations: `export`, `import`, `backup`, `restore` |
 | `!s3 db export` | `s3-export-import.js` | JSON export (three-tier: essential, logging, all) |
 | `!s3 db export --all` | `s3-export-import.js` | Includes ephemeral tables |

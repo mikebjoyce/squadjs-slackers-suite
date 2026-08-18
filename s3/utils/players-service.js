@@ -429,14 +429,19 @@ export default class PlayersService {
     const squads = this._squadsCache || [];
     const active = this._getActiveRegistry();
 
-    // Build squadID -> { leaders[], members[] } from player registry
+    // Build "teamID:squadID" -> { leaders[], members[] } from player registry.
+    // Squad numbers restart per team (both teams have a squad 1), so keying on
+    // squadID alone merges the two teams' same-numbered squads into one bucket.
+    const squadKey = (teamID, squadID) => `${Number(teamID)}:${Number(squadID)}`;
+
     const bySquad = new Map();
     for (const [, p] of active) {
       if (p.squadID == null) continue;
-      if (!bySquad.has(p.squadID)) {
-        bySquad.set(p.squadID, { leaders: [], members: [] });
+      const key = squadKey(p.teamID, p.squadID);
+      if (!bySquad.has(key)) {
+        bySquad.set(key, { leaders: [], members: [] });
       }
-      const entry = bySquad.get(p.squadID);
+      const entry = bySquad.get(key);
       if (p.isLeader) {
         entry.leaders.push(p.eosID);
       } else {
@@ -445,15 +450,16 @@ export default class PlayersService {
     }
 
     return squads
-      .map((s) => ({
-        squadID: s.squadID,
-        teamID: s.teamID,
-        squadName: s.squadName,
-        locked: s.locked === 'True' || s.locked === true,
-        players: bySquad.has(s.squadID)
-          ? [...bySquad.get(s.squadID).leaders, ...bySquad.get(s.squadID).members]
-          : []
-      }))
+      .map((s) => {
+        const entry = bySquad.get(squadKey(s.teamID, s.squadID));
+        return {
+          squadID: s.squadID,
+          teamID: s.teamID,
+          squadName: s.squadName,
+          locked: s.locked === 'True' || s.locked === true,
+          players: entry ? [...entry.leaders, ...entry.members] : []
+        };
+      })
       .filter((s) => s.players.length > 0);
   }
 
