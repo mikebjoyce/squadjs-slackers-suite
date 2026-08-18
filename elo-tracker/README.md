@@ -245,28 +245,36 @@ Candidates fall into tiers, and the best tier present wins outright:
 | Tier | Match |
 |------|-------|
 | 0 | Exact `eosID` or `steamID` |
-| 1 | Exact name, case-insensitive (compared against `TRIM(name)` — Squad stores most names with a leading space) |
-| 2 | Exact name once clan tags are stripped (`[NL] Cerv` → `Cerv`) |
-| 3 | Prefix of the raw or tag-stripped name |
-| 4 | Substring anywhere in the name |
+| 1 | Exact name, case-insensitive — either as stored (compared against `TRIM(name)`, since Squad stores most names with a leading space) or once clan tags are stripped (`[NL] Cerv` → `Cerv`) |
+| 2 | Prefix of the raw or tag-stripped name |
+| 3 | Substring anywhere in the name |
 
 Ties **within** a tier are broken by: currently on the server, then most rounds
 played, then most recently seen. Online never beats a better tier.
 
-When the winning match was not exact, the reply names the runners-up
-(`Also matched: Cerveira (2 rds)…`) so an ambiguous term is visible as such
-rather than silently resolving to someone else. Searches are case-insensitive on
-every supported database engine.
+A clan tag is treated as decoration, not identity, so a stored name and a
+tag-stripped one compete on equal footing and rounds played decides. `!elo hunty`
+returns the 384-round `[✦NL✦] Hunty`, not the 12-round ` Hunty` that happens to
+hold the bare string. The trade-off: an account whose stored name equals another
+player's tag-stripped name can no longer be reached by name — use its SteamID, or
+bare `!elo` if it is your own. On the production data set 51 names of 11,484 are
+affected.
+
+When the result was a guess — the top tier is a prefix or substring hit, or two
+players tie at the best tier — the reply names the runners-up
+(`Also matched: Hunty (12 rds)…`) rather than silently resolving to one of them.
+A unique exact match shows no such line. Searches are case-insensitive on every
+supported database engine.
 
 Destructive commands (`!eloadmin reset`, `!elo reset <identifier>`) require an
-**unambiguous** match: tier 0–2 **and** nobody else matching at that same tier.
+**unambiguous** match: tier 0–1 **and** nobody else matching at that same tier.
 So `reset cerv` works when one player strips to `Cerv`, but is refused when both
 `[NL] Cerv` and `[US] Cerv` exist — otherwise it would silently wipe whichever
 had more rounds. Anything less lists the candidates and changes nothing.
 
-On the production data set this refuses roughly 3% of full-name resets, all of
-them genuine duplicate names (23 players are named `Reaper`). Use a SteamID for
-those.
+On the production data set this refuses roughly 3% of full-name resets: mostly
+genuine duplicate names (23 players are named `Reaper`), plus the 41 rows where a
+stored name ties a tag-stripped one. Use a SteamID for those.
 
 > Before this was ranked, the lookup was an unordered `findOne`: any substring
 > hit could win depending on row order, so `!elo cerv` could return a 2-round

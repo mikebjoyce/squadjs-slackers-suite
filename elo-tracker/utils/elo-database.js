@@ -58,10 +58,14 @@
   * - pruneStaleEntries() removes provisional players unseen for 30 days
   *   and calibrated players unseen for 90 days.
   * - searchPlayers() attaches a non-persisted `_matchTier` (0 = exact ID,
-  *   1 = exact name, 2 = exact name minus clan tags, 3 = prefix,
-  *   4 = substring) to every returned row. Callers that must not act on a
+  *   1 = exact name either as stored or minus clan tags, 2 = prefix,
+  *   3 = substring) to every returned row. Callers that must not act on a
   *   guess — !eloadmin reset, for one — should gate on isUnambiguous(),
   *   which requires a good tier AND uniqueness at that tier.
+  * - Literal and tag-stripped exact names share tier 1 on purpose, so that
+  *   `!elo hunty` resolves to the 384-round `[✦NL✦] Hunty` rather than the
+  *   12-round ` Hunty` that happens to hold the bare string. See the
+  *   searchPlayers() docblock for the trade-off this accepts.
   * - The exact-name query compares against TRIM(name): Squad stores most
   *   names with a leading space (10,604 of 11,787 rows in one production
   *   export), so an untrimmed compare matches almost nothing in the field.
@@ -233,16 +237,38 @@ export default class EloDatabase {
    * wins outright, and lower tiers are only ever runners-up:
    *
    *   0  exact eosID or steamID          (an ID is never ambiguous)
-   *   1  exact name, case-insensitive
-   *   2  exact name once clan tags are stripped ("[NL] Cerv" -> "Cerv")
-   *   3  prefix match on raw or tag-stripped name
-   *   4  substring match anywhere
+   *   1  exact name, case-insensitive, EITHER as stored or once clan tags
+   *      are stripped ("[NL] Cerv" -> "Cerv")
+   *   2  prefix match on raw or tag-stripped name
+   *   3  substring match anywhere
    *
    * Within a tier: currently-online players first (someone typing a partial
    * name mid-round almost always means the player in the match), then most
    * roundsPlayed, then most recent lastSeen. That ordering is what actually
    * fixes the reported bug — both `Cerveira` and `[NL] Cerv` land in
    * tier 3, and 267 rounds beats 2.
+   *
+   * ─── WHY LITERAL AND TAG-STRIPPED SHARE TIER 1 ───────────────────
+   *
+   * They were separate tiers at first (literal above tag-stripped), which
+   * meant an exact stored name beat a tagged one outright no matter how
+   * lopsided the two accounts were. In production that gave:
+   *
+   *   " Hunty"       12 rounds,   5W/7L    <- won, purely for being literal
+   *   "[✦NL✦] Hunty" 384 rounds, 201W/183L
+   *
+   * A clan tag is decoration, not identity: players type `hunty` meaning the
+   * regular, not the drive-by account that happens to hold the bare string.
+   * Merging the two lets roundsPlayed decide, and the loser is still named in
+   * the "Also matched" line.
+   *
+   * The cost, accepted knowingly: an account whose stored name equals another
+   * player's tag-stripped name is no longer reachable by any name string —
+   * `hunty` and ` Hunty` now both resolve to the tagged player. Those accounts
+   * remain reachable by SteamID, and by bare `!elo` for the player themselves.
+   * Measured on the 2026-08-17 export (11,787 rows, 11,484 distinct names),
+   * 51 terms have both kinds of match and 29 change winner — every one of them
+   * toward the higher-round account, 20 with a 5x or greater rounds gap.
    *
    * ─── WHY THE SCORING IS IN JS, NOT SQL ───────────────────────────
    *
@@ -261,7 +287,7 @@ export default class EloDatabase {
    * @param {string} identifier          - eosID, steamID, or (partial) name.
    * @param {Object} [opts]
    * @param {number} [opts.limit=100]    - Max fuzzy rows pulled for scoring.
-   *        Tier 2 (exact name minus clan tags) cannot be pre-queried in SQL —
+   *        A tag-stripped exact name cannot be pre-queried in SQL —
    *        tag stripping is JS-side — so a tag-wearing player is only ever
    *        found by the fuzzy pass, and too small a limit can truncate them
    *        away on a common substring. The engine scans for `%term%` either
@@ -304,7 +330,8 @@ export default class EloDatabase {
           collected.set(row.eosID, { row, tier });
         };
 
-        // Tier 1 — exact name. A wildcard-free LIKE gives case-insensitivity
+        // Tier 1 (literal half) — exact name as stored. A wildcard-free LIKE
+        // gives case-insensitivity
         // on every dialect for free; the helper escapes %, _ and the escape
         // character itself, so a name containing them is matched literally
         // rather than as a pattern.
@@ -323,7 +350,9 @@ export default class EloDatabase {
         });
         for (const r of exactNameRows) add(r.toJSON(), 1);
 
-        // Tiers 2-4 — one fuzzy substring pass, scored below. Ordered by
+        // Tiers 1-3 — one fuzzy substring pass, scored below. It can still
+        // produce tier 1 hits: the tag-stripped half of tier 1 is JS-side, so
+        // "[NL] Cerv" can only ever arrive through here. Ordered by
         // roundsPlayed so that when the LIMIT does bite, it drops the least
         // established accounts rather than an arbitrary slice.
         const fuzzyRows = await model.findAll({
@@ -366,10 +395,12 @@ export default class EloDatabase {
         const raw = String(row.name || '').trim().toLowerCase();
         const bare = EloDatabase.stripClanTags(row.name).toLowerCase();
 
-        if (raw === needle) resolvedTier = 1;
-        else if (bare === needle) resolvedTier = 2;
-        else if (raw.startsWith(needle) || bare.startsWith(needle)) resolvedTier = 3;
-        else resolvedTier = 4; // matched the LIKE, so it is a substring hit somewhere
+        // Literal and tag-stripped exact matches share tier 1 deliberately —
+        // see "WHY LITERAL AND TAG-STRIPPED SHARE TIER 1" on searchPlayers().
+        // Whoever has more rounds then wins on the tiebreak below.
+        if (raw === needle || bare === needle) resolvedTier = 1;
+        else if (raw.startsWith(needle) || bare.startsWith(needle)) resolvedTier = 2;
+        else resolvedTier = 3; // matched the LIKE, so it is a substring hit somewhere
       }
 
       return {
@@ -430,15 +461,17 @@ export default class EloDatabase {
    * Destructive commands (!eloadmin reset, !elo reset <identifier>) must not
    * act on a guess, so they require BOTH:
    *
-   *   1. A good tier — 0 (exact ID), 1 (exact name) or 2 (exact name minus
-   *      clan tags). A prefix or substring hit is a guess by definition.
+   *   1. A good tier — 0 (exact ID) or 1 (exact name, as stored or minus clan
+   *      tags). A prefix or substring hit is a guess by definition.
    *   2. Uniqueness *at that tier* — nobody else matched equally well.
    *
    * Rule 2 is the one that is easy to miss. `[NL] Cerv` and `[US] Cerv` both
-   * strip to `Cerv`, so the term "cerv" matches both at tier 2 and the ranker
+   * strip to `Cerv`, so the term "cerv" matches both at tier 1 and the ranker
    * picks the higher-round one — exactly the silent-wrong-player behaviour the
    * ranking was introduced to stop, except here it would wipe a rating rather
-   * than print the wrong stats.
+   * than print the wrong stats. Since literal and tag-stripped names now share
+   * tier 1, this also covers ` Hunty` vs `[NL] Hunty`: `reset hunty` is refused
+   * rather than resolving to whichever has more rounds.
    *
    * Uniqueness is deliberately scoped to the winning tier rather than the whole
    * result set: an exact full name must stay resettable even when longer names
@@ -450,9 +483,9 @@ export default class EloDatabase {
    */
   static isUnambiguous(candidates) {
     if (!Array.isArray(candidates) || candidates.length === 0) return false;
-    const best = candidates[0]._matchTier ?? 4;
-    if (best > 2) return false;
-    return candidates.filter((p) => (p._matchTier ?? 4) === best).length === 1;
+    const best = candidates[0]._matchTier ?? 3;
+    if (best > 1) return false;
+    return candidates.filter((p) => (p._matchTier ?? 3) === best).length === 1;
   }
 
   /**
@@ -466,8 +499,16 @@ export default class EloDatabase {
    * runners-up gets the same information across in one line and costs the
    * player nothing when the top hit was already right.
    *
-   * Suppressed entirely for tier 0/1 hits (exact ID or exact name) — those
-   * are not guesses, so there is nothing to second-guess.
+   * Suppression is delegated to isUnambiguous() rather than duplicating a tier
+   * test, so the line appears in exactly the cases a destructive command would
+   * refuse to act on — one definition of "this was a guess", used by both.
+   *
+   * That coupling is what surfaces the tier-1 contests. The earlier rule
+   * suppressed the line for any tier <= 1, so when ` Hunty` and `[NL] Hunty`
+   * both matched, the reply named one and gave no hint the other existed —
+   * wrong answer and no way to tell. A unique exact hit still shows nothing,
+   * even when prefix/substring runners-up trail it, because there is genuinely
+   * nothing to second-guess.
    *
    * @param {Array<Object>} candidates - Ranked rows from searchPlayers().
    * @param {number} [max=3]           - Max runners-up to name.
@@ -475,7 +516,7 @@ export default class EloDatabase {
    */
   static formatOtherMatches(candidates, max = 3) {
     if (!Array.isArray(candidates) || candidates.length < 2) return null;
-    if ((candidates[0]._matchTier ?? 4) <= 1) return null;
+    if (EloDatabase.isUnambiguous(candidates)) return null;
 
     const others = candidates.slice(1, 1 + max)
       .map((p) => `${String(p.name || '?').trim()} (${p.roundsPlayed || 0} rds)`);

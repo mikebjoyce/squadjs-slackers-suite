@@ -310,8 +310,9 @@ export default async function runDatabaseTests(runTest) {
     if (!cerv) throw new Error('Ranked search found nothing for "cerv"');
     if (cerv.eosID !== 'eos_cerv') throw new Error(`Expected [NL] Cerv, got ${cerv.name}`);
 
-    // 2. Clan tags are transparent: "cerv" hits tier 2 on the tag-stripped name.
-    if (cerv._matchTier !== 2) throw new Error(`Expected tier 2 (exact minus tag), got ${cerv._matchTier}`);
+    // 2. Clan tags are transparent: "cerv" hits tier 1 on the tag-stripped
+    //    name, the same tier a literally-stored "Cerv" would occupy.
+    if (cerv._matchTier !== 1) throw new Error(`Expected tier 1 (exact minus tag), got ${cerv._matchTier}`);
 
     // 3. Case-insensitive on every dialect, including the exact-name query.
     const upper = await db.searchPlayer('CERVEIRA');
@@ -323,24 +324,29 @@ export default async function runDatabaseTests(runTest) {
     if (!byId || byId.eosID !== 'eos_cerv') throw new Error('SteamID lookup failed');
     if (byId._matchTier !== 0) throw new Error(`Expected tier 0 for ID, got ${byId._matchTier}`);
 
-    // 5. Runners-up are reported, so the asker can tell it was a fuzzy hit.
+    // 5. All three rows are returned as candidates, best-first, so callers can
+    //    report runners-up when the top hit was a guess.
     const candidates = await db.searchPlayers('cerv');
     if (candidates.length !== 3) throw new Error(`Expected 3 candidates, got ${candidates.length}`);
-    const hint = EloDatabase.formatOtherMatches(candidates);
-    if (!hint || !hint.includes('Cerveira')) throw new Error('Expected an "Also matched" hint naming Cerveira');
 
-    // 6. …but never on an exact match, where there is nothing to second-guess.
+    // 6. No "Also matched" line here, nor on a plain exact name: [NL] Cerv is
+    //    the sole tier-1 hit, so the answer is not a guess and the trailing
+    //    prefix matches are noise. The hint is reserved for genuine ambiguity
+    //    — see the tier-1 contest test below.
+    if (EloDatabase.formatOtherMatches(candidates) !== null) {
+      throw new Error('Unique exact match should not emit an "Also matched" hint');
+    }
     if (EloDatabase.formatOtherMatches(await db.searchPlayers('CERVEIRA')) !== null) {
       throw new Error('Exact match should not emit an "Also matched" hint');
     }
 
     // 7. Online players win ties *within* a tier. Cerveira (2 rounds) and
-    //    CervTheThird (40 rounds) are both tier 3 prefix matches, so rounds
+    //    CervTheThird (40 rounds) are both tier 2 prefix matches, so rounds
     //    normally put CervTheThird ahead; marking Cerveira online flips them.
     const offline = await db.searchPlayers('cerv');
     if (offline.findIndex(p => p.eosID === 'eos_cerveira') <
         offline.findIndex(p => p.eosID === 'eos_cervmain')) {
-      throw new Error('Baseline wrong: expected the higher-round tier-3 match first');
+      throw new Error('Baseline wrong: expected the higher-round tier-2 match first');
     }
     const online = await db.searchPlayers('cerv', { onlineIDs: new Set(['eos_cerveira']) });
     if (online.findIndex(p => p.eosID === 'eos_cerveira') >
@@ -348,8 +354,8 @@ export default async function runDatabaseTests(runTest) {
       throw new Error('Online tiebreak not applied within tier');
     }
 
-    // 8. Online must NOT override tier: [NL] Cerv is a tier-2 match and still
-    //    outranks an online tier-3 match.
+    // 8. Online must NOT override tier: [NL] Cerv is a tier-1 match and still
+    //    outranks an online tier-2 match.
     if (online[0].eosID !== 'eos_cerv') throw new Error('Online bump wrongly crossed tier boundary');
 
     // 9. The destructive-command gate. "cerv" uniquely strips to [NL] Cerv, so
@@ -363,13 +369,63 @@ export default async function runDatabaseTests(runTest) {
     //     clan's Cerv had more rounds.
     await db.upsertPlayerStats('eos_uscerv', { steamID: 'steam_uscerv', name: '[US] Cerv', roundsPlayed: 99, wins: 50, losses: 49 });
     const collision = await db.searchPlayers('cerv');
-    if (collision.filter(p => p._matchTier === 2).length !== 2) throw new Error('Expected two tier-2 candidates');
+    if (collision.filter(p => p._matchTier === 1).length !== 2) throw new Error('Expected two tier-1 candidates');
     if (EloDatabase.isUnambiguous(collision)) throw new Error('Tag-stripped collision must not be resettable');
     // An exact ID stays resettable regardless of the collision.
     if (!EloDatabase.isUnambiguous(await db.searchPlayers('76561198962436118'))) {
       throw new Error('Exact ID must always be resettable');
     }
     await s3dbShim.getModel('Elo_PlayerStats').destroy({ where: { eosID: 'eos_uscerv' } });
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // Test 5a2: Literal vs tag-stripped exact match — the "Hunty" case.
+  //
+  // Reported from production: `!elo hunty` returned a 12-round " Hunty" over
+  // the 384-round "[✦NL✦] Hunty". Literal exact used to be its own tier above
+  // tag-stripped exact, so rounds never got a say and the footer was suppressed
+  // as well — wrong player AND no hint that another existed.
+  //
+  // Both stored names are used verbatim from the 2026-08-17 export, padding
+  // included, since the leading space on " Hunty" is what makes it a literal
+  // exact match for the term "hunty" in the first place.
+  // ────────────────────────────────────────────────────────────────
+  await runTest('Search: literal and tag-stripped exact names compete on rounds', async () => {
+    await db.upsertPlayerStats('eos_hunty_bare', { steamID: 'steam_hunty_bare', name: ' Hunty', roundsPlayed: 12, wins: 5, losses: 7 });
+    await db.upsertPlayerStats('eos_hunty_nl', { steamID: 'steam_hunty_nl', name: '[✦NL✦] Hunty', roundsPlayed: 384, wins: 201, losses: 183 });
+
+    const candidates = await db.searchPlayers('hunty');
+    if (candidates.length !== 2) throw new Error(`Expected 2 candidates, got ${candidates.length}`);
+
+    // 1. Both sit at tier 1 — the merge is the whole fix.
+    if (candidates.filter(p => p._matchTier === 1).length !== 2) {
+      throw new Error(`Expected both at tier 1, got ${candidates.map(p => p._matchTier).join(',')}`);
+    }
+
+    // 2. Rounds decide, so the tagged regular wins.
+    if (candidates[0].eosID !== 'eos_hunty_nl') {
+      throw new Error(`Expected [NL] Hunty, got ${JSON.stringify(candidates[0].name)}`);
+    }
+
+    // 3. The displaced account is named, so the asker can see it exists.
+    const hint = EloDatabase.formatOtherMatches(candidates);
+    if (!hint || !hint.includes('Hunty (12 rds)')) {
+      throw new Error(`Expected an "Also matched" hint naming the 12-round account, got ${hint}`);
+    }
+
+    // 4. Online still outranks rounds within the tier — a bare-named player
+    //    actually in the match beats a tagged one who logged off.
+    const online = await db.searchPlayers('hunty', { onlineIDs: new Set(['eos_hunty_bare']) });
+    if (online[0].eosID !== 'eos_hunty_bare') throw new Error('Online tiebreak not applied at tier 1');
+
+    // 5. A tier-1 contest blocks resets: `reset hunty` must not pick a side.
+    if (EloDatabase.isUnambiguous(candidates)) throw new Error('Tier-1 contest must not be resettable');
+    if (!EloDatabase.isUnambiguous(await db.searchPlayers('steam_hunty_bare'))) {
+      throw new Error('SteamID must stay resettable — it is the documented escape hatch');
+    }
+
+    const model = s3dbShim.getModel('Elo_PlayerStats');
+    await model.destroy({ where: { eosID: ['eos_hunty_bare', 'eos_hunty_nl'] } });
   });
 
   // ────────────────────────────────────────────────────────────────
