@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║              SWITCH PLUGIN v2.4.0 — COMMAND HANDLING           ║
+ * ║              SWITCH PLUGIN — COMMAND HANDLING                  ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -422,7 +422,7 @@ const SwitchCommands = {
                     // presence tracking — admin clear is a full reset of all eligibility state.
                     const maxTokens = plugin.options.maxSwitchTokens;
                     await PlayerCooldowns.upsert(
-                      { eosID: result.eosID, tokenBalance: maxTokens, tokenRegenAnchor: new Date(), scrambleLockdownExpiry: null, seedPresenceStart: null },
+                      { eosID: result.eosID, tokenBalance: maxTokens, tokenRegenAnchor: new Date(), scrambleLockdownExpiry: null, seedPresenceStart: null, lastActiveTimestamp: new Date() },
                       { transaction: t }
                     );
                   });
@@ -654,7 +654,7 @@ const SwitchCommands = {
                       plugin._regenTokens(row);
                       plugin._spendToken(row);
                       await PlayerCooldowns.upsert(
-                        { eosID, steamID, playerName, tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor },
+                        { eosID, steamID, playerName, tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor, lastActiveTimestamp: new Date() },
                         { transaction: t }
                       );
                     });
@@ -1256,8 +1256,15 @@ const SwitchCommands = {
             }
           }
 
+          // Two distinct facts, deliberately shown side by side. firstSeenTimestamp
+          // is set once at row creation and never updated — it means "first tracked",
+          // which is why labelling it "Joined" was misleading. lastActiveTimestamp is
+          // the live one and drives row retention.
           if (result.firstSeenTimestamp) {
-            desc += `⏱️ **Joined:** <t:${Math.floor(new Date(result.firstSeenTimestamp).getTime() / 1000)}:f>\n`;
+            desc += `📅 **First Tracked:** <t:${Math.floor(new Date(result.firstSeenTimestamp).getTime() / 1000)}:f>\n`;
+          }
+          if (result.lastActiveTimestamp) {
+            desc += `⏱️ **Last Active:** <t:${Math.floor(new Date(result.lastActiveTimestamp).getTime() / 1000)}:f>\n`;
           }
 
           await message.channel.send({ embeds: [{ title: '🔍 Player Status', description: desc, color: 0x3498db }] });
@@ -1281,7 +1288,7 @@ const SwitchCommands = {
             // presence tracking — admin clear is a full reset of all eligibility state.
             const maxTokens = plugin.options.maxSwitchTokens;
             await PlayerCooldowns.upsert(
-              { eosID: result.eosID, tokenBalance: maxTokens, tokenRegenAnchor: new Date(), scrambleLockdownExpiry: null, seedPresenceStart: null },
+              { eosID: result.eosID, tokenBalance: maxTokens, tokenRegenAnchor: new Date(), scrambleLockdownExpiry: null, seedPresenceStart: null, lastActiveTimestamp: new Date() },
               { transaction: t }
             );
           });

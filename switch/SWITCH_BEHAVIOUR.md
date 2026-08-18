@@ -76,7 +76,14 @@ Tokens refill one at a time, independently. With **2** tokens saved, you can swi
 
 During seed rounds, you earn **+1** bonus token for every **20** minutes you are present.
 You can earn up to **1** bonus token per seed round.
-Bonus tokens stack above your normal cap of **2**, so after a full seed round you could hold up to **3** tokens total.
+
+If the seed round ends before you have banked a full 20 minutes, you still get **+1**
+as long as you are **still on the server when the round ends**. Leave early and you
+get nothing for that round — though anything you already earned is yours to keep.
+
+Bonus tokens stack above your normal cap of **2**, up to a hard ceiling of **3** tokens.
+Once you are at 3 you stop earning, however many seed rounds you play, until you spend
+one and drop back below the ceiling.
 
 ### Checking Your Balance
 
@@ -201,9 +208,10 @@ The following table lists every configuration option with the value used to gene
 | Option | Value | Description |
 |--------|-------|-------------|
 | `maxSwitchTokens` | 2 | Maximum switch tokens a player can hold |
-| `seedTokenBonusAmount` | 1 | Max bonus tokens per seed round |
+| `seedTokenBonusAmount` | 1 | Max bonus tokens per seed round, and the amount by which seed bonuses may exceed `maxSwitchTokens` |
 | `seedTokenBonusMinutes` | 20 | Minutes of seed presence to earn one bonus token |
 | `seedTokenBonusMinPlayers` | 0 | Minimum players online for seed time accrual |
+| `pruneInactivePlayerDays` | 3 | Days unseen before a player's cooldown row is pruned |
 
 ### Queue Timeout Switch
 

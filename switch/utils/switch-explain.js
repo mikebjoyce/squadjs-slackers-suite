@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║          SWITCH PLUGIN v2.4.0 — EXPLAIN EMBED GENERATOR       ║
+ * ║          SWITCH PLUGIN — EXPLAIN EMBED GENERATOR              ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -369,7 +369,8 @@ function _buildTokenEmbed(plugin) {
     const seedLines = [
       `During seed rounds, you earn **+1** bonus token for every **${seedBonusMinutes}** minutes you are present${minNote}.`,
       `You can earn up to **${seedBonusAmount}** bonus token${seedBonusAmount !== 1 ? 's' : ''} per seed round.`,
-      `Bonus tokens stack above your normal cap of **${maxTokens}**, so after a full seed round you could hold up to **${maxTokens + seedBonusAmount}** tokens total.`
+      `If the round ends before you have banked a full **${seedBonusMinutes}** minutes, you still get **+1** — as long as you are still on the server when it ends.`,
+      `Bonus tokens stack above your normal cap of **${maxTokens}**, up to a hard ceiling of **${maxTokens + seedBonusAmount}**. At the ceiling you stop earning until you spend one.`
     ].join('\n');
     seedBonusField = { name: 'Seed Bonus', value: seedLines, inline: false };
   }

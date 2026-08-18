@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║              SWITCH PLUGIN v2.3.2 — QUEUE SUBSYSTEM            ║
+ * ║              SWITCH PLUGIN — QUEUE SUBSYSTEM                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -232,7 +232,7 @@ const SwitchQueue = {
                 plugin._regenTokens(row);
                 plugin._spendToken(row);
                 await PlayerCooldowns.upsert(
-                  { eosID: entry.eosID, steamID: entry.steamID, playerName: entry.playerName, tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor },
+                  { eosID: entry.eosID, steamID: entry.steamID, playerName: entry.playerName, tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor, lastActiveTimestamp: new Date() },
                   { transaction: t }
                 );
               });
@@ -463,7 +463,7 @@ const SwitchQueue = {
                     plugin._regenTokens(row);
                     plugin._spendToken(row);
                     await PlayerCooldowns.upsert(
-                      { eosID: p.eosID, steamID: p.steamID, playerName: p.playerName, tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor },
+                      { eosID: p.eosID, steamID: p.steamID, playerName: p.playerName, tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor, lastActiveTimestamp: new Date() },
                       { transaction: t }
                     );
                   });
@@ -617,7 +617,7 @@ const SwitchQueue = {
                     plugin._regenTokens(row);
                     plugin._spendToken(row);
                     await PlayerCooldowns.upsert(
-                      { eosID: entry.eosID, steamID: entry.steamID, playerName: entry.playerName, tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor },
+                      { eosID: entry.eosID, steamID: entry.steamID, playerName: entry.playerName, tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor, lastActiveTimestamp: new Date() },
                       { transaction: t }
                     );
                   });

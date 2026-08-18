@@ -1,4 +1,4 @@
-# Switch Plugin v2.4.0
+# Switch Plugin v2.5.0
 
 **Team-change management with database persistence, TeamBalancer integration, and S³-aware player tracking.**
 
@@ -23,7 +23,8 @@ Survives server restarts via any Sequelize-compatible database (SQLite, MySQL, P
 * **Double-Switch** — swap to opposite team and back to fix game bugs without changing teams
 * **Liberal Mode Support** — relaxed switching rules during Seed/Jensen rounds
 * **Token Bucket Cooldown** — players hold up to `maxSwitchTokens` (default 2) with individual per-token regeneration; set to 1 for legacy flat-cooldown behavior. Token-aware messaging adapts automatically based on the configured token count.
- * **Seed Bonus Tokens** — players earn bonus switch tokens (stacking above the normal cap) for time spent in seed-mode rounds. Configurable minimum player threshold (`seedTokenBonusMinPlayers`) gates time accrual so low-population servers don't hand out tokens at 2 AM. Set either `seedTokenBonusAmount` or `seedTokenBonusMinutes` to 0 to disable seed bonus tokens entirely.
+ * **Seed Bonus Tokens** — players earn bonus switch tokens for time spent in seed-mode rounds, stacking above the normal cap up to an absolute ceiling of `maxSwitchTokens + seedTokenBonusAmount`. Players still present when the round ends receive a consolation token even if they never accrued a full interval. Configurable minimum player threshold (`seedTokenBonusMinPlayers`) gates time accrual so low-population servers don't hand out tokens at 2 AM. Set either `seedTokenBonusAmount` or `seedTokenBonusMinutes` to 0 to disable seed bonus tokens entirely.
+ * **Row Retention** — cooldown rows are pruned automatically: immediately once a row carries no information (exactly `maxSwitchTokens`, no seed state), and after `pruneInactivePlayerDays` for everything else. Keeps the table bounded on long-running servers.
 * **Dynamic Balance Tolerance** — interpolated extra imbalance slots when server is below full capacity
 * **Auto-Updating Explain Channel** — When `explainChannelID` is configured, the full `!switch explain` embed sequence plus a 7-day reliability stats embed is posted to the designated channel on mount and periodically refreshed in-place (every 30 minutes). Players always see current information without manual `!switch explain` re-runs.
 * **Enhanced `!switch stats`** — Discord aggregate embed with per-move-type counts, denial reason breakdowns, queue outcomes, liberal-mode filtering, and data quality warnings
@@ -112,7 +113,8 @@ Add the following to your SquadJS `config.json`:
     "maxSwitchTokens": 2,
     "seedTokenBonusAmount": 1,
     "seedTokenBonusMinutes": 20,
-    "seedTokenBonusMinPlayers": 0
+    "seedTokenBonusMinPlayers": 0,
+    "pruneInactivePlayerDays": 3
   }
 ]
 ```
@@ -198,6 +200,7 @@ The Switch plugin exposes a public API for external consumers (such as SmartAssi
 
 ### Version Compatibility
 
+- `static version = '2.5.0'` — seed bonus reworked around round identity rather than layer edges, absolute wallet ceiling, ENDGAME consolation grant, and two-tier row retention (schema v5, adds `lastActiveTimestamp`).
 - `static version = '2.4.0'` — seed bonus min-player threshold, seed bonus disable (0-value options), and end-game seed completion grants on top of the v2.3.2 feature set.
 - Consumers should check `plugin.constructor.version` (wrapped in try/catch) and require `>= 2.0.0` before using the API.
 
@@ -229,14 +232,37 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 | `scrambleLockdownDurationMinutes` | Duration to block switching after a scramble | `30` |
 | `scrambleLockdownMinPlayers` | Minimum total players required to apply scramble lockdown. Below this threshold, scrambles clear the queue but do not lock switching. | `60` |
 
-### Token System (v2.3.0, seed bonuses enhanced in v2.4.0)
+### Token System (v2.3.0, seed bonuses enhanced in v2.4.0, reworked in v2.5.0)
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `maxSwitchTokens` | Maximum number of switch tokens a player can hold. Each switch consumes 1 token; tokens regenerate individually over the cooldown interval. Set to 1 for legacy flat-cooldown behavior. | `2` |
-| `seedTokenBonusAmount` | Maximum bonus tokens a player can earn per seed round. Each qualifying interval grants +1 token. Set to 0 to disable seed bonus tokens entirely. | `1` |
+| `seedTokenBonusAmount` | Maximum bonus tokens a player can earn per seed round. Each qualifying interval grants +1 token. Also sets the absolute wallet ceiling — see below. Set to 0 to disable seed bonus tokens entirely. | `1` |
 | `seedTokenBonusMinutes` | Minutes a player must be present in a seed-mode round to earn one bonus token. Set to 0 to disable seed bonus tokens entirely. | `20` |
 | `seedTokenBonusMinPlayers` | Minimum number of players on the server before seed presence time accrues toward bonus tokens. Set to 0 to disable the minimum (time always accrues in seed mode). | `0` |
+| `pruneInactivePlayerDays` | Days a player must be unseen before their cooldown row is pruned. Rows sitting at exactly `maxSwitchTokens` with no seed state are pruned after 30 minutes regardless, since they carry no information. Set to 0 to disable pruning entirely. | `3` |
+
+#### Seed bonus: the wallet ceiling
+
+`seedTokenBonusAmount` is a **per-round earning cap and an absolute wallet ceiling
+at the same time**. A player can never hold more than
+`maxSwitchTokens + seedTokenBonusAmount` — 3 with the defaults above.
+
+Consequently, across consecutive seed rounds the ceiling is what actually binds:
+someone who earns their bonus in the first seed round and does not spend it will
+keep accruing presence in later rounds without receiving anything, because they are
+already at the ceiling. They start earning again once they spend back below it.
+This is deliberate — it stops bonus tokens stacking without limit over a long
+seeding session.
+
+Two grants exist:
+
+- **Periodic** — +1 for every `seedTokenBonusMinutes` of presence in the round.
+- **Consolation** — +1 at round end (the ENDGAME phase) for players who were
+  present but never accrued a full interval. Only players **still connected** at
+  round end qualify, and only if their presence began before ENDGAME. A player who
+  leaves early keeps anything the periodic grant already gave them, but receives no
+  consolation.
 
 ### Queue Timeout Switch (v2.2.0)
 

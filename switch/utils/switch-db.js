@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║              SWITCH PLUGIN v2.3.2 — DATABASE LAYER             ║
+ * ║              SWITCH PLUGIN — DATABASE LAYER                    ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -34,8 +34,12 @@
  * - Migrations are version-tracked via S³ MigrationEngine.
  * - timeLimitEnabled defaults to true; loaded from DB after
  *   migrations guarantee the Settings table exists.
- * - cleanup() purges rows with expired cooldowns AND no active
- *   scramble lockdown AND stale firstSeenTimestamp (>24h old).
+ * - cleanup() applies two-tier row retention: rows at exactly
+ *   maxSwitchTokens with no seed state are pruned after 30 minutes
+ *   (they carry no information); everything else is pruned after
+ *   pruneInactivePlayerDays. Connected players and seed mode are
+ *   both excluded. See the cleanup() docblock for why the tier-1
+ *   token comparison must stay an equality.
  *
  * Author:
  * Discord: `real_slacker`
@@ -105,6 +109,17 @@ const SwitchDB = {
         type: plugin._s3db.getDataTypes().INTEGER,
         allowNull: false,
         defaultValue: 0
+      },
+      // v2.5.0: Last activity timestamp, the retention clock for cleanup().
+      // Written on join (onS3PlayerJoined), on leave (onS3PlayerLeft) and on every
+      // token spend — none of them gated on seed mode. The leave write is what makes
+      // the field mean "last seen" rather than "last stamped event"; without it a
+      // player connected for days without spending would be prunable the instant
+      // they disconnect. Replaces firstSeenTimestamp, which only ever recorded row
+      // creation and so could not express staleness at all.
+      lastActiveTimestamp: {
+        type: plugin._s3db.getDataTypes().DATE,
+        allowNull: true
       }
     }, { timestamps: false });
 
@@ -144,7 +159,7 @@ const SwitchDB = {
 
     // ── Migration Registration ─────────────────────────────────
 
-    plugin.registerExpectedVersion('switch', 4, {
+    plugin.registerExpectedVersion('switch', 5, {
       models: ['SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_Endmatches', 'SwitchPlugin_Settings']
     });
     plugin.registerMigrations('switch', [
@@ -333,6 +348,59 @@ const SwitchDB = {
             await SettingsModel.destroy({ where: { key: 'explainMessageId' }, transaction: qi.transaction });
           }
         }
+      },
+      {
+        version: 5,
+        description: 'Add lastActiveTimestamp column for cleanup staleness (Fix 2)',
+        touches: {
+          columns: {
+            SwitchPlugin_PlayerCooldowns: ['lastActiveTimestamp']
+          }
+        },
+        up: async (qi) => {
+          const existing = await qi.showAllTables();
+          if (existing.includes('SwitchPlugin_PlayerCooldowns')) {
+            const columns = await qi.describeTable('SwitchPlugin_PlayerCooldowns');
+            if (!columns.lastActiveTimestamp) {
+              await qi.addColumn('SwitchPlugin_PlayerCooldowns', 'lastActiveTimestamp', {
+                type: qi.DataTypes.DATE,
+                allowNull: true
+              });
+              // Backfill to the migration's run time, NOT to firstSeenTimestamp.
+              // firstSeenTimestamp records when a row was created, not when the
+              // player was last around — backfilling from it would hand long-lived
+              // rows an already-expired retention clock and delete players who were
+              // on the server yesterday. Stamping everyone at upgrade gives a fresh
+              // window: active players get re-stamped on their next connect or
+              // disconnect, genuinely abandoned rows age out on schedule.
+              //
+              // Unconditional update, no WHERE. This branch only runs in the same
+              // pass that just added the column, so every row is NULL by definition
+              // — and matching on `lastActiveTimestamp: null` would mean relying on
+              // the query builder to translate it to IS NULL rather than the `= NULL`
+              // that never matches anything. Same discipline as the seed WHERE
+              // clauses: don't let correctness hinge on NULL handling.
+              // Runs inside the migration's transaction so a later failure rolls the
+              // backfill back with the addColumn, rather than leaving every row
+              // stamped against a column that no longer exists.
+              await qi.bulkUpdate(
+                'SwitchPlugin_PlayerCooldowns',
+                { lastActiveTimestamp: new Date() },
+                {},
+                { transaction: qi.transaction }
+              );
+            }
+          }
+        },
+        down: async (qi) => {
+          const existing = await qi.showAllTables();
+          if (existing.includes('SwitchPlugin_PlayerCooldowns')) {
+            const columns = await qi.describeTable('SwitchPlugin_PlayerCooldowns');
+            if (columns.lastActiveTimestamp) {
+              await qi.removeColumn('SwitchPlugin_PlayerCooldowns', 'lastActiveTimestamp');
+            }
+          }
+        }
       }
     ]);
 
@@ -453,50 +521,127 @@ const SwitchDB = {
     };
 
     /**
-     * Purges expired cooldown rows from the database.
-     * Removes rows where: no active scramble lockdown, player has full tokens
-     * (tokenBalance >= maxSwitchTokens), and firstSeenTimestamp is older than
-     * 24 hours (stale records).
+     * v2.5.0: Two-tier row retention. Called from onRoundEnded.
+     *
+     * TIER 1 — empty rows, hardcoded 30 minutes.
+     *   A row sitting at EXACTLY maxSwitchTokens with no seed state and no active
+     *   lockdown carries no information: an absent row already defaults to max, so
+     *   deleting it is lossless. No reason to keep it.
+     *
+     *   The `= maxSwitchTokens` is load-bearing and must never be relaxed to `>=`.
+     *   Token regeneration is lazy (see plugin._regenTokens) — a row BELOW max
+     *   holds real state in tokenRegenAnchor, and deleting it hands the player a
+     *   fresh row at max. At a 30-minute window that is an exploit: switch,
+     *   disconnect, return 31 minutes later with full tokens instead of waiting out
+     *   the refill. A row ABOVE max holds an unspent seed bonus. Both belong in
+     *   tier 2, whose window comfortably exceeds a full regeneration cycle.
+     *
+     *   The lockdown guard is also load-bearing at this scale:
+     *   scrambleLockdownDurationMinutes is the same order as the window, so without
+     *   it a player who disconnects under scramble lockdown could have the lockdown
+     *   deleted out from under them before it expires.
+     *
+     * TIER 2 — everything else, pruneInactivePlayerDays (default 3).
+     *   Catch-all. Past the window, regen state is moot (a full refill takes
+     *   maxSwitchTokens * regen interval), an unspent bonus is deemed abandoned,
+     *   and stale seed state is meaningless. This is the rule that actually bounds
+     *   table growth: every player who seeds ends up above max and would otherwise
+     *   be immortal under a no-confiscation guard.
+     *
+     * Neither tier touches connected players — deleting a row that the seed
+     * reconciler recreates on the next tick is pure churn.
+     *
+     * The whole pass is skipped during seed mode. cleanup() runs from onRoundEnded,
+     * the same moment the ENDGAME consolation grant fires, and skipping keeps the
+     * two from competing for the same rows without an ordering dependency.
+     *
+     * NULL lastActiveTimestamp means "keep". Migration v5 backfills every row, so
+     * NULL should not occur; treating it as keep is the safe reading if it does.
      */
     plugin.cleanup = async function () {
       const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
       if (!PlayerCooldowns) return;
 
+      // Don't compete with the ENDGAME consolation grant for the same rows.
+      if (plugin._s3?.gameState?.isSeedMode?.()) {
+        plugin.verbose(2, '[Cleanup] Skipped — seed mode active.');
+        return;
+      }
+
+      const retentionDays = plugin.options.pruneInactivePlayerDays ?? 0;
+      if (retentionDays <= 0) {
+        plugin.verbose(2, '[Cleanup] Skipped — pruneInactivePlayerDays is 0 (pruning disabled).');
+        return;
+      }
+
       const maxTokens = plugin.options.maxSwitchTokens;
       const now = new Date();
+      const emptyRowCutoff = new Date(now.getTime() - (30 * 60 * 1000));
+      const staleCutoff = new Date(now.getTime() - (retentionDays * 24 * 60 * 60 * 1000));
+
+      // Connected players are never pruned.
+      const rosterReady = plugin._s3?.players?.isReady?.() === true;
+      const allPlayers = rosterReady
+        ? plugin._s3.players.getAllPlayers()
+        : plugin.server.players;
+      const connectedEosIDs = (allPlayers || [])
+        .map(p => p?.eosID)
+        .filter(Boolean);
+
+      // An empty roster is only trustworthy if we could actually read one. S³
+      // reporting zero players is a genuinely empty server and pruning is exactly
+      // right; S³ not being ready means we cannot tell who is online, and the
+      // exclusion below would silently become a no-op — deleting rows out from
+      // under connected players. Skip rather than guess.
+      if (connectedEosIDs.length === 0 && !rosterReady) {
+        plugin.verbose(2, '[Cleanup] Skipped — player roster unavailable, cannot exclude connected players.');
+        return;
+      }
 
       try {
         await plugin._withDb(async (t) => {
-          await PlayerCooldowns.destroy({
-            where: {
-              [Op.and]: [
-                {
-                  [Op.or]: [
-                    { scrambleLockdownExpiry: null },
-                    { scrambleLockdownExpiry: { [Op.lt]: now } }
-                  ]
-                },
-                {
-                  // Player has full (or more) tokens — no active cooldown
-                  tokenBalance: { [Op.gte]: maxTokens }
-                },
-                {
-                  [Op.or]: [
-                    { firstSeenTimestamp: null },
-                    { firstSeenTimestamp: { [Op.lt]: new Date(now.getTime() - (24 * 60 * 60 * 1000)) } }
-                  ]
-                },
-                // Fixed 2026-08-15: never delete rows with active seed presence
-                // or an earned seed bonus, regardless of firstSeenTimestamp.
-                // Seed grants intentionally push tokenBalance above the cap, and
-                // seed-created rows historically had firstSeenTimestamp null —
-                // which made cleanup() delete the bonus before it could be spent.
-                { seedPresenceStart: null },
-                { seedBonusTokensEarned: 0 }
-              ]
-            },
-            transaction: t
-          });
+          const where = {
+            [Op.and]: [
+              {
+                [Op.or]: [
+                  { scrambleLockdownExpiry: null },
+                  { scrambleLockdownExpiry: { [Op.lt]: now } }
+                ]
+              },
+              // NULL is spelled out rather than left to three-valued logic —
+              // `lastActiveTimestamp < cutoff` is UNKNOWN against NULL and would
+              // silently exclude the row anyway, but stating it keeps the intent
+              // readable and dialect-independent.
+              { lastActiveTimestamp: { [Op.ne]: null } },
+              {
+                [Op.or]: [
+                  {
+                    // Tier 1: the row carries nothing
+                    tokenBalance: maxTokens,
+                    seedPresenceStart: null,
+                    seedBonusTokensEarned: 0,
+                    lastActiveTimestamp: { [Op.lt]: emptyRowCutoff }
+                  },
+                  {
+                    // Tier 2: abandoned, whatever it holds
+                    lastActiveTimestamp: { [Op.lt]: staleCutoff }
+                  }
+                ]
+              }
+            ]
+          };
+
+          if (connectedEosIDs.length > 0) {
+            where[Op.and].push({ eosID: { [Op.notIn]: connectedEosIDs } });
+          }
+
+          const deleted = await PlayerCooldowns.destroy({ where, transaction: t });
+          if (deleted > 0) {
+            // Logged at verbose(1) deliberately: the first pass after the v5
+            // backfill prunes the entire long tail at once and looks alarming
+            // without a number attached to it.
+            plugin.verbose(1, `[Cleanup] Pruned ${deleted} cooldown rows (empty >30m, or unseen >${retentionDays}d).`);
+          }
         });
       } catch (err) {
         plugin.verbose(1, `Cleanup error: ${err.message}`);

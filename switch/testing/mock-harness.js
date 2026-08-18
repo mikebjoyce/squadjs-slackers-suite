@@ -115,12 +115,36 @@ export function createMockDb() {
       const normalizedOp = opKey.replace(/^_/, '');
       const a = rowVal instanceof Date ? rowVal.getTime() : (rowVal != null ? Number(rowVal) : NaN);
       const b = opVal instanceof Date ? opVal.getTime() : (opVal != null ? Number(opVal) : NaN);
+      if (normalizedOp === 'eq') return rowVal === opVal;
+      if (normalizedOp === 'in') {
+        // Shorthand for Sequelize Op.in — used by connected-player filters
+        if (!Array.isArray(opVal)) return false;
+        return opVal.includes(rowVal);
+      }
+      const rowIsNull = rowVal === null || rowVal === undefined;
+      if (normalizedOp === 'notIn') {
+        if (!Array.isArray(opVal)) return false;
+        return !opVal.includes(rowVal);
+      }
       if (normalizedOp === 'ne') {
-        // null and undefined are both "not equal" to any non-null value
-        if (rowVal === null || rowVal === undefined) return opVal !== null && opVal !== undefined;
+        // ANSI three-valued logic, NOT JavaScript !==.
+        //
+        // `col != 'x'` against a NULL column evaluates to UNKNOWN in SQLite, MySQL
+        // and Postgres alike, so the engine EXCLUDES the row. This mock previously
+        // returned true there, which is why a production WHERE that stranded rows
+        // with a NULL lastSeedBonusRoundID passed every test. Modelling the real
+        // behaviour means a clause that relies on three-valued logic now fails here
+        // the same way it fails in the database.
+        //
+        // `col != NULL` (opVal null) is likewise UNKNOWN for every row — except
+        // that Sequelize renders { [Op.ne]: null } as `IS NOT NULL`, which is a
+        // genuine test, so that form is handled explicitly.
+        if (opVal === null || opVal === undefined) return !rowIsNull;  // IS NOT NULL
+        if (rowIsNull) return false;                                    // UNKNOWN -> excluded
         return rowVal !== opVal;
       }
-      if (normalizedOp === 'eq') return rowVal === opVal;
+      // Comparison operators are UNKNOWN against NULL too — isNaN already excludes
+      // those rows, since a null rowVal produces NaN above.
       if (normalizedOp === 'lt') return !isNaN(a) && !isNaN(b) && a < b;
       if (normalizedOp === 'lte') return !isNaN(a) && !isNaN(b) && a <= b;
       if (normalizedOp === 'gte') return !isNaN(a) && !isNaN(b) && a >= b;
@@ -142,51 +166,47 @@ export function createMockDb() {
       return row[key] === val;
     },
 
-    /** Checks all conditions in a plain where-object (no Op.or/Op.and) against a row. */
+    /**
+     * Checks a where-object against a row. THE single where-matcher — update(),
+     * findAll(), destroy() and count() all route through here. It used to be
+     * duplicated inline in update(), which is how the mock drifted: a fix applied
+     * here silently did nothing for UPDATE statements.
+     *
+     * Recurses, so branches may themselves contain _or/_and to any depth. The seed
+     * reset clause needs that: its "stale row" branch ANDs (presence IS NOT NULL)
+     * with a nested OR over (round IS NULL, round != current).
+     *
+     * Symbol keys are collected explicitly. Production passes real Sequelize Op
+     * symbols while the test helpers use '_or'/'_and' strings, and Object.entries()
+     * skips Symbols — without this a production where-clause would match every row.
+     */
     _matchesWhere(row, where) {
-      for (const [key, val] of Object.entries(where)) {
+      if (!where || typeof where !== 'object') return true;
+
+      const entries = Object.entries(where);
+      for (const sym of Object.getOwnPropertySymbols(where)) {
+        const name = String(sym);
+        if (name.endsWith('or]') || name === 'Symbol(or)') entries.push(['_or', where[sym]]);
+        else if (name.endsWith('and]') || name === 'Symbol(and)') entries.push(['_and', where[sym]]);
+      }
+
+      for (const [key, val] of entries) {
         if (key === 'Op.or' || key === '_or') {
-          // Handle shorthand { Op.or: [...] } — the mock represents Op.or as '_or'
-          const orArr = val;
-          let anyMatch = false;
-          for (const subCond of orArr) {
-            if (typeof subCond === 'object') {
-              let subOk = true;
-              for (const [sk, sv] of Object.entries(subCond)) {
-                if (!db._matchCondition(row, sk, sv)) { subOk = false; break; }
-              }
-              if (subOk) { anyMatch = true; break; }
-            }
-          }
-          if (!anyMatch) return false;
+          if (!Array.isArray(val)) return false;
+          if (!val.some(sub => typeof sub === 'object' && db._matchesWhere(row, sub))) return false;
         } else if (key === 'Op.and' || key === '_and') {
-          const andArr = val;
-          for (const subCond of andArr) {
-            if (typeof subCond === 'object') {
-              let subOk = true;
-              for (const [sk, sv] of Object.entries(subCond)) {
-                if (!db._matchCondition(row, sk, sv)) { subOk = false; break; }
-              }
-              if (!subOk) return false;
-            }
+          if (!Array.isArray(val)) return false;
+          if (!val.every(sub => typeof sub === 'object' && db._matchesWhere(row, sub))) return false;
+        } else if (val && typeof val === 'object' && val.constructor === Object) {
+          // Field-level nested OR, e.g. { col: { _or: [v1, v2] } }
+          const nestedKey = Object.keys(val)[0];
+          if (nestedKey === 'Op.or' || nestedKey === '_or') {
+            if (!val[nestedKey].some(orVal => db._matchCondition(row, key, orVal))) return false;
+          } else if (!db._matchCondition(row, key, val)) {
+            return false;
           }
-        } else {
-          // Handle { [Op.or]: [...] } as a nested value
-          if (val && typeof val === 'object' && val.constructor === Object) {
-            const nestedKey = Object.keys(val)[0];
-            if (nestedKey === 'Op.or' || nestedKey === '_or') {
-              const orArr = val[nestedKey];
-              let anyMatch = false;
-              for (const orVal of orArr) {
-                if (db._matchCondition(row, key, orVal)) { anyMatch = true; break; }
-              }
-              if (!anyMatch) return false;
-              continue;
-            }
-            if (!db._matchCondition(row, key, val)) return false;
-          } else {
-            if (!db._matchCondition(row, key, val)) return false;
-          }
+        } else if (!db._matchCondition(row, key, val)) {
+          return false;
         }
       }
       return true;
@@ -196,60 +216,10 @@ export function createMockDb() {
       const where = opts.where || {};
       let count = 0;
 
-      // Resolve the actual value for Op.or/Op.and regardless of key type (Symbol or string)
-      // Sequelize uses Symbol keys for Op.or/Op.and; our string-based test helpers use _or/_and.
-      const orSymbol = Object.getOwnPropertySymbols(where).find(s => String(s).endsWith('or]'));
-      const andSymbol = Object.getOwnPropertySymbols(where).find(s => String(s).endsWith('and]'));
-      const orCondition = where['_or'] || where['Op.or'] || (orSymbol ? where[orSymbol] : null);
-      const andCondition = where['_and'] || where['Op.and'] || (andSymbol ? where[andSymbol] : null);
-
       for (const [eosID, row] of store) {
-        let match = true;
-
-        if (orCondition !== null) {
-          // Op.or at top level: match if any sub-condition matches, AND check regular conditions
-          match = true;
-          for (const [key, val] of Object.entries(where)) {
-            if (key === '_or' || key === '_and' || key === 'Op.or' || key === 'Op.and') continue;
-            // Skip Symbol keys that aren't regular column names
-            if (typeof key === 'symbol') continue;
-            if (!db._matchCondition(row, key, val)) { match = false; break; }
-          }
-          if (match) {
-            let orMatch = false;
-            for (const subCond of orCondition) {
-              let subOk = true;
-              if (typeof subCond === 'object') {
-                for (const [sk, sv] of Object.entries(subCond)) {
-                  if (!db._matchCondition(row, sk, sv)) { subOk = false; break; }
-                  if (!subOk) break;
-                }
-              }
-              if (subOk) { orMatch = true; break; }
-            }
-            if (!orMatch) match = false;
-          }
-        } else if (andCondition !== null) {
-          match = true;
-          for (const [key, val] of Object.entries(where)) {
-            if (key === '_or' || key === '_and' || key === 'Op.or' || key === 'Op.and') continue;
-            if (typeof key === 'symbol') continue;
-            if (!db._matchCondition(row, key, val)) { match = false; break; }
-          }
-          if (match) {
-            for (const subCond of andCondition) {
-              if (typeof subCond === 'object') {
-                for (const [sk, sv] of Object.entries(subCond)) {
-                  if (!db._matchCondition(row, sk, sv)) { match = false; break; }
-                  if (!match) break;
-                }
-              }
-              if (!match) break;
-            }
-          }
-        } else {
-          match = db._matchesWhere(row, where);
-        }
+        // Single matcher, shared with findAll/destroy/count. This used to be a
+        // hand-inlined copy that could not recurse into nested _or branches.
+        const match = db._matchesWhere(row, where);
 
         if (match) {
           // Apply Sequelize.literal-like updates (e.g. increment)
@@ -294,6 +264,20 @@ export function createMockDb() {
       const row = { ...fields };
       store.set(fields.eosID, row);
       return row;
+    },
+
+    /**
+     * Simulate Sequelize bulkCreate.
+     * Accepts an array of row field objects and inserts each.
+     */
+    bulkCreate: async (records) => {
+      const rows = [];
+      for (const fields of records) {
+        const row = { ...fields };
+        store.set(fields.eosID, row);
+        rows.push(row);
+      }
+      return rows;
     },
 
     /**
@@ -434,6 +418,7 @@ export function createMockHarness(opts = {}, clock = null) {
   // Tests that need a specific join time set this on the plugin.
   let joinSeconds = 0;
   let matchSeconds = 0;
+  let phase = 'LIVE';        // tests control this via _setPhase()
 
   // ── Build plugin stub ───────────────────────────────────────
   const plugin = {
@@ -444,6 +429,8 @@ export function createMockHarness(opts = {}, clock = null) {
     _s3: {
       gameState: {
         isSeedMode: () => options.isLiberalMode,
+        isEnding: () => phase === 'ENDGAME',
+        getPhase: () => phase,
         getMatchId: () => 'test-match-1'
       },
       players: {
@@ -456,6 +443,7 @@ export function createMockHarness(opts = {}, clock = null) {
     // Allow tests to control time-dependent values
     _setJoinSeconds: (s) => { joinSeconds = s; },
     _setMatchSeconds: (s) => { matchSeconds = s; },
+    _setPhase: (p) => { phase = p; },
     _setPlayerCount: (n) => {
       plugin.server.players = Array.from({ length: n }, (_, i) => ({ eosID: `p${i + 1}`, name: `Player ${i + 1}` }));
     },
@@ -470,6 +458,10 @@ export function createMockHarness(opts = {}, clock = null) {
     _isSeedAccrualActive: () => {
       if (!options.isLiberalMode) return false;
       if (!(options.seedTokenBonusAmount > 0 && options.seedTokenBonusMinutes > 0)) return false;
+      // v2.5.0: no accrual during ENDGAME — isSeedMode() stays true through the
+      // whole scoreboard/voting window, so without this the reconciler would
+      // re-stamp presence right after the round-close sweep cleared it.
+      if (plugin._s3.gameState.isEnding()) return false;
       const minPlayers = options.seedTokenBonusMinPlayers ?? 0;
       if (minPlayers === 0) return true;
       return plugin.server.players.length >= minPlayers;
