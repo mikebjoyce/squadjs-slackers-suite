@@ -35,6 +35,9 @@
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
+ * - Registry rows are refreshed in place every tick: name, teamID, squadID
+ *   and isLeader all track the live server.players entry, so leadership
+ *   reflects the current SL rather than the state at first registration.
  * - Lock priority ordering: TeamBalancer(3) > SmartAssign(2) > Switch(1).
  * - registerPriority('MyPlugin', 4) allows third-party plugins to
  *   register a custom priority level — extensible beyond the hardcoded map.
@@ -73,6 +76,26 @@ const DEFAULT_REFRESH_NOW_FLOOR_MS = 1000;      // minimum gap for refreshNow() 
 const DEFAULT_SESSION_EXPIRY_MS = 30 * 60 * 1000; // 30 min — how long without activity before a session expires
 const DEFAULT_SESSION_UPDATE_INTERVAL_MS = 5 * 60 * 1000; // 5 min — how often to refresh lastActivity in DB
 const DEFAULT_RCON_RECOVERY_GRACE_MS = 30000; // 30s — suppress leave detection for this long after an RCON_ERROR
+
+/**
+ * Coerce a raw SquadJS `isLeader` into a boolean, distinguishing "not a leader"
+ * from "the source did not say".
+ *
+ * SquadJS documents Player.isLeader as a bool, but its sibling Squad.locked
+ * arrives as the string "True"/"False" straight out of the RCON parse, so the
+ * string form is accepted here too — LoggingService already normalises it the
+ * same way. Sources that carry no leadership information at all (the
+ * PLAYER_CONNECTED payload, for one) must not be read as a demotion, so
+ * null/undefined returns `fallback` rather than false.
+ *
+ * @param {*} raw - Value from the SquadJS player object.
+ * @param {boolean} fallback - Returned when `raw` is null/undefined.
+ * @returns {boolean} Normalised leadership flag.
+ */
+function normalizeIsLeader(raw, fallback = false) {
+  if (raw === null || raw === undefined) return fallback === true;
+  return raw === true || raw === 'True';
+}
 
 /* ────────────────────────── BOOTSTRAP DDL ──────────────────────────
  *
@@ -1241,6 +1264,7 @@ export default class PlayersService {
       projected.eosID = registryState.eosID;
       projected.steamID = registryState.steamID;
       projected.squadID = registryState.squadID;
+      projected.isLeader = registryState.isLeader;
       projected.lastSeenAt = registryState.lastSeenAt;
 
       // Overwrite projected team if the real team is resolved mid-window.
@@ -1302,7 +1326,7 @@ export default class PlayersService {
       name: player?.name || 'Unknown',
       teamID: player?.teamID ?? null,
       squadID: player?.squadID ?? null,
-      isLeader: player?.isLeader ?? false,
+      isLeader: normalizeIsLeader(player?.isLeader, false),
       joinTime: now,
       lastSeenAt: now,
       joinEmitted
@@ -1490,6 +1514,14 @@ export default class PlayersService {
     state.squadID = rawPlayer?.squadID ?? state.squadID;
     state.eosID = rawPlayer?.eosID || state.eosID;
     state.steamID = rawPlayer?.steamID || state.steamID;
+    // Leadership is per-tick state, not join-time state: a player connects as a
+    // non-leader and only becomes SL later, and can be demoted at any point.
+    // Omitting this line pinned isLeader to whatever it was on the tick the
+    // player was first registered — which for anyone who joined and *then* made
+    // a squad meant a permanent false, so getSquads() sorted them as a grunt and
+    // `!s3 players` never crowned them. PLAYER_CONNECTED carries no isLeader at
+    // all, hence the undefined-means-keep guard rather than a bare `??`.
+    state.isLeader = normalizeIsLeader(rawPlayer?.isLeader, state.isLeader);
     state.lastSeenAt = now;
 
     this._indexPlayer(state, key);

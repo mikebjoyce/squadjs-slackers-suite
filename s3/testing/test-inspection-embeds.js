@@ -370,7 +370,7 @@ await runTest('an unpopulated squad cache reads as pending, not as zero squads',
     'team roster must be labelled pending, not Unassigned'
   );
   assert.equal(
-    team1.fields.find((f) => f.name.includes('🚶 Unassigned')),
+    team1.fields.find((f) => f.name.startsWith('Unassigned (')),
     undefined,
     'must not claim players are unassigned when squad data is missing'
   );
@@ -386,7 +386,7 @@ await runTest('an empty-but-populated squad cache reports genuine unassignment',
 
   assert.equal(meta.fields.find((f) => f.name.includes('Squad Data Pending')), undefined);
   assert.equal(meta.fields.find((f) => f.name === 'Unassigned').value, '9 not in a squad');
-  assert.ok(team1.fields.find((f) => f.name.includes('🚶 Unassigned')));
+  assert.ok(team1.fields.find((f) => f.name.startsWith('Unassigned (')));
 });
 
 await runTest('a team with no players renders a placeholder rather than an empty field', async () => {

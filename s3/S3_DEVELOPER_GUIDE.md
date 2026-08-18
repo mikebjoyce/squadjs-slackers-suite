@@ -249,6 +249,13 @@ Tracks player state (name, team, squad, join time), manages per-player and globa
 }
 ```
 
+`name`, `teamID`, `squadID` and `isLeader` are refreshed from `server.players`
+on every `UPDATED_PLAYER_INFORMATION` tick, so `isLeader` reflects the player's
+leadership *now* — promotions and handovers both land on the next tick. Sources
+that carry no leadership field (the `PLAYER_CONNECTED` payload) leave the flag
+alone rather than clearing it. `getSquads()` uses this to order each squad's
+`players` array leaders-first.
+
 ---
 
 ### 2.4 — ClansService

@@ -375,6 +375,75 @@ await runTest('reconnect persistence helpers use db-backed model when provided',
   await service.unmount();
 });
 
+await runTest('isLeader tracks the live tick, not the tick the player was first seen', async () => {
+  // Regression: the update path in _registerPlayer() refreshed name/team/squad
+  // but not isLeader, so the flag was frozen at whatever the player had when
+  // they were first registered. Anyone who connected (never a leader) and then
+  // created a squad stayed isLeader=false forever, which made getSquads() rank
+  // them as a grunt and left `!s3 players` with no crown on any SL.
+  const server = new MockServer();
+  const service = new PlayersService({ server });
+  await service.mount();
+
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: null, isLeader: false },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 1, squadID: null, isLeader: false }
+  ];
+  server.squads = [];
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.getPlayer('e1').isLeader, false);
+
+  // Alpha creates squad 1; Bravo joins it.
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1, isLeader: true },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 1, squadID: 1, isLeader: false }
+  ];
+  server.squads = [{ squadID: 1, teamID: 1, squadName: 'INFANTRY', locked: 'False' }];
+  await service.handleUpdatedPlayerInfo();
+
+  assert.equal(service.getPlayer('e1').isLeader, true, 'promotion must be picked up');
+  // getSquads() sorts leaders first — that ordering is what the embed relies on.
+  assert.deepEqual(service.getSquads()[0].players, ['e1', 'e2']);
+
+  // Handover: Bravo takes the squad. A demotion must be picked up too.
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1, isLeader: false },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 1, squadID: 1, isLeader: true }
+  ];
+  await service.handleUpdatedPlayerInfo();
+
+  assert.equal(service.getPlayer('e1').isLeader, false, 'demotion must be picked up');
+  assert.equal(service.getPlayer('e2').isLeader, true);
+  assert.deepEqual(service.getSquads()[0].players, ['e2', 'e1']);
+
+  // A source that omits isLeader entirely (the PLAYER_CONNECTED payload shape)
+  // is missing data, not a demotion — it must not strip the flag.
+  await service.handlePlayerConnected({
+    player: { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 1, squadID: 1 }
+  });
+  assert.equal(service.getPlayer('e2').isLeader, true, 'absent isLeader must not demote');
+
+  await service.unmount();
+});
+
+await runTest('isLeader accepts the RCON string form', async () => {
+  // Squad.locked arrives from the RCON parse as "True"/"False"; normalise the
+  // same way for isLeader so a parser change cannot silently drop every crown.
+  const server = new MockServer();
+  const service = new PlayersService({ server });
+  await service.mount();
+
+  server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1, isLeader: 'True' }];
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.getPlayer('e1').isLeader, true);
+
+  server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1, isLeader: 'False' }];
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.getPlayer('e1').isLeader, false);
+
+  await service.unmount();
+});
+
 if (!process.exitCode) {
   console.log('\nAll players-service tests passed.');
 }

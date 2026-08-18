@@ -732,8 +732,8 @@ export function buildPlayersEmbeds(plugin) {
       // Without a squad snapshot these players are not known to be squadless —
       // we simply have no squad data for them yet. Label accordingly.
       const label = squadDataPending
-        ? `📋 Roster (${leftover.length}) — squad data pending`
-        : `🚶 Unassigned (${leftover.length})`;
+        ? `Roster (${leftover.length}) — squad data pending`
+        : `Unassigned (${leftover.length})`;
       pushLineField(
         fields,
         label,
