@@ -175,7 +175,7 @@ import SwitchExplain from '../utils/switch-explain.js';
  *
  */
 export default class Switch extends S3DiscordPluginBase {
-    static version = '2.5.0';
+    static version = '2.5.1';
 
     static get description() {
         return "Switch plugin with persistent join timers";
@@ -484,7 +484,11 @@ export default class Switch extends S3DiscordPluginBase {
      * and ChangeTeam detection.
      */
     _checkS3Version() {
-        const required = '1.0.0';
+        // 1.2.2 — the token grants call _s3db.incrementLiteral() and checkPlayer()
+        // calls _s3db.caseInsensitiveLikeOp(), both added in S³ 1.2.2. Against an
+        // older S³ these are undefined, so the seed-bonus UPDATE would throw
+        // mid-grant rather than failing at mount where it is diagnosable.
+        const required = '1.2.2';
         const actual = this._s3?.version;
         if (!actual || actual < required) {
             throw new Error(
@@ -988,8 +992,11 @@ export default class Switch extends S3DiscordPluginBase {
      * The scramble lock is cleared whenever a row exists and either an active lock
      * or a below-cap balance warrants action.
      *
-     * Uses Sequelize.literal('tokenBalance + 1') for an atomic increment to avoid
-     * TOCTOU races with concurrent grant paths. Sets tokenRegenAnchor = null on the
+     * Uses _s3db.incrementLiteral('tokenBalance') for an atomic increment to avoid
+     * TOCTOU races with concurrent grant paths. The helper quotes the identifier so
+     * the statement survives Postgres identifier folding — a bare
+     * Sequelize.literal('tokenBalance + 1') errors there with
+     * `column "tokenbalance" does not exist`. Sets tokenRegenAnchor = null on the
      * grant so the regen clock doesn't immediately consume it — at the cost of
      * discarding any accrued mid-regen progress toward the next token.
      *
@@ -1021,7 +1028,7 @@ export default class Switch extends S3DiscordPluginBase {
         await this._withDb(async (t) => {
             const fields = { scrambleLockdownExpiry: null };
             if (belowCap) {
-                fields.tokenBalance = Sequelize.literal('tokenBalance + 1');
+                fields.tokenBalance = this._s3db.incrementLiteral('tokenBalance', 1);
                 fields.tokenRegenAnchor = null;
             }
             await PlayerCooldowns.update(fields, { where: { eosID }, transaction: t });
@@ -1672,8 +1679,9 @@ export default class Switch extends S3DiscordPluginBase {
             // seedPresenceStart is nulled rather than reset to NOW: the round is
             // over, there is no more presence to accrue.
             //
-            // Uses Sequelize.literal for the additive increments — safe (integer,
-            // no user input).
+            // Uses _s3db.incrementLiteral for the additive increments — safe
+            // (integer, no user input) and identifier-quoted so the camelCase
+            // columns survive Postgres identifier folding.
             const whereClause = {
                 eosID: { [Op.in]: connectedEosIDs },
                 seedPresenceStart: {
@@ -1694,8 +1702,8 @@ export default class Switch extends S3DiscordPluginBase {
 
             const [grantCount] = await PlayerCooldowns.update(
                 {
-                    tokenBalance: Sequelize.literal('tokenBalance + 1'),
-                    seedBonusTokensEarned: Sequelize.literal('seedBonusTokensEarned + 1'),
+                    tokenBalance: this._s3db.incrementLiteral('tokenBalance', 1),
+                    seedBonusTokensEarned: this._s3db.incrementLiteral('seedBonusTokensEarned', 1),
                     seedPresenceStart: null,
                     lastSeedBonusRoundID: currentMatchId
                 },
@@ -1926,12 +1934,13 @@ export default class Switch extends S3DiscordPluginBase {
             // mechanic. seedPresenceStart is only set to null on seed→non-seed transition
             // (see _grantSeedBonusAtEndgame).
             //
-            // Uses Sequelize.literal for the additive tokenBalance increment since
-            // the addition is safe (integer, no user input).
+            // Uses _s3db.incrementLiteral for the additive tokenBalance increment
+            // since the addition is safe (integer, no user input); the helper quotes
+            // the camelCase identifiers so the statement is Postgres-safe.
             const [grantCount] = await PlayerCooldowns.update(
                 {
-                    tokenBalance: Sequelize.literal('tokenBalance + 1'),
-                    seedBonusTokensEarned: Sequelize.literal('seedBonusTokensEarned + 1'),
+                    tokenBalance: this._s3db.incrementLiteral('tokenBalance', 1),
+                    seedBonusTokensEarned: this._s3db.incrementLiteral('seedBonusTokensEarned', 1),
                     seedPresenceStart: new Date(now),
                     lastSeedBonusRoundID: currentMatchId
                 },

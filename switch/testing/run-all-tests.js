@@ -5,7 +5,7 @@
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Runs all 50 switch token system tests in sequence and reports
+ * Runs every switch token system test in sequence and reports
  * aggregate results.
  *
  * ─── USAGE ───────────────────────────────────────────────────────
@@ -26,13 +26,14 @@ const testFiles = [
   'test-token-messaging.js',
   'test-admin-clear.js',
   'test-seed-bonus.js',
-  'test-token-queue-integration.js'
+  'test-token-queue-integration.js',
+  'test-dialect-literals.js'
 ];
 
 console.log('═'.repeat(50));
 console.log('  SWITCH PLUGIN — TOKEN SYSTEM TEST SUITE');
 console.log('═'.repeat(50));
-console.log(`  ${testFiles.length} test files | 50 total tests\n`);
+console.log(`  ${testFiles.length} test files\n`);
 
 let totalPassed = 0;
 let totalFailed = 0;

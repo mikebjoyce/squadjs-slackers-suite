@@ -218,13 +218,21 @@ export default class EloDatabase {
         });
         if (exact) return exact.toJSON();
 
-        const escaped = id.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
-        // ⚠️ ESCAPE '\\\\' — JavaScript '\\\\' produces string '\\', which SQL
-        // interprets as a single literal backslash (the LIKE escape character).
-        // Using '\\' (double) would produce a single '\' in SQL, which escapes
-        // the closing quote and causes a syntax error — silently swallowed by
-        // the catch block as "No ELO record found." Keep it quadruple.
-        const literalLike = Sequelize.literal(`name LIKE '%${escaped}%' ESCAPE '\\\\'`);
+        // Name search is built by S³ so it is correct on every dialect. The
+        // hand-rolled literal this replaces was wrong three ways:
+        //   1. `name LIKE ...` — unquoted. Fine on SQLite/MySQL; on Postgres the
+        //      identifier folds to `name`, and LIKE there is case-sensitive, so
+        //      `!elo slacker` stopped matching `Slacker`.
+        //   2. ESCAPE '\\' (two backslashes in the emitted SQL) — worked on MySQL
+        //      only. SQLite rejected it outright with "ESCAPE expression must be a
+        //      single character", so fuzzy name search was already dead on SQLite;
+        //      the error was swallowed below and surfaced as "No ELO record found".
+        //      The helper uses '!' as the escape character, which needs no
+        //      literal-escaping on any of the three engines.
+        //   3. The term was interpolated into a single-quoted SQL string without
+        //      escaping quotes, so a name like O'Brien produced a syntax error —
+        //      likewise swallowed — and the argument comes straight from a command.
+        const literalLike = this._s3db.caseInsensitiveLikeLiteral('name', id);
         const fuzzy = await this._s3db.getModel('Elo_PlayerStats').findOne({
           where: {
             [Op.or]: [
@@ -336,6 +344,9 @@ export default class EloDatabase {
           where: {
             roundsPlayed: { [Op.gte]: minRounds }
           },
+          // Postgres-safe unquoted: `mu` and `sigma` are already all-lowercase, so
+          // Postgres identifier folding is a no-op. A camelCase column here would
+          // need this._s3db.quoteIdentifier() — see DBService "DIALECT PORTABILITY".
           order: [[Sequelize.literal(`(mu - (${EloCalculator.SIGMA_MULTIPLIER} * sigma))`), 'DESC']],
           limit: limit,
           offset: offset,

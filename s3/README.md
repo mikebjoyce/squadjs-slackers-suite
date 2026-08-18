@@ -90,6 +90,15 @@ The engine supports:
 - **`exportToFile()` / `restoreFromFile()`** — connector-agnostic JSON file backup/restore (works on SQLite, Postgres, MySQL)
 - **`autoMigrate`** config option — skips the Discord confirmation prompt
 
+> **Writing raw SQL in a migration?** Quote every camelCase identifier via
+> `dbService.quoteIdentifier()`. Postgres folds unquoted identifiers to lower
+> case while Sequelize creates camelCase columns quoted, so unquoted DDL creates
+> a table your models cannot address — invisible on SQLite and MySQL, fatal on
+> Postgres. `DBService` also exposes `incrementLiteral()`,
+> `caseInsensitiveLikeOp()` and `caseInsensitiveLikeLiteral()` for the common
+> cases. See `S3_DEVELOPER_GUIDE.md` §7.10, and
+> `testing/test-dialect-portability.js` for real-engine regression cover.
+
 ## `!s3` Command System
 
 The `!s3` admin command surface is organised across:

@@ -138,6 +138,19 @@ Centralises Sequelize connector management, schema version tracking, and migrati
 | `getDatabasePath()` | `() => string\|null` | File path or null | SQLite only |
 | `models` | property | `object` | All defined models, keyed by name. Direct property, not a getter method. |
 
+**Dialect portability helpers** — use these whenever you write raw SQL. See §7.10.
+
+| Method | Signature | Returns | Notes |
+|--------|-----------|---------|-------|
+| `getDialect()` | `() => string\|null` | `'sqlite'` / `'mysql'` / `'postgres'` | The **real** dialect. Branch on this, never on `getConnectorName()` |
+| `quoteIdentifier(name)` | `(string) => string` | Quoted identifier | `` `col` `` on SQLite/MySQL, `"col"` on Postgres |
+| `escapeValue(value)` | `(*) => string` | Quoted SQL literal | For values inlined into a literal instead of bound |
+| `incrementLiteral(col, n)` | `(string, number?) => Literal` | Sequelize literal | Portable atomic `col + n` for `Model.update()` |
+| `caseInsensitiveLikeOp()` | `() => symbol` | `Op.iLike` / `Op.like` | Case-insensitive substring match on every dialect |
+| `caseInsensitiveLikeLiteral(col, term)` | `(string, string) => Literal` | Sequelize literal | As above, plus a working `ESCAPE` clause and safe value quoting |
+
+> **`getConnectorName()` vs `getDialect()`:** `getConnectorName()` returns the connector **label** — the key in the `connectors` map from `config.json`. That's conventionally the dialect name, but a deployment may key its connector `main` or `s3`, in which case the label matches no dialect branch at all. Any code deciding *what SQL to emit* must use `getDialect()`.
+
 > **Note:** `canBackup(connector)` is **not** a `DBService` method — it's a standalone export from `s3-backup.js` that always returns `true` (all Sequelize dialects get JSON-export fallback; the SQLite-only gate was removed). If you need this on a `DBService` instance, import it separately: `import { canBackup } from './s3-backup.js'`.
 
 **Static methods (for advanced use):**
@@ -861,6 +874,59 @@ await this.verifyAndRunMigrations('my-plugin');
 
 ---
 
+### 7.10 — Unquoted camelCase Identifiers in Raw SQL
+
+This one is invisible on SQLite and MySQL and fatal on Postgres, so it survives review and testing indefinitely.
+
+Postgres folds unquoted identifiers to lower case. Sequelize creates camelCase columns **quoted**, so an unquoted reference resolves to a name that does not exist:
+
+```js
+// ❌ ANTI-PATTERN — errors on Postgres with: column "tokenbalance" does not exist
+await PlayerCooldowns.update(
+  { tokenBalance: Sequelize.literal('tokenBalance + 1') },
+  { where: { eosID } }
+);
+
+// ❌ ANTI-PATTERN — creates s3_playerreconnects(eosid, updatedat) on Postgres,
+//    which the Sequelize model (tableName: 'S3_PlayerReconnects') cannot address
+await connector.query(`
+  CREATE TABLE IF NOT EXISTS S3_PlayerReconnects (
+    eosID VARCHAR(64) PRIMARY KEY,
+    updatedAt BIGINT NOT NULL
+  );
+`);
+```
+
+**Fix:**
+
+```js
+// ✅ CORRECT — portable atomic increment
+await PlayerCooldowns.update(
+  { tokenBalance: this._s3db.incrementLiteral('tokenBalance', 1) },
+  { where: { eosID } }
+);
+
+// ✅ CORRECT — quoted DDL
+const q = (id) => dbService.quoteIdentifier(id);
+await connector.query(`
+  CREATE TABLE IF NOT EXISTS ${q('S3_PlayerReconnects')} (
+    ${q('eosID')} VARCHAR(64) PRIMARY KEY,
+    ${q('updatedAt')} BIGINT NOT NULL
+  );
+`);
+```
+
+**The diagnostic rule:** a raw SQL fragment is Postgres-safe only if every identifier it names is already all-lowercase. EloTracker's `(mu - (3.0 * sigma))` literals are fine for exactly that reason — folding is a no-op on them.
+
+Two related traps in the same family:
+
+- **`LIKE` is case-sensitive on Postgres.** SQLite's `LIKE` is case-insensitive for ASCII and MySQL's default collation is case-insensitive, so a name lookup that works on both silently stops matching on Postgres. Use `caseInsensitiveLikeOp()`. Do **not** reach for `Op.iLike` directly — it is a syntax error on SQLite and MySQL.
+- **`LIKE ... ESCAPE '\'` cannot be written portably.** MySQL processes backslash escapes inside string literals and the other two do not, so whichever spelling you pick is a hard error somewhere: `ESCAPE '\\'` fails on SQLite with *"ESCAPE expression must be a single character"*. Use `caseInsensitiveLikeLiteral()`, which escapes with `!` instead.
+
+Regression cover for all of this lives in `s3/testing/test-dialect-portability.js`, which runs each statement against real SQLite, MySQL and Postgres engines. A mock cannot catch this class of defect — it has no dialect to model.
+
+---
+
 ## §8 — S³ Plugin Base Class Guide
 
 ### 8.1 — When to Use Which
@@ -1387,6 +1453,8 @@ node testing/test-game-state-service.js
 | `test-handshake-flow.js` | Cross-plugin coordination tests |
 | `test-join-pipeline.js` | Player join sequence with handshake active |
 | `test-player-session-persistence.js` | Session recovery on mount |
+| `test-dialect-portability.js` | Raw SQL against **real** SQLite/MySQL/Postgres engines — see 11.4 |
+| `test-migration-permissions.js` | Migration DDL at three permission tiers, per dialect (Docker-gated) |
 
 ### 11.2 — Mock Patterns
 
@@ -1423,6 +1491,29 @@ class TestPlugin extends S3PluginBase {
   }
 }
 ```
+
+### 11.4 — Testing Raw SQL: Mocks Are Not Enough
+
+Mocks cannot model dialect behaviour — that is a property of the engine, not of the code. Identifier folding, collation, and `ESCAPE` parsing simply do not exist in a hand-written mock, so a mock suite will report green while the statement is broken on a real database. Every defect in `docs/TASK_POSTGRES_PORTABILITY.md` passed the mock suite for its entire lifetime, and one of them (`ESCAPE '\\'` in EloTracker's name search) was broken on **SQLite** — the primary deployment target — the whole time.
+
+**If you touch raw SQL, run it against a real engine.** `s3/testing/test-dialect-portability.js` is set up for this: SQLite runs in-memory with no setup, and MySQL/Postgres skip gracefully when unreachable.
+
+```bash
+# Start the engines (ports match test-migration-permissions.js)
+docker run -d --name s3-test-postgres -e POSTGRES_PASSWORD=postgres -p 5433:5432 postgres:16-alpine
+docker run -d --name s3-test-mysql -e MYSQL_ROOT_PASSWORD=root -p 3307:3306 mysql:8
+
+node s3/testing/test-dialect-portability.js
+
+docker rm -f s3-test-postgres s3-test-mysql
+```
+
+Two conventions worth copying from that file:
+
+- **Pin the defect, not just the fix.** Each fix has a companion test asserting the *old* form still fails on Postgres and still passes on SQLite/MySQL. That documents why the bug was invisible and fails loudly if an assumption changes.
+- **Assert backward compatibility explicitly.** When changing emitted SQL, prove the new statement still works against data an older build created — otherwise the fix is an upgrade hazard for live servers.
+
+> `sqlite3` will not install in the stock `node:*-slim` images (the prebuilt binding needs a newer glibc than they ship). Run the tests on the host, or build `sqlite3` from source in the container.
 
 ---
 

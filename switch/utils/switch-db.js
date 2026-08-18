@@ -650,6 +650,16 @@ const SwitchDB = {
 
     /**
      * Looks up a player's cooldown/lock record by eosID or name substring.
+     *
+     * The name match must be case-insensitive — admins type `!switch check bob`
+     * for a player called `BobTheBuilder`. Op.like already delivers that on
+     * SQLite (case-insensitive for ASCII) and MySQL (case-insensitive default
+     * collation), but NOT on Postgres, where LIKE is case-sensitive and the
+     * lookup would silently stop matching. caseInsensitiveLikeOp() swaps in
+     * Op.iLike there and leaves SQLite/MySQL emitting exactly the SQL they
+     * always have. Op.iLike cannot simply be used unconditionally — it is a
+     * syntax error on both other engines.
+     *
      * @param {string} ident — eosID or partial player name
      * @returns {object|null|string} record, null if not found, 'multiple' if ambiguous
      */
@@ -659,9 +669,10 @@ const SwitchDB = {
       let record = await PlayerCooldowns.findByPk(ident);
       if (record) return record;
 
+      const likeOp = plugin._s3db?.caseInsensitiveLikeOp?.() || Op.like;
       const records = await PlayerCooldowns.findAll({
         where: {
-          playerName: { [Op.like]: `%${ident}%` }
+          playerName: { [likeOp]: `%${ident}%` }
         }
       });
 

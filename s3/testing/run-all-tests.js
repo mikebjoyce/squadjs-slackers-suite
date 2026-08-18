@@ -42,7 +42,10 @@ const CATEGORY_TESTS = {
     'test-command-standardization.js',
     'test-migration-backup.js',
     'test-auto-migrate.js',
-    'test-db-connector-compat.js'
+    'test-db-connector-compat.js',
+    // SQLite coverage always runs; the MySQL/Postgres cases self-skip when
+    // those engines are unreachable, so this stays a Category 1 test.
+    'test-dialect-portability.js'
   ],
   2: [
     'test-join-pipeline.js',

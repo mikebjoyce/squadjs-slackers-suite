@@ -132,35 +132,59 @@ function filterByTier(modelNames, { tier = 'historical' } = {}) {
  * transaction. Dialect-agnostic — handles SQLite, Postgres, MySQL.
  * SQLite: no-op (FK checks off by default via WAL pragmas).
  *
+ * The two dialect branches used to be transposed: `SET session_replication_role`
+ * is a *Postgres* setting and was being sent to MySQL, which rejects it with
+ * "Unknown system variable 'session_replication_role'" and aborted the restore.
+ * MySQL's equivalent is `SET FOREIGN_KEY_CHECKS`.
+ *
+ * On Postgres, `session_replication_role = replica` is the only statement that
+ * genuinely suppresses FK triggers, but setting it requires superuser. When the
+ * connection lacks that, fall back to `SET CONSTRAINTS ALL DEFERRED`, which any
+ * role may issue — it only defers constraints declared DEFERRABLE, so it is a
+ * partial measure, but it is strictly better than aborting the import.
+ *
  * @param {import('sequelize').Sequelize} connector
+ * @param {(level: number, msg: string) => void} [verboseLogger]
  * @returns {Promise<void>}
  */
-async function disableForeignKeyChecks(connector) {
+async function disableForeignKeyChecks(connector, verboseLogger = () => {}) {
   if (!connector || typeof connector.query !== 'function') return;
   const dialect = typeof connector.getDialect === 'function' ? connector.getDialect() : 'sqlite';
 
   if (dialect === 'postgres') {
-    await connector.query('SET CONSTRAINTS ALL DEFERRED');
+    try {
+      await connector.query('SET session_replication_role = replica');
+    } catch (err) {
+      verboseLogger(2, `[ExportImport] session_replication_role unavailable (${err.message}) — falling back to SET CONSTRAINTS ALL DEFERRED. FK checks are only deferred for DEFERRABLE constraints.`);
+      await connector.query('SET CONSTRAINTS ALL DEFERRED');
+    }
   } else if (dialect === 'mysql') {
-    await connector.query('SET session_replication_role = replica');
+    await connector.query('SET FOREIGN_KEY_CHECKS = 0');
   }
   // SQLite: FK checks are off by default — no-op
 }
 
 /**
  * Re-enable foreign key constraint checks after an import transaction.
+ * Mirrors disableForeignKeyChecks(), including the Postgres fallback.
  *
  * @param {import('sequelize').Sequelize} connector
+ * @param {(level: number, msg: string) => void} [verboseLogger]
  * @returns {Promise<void>}
  */
-async function enableForeignKeyChecks(connector) {
+async function enableForeignKeyChecks(connector, verboseLogger = () => {}) {
   if (!connector || typeof connector.query !== 'function') return;
   const dialect = typeof connector.getDialect === 'function' ? connector.getDialect() : 'sqlite';
 
   if (dialect === 'postgres') {
-    await connector.query('SET CONSTRAINTS ALL IMMEDIATE');
+    try {
+      await connector.query('SET session_replication_role = DEFAULT');
+    } catch (err) {
+      verboseLogger(2, `[ExportImport] Could not restore session_replication_role (${err.message}) — restoring constraints via SET CONSTRAINTS ALL IMMEDIATE.`);
+      await connector.query('SET CONSTRAINTS ALL IMMEDIATE');
+    }
   } else if (dialect === 'mysql') {
-    await connector.query('SET session_replication_role = DEFAULT');
+    await connector.query('SET FOREIGN_KEY_CHECKS = 1');
   }
   // SQLite: no-op
 }
@@ -326,7 +350,8 @@ export async function importFromJSON(dbService, json, { dryRun = false } = {}) {
 
   // Execute inside a single transaction
   if (connector && typeof connector.transaction === 'function') {
-    await disableForeignKeyChecks(connector);
+    const fkLogger = typeof dbService.verboseLogger === 'function' ? dbService.verboseLogger : () => {};
+    await disableForeignKeyChecks(connector, fkLogger);
     try {
       await connector.transaction(async (transaction) => {
         for (const [tableName, rows] of Object.entries(json.tables)) {
@@ -354,7 +379,7 @@ export async function importFromJSON(dbService, json, { dryRun = false } = {}) {
         }
       });
     } finally {
-      await enableForeignKeyChecks(connector);
+      await enableForeignKeyChecks(connector, fkLogger);
     }
   } else {
     // Fallback: no transaction support — upsert directly

@@ -20,6 +20,14 @@
  *   isReady()                   — Returns true when service is mounted.
  *   getConnector()              — Returns the underlying Sequelize instance.
  *   getConnectorName()          — Returns dialect name or connector label.
+ *   getDialect()                — Returns the TRUE SQL dialect (use this, not
+ *                                  getConnectorName(), to branch on SQL syntax).
+ *   quoteIdentifier(name)       — Dialect-correct identifier quoting.
+ *   escapeValue(value)          — Dialect-correct SQL string literal escaping.
+ *   incrementLiteral(col, n)    — Portable atomic `col + n` update expression.
+ *   caseInsensitiveLikeOp()     — Op.iLike on Postgres, Op.like elsewhere.
+ *   caseInsensitiveLikeLiteral(col, term) — Portable case-insensitive LIKE
+ *                                  literal with a working ESCAPE clause.
  *   acquireAdvisoryLock(key, timeoutMs) — Acquire cross-process advisory lock
  *   releaseAdvisoryLock(key)            — Release advisory lock
  *   getDataTypes()              — Resolves Sequelize DataTypes from connector.
@@ -61,8 +69,15 @@
  *   defineModel(), used by s3-export-import.js for backup/restore.
  * - canBackup(connector) returns true for all connectors, enabling the
  *   connector-agnostic JSON export/import fallback in s3-export-import.js.
+ * - Dialect portability: any raw SQL (Sequelize.literal, connector.query(),
+ *   bootstrap DDL) that names a camelCase identifier MUST quote it via
+ *   quoteIdentifier(). Postgres folds unquoted identifiers to lower case while
+ *   Sequelize creates camelCase columns quoted, so the two stop agreeing —
+ *   invisibly on SQLite and MySQL, fatally on Postgres. See the helper block
+ *   under "DIALECT PORTABILITY" and s3/testing/test-dialect-portability.js.
  *
  */
+import SequelizeLib from 'sequelize';
 import MigrationEngine from './migration-engine.js';
 
 export default class DBService {
@@ -403,6 +418,159 @@ export default class DBService {
     return this.sequelize ? 'sequelize' : null;
   }
 
+  /* ────────────────────────────────────── DIALECT PORTABILITY ────────────────────────────────────── */
+
+  /**
+   * The true SQL dialect of the active connector.
+   *
+   * Prefer this over getConnectorName() whenever the answer decides which SQL
+   * to emit. getConnectorName() returns the *connector label* from config.json
+   * (`databaseOption`), which is only conventionally the dialect name — a
+   * connector keyed as "main" or "s3" would return that string and silently
+   * miss every dialect branch.
+   *
+   * @returns {'sqlite'|'mysql'|'postgres'|string|null} dialect, or null with no connector.
+   */
+  getDialect() {
+    if (this.sequelize && typeof this.sequelize.getDialect === 'function') {
+      return this.sequelize.getDialect();
+    }
+    // Raw config object (not a live Sequelize instance) — resolveConnector may
+    // hand back the config straight from the connectors map.
+    if (this.sequelize && typeof this.sequelize.dialect === 'string') {
+      return this.sequelize.dialect;
+    }
+    if (this.sequelize && typeof this.sequelize.storage === 'string') {
+      return 'sqlite';
+    }
+    return null;
+  }
+
+  /**
+   * Quote a table or column identifier for the active dialect.
+   *
+   * **Why this exists.** Postgres folds unquoted identifiers to lower case.
+   * Sequelize creates camelCase columns *quoted* (`"tokenBalance"`), so any raw
+   * SQL that names one unquoted resolves to `tokenbalance` and errors with
+   * `column "tokenbalance" does not exist`. SQLite ignores identifier case and
+   * MySQL column names are case-insensitive, which is why this class of defect
+   * is invisible until a Postgres URL is pointed at the suite.
+   *
+   * **The rule:** a raw SQL fragment — `Sequelize.literal`, `connector.query()`,
+   * bootstrap DDL — is Postgres-safe only if every identifier it names is
+   * already all-lowercase. Anything camelCase must come through here.
+   *
+   * @param {string} identifier - Bare table or column name.
+   * @returns {string} Dialect-quoted identifier (`"x"` on Postgres, `` `x` `` elsewhere).
+   */
+  quoteIdentifier(identifier) {
+    const name = String(identifier);
+    if (this.sequelize && typeof this.sequelize.getQueryInterface === 'function') {
+      try {
+        return this.sequelize.getQueryInterface().quoteIdentifier(name);
+      } catch {
+        // Fall through to the static form below.
+      }
+    }
+    // No live connector (no-op mode / raw config). Emit the ANSI form, which is
+    // correct for SQLite and Postgres; MySQL only differs when ANSI_QUOTES is off,
+    // and without a connector there is nothing to execute the SQL against anyway.
+    return `"${name.replace(/"/g, '""')}"`;
+  }
+
+  /**
+   * Escape a value into a literal SQL string constant for the active dialect.
+   * Use when a value must be inlined into a `Sequelize.literal` rather than bound.
+   *
+   * @param {*} value
+   * @returns {string} Quoted, escaped SQL literal (e.g. `'%O''Brien%'`).
+   */
+  escapeValue(value) {
+    if (this.sequelize && typeof this.sequelize.escape === 'function') {
+      return this.sequelize.escape(value);
+    }
+    return `'${String(value).replace(/'/g, "''")}'`;
+  }
+
+  /**
+   * Build a dialect-safe atomic increment expression for `Model.update()`.
+   *
+   * Use instead of a hand-written `Sequelize.literal('col + 1')` whenever the
+   * column is camelCase. `Model.increment()` is preferable for a *pure*
+   * increment, but does not fit when the same statement must also set other
+   * columns atomically (as the Switch seed-bonus grants do).
+   *
+   * @param {string} column     - Column name (quoted for you).
+   * @param {number} [amount=1] - Integer amount to add; may be negative.
+   * @returns {object} A Sequelize literal suitable as an update field value.
+   */
+  incrementLiteral(column, amount = 1) {
+    const n = Number(amount);
+    if (!Number.isFinite(n)) {
+      throw new Error(`incrementLiteral requires a finite numeric amount, got ${amount}`);
+    }
+    const expr = `${this.quoteIdentifier(column)} ${n < 0 ? '-' : '+'} ${Math.abs(n)}`;
+    const literal = this.sequelize && typeof this.sequelize.literal === 'function'
+      ? this.sequelize.literal.bind(this.sequelize)
+      : null;
+    if (!literal) {
+      // No-op mode: hand back a shape the mock/no-connector paths still recognise.
+      return { val: expr };
+    }
+    return literal(expr);
+  }
+
+  /**
+   * The Sequelize operator giving case-INsensitive `LIKE` on the active dialect.
+   *
+   * MySQL's default collation is case-insensitive and SQLite's `LIKE` is
+   * case-insensitive for ASCII, so `Op.like` already behaves this way on both.
+   * Postgres `LIKE` is case-sensitive and needs `Op.iLike` — which is a syntax
+   * error on the other two, so the branch is mandatory rather than cosmetic.
+   *
+   * @returns {symbol} `Op.iLike` on Postgres, `Op.like` elsewhere.
+   */
+  caseInsensitiveLikeOp() {
+    const Op = this.sequelize?.constructor?.Op || SequelizeLib.Op;
+    return this.getDialect() === 'postgres' ? Op.iLike : Op.like;
+  }
+
+  /**
+   * Build a case-insensitive substring match as a raw literal, for the cases
+   * that also need a `LIKE ... ESCAPE` clause (which `Op.like` cannot express).
+   *
+   * Handles three things that are easy to get wrong by hand:
+   *   1. The column is quoted, so camelCase survives Postgres identifier folding.
+   *   2. The term is escaped through the connector, so an apostrophe in a player
+   *      name cannot break — or inject into — the statement.
+   *   3. `%`, `_` and the escape character itself are neutralised so they match
+   *      literally instead of acting as wildcards.
+   *
+   * **The escape character is `!`, not `\`.** A backslash cannot be made
+   * portable: MySQL processes backslash escapes inside string literals (so the
+   * escape char must be written `'\\'`), while SQLite and Postgres do not (so it
+   * must be written `'\'`). Either spelling is a hard error on the other engines
+   * — `'\\'` fails on SQLite with *"ESCAPE expression must be a single
+   * character"*. `!` needs no escaping in any of the three.
+   *
+   * @param {string} column - Column to match against (quoted for you).
+   * @param {string} term   - Raw user-supplied search term.
+   * @returns {object} A Sequelize literal usable as a `where`, including inside `Op.or`.
+   */
+  caseInsensitiveLikeLiteral(column, term) {
+    const escaped = String(term)
+      .replace(/!/g, '!!')
+      .replace(/%/g, '!%')
+      .replace(/_/g, '!_');
+    const keyword = this.getDialect() === 'postgres' ? 'ILIKE' : 'LIKE';
+    const expr =
+      `${this.quoteIdentifier(column)} ${keyword} ${this.escapeValue(`%${escaped}%`)} ESCAPE '!'`;
+    const literal = this.sequelize && typeof this.sequelize.literal === 'function'
+      ? this.sequelize.literal.bind(this.sequelize)
+      : null;
+    return literal ? literal(expr) : { val: expr };
+  }
+
   /**
    * Acquire an advisory lock scoped to a logical key (e.g. 's3_migrate_s3-players').
    * Prevents concurrent execution of critical sections across multiple processes.
@@ -410,6 +578,24 @@ export default class DBService {
    * - SQLite: already serialized by _s3_mutex — returns true immediately.
    * - Postgres: uses pg_try_advisory_lock(hashtext(key)) — non-blocking, returns false if held.
    * - MySQL: uses GET_LOCK(key, timeout) — waits up to timeoutMs.
+   *
+   * ⚠️ **KNOWN LIMITATION — branches on the connector LABEL, not the dialect.**
+   * `getConnectorName()` returns `databaseOption`, which is the key of the
+   * connector in `config.json`'s `connectors` block. SquadJS does not constrain
+   * that key: `squad-server/factory.js` reads the dialect from the connector's
+   * *config value* and uses the key only for a log line, so
+   * `connectors: { squadDB: { dialect: 'postgres', … } }` is entirely legal.
+   * With such a name this falls through to the "unknown dialect" branch below
+   * and returns true **unprotected** — the cross-process migration lock in
+   * MigrationEngine.runMigrations() silently stops guarding anything.
+   *
+   * Deliberately left as-is (2026-08-18): every known deployment names the
+   * connector after its dialect, which is the documented SquadJS convention, and
+   * SQLite is unaffected either way (both the sqlite branch and the unknown
+   * branch return true). Changing it would start taking real locks where none
+   * are taken today — a concurrency behaviour change not worth making blind.
+   * The fix, if ever wanted, is to consult `getDialect()` in the unknown branch.
+   * See docs/TASK_POSTGRES_PORTABILITY.md.
    *
    * @param {string} key        - Logical lock name (e.g. 's3_migrate_s3-players')
    * @param {number} [timeoutMs=30000] - Max wait time in ms (MySQL only; Postgres is non-blocking)
@@ -481,6 +667,10 @@ export default class DBService {
    * - SQLite: no-op (mutex auto-releases via promise chain).
    * - Postgres: pg_advisory_unlock(hashtext(key)).
    * - MySQL: DO RELEASE_LOCK(key).
+   *
+   * ⚠️ Same connector-label limitation as acquireAdvisoryLock() — see the note
+   * there. The two must keep using the SAME detection: if one resolves the
+   * dialect and the other does not, a lock would be taken and never released.
    *
    * @param {string} key - Logical lock name (must match acquireAdvisoryLock call)
    * @returns {Promise<void>}

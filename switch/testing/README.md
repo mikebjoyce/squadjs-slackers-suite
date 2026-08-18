@@ -25,10 +25,22 @@ switch/testing/
 ├── test-token-messaging.js    # Player-facing string gating (§3.6)
 ├── test-admin-clear.js        # Admin clear refill semantics (§3.4)
 ├── test-seed-bonus.js         # Stage 2 seed bonus grants (§4.1–4.4)
-└── test-token-queue-integration.js  # Token spend at queue resolution (§3.3)
+├── test-token-queue-integration.js  # Token spend at queue resolution (§3.3)
+└── test-dialect-literals.js   # Mock/production agreement on SQL literals
 ```
 
 All tests are **pure-logic unit tests**. No Docker, no live SquadJS server, no RCON, no Discord connection required. They run with plain `node` and use Node's built-in `assert` module.
+
+> **The mock cannot model a database.** These tests validate WHERE clauses and
+> field updates against a hand-written mock, which by construction knows nothing
+> about identifier folding, collation, or `ESCAPE` parsing. The mock's increment
+> parser once matched only a bare `tokenBalance + 1`, so when the token grants
+> started emitting the quoted, Postgres-safe `` `tokenBalance` + 1 ``, every
+> mocked grant would have reported success while applying nothing.
+> `test-dialect-literals.js` exists to close that gap: it feeds the mock a
+> literal built by a **real** `DBService`, so a shape change fails loudly here
+> instead of drifting silently. Anything touching raw SQL also needs
+> `s3/testing/test-dialect-portability.js`, which runs against real engines.
 
 ## Mock Harness
 
@@ -99,8 +111,9 @@ For seed bonus tests (which test the atomic UPDATE WHERE patterns), the test hel
 | Stacking above cap | 1 | Balance exceeds maxSwitchTokens from multiple seed grants, not clamped by regen |
 | Re-entrancy guard | 1 | Boolean guard prevents concurrent periodic+transition processing |
 | Queue integration | 3 | Solo switch spend, pair trade double spend, regen-while-queued anchor correctness |
+| Dialect-safe literals | 12 | Increment-literal parsing (bare / backtick / double-quote / negative), mock applies a real `DBService` literal per dialect, full seed-grant field set, `caseInsensitiveLikeOp()` selection |
 
-**Total: 50 tests, 0 dependencies beyond Node.js stdlib.**
+**Total: 98 tests. Requires `sequelize` on the module path (for `test-dialect-literals.js`); everything else is Node.js stdlib.**
 
 ## Running Tests
 
@@ -115,6 +128,7 @@ node switch/testing/test-token-messaging.js
 node switch/testing/test-admin-clear.js
 node switch/testing/test-seed-bonus.js
 node switch/testing/test-token-queue-integration.js
+node switch/testing/test-dialect-literals.js
 ```
 
 ## What's NOT Tested (Remains Manual QA)

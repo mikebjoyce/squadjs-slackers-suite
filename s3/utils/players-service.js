@@ -74,6 +74,54 @@ const DEFAULT_SESSION_EXPIRY_MS = 30 * 60 * 1000; // 30 min — how long without
 const DEFAULT_SESSION_UPDATE_INTERVAL_MS = 5 * 60 * 1000; // 5 min — how often to refresh lastActivity in DB
 const DEFAULT_RCON_RECOVERY_GRACE_MS = 30000; // 30s — suppress leave detection for this long after an RCON_ERROR
 
+/* ────────────────────────── BOOTSTRAP DDL ──────────────────────────
+ *
+ * S3_PlayerReconnects and S3_PlayerSessions are infrastructure tables created
+ * by raw DDL at mount (rather than by model sync) so they exist before any
+ * query runs. The DDL is emitted from these builders, in one place, because it
+ * runs from FOUR call sites — the two bootstrap paths in _initSessionPersistence
+ * / _initReconnectPersistence, and the two migration up() bodies that re-run it
+ * through the migration engine's query interface.
+ *
+ * Every identifier is quoted. Unquoted, Postgres folds them to lower case and
+ * creates `s3_playerreconnects(eosid, updatedat, …)`, while the Sequelize models
+ * below declare `tableName: 'S3_PlayerReconnects'` and are quoted by Sequelize —
+ * so the models address a table that does not exist and every read and write
+ * against them fails. SQLite ignores identifier case and MySQL column names are
+ * case-insensitive, which is why the unquoted form worked for years.
+ *
+ * Quoting is backward-compatible on SQLite and MySQL: `CREATE TABLE IF NOT
+ * EXISTS "S3_PlayerReconnects"` matches a table an older build created unquoted,
+ * so no second table appears and existing rows stay reachable. Verified against
+ * SQLite, MySQL 8 and Postgres 16 in s3/testing/test-dialect-portability.js.
+ *
+ * @param {(id: string) => string} q - Identifier quoter (DBService.quoteIdentifier).
+ */
+function reconnectsTableDDL(q) {
+  return `
+      CREATE TABLE IF NOT EXISTS ${q('S3_PlayerReconnects')} (
+        ${q('eosID')} VARCHAR(64) PRIMARY KEY,
+        ${q('steamID')} VARCHAR(64) NULL,
+        ${q('playerName')} VARCHAR(255) NULL,
+        ${q('lastTeamID')} INTEGER NULL,
+        ${q('lastSeenAt')} BIGINT NULL,
+        ${q('updatedAt')} BIGINT NOT NULL
+      );
+    `;
+}
+
+function sessionsTableDDL(q) {
+  return `
+      CREATE TABLE IF NOT EXISTS ${q('S3_PlayerSessions')} (
+        ${q('eosID')} VARCHAR(64) PRIMARY KEY,
+        ${q('steamID')} VARCHAR(64) NULL,
+        ${q('playerName')} VARCHAR(255) NULL,
+        ${q('sessionStart')} BIGINT NOT NULL,
+        ${q('lastActivity')} BIGINT NOT NULL
+      );
+    `;
+}
+
 export default class PlayersService {
   constructor({
     parent = null,
@@ -1518,9 +1566,11 @@ export default class PlayersService {
     if (connector && typeof connector.query === 'function') {
       try {
         await dbService.executeWithRetry(async () => {
-          await connector.query('DELETE FROM S3_PlayerReconnects WHERE updatedAt < :cutoff', {
-            replacements: { cutoff }
-          });
+          await connector.query(
+            `DELETE FROM ${dbService.quoteIdentifier('S3_PlayerReconnects')} ` +
+            `WHERE ${dbService.quoteIdentifier('updatedAt')} < :cutoff`,
+            { replacements: { cutoff } }
+          );
         });
       } catch (err) {
         this.verboseLogger(1, `[Players] Failed pruning reconnect DB rows: ${err.message}`);
@@ -1583,24 +1633,18 @@ export default class PlayersService {
 
     // Bootstrap DDL — ensures S3_PlayerSessions exists unconditionally at mount.
     // Infrastructure table, not a migration — no confirmation needed.
-    await connector.query(`
-      CREATE TABLE IF NOT EXISTS S3_PlayerSessions (
-        eosID VARCHAR(64) PRIMARY KEY,
-        steamID VARCHAR(64) NULL,
-        playerName VARCHAR(255) NULL,
-        sessionStart BIGINT NOT NULL,
-        lastActivity BIGINT NOT NULL
-      );
-    `);
+    const q = (id) => dbService.quoteIdentifier(id);
+    await connector.query(sessionsTableDDL(q));
 
     // Clean up stale session rows (>24h inactive). These are never used for
     // session recovery — _recoverSessionTimes() treats anything >30min as stale.
     // Mount-time cleanup is sufficient; no periodic timer needed.
     try {
       const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-      await connector.query('DELETE FROM S3_PlayerSessions WHERE lastActivity < :cutoff', {
-        replacements: { cutoff }
-      });
+      await connector.query(
+        `DELETE FROM ${q('S3_PlayerSessions')} WHERE ${q('lastActivity')} < :cutoff`,
+        { replacements: { cutoff } }
+      );
       this.verboseLogger(3, `[Players] Session cleanup: removed rows with lastActivity < ${new Date(cutoff).toISOString()}`);
     } catch (err) {
       this.verboseLogger(2, `[Players] Session cleanup failed (non-fatal): ${err.message}`);
@@ -1913,16 +1957,7 @@ export default class PlayersService {
     // The migration registration below also runs idempotent DDL through
     // the migration engine's query interface so verification passes on
     // fresh databases (see NOTE below for details).
-    await connector.query(`
-      CREATE TABLE IF NOT EXISTS S3_PlayerReconnects (
-        eosID VARCHAR(64) PRIMARY KEY,
-        steamID VARCHAR(64) NULL,
-        playerName VARCHAR(255) NULL,
-        lastTeamID INTEGER NULL,
-        lastSeenAt BIGINT NULL,
-        updatedAt BIGINT NOT NULL
-      );
-    `);
+    await connector.query(reconnectsTableDDL((id) => dbService.quoteIdentifier(id)));
 
     // ── Migration registration ─────────────────────────────────────
     // NOTE: The bootstrap DDL above (connector.query) creates tables before
@@ -1951,16 +1986,7 @@ export default class PlayersService {
           up: async (qi) => {
             // Run through qi so verification sees the table on the same connection.
             // Idempotent — safe if bootstrap DDL already created it.
-            await qi.rawQuery(`
-              CREATE TABLE IF NOT EXISTS S3_PlayerReconnects (
-                eosID VARCHAR(64) PRIMARY KEY,
-                steamID VARCHAR(64) NULL,
-                playerName VARCHAR(255) NULL,
-                lastTeamID INTEGER NULL,
-                lastSeenAt BIGINT NULL,
-                updatedAt BIGINT NOT NULL
-              );
-            `);
+            await qi.rawQuery(reconnectsTableDDL((id) => dbService.quoteIdentifier(id)));
           }
         },
         {
@@ -1975,15 +2001,7 @@ export default class PlayersService {
           up: async (qi) => {
             // Run through qi so verification sees the table on the same connection.
             // Idempotent — safe if bootstrap DDL already created it.
-            await qi.rawQuery(`
-              CREATE TABLE IF NOT EXISTS S3_PlayerSessions (
-                eosID VARCHAR(64) PRIMARY KEY,
-                steamID VARCHAR(64) NULL,
-                playerName VARCHAR(255) NULL,
-                sessionStart BIGINT NOT NULL,
-                lastActivity BIGINT NOT NULL
-              );
-            `);
+            await qi.rawQuery(sessionsTableDDL((id) => dbService.quoteIdentifier(id)));
           }
         }
       ]);

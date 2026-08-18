@@ -70,6 +70,34 @@ export class MockClock {
   }
 }
 
+// ── Literal parsing ──────────────────────────────────────────
+
+/**
+ * Parse an atomic increment expression out of a Sequelize literal.
+ *
+ * Production builds these via `DBService.incrementLiteral()`, which **quotes the
+ * identifier** so camelCase columns survive Postgres identifier folding. The
+ * quote character is dialect-dependent — `` `col` `` on SQLite and MySQL,
+ * `"col"` on Postgres — so this accepts every form, plus the bare identifier
+ * that the older hand-written literals and some test helpers still emit.
+ * Recognising only the bare form is how this mock silently stopped applying
+ * token grants when the production literal changed shape.
+ *
+ * @param {string} expr - e.g. '"tokenBalance" + 1', '`tokenBalance` + 1', 'tokenBalance - 2'
+ * @returns {{column: string, delta: number}|null} null when it is not an increment.
+ */
+export function parseIncrementExpression(expr) {
+  if (typeof expr !== 'string') return null;
+  const m = expr.match(
+    /^\s*(?:`([^`]+)`|"([^"]+)"|\[([^\]]+)\]|(\w+))\s*([+-])\s*(\d+)\s*$/
+  );
+  if (!m) return null;
+  const column = m[1] ?? m[2] ?? m[3] ?? m[4];
+  const sign = m[5];
+  const magnitude = parseInt(m[6], 10);
+  return { column, delta: sign === '-' ? -magnitude : magnitude };
+}
+
 // ── Mock DB ──────────────────────────────────────────────────
 
 export function createMockDb() {
@@ -224,28 +252,21 @@ export function createMockDb() {
         if (match) {
           // Apply Sequelize.literal-like updates (e.g. increment)
           for (const [key, val] of Object.entries(fields)) {
-            if (val && typeof val === 'object' && val.constructor && val.constructor.name === 'Literal') {
-              // Sequelize.Literal object
-              const literalStr = val.val || '';
-              const incMatch = literalStr.match(/^(\w+)\s*\+\s*(\d+)$/);
-              if (incMatch) {
-                const colName = incMatch[1];
-                const increment = parseInt(incMatch[2], 10);
-                const current = row[colName] != null ? Number(row[colName]) : 0;
-                row[colName] = current + increment;
-              } else {
+            const isLiteral = val && typeof val === 'object'
+              && val.constructor && val.constructor.name === 'Literal';
+            const isShorthand = val && typeof val === 'object'
+              && typeof val.val === 'string' && !isLiteral;
+
+            if (isLiteral || isShorthand) {
+              const literalStr = typeof val.val === 'string' ? val.val : '';
+              const inc = parseIncrementExpression(literalStr);
+              if (inc) {
+                const current = row[inc.column] != null ? Number(row[inc.column]) : 0;
+                row[inc.column] = current + inc.delta;
+              } else if (isLiteral) {
                 row[key] = row[literalStr] !== undefined ? row[literalStr] : 0;
-              }
-            } else if (val && typeof val === 'object' && val.val && typeof val.val === 'string' && val.val.includes('+')) {
-              // Shorthand { val: 'column + N' } — used by test helpers
-              const incMatch = val.val.match(/^(\w+)\s*\+\s*(\d+)$/);
-              if (incMatch) {
-                const colName = incMatch[1];
-                const increment = parseInt(incMatch[2], 10);
-                const current = row[colName] != null ? Number(row[colName]) : 0;
-                row[colName] = current + increment;
               } else {
-                row[key] = val.val;
+                row[key] = literalStr;
               }
             } else {
               row[key] = val;
