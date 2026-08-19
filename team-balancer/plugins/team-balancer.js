@@ -135,6 +135,9 @@
  *
  * Scramble Execution:
  *   scrambleAnnouncementDelay          - Seconds before scramble executes (default: 25).
+ *   seedScrambleAnnouncementDelay      - Countdown for the seed auto-scramble only (default: 5, min 3).
+ *                                        Separate from scrambleAnnouncementDelay: the window
+ *                                        before the map change is much shorter after a Seed round.
  *   scramblePercentage                 - Fraction of players to move (default: 0.5).
  *   changeTeamRetryInterval            - RCON retry interval in ms (default: 100).
  *   maxScrambleCompletionTime          - Max execution time in ms (default: 15000).
@@ -193,6 +196,7 @@
  *   "invasionAttackTeamThreshold": 300,
  *   "invasionDefenceTeamThreshold": 500,
  *   "scrambleAnnouncementDelay": 25,
+ *   "seedScrambleAnnouncementDelay": 5,
  *   "scramblePercentage": 0.5,
  *   "changeTeamRetryInterval": 100,
  *   "maxScrambleCompletionTime": 15000,
@@ -287,6 +291,11 @@ export default class TeamBalancer extends S3PluginBase {
       scrambleAnnouncementDelay: {
         default: 25,
         type: 'number'
+      },
+      seedScrambleAnnouncementDelay: {
+        default: 5,
+        type: 'number',
+        description: 'Seconds between the seed auto-scramble announcement and its execution (default: 5). Independent from scrambleAnnouncementDelay — a countdown still running at NEW_GAME is discarded and the scramble never happens.'
       },
       scramblePercentage: {
         default: 0.5,
@@ -398,6 +407,13 @@ export default class TeamBalancer extends S3PluginBase {
     if (this.options.scrambleAnnouncementDelay < 10) {
       Logger.verbose('TeamBalancer', 1, `scrambleAnnouncementDelay (${this.options.scrambleAnnouncementDelay}s) too low. Enforcing minimum 10 seconds.`);
       this.options.scrambleAnnouncementDelay = 10;
+    }
+    // Its own floor, well below the global 10s: the whole point of the option is that a Seed
+    // round's post-round window is shorter than that minimum. 3s still leaves the announcement
+    // time to reach players before the swaps start.
+    if (this.options.seedScrambleAnnouncementDelay < 3) {
+      Logger.verbose('TeamBalancer', 1, `seedScrambleAnnouncementDelay (${this.options.seedScrambleAnnouncementDelay}s) too low. Enforcing minimum 3 seconds.`);
+      this.options.seedScrambleAnnouncementDelay = 3;
     }
     if (this.options.changeTeamRetryInterval < 50) {
       Logger.verbose('TeamBalancer', 1, `changeTeamRetryInterval (${this.options.changeTeamRetryInterval}ms) too low. Enforcing minimum 50ms.`);
@@ -1577,8 +1593,11 @@ export default class TeamBalancer extends S3PluginBase {
       // A countdown armed in the previous round must not fire into this one: teams are freshly assigned
       // at NEW_GAME (teamIDs stay null for 30-60s), so it would scramble the wrong round. Driven off the
       // timer handle, not _scramblePending — resetStreak() clears that flag while the timer still runs.
+      // Level 1, not 2: players were already told a scramble was coming and it silently is not. That
+      // is the one signal an operator has to tune the announcement delays against, so it belongs in
+      // the default log output — a too-long delay does not postpone the scramble, it cancels it.
       if (this._clearPendingScrambleCountdown()) {
-        Logger.verbose('TeamBalancer', 2, '[TeamBalancer] Discarding pending scramble countdown (new game started before it could execute).');
+        Logger.verbose('TeamBalancer', 1, '[TeamBalancer] Discarding pending scramble countdown (new game started before it could execute). The announcement delay outlasted the round — lower it if this repeats.');
       }
 
       // Discard any armed "!scramble matchend" — a new round has started without consuming it.
@@ -1738,14 +1757,17 @@ export default class TeamBalancer extends S3PluginBase {
         roundReport.scrambled = true;
         roundReport.scrambleCondition = 'Seed Auto Scramble';
         Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Seed match ended with ${this.server.players.length} players. Triggering auto-scramble.`);
-        const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.seedScrambleAnnouncement, { delay: this.options.scrambleAnnouncementDelay })}`;
+        // Bound once and used for the announcement AND the countdown — the text must never quote a
+        // delay the timer does not actually run on.
+        const seedDelay = this.options.seedScrambleAnnouncementDelay;
+        const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.seedScrambleAnnouncement, { delay: seedDelay })}`;
         try {
           await this.server.rcon.broadcast(msg);
         } catch (err) {
           Logger.verbose('TeamBalancer', 1, `Failed to broadcast seed scramble announcement: ${err.message}`);
         }
         this.mirrorRconToDiscord(msg, 'warning');
-        this.initiateScramble(false, false).catch(err =>
+        this.initiateScramble(false, false, null, null, seedDelay).catch(err =>
           Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
         );
         // Seed rounds never feed the streak, so clear it here rather than leaving it to
@@ -2209,7 +2231,7 @@ export default class TeamBalancer extends S3PluginBase {
   // ║        SCRAMBLE EXECUTION FLOW        ║
   // ╚═══════════════════════════════════════╝
 
-  async initiateScramble(isSimulated = false, immediate = false, steamID = null, player = null) {
+  async initiateScramble(isSimulated = false, immediate = false, steamID = null, player = null, delaySeconds = null) {
     if (this._scramblePending || this._scrambleInProgress) {
       Logger.verbose('TeamBalancer', 4, 'Scramble initiation blocked: scramble already pending or in progress.');
       return false;
@@ -2224,14 +2246,18 @@ export default class TeamBalancer extends S3PluginBase {
     
     if (!immediate) {      
       this._scramblePending = true;
-      const delaySeconds = this.options.scrambleAnnouncementDelay;
+      // Callers with a timing window of their own pass it in — the seed auto-scramble does, because
+      // the gap between a Seed round ending and the map change is far shorter than the global delay
+      // (and a countdown still armed at NEW_GAME is discarded, i.e. the scramble never happens).
+      // ?? not ||, so a deliberately small delay is not thrown away as falsy.
+      const delay = delaySeconds ?? this.options.scrambleAnnouncementDelay;
       this._scrambleCountdownTimeout = setTimeout(async () => {
         // Drop the handle first: a non-null handle must mean "a countdown is still armed", which is
         // what NEW_GAME/unmount/cancel check before tearing it down.
         this._scrambleCountdownTimeout = null;
         Logger.verbose('TeamBalancer', 4, 'Scramble countdown finished, executing scramble.');
         await this.executeScramble(false, steamID, player);
-      }, delaySeconds * 1000);
+      }, delay * 1000);
       return true;
     } else {      
       Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Immediate live scramble initiated by ${adminName}`);

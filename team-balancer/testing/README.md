@@ -14,6 +14,17 @@ Stress-tests the Scrambler algorithm using mock data. Runs multiple scenarios (s
 node scrambler-test-runner.js
 ```
 
+**`test-cross-clan-squad-collision.js`**
+Two regression checks around clans that share a squad, both wired into `scrambler-test-runner.js` — no separate command needed.
+- `runCrossClanSquadDecompositionTest` — 30 randomized runs where a third clan spans two squads already claimed by other clans. Squads must stay atomic, and no player may appear in two of the reported virtual squads.
+- `runAnchorFallbackTagTest` — deterministic: when a clan's members sit entirely inside an earlier clan's virtual squad, the merged unit must keep both tags and count every real clan member as a member rather than as someone pulled along.
+
+**`embed-format-test.js`**
+Standalone assertions for the Discord scramble report (`DiscordHelpers.createScrambleDetailsMessage`): one row per listed player, one block per virtual squad, no player listed twice, correct `◆`/`◇`/`⚓` markers, and no field over Discord's 1024-character limit. Add `--print` to dump sample embeds for eyeballing column alignment. Standalone — no server required.
+```
+node embed-format-test.js [--print]
+```
+
 **`mock-data-generator.js`**
 Helper module used by `scrambler-test-runner.js`. Generates mock player and squad data with configurable team ratios, lock rates, and squad size distributions. Not a runnable script — imported by other test files.
 
@@ -23,8 +34,8 @@ Replays historical match data from an EloTracker DB backup and JSONL match log t
 node historical-scramble-test.js <elodb.json> [merged.jsonl]
 ```
 
-**`plugin-logic-test-runner.js`**
-Tests win streak logic, dominant win detection, and scramble triggering using a mock SquadJS environment. Does not require a live server, but the mock server harness may drift from the real SquadJS API over time.
+**`plugin-logic-test-runner.js`** — ⚠️ **currently does not run**
+Tests win streak logic, dominant win detection, and scramble triggering using a mock SquadJS environment. Carried over from the standalone TeamBalancer repo and never updated for S³: its mock server has no `SlackersSquadServices` plugin, so the mount path fails the S³ discovery and version checks. It also cannot resolve `s3-plugin-base.js` from the source tree, since `install.cjs` only flattens that next to `team-balancer.js` in the assembled output. Fixing it needs an assembled tree plus a mock S³ exposing `version` and the service getters.
 ```
 node plugin-logic-test-runner.js
 ```

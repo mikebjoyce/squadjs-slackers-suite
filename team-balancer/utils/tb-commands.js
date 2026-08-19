@@ -404,7 +404,7 @@ const CommandHandlers = {
             // Page 3/3: Key config
             await this.respond(player, [
               `Thresholds: ${this.options.maxWinStreak} wins / ${this.options?.minTicketsToCountAsDominantWin || 150} tix`,
-              `Scramble: ${(this.options?.scramblePercentage || 0.5) * 100}% | ${this.options?.scrambleAnnouncementDelay}s | ${this.options?.maxScrambleCompletionTime}ms`,
+              `Scramble: ${(this.options?.scramblePercentage || 0.5) * 100}% | ${this.options?.scrambleAnnouncementDelay}s (Seed: ${this.options?.seedScrambleAnnouncementDelay}s) | ${this.options?.maxScrambleCompletionTime}ms`,
               `Teams: ${team1Name} | ${team2Name}`,
               `1-Round: ${this.options?.enableSingleRoundScramble ? `ON (> ${this.options?.singleRoundScrambleThreshold} tix)` : 'OFF'}`,
               `Invasion: Atk ${this.options?.invasionAttackTeamThreshold} | Def ${this.options?.invasionDefenceTeamThreshold}`

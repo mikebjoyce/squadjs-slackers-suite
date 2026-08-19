@@ -42,7 +42,10 @@ import {
   generateScenario_ClanInsideAnothersAnchor,
   generateScenario_ClanSizeOrdering
 } from './mock-data-generator.js';
-import { runCrossClanSquadDecompositionTest } from './test-cross-clan-squad-collision.js';
+import {
+  runCrossClanSquadDecompositionTest,
+  runAnchorFallbackTagTest
+} from './test-cross-clan-squad-collision.js';
 
 // Failure tracker — turns observational checks into a real gate (process.exit on regression).
 const _failures = [];
@@ -567,7 +570,17 @@ async function runAllTests() {
 
   await runClanCollisionTest(20);
 
-  await runCrossClanSquadDecompositionTest({ runs: 30 });
+  // Called since the collision fix but its result was discarded, so the gate never ran. It is
+  // the only place the clan-merge path is exercised end to end, which is where duplicate report
+  // rosters came from.
+  const crossClan = await runCrossClanSquadDecompositionTest({ runs: 30 });
+  track('Cross-clan squads stay atomic and rosters stay disjoint', crossClan.pass,
+    ` (${crossClan.dividedCount} divided, ${crossClan.squadDividedCount} damaged, ` +
+    `${crossClan.duplicateCount} duplicated)`);
+
+  const fallbackTags = await runAnchorFallbackTagTest();
+  track('Anchor fallback keeps every merged clan tag and member', fallbackTags.pass,
+    ` (tags [${fallbackTags.tags.join(', ')}], members [${fallbackTags.members.join(', ')}])`);
 
   await runBulkTests(2500);
   await runClanBulkTest(500);
