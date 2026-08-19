@@ -34,7 +34,7 @@ S³ (Slacker's Squad Services) is the centralised service container for shared s
 
 - **Server configuration** — map configs, layer rotation, community settings
 - **Database access** — SQLite (or Postgres/MySQL via Sequelize), schema versioning, migration pipeline
-- **Game-state lifecycle** — round phase tracking (STAGING → LIVE → ENDGAME → RESOLVING), layer/gamemode inference, crash recovery
+- **Game-state lifecycle** — round phase tracking (STAGING → LIVE → ENDGAME), layer/gamemode inference, crash recovery
 - **Player state** — team-change attribution, reconnect tracking, per-player and global locks
 - **Faction metadata** — team/faction identification from player kit role strings (e.g., `US_Rifleman` → team abbreviation `US`)
 - **Clan grouping** — tag-based clan detection and grouping utilities
@@ -167,7 +167,11 @@ Centralises Sequelize connector management, schema version tracking, and migrati
 
 **Source file:** `utils/game-state-service.js`
 
-Tracks round phases (STAGING → LIVE → ENDGAME → RESOLVING), infers gamemode/layer from server state, provides round timing and match IDs, and handles crash recovery via persisted state.
+Tracks round phases (STAGING → LIVE → ENDGAME), infers gamemode/layer from server state, provides round timing and match IDs, and handles crash recovery via persisted state.
+
+**Phase vs. resolving — two separate questions.** The *phase* is where the round is (STAGING mirrors the in-game staging period that keeps players in main). `resolving` is whether team data can be trusted yet, and it is **not** bounded by the phase: it is set at `NEW_GAME` and cleared by the first player-info tick that shows every tracked player on a real team, whatever phase that lands in. `resolvingTimeoutMs` (default 120s) is the escape hatch for a round where that never happens — floored at runtime to 4× PlayersService's effective refresh interval, since the flag can only ever clear on a tick and that interval is dynamic (clamped to [3s, 60s], set by the fastest registrant).
+
+**STAGING duration:** SquadJS gives no "match started" event, so STAGING → LIVE is a timer: `stagingDurationMs` (default 180s), or **5s on seed/training layers**, which have no real staging phase and would otherwise sit in STAGING forever (a seed round never fires another `NEW_GAME`). The shortcut applies **only when the layer was resolved for the current round** — `getLayerName()` falls back to the previous round's layer, and trusting that fallback here once made S³ declare LIVE 5s into a full RAAS staging phase because the round before it was Jensen's Range. When the real layer arrives mid-STAGING (`data.layer` was null, or S³ restarted), `resolveLayerInfo()` re-arms the timer against `lastNewGameAt`, so a late-identified seed round goes LIVE immediately rather than waiting out a second full duration.
 
 **SquadJS events it subscribes to:** `NEW_GAME`, `ROUND_ENDED`, `UPDATED_LAYER_INFORMATION`, `UPDATED_SERVER_INFORMATION`, `UPDATED_PLAYER_INFORMATION`
 
@@ -176,13 +180,15 @@ Tracks round phases (STAGING → LIVE → ENDGAME → RESOLVING), infers gamemod
 | Method | Returns | Notes |
 |--------|---------|-------|
 | `isReady()` | `boolean` | Mounted, timers initialised, layer resolved |
-| `getPhase()` | `string` | `'STAGING'` / `'LIVE'` / `'ENDGAME'` / `'RESOLVING'` |
+| `getPhase()` | `string` | `'STAGING'` / `'LIVE'` / `'ENDGAME'` (there is no `'RESOLVING'` phase — see `isResolving()`) |
 | `isStaging()` | `boolean` | Phase === `'STAGING'` |
 | `isLive()` | `boolean` | Phase === `'LIVE'` |
 | `isEnding()` | `boolean` | Phase === `'ENDGAME'` |
-| `isResolving()` | `boolean` | Phase === `'RESOLVING'` |
+| `isResolving()` | `boolean` | Team data not yet trusted for this round — **any phase**, not just STAGING. Don't act on team IDs while true |
 | `getGamemode()` | `string\|null` | Inferred game mode (e.g. `'AAS'`, `'RAAS'`, `'Seed'`) |
 | `getLayerName()` | `string\|null` | Raw layer name (e.g. `'Sumari AAS v1'`) |
+| `isLayerResolved()` | `boolean` | `false` while the two getters above are returning the `'Unknown'` placeholder — use it before trusting a negative `isIgnoredMode()` / `isSeedMode()` |
+| `refreshLayer(source?)` | `Promise<boolean>` | Forces `server.updateServerInformation()` (5s cap) and re-resolves, instead of waiting out SquadJS's ~30s poll |
 | `getRoundStartTime()` | `number\|null` | Epoch MS of round START or LIVE transition |
 | `getMatchId()` | `string\|null` | Layer hash + match counter |
 | `isIgnoredMode()` | `boolean` | Gamemode in ignored list (seed/training/event) |
@@ -219,6 +225,7 @@ Tracks player state (name, team, squad, join time), manages per-player and globa
 | `getJoinTime(eosID\|steamID)` | `number\|null` | Epoch MS player joined |
 | `getSquads()` | `object[]` | Squad list from registry — `{ squadID, teamID, squadName, locked, players }`, leaders first. Membership is keyed by team **and** squad number, since squad numbers restart per team. |
 | `areTeamsResolved()` | `boolean` | All players on valid teams (1 or 2) |
+| `getEffectiveRefreshIntervalMs()` | `number\|null` | Actual registry refresh cadence — `clamp(fastest registrant, 3s, 60s)`. Measure any "wait for team data" budget in these |
 | `recordMove(eosID, teamID, source, options?)` | `void` | Record attribution for team change |
 | `canAct(eosID, source)` | `boolean` | Check if player can be acted upon (not locked by another plugin) |
 | `lock(eosID, source, ttlMs?)` | `boolean` | Acquire per-player lock (returns false if already locked by higher priority) |
@@ -311,7 +318,9 @@ When both teams have been identified, the cache looks like:
 { 1: 'US', 2: 'RUS' }
 ```
 
-**Lifecycle:** Polling is gated on `gameState.resolving`, **not** round phase. On `NEW_GAME`, `resolving` goes true and polling stops — player roles may still carry stale data from the previous round. Once all players have valid team IDs, `resolving` clears and polling starts, running in **either** STAGING or LIVE. This is why seed-mode rounds (which never reach LIVE) still resolve faction abbreviations. Once both teams are identified, polling stops until the next `NEW_GAME`.
+**Lifecycle:** Polling is gated on `gameState.resolving`, **not** round phase. On `NEW_GAME`, `resolving` goes true and polling stops — player roles may still carry stale data from the previous round. Once all players have valid team IDs, `resolving` clears and polling starts, in whatever phase that happens to be. Once both teams are identified, polling stops until the next `NEW_GAME`.
+
+> This gate is why `resolving` had to stop being clamped to STAGING. Seed rounds go LIVE 5s after `NEW_GAME`, and the staging timer used to force `resolving = false` on the way — before the first ~20s player tick. Faction polling therefore started while roles could still be the previous round's, and since polling stops for good once both teams are cached, a bad early read would stick for the whole round.
 
 **Public API:**
 
@@ -541,8 +550,8 @@ S³ subscribes to these SquadJS events and delegates them to the appropriate ser
 |-------|-------------|------------|
 | `NEW_GAME` | gameState, factions | Server starts a new game |
 | `ROUND_ENDED` | gameState, factions | Round finishes |
-| `UPDATED_LAYER_INFORMATION` | gameState | Layer info received from server |
-| `UPDATED_SERVER_INFORMATION` | gameState | Server info (name, map, etc.) updated |
+| `UPDATED_LAYER_INFORMATION` | gameState | Layer poll completed — **carries no layer**; used only for recovery-timing checks (see §7.11) |
+| `UPDATED_SERVER_INFORMATION` | gameState | Server info updated — `info.currentLayer` is S³'s **sole** layer resolution path |
 | `UPDATED_PLAYER_INFORMATION` | gameState, factions, players | Player list refresh tick |
 | `PLAYER_CONNECTED` | players | Player connects to server |
 
@@ -932,6 +941,26 @@ Two related traps in the same family:
 - **`LIKE ... ESCAPE '\'` cannot be written portably.** MySQL processes backslash escapes inside string literals and the other two do not, so whichever spelling you pick is a hard error somewhere: `ESCAPE '\\'` fails on SQLite with *"ESCAPE expression must be a single character"*. Use `caseInsensitiveLikeLiteral()`, which escapes with `!` instead.
 
 Regression cover for all of this lives in `s3/testing/test-dialect-portability.js`, which runs each statement against real SQLite, MySQL and Postgres engines. A mock cannot catch this class of defect — it has no dialect to model.
+
+### 7.11 — Reading `server.currentLayer` Instead of S³
+
+```js
+// ❌ ANTI-PATTERN — silently empty after a mid-round SquadJS restart
+const layer = this.server.currentLayer?.name || 'Unknown';
+const mode  = this.server.currentLayer?.gamemode || '';
+if (ignoredModes.some(m => layer.toLowerCase().includes(m))) return;
+
+// ✅ CORRECT — S³ GameStateService is the single resolver
+const gs = this._s3?.gameState;
+if (gs?.isIgnoredMode?.()) return;
+const layer = gs?.getLayerName?.() ?? 'Unknown';
+```
+
+**Why it fails:** SquadJS never repopulates `server.currentLayer` from RCON when a plugin mounts mid-round (4.2.0 behaviour), and it can read the literal string `"Unknown"` during a restart. The failure is silent in the worst way: the layer string comes out empty, every `includes()` test against it returns `false`, and a gate meant to *skip* seed/training layers instead lets everything through until the next map roll.
+
+**The event trap behind it:** `UPDATED_LAYER_INFORMATION` announces "layer info updated" but carries **no payload** — SquadJS's own docs tell consumers to read `server.currentLayer`, which that event does not populate. The layer actually arrives on `UPDATED_SERVER_INFORMATION` as `info.currentLayer`. S³ handles this asymmetry in one place: `handleServerInfoUpdated()` is the sole resolution path, `handleLayerInfoUpdated()` is deliberately neutered, and `mount()` bootstraps through `server.currentLayer` → forced `refreshLayer()` → `layerHistory[0]` so a restart resolves in seconds rather than waiting out the ~30s poll. Every one of those reads is validated — S³ never caches a layer named `"Unknown"` over a good one.
+
+**Fix:** never read `server.currentLayer`, `server.layerHistory`, or `server.nextLayer` from a consumer plugin. Take `getLayerName()` / `getGamemode()` / `isIgnoredMode()` from `gameState`, subscribe to `onLayerGameModeChange()` if you need to react to changes, and check `isLayerResolved()` before trusting a *negative* answer from a layer-based gate.
 
 ---
 

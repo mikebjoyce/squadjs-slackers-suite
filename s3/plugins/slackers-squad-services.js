@@ -27,7 +27,11 @@
  *     handleNewGame(data)         — Delegates NEW_GAME to gameState and factions.
  *     handleRoundEnded(data)      — Delegates ROUND_ENDED to gameState and factions.
  *     handleLayerInfoUpdated(d)   — Delegates UPDATED_LAYER_INFORMATION to gameState.
+ *                                   (recovery-timing only — that event carries no
+ *                                   layer and server.currentLayer is unreliable)
  *     handleServerInfoUpdated(d)  — Delegates UPDATED_SERVER_INFORMATION to gameState.
+ *                                   THE layer resolution path: info.currentLayer is the
+ *                                   only place SquadJS reliably delivers layer data.
  *     handleUpdatedPlayerInfo(d)  — Delegates UPDATED_PLAYER_INFORMATION to gameState, factions, players.
  *     handlePlayerConnected(d)    — Delegates PLAYER_CONNECTED to players.
  *

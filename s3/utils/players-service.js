@@ -492,6 +492,21 @@ export default class PlayersService {
     return players.every((player) => player?.teamID === 1 || player?.teamID === 2);
   }
 
+  /**
+   * How often the registry is actually refreshed, in ms — clamp(fastest
+   * registered interval, refreshMinIntervalMs, refreshMaxIntervalMs), or null
+   * when nothing has registered interest.
+   *
+   * Exposed because it is the unit any "how long should I wait for team data"
+   * budget has to be measured in: areTeamsResolved() can only change on a tick,
+   * so a timeout shorter than a few of these expires before the answer could
+   * possibly have arrived. GameStateService uses it to floor its resolving
+   * deadline.
+   */
+  getEffectiveRefreshIntervalMs() {
+    return this._refreshState?.effectiveInterval || null;
+  }
+
   // ---------------------------------------------------------------------------
   // Coalesced refresh manager — public API
   // ---------------------------------------------------------------------------

@@ -329,8 +329,9 @@ const CommandHandlers = {
             const t1Count = players.filter((p) => p.teamID === 1).length;
             const t2Count = players.filter((p) => p.teamID === 2).length;
 
-            // Layer
-            const currentLayer = this.server.currentLayer?.name || 'Unknown';
+            // Layer — from S³, never server.currentLayer (null after a
+            // mid-round SquadJS restart, which made this read "Unknown").
+            const currentLayer = this._s3?.gameState?.getLayerName?.() || this.layerNameCached || 'Unknown';
 
             const eloTrackerPlugin = this.server.plugins?.find(p => p.constructor.name === 'EloTracker');
             const eloStatus = this.options?.useEloForBalance ? (eloTrackerPlugin ? 'Active' : 'Unavailable') : 'Disabled';
@@ -386,9 +387,11 @@ const CommandHandlers = {
             const t2Players = players.filter((p) => p.teamID === 2);
             const t1Squads = squads.filter((s) => s.teamID === 1);
             const t2Squads = squads.filter((s) => s.teamID === 2);
-            const layer = await this.server.currentLayer;
-            const layerName = layer?.name || 'Unknown';
-            const gameMode = this.gameModeCached || 'N/A';
+            // Layer/gamemode from S³ (single resolver); the local caches are
+            // only a mirror of it, kept as a fallback if S³ is unavailable.
+            const gs = this._s3?.gameState;
+            const layerName = gs?.getLayerName?.() || this.layerNameCached || 'Unknown';
+            const gameMode = gs?.getGamemode?.() || this.gameModeCached || 'N/A';
             const team1Name = this.getTeamName(1);
             const team2Name = this.getTeamName(2);
 

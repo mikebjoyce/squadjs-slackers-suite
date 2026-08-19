@@ -1342,8 +1342,17 @@ export default class SmartAssign extends S3PluginBase {
     // ═══════════════════════════════════════════════════════════════
     const s3Players = this._s3?.players;
     const proxyServer = s3Players?.isReady()
-      ? { players: s3Players.getAllPlayers(), currentLayer: this.server.currentLayer }
+      ? { players: s3Players.getAllPlayers() }
       : this.server;
+    // ═══════════════════════════════════════════════════════════════
+    // LAYER FACTS FROM S³, NOT server.currentLayer: that property is null
+    // after a mid-round SquadJS restart, which silently disabled the
+    // evaluator's ignored-mode check until the next map roll. S³
+    // GameStateService owns layer resolution — pass its view down, and pass
+    // its configured ignoredGameModes with it so this check can never
+    // disagree with the isIgnoredMode() gate in the JOIN path above.
+    // ═══════════════════════════════════════════════════════════════
+    const gs = this._s3?.gameState;
     return evaluateTeamAssignment(player, proxyServer, {
       reconnectTeam,
       pendingAssignments: this._pendingAssignments,
@@ -1351,7 +1360,9 @@ export default class SmartAssign extends S3PluginBase {
       pendingVeterans: this._pendingVeterans,
       pendingPlayerMoves: this._pendingPlayerMoves,
       eloTracker: this.eloTracker,
-      ignoredModes: [],
+      ignoredModes: gs?.ignoredGameModes ?? [],
+      layerName: gs?.getLayerName?.() ?? '',
+      gamemode: gs?.getGamemode?.() ?? '',
       playerTagCache: tagCache,
       clansService: this._s3?.clans || null,
       clanGroupOptions: {

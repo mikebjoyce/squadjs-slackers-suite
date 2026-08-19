@@ -6,8 +6,8 @@
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
  * Validates FactionsService: faction and team name resolution from
- * game layer data, live-phase gating, and layer/faction cache clearing
- * on new game events.
+ * game layer data, resolving-flag gating of abbreviation polling, and
+ * layer/faction cache clearing on new game events.
  *
  * ─── USAGE ───────────────────────────────────────────────────────
  *
@@ -31,8 +31,12 @@ class MockServer extends EventEmitter {
 }
 
 class MockGameState {
-  constructor(phase = 'LIVE') {
+  constructor(phase = 'LIVE', resolving = false) {
     this.phase = phase;
+    // FactionsService gates polling on `resolving`, NOT on phase — roles can
+    // carry the previous round's faction data until team IDs settle. Phase is
+    // only here because the constructor requires an isLive() to exist.
+    this.resolving = resolving;
   }
 
   isLive() {
@@ -41,6 +45,10 @@ class MockGameState {
 
   setPhase(phase) {
     this.phase = phase;
+  }
+
+  setResolving(resolving) {
+    this.resolving = resolving;
   }
 }
 
@@ -103,9 +111,14 @@ await runTest('getFactionId resolves from cache first, then role prefix fallback
   assert.equal(service.getFactionId('RGF'), null);
 });
 
-await runTest('LIVE-gated behavior: no poll while STAGING, polls once LIVE and fills cache', async () => {
+// Polling is gated on gameState.resolving, not on phase. This test previously
+// asserted a LIVE-phase gate that _ensurePollingState() does not implement —
+// and a STAGING-only mock with no `resolving` field polled immediately, as the
+// service intends. Seed rounds never reach LIVE, so a phase gate would leave
+// them without faction abbreviations forever.
+await runTest('resolving-gated behavior: no poll while resolving, polls once teams settle (any phase)', async () => {
   const server = new MockServer();
-  const gameState = new MockGameState('STAGING');
+  const gameState = new MockGameState('STAGING', true); // NEW_GAME just fired
   const service = new FactionsService({ server, gameState, pollIntervalMs: 25 });
 
   server.players = [
@@ -115,16 +128,20 @@ await runTest('LIVE-gated behavior: no poll while STAGING, polls once LIVE and f
 
   await service.mount();
 
+  // Roles may still be the previous round's — nothing may be cached yet.
   assert.equal(service.getCachedAbbreviations()[1], undefined);
   assert.equal(service.getCachedAbbreviations()[2], undefined);
 
-  gameState.setPhase('LIVE');
+  // Teams settle while still in STAGING (the seed-round case): polling starts
+  // without ever needing a LIVE transition.
+  gameState.setResolving(false);
   service.handleUpdatedPlayerInfo();
 
   await new Promise((resolve) => setTimeout(resolve, 10));
   const cache = service.getCachedAbbreviations();
   assert.equal(cache[1], 'US');
   assert.equal(cache[2], 'MEA');
+  assert.equal(gameState.phase, 'STAGING');
 
   await service.unmount();
 });

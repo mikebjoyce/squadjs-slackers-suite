@@ -78,7 +78,9 @@ export default class GameStateService {
     verboseLogger = () => {},
     ignoredGameModes = [],
     stagingDurationMs = 180000, //default staging phase is 3 minutes (depends on game mode, squad wiki source; veracity unknown)
-    maxRecoveredRoundAgeMs = 7200000
+    maxRecoveredRoundAgeMs = 7200000,
+    layerRefreshTimeoutMs = 5000,
+    resolvingTimeoutMs = 120000
   } = {}) {
     this.parent = parent;
     this.server = server;
@@ -96,6 +98,20 @@ export default class GameStateService {
       ? maxRecoveredRoundAgeMs
       : 7200000;
 
+    // Cap on the forced server.updateServerInformation() call used to pull a
+    // layer immediately instead of waiting out SquadJS's ~30s poll. It goes to
+    // RCON, so it must never be able to stall S³'s mount.
+    this.layerRefreshTimeoutMs = Number.isFinite(layerRefreshTimeoutMs) ? layerRefreshTimeoutMs : 5000;
+    this._layerRefreshInFlight = null;
+
+    // Upper bound on the resolving window. `resolving` normally clears when a
+    // player-info tick reports every tracked player on a real team; this is
+    // only the escape hatch for a round where that never happens (empty
+    // server, a player stuck with teamID=null). Must comfortably exceed the
+    // player refresh interval — several ticks, not one.
+    this.resolvingTimeoutMs = Number.isFinite(resolvingTimeoutMs) ? resolvingTimeoutMs : 120000;
+    this._resolvingTimer = null;
+
     this.phase = 'LIVE';
     this.resolving = false;
     this.lastPhaseChangeAt = Date.now();
@@ -109,6 +125,12 @@ export default class GameStateService {
     this.gameModeCached = null;
     this.layerNameCached = null;
     this.lastKnownGoodLayer = null;
+
+    // True once the CURRENT round's layer has been resolved (or recovered from
+    // the DB for this same round). getLayerName() happily serves the previous
+    // round's layer as a fallback, which is fine for display and fatal for the
+    // seed/training staging shortcut — see _startStagingLiveTimer.
+    this._roundLayerTrusted = false;
 
     this._stagingLiveTimer = null;
     this._endgameTimer = null;
@@ -156,9 +178,7 @@ export default class GameStateService {
       this.verboseLogger(2, `[GameState] Mounted mid-round — backfilled roundStartTime: ${new Date(this.roundStartTime).toISOString()}`);
     }
 
-    if (this.server.currentLayer) {
-      await this.resolveLayerInfo(this.server.currentLayer, 'mount');
-    }
+    await this._bootstrapLayer();
 
     this._isMounted = true;
     this.verboseLogger(2, '[GameState] Mounted.');
@@ -169,6 +189,7 @@ export default class GameStateService {
 
     this._clearStagingLiveTimer();
     this._clearEndgameTimer();
+    this._clearResolvingTimer();
     this._isMounted = false;
     this.verboseLogger(2, '[GameState] Unmounted.');
   }
@@ -189,8 +210,17 @@ export default class GameStateService {
     return this.phase === 'ENDGAME';
   }
 
+  /**
+   * True while team data is not yet trustworthy for the current round.
+   *
+   * Deliberately NOT tied to the phase. It used to be `phase === 'STAGING' &&
+   * resolving`, which made it a lie on every seed round: seed/training layers
+   * advance to LIVE after 5s, and the player-info tick that actually confirms
+   * teams runs on a ~20s interval, so the flag was cleared before a single
+   * tick had been seen. Resolution is a property of the data, not of the phase.
+   */
   isResolving() {
-    return this.phase === 'STAGING' && this.resolving;
+    return this.resolving;
   }
 
   isReady() {
@@ -297,6 +327,20 @@ export default class GameStateService {
     return this.layerNameCached || this.lastKnownGoodLayer?.name || 'Unknown';
   }
 
+  /**
+   * True when S³ holds a real layer name (not the 'Unknown' placeholder).
+   *
+   * getLayerName()/getGamemode() return the string 'Unknown' both when the
+   * layer genuinely has not resolved yet and when SquadJS itself reported
+   * "Unknown" — consumers that gate behaviour on the layer (ignored modes,
+   * seed detection, liberal switch rules) cannot tell those apart from a
+   * real layer name without this. Use it to decide whether a negative answer
+   * from isIgnoredMode()/isSeedMode() is trustworthy yet.
+   */
+  isLayerResolved() {
+    return this._isKnownLayerName(this.layerNameCached || this.lastKnownGoodLayer?.name);
+  }
+
   inferGameMode(layerName) {
     if (!layerName) return 'Unknown';
     const name = String(layerName).toLowerCase();
@@ -343,14 +387,146 @@ export default class GameStateService {
       gamemode = layer.gamemode || this.inferGameMode(name);
     }
 
+    // ── NEVER CACHE AN "Unknown" LAYER ────────────────────────────────
+    // SquadJS documents server.currentLayer / NEW_GAME data.layer as
+    // possibly reading literally "Unknown" during and after a server
+    // restart. Writing that into the caches is strictly worse than
+    // keeping what we already had: it overwrites a good layer recovered
+    // from the DB (mount order is _recoverPersistedState -> _bootstrapLayer)
+    // and it makes lastKnownGoodLayer — the stale-but-valid fallback that
+    // getLayerName()/getGamemode() lean on — hold a value that is neither
+    // last, known, nor good. Reject it and wait for the next real
+    // UPDATED_SERVER_INFORMATION payload instead.
+    if (!this._isKnownLayerName(name)) {
+      this.verboseLogger(2, `[GameState:${source}] Ignoring unresolved layer ("${name}") — keeping ${this.getLayerName()} / ${this.getGamemode()}.`);
+      return false;
+    }
+
+    // ── VALIDATE RECOVERY BEFORE OVERWRITING THE RECOVERED LAYER ──────
+    // _validateRecoveredState compares the authoritative name against
+    // lastKnownGoodLayer, which still holds the DB-recovered value at this
+    // point — one line further down it would be gone. Doing it here means
+    // every resolution path (mount bootstrap, NEW_GAME, forced refresh,
+    // UPDATED_SERVER_INFORMATION) gets divergence detection for free; before
+    // this, no caller passed serverLayerName at all and the check was dead.
+    await this._validateRecoveredState(source, { serverLayerName: name });
+
     this.gameModeCached = gamemode;
     this.layerNameCached = name;
     this.lastKnownGoodLayer = { gamemode, name };
+    this._roundLayerTrusted = true;
     await this._persistState();
 
     this.verboseLogger(4, `[GameState:${source}] Layer info updated: ${gamemode} / ${name}`);
+
+    // The staging shortcut for seed/training rounds is decided from the layer,
+    // and the layer often arrives AFTER NEW_GAME (null data.layer, restart,
+    // forced refresh). Re-arm the timer now that we actually know what we are
+    // playing — it recomputes from lastNewGameAt, so a seed layer identified
+    // 20s in fires immediately rather than adding another full duration.
+    if (this.phase === 'STAGING' && this.lastNewGameAt) {
+      this._startStagingLiveTimer(this.lastNewGameAt);
+    }
+
     this._notifyLayerGameModeChange(prevLayer, prevGameMode);
     return true;
+  }
+
+  /**
+   * Force SquadJS to repopulate its own layer state, then resolve from it.
+   *
+   * server.updateServerInformation() is the only SquadJS call that refills
+   * server.currentLayer, and it emits UPDATED_SERVER_INFORMATION when it
+   * completes — so handleServerInfoUpdated may resolve the layer before this
+   * method's own resolveLayerInfo call does. That is harmless: resolveLayerInfo
+   * is idempotent for an unchanged layer, and reading server.currentLayer
+   * directly here means the bootstrap does not depend on the S³ plugin having
+   * bound its listeners yet (it has not, at service-mount time).
+   *
+   * Concurrent callers share one in-flight refresh — the point is to shorten
+   * the unresolved window, not to hammer RCON.
+   *
+   * @returns {Promise<boolean>} true if a real layer was resolved.
+   */
+  async refreshLayer(source = 'refreshLayer') {
+    if (typeof this.server?.updateServerInformation !== 'function') {
+      this.verboseLogger(3, `[GameState:${source}] server.updateServerInformation() unavailable — cannot force a layer refresh.`);
+      return false;
+    }
+
+    if (this._layerRefreshInFlight) return this._layerRefreshInFlight;
+
+    this._layerRefreshInFlight = (async () => {
+      let timedOut = false;
+      try {
+        let timer = null;
+        const pending = Promise.resolve(this.server.updateServerInformation());
+        // Promise.race abandons the loser: if the timeout wins, this RCON call
+        // still settles later and a late rejection would come back as an
+        // unhandled rejection. Attach the handler up front so it gets reported.
+        pending.catch((err) => {
+          if (timedOut) this.verboseLogger(2, `[GameState:${source}] updateServerInformation rejected after it had already timed out: ${err.message}`);
+        });
+        const timeout = new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error(`updateServerInformation timed out after ${this.layerRefreshTimeoutMs}ms`));
+          }, this.layerRefreshTimeoutMs);
+        });
+        try {
+          await Promise.race([pending, timeout]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      } catch (err) {
+        this.verboseLogger(2, `[GameState:${source}] Forced server-information refresh failed: ${err.message}`);
+        return false;
+      }
+      return this.resolveLayerInfo(this.server?.currentLayer, source);
+    })();
+
+    try {
+      return await this._layerRefreshInFlight;
+    } finally {
+      this._layerRefreshInFlight = null;
+    }
+  }
+
+  /**
+   * Establish a layer at mount time.
+   *
+   * This is the fix for the original "everything says Unknown after a SquadJS
+   * restart" bug class. Mounting mid-round used to read server.currentLayer
+   * once and give up: SquadJS 4.2.0 does not repopulate it from RCON on
+   * recovery, so S³ served 'Unknown' — and every consumer gate that reads the
+   * layer (ignored modes, seed detection, liberal switch rules) silently
+   * answered "no" — until the next ~30s UPDATED_SERVER_INFORMATION poll.
+   *
+   * Three sources, cheapest first. Each is validated by resolveLayerInfo, so
+   * a literal "Unknown" from any of them falls through to the next.
+   */
+  async _bootstrapLayer() {
+    // 1. Whatever SquadJS already holds — free, and correct when S³ mounts
+    //    into an already-running SquadJS process.
+    if (await this.resolveLayerInfo(this.server?.currentLayer, 'mount')) return true;
+
+    // 2. Make SquadJS go and ask the server now, rather than waiting out its poll.
+    if (await this.refreshLayer('mount:forcedRefresh')) return true;
+
+    // 3. Last resort: newest entry of layerHistory (newest first). Populated
+    //    from NEW_GAME, so it is empty on a cold SquadJS start but survives an
+    //    S³-only remount.
+    const historical = Array.isArray(this.server?.layerHistory) ? this.server.layerHistory[0]?.layer : null;
+    if (historical && await this.resolveLayerInfo(historical, 'mount:layerHistory')) return true;
+
+    if (this.isLayerResolved()) {
+      // Nothing live to be had, but DB recovery left us a usable layer.
+      this.verboseLogger(2, `[GameState] Mount: no live layer available — serving recovered ${this.getLayerName()} / ${this.getGamemode()}.`);
+      return false;
+    }
+
+    this.verboseLogger(1, '[GameState] Mount: layer unresolved — getLayerName()/getGamemode() report Unknown until the next UPDATED_SERVER_INFORMATION poll.');
+    return false;
   }
 
   isIgnoredMode() {
@@ -416,6 +592,11 @@ export default class GameStateService {
     this.lastNewGameAt = now;
     this.lastPhaseChangeAt = now;
 
+    // A new round invalidates the layer we know: whatever getLayerName() still
+    // returns belongs to the round that just ended, until something resolves
+    // this one. resolveLayerInfo() flips this back to true.
+    this._roundLayerTrusted = false;
+
     // S³ owns roundStartTime — use our own process clock as the single source of truth.
     // server.matchStartTime is not reliable across restarts (new Date per process lifetime).
     this.roundStartTime = Date.now();
@@ -428,20 +609,30 @@ export default class GameStateService {
     // layer from DB recovery (e.g. "Black Coast Invasion v1" from 5 hours ago).
     //
     // FIX: Fall back to server.currentLayer when data.layer is null. If both
-    // are null (server just restarted, SquadJS hasn't populated currentLayer
-    // yet), handleServerInfoUpdated will catch the real layer on the next
-    // ~30s UPDATED_SERVER_INFORMATION poll.
+    // are null or read "Unknown" (server just restarted, SquadJS hasn't
+    // populated currentLayer yet), force a server-information refresh so we
+    // don't sit on the previous round's layer for a whole ~30s poll cycle;
+    // handleServerInfoUpdated remains the backstop if that refresh fails.
     //
     // DO NOT rely solely on data.layer — it can be null. DO NOT rely solely
     // on server.currentLayer — it can be null after restart. Always try both.
     const layerSource = data?.layer || this.server.currentLayer;
     this.verboseLogger(2, `[GameState] NEW_GAME: data.layer=${JSON.stringify(data?.layer)}, server.currentLayer=${JSON.stringify(this.server.currentLayer)}, using=${JSON.stringify(layerSource)}`);
 
-    if (layerSource) {
-      await this.resolveLayerInfo(layerSource, 'handleNewGame');
+    const layerResolved = layerSource
+      ? await this.resolveLayerInfo(layerSource, 'handleNewGame')
+      : false;
+
+    if (!layerResolved) {
+      // Fire-and-forget: a new round must not wait on an RCON round trip to
+      // reach STAGING. refreshLayer() reports its own failures.
+      this.refreshLayer('handleNewGame:forcedRefresh').catch((err) => {
+        this.verboseLogger(2, `[GameState] NEW_GAME forced layer refresh rejected: ${err.message}`);
+      });
     }
 
     this._startStagingLiveTimer(now);
+    this._startResolvingTimer(now);
     await this._persistState();
 
     this.verboseLogger(2, '[GameState] NEW_GAME -> STAGING (resolving=true).');
@@ -453,6 +644,7 @@ export default class GameStateService {
     const prevPhase = this.phase;
     this._recoveredStateActive = false;
     this._clearStagingLiveTimer();
+    this._clearResolvingTimer();
     this.resolving = false;
     this.phase = 'ENDGAME';
     this.lastRoundEndedAt = now;
@@ -521,10 +713,15 @@ export default class GameStateService {
     // layer resolution path. handleLayerInfoUpdated CANNOT do it.
     if (!info?.currentLayer) return;
 
-    await this._validateRecoveredState('handleServerInfoUpdated');
-
     const incomingName = this._extractLayerName(info.currentLayer);
     this.verboseLogger(2, `[GameState] UPDATED_SERVER_INFORMATION: info.currentLayer=${JSON.stringify(info.currentLayer)}, extractedName=${incomingName}`);
+
+    // Pass the authoritative name in: this is the one event that carries a
+    // trustworthy layer, so it is what recovery validation must be judged
+    // against. It also has to happen here rather than only inside
+    // resolveLayerInfo — an unchanged layer returns below without resolving,
+    // and that agreement is exactly what confirms the recovered state.
+    await this._validateRecoveredState('handleServerInfoUpdated', { serverLayerName: incomingName });
 
     if (!this._isKnownLayerName(incomingName)) return;
     if (this._normalizeLayerName(this.lastKnownGoodLayer?.name) === this._normalizeLayerName(incomingName)) return;
@@ -535,7 +732,12 @@ export default class GameStateService {
   async handleUpdatedPlayerInfo() {
     await this._validateRecoveredState('handleUpdatedPlayerInfo');
 
-    if (!(this.phase === 'STAGING' && this.resolving)) return;
+    // Gate on the flag alone, not on the phase. A seed/training round is LIVE
+    // 5s after NEW_GAME — long before the first player-info tick — so a
+    // STAGING-only check meant those rounds could never clear `resolving` here
+    // and had to have it force-cleared by the staging timer instead, whether or
+    // not teams had actually settled.
+    if (!this.resolving) return;
 
     // Two-tier team resolution check:
     //
@@ -557,8 +759,9 @@ export default class GameStateService {
       if (!allResolved) return;
 
       this.resolving = false;
+      this._clearResolvingTimer();
       await this._persistState();
-      this.verboseLogger(2, '[GameState] All tracked players resolved -> STAGING(resolving=false).');
+      this.verboseLogger(2, `[GameState] All tracked players resolved -> resolving=false (phase ${this.phase}).`);
       return;
     }
 
@@ -570,8 +773,9 @@ export default class GameStateService {
     if (!allResolved) return;
 
     this.resolving = false;
+    this._clearResolvingTimer();
     await this._persistState();
-    this.verboseLogger(2, `[GameState] All ${players.length} players resolved -> STAGING(resolving=false).`);
+    this.verboseLogger(2, `[GameState] All ${players.length} players resolved -> resolving=false (phase ${this.phase}).`);
   }
 
   _clearStagingLiveTimer() {
@@ -588,6 +792,65 @@ export default class GameStateService {
     }
   }
 
+  _clearResolvingTimer() {
+    if (this._resolvingTimer) {
+      clearTimeout(this._resolvingTimer);
+      this._resolvingTimer = null;
+    }
+  }
+
+  /**
+   * Upper bound on the resolving window, armed at NEW_GAME.
+   *
+   * The staging timer used to double as this deadline, which coupled a
+   * data-trust question to a phase-length guess — fine at 180s, actively wrong
+   * at the 5s seed/training duration. This timer is independent: it only fires
+   * when no player-info tick ever confirmed teams, and it says so in the log
+   * rather than pretending resolution happened.
+   */
+  /**
+   * The resolving deadline, floored against the real player-refresh cadence.
+   *
+   * `resolving` can only clear on a player-info tick, so a budget shorter than
+   * several ticks expires before the answer could have arrived — which is the
+   * bug that made the old 5s staging-timer clear meaningless. The tick interval
+   * is not a constant: PlayersService clamps it to [3s, 60s] and takes the
+   * fastest interval any plugin registered, so a deployment with a 60s cadence
+   * gets only two ticks out of the 120s default. Derive the floor instead of
+   * assuming prod's 20s.
+   */
+  _resolvingBudgetMs() {
+    const tickMs = this.parent?.players?.getEffectiveRefreshIntervalMs?.() || 0;
+    const floor = tickMs > 0 ? tickMs * 4 : 0;
+    return Math.max(this.resolvingTimeoutMs, floor);
+  }
+
+  _startResolvingTimer(resolvingStartedAtMs) {
+    this._clearResolvingTimer();
+
+    const budget = this._resolvingBudgetMs();
+    if (budget > this.resolvingTimeoutMs) {
+      this.verboseLogger(3, `[GameState] Resolving deadline raised to ${budget}ms (4 player-info ticks) — the configured ${this.resolvingTimeoutMs}ms is shorter than the refresh cadence allows.`);
+    }
+
+    const elapsed = Math.max(0, Date.now() - Number(resolvingStartedAtMs || Date.now()));
+    const remaining = Math.max(0, budget - elapsed);
+
+    this._resolvingTimer = setTimeout(async () => {
+      if (!this.resolving) return;
+      this.resolving = false;
+      this._resolvingTimer = null;
+      await this._persistState();
+      this.verboseLogger(1, `[GameState] Teams never resolved within ${budget}ms — clearing resolving on the deadline (phase ${this.phase}).`);
+    }, remaining);
+
+    // Housekeeping deadline, not work worth keeping the process alive for. A
+    // live SquadJS always has sockets holding the loop open, so this only
+    // matters where it should: a test or a shutdown exits instead of waiting
+    // out the full timeout.
+    this._resolvingTimer.unref?.();
+  }
+
   _startStagingLiveTimer(stagingStartedAtMs) {
     this._clearStagingLiveTimer();
 
@@ -595,9 +858,23 @@ export default class GameStateService {
     // freely and the server stays in pre-round indefinitely. Use a short 5s
     // effective duration so the phase advances to LIVE instead of getting stuck
     // at STAGING (Seed rounds are perpetual and never fire another NEW_GAME).
-    const effectiveDuration = (this.isSeedMode() || this.isTrainingMode())
-      ? 5000
-      : this.stagingDurationMs;
+    //
+    // ── ONLY ON A LAYER RESOLVED FOR THIS ROUND ──────────────────────
+    // BUG HISTORY (prod log, squadjs-log (29).log ~line 19019): NEW_GAME
+    // arrived with data.layer=null AND server.currentLayer=null while the
+    // previous round was JensensRange. isTrainingMode() consulted the stale
+    // cached layer, said yes, and S³ declared LIVE 5 seconds into what was
+    // really a full ~3 minute staging phase. The mirror image is just as bad:
+    // a seed round following a RAAS round sits in STAGING for the full
+    // duration. Requiring _roundLayerTrusted makes the default the safe
+    // answer, and resolveLayerInfo() re-arms this timer the moment the real
+    // layer lands — usually within a second or two thanks to refreshLayer().
+    const shortStaging = this._roundLayerTrusted && (this.isSeedMode() || this.isTrainingMode());
+    const effectiveDuration = shortStaging ? 5000 : this.stagingDurationMs;
+
+    if (!this._roundLayerTrusted) {
+      this.verboseLogger(3, `[GameState] Staging timer armed on an unresolved layer — using the default ${this.stagingDurationMs}ms, will re-arm when the layer resolves.`);
+    }
 
     const elapsed = Math.max(0, Date.now() - Number(stagingStartedAtMs || Date.now()));
     const remaining = Math.max(0, effectiveDuration - elapsed);
@@ -608,10 +885,14 @@ export default class GameStateService {
 
       const prevPhase = this.phase;
       this.phase = 'LIVE';
-      this.resolving = false;
+      // NOTE: `resolving` is deliberately NOT cleared here. Going LIVE says the
+      // round has started; it says nothing about whether team data has settled,
+      // and on seed/training rounds this timer fires 5s in — before the first
+      // player-info tick. handleUpdatedPlayerInfo() clears the flag when teams
+      // are actually resolved, and _startResolvingTimer() is the upper bound.
       this.lastPhaseChangeAt = Date.now();
       await this._persistState();
-      this.verboseLogger(2, '[GameState] STAGING timer elapsed -> LIVE.');
+      this.verboseLogger(2, `[GameState] STAGING timer elapsed -> LIVE${this.resolving ? ' (teams still resolving).' : '.'}`);
       this._notifyGamePhaseChange(prevPhase);
 
       // Emit server-wide event so consumer plugins (e.g. SmartAssign snapshot)
@@ -828,6 +1109,9 @@ export default class GameStateService {
         name: this.layerNameCached || 'Unknown',
         gamemode: this.gameModeCached || 'Unknown'
       };
+      // A persisted layer belongs to the round we are resuming, not to a
+      // previous one — it is trustworthy for the staging shortcut below.
+      this._roundLayerTrusted = this._isKnownLayerName(this.layerNameCached);
     }
 
     if (this.phase === 'STAGING' && this.lastNewGameAt) {
@@ -842,6 +1126,13 @@ export default class GameStateService {
       } else {
         this._startStagingLiveTimer(this.lastNewGameAt);
       }
+    }
+
+    // A recovered round can be mid-resolving in any phase now that the flag is
+    // no longer bounded by STAGING — re-arm its deadline from the original
+    // NEW_GAME, so a crash cannot leave `resolving` true forever.
+    if (this.resolving) {
+      this._startResolvingTimer(this.lastNewGameAt || Date.now());
     }
 
     // ENDGAME stale-round guard: if lastRoundEndedAt >5 min ago, the next NEW_GAME
@@ -883,7 +1174,14 @@ export default class GameStateService {
   // fingerprint for identity checks.
   _normalizeLayerName(name) {
     if (!name) return '';
-    return String(name).replace(/[^a-z0-9]/g, '').toLowerCase();
+    // toLowerCase FIRST. The class [^a-z0-9] does not include A-Z, so stripping
+    // before lowercasing deletes every capital — and layer gamemode tokens are
+    // all-caps, so "Yehorivka_RAAS_v2" and "Yehorivka_AAS_v2" both collapsed to
+    // "ehorivkav2". handleServerInfoUpdated compares normalized names to decide
+    // whether the layer changed, so that collision made it return early on a
+    // real RAAS->AAS switch: the layer went stale for the whole round and no
+    // subscriber was notified. Caught on the live test server, 2026-08-19.
+    return String(name).toLowerCase().replace(/[^a-z0-9]/g, '');
   }
 
   _isRecoveredRoundTooOld(now = Date.now()) {
@@ -908,6 +1206,7 @@ export default class GameStateService {
     const prevPhase = this.phase;
     this._clearStagingLiveTimer();
     this._clearEndgameTimer();
+    this._clearResolvingTimer();
     this.phase = 'LIVE';
     this.resolving = false;
     this.lastPhaseChangeAt = now;
@@ -940,6 +1239,7 @@ export default class GameStateService {
     this.layerNameCached = null;
     this.gameModeCached = null;
     this.lastKnownGoodLayer = null;
+    this._roundLayerTrusted = false;
     this._recoveredStateActive = false;
     await this._persistState();
     this.verboseLogger(1, `[GameState] Recovered state invalidated -> LIVE (${reason}). Layer caches cleared.`);

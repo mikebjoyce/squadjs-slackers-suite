@@ -128,6 +128,8 @@ const REGULAR_MIN_ROUNDS = 10;  // Veteran threshold
  *     pendingPlayerMoves: Map<steamID, ...>,
  *     eloTracker: EloTracker | null,
  *     ignoredModes: string[],               // Lowercase gamemode substrings to skip
+ *     layerName: string,                    // S³ gameState.getLayerName() — see note below
+ *     gamemode: string,                     // S³ gameState.getGamemode()
  *     playerTagCache: Map<eosID, tag|null>, // Clan tag cache (optional)
  *     clansService: ClansService|null,       // S³ ClansService for clan team lookup
  *     clanGroupOptions: { minSize, caseSensitive }, // Clan grouping options
@@ -145,6 +147,8 @@ export async function evaluateTeamAssignment(player, server, context) {
      pendingPlayerMoves = new Map(),
      eloTracker = null,
      ignoredModes = [],
+     layerName = '',
+     gamemode = '',
      playerTagCache = null,
      clansService = null,
      clanGroupOptions = { minSize: 2, caseSensitive: false },
@@ -152,17 +156,22 @@ export async function evaluateTeamAssignment(player, server, context) {
       maxTeamSize = 50
     } = context;
 
-  // Check if current layer/gamemode is ignored
-  const currentLayerName = server.currentLayer && server.currentLayer.name
-    ? String(server.currentLayer.name).toLowerCase()
-    : '';
-  const currentGamemode = server.currentLayer && server.currentLayer.gamemode
-    ? String(server.currentLayer.gamemode).toLowerCase()
-    : '';
+  // ── LAYER FACTS COME FROM S³, NEVER FROM server.currentLayer ────────
+  // This used to read server.currentLayer directly. That property is null
+  // after a mid-round SquadJS restart (SquadJS 4.2.0 never repopulates it
+  // from RCON on recovery), so both strings came out empty and NO layer was
+  // ever treated as ignored until the next map roll. S³ GameStateService is
+  // the single resolver — it validates, caches, and survives restarts — so
+  // the caller passes its getLayerName()/getGamemode() in via context.
+  const currentLayerName = layerName ? String(layerName).toLowerCase() : '';
+  const currentGamemode = gamemode ? String(gamemode).toLowerCase() : '';
 
-  const isIgnored = ignoredModes.some(
-    m => currentLayerName.includes(m) || currentGamemode.includes(m)
-  );
+  const isIgnored = ignoredModes.some((m) => {
+    // Lowercase defensively: S³ lowercases via setIgnoredGameModes(), but a
+    // raw config array passed straight through would not be.
+    const needle = String(m).toLowerCase();
+    return needle && (currentLayerName.includes(needle) || currentGamemode.includes(needle));
+  });
 
   if (isIgnored) {
     return { targetTeam: null, reason: 'Ignored Gamemode' };

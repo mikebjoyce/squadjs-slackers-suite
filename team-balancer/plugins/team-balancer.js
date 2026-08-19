@@ -1162,7 +1162,6 @@ export default class TeamBalancer extends S3PluginBase {
     this._clearPendingScrambleCountdown();
     if (this._abbreviationPollStartTimeout) clearTimeout(this._abbreviationPollStartTimeout);
     this.cleanupScrambleTracking();
-    this.stopPollingGameInfo();
     this.stopPollingTeamAbbreviations();
     this._scrambleInProgress = false;
     this._scrambleOnRoundEnd = false;
@@ -1172,138 +1171,23 @@ export default class TeamBalancer extends S3PluginBase {
   }
 
   // ╔═══════════════════════════════════════╗
-  // ║          POLLING MECHANISMS           ║
+  // ║          LAYER INFO — S³ OWNED        ║
   // ╚═══════════════════════════════════════╝
-
-  inferGameMode(layerName) {
-    if (!layerName) return 'Unknown';
-    const name = layerName.toLowerCase();
-    if (name.includes('seed')) return 'Seed';
-    if (name.includes('invasion')) return 'Invasion';
-    if (name.includes('raas')) return 'RAAS';
-    if (name.includes('aas')) return 'AAS';
-    if (name.includes('tc')) return 'TC';
-    if (name.includes('skirmish')) return 'Skirmish';
-    if (name.includes('insurgency')) return 'Insurgency';
-    if (name.includes('destruction')) return 'Destruction';
-    if (name.includes('jensen')) return 'Jensen';
-    return 'Unknown';
-  }
-
-  async resolveLayerInfo(layerData, source = 'Unknown') {
-    let layer = layerData;
-    if (layer instanceof Promise) {
-      try {
-        layer = await layer;
-      } catch (err) {
-        Logger.verbose('TeamBalancer', 1, `[${source}] Failed to resolve layer promise: ${err.message}`);
-        layer = null;
-      }
-    }
-    
-    if (!layer) {
-      Logger.verbose('TeamBalancer', 3, `[${source}] Layer object is completely null or undefined.`);
-      return false;
-    }
-    
-    let gamemode = 'Unknown';
-    let name = 'Unknown';
-
-    if (typeof layer === 'string') {
-      name = layer;
-      gamemode = this.inferGameMode(name);
-      Logger.verbose('TeamBalancer', 4, `[${source}] Layer is a string ("${layer}"), inferred gamemode: ${gamemode}.`);
-    } else if (typeof layer === 'object') {
-      name = layer.name || layer.layer || 'Unknown';
-      gamemode = layer.gamemode || this.inferGameMode(name);
-      if (gamemode === 'Unknown' || name === 'Unknown') {
-         Logger.verbose('TeamBalancer', 4, `[${source}] Layer object missing properties: ${JSON.stringify(layer)}`);
-      }
-    }
-
-    this.gameModeCached = gamemode;
-    this.layerNameCached = name;
-    this.lastKnownGoodLayer = { gamemode, name };
-    Logger.verbose('TeamBalancer', 4, `[${source}] Layer info updated: ${gamemode} / ${name}`);
-    return true;
-  }
-
-  async onLayerInfoUpdated() {
-    try {
-      const resolved = await this.resolveLayerInfo(this.server.currentLayer, 'onLayerInfoUpdated');
-      if (resolved && this._gameInfoPollingInterval) {
-        clearInterval(this._gameInfoPollingInterval);
-        this._gameInfoPollingInterval = null;
-        Logger.verbose('TeamBalancer', 4, 'Game info polling stopped (layer info updated).');
-      }
-    } catch (err) {
-      Logger.verbose('TeamBalancer', 4, `Error in onLayerInfoUpdated: ${err.message}`);
-    }
-  }
-
-  async onServerInfoUpdated(info) {
-    try {
-      if (info && info.currentLayer) {
-        const incomingName = typeof info.currentLayer === 'string'
-          ? info.currentLayer
-          : info.currentLayer?.name;
-
-        if (this.lastKnownGoodLayer?.name === incomingName) return;
-
-        const resolved = await this.resolveLayerInfo(info.currentLayer, 'onServerInfoUpdated');
-        if (resolved && this._gameInfoPollingInterval) {
-          clearInterval(this._gameInfoPollingInterval);
-          this._gameInfoPollingInterval = null;
-          Logger.verbose('TeamBalancer', 4, 'Game info polling stopped (server info updated).');
-        }
-      }
-    } catch (err) {
-      Logger.verbose('TeamBalancer', 4, `Error in onServerInfoUpdated: ${err.message}`);
-    }
-  }
-
-  async startPollingGameInfo() {
-    Logger.verbose('TeamBalancer', 4, 'Starting game info polling.');
-
-    const pollGameInfo = async () => {
-      // Guard: already resolved via onServerInfoUpdated during the initial await
-      if (this.gameModeCached && this.gameModeCached !== 'Unknown') {
-        if (this._gameInfoPollingInterval) {
-          clearInterval(this._gameInfoPollingInterval);
-          this._gameInfoPollingInterval = null;
-          Logger.verbose('TeamBalancer', 4, 'Game info polling stopped (resolved externally).');
-        }
-        return;
-      }
-      try {
-        const resolved = await this.resolveLayerInfo(this.server.currentLayer, 'startPollingGameInfo');
-        if (resolved && this._gameInfoPollingInterval) {
-          clearInterval(this._gameInfoPollingInterval);
-          this._gameInfoPollingInterval = null;
-          Logger.verbose('TeamBalancer', 4, 'Game info polling stopped.');
-        } else if (!resolved) {
-          Logger.verbose('TeamBalancer', 4, 'Game info not yet available. Retrying...');
-        }
-      } catch (err) {
-        Logger.verbose('TeamBalancer', 4, `Error during game info polling: ${err.message}`);
-      }
-    };
-
-    await pollGameInfo();
-
-    // Race condition guard: onServerInfoUpdated may have resolved during the above await
-    if (this.gameModeCached && this.gameModeCached !== 'Unknown') return;
-
-    this._gameInfoPollingInterval = setInterval(pollGameInfo, 10000);
-  }
-
-  stopPollingGameInfo() {
-    if (this._gameInfoPollingInterval) {
-      Logger.verbose('TeamBalancer', 4, 'Stopping game info polling.');
-      clearInterval(this._gameInfoPollingInterval);
-      this._gameInfoPollingInterval = null;
-    }
-  }
+  //
+  // TeamBalancer used to carry its own copy of S³'s layer stack:
+  // inferGameMode(), resolveLayerInfo(), onLayerInfoUpdated(),
+  // onServerInfoUpdated() and a 10s startPollingGameInfo() fallback loop.
+  // All of it was removed — it had already been orphaned (mount() stopped
+  // binding UPDATED_LAYER_INFORMATION / UPDATED_SERVER_INFORMATION and
+  // nothing called startPollingGameInfo), and two of those methods read
+  // this.server.currentLayer, which is null after a mid-round SquadJS
+  // restart and would have re-introduced "Unknown" layers here.
+  //
+  // gameModeCached / layerNameCached / lastKnownGoodLayer are now a pure
+  // mirror of S³, fed by the gameState.onLayerGameModeChange() subscription
+  // registered in mount(). Read S³ directly for live values —
+  // this._s3.gameState.getLayerName() / getGamemode() — and DO NOT re-add a
+  // local resolver or a server.currentLayer read.
 
   getTeamName(teamID) {
     if (this.options.useGenericTeamNamesInBroadcasts) {

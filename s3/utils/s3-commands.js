@@ -429,7 +429,9 @@ export function buildGameStateEmbed(plugin) {
     { name: 'isStaging', value: gs.isStaging?.() ? '🟡' : '⚫', inline: true },
     { name: 'isEnding', value: gs.isEnding?.() ? '🔴' : '⚫', inline: true },
     { name: 'Gamemode', value: mode, inline: true },
-    { name: 'Layer', value: truncate(layer, 50), inline: true },
+    // ⚠️ marks a layer S³ has not actually resolved yet (the 'Unknown'
+    // placeholder), so operators can tell it apart from a real layer name.
+    { name: 'Layer', value: `${gs.isLayerResolved?.() === false ? '⚠️ ' : ''}${truncate(layer, 50)}`, inline: true },
     { name: 'isIgnoredMode', value: gs.isIgnoredMode?.() ? '🟡' : '⚫', inline: true },
     { name: 'MatchId', value: `\`${matchId}\``, inline: true },
     { name: 'Round Start', value: formatTimestamp(roundStartTime), inline: true },
