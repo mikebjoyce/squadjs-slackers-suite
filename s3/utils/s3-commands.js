@@ -1651,6 +1651,8 @@ export function createCommandHandlers(context) {
       // Categorise drift entries
       const errors = drift.filter(d => d.error);
       const missing = drift.filter(d => d.missing && d.missing.length > 0);
+      const missingRows = drift.filter(d => d.missingRows && d.missingRows.length > 0);
+      const dataViolations = drift.filter(d => d.dataViolations && d.dataViolations.length > 0);
       const extra = drift.filter(d => d.extra && d.extra.length > 0);
 
       const lines = [];
@@ -1671,6 +1673,22 @@ export function createCommandHandlers(context) {
         lines.push('');
       }
 
+      if (missingRows.length > 0) {
+        lines.push('**🧩 Missing Rows**');
+        for (const r of missingRows) {
+          lines.push(`  • \`${r.table}\`: ${r.missingRows.map(row => `\`${row.key}=${row.value}\``).join(', ')}`);
+        }
+        lines.push('');
+      }
+
+      if (dataViolations.length > 0) {
+        lines.push('**🕳️ Unpopulated Data**');
+        for (const dv of dataViolations) {
+          lines.push(`  • \`${dv.table}\`: ${dv.dataViolations.map(v => `${v.offenders} row(s) with empty \`${v.column}\``).join(', ')}`);
+        }
+        lines.push('');
+      }
+
       if (extra.length > 0) {
         lines.push('**📦 Extra Columns**');
         for (const x of extra) {
@@ -1679,8 +1697,8 @@ export function createCommandHandlers(context) {
         lines.push('');
       }
 
-      // Severity: red if errors or missing, orange if extra-only
-      const hasCritical = errors.length > 0 || missing.length > 0;
+      // Severity: red if errors, missing schema, or unpopulated data; orange if extra-only
+      const hasCritical = errors.length > 0 || missing.length > 0 || missingRows.length > 0 || dataViolations.length > 0;
       const color = hasCritical ? 0xe74c3c : 0xf39c12;
 
       await sendDiscordMessage(message.channel, {

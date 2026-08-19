@@ -1,4 +1,4 @@
-# SlackersSquadServices (S³) Plugin v1.3.1
+# SlackersSquadServices (S³) Plugin v1.4.0
 
 **Centralised service container for shared state across SquadJS plugins**
 

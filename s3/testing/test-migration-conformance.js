@@ -67,73 +67,20 @@ import assert from 'node:assert/strict';
 
 import { Sequelize } from 'sequelize';
 
-import { execFileSync } from 'node:child_process';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-
 import DBService from '../utils/db-service.js';
 import PlayersService from '../utils/players-service.js';
 import SwitchDB from '../../switch/utils/switch-db.js';
-
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const ASSEMBLY_DIR = path.join(REPO_ROOT, '.tmp-conformance');
+import { buildAssembly, importFromAssembly, cleanAssembly } from './plugin-assembly.js';
 
 /**
- * Consumer plugin entry points import sibling S³ files (`./s3-plugin-base.js`),
- * which only resolve in the FLATTENED layout install.cjs produces — in this
- * source tree they live under s3/plugins/. So the three plugins that register
- * their schema inline are imported from a throwaway assembly built by the real
- * install.cjs, which has the additional virtue of proving the shipped layout
- * imports cleanly.
- *
- * The assembly is built inside the repo (not the OS temp dir) so that bare
- * imports like 'sequelize' still resolve up the directory tree to the SquadJS
- * node_modules, and so `../../core/logger.js` finds the repo's test shim.
+ * The three plugins that register their schema inline are imported from a
+ * throwaway flattened assembly, because their entry points import sibling S³
+ * files that only resolve in the shipped layout. See plugin-assembly.js.
  */
-function buildAssembly() {
-  fs.rmSync(ASSEMBLY_DIR, { recursive: true, force: true });
-  execFileSync(
-    process.execPath,
-    [path.join(REPO_ROOT, 'install.cjs'), '--plugin=all', `--output=${ASSEMBLY_DIR}`, '--force'],
-    { cwd: REPO_ROOT, stdio: 'pipe' }
-  );
-
-  // SquadJS's own BasePlugin lives in a deployed SquadJS install, not in this
-  // repo — the same reason core/logger.js is a shim here. Drop a minimal stand-in
-  // into the assembly (never into the source tree, where install.cjs would ship
-  // it and collide with the real one).
-  fs.writeFileSync(
-    path.join(ASSEMBLY_DIR, 'plugins', 'base-plugin.js'),
-    `// Test shim — see s3/testing/test-migration-conformance.js
-export default class BasePlugin {
-  constructor(server, options, connectors) {
-    this.server = server;
-    this.options = options;
-    this.connectors = connectors;
-  }
-  static get description() { return ''; }
-  static get defaultEnabled() { return true; }
-  static get optionsSpecification() { return {}; }
-  async prepareToMount() {}
-  async mount() {}
-  async unmount() {}
-  verbose() {}
-}
-`
-  );
-}
-
-async function importFromAssembly(fileName) {
-  const target = path.join(ASSEMBLY_DIR, 'plugins', fileName);
-  const module = await import(pathToFileURL(target).href);
-  return module.default;
-}
-
-buildAssembly();
-const EloTracker = await importFromAssembly('elo-tracker.js');
-const SmartAssign = await importFromAssembly('smart-assign.js');
-const TeamBalancer = await importFromAssembly('team-balancer.js');
+const ASSEMBLY_DIR = buildAssembly('.tmp-conformance');
+const EloTracker = await importFromAssembly(ASSEMBLY_DIR, 'elo-tracker.js');
+const SmartAssign = await importFromAssembly(ASSEMBLY_DIR, 'smart-assign.js');
+const TeamBalancer = await importFromAssembly(ASSEMBLY_DIR, 'team-balancer.js');
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -505,6 +452,36 @@ function referencedMembers(fn) {
   return [...members];
 }
 
+/**
+ * Members whose presence in an up() means the migration rewrites values in rows
+ * that already exist — the add-a-column-then-backfill shape that produced the
+ * v5 incident. Those are the migrations whose success is not provable from the
+ * schema alone, so they are the ones required to declare touches.data.
+ *
+ * bulkInsert is excluded: rows it creates are already covered by touches.rows.
+ * bulkDelete is excluded: a deletion leaves no value to assert.
+ */
+const BACKFILL_MEMBERS = new Set(['bulkUpdate']);
+
+/**
+ * Does this migration rewrite existing rows without declaring what the rewrite
+ * was supposed to achieve? Returns the offending members, or [] if it is fine.
+ *
+ * The escape hatch is an explicit empty declaration — `data: { Table: [] }` —
+ * which reads as "considered, no invariant to assert" and cannot be arrived at
+ * by forgetting.
+ *
+ * Heuristic, and honest about it: it only sees `qi.*` calls, so a migration that
+ * reaches a model through qi.db.getModel() and calls .update() on it is invisible
+ * here. It catches the shape that actually shipped broken, not every possible one.
+ */
+function undeclaredBackfill(migration) {
+  const members = referencedMembers(migration.up).filter((m) => BACKFILL_MEMBERS.has(m));
+  if (members.length === 0) return [];
+  if (migration.touches?.data !== undefined) return [];
+  return members;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Scenarios — generated per adapter, per dialect
 // ═══════════════════════════════════════════════════════════════════════════
@@ -541,7 +518,73 @@ test('the query-interface scan detects members, including bad ones', async () =>
   }
 });
 
+// ---- the backfill heuristic must be capable of failing ----
+// Same discipline as the scan above: a check that never fires is
+// indistinguishable in the output from one that passes honestly.
+test('the backfill heuristic flags an undeclared rewrite and accepts a declared one', async () => {
+  const backfill = async (qi) => {
+    await qi.addColumn('T', 'c', {});
+    await qi.bulkUpdate('T', { c: 1 }, {});
+  };
+
+  assert.deepEqual(
+    undeclaredBackfill({ version: 1, touches: { columns: { T: ['c'] } }, up: backfill }),
+    ['bulkUpdate'],
+    'heuristic missed a bulkUpdate with no touches.data — it would pass anything'
+  );
+
+  assert.deepEqual(
+    undeclaredBackfill({
+      version: 1,
+      touches: { columns: { T: ['c'] }, data: { T: [{ column: 'c', notNull: true }] } },
+      up: backfill
+    }),
+    [],
+    'heuristic flagged a migration that does declare touches.data'
+  );
+
+  assert.deepEqual(
+    undeclaredBackfill({ version: 1, touches: { data: { T: [] } }, up: backfill }),
+    [],
+    'heuristic ignored the explicit empty opt-out'
+  );
+
+  assert.deepEqual(
+    undeclaredBackfill({ version: 1, touches: {}, up: async (qi) => { await qi.bulkInsert('T', [{}]); } }),
+    [],
+    'heuristic fired on bulkInsert, which touches.rows already covers'
+  );
+});
+
 for (const adapter of ADAPTERS) {
+  // ---- rewrites of existing rows declare what they were for ----
+  // Source-level, so it costs nothing and covers branches no scenario reaches.
+  test(`${adapter.label}: every migration that rewrites existing rows declares touches.data`, async () => {
+    const ctx = await openDb('sqlite');
+    try {
+      const all = await registerSchema(ctx.db, adapter);
+
+      const problems = [];
+      for (const migration of all) {
+        const members = undeclaredBackfill(migration);
+        if (members.length > 0) {
+          problems.push(
+            `v${migration.version} up() calls qi.${members.join(', qi.')} but declares no touches.data — ` +
+            `add { data: { Table: [{ column: 'col', notNull: true }] } }, or { data: { Table: [] } } if there is genuinely no invariant`
+          );
+        }
+      }
+
+      assert.deepEqual(
+        problems,
+        [],
+        `${adapter.pluginName} has backfills whose success nothing verifies:\n  ${problems.join('\n  ')}`
+      );
+    } finally {
+      await closeDb(ctx);
+    }
+  });
+
   // ---- every qi.* call resolves, in up() AND down() ----
   // Dialect-independent: the wrapper's surface is the same everywhere, so this
   // runs once on SQLite rather than three times.
@@ -684,6 +727,6 @@ for (const adapter of ADAPTERS) {
 await probeReachability();
 await run();
 
-// Remove the throwaway assembly. Left behind only if the process dies hard,
-// and .gitignore covers it either way.
-fs.rmSync(ASSEMBLY_DIR, { recursive: true, force: true });
+// Remove the throwaway assembly. It is not gitignored — deliberately, so that
+// one left behind by a hard crash shows up in git status rather than lurking.
+cleanAssembly(ASSEMBLY_DIR);

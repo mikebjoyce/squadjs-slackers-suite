@@ -1150,18 +1150,19 @@ Inside `_onS3Ready()`:
 
 #### 9.1.1 — The `touches` Declaration
 
-Every migration **must** declare which tables, columns, and seed rows it creates or modifies. This enables two verification layers:
+Every migration **must** declare which tables, columns, seed rows, and data post-conditions it creates or modifies. This enables two verification layers:
 
-- **Post-migration verification** — after each migration commits, `_verifyMigrationResult()` confirms every declared table/column/row actually exists in the live database. Silent failures (e.g. `ADD COLUMN` that fails silently because the MySQL user lacks `ALTER` privileges) are caught immediately.
-- **Ongoing drift detection** — on every S³ mount, the engine aggregates all `touches.rows` via `getExpectedRows()` and checks that the declared seed rows still exist. This catches data loss across connector swaps, DB restores, or manual edits.
+- **Post-migration verification** — after each migration commits, `_verifyMigrationResult()` confirms every declared table/column/row actually exists in the live database, and that every declared data post-condition holds. Silent failures (e.g. `ADD COLUMN` that fails silently because the MySQL user lacks `ALTER` privileges) are caught immediately.
+- **Ongoing drift detection** — on every S³ mount, the engine aggregates all `touches.rows` via `getExpectedRows()` and all `touches.data` via `getExpectedData()`, then re-checks both. This catches data loss across connector swaps, DB restores, or manual edits.
 
-**Three sub-fields:**
+**Four sub-fields:**
 
 | Field | Format | Purpose |
 |-------|--------|---------|
 | `creates` | `string[]` — table names that this migration creates | Post-migration verifier checks `showAllTables()` |
 | `columns` | `Record<string, string[]>` — table name → column names added to *existing* tables | Post-migration verifier checks `describeTable()` for each column |
 | `rows` | `Record<string, Array<{key: string, value: string}>>` — table name → seed row matchers. Each entry: `{ key: '<columnName>', value: '<expectedValue>' }` tells the verifier to find a row where `key` column equals `value` | Verified after migration commits, and on every S³ mount via drift detection |
+| `data` | `Record<string, Array<{column: string, notNull: true}>>` — table name → post-conditions on column *values* | Verified after migration commits, and on every S³ mount via drift detection. See [§9.1.3](#913--data-post-conditions-touchesdata) |
 
 **Examples:**
 
@@ -1234,6 +1235,48 @@ touches: {
 
 The `key`/`value` pair is used as a `WHERE` clause: `model.findOne({ where: { [key]: value } })`. Multiple pairs = multiple independent rows expected in the table.
 
+#### 9.1.3 — Data Post-Conditions (`touches.data`)
+
+`creates`, `columns` and `rows` all answer *does this thing exist*. None of them answer *did the value actually get written*. `touches.data` closes that gap.
+
+**The failure this exists for.** A migration that adds a column and backfills it can have the backfill do nothing — no rows matched, an early `return`, a guard that skipped the branch — and every existence check still passes. The engine records the version, everything reports green, and the column is empty. This is what shipped as Switch v5 (2026-08-18).
+
+It bites hardest on the servers least able to notice it. A DB user without an `ALTER` grant has its schema applied **by hand**, so by the time `up()` runs the DDL is already satisfied and the data step is the only part the engine actually executes. A silent no-op there is invisible by construction.
+
+**Format:**
+```js
+touches: {
+  columns: { SwitchPlugin_PlayerCooldowns: ['lastActiveTimestamp'] },
+  data: {
+    SwitchPlugin_PlayerCooldowns: [{ column: 'lastActiveTimestamp', notNull: true }]
+  }
+}
+```
+
+**How it works:**
+1. After the migration commits, `_verifyMigrationResult()` runs one `count()` per declaration. Any offending rows produce a composite failure, the error names the count, and **the version is not recorded** — so the next mount sees a pending migration and re-applies the (idempotent) `up()`.
+2. On every S³ mount, `DBService.verifyLiveSchema()` re-checks the same assertion via `getExpectedData()`. A violation is reported as `dataViolations` drift, which is treated exactly like a missing column: the plugin's recorded version is rolled back, the migration gate re-opens, and the admin is prompted to run `!s3 migrate force`.
+
+**The vocabulary is deliberately one word long.** `notNull: true` is the only predicate. Every predicate added is another thing that can be subtly wrong in a way nobody tests, and a rich assertion DSL becomes a second, worse migration language. Add `equals` only when a real case demands it — an unknown key is rejected at registration rather than silently ignored, so a typo cannot pass.
+
+> ⚠️ **Only declare a predicate that holds for the lifetime of the table.**
+>
+> This is re-checked on *every mount*, not just after the migration. If any code path can legitimately write NULL to that column *after* the migration has run, it is not an invariant, and asserting it as one puts the plugin into a rollback-and-re-gate loop on every mount, forever.
+>
+> Before declaring `notNull`, find every write path to that column and confirm each one populates it. Switch v5 qualifies only because connect, disconnect, all three queue token spends, the admin commands, and the scramble-lockdown `bulkCreate` all stamp `lastActiveTimestamp` — the last of which had to be **fixed** to make the declaration true.
+
+**When there is no invariant.** Declare it explicitly:
+
+```js
+touches: { data: { MyPlugin_Table: [] } }
+```
+
+An empty array asserts nothing and contributes nothing to drift detection. It exists so "I considered this and there is no invariant" is distinguishable from "I forgot" — the conformance harness (`s3/testing/test-migration-conformance.js`) **fails** any migration whose `up()` calls `qi.bulkUpdate` without declaring `touches.data` either way. `bulkInsert` is exempt (its rows are covered by `touches.rows`) and so is `bulkDelete` (a deletion leaves no value to assert).
+
+That check is a source scan, so it is honest about its limits: it sees `qi.*` calls only. A migration that reaches a model through `qi.db.getModel()` and calls `.update()` on it is invisible to it. It catches the shape that actually shipped broken, not every possible one.
+
+**Tests:** `s3/testing/test-migration-data-assertions.js` covers registration validation, the post-commit failure, the hand-migrated state, the drift path, and the rollback — on SQLite, MySQL and Postgres. It includes a control case asserting that the *same* no-op backfill passes silently when nothing is declared, so the mechanism cannot pass vacuously.
+
 ### 9.2 — Query Interface (qi) API
 
 The `qi` (QueryInterface) object passed to each migration function provides these methods:
@@ -1283,7 +1326,7 @@ Each `qi` method above is already bound to the migration's transaction, so pass 
 - Pre-migration backup runs **two tiers**: SQLite file-copy backup only when a `dbPath` is available (SQLite connector), and JSON export **always**, regardless of dialect. Migration aborts only if *both* tiers fail — a Postgres/MySQL deployment with a healthy JSON export still proceeds even though it has no file copy.
 - The `verifyAndRunMigrations()` single-call pattern checks schema versions first, runs only pending migrations, and returns the result
 
-**Post-migration verification:** After each migration's `up()` commits, the engine calls `_verifyMigrationResult()` with a fresh (non-transactional) `qi` to check that every table, column, and row declared in the migration's `touches` actually exists in the live database. This catches silent failures — such as `ADD COLUMN` that appears to succeed but doesn't take effect because the MySQL user lacks `ALTER` privileges — before the next migration runs. Verification failures produce a composite error listing all missing tables/columns/rows, and the migration batch is aborted.
+**Post-migration verification:** After each migration's `up()` commits, the engine calls `_verifyMigrationResult()` with a fresh (non-transactional) `qi` to check that every table, column, and row declared in the migration's `touches` actually exists in the live database, and that every `touches.data` post-condition holds. This catches silent failures — such as `ADD COLUMN` that appears to succeed but doesn't take effect because the MySQL user lacks `ALTER` privileges, or a backfill that matched no rows — before the next migration runs. Verification failures produce a composite error listing everything that is missing or unpopulated, and the migration batch is aborted without recording the version.
 
 ### 9.5 — S³ Schema Versions Table
 
@@ -1334,6 +1377,7 @@ The verification runs automatically on every S³ mount (after all consumer plugi
 - Whether the schema is up to date
 - A list of missing tables or columns (when `touches.creates` / `touches.columns` declarations don't match the live schema)
 - A list of missing seed rows (when `touches.rows` declarations don't match)
+- A list of unpopulated columns with offending row counts (when `touches.data` post-conditions no longer hold)
 - Remediation suggestions
 
 #### `!s3 diag`

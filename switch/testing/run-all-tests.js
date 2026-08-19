@@ -27,7 +27,11 @@ const testFiles = [
   'test-admin-clear.js',
   'test-seed-bonus.js',
   'test-token-queue-integration.js',
-  'test-dialect-literals.js'
+  'test-dialect-literals.js',
+  // Builds a flattened assembly via install.cjs so a real Switch instance can
+  // be constructed — slower than the mock-harness suites, and the only one
+  // that runs an event handler end to end into a real database.
+  'test-scramble-lockdown.js'
 ];
 
 console.log('═'.repeat(50));

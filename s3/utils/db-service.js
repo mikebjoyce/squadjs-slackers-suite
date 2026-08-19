@@ -81,8 +81,8 @@
  *
  */
 import SequelizeLib from 'sequelize';
-import MigrationEngine from './migration-engine.js';
-import { stderrWarn } from './s3-stderr.js';
+import MigrationEngine, { countNullColumn } from './migration-engine.js';
+import { stderrError, stderrWarn } from './s3-stderr.js';
 
 export default class DBService {
   constructor({
@@ -376,13 +376,39 @@ export default class DBService {
     // When the DB is unreachable, Sequelize's connection pool may leak
     // rejections that aren't chained to any consumer promise. This handler
     // catches those at the process level and logs them at level 4 (debug).
+    //
+    // CRITICAL: registering ANY unhandledRejection listener replaces Node's
+    // default handler for the WHOLE process — not just for the rejections this
+    // one recognises. Node does not print, and does not exit, once a listener
+    // exists. So an early `return` on the branch below would silently swallow
+    // every unhandled rejection in SquadJS, ours and every other plugin's, from
+    // the moment this service mounts.
+    //
+    // That is not hypothetical: it hid a failed S³ mount completely. A DB user
+    // without a CREATE grant made PlayersService's bootstrap DDL throw, the
+    // rejection propagated to SquadJS's un-caught `main()`, and the result was
+    // a half-mounted S³ with zero output on either stream — the server carried
+    // on as if nothing had happened.
+    //
+    // So anything this handler does not positively recognise is reported, not
+    // dropped. It is deliberately not re-thrown: restoring the crash would let
+    // any unrelated plugin's stray rejection take the game server down, which
+    // is a worse failure than a loud log line.
     this._unhandledRejectionHandler = (reason) => {
       if (
         reason &&
         (DBService.isNetworkError(reason) || reason.name === 'SequelizeConnectionError')
       ) {
         this.verboseLogger(4, `[DB] Suppressed unhandled rejection (Sequelize internal): ${reason?.message || reason}`);
+        return;
       }
+      const message = reason?.message || String(reason);
+      this.verboseLogger(1, `[DB] UNHANDLED REJECTION: ${message}`);
+      stderrError(
+        'UnhandledRejection',
+        `An unhandled promise rejection reached the process: ${message}`,
+        reason instanceof Error ? reason : undefined
+      );
     };
     process.on('unhandledRejection', this._unhandledRejectionHandler);
 
@@ -1010,10 +1036,11 @@ export default class DBService {
     // the drift check finishes.
     this.verifyLiveSchema().then(async drift => {
       this._lastDriftResult = drift;
-      // Only invoke recovery for missing columns or missing rows — extra-only
-      // drift does not block the gate. _handleDetectedDrift() re-opens the gate
-      // and returns without closing it; the caller must not fall through to gate-null.
-      const hasMissing = drift.some(e => e.missing || e.missingRows);
+      // Only invoke recovery for missing columns, missing rows, or violated data
+      // post-conditions — extra-only drift does not block the gate.
+      // _handleDetectedDrift() re-opens the gate and returns without closing it;
+      // the caller must not fall through to gate-null.
+      const hasMissing = drift.some(e => e.missing || e.missingRows || e.dataViolations);
       if (hasMissing) {
         await this._handleDetectedDrift(drift);
         return;
@@ -1045,7 +1072,7 @@ export default class DBService {
    * columns are missing (e.g. a prior migration's ADD COLUMN silently failed
    * due to MySQL permissions).
    *
-   * @param {Array<{pluginName: string, table: string, model?: string, missing?: string[], missingRows?: Array<{key: string, value: string}>, extra?: string[], error?: string}>} drift
+   * @param {Array<{pluginName: string, table: string, model?: string, missing?: string[], missingRows?: Array<{key: string, value: string}>, dataViolations?: Array<{column: string, offenders: number}>, extra?: string[], error?: string}>} drift
    */
   async _handleDetectedDrift(drift) {
     const stderrLines = [];
@@ -1057,6 +1084,11 @@ export default class DBService {
       if (entry.missingRows) {
         this.verboseLogger(1, `[DB] POST-MIGRATION ROW DRIFT: ${entry.table} missing row(s): ${entry.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
         stderrLines.push(`${entry.pluginName}: ${entry.table} missing row(s): ${entry.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
+      }
+      if (entry.dataViolations) {
+        const summary = entry.dataViolations.map(v => `${v.offenders} row(s) with NULL "${v.column}"`).join('; ');
+        this.verboseLogger(1, `[DB] POST-MIGRATION DATA DRIFT: ${entry.table}: ${summary}`);
+        stderrLines.push(`${entry.pluginName}: ${entry.table}: ${summary}`);
       }
     }
     // Mirror to stderr for operators who split the streams. WARN rather than
@@ -1070,8 +1102,9 @@ export default class DBService {
         stderrLines.join('\n')
       );
     }
-    // Only act on missing columns or missing rows — extra columns are informational only
-    const pluginNames = [...new Set(drift.filter(e => e.missing || e.missingRows).map(e => e.pluginName))];
+    // Only act on missing columns, missing rows, or violated data post-conditions
+    // — extra columns are informational only
+    const pluginNames = [...new Set(drift.filter(e => e.missing || e.missingRows || e.dataViolations).map(e => e.pluginName))];
     if (pluginNames.length === 0) {
       this.verboseLogger(2, '[DB] Drift detected but only extra columns — no recovery needed.');
       return;
@@ -1138,15 +1171,19 @@ export default class DBService {
    * Verify live schema against registered Sequelize model definitions.
    * Diffs each plugin's registered models' rawAttributes against the actual
    * database columns via describeTable(). Returns an array of drift entries.
-   * Called on every mount (metadata-only, negligible cost).
+   * Called on every mount. Schema checks are metadata-only. The data checks add
+   * one COUNT per declared post-condition, and only migrations that declare
+   * touches.data contribute any. Each COUNT is an unindexed scan, so declaring
+   * one on a table with millions of rows wants an index on the asserted column.
    *
    * Drift entry shapes:
-   *   { pluginName, table, error }       — describeTable() failure or row-verification error
-   *   { pluginName, table, missing }     — columns expected in model but absent from DB
-   *   { pluginName, table, missingRows } — seed rows declared via migration touches.rows absent from DB
-   *   { pluginName, table, extra }       — columns in DB but not in model
+   *   { pluginName, table, error }          — describeTable() failure, or row/data verification error
+   *   { pluginName, table, missing }        — columns expected in model but absent from DB
+   *   { pluginName, table, missingRows }    — seed rows declared via migration touches.rows absent from DB
+   *   { pluginName, table, dataViolations } — touches.data post-conditions no longer hold
+   *   { pluginName, table, extra }          — columns in DB but not in model
    *
-   * @returns {Promise<Array<{pluginName: string, table: string, model?: string, missing?: string[], missingRows?: Array<{key: string, value: string}>, extra?: string[], error?: string}>>}
+   * @returns {Promise<Array<{pluginName: string, table: string, model?: string, missing?: string[], missingRows?: Array<{key: string, value: string}>, dataViolations?: Array<{column: string, offenders: number}>, extra?: string[], error?: string}>>}
    */
   async verifyLiveSchema() {
     if (this._pluginModels.size === 0) {
@@ -1207,33 +1244,12 @@ export default class DBService {
     if (this._migrationEngine) {
       const expectedRows = this._migrationEngine.getExpectedRows();
       for (const [tableName, rowDefs] of expectedRows.entries()) {
-        // Find which plugin owns this table by checking _pluginModels.
-        // We need the model name (registered via registerExpectedVersion's models[]).
-        let owningPlugin = null;
-        for (const [pn, modelNames] of this._pluginModels.entries()) {
-          for (const mn of modelNames) {
-            const m = this.models[mn];
-            if (m && (m.tableName || m.name) === tableName) {
-              owningPlugin = pn;
-              break;
-            }
-          }
-          if (owningPlugin) break;
-        }
-        if (!owningPlugin) {
+        const owner = this._resolveTableOwner(tableName);
+        if (!owner) {
           // No registered plugin claims this table — skip to avoid false positives
           continue;
         }
-
-        // Resolve the model for this table
-        let rowModel = null;
-        for (const mn of (this._pluginModels.get(owningPlugin) || [])) {
-          const m = this.models[mn];
-          if (m && (m.tableName || m.name) === tableName) {
-            rowModel = m;
-            break;
-          }
-        }
+        const { pluginName: owningPlugin, model: rowModel } = owner;
         if (!rowModel) {
           drift.push({ pluginName: owningPlugin, table: tableName, error: 'Row verification: model not found in registry' });
           continue;
@@ -1248,6 +1264,39 @@ export default class DBService {
           } catch (err) {
             drift.push({ pluginName: owningPlugin, table: tableName, error: `Row verification failed: ${err.message}` });
           }
+        }
+      }
+
+      // ── Data drift detection ─────────────────────────────────
+      // Re-check touches.data post-conditions on every mount. The migration-time
+      // check in _verifyMigrationResult() only sees the moment after up() ran;
+      // this sees a database that has since been restored from an older dump,
+      // switched connectors, or edited by hand. Nothing else would look, because
+      // nothing re-runs a version the tracker already considers current.
+      const expectedData = this._migrationEngine.getExpectedData?.() || new Map();
+      for (const [tableName, dataDefs] of expectedData.entries()) {
+        const owner = this._resolveTableOwner(tableName);
+        if (!owner) continue;
+        const { pluginName: owningPlugin, model: dataModel } = owner;
+        if (!dataModel) {
+          drift.push({ pluginName: owningPlugin, table: tableName, error: 'Data verification: model not found in registry' });
+          continue;
+        }
+
+        const violations = [];
+        for (const def of dataDefs) {
+          if (def.notNull !== true) continue;
+          try {
+            const offenders = await countNullColumn(dataModel, def.column);
+            if (offenders > 0) {
+              violations.push({ column: def.column, offenders });
+            }
+          } catch (err) {
+            drift.push({ pluginName: owningPlugin, table: tableName, error: `Data verification failed for "${def.column}": ${err.message}` });
+          }
+        }
+        if (violations.length > 0) {
+          drift.push({ pluginName: owningPlugin, table: tableName, dataViolations: violations });
         }
       }
     }
@@ -1266,6 +1315,9 @@ export default class DBService {
         if (entry.missingRows) {
           this.verboseLogger(1, `[DB] ROW DRIFT: ${entry.table} missing row(s): ${entry.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
         }
+        if (entry.dataViolations) {
+          this.verboseLogger(1, `[DB] DATA DRIFT: ${entry.table} ${entry.dataViolations.map(v => `${v.offenders} row(s) with NULL ${v.column}`).join('; ')}`);
+        }
         if (entry.extra) {
           this.verboseLogger(2, `[DB] DRIFT: ${entry.table} has extra columns: ${entry.extra.join(', ')}`);
         }
@@ -1273,6 +1325,36 @@ export default class DBService {
     }
 
     return drift;
+  }
+
+  /**
+   * Resolve which registered plugin owns a raw table name, and that plugin's
+   * model for it. Model names are not always table names — a model registered
+   * as 'Elo_PluginState' backs the table 'Elo_PluginStates' — so both the
+   * ownership lookup and the model lookup match on tableName with a fallback
+   * to the model name, exactly as verifyLiveSchema does for column drift.
+   *
+   * Returns null when no registered plugin claims the table — callers skip
+   * rather than report a false drift, because a table nobody registered a model
+   * for is not something this service can have an opinion about.
+   *
+   * `model` is non-null whenever a result is returned (ownership is established
+   * *by* finding the model). Callers still guard, so that a future change to the
+   * matching rule surfaces as a drift entry rather than a TypeError mid-mount.
+   *
+   * @param {string} tableName
+   * @returns {{ pluginName: string, model: Object }|null}
+   */
+  _resolveTableOwner(tableName) {
+    for (const [pluginName, modelNames] of this._pluginModels.entries()) {
+      for (const mn of modelNames) {
+        const m = this.models[mn];
+        if (m && (m.tableName || m.name) === tableName) {
+          return { pluginName, model: m };
+        }
+      }
+    }
+    return null;
   }
 
   /* ────────────────────────────────────── INTERNAL ────────────────────────────────────── */

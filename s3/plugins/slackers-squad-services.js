@@ -149,7 +149,7 @@ import ServerConfigService from '../utils/server-config-service.js';
 import LoggingService from '../utils/logging-service.js';
 import crypto from 'node:crypto';
 import { registerS3DiscordCommands } from '../utils/s3-discord.js';
-import { configureStderrDiagnostics, flushStderrDiagnostics } from '../utils/s3-stderr.js';
+import { configureStderrDiagnostics, flushStderrDiagnostics, stderrError } from '../utils/s3-stderr.js';
 import { buildMigrationEmbed } from '../utils/s3-migration-discord.js';
 export default class SlackersSquadServices extends BasePlugin {
   static get description() {
@@ -160,7 +160,7 @@ export default class SlackersSquadServices extends BasePlugin {
     return false;
   }
 
-  static get version() { return '1.3.1'; }
+  static get version() { return '1.4.0'; }
 
   static get optionsSpecification() {
     return {
@@ -423,39 +423,72 @@ export default class SlackersSquadServices extends BasePlugin {
     });
   }
 
+  /**
+   * Mount one service, naming it if it throws.
+   *
+   * SquadJS mounts plugins with `Promise.all(...)` from an un-caught `main()`,
+   * so a rejection here surfaces as an unhandled rejection rather than as
+   * anything a caller handles. Once DBService has mounted it has also installed
+   * a process-level listener for those, which means the server keeps running
+   * with a half-mounted S³ — so a service failing after `db` needs to announce
+   * itself or it announces nothing. Reporting the service by name is the
+   * difference between "S³ is broken" and "PlayersService could not create its
+   * table". Re-thrown unchanged: this adds a diagnostic, it does not decide
+   * that a failed mount is survivable.
+   *
+   * Reports through stderrError directly rather than reportError(): this class
+   * extends SquadJS's BasePlugin, not S3PluginBase, so it has no reportError.
+   *
+   * @param {string} name - Service key, used in the message
+   * @param {Function} fn - Async thunk performing the mount
+   */
+  async _mountService(name, fn) {
+    try {
+      await fn();
+    } catch (err) {
+      this.verbose(1, `[S3] ${name} service failed to mount: ${err.message}`);
+      stderrError(
+        'S3Mount',
+        `${name} service failed to mount — S³ is only partially available.`,
+        err
+      );
+      throw err;
+    }
+  }
+
   async mount() {
     // Belt and braces — prepareToMount() has normally already done this.
     this._configureStderrDiagnostics();
 
     if (this.services.serverConfig) {
-      await this.services.serverConfig.mount();
+      await this._mountService('serverConfig', () => this.services.serverConfig.mount());
     }
 
     if (this.services.db) {
-      await this.services.db.mount();
+      await this._mountService('db', () => this.services.db.mount());
     }
 
     if (this.services.gameState) {
       // Push S³'s ignoredGameModes config into GameStateService before mount
       // so isIgnoredMode() reads the single source of truth.
       this.services.gameState.setIgnoredGameModes(this.options.ignoredGameModes);
-      await this.services.gameState.mount();
+      await this._mountService('gameState', () => this.services.gameState.mount());
     }
 
     if (this.services.factions) {
-      await this.services.factions.mount();
+      await this._mountService('factions', () => this.services.factions.mount());
     }
 
     if (this.services.clans) {
-      await this.services.clans.mount();
+      await this._mountService('clans', () => this.services.clans.mount());
     }
 
     if (this.services.players) {
-      await this.services.players.mount();
+      await this._mountService('players', () => this.services.players.mount());
     }
 
     if (this.services.logging) {
-      await this.services.logging.mount();
+      await this._mountService('logging', () => this.services.logging.mount());
     }
 
     this._bindServerEvents();
@@ -480,6 +513,10 @@ export default class SlackersSquadServices extends BasePlugin {
             .filter(e => e.missingRows)
             .map(e => `- **${e.table}**: ${e.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
           if (missingRows.length > 0) parts.push(missingRows.join('\n'));
+          const dataViolations = drift
+            .filter(e => e.dataViolations)
+            .map(e => `- **${e.table}**: ${e.dataViolations.map(v => `${v.offenders} row(s) with empty \`${v.column}\``).join(', ')}`);
+          if (dataViolations.length > 0) parts.push(dataViolations.join('\n'));
           const description = parts.length > 0
             ? `Schema or data drift detected — expected state is missing from the live database.\nUse \`!s3 migrate force\` to re-apply.\n\n${parts.join('\n')}`
             : `Schema drift detected — use \`!s3 migrate verify\` for details.`;
@@ -697,12 +734,12 @@ export default class SlackersSquadServices extends BasePlugin {
         this.verbose(1, `[S3 Migration] Schema drift detected on up-to-date server — ${drift.length} issue(s).`);
         await db._handleDetectedDrift(drift);
         // Only re-schedule the migration prompt if the drift includes missing
-        // columns or missing rows — extra-only drift is informational and does
-        // not require admin intervention. _handleDetectedDrift() only re-opens
-        // the migration gate when missing columns or rows are found;
-        // unconditionally re-scheduling here would create an infinite loop
-        // since extra-only drift never creates a pending migration.
-        if (drift.some(e => e.missing || e.missingRows)) {
+        // columns, missing rows, or violated data post-conditions — extra-only
+        // drift is informational and does not require admin intervention.
+        // _handleDetectedDrift() only re-opens the migration gate for those
+        // three; unconditionally re-scheduling here would create an infinite
+        // loop since extra-only drift never creates a pending migration.
+        if (drift.some(e => e.missing || e.missingRows || e.dataViolations)) {
           this._scheduleMigrationPrompt();
         }
       }

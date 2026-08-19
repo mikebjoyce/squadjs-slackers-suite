@@ -175,7 +175,7 @@ import SwitchExplain from '../utils/switch-explain.js';
  *
  */
 export default class Switch extends S3DiscordPluginBase {
-    static version = '2.5.4';
+    static version = '2.5.5';
 
     static get description() {
         return "Switch plugin with persistent join timers";
@@ -484,11 +484,17 @@ export default class Switch extends S3DiscordPluginBase {
      * and ChangeTeam detection.
      */
     _checkS3Version() {
+        // 1.4.0 — migration v5 declares touches.data, which only S³ 1.4.0 and
+        // later validate or verify. An older engine ignores the key silently:
+        // registration succeeds, the migration applies, and the operator is left
+        // believing the backfill is checked when nothing checks it. That is the
+        // exact failure this plugin was patched for, so it fails at mount instead.
+        //
         // 1.2.2 — the token grants call _s3db.incrementLiteral() and checkPlayer()
         // calls _s3db.caseInsensitiveLikeOp(), both added in S³ 1.2.2. Against an
         // older S³ these are undefined, so the seed-bonus UPDATE would throw
         // mid-grant rather than failing at mount where it is diagnosable.
-        const required = '1.2.2';
+        const required = '1.4.0';
         const actual = this._s3?.version;
         if (!actual || actual < required) {
             throw new Error(
@@ -2220,10 +2226,27 @@ export default class Switch extends S3DiscordPluginBase {
             return;
         }
 
-         const records = lockoutPlayers
-             .map(p => {
-                 return { eosID: p.eosID, steamID: p.steamID ?? null, playerName: p.name, scrambleLockdownExpiry: expiry };
-             });
+        // lastActiveTimestamp is stamped here because a player being locked out
+        // was, by definition, on the server when the scramble fired.
+        //
+        // This bulkCreate is a row-creating path: a player who joined outside
+        // seed mode and never spent a token has no cooldown row, so the scramble
+        // is what creates it. Omitting the column made that row immortal —
+        // cleanup() requires lastActiveTimestamp != null before it prunes
+        // anything — and, since Switch v5 declares a notNull post-condition on
+        // the column that drift detection re-checks on every mount, it would
+        // also have re-gated the plugin after any scramble. See the
+        // lastActiveTimestamp comment in switch-db.js for the full write-path
+        // list this belongs to.
+        //
+        // Only the create side needs it: updateOnDuplicate below deliberately
+        // omits the column, leaving an existing row's value to the join/leave
+        // handlers that track it accurately.
+        const nowDate = new Date();
+        const records = lockoutPlayers
+            .map(p => {
+                return { eosID: p.eosID, steamID: p.steamID ?? null, playerName: p.name, scrambleLockdownExpiry: expiry, lastActiveTimestamp: nowDate };
+            });
 
         this.verbose(3, `[SCRAMBLE_EVENT] Created ${records.length} lockdown records for DB write`);
 

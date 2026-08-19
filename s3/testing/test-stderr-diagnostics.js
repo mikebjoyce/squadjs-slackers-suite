@@ -241,6 +241,35 @@ async function runChildCase(caseName) {
     return;
   }
 
+  // ── Process-level unhandled rejections ─────────────────────────────
+  // DBService.mount() installs a process 'unhandledRejection' listener to keep
+  // Sequelize pool noise out of the log. Installing ANY such listener replaces
+  // Node's default handler for the whole process, so whatever that listener
+  // declines to report is gone — from every plugin, not just S³. These two
+  // cases pin both halves of that contract, and they must run in a child
+  // because the behaviour under test is the process's, not a function's.
+  if (caseName === 'unhandled-rejection-reported') {
+    configureStderrDiagnostics({ mode: 'mirror' });
+    await fixtureDb();
+    Promise.reject(new Error('escaped-rejection-marker'));
+    await new Promise((r) => setTimeout(r, 250));
+    flushStderrDiagnostics();
+    console.log('child-stdout-marker');
+    return;
+  }
+
+  if (caseName === 'unhandled-rejection-sequelize-suppressed') {
+    configureStderrDiagnostics({ mode: 'mirror' });
+    await fixtureDb();
+    const poolNoise = new Error('pool-noise-marker');
+    poolNoise.name = 'SequelizeConnectionError';
+    Promise.reject(poolNoise);
+    await new Promise((r) => setTimeout(r, 250));
+    flushStderrDiagnostics();
+    console.log('child-stdout-marker');
+    return;
+  }
+
   throw new Error(`unknown case "${caseName}"`);
 }
 
@@ -351,6 +380,30 @@ test('schema drift writes a WARN block naming the missing column', async () => {
   assert.match(stderr, /\[S3\] \[WARN\] \[SchemaDrift\]/, 'no greppable S3 WARN prefix on stderr');
   assert.match(stderr, /lastActiveTimestamp/, 'missing column not named in the stderr block');
   assert.match(stderr, /!s3 migrate force/, 'stderr block does not say how to recover');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3b. The process-level rejection handler does not swallow other people's work
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('an unrecognised unhandled rejection is reported, not swallowed', async () => {
+  // Regression: DBService.mount() installs a process 'unhandledRejection'
+  // listener for Sequelize pool noise. Because Node disables its own default
+  // handler as soon as any listener exists, an early return on the recognised
+  // branch silently ate EVERY unhandled rejection in SquadJS — which is how a
+  // failed S³ mount produced no output at all on either stream.
+  const { stdout, stderr } = capture('unhandled-rejection-reported');
+  assert.ok(stdout.includes('child-stdout-marker'), 'fixture did not run to completion');
+  assert.match(stderr, /escaped-rejection-marker/, 'the rejection vanished — nothing would ever surface it');
+  assert.match(stderr, /\[S3\] \[ERROR\] \[UnhandledRejection\]/, 'no greppable S3 ERROR prefix on stderr');
+});
+
+test('Sequelize connection-pool rejections stay suppressed', async () => {
+  // The other half: the handler exists for a reason, and a DB outage must not
+  // fill the error file with pool churn the operator can do nothing about.
+  const { stdout, stderr } = capture('unhandled-rejection-sequelize-suppressed');
+  assert.ok(stdout.includes('child-stdout-marker'), 'fixture did not run to completion');
+  assert.doesNotMatch(stderr, /pool-noise-marker/, 'pool noise leaked into the error file');
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -49,6 +49,8 @@ const CATEGORY_TESTS = {
     'test-dialect-portability.js',
     // Same shape: SQLite always runs, MySQL/Postgres self-skip when unreachable.
     'test-migration-bulk-types.js',
+    // touches.data post-conditions: same shape again, all three engines.
+    'test-migration-data-assertions.js',
     // Spawns child processes to assert stdout/stderr separation.
     'test-stderr-diagnostics.js',
     // Replays every plugin's real migrations across DB states. Builds a

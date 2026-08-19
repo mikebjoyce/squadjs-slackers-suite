@@ -117,6 +117,22 @@ const SwitchDB = {
       // player connected for days without spending would be prunable the instant
       // they disconnect. Replaces firstSeenTimestamp, which only ever recorded row
       // creation and so could not express staleness at all.
+      //
+      // v2.5.5: This column carries a migration post-condition — v5 declares
+      // touches.data notNull on it, which drift detection re-checks on EVERY
+      // mount. A row created without it does not merely age badly (cleanup()
+      // requires lastActiveTimestamp != null before pruning, so NULL rows are
+      // immortal); it fails the assertion and puts Switch into a
+      // rollback-and-re-gate loop until an operator re-runs the migration.
+      //
+      // Every path that CREATES a row must therefore stamp it. As of v2.5.5:
+      //   switch.js         onS3PlayerJoined seed-mode create
+      //   switch.js         seed-grant bulkCreate for connected players with no row
+      //   switch.js         scramble lockdown bulkCreate (fixed in v2.5.5)
+      //   switch-queue.js   all three token-spend upserts
+      //   switch-commands.js  the admin grant/reset upserts
+      // The join and leave handlers are UPDATE ... WHERE eosID — they no-op when
+      // no row exists, so they maintain the value but never introduce a NULL.
       lastActiveTimestamp: {
         type: plugin._s3db.getDataTypes().DATE,
         allowNull: true
@@ -355,6 +371,22 @@ const SwitchDB = {
         touches: {
           columns: {
             SwitchPlugin_PlayerCooldowns: ['lastActiveTimestamp']
+          },
+          // The column existing is not the point of this migration — the column
+          // being *populated* is. Declaring it here makes the backfill's success
+          // a condition of recording v5, and re-checks it on every mount, which
+          // is the only thing that would have caught the hand-migrated server
+          // where the ALTER was already done and the backfill silently no-opped.
+          //
+          // This is re-checked forever, so it is only safe because every path
+          // that CREATES a row stamps the column — see the lastActiveTimestamp
+          // comment on the model above for the authoritative list. The join and
+          // leave handlers are UPDATEs that no-op when no row exists, so they
+          // cannot introduce a NULL; only the creating paths can. Adding a row
+          // creator that omits this column would put Switch into a
+          // rollback-and-re-gate loop on every mount.
+          data: {
+            SwitchPlugin_PlayerCooldowns: [{ column: 'lastActiveTimestamp', notNull: true }]
           }
         },
         up: async (qi) => {
