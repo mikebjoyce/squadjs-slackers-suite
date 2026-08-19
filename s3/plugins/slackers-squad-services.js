@@ -149,6 +149,7 @@ import ServerConfigService from '../utils/server-config-service.js';
 import LoggingService from '../utils/logging-service.js';
 import crypto from 'node:crypto';
 import { registerS3DiscordCommands } from '../utils/s3-discord.js';
+import { configureStderrDiagnostics, flushStderrDiagnostics } from '../utils/s3-stderr.js';
 import { buildMigrationEmbed } from '../utils/s3-migration-discord.js';
 export default class SlackersSquadServices extends BasePlugin {
   static get description() {
@@ -159,7 +160,7 @@ export default class SlackersSquadServices extends BasePlugin {
     return false;
   }
 
-  static get version() { return '1.2.4'; }
+  static get version() { return '1.3.1'; }
 
   static get optionsSpecification() {
     return {
@@ -262,6 +263,20 @@ export default class SlackersSquadServices extends BasePlugin {
         type: 'boolean',
         description: 'When true, pending schema migrations are applied automatically on startup without Discord confirmation. Defaults to false.',
         default: false
+      },
+      stderrDiagnostics: {
+        required: false,
+        type: 'string',
+        description:
+          "Whether S³ failures are also copied to stderr. 'off' (default) changes nothing — everything goes to the SquadJS log as before. Set 'mirror' if you split the streams (`node index.js > squadjs.log 2> squadjs.err`, or pm2's separate out/err files) and want migration failures, DB errors and schema drift to land in the error file with their stack traces. 'auto' copies only when stdout and stderr lead to different places, for a config shared between a console session and a redirected service. Under Docker's default log driver or systemd/journald both streams end up in one sink, so 'mirror' there means every error appears twice.",
+        default: 'off'
+      },
+      stderrDedupeWindowSeconds: {
+        required: false,
+        type: 'number',
+        description:
+          'Identical stderr events inside this window are counted rather than written, with the tally emitted afterwards. Stops a DB outage — which throws on every tick — from filling the error file. Defaults to 60.',
+        default: 60
       }
     };
   }
@@ -319,6 +334,16 @@ export default class SlackersSquadServices extends BasePlugin {
   }
 
   async prepareToMount() {
+    // Configure the stderr channel here, not in mount(). SquadJS calls
+    // prepareToMount() on every plugin before mounting any of them, and S³ is
+    // required to be first in the plugins array — so this is the earliest point
+    // at which the operator's setting is known, and it lands before any consumer
+    // plugin can fail. Doing it in mount() was too late for a whole class of
+    // failure: S3DiscordPluginBase fetches its channel during prepareToMount, so
+    // a bad channelID reported through reportError() was always suppressed by the
+    // 'off' default and never reached the error file. Caught on a live server.
+    this._configureStderrDiagnostics();
+
     this.services.db = new DBService({
       parent: this,
       server: this.server,
@@ -381,7 +406,27 @@ export default class SlackersSquadServices extends BasePlugin {
     });
   }
 
+  /**
+   * Apply the operator's stderr settings to the diagnostic channel.
+   *
+   * Called from prepareToMount() so it takes effect before any plugin can fail,
+   * and again from mount() so a host that mounts without preparing (tests, or a
+   * future SquadJS change) still gets configured. Idempotent.
+   */
+  _configureStderrDiagnostics() {
+    const stderrMode = ['auto', 'mirror', 'off'].includes(this.options.stderrDiagnostics)
+      ? this.options.stderrDiagnostics
+      : 'off';
+    configureStderrDiagnostics({
+      mode: stderrMode,
+      windowMs: Math.max(0, Number(this.options.stderrDedupeWindowSeconds ?? 60)) * 1000
+    });
+  }
+
   async mount() {
+    // Belt and braces — prepareToMount() has normally already done this.
+    this._configureStderrDiagnostics();
+
     if (this.services.serverConfig) {
       await this.services.serverConfig.mount();
     }
@@ -471,6 +516,11 @@ export default class SlackersSquadServices extends BasePlugin {
    * cleanup will work correctly.
    */
   async unmount() {
+    // Emit any suppressed stderr tallies before shutting down — a burst that
+    // stopped before its dedupe window closed would otherwise never report its
+    // final count, which is exactly the number an operator wants after an outage.
+    flushStderrDiagnostics();
+
     // Clean up migration prompt debounce timer
     if (this._migrationPromptTimer) {
       clearTimeout(this._migrationPromptTimer);

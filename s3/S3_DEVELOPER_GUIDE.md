@@ -1248,12 +1248,23 @@ The `qi` (QueryInterface) object passed to each migration function provides thes
 | `createTable(name, attrs, opts?)` | `(string, object, object?) => Promise` | Create table |
 | `dropTable(name, opts?)` | `(string, object?) => Promise` | Drop table |
 | `showAllTables()` | `() => Promise<string[]>` | List all tables |
+| `describeTable(table)` | `(string) => Promise<object>` | Column map for a table |
+| `bulkInsert(table, rows, opts?)` | `(string, object[], object?) => Promise` | Insert rows |
+| `bulkUpdate(table, values, where?, opts?)` | `(string, object, object?, object?) => Promise` | Set-wide UPDATE (backfills) |
+| `bulkDelete(table, where?, opts?)` | `(string, object?, object?) => Promise` | Set-wide DELETE |
 | `rawQuery(sql, replacements?)` | `(string, object?) => Promise<*>` | Execute raw SQL |
 | `sequelize` | property | Direct Sequelize access |
 | `db` | property | DBService instance |
 | `transaction` | property | Active Sequelize transaction |
+| `DataTypes` | property | Sequelize DataTypes for column defs |
 
-> **Best practice — use model-based access for DML in migrations.** For data-manipulation operations (inserts, upserts, destroys) inside migration `up()`/`down()` handlers, use `qi.db.getModel('ModelName')` to access the Sequelize model and call `create()`/`upsert()`/`destroy()` on it. This is **dialect-safe** — Sequelize handles correct identifier quoting (backticks for MySQL, double quotes for PostgreSQL) and type coercion automatically. Avoid `qi.bulkInsert()` / `qi.bulkDelete()` for data rows, as these can produce dialect-inconsistent SQL. See the Switch plugin migration v4 (`switch-db.js`) for a real-world example of model-based seed row insertion.
+Each `qi` method above is already bound to the migration's transaction, so pass options only for the operation itself. `qi.transaction` is exposed for model calls, which do need it explicitly.
+
+> **Best practice — use model-based access for row-level DML in migrations.** For single-row work (inserts, upserts, destroys) inside migration `up()`/`down()` handlers, use `qi.db.getModel('ModelName')` and call `create()`/`upsert()`/`destroy()` on it. Sequelize then handles identifier quoting (backticks for MySQL, double quotes for PostgreSQL) and type coercion for you. See Switch migration v4 (`switch-db.js`) for a real-world example of model-based seed row insertion.
+>
+> For **set-wide** work — backfilling a column across every row — use `qi.bulkUpdate()`. It resolves the registered model's attribute types automatically, which matters more than it looks: Sequelize's low-level bulk API escapes values by their JS shape when it has no types, and on SQLite a `Date` then lands in the column as an **integer epoch** rather than the TEXT that `DataTypes.DATE` reads back. Every subsequent read of that row dies with `date.includes is not a function`. MySQL and Postgres escape a `Date` to a datetime literal either way, so this reaches production on SQLite deployments only. If you bypass the wrapper and call `qi.sequelize.getQueryInterface().bulkUpdate()` directly, you must pass `model.rawAttributes` as the fifth argument yourself.
+
+> **Write backfills so they survive a re-run.** Do not nest a backfill inside the `if (!columns.x)` guard that adds the column — the column existing does not prove the data step ran. A DB whose user lacks `ALTER` privileges gets its DDL applied by hand, and an attempt that failed after the `ALTER` leaves the same state: column present, every row NULL. Match on `{ col: { [Op.is]: null } }` instead, outside the guard, so `!s3 migrate force` repairs those rows and leaves rows stamped by live gameplay untouched. `Op.is` generates a real `IS NULL`; a bare `col: null` in a raw where-clause can become the `= NULL` that matches nothing. Switch migration v5 is the reference implementation, and `s3/testing/test-migration-bulk-types.js` locks both behaviours down against real engines.
 
 ### 9.3 — Version Numbering
 
@@ -1344,6 +1355,66 @@ A consolidated read‑only diagnostic command that surfaces:
 | Pre‑upgrade schema check | `!s3 migrate verify` |
 
 Both commands require S³'s Discord admin channel to be configured (`channelID` in config).
+
+### 9.9 — Failure Diagnostics on stderr
+
+SquadJS's `Logger` writes everything to stdout. Operators who split the streams —
+
+```bash
+node index.js > squadjs.log 2> squadjs.err
+```
+
+— therefore saw an empty error file no matter what broke. S³ mirrors its operational failures to **fd 2** so they land in `squadjs.err`:
+
+| Event | Level | Scope |
+|-------|-------|-------|
+| A migration's `up()` throws | `ERROR` | `MigrationEngine` |
+| Pre-migration backup fails (migration aborted) | `ERROR` | `MigrationEngine` |
+| Schema drift with missing columns or rows | `WARN` | `SchemaDrift` |
+| `_withDb()` transaction fails | `ERROR` | `<Plugin>:DB` |
+| A plugin's command/event handler catch-all | `ERROR` | `<Plugin>:Commands` |
+| Discord channel fetch or message send fails | `ERROR` | `<Plugin>:Discord` |
+
+```
+[2026-08-19T01:57:49.856Z] [S3] [ERROR] [MigrationEngine] "switch" v4 -> v5 failed: qi.bulkUpdate is not a function
+    TypeError: qi.bulkUpdate is not a function
+    at Object.up (file:///.../switch/utils/switch-db.js:387:22)
+    at file:///.../s3/utils/migration-engine.js:608:29
+```
+
+The fixed prefix is the point: `grep '\[S3\] \[ERROR\]' squadjs.err` returns S³ events and nothing else. The block also carries the **stack**, which the Discord embed does not — the embed renders `err.message` only, so the failing migration file was previously unidentifiable from Discord alone.
+
+**Reporting from a consumer plugin.** `S3PluginBase.reportError(scope, summary, err, options?)` logs at verbose level 1 *and* mirrors to stderr — use it in place of a bare `this.verbose(1, ...)` for a caught error an operator would want to find afterwards. Pass `{ includeStackInLog: true }` at sites that already logged the stack to stdout, so nothing a stdout-only reader used to see disappears. Services that aren't plugins take an injected reporter instead (see `EloDatabase`, whose owning plugin assigns `db.reportError`), which keeps consumer utils from importing S³ internals — `install.cjs` flattens every plugin's `utils/` into one directory, so a cross-plugin relative import that resolves in `out/` will not resolve in this source tree.
+
+Do **not** route expected conditions or retry-and-recover paths through it. Elo's `_withDb` deliberately skips lock-contention errors: they are normal under concurrency and already retried, so mirroring them would fill the error file with noise the operator can do nothing about.
+
+**Configuration.**
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `stderrDiagnostics` | `'off'` | `'off'` = stdout only, identical to pre-1.3.0; `'mirror'` = always copy to stderr; `'auto'` = copy unless fd 1 and fd 2 share a destination |
+| `stderrDedupeWindowSeconds` | `60` | Identical events inside the window are counted, not written |
+
+**The default is `'off'`, and that is the point.** Installing or upgrading S³ must not change what appears in anyone's logs. This channel only helps an operator who has already separated their streams — and separating them is a deliberate act, done by someone who will also read a config option. Defaulting to on would have handed duplicated lines to console users and Docker/journald users, and moved errors into a new file for pm2 users, none of whom asked for anything.
+
+`'auto'` exists for a config shared between a console session and a redirected service: it calls `fstat` on fd 1 and fd 2 and suppresses the copy when dev/inode/rdev match, covering a shared file and a shared console device. It cannot see Docker's default log driver or systemd/journald, which hand the process two distinct pipes and merge them downstream — under those, `'auto'` behaves as `'mirror'` and you get doubles.
+
+**Flood control.** Migration failures happen once per restart; runtime errors do not. When the DB goes away, `_withDb` throws every tick, and an unthrottled mirror turns an outage into an error file that fills the disk — a worse failure than the one being reported. Identical events are therefore deduplicated by fingerprint:
+
+```
+[...] [S3] [ERROR] [Switch:DB] Error in _withDb: SQLITE_ERROR: no such column: lastActiveTimestamp
+[...] [S3] [ERROR] [Switch:DB] (suppressed 499 identical event(s) over 60s) Error in _withDb: SQLITE_ERROR: ...
+```
+
+Digit and hex runs are normalised out of the fingerprint, so the same failure for a thousand different players collapses to one entry rather than a thousand. Distinct failures never merge. No timers are involved — a pending tally is flushed by the next event of any kind, and by `flushStderrDiagnostics()` on S³ unmount, so a burst that stops entirely still reports its final count. The stdout log is untouched by any of this: it keeps every occurrence, in sequence.
+
+Three rules for anything added here:
+
+- **Mirror, never replace.** `stderrError()` sits alongside the existing `verbose()` call and Discord embed; it does not swallow the error, and the engine still re-throws so every caller's handling is unchanged.
+- **Write, don't throw.** The literal request was to "throw it so the OS picks it up". An uncaught throw in a plugin takes the server down or becomes an unhandled rejection — writing to fd 2 is what actually reaches `2>` redirection while leaving the server running.
+- **Stay quiet when nothing is wrong.** A successful migration writes nothing to stderr, and extra-column drift (informational) is deliberately excluded — it would otherwise append to the error file on every mount.
+
+Helpers live in `s3/utils/s3-stderr.js` (`stderrError`, `stderrWarn`); `s3/testing/test-stderr-diagnostics.js` asserts the separation from child processes, since an in-process spy proves only that the function was called.
 
 ---
 
@@ -1462,6 +1533,8 @@ node testing/test-game-state-service.js
 | `test-join-pipeline.js` | Player join sequence with handshake active |
 | `test-player-session-persistence.js` | Session recovery on mount |
 | `test-dialect-portability.js` | Raw SQL against **real** SQLite/MySQL/Postgres engines — see 11.4 |
+| `test-migration-bulk-types.js` | `qi.bulkInsert`/`bulkUpdate` value typing and NULL backfills, real engines — see 11.4 |
+| `test-stderr-diagnostics.js` | Migration failures and drift reach fd 2, not stdout — see 9.9 |
 | `test-migration-permissions.js` | Migration DDL at three permission tiers, per dialect (Docker-gated) |
 
 ### 11.2 — Mock Patterns
@@ -1512,9 +1585,12 @@ docker run -d --name s3-test-postgres -e POSTGRES_PASSWORD=postgres -p 5433:5432
 docker run -d --name s3-test-mysql -e MYSQL_ROOT_PASSWORD=root -p 3307:3306 mysql:8
 
 node s3/testing/test-dialect-portability.js
+node s3/testing/test-migration-bulk-types.js
 
 docker rm -f s3-test-postgres s3-test-mysql
 ```
+
+The same rule covers **values**, not just identifiers. SQLite columns are typeless, so a mis-serialized value is accepted on write and only explodes on read — the Switch v5 backfill (2026-08-18) wrote `lastActiveTimestamp` as an integer epoch through Sequelize's untyped bulk API and every later `findByPk` died with `date.includes is not a function`, on SQLite alone. `test-migration-bulk-types.js` asserts the stored `typeof()` directly, which is the only way to see that failure before a player does.
 
 Two conventions worth copying from that file:
 

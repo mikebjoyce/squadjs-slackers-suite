@@ -102,6 +102,13 @@ export default class EloDatabase {
     this.verbose = (level, message) => {
       /* intended to be overridden by the owning plugin */
     };
+    // Error reporter, injected by the owning plugin as its reportError() so
+    // failures also reach stderr. Defaults to a verbose-only implementation:
+    // this service is constructed before the plugin wires it up, and is also
+    // used standalone by the test suite, where stderr mirroring is unwanted.
+    this.reportError = (scope, summary) => {
+      this.verbose(1, `[${scope}] ${summary}`);
+    };
   }
 
   /** --- Model accessor for external consumers (e.g. elo-discord.js) --- */
@@ -172,7 +179,9 @@ export default class EloDatabase {
       return await this._s3db.withTransactionWithRetry(fn);
     } catch (err) {
       if (!isLockError(err)) {
-        this.verbose(1, `[DB] Error in _withDb: ${err.message}`);
+        // Lock contention stays out of this — it is expected under concurrency
+        // and retried, so mirroring it would fill the error file with noise.
+        this.reportError('DB', `Error in _withDb: ${err.message}`, err);
       }
       return null;
     }

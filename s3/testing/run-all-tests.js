@@ -46,7 +46,14 @@ const CATEGORY_TESTS = {
     'test-db-connector-compat.js',
     // SQLite coverage always runs; the MySQL/Postgres cases self-skip when
     // those engines are unreachable, so this stays a Category 1 test.
-    'test-dialect-portability.js'
+    'test-dialect-portability.js',
+    // Same shape: SQLite always runs, MySQL/Postgres self-skip when unreachable.
+    'test-migration-bulk-types.js',
+    // Spawns child processes to assert stdout/stderr separation.
+    'test-stderr-diagnostics.js',
+    // Replays every plugin's real migrations across DB states. Builds a
+    // throwaway assembly via install.cjs, so it is slower than the rest.
+    'test-migration-conformance.js'
   ],
   2: [
     'test-join-pipeline.js',

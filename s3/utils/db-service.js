@@ -82,6 +82,7 @@
  */
 import SequelizeLib from 'sequelize';
 import MigrationEngine from './migration-engine.js';
+import { stderrWarn } from './s3-stderr.js';
 
 export default class DBService {
   constructor({
@@ -1047,13 +1048,27 @@ export default class DBService {
    * @param {Array<{pluginName: string, table: string, model?: string, missing?: string[], missingRows?: Array<{key: string, value: string}>, extra?: string[], error?: string}>} drift
    */
   async _handleDetectedDrift(drift) {
+    const stderrLines = [];
     for (const entry of drift) {
       if (entry.missing) {
         this.verboseLogger(1, `[DB] POST-MIGRATION DRIFT: ${entry.table} missing columns: ${entry.missing.join(', ')}`);
+        stderrLines.push(`${entry.pluginName}: ${entry.table} missing column(s): ${entry.missing.join(', ')}`);
       }
       if (entry.missingRows) {
         this.verboseLogger(1, `[DB] POST-MIGRATION ROW DRIFT: ${entry.table} missing row(s): ${entry.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
+        stderrLines.push(`${entry.pluginName}: ${entry.table} missing row(s): ${entry.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
       }
+    }
+    // Mirror to stderr for operators who split the streams. WARN rather than
+    // ERROR: drift is a state the operator must act on (!s3 migrate force), not
+    // a failure that just happened. Extra-only drift is deliberately excluded —
+    // it is informational and would put noise in the error file on every mount.
+    if (stderrLines.length > 0) {
+      stderrWarn(
+        'SchemaDrift',
+        `Expected schema or data is missing from the live database — run '!s3 migrate force' to re-apply.`,
+        stderrLines.join('\n')
+      );
     }
     // Only act on missing columns or missing rows — extra columns are informational only
     const pluginNames = [...new Set(drift.filter(e => e.missing || e.missingRows).map(e => e.pluginName))];

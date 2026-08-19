@@ -1,4 +1,4 @@
-# Switch Plugin v2.5.1
+# Switch Plugin v2.5.4
 
 **Team-change management with database persistence, TeamBalancer integration, and S³-aware player tracking.**
 
@@ -200,6 +200,10 @@ The Switch plugin exposes a public API for external consumers (such as SmartAssi
 
 ### Version Compatibility
 
+- `static version = '2.5.4'` — Correct misleading 'schema already up to date' log when migrations are pending
+- `static version = '2.5.3'` — Route onChatMessage catch-all through reportError (enables opt-in stderr mirroring; stdout unchanged)
+- `static version = '2.5.2'` — Fix v5 migration backfill: qi.bulkUpdate + IS NULL, repairs hand-migrated DBs
+- `static version = '2.5.1'` — Quote camelCase identifiers in raw SQL (token grants, `checkPlayer()`) via S³'s `incrementLiteral()` / `caseInsensitiveLikeOp()`; raises the required S³ version to 1.2.2, which is where those helpers landed. Postgres-fatal, invisible on SQLite and MySQL.
 - `static version = '2.5.0'` — seed bonus reworked around round identity rather than layer edges, absolute wallet ceiling, ENDGAME consolation grant, and two-tier row retention (schema v5, adds `lastActiveTimestamp`).
 - `static version = '2.4.0'` — seed bonus min-player threshold, seed bonus disable (0-value options), and end-game seed completion grants on top of the v2.3.2 feature set.
 - Consumers should check `plugin.constructor.version` (wrapped in try/catch) and require `>= 2.0.0` before using the API.

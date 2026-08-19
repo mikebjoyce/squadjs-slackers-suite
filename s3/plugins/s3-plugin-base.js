@@ -68,6 +68,7 @@
  */
 
 import BasePlugin from './base-plugin.js';
+import { stderrError } from '../utils/s3-stderr.js';
 
 export default class S3PluginBase extends BasePlugin {
   constructor(server, options, connectors) {
@@ -291,9 +292,19 @@ export default class S3PluginBase extends BasePlugin {
   /**
    * Verifies schema versions and runs any pending migrations.
    *
+   * **`null` is ambiguous by design and must not be read as "up to date".** It is
+   * returned for three different outcomes:
+   *   - the DB service is unavailable;
+   *   - migrations are pending but unconfirmed (this method logs that itself, and
+   *     S³ posts the Discord prompt);
+   *   - the schema is already current.
+   * A caller that prints "already up to date" on null will contradict the
+   * pending-but-unconfirmed line logged moments earlier. If you need to tell the
+   * cases apart, ask `s3db.verifySchemaVersions()` rather than inferring.
+   *
    * @param {string} pluginName - Namespace to migrate.
-   * @returns {Promise<object|null>} Migration result, or null if no
-   *   DB available or already up to date.
+   * @returns {Promise<{applied: number, skipped: number}|null>} Result when
+   *   migrations actually ran; otherwise null — see above.
    */
   async verifyAndRunMigrations(pluginName) {
     if (!this._s3db || typeof this._s3db.isReady !== 'function' || !this._s3db.isReady()) {
@@ -357,9 +368,41 @@ export default class S3PluginBase extends BasePlugin {
     try {
       return await this._s3db.withTransactionWithRetry(fn);
     } catch (err) {
-      this.verbose(1, `[DB] Error in _withDb: ${err.message}`);
+      this.reportError('DB', `Error in _withDb: ${err.message}`, err);
       return null;
     }
+  }
+
+  /**
+   * Log a caught error at verbose level 1, and — when the operator has opted in
+   * via S³'s `stderrDiagnostics` option — also mirror it to stderr so it lands in
+   * `2>` redirection alongside migration failures. The default is 'off', so on a
+   * stock install this behaves exactly like the `verbose(1, ...)` call it replaced.
+   *
+   * Use this for errors an operator would want to find after the fact —
+   * a swallowed exception in an event handler, a failed DB write. Do not use
+   * it for expected conditions or retry-and-recover paths; those belong at
+   * verbose level 2+ and would only add noise to the error file.
+   *
+   * The stderr side deduplicates identical events, so a per-tick failure
+   * (a DB outage, say) writes once and then a suppressed count rather than
+   * thousands of blocks. The verbose line is unaffected — the main log keeps
+   * every occurrence, in sequence.
+   *
+   * @param {string} scope - Short subsystem tag, e.g. 'DB' or 'Commands'
+   * @param {string} summary - One-line description; also the stdout message
+   * @param {Error} [err] - The error, if available; its stack goes to stderr
+   * @param {object} [options]
+   * @param {boolean} [options.includeStackInLog=false] - Also append the stack to
+   *   the stdout line. Set at call sites that logged the stack before this
+   *   helper existed, so nothing an operator reading only stdout used to see
+   *   disappears. Leave false for per-tick paths, where a stack every tick in
+   *   the main log is what made the error file necessary in the first place.
+   */
+  reportError(scope, summary, err = null, { includeStackInLog = false } = {}) {
+    const stackSuffix = includeStackInLog && err?.stack ? `\n${err.stack}` : '';
+    this.verbose(1, `[${scope}] ${summary}${stackSuffix}`);
+    stderrError(`${this.constructor.name || 'S3Plugin'}:${scope}`, summary, err);
   }
 
   // ═══════════════════════════════════════════════════════════════

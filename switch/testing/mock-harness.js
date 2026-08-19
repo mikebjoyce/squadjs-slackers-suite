@@ -493,6 +493,11 @@ export function createMockHarness(opts = {}, clock = null) {
       // console.error(...args.map(String));
     },
 
+    // Mirrors S3PluginBase.reportError so mock-driven code paths that report an
+    // error behave like the real plugin. Stays a no-op: the stderr channel is
+    // opt-in and a test run should not write to the error stream.
+    reportError: () => {},
+
     _getModel: (name) => {
       // Tests don't use _getModel — they call the token methods directly
       return null;

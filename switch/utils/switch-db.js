@@ -366,30 +366,35 @@ const SwitchDB = {
                 type: qi.DataTypes.DATE,
                 allowNull: true
               });
-              // Backfill to the migration's run time, NOT to firstSeenTimestamp.
-              // firstSeenTimestamp records when a row was created, not when the
-              // player was last around — backfilling from it would hand long-lived
-              // rows an already-expired retention clock and delete players who were
-              // on the server yesterday. Stamping everyone at upgrade gives a fresh
-              // window: active players get re-stamped on their next connect or
-              // disconnect, genuinely abandoned rows age out on schedule.
-              //
-              // Unconditional update, no WHERE. This branch only runs in the same
-              // pass that just added the column, so every row is NULL by definition
-              // — and matching on `lastActiveTimestamp: null` would mean relying on
-              // the query builder to translate it to IS NULL rather than the `= NULL`
-              // that never matches anything. Same discipline as the seed WHERE
-              // clauses: don't let correctness hinge on NULL handling.
-              // Runs inside the migration's transaction so a later failure rolls the
-              // backfill back with the addColumn, rather than leaving every row
-              // stamped against a column that no longer exists.
-              await qi.bulkUpdate(
-                'SwitchPlugin_PlayerCooldowns',
-                { lastActiveTimestamp: new Date() },
-                {},
-                { transaction: qi.transaction }
-              );
             }
+            // Backfill to the migration's run time, NOT to firstSeenTimestamp.
+            // firstSeenTimestamp records when a row was created, not when the
+            // player was last around — backfilling from it would hand long-lived
+            // rows an already-expired retention clock and delete players who were
+            // on the server yesterday. Stamping everyone at upgrade gives a fresh
+            // window: active players get re-stamped on their next connect or
+            // disconnect, genuinely abandoned rows age out on schedule.
+            //
+            // Deliberately OUTSIDE the addColumn guard, and matched on IS NULL.
+            // The column existing does not imply the backfill ran: a DB that was
+            // hand-migrated, or one where an earlier attempt at this migration
+            // failed after the ALTER, arrives here with the column present and
+            // every row NULL. cleanup() treats NULL as "keep", so those rows are
+            // not at risk of deletion — they simply never age out until the player
+            // reconnects. Re-running with `!s3 migrate force` repairs them.
+            // Op.is generates a real `IS NULL` (never the `= NULL` that matches
+            // nothing), and updating only NULL rows keeps this idempotent: rows
+            // already stamped by live gameplay are left alone rather than being
+            // reset to the migration's clock.
+            //
+            // Runs inside the migration's transaction so a later failure rolls the
+            // backfill back with the addColumn, rather than leaving every row
+            // stamped against a column that no longer exists.
+            await qi.bulkUpdate(
+              'SwitchPlugin_PlayerCooldowns',
+              { lastActiveTimestamp: new Date() },
+              { lastActiveTimestamp: { [Op.is]: null } }
+            );
           }
         },
         down: async (qi) => {
@@ -404,12 +409,20 @@ const SwitchDB = {
       }
     ]);
 
-    // Run any pending migrations
+    // Run any pending migrations.
+    //
+    // A null result does NOT mean "up to date": verifyAndRunMigrations() also
+    // returns null when the DB is unavailable, and when migrations are pending
+    // but unconfirmed (it logs its own line in that case, and S³ posts the
+    // Discord prompt). Claiming "already up to date" here printed a flat
+    // contradiction two lines below "Migrations pending but not confirmed" —
+    // harmless to the run, actively misleading to whoever is reading the log
+    // while a migration is stuck.
     const result = await plugin.verifyAndRunMigrations('switch');
     if (result) {
-      plugin.verbose(1, `[S3] Switch v1 migration: applied=${result.applied}, skipped=${result.skipped}.`);
+      plugin.verbose(1, `[S3] Switch migrations: applied=${result.applied}, skipped=${result.skipped}.`);
     } else {
-      plugin.verbose(3, '[S3] Switch schema already up to date.');
+      plugin.verbose(3, '[S3] Switch migrations not run this pass — schema current, awaiting confirmation, or DB unavailable.');
     }
 
     // ── Attach Methods ─────────────────────────────────────────

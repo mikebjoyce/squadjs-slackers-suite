@@ -62,7 +62,8 @@ import {
   validateImportStructure,
   serializeForAttachment,
   restoreFromFile,
-  exportToFile
+  exportToFile,
+  formatSize
 } from './s3-export-import.js';
 
 // ============================================================================
@@ -2019,6 +2020,19 @@ export function createCommandHandlers(context) {
       const dbPath = me?.dbPath;
       const db = plugin.services?.db;
 
+      // Acknowledge before starting — a JSON restore upserts every row in the
+      // file and can run for minutes on a production-sized export. Without this
+      // the command looks dead while the DB is mid-write, which is the worst
+      // moment for an admin to conclude nothing happened and re-run it.
+      await sendDiscordMessage(message.channel, {
+        embeds: [{
+          color: 0xf39c12,
+          title: '⏳ Restoring Database…',
+          description: `Reading \`${filename}\` and upserting rows. This can take several minutes on a large backup — the result will be posted here when it finishes. **Do not re-run this command in the meantime.**`,
+          timestamp: new Date().toISOString()
+        }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+
       try {
         const result = await restoreFromFile(filename, db, null, dbPath);
 
@@ -2058,6 +2072,18 @@ export function createCommandHandlers(context) {
         return;
       }
 
+      // Acknowledge before starting. A full-tier export walks every table and
+      // can take tens of seconds on a mature database (a production export runs
+      // ~100 MB), during which the command looks ignored and admins re-run it.
+      await sendDiscordMessage(message.channel, {
+        embeds: [{
+          color: 0xf39c12,
+          title: '⏳ Creating Backup…',
+          description: 'Exporting all tables to JSON. This can take a while on a large database — the result will be posted here when it finishes.',
+          timestamp: new Date().toISOString()
+        }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+
       try {
         const result = await exportToFile(db, null, { tier: 'all', retention: 5 });
         if (!result) {
@@ -2071,7 +2097,7 @@ export function createCommandHandlers(context) {
           embeds: [{
             color: 0x2ecc71,
             title: '✅ Backup Created',
-            description: `Saved \`${result.filename}\` (${result.sizeBytes} bytes) to \`backups/\` directory.`,
+            description: `Saved \`${result.filename}\` (${formatSize(result.sizeBytes)}) to \`backups/\` directory.`,
             fields: [{
               name: 'ℹ️',
               value: 'Use `!s3 backup list` to see all available backups.',
@@ -2196,6 +2222,17 @@ export function createCommandHandlers(context) {
 
       // ── --to-file: write to server filesystem ───────────────
       if (hasToFile) {
+        // Same acknowledgement as `!s3 backup create` — this is the same export,
+        // and the 'all' tier is the slow one.
+        await sendDiscordMessage(message.channel, {
+          embeds: [{
+            color: 0xf39c12,
+            title: `⏳ Exporting to File (${tier})…`,
+            description: 'Writing tables to JSON. This can take a while on a large database — the result will be posted here when it finishes.',
+            timestamp: new Date().toISOString()
+          }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+
         try {
           const result = await exportToFile(db, null, { tier, retention: 5 });
           if (!result) {
@@ -2208,7 +2245,7 @@ export function createCommandHandlers(context) {
             embeds: [{
               color: 0x2ecc71,
               title: `✅ Exported to File (${tier})`,
-              description: `Saved \`${result.filename}\` (${result.sizeBytes} bytes) to \`backups/\` directory.`,
+              description: `Saved \`${result.filename}\` (${formatSize(result.sizeBytes)}) to \`backups/\` directory.`,
               timestamp: new Date().toISOString()
             }]
           }, 'S3', (...a) => plugin.verbose(...a));

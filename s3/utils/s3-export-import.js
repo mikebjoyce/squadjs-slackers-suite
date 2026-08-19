@@ -201,8 +201,10 @@ function timestampString(ts) {
 
 /**
  * Format byte count to a human-readable string.
+ * Exported so Discord output can show '96.3 MB' rather than a raw byte count —
+ * a full-tier export runs to nine figures on a mature database.
  */
-function formatSize(bytes) {
+export function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;

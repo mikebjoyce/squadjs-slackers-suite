@@ -48,6 +48,7 @@
  *   db              - DBService instance (access to models, connectors)
  *   transaction     - Active Sequelize transaction
  *   addColumn, removeColumn, addIndex, removeIndex, rawQuery
+ *   bulkInsert, bulkUpdate, bulkDelete
  *
  * ─── DEPENDENCIES ───────────────────────────────────────────────
  *
@@ -72,6 +73,7 @@
 import crypto from 'node:crypto';
 import { createBackup } from './s3-backup.js';
 import { exportToFile as jsonExportToFile } from './s3-export-import.js';
+import { stderrError } from './s3-stderr.js';
 
 /**
  * Create a QueryInterface object bound to a specific DBService + transaction.
@@ -79,6 +81,39 @@ import { exportToFile as jsonExportToFile } from './s3-export-import.js';
  */
 function createQueryInterface(sequelize, db, transaction) {
   const DataTypes = db.getDataTypes();
+
+  /**
+   * Find the registered model backing a raw table name, so bulk operations can
+   * be given real attribute types.
+   *
+   * Without types, Sequelize's low-level bulk API escapes values by their JS
+   * shape alone — and on SQLite a JS Date then lands in the column as an integer
+   * epoch instead of the 'YYYY-MM-DD HH:MM:SS.SSS +00:00' TEXT that DataTypes.DATE
+   * reads back. Every later read of that row throws "date.includes is not a
+   * function". MySQL and Postgres escape Dates to a datetime literal regardless,
+   * which is exactly why this class of bug reaches production on SQLite only.
+   *
+   * The model is needed in TWO places, and supplying only one is a trap:
+   *   - `attributes` types the SET values.
+   *   - `options.model` types the WHERE values.
+   * Verified: updating `{ ts: <Date> }` as a WHERE with attributes but no model
+   * matches zero rows on SQLite and reports success, because the comparison is
+   * against a mis-escaped literal. Both are passed below.
+   *
+   * Models are keyed by model name, which is not always the table name, so match
+   * on either.
+   * @param {string} tableName
+   * @returns {Object|null} the Sequelize model, or null if none owns the table
+   */
+  function modelForTable(tableName) {
+    const direct = db.getModel(tableName);
+    if (direct?.rawAttributes) return direct;
+    for (const name of db.getModelNames?.() || []) {
+      const model = db.getModel(name);
+      if (model && (model.tableName || model.name) === tableName) return model;
+    }
+    return null;
+  }
 
   return {
     sequelize,
@@ -139,9 +174,64 @@ function createQueryInterface(sequelize, db, transaction) {
       await qi.createTable(tableName, attributes, { ...options, transaction });
     },
 
+    /**
+     * Bulk INSERT inside the migration transaction.
+     * Attribute types are resolved from the registered model for the same
+     * SQLite serialization reason described on bulkUpdate; `options.attributes`
+     * overrides the lookup.
+     */
     async bulkInsert(tableName, records, options = {}) {
       const qi = sequelize.getQueryInterface();
-      await qi.bulkInsert(tableName, records, { ...options, transaction });
+      const { attributes: override, ...rest } = options;
+      const attributes = override || modelForTable(tableName)?.rawAttributes || null;
+      await qi.bulkInsert(tableName, records, { ...rest, transaction }, attributes);
+    },
+
+    /**
+     * Bulk UPDATE inside the migration transaction.
+     * `where` is a Sequelize where-object; pass {} to update every row.
+     * Use this for backfills — the query generator handles dialect-correct
+     * identifier quoting, so camelCase columns survive on Postgres.
+     *
+     * The registered model is resolved automatically (see modelForTable) and
+     * supplied twice — as `attributes` for the SET values and as `options.model`
+     * for the WHERE values — so DATE/BOOLEAN/JSON serialize correctly on SQLite
+     * on both sides of the statement. Pass `options.attributes` / `options.model`
+     * only to override that lookup, e.g. for a table with no registered model.
+     * @param {string} tableName
+     * @param {Object} values - column → new value
+     * @param {Object} [where] - where-object; {} means all rows
+     */
+    async bulkUpdate(tableName, values, where = {}, options = {}) {
+      const qi = sequelize.getQueryInterface();
+      const { attributes: attrOverride, model: modelOverride, ...rest } = options;
+      const model = modelOverride || modelForTable(tableName);
+      const attributes = attrOverride || model?.rawAttributes || null;
+      await qi.bulkUpdate(
+        tableName,
+        values,
+        where,
+        { ...rest, transaction, ...(model ? { model } : {}) },
+        attributes
+      );
+    },
+
+    /**
+     * Bulk DELETE inside the migration transaction.
+     * `where` is a Sequelize where-object; pass {} to delete every row.
+     *
+     * The model is passed as Sequelize's fourth argument, which is what types
+     * the WHERE values — without it, deleting `{ someDate: <Date> }` matches
+     * nothing on SQLite and still reports success. Override with
+     * `options.model` for a table with no registered model.
+     * @param {string} tableName
+     * @param {Object} [where] - where-object; {} means all rows
+     */
+    async bulkDelete(tableName, where = {}, options = {}) {
+      const qi = sequelize.getQueryInterface();
+      const { model: modelOverride, ...rest } = options;
+      const model = modelOverride || modelForTable(tableName);
+      await qi.bulkDelete(tableName, where, { ...rest, transaction }, model || undefined);
     },
 
     /**
@@ -521,6 +611,8 @@ export default class MigrationEngine {
       if (!fileCopyResult && !jsonExportResult) {
         const msg = `[MigrationEngine] Backup FAILED for "${pluginName}" — aborting migration. Both file copy and JSON export failed. Check disk space, permissions, and DB connectivity.`;
         this.verboseLogger(1, msg);
+        stderrError('MigrationEngine', `Backup failed for "${pluginName}" — migration aborted before any schema change.`,
+          'Both the file copy and the JSON export failed. Check disk space, file permissions on the backup directory, and DB connectivity.');
         throw new Error(msg);
       }
 
@@ -549,6 +641,18 @@ export default class MigrationEngine {
           this.verboseLogger(3, `[MigrationEngine] Applied v${migration.version} for "${pluginName}".`);
           applied += 1;
         } catch (err) {
+          // Single choke point for migration failure diagnostics: every caller
+          // (autoMigrate, !s3 migrate force, !s3 confirm, a plugin's own
+          // verifyAndRunMigrations) funnels through this loop, and the Discord
+          // embed only carries err.message — the stack dies here otherwise.
+          // Mirrored to stderr so `2>` redirection captures it, then re-thrown
+          // unchanged so existing handling is untouched.
+          stderrError(
+            'MigrationEngine',
+            `"${pluginName}" v${appliedVersion} -> v${migration.version} failed: ${err.message}`,
+            err
+          );
+          this.verboseLogger(1, `[MigrationEngine] "${pluginName}" v${migration.version} failed: ${err.message}`);
           throw err; // Re-throw so the calling code knows the batch failed
         }
       }

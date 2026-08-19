@@ -1,4 +1,4 @@
-# SlackersSquadServices (S³) Plugin v1.2.4
+# SlackersSquadServices (S³) Plugin v1.3.1
 
 **Centralised service container for shared state across SquadJS plugins**
 
@@ -46,7 +46,8 @@ SlackersSquadServices/
 │   ├── s3-discord.js                      ← Discord infra (command dispatch → s3-commands.js)
 │   ├── s3-commands.js                     ← Command handlers (backup, export, import, db)
 │   ├── s3-backup.js                       ← Backup/restore orchestration
-│   └── s3-export-import.js               ← JSON export/import (connector-agnostic)
+│   ├── s3-export-import.js               ← JSON export/import (connector-agnostic)
+│   └── s3-stderr.js                      ← Failure diagnostics on fd 2 (stderr)
 ├── testing/
 │   ├── test-server-config-service.js
 │   ├── test-db-service.js
@@ -98,6 +99,37 @@ The engine supports:
 > `caseInsensitiveLikeOp()` and `caseInsensitiveLikeLiteral()` for the common
 > cases. See `S3_DEVELOPER_GUIDE.md` §7.10, and
 > `testing/test-dialect-portability.js` for real-engine regression cover.
+
+### Failure Diagnostics on stderr
+
+SquadJS's logger writes everything to stdout, so operators who split the streams get an error file containing only Node crashes — nothing any plugin logged. **Off by default**: set `stderrDiagnostics: 'mirror'` to have S³ copy its operational failures to **fd 2** as well, where `2>` redirection picks them up. Leave it alone and nothing about your logs changes.
+
+```bash
+node index.js > squadjs.log 2> squadjs.err
+grep '\[S3\] \[ERROR\]' squadjs.err
+```
+
+```
+[2026-08-19T01:57:49.856Z] [S3] [ERROR] [MigrationEngine] "switch" v4 -> v5 failed: qi.bulkUpdate is not a function
+    TypeError: qi.bulkUpdate is not a function
+    at Object.up (file:///.../switch/utils/switch-db.js:387:22)
+```
+
+Covered: migration failures, aborted pre-migration backups, `_withDb` failures, plugin command/event handler catch-alls, and Discord send failures (`ERROR`); schema drift with missing columns or rows (`WARN`). Stack traces are included, which Discord embeds do not carry — they show `err.message` only. Nothing is duplicated onto stdout, and a clean run writes nothing at all.
+
+Repeats are deduplicated so a DB outage — which throws every tick — cannot fill the disk:
+
+```
+[...] [S3] [ERROR] [Switch:DB] Error in _withDb: SQLITE_ERROR: no such column: lastActiveTimestamp
+[...] [S3] [ERROR] [Switch:DB] (suppressed 499 identical event(s) over 60s) Error in _withDb: SQLITE_ERROR: ...
+```
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `stderrDiagnostics` | `'off'` | `'off'` = stdout only (no change from before); `'mirror'` = also copy to stderr; `'auto'` = copy unless both streams lead to the same place |
+| `stderrDedupeWindowSeconds` | `60` | Identical events inside the window are counted, not written |
+
+**Turn it on with `'mirror'` if you redirect stderr somewhere separate** — `2> squadjs.err`, or pm2's separate error file. Don't turn it on under Docker's default log driver or systemd/journald: both streams end up in one sink there, so every error would appear twice in `docker logs` / `journalctl`. `'auto'` covers the in-between case of one config used both in a console and as a redirected service, though it cannot detect the Docker/journald merge either. The stdout log keeps every occurrence regardless of the setting. See `S3_DEVELOPER_GUIDE.md` §9.9.
 
 ## `!s3` Command System
 
@@ -177,6 +209,8 @@ this.players.registerPriority('MyPlugin', 4);  // Above TeamBalancer (default: 3
 | `enableFileLogging` | no | boolean | `false` | Enable JSONL file mirror for S³ logging events. Each DB write is also appended as a self-contained JSONL line to the logPath file. |
 | `logPath` | no | string | `"./s3-log.jsonl"` | Path to JSONL file for S³ event mirror. Only used when enableFileLogging is true. |
 | `autoMigrate` | no | boolean | `false` | If `true`, skips Discord confirmation prompt for migrations |
+| `stderrDiagnostics` | no | string | `"off"` | `"off"` leaves logging exactly as before; `"mirror"` also copies failures to stderr for `2>` redirection; `"auto"` copies only when stdout and stderr lead to different places |
+| `stderrDedupeWindowSeconds` | no | number | `60` | Identical stderr events inside this window are counted rather than written |
 
 ## Author
 

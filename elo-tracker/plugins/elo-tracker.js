@@ -148,7 +148,7 @@ import { EloDiscord } from '../utils/elo-discord.js';
 import EloCommands from '../utils/elo-commands.js';
 
 export default class EloTracker extends S3PluginBase {
-  static version = '2.1.5';
+  static version = '2.1.6';
 
   static get description() {
     return 'A SquadJS plugin that tracks player participation across rounds, computes individual ELO ratings using a TrueSkill-based algorithm, and persists all data via Sequelize-compatible databases (SQLite, MySQL, PostgreSQL, etc.).';
@@ -330,6 +330,9 @@ export default class EloTracker extends S3PluginBase {
     if (this.s3db?.isReady() && this.db) {
       this.db._s3db = this.s3db;
       this.db.verbose = (level, message) => Logger.verbose('EloTracker', level, message);
+      // Route the service's failures through the plugin's reporter so they
+      // reach stderr like every other S³ consumer's.
+      this.db.reportError = (scope, summary, err) => this.reportError(scope, summary, err);
     }
 
     // Register Elo migrations on S³ connector

@@ -734,7 +734,19 @@ const SwitchCommands = {
             gamePhase
           });
         }
-        plugin.verbose(1, `Error in onChatMessage: ${err.stack}`);
+        // Mirrored to stderr: this catch-all is the one an operator sees repeat
+        // during an incident (it fired every !switch when v5's column was
+        // missing), so it belongs in the error file, deduped.
+        //
+        // Guarded because this is a catch-all: if a caller passes a plugin
+        // stand-in without reportError (the mock harness did), an unguarded call
+        // would throw from inside the catch and replace the real error with a
+        // TypeError — losing exactly the diagnostic this block exists to emit.
+        if (typeof plugin.reportError === 'function') {
+          plugin.reportError('Commands', `Error in onChatMessage: ${err.message}`, err, { includeStackInLog: true });
+        } else {
+          plugin.verbose(1, `Error in onChatMessage: ${err.stack}`);
+        }
       }
     };
 
