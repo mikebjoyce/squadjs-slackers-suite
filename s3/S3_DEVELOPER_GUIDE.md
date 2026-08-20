@@ -237,7 +237,9 @@ Tracks player state (name, team, squad, join time), manages per-player and globa
 | `getAllPlayers()` | `object[]` | All tracked player states |
 | `getJoinTime(eosID\|steamID)` | `number\|null` | Epoch MS player joined |
 | `getSquads()` | `object[]` | Squad list from registry — `{ squadID, teamID, squadName, locked, players }`, leaders first. Membership is keyed by team **and** squad number, since squad numbers restart per team. |
-| `areTeamsResolved()` | `boolean` | All players on valid teams (1 or 2) |
+| `areTeamsResolved()` | `boolean` | All players on valid teams (1 or 2), ignoring stuck clients |
+| `getStuckPlayerKeys()` | `Set<string>` | Players wedged at teamID N/A, excluded from the gate above |
+| `isPlayerStuck(key)` | `boolean` | Whether one player is currently quarantined |
 | `getEffectiveRefreshIntervalMs()` | `number\|null` | Actual registry refresh cadence — `clamp(fastest registrant, 3s, 60s)`. Measure any "wait for team data" budget in these |
 | `recordMove(eosID, teamID, source, options?)` | `boolean` | Record attribution for team change. Returns `false` only when the identifier is unusable — it does **not** check `isReady()` |
 | `canAct(eosID, source)` | `boolean` | Check if player can be acted upon (not locked by another plugin) |

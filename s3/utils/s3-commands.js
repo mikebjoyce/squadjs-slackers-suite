@@ -692,9 +692,18 @@ export function buildPlayersEmbeds(plugin) {
     });
   }
 
-  if (unresolved.length > 0) {
+  // A player whose client wedges at `Team ID: N/A` never resolves on their own —
+  // it takes a reconnect. Those are quarantined so they stop holding the
+  // resolution gate down, and they need to read differently from a player who is
+  // simply mid-transition, because only one of the two clears by waiting.
+  const stuckKeys = players.getStuckPlayerKeys?.() ?? new Set();
+  const isStuck = (p) => stuckKeys.has(p?.eosID) || stuckKeys.has(p?.steamID);
+  const stuck = unresolved.filter(isStuck);
+  const awaiting = unresolved.filter((p) => !isStuck(p));
+
+  if (awaiting.length > 0) {
     metaFields.push({
-      name: `⚠️ Team Unresolved (${unresolved.length})`,
+      name: `⚠️ Team Unresolved (${awaiting.length})`,
       value: 'S³ has no teamID for these players yet — initial sync or the '
         + 'post-`NEW_GAME` null window. Not a game state; it should clear on its own.',
       inline: false
@@ -702,7 +711,23 @@ export function buildPlayersEmbeds(plugin) {
     pushLineField(
       metaFields,
       'Awaiting teamID',
-      unresolved.map((p) => formatPlayerLine(p, players)),
+      awaiting.map((p) => formatPlayerLine(p, players)),
+      { maxFields: 1 }
+    );
+  }
+
+  if (stuck.length > 0) {
+    metaFields.push({
+      name: `🩹 Stuck Client (${stuck.length})`,
+      value: 'These players have reported no teamID for far longer than a round '
+        + 'transition takes, so S³ has stopped counting them towards team resolution — '
+        + 'the rest of the lobby is unaffected. This clears when they reconnect.',
+      inline: false
+    });
+    pushLineField(
+      metaFields,
+      'Ignored for resolution',
+      stuck.map((p) => formatPlayerLine(p, players)),
       { maxFields: 1 }
     );
   }

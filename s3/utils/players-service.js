@@ -76,6 +76,15 @@ const DEFAULT_REFRESH_NOW_FLOOR_MS = 1000;      // minimum gap for refreshNow() 
 const DEFAULT_SESSION_EXPIRY_MS = 30 * 60 * 1000; // 30 min — how long without activity before a session expires
 const DEFAULT_SESSION_UPDATE_INTERVAL_MS = 5 * 60 * 1000; // 5 min — how often to refresh lastActivity in DB
 const DEFAULT_RCON_RECOVERY_GRACE_MS = 30000; // 30s — suppress leave detection for this long after an RCON_ERROR
+// How long a single player may sit at teamID N/A before they stop counting
+// against the roster-wide resolution gate. The legitimate post-NEW_GAME null
+// window clears in seconds, so this is deliberately far longer than it needs to
+// be: quarantining a player who was about to resolve is the worse mistake, and
+// waiting costs nothing because the clock is cleared the moment they report a
+// real team or leave. Longer than GameStateService's 120s resolving budget,
+// which means the round a client first wedges still ends its resolving window
+// on the deadline — every subsequent round resolves normally.
+const DEFAULT_UNRESOLVED_GRACE_MS = 180000;
 
 /**
  * Coerce a raw SquadJS `isLeader` into a boolean, distinguishing "not a leader"
@@ -158,7 +167,8 @@ export default class PlayersService {
     refreshDebounceWindowMs = DEFAULT_REFRESH_DEBOUNCE_WINDOW_MS,
     refreshNowFloorMs = DEFAULT_REFRESH_NOW_FLOOR_MS,
     sessionExpiryMs = DEFAULT_SESSION_EXPIRY_MS,
-    sessionUpdateIntervalMs = DEFAULT_SESSION_UPDATE_INTERVAL_MS
+    sessionUpdateIntervalMs = DEFAULT_SESSION_UPDATE_INTERVAL_MS,
+    unresolvedGraceMs = DEFAULT_UNRESOLVED_GRACE_MS
   } = {}) {
     this.parent = parent;
     this.server = server;
@@ -173,6 +183,7 @@ export default class PlayersService {
     this.refreshNowFloorMs = Number.isFinite(refreshNowFloorMs) ? Math.max(500, refreshNowFloorMs) : DEFAULT_REFRESH_NOW_FLOOR_MS;
     this.sessionExpiryMs = Number.isFinite(sessionExpiryMs) ? Math.max(60000, sessionExpiryMs) : DEFAULT_SESSION_EXPIRY_MS;
     this.sessionUpdateIntervalMs = Number.isFinite(sessionUpdateIntervalMs) ? Math.max(60000, sessionUpdateIntervalMs) : DEFAULT_SESSION_UPDATE_INTERVAL_MS;
+    this.unresolvedGraceMs = Number.isFinite(unresolvedGraceMs) ? Math.max(0, unresolvedGraceMs) : DEFAULT_UNRESOLVED_GRACE_MS;
 
     this.registry = new Map(); // key (prefer EOS ID; fallback to steamID) -> player state
     // Optional index for legacy/secondary IDs. steamID may be undefined for EOS-only players.
@@ -209,6 +220,15 @@ export default class PlayersService {
     // Snapshot of this.server.squads (raw SquadJS squad objects), refreshed each tick
     // when teams are fully resolved. Used by getSquads() to serve full squad metadata.
     this._squadsCache = null;
+    // key -> { since, warned } for every player currently reporting an unreal
+    // teamID. Once `since` is older than the grace window the player is treated
+    // as stuck and excluded from the roster-wide gate. See _ageUnresolvedPlayers.
+    this._unresolvedSince = new Map();
+    // Keys quarantined by the pass above — exposed via getStuckPlayerKeys().
+    this._stuckKeys = new Set();
+    // Edge-triggers the mass-unresolved log so a round transition does not
+    // reprint it on every tick.
+    this._systemicUnresolved = false;
 
     this.PRIORITY = {
       TeamBalancer: 3,
@@ -302,6 +322,11 @@ export default class PlayersService {
     this._isMounted = false;
     this._initialSyncComplete = false;
     this._lastRconErrorTime = 0;
+    // Drop the unreal-teamID clocks with the rest of the resolution state. A
+    // remount re-runs initial sync, so a clock left over from before it would
+    // quarantine a player on their first tick back without any grace.
+    this._unresolvedSince.clear();
+    this._stuckKeys.clear();
     this.verboseLogger(2, '[Players] Unmounted.');
   }
 
@@ -487,9 +512,14 @@ export default class PlayersService {
   }
 
   areTeamsResolved() {
-    const players = [...this.registry.values()];
-    if (!players.length) return false;
-    return players.every((player) => player?.teamID === 1 || player?.teamID === 2);
+    const entries = [...this.registry.entries()];
+    if (!entries.length) return false;
+    // A quarantined player does not count against this. Without that, one stuck
+    // client meant GameStateService could only ever leave `resolving` on the
+    // BUDGET_EXPIRED deadline rather than on PLAYERS_RESOLVED — for every round
+    // that player stayed connected.
+    if (!entries.some(([, p]) => this._isRealTeam(p?.teamID))) return false;
+    return entries.every(([key, p]) => this._isRealTeam(p?.teamID) || this._stuckKeys.has(key));
   }
 
   /**
@@ -922,14 +952,19 @@ export default class PlayersService {
     const now = Date.now();
     const current = new Set();
     const isInitialSync = !this._initialSyncComplete;
-    // If any player reports a non-1/2 teamID, we are in the null-teamID window.
-    const hasNullTeams = players.some((player) => !this._isRealTeam(player?.teamID));
-    const allResolved = players.length > 0 && !hasNullTeams;
+    // Players reporting a non-1/2 teamID who are still inside the grace window —
+    // i.e. genuinely mid-resolve rather than stuck. Anyone past the window has
+    // been quarantined and no longer holds the whole lobby hostage.
+    const { blocking, keyed } = this._ageUnresolvedPlayers(players, now);
+    const hasNullTeams = blocking.size > 0;
+    // `keyed`, not players.length: a roster S³ could not key a single player
+    // out of has resolved nothing, and must not be reported as settled.
+    const allResolved = keyed > 0 && !hasNullTeams;
     let joinCount = 0;
     let leaveCount = 0;
     let teamChangeCount = 0;
 
-    this.verboseLogger(2, `[Players] UPDATED_PLAYER_INFORMATION: ${players.length} server players, ${this.registry.size} tracked, initialSync=${isInitialSync}, hasNullTeams=${hasNullTeams}`);
+    this.verboseLogger(2, `[Players] UPDATED_PLAYER_INFORMATION: ${players.length} server players, ${this.registry.size} tracked, initialSync=${isInitialSync}, hasNullTeams=${hasNullTeams}, stuck=${this._stuckKeys.size}`);
 
     for (const rawPlayer of players) {
       const result = this._registerPlayer(rawPlayer, now, {
@@ -1122,6 +1157,142 @@ export default class PlayersService {
 
   _isRealTeam(teamID) {
     return teamID === 1 || teamID === 2;
+  }
+
+  /**
+   * "Name (eosID)" where the registry knows the player, bare key otherwise.
+   * A stuck-client log naming only an EOS ID is not actionable by an admin who
+   * has to go find that player in game.
+   */
+  _describeKey(key) {
+    const name = this.registry.get(key)?.name;
+    return name ? `${name} (${key})` : key;
+  }
+
+  /**
+   * How long a player may report an unreal teamID before being quarantined.
+   *
+   * Floored at three refresh ticks for the same reason the resolving deadline
+   * is floored at four: the answer can only change on a tick, so a window
+   * shorter than the cadence would quarantine players who simply have not been
+   * looked at yet.
+   */
+  _unresolvedGraceWindowMs() {
+    const tickMs = this.getEffectiveRefreshIntervalMs() || 0;
+    return Math.max(this.unresolvedGraceMs, tickMs * 3);
+  }
+
+  /**
+   * Age the unreal-teamID clock for every player on the server and return the
+   * set of keys that should still block the roster-wide resolution gate.
+   *
+   * BUG HISTORY: `allResolved` used to be a flat `players.some(...)` over the
+   * raw roster, so a SINGLE player whose client wedged at `Team ID: N/A` — one
+   * did, stuck on the previous layer across a whole round — pinned it false
+   * indefinitely. That froze `_lastStablePlayers` and `_squadsCache`, and, far
+   * worse, suppressed S3_PLAYER_TEAM_CHANGED for EVERY player for the whole
+   * round, blinding TeamBalancer, SmartAssign and Switch. `resolving` had a
+   * deadline to escape on; this gate had none.
+   *
+   * The transient window that gate exists for is a property of the round
+   * transition, where the roster goes null en masse and clears in seconds. So
+   * quarantine is deliberately withheld while HALF OR MORE of the roster is
+   * unreal: that shape is either a real transition or a systemic RCON/parse
+   * failure, and in neither case should S³ declare teams resolved.
+   */
+  _ageUnresolvedPlayers(players, now) {
+    const blocking = new Set();
+    const seen = new Set();
+    const unresolved = [];
+
+    for (const raw of players) {
+      const key = this._selectPlayerKey(raw);
+      if (!key) continue;
+      seen.add(key);
+
+      if (this._isRealTeam(raw?.teamID)) {
+        if (this._unresolvedSince.has(key)) {
+          const entry = this._unresolvedSince.get(key);
+          this._unresolvedSince.delete(key);
+          this._stuckKeys.delete(key);
+          if (entry.warned) {
+            this.verboseLogger(1, `[Players] ${this._describeKey(key)} reports team ${raw.teamID} again after ${Math.round((now - entry.since) / 1000)}s stuck — back in the resolution gate.`);
+          }
+        }
+        continue;
+      }
+
+      unresolved.push(key);
+      if (!this._unresolvedSince.has(key)) {
+        this._unresolvedSince.set(key, { since: now, warned: false });
+      }
+    }
+
+    // Forget anyone who left, so a reconnect starts a fresh clock.
+    for (const key of [...this._unresolvedSince.keys()]) {
+      if (!seen.has(key)) {
+        this._unresolvedSince.delete(key);
+        this._stuckKeys.delete(key);
+      }
+    }
+    for (const key of [...this._stuckKeys]) {
+      if (!seen.has(key)) this._stuckKeys.delete(key);
+    }
+
+    // Mass-unresolved: a transition or a systemic failure, never one bad client.
+    // Measured against the players S³ can actually key, not the raw list — a row
+    // with neither ID is invisible to the registry, and counting it in the
+    // denominator would drag the ratio down and quarantine people early.
+    const systemic = unresolved.length * 2 >= seen.size;
+
+    // Edge-triggered on purpose: this fires on every legitimate round
+    // transition, and printing it per tick would bury it. What makes it worth
+    // logging at all is the case it is NOT designed for — if this state is
+    // entered and never left, quarantine can never engage, and this line is the
+    // only evidence of why the resolution gate is still down.
+    if (systemic !== this._systemicUnresolved) {
+      this._systemicUnresolved = systemic;
+      if (systemic && seen.size > 0) {
+        this.verboseLogger(2, `[Players] ${unresolved.length}/${seen.size} players report no teamID — mass window (transition or RCON fault), quarantine withheld.`);
+      } else if (!systemic) {
+        this.verboseLogger(2, `[Players] Mass null-teamID window cleared — ${unresolved.length}/${seen.size} still unresolved.`);
+      }
+    }
+
+    if (systemic) {
+      if (unresolved.length > 0) this._stuckKeys.clear();
+      return { blocking: new Set(unresolved), keyed: seen.size };
+    }
+
+    const grace = this._unresolvedGraceWindowMs();
+    for (const key of unresolved) {
+      const entry = this._unresolvedSince.get(key);
+      if (now - entry.since < grace) {
+        blocking.add(key);
+        continue;
+      }
+
+      this._stuckKeys.add(key);
+      if (!entry.warned) {
+        entry.warned = true;
+        this.verboseLogger(1, `[Players] ${this._describeKey(key)} has reported no teamID for ${Math.round((now - entry.since) / 1000)}s — treating as a stuck client and excluding it from the team-resolution gate. They usually need to reconnect.`);
+      }
+    }
+
+    return { blocking, keyed: seen.size };
+  }
+
+  /**
+   * Keys of players excluded from the resolution gate because their client is
+   * wedged at teamID N/A. They are still tracked and still in the registry —
+   * they just no longer speak for whether the lobby's teams are settled.
+   */
+  getStuckPlayerKeys() {
+    return new Set(this._stuckKeys);
+  }
+
+  isPlayerStuck(key) {
+    return this._stuckKeys.has(this._normalizeIdentifier(key));
   }
 
   _getActiveRegistry() {
