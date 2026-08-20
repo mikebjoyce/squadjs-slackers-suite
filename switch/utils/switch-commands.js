@@ -106,7 +106,7 @@ const SwitchCommands = {
                 return;
               }
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
-              pl = plugin.getPlayerByUsernameOrSteamID(steamID, commandSplit.splice(1).join(' '))
+              pl = plugin.getPlayerByUsernameOrSteamID(eosID, commandSplit.splice(1).join(' '))
               if (pl) {
                 plugin._taggedSwitchPlayer(pl.eosID, 'Admin-Force').catch(err => {
                   plugin.verbose(1, `Admin switch now failed: ${err.message}`);
@@ -123,8 +123,8 @@ const SwitchCommands = {
                 const swapArgs = commandSplit.splice(1).join(' ').split(' ');
                 const name1 = swapArgs[0];
                 const name2 = swapArgs[1];
-                const p1 = plugin.getPlayerByUsernameOrSteamID(steamID, name1);
-                const p2 = plugin.getPlayerByUsernameOrSteamID(steamID, name2);
+                const p1 = plugin.getPlayerByUsernameOrSteamID(eosID, name1);
+                const p2 = plugin.getPlayerByUsernameOrSteamID(eosID, name2);
                 if (p1 && p2) {
                   await plugin._taggedSwitchPlayer(p1.eosID, 'Admin-Force');
                   await plugin._taggedSwitchPlayer(p2.eosID, 'Admin-Force');
@@ -140,7 +140,7 @@ const SwitchCommands = {
                 return;
               }
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
-              pl = plugin.getPlayerByUsernameOrSteamID(steamID, commandSplit.splice(1).join(' '))
+              pl = plugin.getPlayerByUsernameOrSteamID(eosID, commandSplit.splice(1).join(' '))
               if (pl) {
                 await plugin.doubleSwitchPlayer(pl.eosID, true);
               }
@@ -172,9 +172,21 @@ const SwitchCommands = {
               }
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
               await plugin.server.updatePlayerList();
-              pl = plugin.getPlayerByUsernameOrSteamID(steamID, commandSplit.splice(1).join(' '));
-              plugin.warn(eosID, `Player "${pl.name}" queued for switch at match end.`);
-              plugin.addPlayerToMatchendSwitches(pl);
+              // v2.5.6: pl can be undefined (no match / ambiguous name) — the
+              // old code dereferenced pl.name and threw, and the throw landed
+              // in the handler-wide catch, so the admin saw nothing at all.
+              // The confirmation also fired before the un-awaited insert.
+              pl = plugin.getPlayerByUsernameOrSteamID(eosID, commandSplit.splice(1).join(' '));
+              if (!pl) break;
+              try {
+                const queued = await plugin.addPlayerToMatchendSwitches(pl);
+                plugin.warn(eosID, queued
+                  ? `Player "${pl.name}" queued for switch at match end.`
+                  : `Player "${pl.name}" was already queued for match end — no change.`);
+              } catch (err) {
+                plugin.verbose(1, `[Switch] matchend enqueue failed for ${pl.name}: ${err.message || err}`);
+                plugin.warn(eosID, `Failed to queue "${pl.name}": ${err.message || err}`);
+              }
               break;
             case "doublesquad":
               if (!isAdmin) {
@@ -194,8 +206,15 @@ const SwitchCommands = {
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
               await plugin.server.updateSquadList();
               await plugin.server.updatePlayerList();
-              plugin.warn(eosID, `Squad ${commandSplit[1]} (${commandSplit[2]}) queued for switch at match end.`);
-              await plugin.addSquadToMatchendSwitches(+commandSplit[1], commandSplit[2]);
+              try {
+                const queuedCount = await plugin.addSquadToMatchendSwitches(+commandSplit[1], commandSplit[2]);
+                plugin.warn(eosID, queuedCount
+                  ? `Squad ${commandSplit[1]} (${commandSplit[2]}): ${queuedCount} player(s) queued for switch at match end.`
+                  : `Squad ${commandSplit[1]} (${commandSplit[2]}): nobody queued (empty squad, or all members already queued).`);
+              } catch (err) {
+                plugin.verbose(1, `[Switch] matchendsquad enqueue failed: ${err.message || err}`);
+                plugin.warn(eosID, `Failed to queue squad ${commandSplit[1]}: ${err.message || err}`);
+              }
               break;
             case "triggermatchend":
               if (!isAdmin) {
@@ -413,21 +432,17 @@ const SwitchCommands = {
                   plugin.warn(eosID, 'Player not found or multiple matches.');
                   return;
                 }
-                const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
-                if (PlayerCooldowns) {
-                  await plugin._withDb(async (t) => {
-                    // v2.3.0 §3.4: Refill tokens instead of deleting the row.
-                    // Set tokenBalance to max, reset regen anchor, clear scramble lock.
-                    // seedPresenceStart: null intentionally resets any in-progress seed
-                    // presence tracking — admin clear is a full reset of all eligibility state.
-                    const maxTokens = plugin.options.maxSwitchTokens;
-                    await PlayerCooldowns.upsert(
-                      { eosID: result.eosID, tokenBalance: maxTokens, tokenRegenAnchor: new Date(), scrambleLockdownExpiry: null, seedPresenceStart: null, lastActiveTimestamp: new Date() },
-                      { transaction: t }
-                    );
-                  });
+                // Reported inline rather than left to the handler's catch-all.
+                // The catch-all is 300 lines below and replies nothing, which is
+                // how `clearall` stayed broken on a live MySQL server for so
+                // long: the admin saw silence and assumed success.
+                try {
+                  await plugin.adminClearPlayer(result.eosID);
+                  plugin.warn(eosID, `Cleared restrictions for ${result.playerName || result.steamID} (seed tokens kept).`);
+                } catch (err) {
+                  plugin.verbose(1, `[Admin] clear failed for ${result.playerName || result.eosID}: ${err.message}`);
+                  plugin.warn(eosID, `Clear failed: ${err.message}`);
                 }
-                plugin.warn(eosID, `Cleared cooldowns for ${result.playerName || result.steamID}`);
               }
               break;
             case "clearall":
@@ -436,15 +451,40 @@ const SwitchCommands = {
                 return;
               }
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
+              try {
+                const { toppedUp, locksCleared } = await plugin.adminClearAllRestrictions();
+                plugin.warn(eosID, `Restrictions cleared — ${toppedUp} topped up, ${locksCleared} scramble locks lifted. Seed tokens kept. Use !switch wipe confirm to delete all rows.`);
+              } catch (err) {
+                plugin.verbose(1, `[Admin] clearall failed: ${err.message}`);
+                plugin.warn(eosID, `Clear all failed: ${err.message}`);
+              }
+              break;
+            case "wipe":
+              if (!isAdmin) {
+                plugin.verbose(1, `[Denied] Player ${playerName} (not admin) attempted admin command: ${subCommand}`);
+                return;
+              }
+              plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
               {
-                const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
-                if (PlayerCooldowns) {
-                  await plugin._withDb(async (t) => {
-                    await PlayerCooldowns.destroy({ where: {}, truncate: true, transaction: t });
-                  });
+                // `wipe` is the only command that destroys earned seed tokens,
+                // and there is no undo. It sits one keystroke away from
+                // `clearall`, which deletes nothing — so the confirm word is
+                // what separates "lift everyone's locks" from "take everyone's
+                // seed bonus away" when an admin types the wrong one in a hurry.
+                if ((commandSplit[1] || '').toLowerCase() !== 'confirm') {
+                  plugin.warn(eosID,
+                    'Wipe DELETES every cooldown row, including earned seed tokens. This cannot be undone. ' +
+                    'Type !switch wipe confirm to proceed, or !switch clearall to lift restrictions without deleting anything.');
+                  return;
+                }
+                try {
+                  const deleted = await plugin.adminWipeAll();
+                  plugin.warn(eosID, `Wiped ${deleted} cooldown rows — every player is back to a clean default.`);
+                } catch (err) {
+                  plugin.verbose(1, `[Admin] wipe failed: ${err.message}`);
+                  plugin.warn(eosID, `Wipe failed: ${err.message}`);
                 }
               }
-              plugin.warn(eosID, "All player cooldowns cleared.");
               break;
             case 'cancel':
               if (!plugin.options.queueEnabled) {
@@ -1292,28 +1332,41 @@ const SwitchCommands = {
           await plugin.safeDiscordReply(message, 'Player not found or multiple matches.');
           return;
         }
-        const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
-        if (PlayerCooldowns) {
-          await plugin._withDb(async (t) => {
-            // v2.3.0 §3.4: Refill tokens instead of deleting the row.
-            // seedPresenceStart: null intentionally resets any in-progress seed
-            // presence tracking — admin clear is a full reset of all eligibility state.
-            const maxTokens = plugin.options.maxSwitchTokens;
-            await PlayerCooldowns.upsert(
-              { eosID: result.eosID, tokenBalance: maxTokens, tokenRegenAnchor: new Date(), scrambleLockdownExpiry: null, seedPresenceStart: null, lastActiveTimestamp: new Date() },
-              { transaction: t }
-            );
-          });
+        try {
+          const summary = await plugin.adminClearPlayer(result.eosID);
+          const detail = summary
+            ? `${summary.tokensBefore} → ${summary.tokensAfter} tokens${summary.lockCleared ? ', scramble lock lifted' : ''}`
+            : 'no row found — already unrestricted';
+          await plugin.safeDiscordReply(message, `✅ Cleared restrictions for **${result.playerName || result.steamID}** (${detail}). Seed tokens kept.`);
+        } catch (err) {
+          plugin.verbose(1, `[Admin] clear failed for ${result.playerName || result.eosID}: ${err.message}`);
+          await plugin.safeDiscordReply(message, `❌ Clear failed: ${err.message}`);
         }
-        await plugin.safeDiscordReply(message, `✅ Cleared cooldowns for **${result.playerName || result.steamID}**.`);
       } else if (subCommand === 'clearall') {
-        const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
-        if (PlayerCooldowns) {
-          await plugin._withDb(async (t) => {
-            await PlayerCooldowns.destroy({ where: {}, truncate: true, transaction: t });
-          });
+        try {
+          const { toppedUp, locksCleared } = await plugin.adminClearAllRestrictions();
+          await plugin.safeDiscordReply(message,
+            `✅ Restrictions cleared — **${toppedUp}** topped up to ${plugin.options.maxSwitchTokens}, **${locksCleared}** scramble locks lifted. Earned seed tokens kept; use \`!switch wipe confirm\` to delete every row.`
+          );
+        } catch (err) {
+          plugin.verbose(1, `[Admin] clearall failed: ${err.message}`);
+          await plugin.safeDiscordReply(message, `❌ Clear all failed: ${err.message}`);
         }
-        await plugin.safeDiscordReply(message, '🗑️ All player cooldowns cleared.');
+      } else if (subCommand === 'wipe') {
+        // See the in-game `wipe` case — same guard, same reason.
+        if ((args[2] || '').toLowerCase() !== 'confirm') {
+          await plugin.safeDiscordReply(message,
+            '⚠️ `!switch wipe` **deletes every cooldown row**, including earned seed tokens. This cannot be undone.\n' +
+            'Run `!switch wipe confirm` to proceed, or `!switch clearall` to lift restrictions without deleting anything.');
+          return;
+        }
+        try {
+          const deleted = await plugin.adminWipeAll();
+          await plugin.safeDiscordReply(message, `🗑️ Wiped **${deleted}** cooldown rows — every player is back to a clean default.`);
+        } catch (err) {
+          plugin.verbose(1, `[Admin] wipe failed: ${err.message}`);
+          await plugin.safeDiscordReply(message, `❌ Wipe failed: ${err.message}`);
+        }
       } else if (subCommand === 'timelimit' && ['on', 'off'].includes(args[2])) {
         const enabled = args[2] === 'on';
         try {
@@ -1359,8 +1412,9 @@ const SwitchCommands = {
           fields: [
             { name: '!switch status', value: 'Show database diagnostics and active locks.' },
             { name: '!switch check <ident>', value: 'Check cooldown status for a player.' },
-            { name: '!switch clear <ident>', value: 'Clear cooldowns for a specific player.' },
-            { name: '!switch clearall', value: 'Clear all player cooldowns.' },
+            { name: '!switch clear <ident>', value: 'Lift one player\'s restrictions (keeps earned seed tokens).' },
+            { name: '!switch clearall', value: 'Lift restrictions for everyone (keeps earned seed tokens).' },
+            { name: '!switch wipe confirm', value: 'Delete every cooldown row — a full reset, seed tokens included. The word `confirm` is required.' },
             { name: '!switch timelimit on|off', value: 'Admin: Toggle join/match time limit for queue entry.' },
             { name: '!switch stats [days]', value: 'Scrape the last N days of round summaries (default 60).' },
             { name: '!switch explain', value: 'Generate a detailed explanation of how team switching works.' },
@@ -1376,8 +1430,9 @@ const SwitchCommands = {
           fields: [
             { name: '!switch status', value: 'Show database diagnostics and active locks.' },
             { name: '!switch check <ident>', value: 'Check cooldown status for a player.' },
-            { name: '!switch clear <ident>', value: 'Clear cooldowns for a specific player.' },
-            { name: '!switch clearall', value: 'Clear all player cooldowns.' },
+            { name: '!switch clear <ident>', value: 'Lift one player\'s restrictions (keeps earned seed tokens).' },
+            { name: '!switch clearall', value: 'Lift restrictions for everyone (keeps earned seed tokens).' },
+            { name: '!switch wipe confirm', value: 'Delete every cooldown row — a full reset, seed tokens included. The word `confirm` is required.' },
             { name: '!switch timelimit on|off', value: 'Admin: Toggle join/match time limit for queue entry.' },
             { name: '!switch stats [days]', value: 'Scrape the last N days of round summaries (default 60).' },
             { name: '!switch explain', value: 'Generate a detailed explanation of how team switching works.' },

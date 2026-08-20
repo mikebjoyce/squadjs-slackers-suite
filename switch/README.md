@@ -1,4 +1,4 @@
-# Switch Plugin v2.5.5
+# Switch Plugin v2.5.6
 
 **Team-change management with database persistence, TeamBalancer integration, and S³-aware player tracking.**
 
@@ -24,7 +24,7 @@ Survives server restarts via any Sequelize-compatible database (SQLite, MySQL, P
 * **Liberal Mode Support** — relaxed switching rules during Seed/Jensen rounds
 * **Token Bucket Cooldown** — players hold up to `maxSwitchTokens` (default 2) with individual per-token regeneration; set to 1 for legacy flat-cooldown behavior. Token-aware messaging adapts automatically based on the configured token count.
  * **Seed Bonus Tokens** — players earn bonus switch tokens for time spent in seed-mode rounds, stacking above the normal cap up to an absolute ceiling of `maxSwitchTokens + seedTokenBonusAmount`. Players still present when the round ends receive a consolation token even if they never accrued a full interval. Configurable minimum player threshold (`seedTokenBonusMinPlayers`) gates time accrual so low-population servers don't hand out tokens at 2 AM. Set either `seedTokenBonusAmount` or `seedTokenBonusMinutes` to 0 to disable seed bonus tokens entirely.
- * **Row Retention** — cooldown rows are pruned automatically in two tiers: after 30 minutes once a row carries no information (exactly `maxSwitchTokens`, no seed state), and after `pruneInactivePlayerDays` for everything else. Connected players are never pruned. Keeps the table bounded on long-running servers.
+ * **Row Retention** — cooldown rows are pruned automatically in two tiers: after 30 minutes once a row carries no information (exactly `maxSwitchTokens`, no seed state), and after `pruneInactivePlayerDays` for everything else. Connected players are never pruned. Keeps the table bounded on long-running servers. Because token regeneration is lazy, a row that has fully refilled still reads below the cap on disk; the prune pass writes completed regeneration back first, so tier 1 can actually match. Per-round seed state is retired at the next `NEW_GAME` regardless of who is connected, which is what stops disconnected seeders from pinning their rows in the table indefinitely.
 * **Dynamic Balance Tolerance** — interpolated extra imbalance slots when server is below full capacity
 * **Explain Channel** — When `explainChannelID` is configured, the full `!switch explain` embed sequence plus a 7-day reliability stats embed is posted to the designated channel on mount. The message ID is persisted in `SwitchPlugin_Settings`, so a restart edits the existing message in place rather than posting a duplicate. It is generated **once per SquadJS startup** — there is no periodic refresh, so the stats age until the next restart.
 * **Enhanced `!switch stats`** — Discord aggregate embed with per-move-type counts, denial reason breakdowns, queue outcomes, liberal-mode filtering, and data quality warnings
@@ -169,9 +169,10 @@ squad-server/
 | `!switch refresh` | Force an RCON player-list refresh |
 | `!switch slots` | Report current balance slot availability |
 | `!switch check <name/steamID>` | Look up another player's cooldown and lock status |
-| `!switch clear <name/steamID>` | Remove all cooldowns and locks for a player |
-| `!switch clearall` | Wipe the entire cooldown database |
-| `!switch status` | Show DB health, active locks, and top-5 locked players |
+| `!switch clear <name/steamID>` | Lift one player's restrictions — tokens topped up to at least full, scramble lock dropped. Never lowers a balance, so earned seed tokens survive |
+| `!switch clearall` | The same for every tracked player. Restrictions only; deletes nothing |
+| `!switch wipe confirm` | Delete every cooldown row. The true reset — an absent row already reads as "full tokens, no locks, no seed progress". The literal word `confirm` is required; without it the command only explains what it would do |
+| `!switch status` | Token and lock summary, plus who is actually blocked from switching |
 | `!switch help` | List all admin commands |
 
 ### Discord Commands
@@ -180,10 +181,11 @@ squad-server/
 
 | Command | Description |
 |---------|-------------|
-| `!switch status` | Database health + RCON latency + top-5 locked players |
+| `!switch status` | Token and lock summary + RCON latency + who is actually blocked |
 | `!switch check <name/steamID>` | Real-time eligibility lookup with Discord timestamps |
-| `!switch clear <name/steamID>` | Remove cooldowns/locks for a player |
-| `!switch clearall` | Wipe entire cooldown database |
+| `!switch clear <name/steamID>` | Lift one player's restrictions; keeps earned seed tokens |
+| `!switch clearall` | Lift restrictions for everyone; keeps earned seed tokens, deletes nothing |
+| `!switch wipe confirm` | Delete every cooldown row. The literal word `confirm` is required |
 | `!switch timelimit on\|off` | Toggle the join/match time limit for queue entry |
 | `!switch stats [days]` | Scrape the last N days of round summaries and show an aggregate embed with movement types, denial reasons, queue outcomes, and data quality info |
 | `!switch help` | List all Discord admin commands |
@@ -206,6 +208,7 @@ The Switch plugin exposes a public API for external consumers (such as SmartAssi
 
 ### Version Compatibility
 
+- `static version = '2.5.6'` — Admin commands split into `clear`/`clearall` (lift restrictions, never confiscate seed tokens) and `wipe confirm` (delete rows, and it will not run without the confirm word); `clearall` no longer uses TRUNCATE, which the live MySQL account has no privilege for and which was failing silently. Per-round seed state is retired at NEW_GAME rather than only for players who happen to be connected at round end, the presence clock stops on disconnect, and fully-regenerated balances are written back so the 30-minute row prune can see them. `!switch status` reports who is actually blocked instead of listing players at full tokens.
 - `static version = '2.5.5'` — Verify migration data effects; stop swallowing unhandled rejections
 - `static version = '2.5.4'` — Correct misleading 'schema already up to date' log when migrations are pending
 - `static version = '2.5.3'` — Route onChatMessage catch-all through reportError (enables opt-in stderr mirroring; stdout unchanged)
@@ -315,7 +318,7 @@ Two grants exist:
 
 ### Discord
 
-The Switch plugin supports splitting Discord traffic across two channels. Round summaries, scramble notifications, and other automated reports always flow to `discordChannelID`. Admin commands (`!switch status/check/clear/clearall/timelimit/stats/help`) are gated to `adminCommandChannelID` when set.
+The Switch plugin supports splitting Discord traffic across two channels. Round summaries, scramble notifications, and other automated reports always flow to `discordChannelID`. Admin commands (`!switch status/check/clear/clearall/wipe/timelimit/stats/help`) are gated to `adminCommandChannelID` when set.
 
 | Option | Description | Default |
 |--------|-------------|---------|

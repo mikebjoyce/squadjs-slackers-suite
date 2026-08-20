@@ -77,13 +77,11 @@ Tokens refill one at a time, independently. With **2** tokens saved, you can swi
 During seed rounds, you earn **+1** bonus token for every **20** minutes you are present.
 You can earn up to **1** bonus token per seed round.
 
-If the seed round ends before you have banked a full 20 minutes, you still get **+1**
-as long as you are **still on the server when the round ends**. Leave early and you
-get nothing for that round — though anything you already earned is yours to keep.
+The **20** minutes must be time actually spent on the server. If you disconnect, the clock stops and restarts from zero when you come back — but anything you have already earned this round stays earned.
 
-Bonus tokens stack above your normal cap of **2**, up to a hard ceiling of **3** tokens.
-Once you are at 3 you stop earning, however many seed rounds you play, until you spend
-one and drop back below the ceiling.
+If the seed round ends before you have banked a full **20** minutes, you still get **+1** as long as you are **still on the server when the round ends**. Leave early and you get nothing for that round — though anything you already earned is yours to keep.
+
+Bonus tokens stack above your normal cap of **2**, up to a hard ceiling of **3** tokens. Once you are at 3 you stop earning, however many seed rounds you play, until you spend one and drop back below the ceiling.
 
 ### Checking Your Balance
 
@@ -218,7 +216,7 @@ The following table lists every configuration option with the value used to gene
 | Option | Value | Description |
 |--------|-------|-------------|
 | `queueTimeoutSwitchEnabled` | true | Force-switch on queue timeout instead of removal |
-| `queueTimeoutExtraSlots` | undefined | Extra imbalance slots for timeout-triggered switches |
+| `queueTimeoutExtraSlots` | 2 | Extra imbalance slots for timeout-triggered switches |
 
 ### Double-Switch
 

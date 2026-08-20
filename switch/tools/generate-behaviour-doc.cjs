@@ -135,6 +135,10 @@ const CFG = {
   // the unconfigured case. The companion config file explicitly sets 15, so the
   // live explain output will show 15 when the option is present in plugin config.
   queueTimeoutMinutes:               rawConfig.queueTimeoutMinutes ?? 20,
+  // ⚠️ The appendix table has always printed this row, but the key was never
+  // resolved here — so it rendered literally as `undefined`. Default matches
+  // switch.js optionsSpecification.
+  queueTimeoutExtraSlots:            rawConfig.queueTimeoutExtraSlots ?? 2,
   doubleSwitchEnabledMinutes:        rawConfig.doubleSwitchEnabledMinutes ?? 10,
   maxUnbalancedSlots:                rawConfig.maxUnbalancedSlots ?? 1,
   scrambleLockdownDurationMinutes:   rawConfig.scrambleLockdownDurationMinutes ?? 30,
@@ -149,6 +153,7 @@ const CFG = {
   seedTokenBonusAmount:              rawConfig.seedTokenBonusAmount ?? 1,
   seedTokenBonusMinutes:             rawConfig.seedTokenBonusMinutes ?? 20,
   seedTokenBonusMinPlayers:          rawConfig.seedTokenBonusMinPlayers ?? 0,
+  pruneInactivePlayerDays:           rawConfig.pruneInactivePlayerDays ?? 3,
   // ⚠️ Aligned with switch-explain.js: the explain system evaluates
   // `plugin.options.queueTimeoutSwitchEnabled === true` which returns false
   // when the option is undefined. The `??` default must be `false` (not `true`)
@@ -369,11 +374,20 @@ function generate() {
       const minNote = CFG.seedTokenBonusMinPlayers > 0
         ? ` (only while **${CFG.seedTokenBonusMinPlayers}+** players are online)`
         : '';
+      // v2.5.6: these four paragraphs used to be hand-written straight into
+      // SWITCH_BEHAVIOUR.md, which meant they hardcoded the 20-minute interval
+      // and were silently erased by the next run of this generator.
+      const tokenCeiling = maxTokens + CFG.seedTokenBonusAmount;
       lines.push(`### Seed Bonus`);
       lines.push(``);
       lines.push(`During seed rounds, you earn **+1** bonus token for every **${CFG.seedTokenBonusMinutes}** minutes you are present${minNote}.`);
       lines.push(`You can earn up to **${CFG.seedTokenBonusAmount}** bonus token${CFG.seedTokenBonusAmount !== 1 ? 's' : ''} per seed round.`);
-      lines.push(`Bonus tokens stack above your normal cap of **${maxTokens}**, so after a full seed round you could hold up to **${maxTokens + CFG.seedTokenBonusAmount}** tokens total.`);
+      lines.push(``);
+      lines.push(`The **${CFG.seedTokenBonusMinutes}** minutes must be time actually spent on the server. If you disconnect, the clock stops and restarts from zero when you come back — but anything you have already earned this round stays earned.`);
+      lines.push(``);
+      lines.push(`If the seed round ends before you have banked a full **${CFG.seedTokenBonusMinutes}** minutes, you still get **+1** as long as you are **still on the server when the round ends**. Leave early and you get nothing for that round — though anything you already earned is yours to keep.`);
+      lines.push(``);
+      lines.push(`Bonus tokens stack above your normal cap of **${maxTokens}**, up to a hard ceiling of **${tokenCeiling}** tokens. Once you are at ${tokenCeiling} you stop earning, however many seed rounds you play, until you spend one and drop back below the ceiling.`);
       lines.push(``);
     }
   } else {
@@ -560,9 +574,10 @@ function generate() {
     lines.push(`| Option | Value | Description |`);
     lines.push(`|--------|-------|-------------|`);
     lines.push(`| \`maxSwitchTokens\` | ${CFG.maxSwitchTokens} | Maximum switch tokens a player can hold |`);
-    lines.push(`| \`seedTokenBonusAmount\` | ${CFG.seedTokenBonusAmount} | Max bonus tokens per seed round |`);
+    lines.push(`| \`seedTokenBonusAmount\` | ${CFG.seedTokenBonusAmount} | Max bonus tokens per seed round, and the amount by which seed bonuses may exceed \`maxSwitchTokens\` |`);
     lines.push(`| \`seedTokenBonusMinutes\` | ${CFG.seedTokenBonusMinutes} | Minutes of seed presence to earn one bonus token |`);
     lines.push(`| \`seedTokenBonusMinPlayers\` | ${CFG.seedTokenBonusMinPlayers} | Minimum players online for seed time accrual |`);
+    lines.push(`| \`pruneInactivePlayerDays\` | ${CFG.pruneInactivePlayerDays} | Days unseen before a player's cooldown row is pruned |`);
     lines.push(``);
     lines.push(`### Queue Timeout Switch`);
     lines.push(``);

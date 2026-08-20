@@ -37,6 +37,7 @@
   "seedTokenBonusAmount":                 1,
   "seedTokenBonusMinutes":                20,
   "seedTokenBonusMinPlayers":             0,
+  "pruneInactivePlayerDays":              3,
 
   "queueTimeoutSwitchEnabled":            true,
   "queueTimeoutExtraSlots":               2,

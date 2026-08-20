@@ -31,7 +31,14 @@ const testFiles = [
   // Builds a flattened assembly via install.cjs so a real Switch instance can
   // be constructed — slower than the mock-harness suites, and the only one
   // that runs an event handler end to end into a real database.
-  'test-scramble-lockdown.js'
+  'test-scramble-lockdown.js',
+  // Same approach, run against SQLite AND MySQL. These two are where the
+  // v2.5.6 admin/seed behaviour is actually pinned; the mock-harness suites
+  // above cannot see permission errors or three-valued logic. MySQL cases
+  // report as SKIPPED when the engine is not up on 127.0.0.1:3307 — read the
+  // skip count, because a skip is not a pass.
+  'test-admin-mutations.js',
+  'test-seed-token-lifecycle.js'
 ];
 
 console.log('═'.repeat(50));

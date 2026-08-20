@@ -9,6 +9,22 @@
  * "clear" = full refill (tokenBalance = max, regenAnchor = now),
  * scramble lock nulled, seed presence nulled.
  *
+ * ─── SUPERSEDED — READ THIS BEFORE TRUSTING A GREEN RUN ──────────
+ *
+ * These cases do not call the clear path. They construct a mock row, apply the
+ * write they EXPECT the clear to perform, and assert on the result — so they
+ * pass whatever plugin.adminClearPlayer() actually does, and they passed
+ * throughout the period when `!switch clearall` was failing outright on the
+ * live server. They are kept because the spec §3.4 arithmetic they encode is
+ * still correct, not because they cover the behaviour.
+ *
+ * The real coverage is test-admin-mutations.js, which runs the shipped helpers
+ * against SQLite and MySQL. Two of the v2.5.6 semantics are deliberately NOT
+ * what this file models: clear now tops up with Math.max rather than assigning
+ * maxSwitchTokens (a seed holder above the cap keeps their surplus), and it no
+ * longer nulls seedPresenceStart (unsticking someone mid-seed-round must not
+ * cost them the round's progress). Add new cases there, not here.
+ *
  * ─── USAGE ───────────────────────────────────────────────────────
  *
  *   node switch/testing/test-admin-clear.js

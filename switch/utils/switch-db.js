@@ -608,6 +608,90 @@ const SwitchDB = {
      * NULL lastActiveTimestamp means "keep". Migration v5 backfills every row, so
      * NULL should not occur; treating it as keep is the safe reading if it does.
      */
+    /**
+     * v2.5.6: Write back token regeneration that has already fully completed.
+     *
+     * Regeneration is lazy — _regenTokens() adjusts a row in memory on every
+     * read, and the stored tokenBalance is only rewritten when the player next
+     * spends. A player who spent down to 1 and then waited out the refill is
+     * therefore displayed as 2/2 while the DATABASE still says 1, forever.
+     *
+     * That divergence is why cleanup()'s tier-1 prune was dead code. Tier 1
+     * deletes rows sitting at exactly maxSwitchTokens with no other state, on
+     * the grounds that an absent row already means the same thing — but it
+     * tests the STORED balance, which never returns to the cap on its own.
+     *
+     * Replayed against the 2026-08-20 production export (378 rows, live config
+     * maxSwitchTokens=2 / switchCooldownHours=1.75): tier 1 matched 0 rows.
+     * 114 of them — the 8 stored at 0 and the 106 stored at 1 — had fully
+     * regenerated and were displayed as 2/2 while the table said otherwise.
+     * With this pass plus the NEW_GAME seed sweep, the same export prunes
+     * 378 → 181 on the first cleanup; the 181 that stay are seed holders
+     * genuinely above the cap, which tier 2 retires at the retention horizon.
+     *
+     * Only rows whose regeneration is COMPLETE are touched, so this changes no
+     * player's effective balance — it writes down what _regenTokens() would
+     * have computed anyway. A row mid-cycle keeps its anchor and its partial
+     * progress. Deleting a row that is genuinely below cap would be an exploit
+     * (spend, disconnect, return to a fresh full row); that is precisely why
+     * this normalizes first and lets tier 1 test the result, rather than
+     * relaxing tier 1's `= maxSwitchTokens` to `>=`.
+     *
+     * One UPDATE per deficit level rather than one clever statement: the
+     * threshold scales with how many tokens are missing, maxSwitchTokens is a
+     * single digit, and this keeps the whole thing inside the ORM instead of
+     * hand-rolling dialect-specific date arithmetic in raw SQL.
+     *
+     * Rows below the cap with a NULL anchor are deliberately not matched —
+     * `Op.lt` against NULL is UNKNOWN, and such a row cannot prove it ever
+     * started regenerating. None exist in the production export; if one ever
+     * appears it ages out through tier 2 rather than being silently topped up.
+     *
+     * @returns {Promise<number>} rows normalized
+     */
+    plugin.normalizeRegeneratedTokens = async function () {
+      const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
+      if (!PlayerCooldowns) return 0;
+
+      const maxTokens = plugin.options.maxSwitchTokens;
+      // Mirrors _regenTokens() exactly: minutes override hours, and a
+      // non-positive interval means tokens never decay in the first place.
+      const intervalMs = plugin.options.switchCooldownMinutes > 0
+        ? plugin.options.switchCooldownMinutes * 60 * 1000
+        : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+      if (intervalMs <= 0) return 0;
+
+      const now = Date.now();
+      let normalized = 0;
+
+      try {
+        await plugin._withDb(async (t) => {
+          for (let deficit = 1; deficit <= maxTokens; deficit++) {
+            const [count] = await PlayerCooldowns.update(
+              { tokenBalance: maxTokens, tokenRegenAnchor: null },
+              {
+                where: {
+                  tokenBalance: maxTokens - deficit,
+                  tokenRegenAnchor: { [Op.lt]: new Date(now - deficit * intervalMs) }
+                },
+                transaction: t
+              }
+            );
+            normalized += count;
+          }
+        });
+
+        if (normalized > 0) {
+          plugin.verbose(1, `[Cleanup] Normalized ${normalized} fully-regenerated rows back to ${maxTokens} tokens.`);
+        }
+      } catch (err) {
+        // Non-fatal: without this the prune simply keeps more rows than it needs to.
+        plugin.verbose(1, `[Cleanup] Token normalization failed: ${err.message}`);
+      }
+
+      return normalized;
+    };
+
     plugin.cleanup = async function () {
       const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
       if (!PlayerCooldowns) return;
@@ -617,6 +701,11 @@ const SwitchDB = {
         plugin.verbose(2, '[Cleanup] Skipped — seed mode active.');
         return;
       }
+
+      // Before the prune, and deliberately ahead of the retention guard: this
+      // reconciles the stored balance with the displayed one, which is worth
+      // doing even for an operator who has pruning switched off entirely.
+      await plugin.normalizeRegeneratedTokens();
 
       const retentionDays = plugin.options.pruneInactivePlayerDays ?? 0;
       if (retentionDays <= 0) {
@@ -729,6 +818,301 @@ const SwitchDB = {
       if (records.length === 0) return null;
       if (records.length > 1) return 'multiple';
       return records[0];
+    };
+
+    /**
+     * v2.5.6: The single source of truth for "who is actually restricted right
+     * now". Every displayed number derives from this one pass.
+     *
+     * The bug it replaces: the diagnostics embed counted players below cap with
+     * lazy regeneration applied, but selected its "Restricted Players (top 5)"
+     * list on the RAW stored balance. On the 2026-08-20 production export that
+     * printed five players as restricted, each rendered "2/2 tokens (full)",
+     * directly under a line reading "Players Below Cap: 0". Both numbers came
+     * from the same table, moments apart, and disagreed because one applied
+     * regen and the other did not. getDiagnosticInfo() had the same defect and
+     * would have reported 114 active locks against a true count of 0.
+     *
+     * Loading the table is deliberate. Regeneration is a function of elapsed
+     * time against a per-row anchor, and expressing it in SQL means dialect-
+     * specific date arithmetic in exactly the place this codebase has been
+     * bitten before. The table is bounded by cleanup()'s retention window —
+     * 378 rows in production, a few hundred at steady state — so one indexed
+     * scan per !switch status is the cheaper mistake.
+     *
+     * "Blocked" means CANNOT SWITCH: no tokens, or an unexpired scramble lock.
+     * Below-cap is not blocked — with maxSwitchTokens at 2, a player holding 1
+     * is below cap and perfectly able to switch, which is why the old
+     * "Players Below Cap" line implied a restriction that did not exist.
+     *
+     * @returns {Promise<object|null>} null when the model is unavailable
+     */
+    plugin.getLiveRestrictionState = async function () {
+      const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
+      if (!PlayerCooldowns) return null;
+
+      const maxTokens = plugin.options.maxSwitchTokens;
+      const ceiling = maxTokens + (plugin.options.seedTokenBonusAmount ?? 0);
+      const now = new Date();
+
+      const rows = await PlayerCooldowns.findAll({
+        attributes: [
+          'eosID', 'steamID', 'playerName', 'tokenBalance', 'tokenRegenAnchor',
+          'scrambleLockdownExpiry', 'seedPresenceStart', 'lastActiveTimestamp'
+        ]
+      });
+
+      // Seed accrual is only real for someone who is on the server — the clock
+      // is compared against NOW, so an offline row's "accruing" is fiction.
+      const rosterReady = plugin._s3?.players?.isReady?.() === true;
+      const allPlayers = rosterReady ? plugin._s3.players.getAllPlayers() : plugin.server?.players;
+      const connected = new Set((allPlayers || []).map(p => p?.eosID).filter(Boolean));
+
+      const blocked = [];
+      let outOfTokens = 0;
+      let scrambleLocked = 0;
+      let belowCap = 0;
+      let seedAccruing = 0;
+
+      for (const r of rows) {
+        // _regenTokens() only reads/writes these two fields, so a plain object
+        // is safe and keeps the Sequelize instance unmodified.
+        const live = { tokenBalance: r.tokenBalance, tokenRegenAnchor: r.tokenRegenAnchor };
+        plugin._regenTokens(live);
+
+        const lockExpiry = r.scrambleLockdownExpiry ? new Date(r.scrambleLockdownExpiry) : null;
+        const lockActive = lockExpiry != null && lockExpiry.getTime() > now.getTime();
+        const noTokens = live.tokenBalance < 1;
+
+        if (lockActive) scrambleLocked++;
+        if (noTokens) outOfTokens++;
+        if (live.tokenBalance < maxTokens) belowCap++;
+        if (r.seedPresenceStart && connected.has(r.eosID) && live.tokenBalance < ceiling) seedAccruing++;
+
+        if (lockActive || noTokens) {
+          blocked.push({
+            eosID: r.eosID,
+            steamID: r.steamID,
+            playerName: r.playerName,
+            tokenBalance: live.tokenBalance,
+            tokenRegenAnchor: live.tokenRegenAnchor,
+            lockExpiry: lockActive ? lockExpiry : null,
+            online: connected.has(r.eosID)
+          });
+        }
+      }
+
+      // Worst first: an active lock outranks an empty wallet, since it cannot be
+      // waited out by regeneration alone. Then fewest tokens.
+      blocked.sort((a, b) => {
+        const al = a.lockExpiry ? a.lockExpiry.getTime() : -Infinity;
+        const bl = b.lockExpiry ? b.lockExpiry.getTime() : -Infinity;
+        if (al !== bl) return bl - al;
+        return a.tokenBalance - b.tokenBalance;
+      });
+
+      return {
+        total: rows.length,
+        maxTokens,
+        blocked,
+        outOfTokens,
+        scrambleLocked,
+        belowCap,
+        seedAccruing,
+        rosterReady
+      };
+    };
+
+    // ── Admin mutations ────────────────────────────────────────
+    //
+    // v2.5.6: `clear`/`clearall` mean "lift restrictions", NOT "reset the row".
+    // The two were conflated, and the conflation confiscated earned seed tokens:
+    // both paths wrote `tokenBalance: maxSwitchTokens` unconditionally, so a
+    // player sitting at maxSwitchTokens + seedTokenBonusAmount was silently
+    // knocked back down to the ordinary cap by an admin trying to help them.
+    //
+    // Top-up is therefore `Math.max(current, maxTokens)` everywhere — "bring them
+    // to at least full", never "set them to full". In-progress seed accrual
+    // (seedPresenceStart / seedBonusTokensEarned / lastSeedBonusRoundID) is left
+    // alone for the same reason: unsticking someone mid-seed-round should not
+    // cost them the round's progress.
+    //
+    // The genuine reset lives in adminWipeAll() and is spelled as a DELETE,
+    // because an ABSENT row already means "max tokens, no restrictions" — see
+    // _checkSwitchEligibility, which defaults a missing row to maxSwitchTokens.
+    // That is also why none of these use `truncate: true`: TRUNCATE is DDL, the
+    // live MySQL user has no DDL grants, and the failure surfaced as an admin
+    // command that replied nothing at all. Every helper here is plain DML.
+
+    /**
+     * Transaction wrapper for the admin mutations — the same thing _withDb()
+     * does, except that it PROPAGATES.
+     *
+     * plugin._withDb() catches, calls reportError(), and returns null. That is
+     * right for background housekeeping and wrong here: it is the mechanism by
+     * which the broken `clearall` reported nothing at all on live MySQL. The
+     * TRUNCATE was rejected for want of the DROP privilege, _withDb swallowed
+     * it, the caller saw a resolved promise, and the admin saw silence. Admin
+     * commands must be able to tell the admin they failed, so these three
+     * throw and the command layer reports it.
+     *
+     * @param {Function} fn — receives the transaction handle. S³ runs no CLS,
+     *   so every statement inside MUST be passed `{ transaction: t }` or it
+     *   executes outside the transaction.
+     */
+    const adminTx = async (fn) => {
+      if (!plugin._s3db || typeof plugin._s3db.isReady !== 'function' || !plugin._s3db.isReady()) {
+        throw new Error('Database is not ready.');
+      }
+      return plugin._s3db.withTransactionWithRetry(fn);
+    };
+
+    /**
+     * Lifts switch restrictions for one player without touching seed state.
+     *
+     * @param {string} eosID
+     * @returns {Promise<object|null>} { tokensBefore, tokensAfter, lockCleared }, or null when no row exists
+     */
+    plugin.adminClearPlayer = async function (eosID) {
+      const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
+      if (!PlayerCooldowns) throw new Error('SwitchPlugin_PlayerCooldowns model not available — DB may not be ready.');
+
+      const maxTokens = plugin.options.maxSwitchTokens;
+      let summary = null;
+
+      await adminTx(async (t) => {
+        // Re-read inside the transaction: the caller resolved this row through
+        // checkPlayer() and the balance may have moved since. Admin commands are
+        // rare enough that the extra read costs nothing.
+        const row = await PlayerCooldowns.findByPk(eosID, { transaction: t });
+        if (!row) return; // absent row is already unrestricted — nothing to do
+
+        const before = row.tokenBalance != null ? row.tokenBalance : maxTokens;
+        const after = Math.max(before, maxTokens);
+        const lockCleared = row.scrambleLockdownExpiry != null;
+
+        await PlayerCooldowns.update(
+          {
+            tokenBalance: after,
+            // null, not now(): no regen cycle is running at or above the cap, and
+            // _regenTokens() re-anchors in memory the moment it reads the row.
+            tokenRegenAnchor: null,
+            scrambleLockdownExpiry: null,
+            lastActiveTimestamp: new Date()
+          },
+          { where: { eosID }, transaction: t }
+        );
+
+        summary = { tokensBefore: before, tokensAfter: after, lockCleared };
+      });
+
+      // Without this a stale joinTime keeps gating !switch even with a full
+      // balance — same reason _clearReconnectLockouts and _resetPlayerLockouts
+      // both call it.
+      try {
+        await plugin._s3?.players?.resetJoinTime?.(eosID);
+      } catch (err) {
+        plugin.verbose(1, `[Admin] resetJoinTime failed for ${eosID}: ${err.message}`);
+      }
+
+      return summary;
+    };
+
+    /**
+     * Lifts switch restrictions for every tracked player, server-wide.
+     *
+     * Deliberately two statements rather than one. A single UPDATE setting
+     * tokenBalance = maxTokens would lower every seed-bonus holder to the
+     * ordinary cap — the exact bug this release fixes. Splitting on the cap
+     * lets rows above it keep their surplus while still losing their lock.
+     *
+     * SQL GREATEST() would express it in one statement, but SQLite spells that
+     * MAX(a, b) while MySQL and Postgres spell it GREATEST(a, b), so a single
+     * statement would need raw dialect-specific SQL. Two ORM updates are worth
+     * more than one clever one here.
+     *
+     * @returns {Promise<{toppedUp: number, locksCleared: number}>}
+     */
+    plugin.adminClearAllRestrictions = async function () {
+      const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
+      if (!PlayerCooldowns) throw new Error('SwitchPlugin_PlayerCooldowns model not available — DB may not be ready.');
+
+      const maxTokens = plugin.options.maxSwitchTokens;
+      let toppedUp = 0;
+      let locksCleared = 0;
+
+      await adminTx(async (t) => {
+        // Below the cap: top up to the cap and drop any lock.
+        //
+        // The NULL arm is spelled out deliberately. `tokenBalance < 2` is
+        // UNKNOWN against NULL on all three engines, so a NULL-balance row
+        // would match neither this statement nor the >= one below and would
+        // keep its scramble lock through a `clearall` — the admin sees a
+        // success line and the player stays locked. The model declares the
+        // column NOT NULL DEFAULT 2, so this should be unreachable, but the
+        // live MySQL schema is applied by hand (that user has no DDL grants),
+        // and the rest of the plugin already reads the column defensively as
+        // `row.tokenBalance != null ? row.tokenBalance : maxTokens`. Costs one
+        // OR; removes a silent-failure mode.
+        const [belowCount] = await PlayerCooldowns.update(
+          {
+            tokenBalance: maxTokens,
+            tokenRegenAnchor: null,
+            scrambleLockdownExpiry: null
+          },
+          {
+            where: {
+              [Op.or]: [
+                { tokenBalance: { [Op.lt]: maxTokens } },
+                { tokenBalance: { [Op.is]: null } }
+              ]
+            },
+            transaction: t
+          }
+        );
+        toppedUp = belowCount;
+
+        // At or above the cap: drop the lock only, leaving any seed surplus intact.
+        const [lockCount] = await PlayerCooldowns.update(
+          { scrambleLockdownExpiry: null },
+          {
+            where: {
+              tokenBalance: { [Op.gte]: maxTokens },
+              scrambleLockdownExpiry: { [Op.ne]: null }
+            },
+            transaction: t
+          }
+        );
+        locksCleared = lockCount;
+      });
+
+      plugin.verbose(1, `[Admin] Cleared restrictions: ${toppedUp} players topped up to ${maxTokens}, ${locksCleared} scramble locks lifted.`);
+      return { toppedUp, locksCleared };
+    };
+
+    /**
+     * Deletes every cooldown row. The true reset — an absent row reads as
+     * "max tokens, no restrictions, no seed state" everywhere in the plugin.
+     *
+     * Plain DELETE, never TRUNCATE: TRUNCATE is DDL, so it requires the DROP
+     * privilege the live MySQL user does not have, and it implicitly commits,
+     * which silently breaks the surrounding _withDb transaction. On SQLite
+     * Sequelize already emitted DELETE for both spellings, so dropping
+     * `truncate: true` is a no-op there and a repair on MySQL.
+     *
+     * @returns {Promise<number>} rows deleted
+     */
+    plugin.adminWipeAll = async function () {
+      const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
+      if (!PlayerCooldowns) throw new Error('SwitchPlugin_PlayerCooldowns model not available — DB may not be ready.');
+
+      let deleted = 0;
+      await adminTx(async (t) => {
+        deleted = await PlayerCooldowns.destroy({ where: {}, transaction: t });
+      });
+
+      plugin.verbose(1, `[Admin] Wiped ${deleted} cooldown rows.`);
+      return deleted;
     };
 
     // ── Load persisted settings ────────────────────────────────

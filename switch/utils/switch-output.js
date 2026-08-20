@@ -21,10 +21,11 @@
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
- * Sequelize (Op) — query operators for getDiagnosticInfo() and
- *   _buildSwitchDiagEmbed().
- * All other dependencies are accessed via plugin.* (the live plugin
- * instance passed to register()).
+ * All dependencies are accessed via plugin.* (the live plugin
+ * instance passed to register()). As of v2.5.6 this module issues no
+ * queries of its own: getDiagnosticInfo() and _buildSwitchDiagEmbed()
+ * both read plugin.getLiveRestrictionState() (switch-db.js), which is
+ * the single place lazy token regeneration is applied for display.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
@@ -44,8 +45,6 @@
  * ═══════════════════════════════════════════════════════════════
  */
 
-import Sequelize from 'sequelize';
-const { Op } = Sequelize;
 
 const SwitchOutput = {
   /**
@@ -651,20 +650,16 @@ const SwitchOutput = {
           dbStatus = 'S³ DB not available';
         }
 
-        const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
-        if (PlayerCooldowns) {
-          totalStoredPlayers = await PlayerCooldowns.count();
-
-          const maxTokens = plugin.options.maxSwitchTokens;
-
-          activeLocks = await PlayerCooldowns.count({
-            where: {
-              [Op.or]: [
-                { scrambleLockdownExpiry: { [Op.gt]: new Date() } },
-                { tokenBalance: { [Op.lt]: maxTokens } }
-              ]
-            }
-          });
+        // v2.5.6: shares getLiveRestrictionState() with the Discord embed.
+        // This used to count `tokenBalance < maxTokens` straight off the stored
+        // column, with no lazy regeneration and no expiry check on the lock —
+        // against the 2026-08-20 production export it would have reported 114
+        // "active locks" when the true number was 0. "Active" now means a player
+        // who genuinely cannot switch at this instant.
+        const state = await plugin.getLiveRestrictionState();
+        if (state) {
+          totalStoredPlayers = state.total;
+          activeLocks = state.blocked.length;
         }
       } catch (e) {
         dbStatus = `Error: ${e.message}`;
@@ -818,103 +813,59 @@ const SwitchOutput = {
         ? plugin.options.switchCooldownMinutes * 60 * 1000
         : plugin.options.switchCooldownHours * 60 * 60 * 1000;
 
-      let playersBelowCap = 0;
-      let scrambleLocks = 0;
-      let totalStoredPlayers = 0;
-      let playerList = 'None';
-
+      // v2.5.6: one pass over the table, every number below derived from it.
+      // Previously this block issued four separate queries, two of which applied
+      // lazy regeneration and two of which did not — which is how the embed came
+      // to print "Players Below Cap: 0" directly above five players listed as
+      // restricted, each showing "2/2 tokens (full)".
+      let state = null;
       try {
-        const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
-        if (PlayerCooldowns) {
-          playersBelowCap = await PlayerCooldowns.count({
-            where: { tokenBalance: { [Op.lt]: maxTokens } }
-          });
-          scrambleLocks = await PlayerCooldowns.count({
-            where: { scrambleLockdownExpiry: { [Op.gt]: now } }
-          });
-          totalStoredPlayers = await PlayerCooldowns.count();
-
-          const lockedPlayers = await PlayerCooldowns.findAll({
-            where: {
-              [Op.or]: [
-                { scrambleLockdownExpiry: { [Op.gt]: now } },
-                { tokenBalance: { [Op.lt]: maxTokens } }
-              ]
-            },
-            order: [['scrambleLockdownExpiry', 'DESC'], ['tokenBalance', 'ASC']],
-            limit: 5
-          });
-
-          if (lockedPlayers.length > 0) {
-            playerList = lockedPlayers.map(p => {
-              // Apply lazy regen in-memory so token counts are live (not stale DB values)
-              const liveRow = { tokenBalance: p.tokenBalance, tokenRegenAnchor: p.tokenRegenAnchor };
-              plugin._regenTokens(liveRow);
-              const parts = [];
-              if (p.scrambleLockdownExpiry && p.scrambleLockdownExpiry > now) {
-                parts.push(`🌪️ <t:${Math.floor(p.scrambleLockdownExpiry.getTime() / 1000)}:R>`);
-              }
-              if (liveRow.tokenBalance < maxTokens) {
-                parts.push(`🎫 ${liveRow.tokenBalance}/${maxTokens} tokens`);
-              } else {
-                parts.push(`🎫 ${liveRow.tokenBalance}/${maxTokens} tokens (full)`);
-              }
-              return `**${p.playerName || p.steamID}**: ${parts.join(' ')}`;
-            }).join('\n');
-          }
-        }
+        state = await plugin.getLiveRestrictionState();
       } catch (err) {
-        // Cooldown stats silently degrade — shown as 0/"None". Transient DB
-        // errors (lock contention, connection blips) should not prevent the
-        // rest of the embed from rendering with System Health + Config + Queue.
-      }
-
-      // Recompute playersBelowCap with lazy regen for accuracy
-      let liveBelowCap = 0;
-      try {
-        const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
-        if (PlayerCooldowns) {
-          const allBelowCap = await PlayerCooldowns.findAll({
-            where: { tokenBalance: { [Op.lt]: maxTokens } },
-            attributes: ['tokenBalance', 'tokenRegenAnchor']
-          });
-          for (const row of allBelowCap) {
-            const liveRow = { tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor };
-            plugin._regenTokens(liveRow);
-            if (liveRow.tokenBalance < maxTokens) {
-              liveBelowCap++;
-            }
-          }
-        }
-      } catch (_) {
-        liveBelowCap = playersBelowCap; // fallback to stored count on error
-      }
-
-      // v2.5.0: Count rows that can still earn a seed bonus — active presence AND
-      // below the wallet ceiling. "Tracked Players" is the raw table size, which is
-      // a retention metric, not an accrual one; on its own it reads as though the
-      // plugin is actively watching hundreds of people when most of those rows are
-      // dormant history.
-      let seedAccruing = 0;
-      try {
-        const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
-        if (PlayerCooldowns) {
-          seedAccruing = await PlayerCooldowns.count({
-            where: {
-              seedPresenceStart: { [Op.ne]: null },
-              tokenBalance: { [Op.lt]: maxTokens + plugin.options.seedTokenBonusAmount }
-            }
-          });
-        }
-      } catch (_) {
-        seedAccruing = 0;  // degrade quietly, same as the other cooldown stats
+        // Degrade quietly. A transient DB error should not stop System Health,
+        // Config and Queue from rendering.
+        plugin.verbose(2, `[Diag] Live restriction state unavailable: ${err.message}`);
       }
 
       const cooldownLines = [];
-      cooldownLines.push(`Players Below Cap:    ${liveBelowCap}`);
-      cooldownLines.push(`Scramble Locks:        ${scrambleLocks}`);
-      cooldownLines.push(`Seed Accruing:         ${seedAccruing}`);
-      cooldownLines.push(`Tracked Players:       ${totalStoredPlayers}`);
+      let playerList = '⚫ Nobody is blocked from switching';
+
+      if (!state) {
+        cooldownLines.push('Unavailable — database not ready');
+        playerList = '⚫ Unavailable';
+      } else {
+        // "Out of Tokens" replaces "Players Below Cap". Below-cap was never a
+        // restriction: with maxSwitchTokens at 2, a player holding 1 can still
+        // switch. Only an empty wallet actually blocks anyone.
+        cooldownLines.push(`Out of Tokens:         ${state.outOfTokens}`);
+        cooldownLines.push(`Scramble Locked:       ${state.scrambleLocked}`);
+        cooldownLines.push(`Holding <${maxTokens} tokens:    ${state.belowCap}`);
+        // Qualified as "online" because the count only includes connected
+        // players now — an offline row's presence clock accrues nothing, and
+        // counting those was reporting 75 seeders on an empty server.
+        cooldownLines.push(`Seed Accruing (online): ${state.seedAccruing}${state.rosterReady ? '' : ' (roster unavailable)'}`);
+        // Explicitly labelled as retention, not surveillance. "Tracked Players:
+        // 378" read as though the plugin were watching 378 people; it is simply
+        // how many rows are inside the pruning window.
+        cooldownLines.push(`Rows (${plugin.options.pruneInactivePlayerDays}d retention):  ${state.total}`);
+
+        if (state.blocked.length > 0) {
+          const shown = state.blocked.slice(0, 5);
+          playerList = shown.map(p => {
+            const parts = [];
+            if (p.lockExpiry) parts.push(`🌪️ <t:${Math.floor(p.lockExpiry.getTime() / 1000)}:R>`);
+            if (p.tokenBalance < 1) {
+              const anchor = p.tokenRegenAnchor ? new Date(p.tokenRegenAnchor).getTime() : Date.now();
+              const nextAt = Math.floor((anchor + cooldownDurationMs) / 1000);
+              parts.push(`🎫 0/${maxTokens}, next <t:${nextAt}:R>`);
+            }
+            return `${p.online ? '🟢' : '⚫'} **${p.playerName || p.steamID || p.eosID}**: ${parts.join(' ')}`;
+          }).join('\n');
+          if (state.blocked.length > shown.length) {
+            playerList += `\n... and ${state.blocked.length - shown.length} more`;
+          }
+        }
+      }
 
       // ── Color logic ──
       const allOk = dbOk && rconOk && s3Ok;
@@ -929,8 +880,18 @@ const SwitchOutput = {
           { name: 'System Health', value: healthLines, inline: false },
           { name: '\u{1F4CB} Config', value: configLines.join('\n'), inline: false },
           { name: `\u{1F465} Queue (${totalQueued})`, value: queueLines.join('\n'), inline: false },
-          { name: '\u{1F550} Cooldown Statistics', value: cooldownLines.join('\n'), inline: false },
-          { name: '\u{1F512} Restricted Players (top 5)', value: playerList, inline: false }
+          { name: '\u{1F550} Token & Lock Summary', value: cooldownLines.join('\n'), inline: false },
+          // Renamed from "Restricted Players (top 5)", which was neither: the
+          // sort key was a mostly-expired lockdown timestamp, and the players it
+          // listed were not restricted. This field now answers one question —
+          // who cannot switch right now — and says so plainly when nobody can.
+          {
+            name: state && state.blocked.length > 0
+              ? `\u{1F512} Currently Blocked (${state.blocked.length})`
+              : '\u{1F513} Currently Blocked',
+            value: playerList,
+            inline: false
+          }
         ]
       };
     };
