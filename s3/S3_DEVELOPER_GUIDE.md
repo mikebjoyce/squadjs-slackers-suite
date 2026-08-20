@@ -1545,12 +1545,37 @@ All commands in the configured `channelID` Discord channel:
 
 ### 10.2 — Export/Import System
 
-**Three-tier classification:**
+**Three-tier classification.** Each model declares its own tier where it is
+defined — S³ owns no central list of what belongs where:
 
-⚠️ The tier sets — and the keys of the export JSON — hold **model names**, not table
-names. Several deliberately differ (model `S3GameStateEvents` → table
-`S3_GameStateEvents`). Writing a table name into a tier matches nothing and the
-tier silently omits the table; see 11.5.
+```js
+this.defineModel('TB_RoundReport', schema, {
+  tableName: 'TB_RoundReport',
+  timestamps: false,
+  exportTier: 'historical'      // 'historical' | 'logging' | 'ephemeral'
+});
+```
+
+A **third-party S³ consumer plugin therefore classifies its own tables without
+editing S³**. The exporter reads the declarations back via
+`dbService.getEffectiveModelTier()`.
+
+Two rules make forgetting survivable:
+
+- **An undeclared model is exported at the default (`historical`) tier**, and
+  `defineModel()` warns by name at mount. Over-exporting fails visibly and
+  recoverably (the exporter errors on Discord's 25 MB limit); under-exporting
+  fails silently and permanently. The fallback picks the recoverable direction.
+- **An invalid tier string throws at definition time**, on the author's own
+  server at startup — not at restore time months later.
+
+Plugins classify *into* these three tiers and cannot mint new ones: the tiers are
+an operator-facing CLI surface (`--logs`, `--all`), and a dynamic tier list would
+depend on which plugins happen to be loaded.
+
+⚠️ The keys of the export JSON — and of `tiers` below — hold **model names**, not
+table names. Several deliberately differ (model `S3GameStateEvents` → table
+`S3_GameStateEvents`); see 11.5.
 
 | Tier | Flag | Models included |
 |------|------|-----------------|
@@ -1558,11 +1583,15 @@ tier silently omits the table; see 11.5.
 | Logging | `--logs` | Above + `S3PlayerEvents`, `S3GameStateEvents`, `S3PlayerSnapshots` |
 | All | `--all` | Above + all auto-recoverable state: `S3GameState`, `S3_PlayerSession`, `S3PlayerReconnect`, `SwitchPlugin_PlayerCooldowns`, `SwitchPlugin_Endmatches`, `Elo_PluginState`, `TeamBalancerState` |
 
-`--all` does not consult the sets at all — it returns every registered model
-unconditionally, which is why tier-set errors stay invisible until someone takes a
-default export. A model in no set is silently missing from the default and `--logs`
-tiers; see [`TASK_EXPORT_TIER_DECLARATION.md`](../docs/dataDump/TASK_EXPORT_TIER_DECLARATION.md)
-for the planned move to per-model declaration.
+The table above is the *current* classification, and it is enforced rather than
+descriptive: `TIER_SETS` in `s3-export-import.js` retains it as the expected
+classification, and `test-export-model-registration.js` asserts every model's
+declared `exportTier` equals its entry there. Moving a table between tiers is
+therefore a deliberate two-file edit — the definition site and the fixture — not
+a one-word change that quietly alters what lands in every operator's backup.
+
+`--all` still returns every registered model unconditionally, so it is a superset
+of the tier logic rather than a path around it.
 
 **Export format:**
 
@@ -1571,6 +1600,8 @@ for the planned move to per-model declaration.
   "s3ExportVersion": 1,
   "exportedAt": 1719547200000,
   "connector": "sqlite",
+  "tier": "historical",
+  "tiers": { "ModelName": "historical" },
   "tables": {
     "ModelName": [ { ... row ... } ]
   },
@@ -1578,6 +1609,12 @@ for the planned move to per-model declaration.
   "results": { "ModelName": { "status": "ok", "rows": 42 } }
 }
 ```
+
+`tier` and `tiers` make a backup self-describing — a restore can tell an operator
+"this file was taken at the default tier, so ephemeral state is not in it" rather
+than leaving them to infer it from absence. Both are **additive**, so the format
+stays version 1 and every backup written before they existed still imports; the
+importer must keep tolerating their absence.
 
 **Import workflow:** Two-step — `!s3 db import` (with attachment) → review embed → `!s3 db import --confirm` → execute.
 
@@ -1654,7 +1691,7 @@ node s3/testing/test-game-state-service.js
 | `test-migration-bulk-types.js` | `qi.bulkInsert`/`bulkUpdate` value typing and NULL backfills, real engines — see 11.4 |
 | `test-stderr-diagnostics.js` | Migration failures and drift reach fd 2, not stdout — see 9.9 |
 | `test-migration-permissions.js` | Migration DDL at three permission tiers, per dialect (Docker-gated) |
-| `test-export-model-registration.js` | Every registered model belongs to exactly one export tier — see 11.5 |
+| `test-export-model-registration.js` | Real services register every model; each declares an `exportTier` matching the fixture; a third-party model reaches the default export without editing S³ — see 11.5 |
 | `test-resolving-cleared-logging.js` | `RESOLVING_CLEARED` rows and `S3_GameStateEvents` shape, on **SQLite and MySQL** |
 | `test-install-layout.js` | `install.cjs` output layout: flattening, per-plugin runners, no collisions |
 | `test-migration-pipeline.js` | End-to-end migration run: ordering, backup, version bump |
@@ -1741,7 +1778,7 @@ These are failure modes with no symptom at runtime — the code logs success and
 
 - **Always use `defineModel()`, never `sequelize.define()` directly.** Only `defineModel()` registers the model into `dbService.models`, which is what `getModelNames()` returns, which is what the exporter enumerates. A raw-defined model works perfectly for reads and writes and is invisible to *every* export tier, including `--all`. Four tables were missing from production backups for months for exactly this reason.
 - **`defineModel()` injects `freezeTableName: true`.** The **model** name becomes the table name unless you pass an explicit `tableName`. Model `S3GameStateEvents` reaching table `S3_GameStateEvents` only works because `tableName` says so.
-- **The export tier sets in `s3-export-import.js` hold model names, not table names.** Writing the table name there matches nothing and the tier silently omits the table. `s3/testing/test-export-model-registration.js` asserts the three tiers partition `getModelNames()` exhaustively — a new model must be added to a tier or that test fails, which is the intended behaviour.
+- **Declare `exportTier` on every model you define.** Classification lives at the definition site, not in `s3-export-import.js` — see 10.2. A model that declares nothing is exported at the default tier and warns by name at mount; an invalid tier throws immediately. The tier sets that remain in `s3-export-import.js` are the *expected classification fixture*, not the allowlist: `s3/testing/test-export-model-registration.js` asserts each model's declared tier equals its entry there, so adding a model means editing both, which is intended. Those sets hold **model names**, not table names — a table name written there matches nothing.
 - **`Model.sync()` emits no DDL for an existing table without `alter`.** A newly added column then exists in the model and nowhere in the database. On a live server with no DDL grants the operator applies schema by hand, so a migration's *data* step must not be nested inside an `addColumn` guard — otherwise the data step is skipped on exactly the servers where the column already exists.
 - **There is no CLS transaction context.** `withTransactionWithRetry(async (t) => …)` does not propagate `t` implicitly; every model call inside must receive `{ transaction: t }`. Miss one and SQLite's single-connection pool throws "cannot start a transaction within a transaction", usually into a catch that logs and continues.
 

@@ -17,7 +17,12 @@ async function createDb() {
   const db = new DBService({ sequelize: seq, defaultRetry: { attempts: 2, baseDelayMs: 0, jitterMs: 0 } });
   await db.mount(); return db;
 }
-function defH(db) { return db.defineModel('Elo_PlayerStats', { eosID: { type: DataTypes.STRING, primaryKey: true }, rating: DataTypes.INTEGER }, { timestamps: false }); }
+// Each stand-in declares its tier the way a real model does — via the
+// `exportTier` option on defineModel(). filterByTier() reads the declaration
+// back out of DBService; it no longer consults a central list, so a model that
+// declares nothing lands in the DEFAULT tier rather than being classified by
+// name. See defUndeclared() below, which exercises exactly that fallback.
+function defH(db) { return db.defineModel('Elo_PlayerStats', { eosID: { type: DataTypes.STRING, primaryKey: true }, rating: DataTypes.INTEGER }, { timestamps: false, exportTier: 'historical' }); }
 // NOTE: these must be the real MODEL names, matching the tier sets in
 // s3-export-import.js and what dbService.getModelNames() reports in production.
 // They previously read 'S3_PlayerEvents' and 'S3_PlayerSessions' — table-name
@@ -25,8 +30,8 @@ function defH(db) { return db.defineModel('Elo_PlayerStats', { eosID: { type: Da
 // machinery against fictional models and stayed green while the real logging
 // tables were absent from every export. See test-export-model-registration.js,
 // which mounts the actual services rather than defining stand-ins.
-function defL(db) { return db.defineModel('S3PlayerEvents', { id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true }, event: DataTypes.STRING }, { tableName: 'S3_PlayerEvents', timestamps: false }); }
-function defE(db) { return db.defineModel('S3_PlayerSession', { eosID: { type: DataTypes.STRING, primaryKey: true }, data: DataTypes.STRING }, { timestamps: false }); }
+function defL(db) { return db.defineModel('S3PlayerEvents', { id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true }, event: DataTypes.STRING }, { tableName: 'S3_PlayerEvents', timestamps: false, exportTier: 'logging' }); }
+function defE(db) { return db.defineModel('S3_PlayerSession', { eosID: { type: DataTypes.STRING, primaryKey: true }, data: DataTypes.STRING }, { timestamps: false, exportTier: 'ephemeral' }); }
 async function populate(db) {
   const H = defH(db); await H.sync(); await H.create({ eosID: 'p1', rating: 1500 }); await H.create({ eosID: 'p2', rating: 1600 });
   const L = defL(db); await L.sync(); await L.create({ event: 'join' });
@@ -73,6 +78,27 @@ async function main() {
     const H2 = defH(d2); await H2.sync(); const L2 = defL(d2); await L2.sync(); const E2 = defE(d2); await E2.sync();
     const imp = await fns.importFromJSON(d2, exp);
     assert.equal(typeof imp.imported, 'object'); assert.ok(Object.keys(imp.imported).length > 0); assert.equal(imp.errors.length, 0);
+    assert.equal((await H2.findAll({ raw: true })).length, 3);
+  });
+  await runTest('a pre-change v1 backup (no tier manifest) still imports', async () => {
+    // Every backup an operator already holds was written before `tier`/`tiers`
+    // existed. Those fields are additive, so the version stays 1 — which means
+    // nothing bumps to warn the importer, and tolerating their absence is the
+    // only thing keeping older files restorable. Strip them and re-import.
+    const d1 = await createDb(); const { H } = await populate(d1);
+    await H.create({ eosID: 'p3', rating: 1700 });
+    const exp = await fns.exportToJSON(d1, { tier: 'all' });
+
+    delete exp.tier;
+    delete exp.tiers;
+
+    const d2 = await createDb();
+    const H2 = defH(d2); await H2.sync(); const L2 = defL(d2); await L2.sync(); const E2 = defE(d2); await E2.sync();
+    const v = await fns.validateImportStructure(exp, d2.getModelNames());
+    assert.equal(v.valid, true, 'a legacy v1 file must still validate');
+
+    const imp = await fns.importFromJSON(d2, exp);
+    assert.equal(imp.errors.length, 0);
     assert.equal((await H2.findAll({ raw: true })).length, 3);
   });
   await runTest('dryRun does not write', async () => {

@@ -280,7 +280,7 @@ export default class EloTracker extends S3PluginBase {
     // and removing `tableName` would cause Sequelize to look for the singular form.
     this.defineModel('Elo_PluginState', {
       id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: false, defaultValue: 1 }
-    }, { timestamps: false, tableName: 'Elo_PluginStates' });
+    }, { timestamps: false, tableName: 'Elo_PluginStates', exportTier: 'ephemeral' });
 
     this.defineModel('Elo_PlayerStats', {
       eosID: { type: this.s3db?.getDataTypes().STRING, primaryKey: true, allowNull: false },
@@ -293,7 +293,7 @@ export default class EloTracker extends S3PluginBase {
       losses: { type: this.s3db?.getDataTypes().INTEGER, defaultValue: 0 },
       roundsPlayed: { type: this.s3db?.getDataTypes().INTEGER, defaultValue: 0 },
       lastSeen: { type: this.s3db?.getDataTypes().BIGINT, allowNull: true }
-    }, { tableName: 'Elo_PlayerStats', timestamps: false, charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' });
+    }, { tableName: 'Elo_PlayerStats', timestamps: false, charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci', exportTier: 'historical' });
 
     this.defineModel('Elo_RoundHistory', {
       id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
@@ -304,7 +304,7 @@ export default class EloTracker extends S3PluginBase {
       roundDuration: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true },
       endedAt: { type: this.s3db?.getDataTypes().BIGINT, allowNull: true },
       playerCount: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true }
-    }, { timestamps: false, tableName: 'Elo_RoundHistories' });
+    }, { timestamps: false, tableName: 'Elo_RoundHistories', exportTier: 'historical' });
 
     this.defineModel('Elo_RoundPlayers', {
       id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
@@ -324,7 +324,7 @@ export default class EloTracker extends S3PluginBase {
       scaledDeltaSigma: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false },
       muAfter: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false },
       sigmaAfter: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false }
-    }, { timestamps: false, tableName: 'Elo_RoundPlayers', charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' });
+    }, { timestamps: false, tableName: 'Elo_RoundPlayers', charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci', exportTier: 'historical' });
 
     // Inject S³ DBService into EloDatabase delegate
     if (this.s3db?.isReady() && this.db) {

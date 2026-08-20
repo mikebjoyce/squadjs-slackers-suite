@@ -17,6 +17,16 @@
  *   All (--all)          — Everything including auto-recoverable plugin
  *     persistence tables.
  *
+ * Each model declares its own tier where it is defined:
+ *
+ *     defineModel('Elo_PlayerStats', schema, { exportTier: 'historical' })
+ *
+ * This file does not own the classification and no plugin needs to edit it to
+ * have its tables backed up. `filterByTier()` reads the declarations back out
+ * of DBService. An undeclared model is exported at the default tier and warned
+ * about — see DEFAULT_EXPORT_TIER in db-service.js for why the fallback errs
+ * towards including too much.
+ *
  * Additions:
  *   exportToFile() — Writes export to a timestamped .s3backup.json file
  *     in the backup directory. Used by MigrationEngine as the fallback
@@ -69,20 +79,29 @@ import { restoreBackup, listBackups } from './s3-backup.js';
 // ─── TABLE CLASSIFICATION ────────────────────────────────────────────
 
 /*
- * ⚠️ These sets hold MODEL names, not table names.
+ * ⚠️ THESE SETS ARE NO LONGER THE ALLOWLIST. They are the test fixture.
  *
- * filterByTier() matches them against dbService.getModelNames(), which returns
- * the keys of dbService.models — the `name` argument passed to defineModel().
- * Several models deliberately pair a non-underscored model name with an
- * underscored table name (model `S3GameStateEvents` → table
- * `S3_GameStateEvents`), so writing the table name here silently matches
- * nothing and the tier quietly omits the table.
+ * Classification now lives at each model's definition site:
  *
- * Every entry below was verified against a real production export on
- * 2026-08-19. `--all` ignores these sets entirely, which is why the
- * mismatches went unnoticed for so long — only the default and --logs tiers
- * ever exercised them. Test coverage now asserts every name here exists in
- * getModelNames() and that the three sets partition it exhaustively.
+ *     defineModel('SwitchPlugin_Settings', schema, { exportTier: 'historical' })
+ *
+ * filterByTier() reads dbService.getEffectiveModelTier(), so a third-party S³
+ * consumer plugin can classify its own tables without editing this file. A
+ * model that declares no tier is exported at the DEFAULT tier and warned about
+ * when it is defined — over-exporting fails visibly (Discord's size limit),
+ * under-exporting fails silently and permanently.
+ *
+ * The sets below are retained deliberately, as the expected classification that
+ * `test-export-model-registration.js` asserts each in-repo model's *declared*
+ * tier against. Moving a table between tiers therefore takes two deliberate
+ * edits — the definition site and this fixture — rather than one word that
+ * quietly changes what lands in every operator's backup. They were verified
+ * against a real production export on 2026-08-19.
+ *
+ * ⚠️ They hold MODEL names, not table names. Several models deliberately pair a
+ * non-underscored model name with an underscored table name (model
+ * `S3GameStateEvents` → table `S3_GameStateEvents`), so a table name written
+ * here matches no model at all.
  */
 
 /**
@@ -130,9 +149,10 @@ const EPHEMERAL_TABLES = new Set([
 ]);
 
 /**
- * The three tiers, exposed for tests. A test asserts these partition
- * getModelNames() exhaustively, which is the check that would have caught the
- * model-name/table-name mismatches above.
+ * The three tiers, exposed as the **expected classification fixture**. A test
+ * asserts every in-repo model's declared `exportTier` equals its entry here,
+ * and that these partition getModelNames() exhaustively. Nothing in the export
+ * path reads them.
  */
 export const TIER_SETS = Object.freeze({
   historical: HISTORICAL_TABLES,
@@ -143,23 +163,43 @@ export const TIER_SETS = Object.freeze({
 // ─── HELPERS ─────────────────────────────────────────────────────────
 
 /**
+ * Map the operator-facing export flag onto the set of model tiers it covers.
+ *
+ * The two vocabularies are deliberately distinct: `--logs` is a *cumulative*
+ * CLI flag ("also give me the logs"), while `logging` is one exclusive tier a
+ * model belongs to. Conflating them is how a model ends up in a flag nobody
+ * expected.
+ */
+const TIERS_FOR_FLAG = Object.freeze({
+  historical: ['historical'],
+  logs: ['historical', 'logging'],
+  all: ['historical', 'logging', 'ephemeral']
+});
+
+/**
  * Determine which model names to include based on export flags.
  *
- * @param {string[]} modelNames - All model names available
+ * Reads each model's declared tier from the dbService registry — see
+ * `defineModel()`'s `exportTier` option. Models that declared no tier fall back
+ * to DBService's DEFAULT_EXPORT_TIER, so a forgotten declaration over-exports
+ * (visible, recoverable) rather than silently omitting the table.
+ *
+ * @param {object} dbService - DBService instance
  * @param {object} options
  * @param {string} [options.tier] - 'historical' (default), 'logs', or 'all'
  * @returns {string[]} Filtered model names in declaration order
  */
-function filterByTier(modelNames, { tier = 'historical' } = {}) {
+function filterByTier(dbService, { tier = 'historical' } = {}) {
+  const modelNames = dbService.getModelNames();
+
+  // `--all` still short-circuits, but now it is a superset of the tier logic
+  // rather than a path that bypasses it: every model has an effective tier, and
+  // all three are listed for this flag.
   if (tier === 'all') return [...modelNames];
 
-  const included = new Set(HISTORICAL_TABLES);
+  const includedTiers = TIERS_FOR_FLAG[tier] || TIERS_FOR_FLAG.historical;
 
-  if (tier === 'logs') {
-    for (const t of LOGGING_TABLES) included.add(t);
-  }
-
-  return modelNames.filter((name) => included.has(name));
+  return modelNames.filter((name) => includedTiers.includes(dbService.getEffectiveModelTier(name)));
 }
 
 /**
@@ -308,21 +348,40 @@ export async function exportToJSON(dbService, { tier = 'historical' } = {}) {
     throw new Error('DBService is not ready.');
   }
 
-  const modelNames = dbService.getModelNames();
-  const selected = filterByTier(modelNames, { tier });
+  const selected = filterByTier(dbService, { tier });
   const connector = dbService.getConnector();
   const connectorName = connector && typeof connector.getDialect === 'function'
     ? connector.getDialect()
     : dbService.getConnectorName() || 'unknown';
 
+  // `tier` and `tiers` are additive, so this stays s3ExportVersion 1 and older
+  // readers ignore them. They make a backup self-describing: a restore can tell
+  // an operator "this file was taken at the default tier, so ephemeral state is
+  // not in it" rather than leaving them to infer it from absence. Importers
+  // must tolerate their absence — v1 files predating this change have neither.
   const result = {
     s3ExportVersion: 1,
     exportedAt: Date.now(),
     connector: connectorName,
+    tier,
+    tiers: Object.fromEntries(selected.map((name) => [name, dbService.getEffectiveModelTier(name)])),
     tables: {},
     rowCounts: {},
     results: {}
   };
+
+  // Surface anything riding the default-tier fallback into the export result,
+  // so an operator taking a backup sees it rather than only the author who
+  // happened to be reading the mount log.
+  const undeclared = typeof dbService.getUndeclaredModelNames === 'function'
+    ? dbService.getUndeclaredModelNames().filter((name) => selected.includes(name))
+    : [];
+  if (undeclared.length > 0) {
+    result.warnings = [
+      `These models declare no exportTier and were exported at the default tier: ` +
+      `${undeclared.join(', ')}. Declare one at each defineModel() call site.`
+    ];
+  }
 
   const missing = selected.filter((name) => !dbService.getModel(name));
   for (const name of missing) {

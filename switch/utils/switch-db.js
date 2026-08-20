@@ -137,7 +137,8 @@ const SwitchDB = {
         type: plugin._s3db.getDataTypes().DATE,
         allowNull: true
       }
-    }, { timestamps: false });
+      // Cooldowns expire on their own and are re-established by live play.
+    }, { timestamps: false, exportTier: 'ephemeral' });
 
     plugin.defineModel('SwitchPlugin_Endmatches', {
       id: {
@@ -158,7 +159,8 @@ const SwitchDB = {
         type: plugin._s3db.getDataTypes().DATE,
         defaultValue: plugin._s3db.getDataTypes().NOW
       }
-    }, { timestamps: false });
+      // End-of-match switch requests, consumed at the next round end.
+    }, { timestamps: false, exportTier: 'ephemeral' });
 
     // Settings key-value table for runtime toggles
     plugin.defineModel('SwitchPlugin_Settings', {
@@ -171,7 +173,10 @@ const SwitchDB = {
         type: plugin._s3db.getDataTypes().STRING,
         allowNull: false
       }
-    }, { timestamps: false, freezeTableName: true });
+      // Operator-configured runtime toggles. NOT auto-recoverable — if lost, an
+      // admin has to re-enter them by hand — so this is historical, unlike the
+      // other two Switch tables.
+    }, { timestamps: false, freezeTableName: true, exportTier: 'historical' });
 
     // ── Migration Registration ─────────────────────────────────
 

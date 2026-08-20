@@ -2300,6 +2300,11 @@ export function createCommandHandlers(context) {
             : `❌ **${name}**: ${r.error}`
         );
 
+        // A model that declared no exportTier was included here by the default-tier
+        // fallback. Say so on the backup itself — the mount-time warning is only
+        // seen by whoever was reading the log at the time.
+        for (const w of exportObj.warnings || []) statusLines.push(`⚠️ ${w}`);
+
         // Serialize for Discord attachment
         let attachment;
         try {

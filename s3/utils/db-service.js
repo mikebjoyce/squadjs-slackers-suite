@@ -36,6 +36,12 @@
  *   getDataTypes()              — Resolves Sequelize DataTypes from connector.
  *   getDatabasePath()           — Returns the SQLite file path used for backup.
  *   defineModel(name, schema, opts) — Defines and caches a Sequelize model.
+ *                                  `opts.exportTier` declares which backup tier
+ *                                  the model belongs to (see EXPORT_TIERS).
+ *   getModelTier(name)          — Declared tier, or null if undeclared.
+ *   getEffectiveModelTier(name) — Declared tier, or DEFAULT_EXPORT_TIER.
+ *   getModelsByTier(tier)       — Model names whose effective tier is `tier`.
+ *   getUndeclaredModelNames()   — Models relying on the default-tier fallback.
  *   registerExpectedVersion(pluginName, version) — Declares a plugin's expected
  *                                  schema version for verification.
  *   verifySchemaVersions()      — Returns { upToDate, pending } comparing
@@ -70,6 +76,12 @@
  *   map and warns if backup/migration coverage is partial. See getDatabasePath().
  * - getModelNames() returns all Sequelize model names registered with
  *   defineModel(), used by s3-export-import.js for backup/restore.
+ * - Export tiers are declared per model, at its definition site, via
+ *   `defineModel(name, schema, { exportTier })` — NOT by a central list inside
+ *   s3-export-import.js. A third-party S³ consumer plugin can therefore classify
+ *   its own tables without editing S³. A model that declares nothing is exported
+ *   at the default tier and warned about at mount; see DEFAULT_EXPORT_TIER for
+ *   why the fallback is the inclusive direction.
  * - canBackup(connector) returns true for all connectors, enabling the
  *   connector-agnostic JSON export/import fallback in s3-export-import.js.
  * - Dialect portability: any raw SQL (Sequelize.literal, connector.query(),
@@ -83,6 +95,40 @@
 import SequelizeLib from 'sequelize';
 import MigrationEngine, { countNullColumn } from './migration-engine.js';
 import { stderrError, stderrWarn } from './s3-stderr.js';
+
+/**
+ * The three export tiers a model may declare via `defineModel(name, schema,
+ * { exportTier })`.
+ *
+ * This list is **fixed** and plugins may not extend it. The tiers are an
+ * operator-facing CLI surface (`!s3 db export`, `--logs`, `--all`); if a plugin
+ * could mint a new tier name, the flag list would depend on which plugins
+ * happen to be loaded, two plugins could collide on a name, and an operator
+ * would have no way to know what a given flag covers. Plugins classify *into*
+ * this set; they do not add to it.
+ *
+ *   historical — irreplaceable. Losing it costs data that cannot be regenerated.
+ *   logging    — forensic. Useful, bulky, roughly reproducible.
+ *   ephemeral  — auto-recoverable plugin state, rebuilt from live play.
+ *
+ * Lives here rather than in s3-export-import.js so `defineModel()` can validate
+ * a declaration without importing the exporter (which imports s3-backup.js and
+ * would close an import cycle).
+ */
+export const EXPORT_TIERS = Object.freeze(['historical', 'logging', 'ephemeral']);
+
+/**
+ * The tier an undeclared model falls into.
+ *
+ * Deliberately the most inclusive tier, because the two failure directions are
+ * not symmetric. Over-exporting fails **visibly and recoverably** — the
+ * exporter already errors with "exceeds Discord's 25 MB limit. Try without
+ * `--all`". Under-exporting fails **silently and permanently**: the backup is
+ * taken, reports success, and is missing a table nobody notices until they try
+ * to restore it. An unclassified model is therefore treated as irreplaceable
+ * until its author says otherwise.
+ */
+export const DEFAULT_EXPORT_TIER = 'historical';
 
 export default class DBService {
   constructor({
@@ -111,6 +157,8 @@ export default class DBService {
     this._databaseOption = databaseOption ?? null;
 
     this.models = {};
+    this._modelTiers = new Map();       // model name → declared exportTier (undeclared models are absent)
+    this._tierWarned = new Set();       // model names already warned about, so a re-mount does not re-spam
     this._isMounted = false;
     this.SchemaVersionsModel = null;
     this._expectedVersions = new Map();
@@ -879,6 +927,13 @@ export default class DBService {
       throw new Error('defineModel called without a valid sequelize connector.');
     }
 
+    // `exportTier` is ours, not Sequelize's — record it and strip it before the
+    // rest is forwarded to define(). Recorded BEFORE the idempotency returns
+    // below, so a model adopted from the connector on a re-mount still lands in
+    // the tier registry.
+    const { exportTier, ...defineOptions } = modelOptions;
+    this._recordExportTier(name, exportTier);
+
     if (this.models[name]) {
       return this.models[name];
     }
@@ -895,10 +950,107 @@ export default class DBService {
       return existing;
     }
 
-    const opts = { freezeTableName: true, ...modelOptions };
+    const opts = { freezeTableName: true, ...defineOptions };
     const model = this.sequelize.define(name, schema, opts);
     this.models[name] = model;
     return model;
+  }
+
+  /* ────────────────────────────────────── EXPORT TIER REGISTRY ────────────────────────────────────── */
+
+  /**
+   * Record (and validate) a model's declared export tier.
+   *
+   * An invalid tier throws **at definition time**, which surfaces on the
+   * author's own server during mount rather than months later when someone
+   * discovers the table missing from a restore.
+   *
+   * @param {string} name - Model name
+   * @param {string|undefined} tier - Declared tier, or undefined when omitted
+   * @private
+   */
+  _recordExportTier(name, tier) {
+    if (tier === undefined || tier === null) {
+      if (!this._modelTiers.has(name) && !this._tierWarned.has(name)) {
+        this._tierWarned.add(name);
+        this.verboseLogger(
+          1,
+          `[DB] Model "${name}" was defined without an exportTier — it will be exported ` +
+          `at the "${DEFAULT_EXPORT_TIER}" (default) tier. Declare one explicitly: ` +
+          `defineModel('${name}', schema, { exportTier: '${EXPORT_TIERS.join("' | '")}' }).`
+        );
+      }
+      return;
+    }
+
+    if (!EXPORT_TIERS.includes(tier)) {
+      throw new Error(
+        `defineModel("${name}") was given exportTier "${tier}", which is not a valid tier. ` +
+        `Valid tiers are: ${EXPORT_TIERS.join(', ')}. Plugins classify into this fixed set; ` +
+        `they cannot define new tiers.`
+      );
+    }
+
+    const previous = this._modelTiers.get(name);
+    if (previous && previous !== tier) {
+      // Keep the first declaration — a later caller silently retiering someone
+      // else's model is exactly the kind of quiet reclassification this task
+      // exists to prevent.
+      this.verboseLogger(
+        1,
+        `[DB] Model "${name}" was re-declared with exportTier "${tier}" but is already ` +
+        `registered as "${previous}". Keeping "${previous}".`
+      );
+      return;
+    }
+
+    this._modelTiers.set(name, tier);
+  }
+
+  /**
+   * The tier a model **declared**, or null if it declared none.
+   * Use getEffectiveModelTier() when you need a tier for every model.
+   *
+   * @param {string} name - Model name
+   * @returns {string|null}
+   */
+  getModelTier(name) {
+    return this._modelTiers.get(name) ?? null;
+  }
+
+  /**
+   * The tier a model is actually treated as, falling back to
+   * DEFAULT_EXPORT_TIER when it declared none.
+   *
+   * @param {string} name - Model name
+   * @returns {string}
+   */
+  getEffectiveModelTier(name) {
+    return this._modelTiers.get(name) ?? DEFAULT_EXPORT_TIER;
+  }
+
+  /**
+   * Registered model names that declared no tier and are therefore relying on
+   * the default-tier fallback. Should be empty on a clean install — a non-empty
+   * result is what the mount-time warning reports.
+   *
+   * @returns {string[]}
+   */
+  getUndeclaredModelNames() {
+    return this.getModelNames().filter((name) => !this._modelTiers.has(name));
+  }
+
+  /**
+   * Registered model names whose effective tier is `tier`.
+   *
+   * @param {string} tier - One of EXPORT_TIERS
+   * @returns {string[]} Model names in declaration order
+   */
+  getModelsByTier(tier) {
+    if (!EXPORT_TIERS.includes(tier)) {
+      throw new Error(`getModelsByTier("${tier}") — valid tiers are: ${EXPORT_TIERS.join(', ')}.`);
+    }
+    return this.getModelNames().filter((name) => this.getEffectiveModelTier(name) === tier);
   }
 
    /* ────────────────────────────────────── SCHEMA VERSION PUBLIC API ────────────────────────────────────── */
@@ -1418,7 +1570,11 @@ export default class DBService {
       },
       {
         tableName: 'S3_SchemaVersions',
-        timestamps: false
+        timestamps: false,
+        // Not regenerable: it records which migrations a database has already
+        // applied. A restore without it re-runs migrations against data that
+        // already has them.
+        exportTier: 'historical'
       }
     );
 

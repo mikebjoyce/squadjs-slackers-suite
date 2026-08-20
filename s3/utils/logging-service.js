@@ -442,6 +442,7 @@ export default class LoggingService {
       {
         tableName: 'S3_PlayerEvents',
         timestamps: false,
+        exportTier: 'logging',
         indexes: [
           { name: 'idx_s3_pe_matchId', fields: ['matchId'] },
           { name: 'idx_s3_pe_eosID', fields: ['eosID'] },
@@ -468,6 +469,7 @@ export default class LoggingService {
       {
         tableName: 'S3_GameStateEvents',
         timestamps: false,
+        exportTier: 'logging',
         indexes: [
           { name: 'idx_s3_gse_matchId', fields: ['matchId'] },
           { name: 'idx_s3_gse_eventType', fields: ['eventType'] },
@@ -491,6 +493,7 @@ export default class LoggingService {
       {
         tableName: 'S3_PlayerSnapshots',
         timestamps: false,
+        exportTier: 'logging',
         indexes: [
           { name: 'idx_s3_ps_matchId_ts', fields: ['matchId', 'ts'] }
         ]

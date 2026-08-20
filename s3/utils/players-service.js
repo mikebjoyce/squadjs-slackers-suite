@@ -1729,7 +1729,10 @@ export default class PlayersService {
       },
       {
         tableName: 'S3_PlayerSessions',
-        timestamps: false
+        timestamps: false,
+        // Session start times are rebuilt from live play on the next tick, and
+        // stale rows are pruned by the cleanup above.
+        exportTier: 'ephemeral'
       }
     ) || null;
   }
@@ -2100,7 +2103,10 @@ export default class PlayersService {
       },
       {
         tableName: 'S3_PlayerReconnects',
-        timestamps: false
+        timestamps: false,
+        // Reconnect memory — repopulated from live play, and entries expire on
+        // their own.
+        exportTier: 'ephemeral'
       }
     ) || null;
   }

@@ -903,7 +903,7 @@ export default class TeamBalancer extends S3PluginBase {
         consecutiveWinsCount: { type: this.s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
         manuallyDisabled: { type: this.s3db.getDataTypes().BOOLEAN, allowNull: false, defaultValue: false },
         scrambleOnRoundEndBy: { type: this.s3db.getDataTypes().JSON, allowNull: true }
-      }, { timestamps: false, tableName: 'TeamBalancerState' });
+      }, { timestamps: false, tableName: 'TeamBalancerState', exportTier: 'ephemeral' });
 
       this.defineModel('TB_RoundReport', {
         id: { type: this.s3db.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
@@ -927,7 +927,7 @@ export default class TeamBalancer extends S3PluginBase {
         scrambled: { type: this.s3db.getDataTypes().BOOLEAN, allowNull: false, defaultValue: false },
         scrambleCondition: { type: this.s3db.getDataTypes().STRING(100), allowNull: true },
         scrambleType: { type: this.s3db.getDataTypes().STRING(100), allowNull: true }
-      }, { timestamps: false, tableName: 'TB_RoundReport' });
+      }, { timestamps: false, tableName: 'TB_RoundReport', exportTier: 'historical' });
 
       // Register expected version + v1 + v2 migrations
       this.registerExpectedVersion('team-balancer', 2, {

@@ -353,6 +353,7 @@ export default class SmartAssign extends S3PluginBase {
       }, {
         tableName: 'SA_AssignmentLog',
         timestamps: false,
+        exportTier: 'historical',
         indexes: [
           { name: 'idx_sa_al_matchId', fields: ['matchId'] },
           { name: 'idx_sa_al_eventType', fields: ['eventType'] },

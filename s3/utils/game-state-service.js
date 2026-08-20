@@ -1282,12 +1282,24 @@ export default class GameStateService {
 
     const DataTypes = this._getDataTypes(dbService, sequelize);
 
-    if (sequelize.models?.S3GameState) {
+    const defineModel = dbService?.defineModel?.bind(dbService);
+
+    // Only short-circuit on a model already present on the connector when there
+    // is NO DBService to register with. With one, defineModel() adopts the
+    // existing model *and* records it in dbService.models; returning early here
+    // instead would leave S3GameState out of getModelNames() — and therefore
+    // out of every export tier including --all, which is the exact defect that
+    // hid four tables from every backup.
+    if (!defineModel && sequelize.models?.S3GameState) {
       this.GameStateModel = sequelize.models.S3GameState;
       return;
     }
 
-    const defineModel = dbService?.defineModel?.bind(dbService);
+    // Raw define is a last resort for a bare connector with no DBService (test
+    // harnesses only). Nothing enumerates models in that configuration, so an
+    // unregistered model has no export consequence there — but this branch must
+    // never be reached when a DBService is present, or the model becomes
+    // invisible to the exporter.
     const modelFactory = defineModel || sequelize.define.bind(sequelize);
 
     this.GameStateModel = modelFactory('S3GameState', {
@@ -1335,7 +1347,10 @@ export default class GameStateService {
       }
     }, {
       tableName: 'S3_GameState',
-      timestamps: false
+      timestamps: false,
+      // A single row of live round bookkeeping, rewritten on every phase change
+      // and rebuilt from the server on the next map roll.
+      exportTier: 'ephemeral'
     });
 
     if (dbService?.executeWithRetry) {
