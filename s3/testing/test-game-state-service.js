@@ -303,6 +303,41 @@ await runTest('the staging timer does not hold the process open', async () => {
   service._clearStagingLiveTimer();
 });
 
+await runTest('the staging timer handle is released once it fires', async () => {
+  const server = new MockServer();
+  const service = new GameStateService({ server, stagingDurationMs: 30 });
+
+  await service.mount();
+  await service.handleNewGame({ layer: 'Mutaha_RAAS_v3' });
+  assert.ok(service._stagingLiveTimer, 'timer should be armed while STAGING');
+
+  await new Promise((resolve) => setTimeout(resolve, 80));
+
+  // `!s3 gamestate` reads this field to answer "Staging Timer: Pending". A
+  // fired timeout handle stays truthy, so leaving it set made the command
+  // report a pending staging timer for the whole LIVE round.
+  assert.equal(service.getPhase(), 'LIVE');
+  assert.equal(service._stagingLiveTimer, null);
+
+  await service.unmount();
+});
+
+await runTest('the staging timer handle is released even when the phase moved on', async () => {
+  const server = new MockServer();
+  const service = new GameStateService({ server, stagingDurationMs: 30 });
+
+  await service.mount();
+  await service.handleNewGame({ layer: 'Mutaha_RAAS_v3' });
+
+  // The callback's early return (phase is no longer STAGING) is the other exit
+  // and has to release the handle too.
+  service.phase = 'LIVE';
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(service._stagingLiveTimer, null);
+
+  await service.unmount();
+});
+
 await runTest('going LIVE does not clear resolving — only a real tick does', async () => {
   const server = new MockServer();
   const service = new GameStateService({ server, stagingDurationMs: 50 });

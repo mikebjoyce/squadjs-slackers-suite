@@ -1142,6 +1142,14 @@ export default class GameStateService {
     );
 
     this._stagingLiveTimer = setTimeout(async () => {
+      // A fired timeout handle stays truthy — Node never nulls it out — so the
+      // field has to be cleared here, on BOTH exits, or it reads as "a staging
+      // timer is pending" for the rest of the round. `!s3 gamestate` reported
+      // `Staging Timer 🟡 Pending` on every LIVE round because of this; the
+      // only time it showed None was before the first NEW_GAME after boot.
+      // _startResolvingTimer has always done this; this one did not.
+      this._stagingLiveTimer = null;
+
       if (this.phase !== 'STAGING') return;
       this._recoveredStateActive = false;
 
