@@ -52,6 +52,7 @@
  * s3-migration-discord.js — buildMigrationEmbed
  * s3-backup.js           — canBackup, listBackups, restoreBackup
  * s3-export-import.js    — exportToJSON, importFromJSON, etc.
+ * s3-common.js           — formatSize
  *
  */
 import { buildMigrationEmbed } from './s3-migration-discord.js';
@@ -62,9 +63,9 @@ import {
   validateImportStructure,
   serializeForAttachment,
   restoreFromFile,
-  exportToFile,
-  formatSize
+  exportToFile
 } from './s3-export-import.js';
+import { formatSize } from './s3-common.js';
 
 // ============================================================================
 // Emoji Utilities

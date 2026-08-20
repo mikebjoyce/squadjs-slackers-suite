@@ -136,7 +136,7 @@ Existing features (double-switch, end-of-match switching) are now S³-aware — 
 
 **SmartAssign** ([readme](smart-assign/README.md)) — Same Elo-aware assignment and One-Hit & Verify RCON approach, now with per-player locking that prevents Switch from racing on the same player, S³-driven reconnect memory (no more standalone `sa-database.js`), and shared clan grouping (replacing the legacy `sa-clan-grouper.js`).
 
-**Switch** ([readme](switch/README.MD)) — Expanded from the legacy version with switch queue, liberal mode, and dynamic balance tolerance — features that required S³'s fast per-tick player-state tracking. Double-switch is now S³-aware with proper team-change attribution. Lock-awareness via `canAct()` replaces ad-hoc SA eval events, so Switch automatically defers during TeamBalancer scrambles and SmartAssign moves.
+**Switch** ([readme](switch/README.md)) — Expanded from the legacy version with switch queue, liberal mode, and dynamic balance tolerance — features that required S³'s fast per-tick player-state tracking. Double-switch is now S³-aware with proper team-change attribution. Lock-awareness via `canAct()` replaces ad-hoc SA eval events, so Switch automatically defers during TeamBalancer scrambles and SmartAssign moves.
 
 ---
 
@@ -200,7 +200,7 @@ Most config options map 1:1 from the legacy plugins. Check each plugin's README 
 
 - [S³](s3/README.md) — Discord channel, database connector
 - [SmartAssign](smart-assign/README.md) — Team selection method, Elo thresholds, clan grouping
-- [Switch](switch/README.MD) — Cooldowns, queue size, double-switch, liberal mode
+- [Switch](switch/README.md) — Cooldowns, queue size, double-switch, liberal mode
 - [EloTracker](elo-tracker/README.md) — TrueSkill parameters, leaderboard thresholds
 - [TeamBalancer](team-balancer/README.md) — Win streak thresholds, scramble timing, Elo weighting
 

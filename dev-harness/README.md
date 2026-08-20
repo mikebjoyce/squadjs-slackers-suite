@@ -84,6 +84,32 @@ A result appears at `outbox/<same-name>.json`:
 
 Omit `commands` entirely for a **pure read** — a snapshot with no RCON traffic.
 
+### Running `!s3` subcommands
+
+A `discord` field runs S³'s own Discord handlers against a **capturing sender**:
+the embed is serialised into the result file and never sent to Discord. This is
+the fastest way to see what `!s3` would report on a live server.
+
+```json
+{
+  "token": "pick-something-long",
+  "discord": ["gamestate", "players"]
+}
+```
+
+`discordCommands` defaults to `['status', 'services', 'gamestate',
+'factions', 'players']` — the read-only ones. Mutating subcommands are
+deliberately excluded: they need a `watchManager` / `stagedImportRef` that a stub
+context cannot supply. `discord` works in full mode alongside `commands`, or on
+its own for a read.
+
+Results come back under `discord`, alongside `results` for any RCON commands —
+one entry per subcommand, each with the captured embed:
+
+```json
+"discord": [{ "command": "gamestate", "ok": true, "embed": { "...": "" } }]
+```
+
 ### Snapshot
 
 ```json
@@ -176,6 +202,6 @@ those bugs; use tape-only mode on the live server for those.
 node testing/test-dev-rcon-harness.js
 ```
 
-16 tests, mocked server/RCON/S³, no running SquadJS needed. They cover the
+19 tests, mocked server/RCON/S³, no running SquadJS needed. They cover the
 harness's own logic only — they say nothing about whether real RCON accepts a
 given command.

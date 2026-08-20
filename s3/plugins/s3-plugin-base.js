@@ -69,6 +69,7 @@
 
 import BasePlugin from './base-plugin.js';
 import { stderrError } from '../utils/s3-stderr.js';
+import { versionAtLeast } from '../utils/s3-common.js';
 
 export default class S3PluginBase extends BasePlugin {
   constructor(server, options, connectors) {
@@ -105,6 +106,19 @@ export default class S3PluginBase extends BasePlugin {
     this._s3 = s3;
     this.verbose(2, '[S3] Discovered SlackersSquadServices.');
     return s3;
+  }
+
+  /**
+   * True when the discovered S³ is at or above `required`.
+   *
+   * Consumers gate mounting on this. See utils/s3-common.js for why the
+   * comparison is numeric rather than the string `<` it replaced.
+   *
+   * @param {string} required - Minimum acceptable S³ version, e.g. '1.4.0'.
+   * @returns {boolean}
+   */
+  _s3VersionAtLeast(required) {
+    return versionAtLeast(this._s3?.version, required);
   }
 
   /**

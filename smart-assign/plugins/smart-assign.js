@@ -304,7 +304,7 @@ export default class SmartAssign extends S3PluginBase {
   _checkS3Version() {
     const required = '1.0.0';
     const actual = this._s3?.version;
-    if (!actual || actual < required) {
+    if (!this._s3VersionAtLeast(required)) {
       throw new Error(
         `[SmartAssign] Incompatible S³ version: got ${actual || 'unknown'}, need >=${required}. ` +
         'Please update SlackersSquadServices.'

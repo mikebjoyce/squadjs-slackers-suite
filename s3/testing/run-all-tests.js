@@ -79,7 +79,11 @@ const CATEGORY_TESTS = {
     'test-export-model-registration.js',
     // Real SQLite, real GameStateService + LoggingService: asserts the
     // resolving-clear rows actually land in S3_GameStateEvents.
-    'test-resolving-cleared-logging.js'
+    'test-resolving-cleared-logging.js',
+    // Parses S3_DEVELOPER_GUIDE.md and checks its command table, option
+    // defaults and test catalog against source. No engine, no I/O beyond
+    // reading three files.
+    'test-developer-guide-accuracy.js'
   ],
   2: [
     'test-join-pipeline.js',

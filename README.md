@@ -94,9 +94,19 @@ Consumer plugins discover S³ at runtime and access services through flat getter
 
 ## S³ Version Compatibility
 
-**Compatibility floor: S³ ≥ 1.0.0**
+S³ is currently **v1.4.0**. Each consumer plugin declares its own floor — they are
+not all the same, so pinning S³ to the lowest one will stop the others mounting:
 
-All four consumer plugins enforce this at runtime via `_checkS3Version()`, which throws on mismatch. There is no silent degradation — if the S³ version is incompatible, the consumer plugin will fail to mount.
+| Consumer | Requires S³ ≥ | Why |
+|---|---|---|
+| SmartAssign | 1.0.0 | Baseline service container |
+| TeamBalancer | 1.0.0 | Baseline service container |
+| EloTracker | 1.2.4 | |
+| Switch | 1.4.0 | Seed-bonus grants need accessors added in 1.4.0; on an older S³ they are `undefined` and the UPDATE throws mid-grant |
+
+Each plugin enforces its floor at runtime via `_checkS3Version()`, which throws on
+mismatch. There is no silent degradation — an incompatible S³ means the consumer
+plugin fails to mount.
 
 ## Installation
 
@@ -127,6 +137,9 @@ This produces an `out/` folder with the correct `plugins/` and `utils/` layout. 
 | `--output=<path>` | Output directory (default: `./out`) |
 | `--with-tools` | Also copy `tools/` directories |
 | `--with-testing` | Also copy `testing/` directories |
+| `--force`, `-f` | Skip the overwrite confirmation prompt. Required when the output directory already holds files that would be overwritten. |
+| `--clean` | **Destructive.** Wipes the output directory before copying — *all* of it, including files that have nothing to do with this suite. Only ever point it at a dedicated output directory, never at a live SquadJS install. |
+| `--help`, `-h` | Print usage and exit |
 
 Examples:
 ```bash
@@ -163,7 +176,9 @@ squad-server/
     └── ...                           (other S³ utils)
 ```
 
-2. **Configure connectors** — Add `database` and `discordClient` connectors to your `config.json`:
+### Then, whichever path you took
+
+1. **Configure connectors** — Add `database` and `discordClient` connectors to your `config.json`:
 
    ```json
    "connectors": {
@@ -178,12 +193,12 @@ squad-server/
    }
    ```
 
-3. **Add plugins to `config.json`** — Follow the mount order above. S³ must be first.
+2. **Add plugins to `config.json`** — Follow the mount order above. S³ must be first.
 
-4. **Configure plugin options** — Each plugin has its own options. See the individual plugin READMEs for details:
+3. **Configure plugin options** — Each plugin has its own options. See the individual plugin READMEs for details:
    - [S³ Configuration](s3/README.md#configuration-options)
    - [SmartAssign](smart-assign/README.md#configuration-options)
-   - [Switch](switch/README.MD#configuration-options) — [Behaviour Reference](switch/SWITCH_BEHAVIOUR.md)
+   - [Switch](switch/README.md#configuration-options) — [Behaviour Reference](switch/SWITCH_BEHAVIOUR.md)
    - [EloTracker](elo-tracker/README.md#configuration-options)
    - [TeamBalancer](team-balancer/README.md#configuration-options)
 
@@ -205,9 +220,13 @@ Exit code 0 means every plugin's runner exited 0. Individual suites can still be
 run directly — see each plugin's README — and S³'s own runner takes categories:
 
 ```bash
-node s3/testing/run-all-tests.js --category 1    # Unit tests
-node s3/testing/run-all-tests.js --category 2    # Integration tests
+node s3/testing/run-all-tests.js --category 1    # Standalone — no server, no game
+node s3/testing/run-all-tests.js --category 2    # Mock-based — no live server
+node s3/testing/run-all-tests.js --category 4    # Multi-dialect permissions (needs Docker)
 ```
+
+Category 3 is the human-led test plans; the runner lists them rather than
+executing them. Passing no `--category` runs 1, 2 and 3.
 
 ### Database changes: a green run is not enough
 
@@ -254,4 +273,4 @@ GitHub: https://github.com/mikebjoyce
 
 ---
 
-*Built for SquadJS — current as of 2026-08-12*
+*Built for SquadJS — current as of 2026-08-20*

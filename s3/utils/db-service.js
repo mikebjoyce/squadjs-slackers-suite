@@ -1352,6 +1352,7 @@ export default class DBService {
   async verifyLiveSchema() {
     if (this._pluginModels.size === 0) {
       this.verboseLogger(3, '[DB] No plugin models registered for drift detection — skipping verifyLiveSchema.');
+      this._lastDriftResult = [];
       return [];
     }
 
@@ -1487,6 +1488,12 @@ export default class DBService {
         }
       }
     }
+
+    // Cache here rather than at each call site. Two callers already did this by
+    // hand and a third (`!s3 migrate verify`) would have had to remember; a
+    // caller that forgot would leave `!s3 diag` reporting a stale verdict that
+    // contradicts the check just run.
+    this._lastDriftResult = drift;
 
     return drift;
   }

@@ -14,7 +14,7 @@ Scramble execution swaps entire squads or unassigned players, balancing team siz
 
 * **Dual Win Streak Tracking**:
   - **Dominant Win Streaks**: Tracks wins that meet ticket margin thresholds (default: 150+ tickets). Triggers scramble after X dominant wins (default: 2).
-  - **Consecutive Win Streaks**: Tracks ANY consecutive wins regardless of margin. Optional secondary trigger (default: disabled). Useful for preventing prolonged one-sided matches even when margins are close.
+  - **Consecutive Win Streaks**: Tracks ANY consecutive wins regardless of margin. Secondary trigger, **on by default at 3** (`maxConsecutiveWinsWithoutThreshold`); set it to `0` to disable. Useful for preventing prolonged one-sided matches even when margins are close.
 
 * **Single-Round Scramble**: Optional "Mercy Rule" to scramble immediately after a single game with extreme ticket disparity.
 
@@ -56,7 +56,7 @@ Tracks per-player TrueSkill ratings (μ/σ) across rounds. When `useEloForBalanc
 
 **[squadjs-switch-teambalancer-aware](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/switch)**
 
-Prevents players from changing teams immediately after a scramble. When TeamBalancer executes a scramble, it fires the `TEAM_BALANCER_SCRAMBLE_EXECUTED` event. The Switch plugin listens for this event and automatically locks all players from switching teams for a configurable duration (default: 20 minutes).
+Prevents players from changing teams immediately after a scramble. When TeamBalancer executes a scramble, it fires the `TEAM_BALANCER_SCRAMBLE_EXECUTED` event. The Switch plugin listens for this event and automatically locks all players from switching teams for a configurable duration (Switch's `scrambleLockdownDurationMinutes`, default 30 minutes).
 
 **Why this matters**: Without this plugin, players moved during a scramble can immediately switch back to their original team, defeating the purpose of team balancing.
 
@@ -74,7 +74,9 @@ S³ is the centralised service container for shared state across Slacker's Squad
 
 **Why this matters**: Rather than maintaining its own duplicate caches, TeamBalancer reads ground-truth data from S³ — player/squad snapshots via `players.getAllPlayers()` / `players.getSquads()`, faction names via `factions.getTeamName()`, game-mode/layer detection via `gameState.getGamemode()` / `gameState.getLayerName()`, ignored-mode checks via `gameState.isIgnoredMode()`, and clan grouping via `clans.extractClanGroups()`. During scrambles, S³'s global-lock mechanism (`players.lockGlobal()` / `players.unlockGlobal()`) prevents concurrent scrambles from conflicting.
 
-**Setup**: Install S³ alongside TeamBalancer. S³ is auto-discovered at runtime via `this.server.plugins`. If S³ is absent, TeamBalancer falls back to raw SquadJS data for all services.
+**Setup**: Install S³ in `config.json` **before** TeamBalancer, so it mounts first. S³ is auto-discovered at runtime via `this.server.plugins`.
+
+S³ is **required, not optional** — there is no fallback to raw SquadJS data. `S3PluginBase._resolveS3()` throws if SlackersSquadServices is not found, so TeamBalancer fails to mount rather than degrading quietly.
 
 **Important**: The following settings have been **delegated to S³'s configuration** and are no longer read from the TeamBalancer plugin config:
 
@@ -137,7 +139,6 @@ Add to your `config.json`:
 {
   "plugin": "TeamBalancer",
   "enabled": true,
-  "database": "sqlite",
   "enableWinStreakTracking": true,
   "enableSeedAutoScramble": true,
   "maxWinStreak": 2,
@@ -170,9 +171,9 @@ Add to your `config.json`:
 }
 ```
 
-> **Note**: Clan tag grouping options (`enableClanTagGrouping`, `minClanGroupSize`, `maxClanGroupSize`, `clanTagMaxEditDistance`, `clanTagCaseSensitive`, `clanGroupingPullEntireSquads`) and `ignoredGameModes` are no longer configured on TeamBalancer — they are managed by S³. See the [S³ section](#s%C2%B3-slackers-squad-services) above.
+> **Note**: Clan tag grouping options (`enableClanTagGrouping`, `minClanGroupSize`, `maxClanGroupSize`, `clanTagMaxEditDistance`, `clanTagCaseSensitive`, `clanGroupingPullEntireSquads`) and `ignoredGameModes` are no longer configured on TeamBalancer — they are managed by S³. See the [S³ section](#s-slackers-squad-services) above.
 
-**Database Options:** The `"database"` option should match a connector name from your SquadJS connectors config. Use `"sqlite"` for file-based storage (default), `"mysql"` for MySQL, or `"postgres"` for PostgreSQL. Any Sequelize-compatible backend is supported.
+**Database:** TeamBalancer has no `database` option and never opens a connector of its own. It defines its models on S³'s connector, so the engine is whatever `database` is set to on the **SlackersSquadServices** plugin.
 
 **File Placement**: Move the project files into your SquadJS directory's squad-server folder.
 
@@ -187,11 +188,15 @@ squad-server/
 │   ├── tb-discord-helpers.js
 │   └── tb-swap-executor.js
 └── testing/ (optional)
+    ├── run-all-tests.js
     ├── scrambler-test-runner.js
+    ├── plugin-logic-test-runner.js
     ├── historical-scramble-test.js
     ├── historical-elo-backbone-test.js
-    ├── plugin-logic-test-runner.js
-    ├── elo-integration-test.js
+    ├── test-tb-elo-scramble.js
+    ├── test-team-balancer-plugin.js
+    ├── test-cross-clan-squad-collision.js
+    ├── embed-format-test.js
     └── mock-data-generator.js
 ```
 
@@ -225,7 +230,6 @@ Admin Commands:
 
 | Option | Required | Type | Default | Description |
 |--------|----------|------|---------|-------------|
-| `database` | yes | string | `"sqlite"` | Sequelize connector name for persistence (SQLite, MySQL, PostgreSQL, etc.) |
 | `enableWinStreakTracking` | no | boolean | `true` | Enable/disable automatic win streak tracking |
 | `enableSeedAutoScramble` | no | boolean | `true` | Auto-scramble teams at the end of a Seed round |
 | `maxWinStreak` | no | number | `2` | Dominant wins in a row to trigger a scramble |
@@ -245,7 +249,7 @@ Admin Commands:
 | `scrambleConfirmationTimeout` | no | number | `60` | Seconds to wait for scramble confirmation |
 | `showWinStreakMessages` | no | boolean | `true` | Broadcast win streak updates after each round |
 | `useGenericTeamNamesInBroadcasts` | no | boolean | `false` | Use "Team 1"/"Team 2" instead of faction names in broadcasts |
-| `discordClient` | no | string | — | Discord connector name for Discord integration |
+| `discordClient` | no | string | `"discord"` | Discord connector name for Discord integration |
 | `discordAdminChannelID` | no | string | `""` | Discord channel ID for admin commands |
 | `discordReportChannelID` | no | string | `""` | Discord channel ID for automated reports (defaults to admin channel if unset) |
 | `discordAdminRoleIDs` | no | array | `[]` | Array of Discord role IDs required for admin commands (empty = all in channel) |
@@ -254,6 +258,7 @@ Admin Commands:
 | `useEloForBalance` | no | boolean | `true` | Weight scrambles by EloTracker mu ratings (requires EloTracker plugin; falls back to numerical balance if absent) |
 | `devMode` | no | boolean | `false` | Allow commands from any player regardless of admin status |
 | `reportLogPath` | no | string | `"team-balancer-reports.jsonl"` | Path to the JSONL log file for round reports |
+| `scrambleReportPath` | no | string | `"TeamBalancerScrambleReports/"` | Directory for per-scramble report files |
 | `enableDatabaseLogging` | no | boolean | `false` | If true, round reports are also written to database tables |
 
 > **S³-Managed Options**: The following settings are no longer configured on the TeamBalancer plugin. They are now managed by S³:
@@ -279,16 +284,16 @@ The plugin operates two independent win tracking systems that can each trigger s
 ### Dominant Win Streaks (Primary)
 Tracks wins where the victor exceeded configured ticket margin thresholds:
 - **Standard modes (RAAS/AAS)**: `minTicketsToCountAsDominantWin` (default: 150)
-- **Invasion mode**: Separate thresholds for attackers (`invasionAttackTeamThreshold`: 300) and defenders (`invasionDefenceTeamThreshold`: 650)
+- **Invasion mode**: Separate thresholds for attackers (`invasionAttackTeamThreshold`: 300) and defenders (`invasionDefenceTeamThreshold`: 500)
 
 A scramble triggers when one team achieves `maxWinStreak` dominant victories in a row (default: 2).
 
 **Use case**: Prevents sustained one-sided stomps where skill or strategy gap is clear.
 
-### Consecutive Win Streaks (Secondary — Optional)
+### Consecutive Win Streaks (Secondary)
 Tracks ANY consecutive wins regardless of ticket margin. Controlled via `maxConsecutiveWinsWithoutThreshold`:
-- **Set to 0** (default): Feature disabled.
-- **Set to X > 0**: Triggers scramble after X consecutive wins, even if margins were close.
+- **Set to X > 0** — triggers a scramble after X consecutive wins, even if margins were close. **Defaults to 3, so this trigger is active out of the box.**
+- **Set to 0** — feature disabled.
 
 **Use case**: Prevents prolonged one-sided outcomes across matches with consistent but narrow victories.
 

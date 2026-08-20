@@ -179,7 +179,7 @@ export default class EloTracker extends S3PluginBase {
        discordAdminRoleID: { required: false, default: '', type: 'string' },
        enableDatabaseLogging: {
          required: false,
-         description: 'If true, mirrors round outcome data into database tables for querying (default: false).',
+         description: 'If true, mirrors round outcome data into database tables for querying (default: true).',
          default: true,
          type: 'boolean'
        }
@@ -248,7 +248,7 @@ export default class EloTracker extends S3PluginBase {
     // A mount-time failure is much cheaper than a lookup that quietly lies.
     const required = '1.2.4';
     const actual = this._s3?.version;
-    if (!actual || actual < required) {
+    if (!this._s3VersionAtLeast(required)) {
       throw new Error(
         `[EloTracker] Incompatible S³ version: got ${actual || 'unknown'}, need >=${required}. ` +
         'Please update SlackersSquadServices.'

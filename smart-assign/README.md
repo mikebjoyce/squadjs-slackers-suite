@@ -87,14 +87,13 @@ Add the following to your `config.json`:
   {
     "plugin": "SmartAssign",
     "enabled": true,
-    "database": "sqlite",
     "logPath": "./smart-assign-log.jsonl",
     "enableEventLogging": true
   }
 ]
 ```
 
-**Database Options:** The `"database"` option should match a connector name from the connectors block. Use `"sqlite"` for file-based storage, `"mysql"` for MySQL, or `"postgres"` for PostgreSQL. Any Sequelize-compatible backend is supported. The `database` option is inherited from S³'s DBService — SmartAssign does not define its own database connector.
+**Database:** SmartAssign has no `database` option — do not put one in its config block. It defines its models on S³'s connector, so the engine is whatever `database` is set to on the **SlackersSquadServices** plugin. The connectors block above exists so you can point S³ at one.
 
 ### 2. File Placement
 

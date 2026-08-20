@@ -71,11 +71,13 @@ No additional configuration is needed on the EloTracker side. TeamBalancer finds
 
 S³ is the centralised service container for shared state across Slacker's Squad plugins. EloTracker uses it as the primary data source for game-state metadata — round start time, layer name, gamemode, and ignored-mode detection.
 
-**Requires S³ ≥1.0.0.**
+**Requires S³ ≥1.2.4.**
 
 **Why this matters**: Rather than maintaining its own round-time tracking, EloTracker reads ground-truth data from S³'s `gameState` service — `getRoundStartTime()`, `getLayerName()`, `getGamemode()`, and `isIgnoredMode()`. This ensures cross-plugin consistency: SA and TB refer to the same roundStartTime and matchId during team assignment and balancing. EloTracker also listens for `TEAM_BALANCER_SCRAMBLE_EXECUTED` to capture a team-balance snapshot post-scramble for Discord reporting.
 
-**Setup**: Install S³ alongside EloTracker. S³ is auto-discovered at runtime via `this.server.plugins`. If S³ is absent, EloTracker falls back to its own direct SquadJS event data for all services.
+**Setup**: Install S³ in `config.json` **before** EloTracker, so it mounts first. S³ is auto-discovered at runtime via `this.server.plugins`.
+
+S³ is **required, not optional** — there is no fallback path. `S3PluginBase._resolveS3()` throws if it cannot find SlackersSquadServices, and `_checkS3Version()` throws if the version is below the floor. Either way EloTracker fails to mount rather than degrading quietly.
 
 ---
 
@@ -116,7 +118,6 @@ Add the following to your `config.json`:
   {
     "plugin": "EloTracker",
     "enabled": true,
-    "database": "sqlite",
     "discordClient": "discord",
     "discordPublicChannelID": "YOUR_CHANNEL_ID",
     "discordAdminChannelID": "YOUR_ADMIN_CHANNEL_ID",
@@ -133,7 +134,7 @@ Add the following to your `config.json`:
 ]
 ```
 
-**Database Options:** The `"database"` option should match a connector name from above. Use `"sqlite"` for file-based storage (default), `"mysql"` for MySQL, or `"postgres"` for PostgreSQL. Any Sequelize-compatible backend is supported.
+**Database:** EloTracker has no `database` option and never opens a connector of its own. It defines its models on S³'s connector, so the engine is whatever `database` is set to on the **SlackersSquadServices** plugin — SQLite, MySQL, Postgres, or any Sequelize-compatible backend. The commented-out connectors above are there so you can point S³ at one.
 
 ### 2. File Placement
 
@@ -174,7 +175,6 @@ squad-server/
 
 | Option | Required | Type | Default | Description |
 |--------|----------|------|---------|-------------|
-| `database` | yes | string | `"sqlite"` | Sequelize connector name for persistence (SQLite, MySQL, PostgreSQL, etc.) |
 | `discordClient` | no | string | `"discord"` | Discord connector name for Discord integration |
 | `discordPublicChannelID` | no | string | `""` | Discord channel ID for public commands (`!elo`, `!elo leaderboard`, etc.) |
 | `discordAdminChannelID` | no | string | `""` | Discord channel ID for admin commands (`!elo status`, `!elo backup`, etc.) |

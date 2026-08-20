@@ -145,25 +145,31 @@ import SwitchExplain from '../utils/switch-explain.js';
  *   !switch help                   → In-game warning popup explaining eligibility rules.
  *   !switch explain                → Detailed breakdown of why you can or cannot switch.
  *   !switch cancel                 → Leave the switch queue.
- *   !switch prefer <team>          → Set team preference for end-of-match switch queue.
  *   !bug / !stuck / !doubleswitch  → Double-switch (swap to opposite team and back).
  *
  * Admin (in-game):
  *   !switch now <name>             → Force immediate team switch for a player.
  *   !switch double <name>          → Force double-switch for a player.
  *   !switch squad <n> <team>       → Switch an entire squad to the opposite team.
+ *   !switch doublesquad <n> <team> → Double-switch an entire squad.
  *   !switch swap <name1> <name2>   → Swap two players between teams.
+ *   !switch matchend <name>        → Queue a player for switch at end of round.
+ *   !switch matchendsquad <n> <t>  → Queue a squad for switch at end of round.
+ *   !switch triggermatchend        → Execute the end-of-match switch queue now.
+ *   !switch refresh                → Force an RCON player-list refresh.
+ *   !switch slots                  → Report current balance slot availability.
  *   !switch check <name/steamID>   → Look up a player's cooldown and lock status.
  *   !switch clear <name/steamID>   → Remove all cooldowns and locks for a player.
  *   !switch clearall               → Wipe the entire cooldown database.
- *   !switch status                 → Show DB health, active locks, and top-10 locked players.
+ *   !switch status                 → Show DB health, active locks, and top-5 locked players.
  *   !switch help                   → List all admin commands.
  * Admin (Discord):
--------
- *   !switch status                 → Database health + RCON latency + top-10 locked players.
+ *   !switch status                 → Database health + RCON latency + top-5 locked players.
  *   !switch check <name/steamID>   → Real-time eligibility lookup with timestamps.
  *   !switch clear <name/steamID>   → Remove cooldowns/locks for a player.
  *   !switch clearall               → Wipe entire cooldown database.
+ *   !switch timelimit on|off       → Toggle the join/match time limit for queue entry.
+ *   !switch stats [days]           → Aggregate embed over the last N days of round summaries.
  *   !switch help                   → List all Discord admin commands.
  *
  * ─── AUTHOR ──────────────────────────────────────────────────────
@@ -293,7 +299,7 @@ export default class Switch extends S3DiscordPluginBase {
             },
             dynamicBalanceTolerance: {
                 required: false,
-                description: "Enable interpolated extra imbalance tolerance when server is below full capacity (default: off). Scales from floor to 98 players.",
+                description: "Enable interpolated extra imbalance tolerance when server is below full capacity (default: on). Scales from floor to 98 players.",
                 default: true,
                 type: 'boolean'
             },
@@ -496,7 +502,7 @@ export default class Switch extends S3DiscordPluginBase {
         // mid-grant rather than failing at mount where it is diagnosable.
         const required = '1.4.0';
         const actual = this._s3?.version;
-        if (!actual || actual < required) {
+        if (!this._s3VersionAtLeast(required)) {
             throw new Error(
                 `[Switch] Incompatible S³ version: got ${actual || 'unknown'}, need >=${required}. ` +
                 'Please update SlackersSquadServices.'

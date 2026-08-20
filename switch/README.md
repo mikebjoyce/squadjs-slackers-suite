@@ -24,9 +24,9 @@ Survives server restarts via any Sequelize-compatible database (SQLite, MySQL, P
 * **Liberal Mode Support** — relaxed switching rules during Seed/Jensen rounds
 * **Token Bucket Cooldown** — players hold up to `maxSwitchTokens` (default 2) with individual per-token regeneration; set to 1 for legacy flat-cooldown behavior. Token-aware messaging adapts automatically based on the configured token count.
  * **Seed Bonus Tokens** — players earn bonus switch tokens for time spent in seed-mode rounds, stacking above the normal cap up to an absolute ceiling of `maxSwitchTokens + seedTokenBonusAmount`. Players still present when the round ends receive a consolation token even if they never accrued a full interval. Configurable minimum player threshold (`seedTokenBonusMinPlayers`) gates time accrual so low-population servers don't hand out tokens at 2 AM. Set either `seedTokenBonusAmount` or `seedTokenBonusMinutes` to 0 to disable seed bonus tokens entirely.
- * **Row Retention** — cooldown rows are pruned automatically: immediately once a row carries no information (exactly `maxSwitchTokens`, no seed state), and after `pruneInactivePlayerDays` for everything else. Keeps the table bounded on long-running servers.
+ * **Row Retention** — cooldown rows are pruned automatically in two tiers: after 30 minutes once a row carries no information (exactly `maxSwitchTokens`, no seed state), and after `pruneInactivePlayerDays` for everything else. Connected players are never pruned. Keeps the table bounded on long-running servers.
 * **Dynamic Balance Tolerance** — interpolated extra imbalance slots when server is below full capacity
-* **Auto-Updating Explain Channel** — When `explainChannelID` is configured, the full `!switch explain` embed sequence plus a 7-day reliability stats embed is posted to the designated channel on mount and periodically refreshed in-place (every 30 minutes). Players always see current information without manual `!switch explain` re-runs.
+* **Explain Channel** — When `explainChannelID` is configured, the full `!switch explain` embed sequence plus a 7-day reliability stats embed is posted to the designated channel on mount. The message ID is persisted in `SwitchPlugin_Settings`, so a restart edits the existing message in place rather than posting a duplicate. It is generated **once per SquadJS startup** — there is no periodic refresh, so the stats age until the next restart.
 * **Enhanced `!switch stats`** — Discord aggregate embed with per-move-type counts, denial reason breakdowns, queue outcomes, liberal-mode filtering, and data quality warnings
 * **In-Game & Discord Admin Commands** — full admin controls via chat or Discord
 
@@ -38,7 +38,7 @@ Survives server restarts via any Sequelize-compatible database (SQLite, MySQL, P
 
 **[squadjs-team-balancer](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/team-balancer)**
 
-Provides squad-preserving scramble functionality. When a scramble is executed, TeamBalancer fires the `TEAM_BALANCER_SCRAMBLE_EXECUTED` event. The Switch plugin listens for this event and automatically locks affected players from switching teams for a configurable duration (default: 20 minutes).
+Provides squad-preserving scramble functionality. When a scramble is executed, TeamBalancer fires the `TEAM_BALANCER_SCRAMBLE_EXECUTED` event. The Switch plugin listens for this event and automatically locks affected players from switching teams for a configurable duration (`scrambleLockdownDurationMinutes`, default 30 minutes).
 
 **Why this matters**: Without this plugin, players moved during a scramble can immediately switch back to their original team, defeating the purpose of team balancing.
 
@@ -58,7 +58,9 @@ S³ is a **required** supporting plugin that provides centralised shared state a
 
 Switch will fail to mount if S³ is absent — there is no fallback path.
 
-**Requires S³ ≥1.0.0.**
+**Requires S³ ≥1.4.0.** The seed-bonus grant path uses accessors that landed in
+1.4.0; on an older S³ they are `undefined` and the UPDATE throws mid-grant rather
+than failing at mount where it would be diagnosable — hence the hard floor.
 
 **Setup**: Install S³ in `config.json` before Switch. It must appear in the plugins array before Switch so it is mounted first. No manual configuration beyond installation is needed.
 
@@ -131,6 +133,7 @@ squad-server/
 │   ├── switch-db.js
 │   ├── switch-output.js
 │   ├── switch-queue.js
+│   ├── switch-explain.js
 │   └── switch-commands.js
 ```
 
@@ -162,6 +165,9 @@ squad-server/
 | `!switch swap <name1> <name2>` | Swap two players between teams |
 | `!switch matchend <name>` | Queue a player for switch at end of round |
 | `!switch matchendsquad <n> <team>` | Queue a squad for switch at end of round |
+| `!switch triggermatchend` | Execute the end-of-match switch queue immediately |
+| `!switch refresh` | Force an RCON player-list refresh |
+| `!switch slots` | Report current balance slot availability |
 | `!switch check <name/steamID>` | Look up another player's cooldown and lock status |
 | `!switch clear <name/steamID>` | Remove all cooldowns and locks for a player |
 | `!switch clearall` | Wipe the entire cooldown database |
@@ -178,11 +184,11 @@ squad-server/
 | `!switch check <name/steamID>` | Real-time eligibility lookup with Discord timestamps |
 | `!switch clear <name/steamID>` | Remove cooldowns/locks for a player |
 | `!switch clearall` | Wipe entire cooldown database |
-| `!switch timelimit on|off` | Toggle the join/match time limit for queue entry |
+| `!switch timelimit on\|off` | Toggle the join/match time limit for queue entry |
 | `!switch stats [days]` | Scrape the last N days of round summaries and show an aggregate embed with movement types, denial reasons, queue outcomes, and data quality info |
 | `!switch help` | List all Discord admin commands |
 
-When `explainChannelID` is set, the full explain embed sequence plus a 7-day reliability stats embed is auto-posted to that channel on mount and refreshed in-place every 30 minutes — admins do not need to manually run `!switch explain` to keep it current.
+When `explainChannelID` is set, the full explain embed sequence plus a 7-day reliability stats embed is auto-posted to that channel on mount, editing the previous message rather than posting a new one. It refreshes on SquadJS startup only — reload SquadJS to regenerate it.
 
 ---
 
@@ -196,10 +202,11 @@ The Switch plugin exposes a public API for external consumers (such as SmartAssi
 |--------|-----------|-------------|
 | `getQueueSnapshot()` | `() → { t1ToT2: Array, t2ToT1: Array }` | Returns shallow copies of both directional sub-queues. Read-only — no side effects. Each entry exposes `{ eosID, steamID, playerName, currentTeamID, targetTeamID, queuedAt }`. `warnInterval` is NOT exposed. |
 | `forceQueueSwap(eosID)` | `(String) → boolean` | Removes the player from the queue, clears warn intervals, and executes the RCON switch. Returns `true` on success, `false` if player was already consumed/cancelled/disconnected. |
-| `consumeQueueEntry(eosID)` | `(String) → Entry | null` | _(Alternative)_ Removes queue bookkeeping only — does NOT execute RCON. Returns the entry or null. |
+| `consumeQueueEntry(eosID)` | `(String) → Entry \| null` | _(Alternative)_ Removes queue bookkeeping only — does NOT execute RCON. Returns the entry or null. |
 
 ### Version Compatibility
 
+- `static version = '2.5.5'` — Verify migration data effects; stop swallowing unhandled rejections
 - `static version = '2.5.4'` — Correct misleading 'schema already up to date' log when migrations are pending
 - `static version = '2.5.3'` — Route onChatMessage catch-all through reportError (enables opt-in stderr mirroring; stdout unchanged)
 - `static version = '2.5.2'` — Fix v5 migration backfill: qi.bulkUpdate + IS NULL, repairs hand-migrated DBs
@@ -314,7 +321,7 @@ The Switch plugin supports splitting Discord traffic across two channels. Round 
 |--------|-------------|---------|
 | `discordChannelID` | Discord channel ID for automated reports (round summaries, scramble lockdown notifications). | `""` |
 | `adminCommandChannelID` | Discord channel ID for admin !switch commands. If not set, all traffic goes through `discordChannelID` (single-channel mode). | `""` |
-| `explainChannelID` | Discord channel ID for auto-updating explain messages with 7-day stats. When set, the full explain embed sequence plus reliability stats are posted to this channel on mount and refreshed every 30 minutes. | `""` |
+| `explainChannelID` | Discord channel ID for the explain messages with 7-day stats. When set, the full explain embed sequence plus reliability stats are posted (or edited in place) on mount. Regenerated on SquadJS startup only, not on a timer. | `""` |
 
 ### v2.0.0 Features
 

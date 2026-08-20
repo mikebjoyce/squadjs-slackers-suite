@@ -75,6 +75,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { restoreBackup, listBackups } from './s3-backup.js';
+import { formatSize, timestampString, parseTimestamp } from './s3-common.js';
 
 // ─── TABLE CLASSIFICATION ────────────────────────────────────────────
 
@@ -262,27 +263,6 @@ async function enableForeignKeyChecks(connector, verboseLogger = () => {}) {
     await connector.query('SET FOREIGN_KEY_CHECKS = 1');
   }
   // SQLite: no-op
-}
-
-/**
- * Format a Unix-ms timestamp to YYYY-MM-DD-HHmmss (matching s3-backup.js).
- */
-function timestampString(ts) {
-  const d = new Date(ts);
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-` +
-    `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-}
-
-/**
- * Format byte count to a human-readable string.
- * Exported so Discord output can show '96.3 MB' rather than a raw byte count —
- * a full-tier export runs to nine figures on a mature database.
- */
-export function formatSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /**
@@ -797,14 +777,3 @@ export function listJsonBackups(backupDir = null) {
   return backups;
 }
 
-/**
- * Parse a YYYY-MM-DD-HHmmss timestamp string to Unix ms.
- */
-function parseTimestamp(str) {
-  const match = str.match(/^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})(\d{2})$/);
-  if (!match) return null;
-
-  const [, year, month, day, hour, min, sec] = match.map(Number);
-  const d = new Date(year, month - 1, day, hour, min, sec);
-  return d.getTime();
-}
