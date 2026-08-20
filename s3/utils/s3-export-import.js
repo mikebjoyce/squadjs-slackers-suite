@@ -68,18 +68,39 @@ import { restoreBackup, listBackups } from './s3-backup.js';
 
 // ─── TABLE CLASSIFICATION ────────────────────────────────────────────
 
+/*
+ * ⚠️ These sets hold MODEL names, not table names.
+ *
+ * filterByTier() matches them against dbService.getModelNames(), which returns
+ * the keys of dbService.models — the `name` argument passed to defineModel().
+ * Several models deliberately pair a non-underscored model name with an
+ * underscored table name (model `S3GameStateEvents` → table
+ * `S3_GameStateEvents`), so writing the table name here silently matches
+ * nothing and the tier quietly omits the table.
+ *
+ * Every entry below was verified against a real production export on
+ * 2026-08-19. `--all` ignores these sets entirely, which is why the
+ * mismatches went unnoticed for so long — only the default and --logs tiers
+ * ever exercised them. Test coverage now asserts every name here exists in
+ * getModelNames() and that the three sets partition it exhaustively.
+ */
+
 /**
  * Historical tables — irreplaceable data exported by default.
  * Player ratings, round histories, match reports, assignment logs,
- * and schema version tracking.
+ * operator-configured settings, and schema version tracking.
  */
 const HISTORICAL_TABLES = new Set([
-  'S3_SchemaVersions',
+  'S3SchemaVersions',
   'Elo_PlayerStats',
   'Elo_RoundHistory',
   'Elo_RoundPlayers',
   'SA_AssignmentLog',
-  'TB_RoundReport'
+  'TB_RoundReport',
+  // Operator-configured Switch settings. Not auto-recoverable — if lost, an
+  // admin has to re-enter them by hand — so this belongs in the default tier
+  // rather than with the ephemeral state. It was previously in no tier at all.
+  'SwitchPlugin_Settings'
 ]);
 
 /**
@@ -87,9 +108,9 @@ const HISTORICAL_TABLES = new Set([
  * Included when the --logs flag is passed.
  */
 const LOGGING_TABLES = new Set([
-  'S3_PlayerEvents',
-  'S3_GameStateEvents',
-  'S3_PlayerSnapshots'
+  'S3PlayerEvents',
+  'S3GameStateEvents',
+  'S3PlayerSnapshots'
 ]);
 
 /**
@@ -97,13 +118,27 @@ const LOGGING_TABLES = new Set([
  * Only included when the --all flag is passed.
  */
 const EPHEMERAL_TABLES = new Set([
-  'S3_GameState',
-  'S3_PlayerSessions',
+  'S3GameState',
+  'S3_PlayerSession',
+  // Reconnect memory — rebuilt from live play, and entries expire on their own.
+  // Previously in no tier at all.
+  'S3PlayerReconnect',
   'SwitchPlugin_PlayerCooldowns',
   'SwitchPlugin_Endmatches',
   'Elo_PluginState',
   'TeamBalancerState'
 ]);
+
+/**
+ * The three tiers, exposed for tests. A test asserts these partition
+ * getModelNames() exhaustively, which is the check that would have caught the
+ * model-name/table-name mismatches above.
+ */
+export const TIER_SETS = Object.freeze({
+  historical: HISTORICAL_TABLES,
+  logging: LOGGING_TABLES,
+  ephemeral: EPHEMERAL_TABLES
+});
 
 // ─── HELPERS ─────────────────────────────────────────────────────────
 

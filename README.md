@@ -114,7 +114,8 @@ All four consumer plugins enforce this at runtime via `_checkS3Version()`, which
 # Node.js (cross-platform)
 node install.cjs --plugin=all
 
-# Bash (Linux/macOS/WSL)
+# Bash (Linux/macOS/WSL) — a thin wrapper that forwards to install.cjs,
+# so both take exactly the same flags and behave identically.
 ./install.sh --plugin=all
 ```
 
@@ -192,13 +193,51 @@ If you're building a new plugin that consumes S³, see the **[S³ Developer Guid
 
 ## Testing
 
-Each plugin includes its own test suite. See individual plugin READMEs for test commands. S³'s test suite can be run via:
+Every plugin carries its own suite. To run all of them in one command:
 
 ```bash
-cd s3/testing
-node run-all-tests.js --category 1    # Unit tests
-node run-all-tests.js --category 2    # Integration tests
+node testing/run-all-tests.js                 # the whole suite
+node testing/run-all-tests.js --fast          # skip the slow randomised sweeps
+node testing/run-all-tests.js --plugin=s3     # one plugin
 ```
+
+Exit code 0 means every plugin's runner exited 0. Individual suites can still be
+run directly — see each plugin's README — and S³'s own runner takes categories:
+
+```bash
+node s3/testing/run-all-tests.js --category 1    # Unit tests
+node s3/testing/run-all-tests.js --category 2    # Integration tests
+```
+
+### Database changes: a green run is not enough
+
+These plugins persist to SQLite or MySQL on live game servers, and the suites that
+exercise a real database **skip themselves when the engine is unreachable** — so a
+run with no MySQL container reports all-pass having tested SQLite only.
+
+Start the engines before touching anything that reads or writes the database:
+
+```bash
+docker run -d --name s3-test-mysql    -e MYSQL_ROOT_PASSWORD=root   -p 3307:3306 mysql:8
+docker run -d --name s3-test-postgres -e POSTGRES_PASSWORD=postgres -p 5433:5432 postgres:16-alpine
+```
+
+Then check the output says `mysql reachable` and `0 skipped`, not just that the
+exit code was 0. Ports are overridable via `S3_TEST_MYSQL_HOST` / `_PORT` /
+`_ROOT_USER` / `_ROOT_PASSWORD` / `_DATABASE`. Postgres is supported but not
+deployed anywhere — SQLite and MySQL are the ones that matter.
+
+Mocks cannot prove SQL correctness: identifier quoting, type coercion and collation
+are properties of the engine. Assert by reading rows back out of a real database.
+Full rules and the pre-push checklist are in `s3/S3_DEVELOPER_GUIDE.md` §11.
+
+### Verifying on a real server
+
+`dev-harness/` is a test-only SquadJS plugin (never installed by `install.cjs`)
+that executes RCON commands and `!s3` subcommands dropped into a watched directory
+as JSON, and writes the results — plus an S³ state snapshot and a round-lifecycle
+tape — back to disk. It is how a change gets confirmed against a running Squad
+server rather than against a mock. See `dev-harness/README.md`.
 
 ## Author
 

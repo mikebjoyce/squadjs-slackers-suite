@@ -361,6 +361,9 @@ export default class SlackersSquadServices extends BasePlugin {
       parent: this,
       server: this.server,
       ignoredGameModes: this.options.ignoredGameModes,
+      // Staging duration is deliberately NOT a config option: it is a property
+      // of the gamemode, not of the server. See STAGING_DURATION_MS_BY_GAMEMODE
+      // in game-state-service.js.
       verboseLogger: (...args) => this.verbose(...args)
     });
 

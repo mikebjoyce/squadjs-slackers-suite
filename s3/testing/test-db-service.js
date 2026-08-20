@@ -14,12 +14,15 @@
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
- * - Uses mock Sequelize — no SQLite file created. No running server
- *   required.
+ * - Mostly mock Sequelize — no SQLite file created, no running server
+ *   required. The migration case is the exception: it runs against real
+ *   in-memory SQLite, because a mock cannot answer the only question worth
+ *   asking there ("did the table actually get created?").
  *
  */
 
 import assert from 'node:assert/strict';
+import Sequelize from 'sequelize';
 import DBService from '../utils/db-service.js';
 
 class MockSequelize {
@@ -178,23 +181,59 @@ await runTest('ensureSqlitePragmas applies once per connector', async () => {
   ]);
 });
 
-await runTest('runMigrations applies pending migrations once', async () => {
-  const sequelize = new MockSequelize({ dialect: 'sqlite' });
+await runTest('runMigrations applies a registered migration exactly once', async () => {
+  // This case used to call db.registerMigration() and db.runMigrations() —
+  // neither of which has ever existed on DBService. Migrations live on the
+  // MigrationEngine (db.migrationEngine.registerMigrations(plugin, [...])),
+  // so the case threw TypeError on its first line and had been asserting
+  // nothing at all. It also predates the confirmation gate: without a
+  // confirmToken() the engine refuses to run and reports zero applied.
+  //
+  // Real in-memory SQLite rather than MockSequelize: a mock cannot tell you
+  // whether the DDL landed, and "the table exists afterwards" is the only
+  // assertion here worth making.
+  const sequelize = new Sequelize.Sequelize({
+    dialect: 'sqlite',
+    storage: ':memory:',
+    logging: false
+  });
   const db = new DBService({
     sequelize,
+    verboseLogger: () => {},
     defaultRetry: { attempts: 2, baseDelayMs: 0, jitterMs: 0 }
   });
 
-  let counter = 0;
-  db.registerMigration('2026-06-21-001-initial', async () => {
-    counter += 1;
-  });
-
   await db.mount();
-  assert.equal(counter, 1);
+  db.migrationEngine.confirmToken('__force__');
 
-  await db.runMigrations();
-  assert.equal(counter, 1);
+  let upCalls = 0;
+  db.migrationEngine.registerMigrations('test-db-service', [
+    {
+      version: 1,
+      description: 'create the probe table',
+      touches: { creates: ['DbServiceProbe'] },
+      up: async (qi) => {
+        upCalls += 1;
+        await qi.createTable('DbServiceProbe', {
+          id: { type: Sequelize.DataTypes.INTEGER, primaryKey: true },
+          label: { type: Sequelize.DataTypes.STRING }
+        });
+      }
+    }
+  ]);
+
+  const first = await db.migrationEngine.runMigrations('test-db-service');
+  assert.equal(first.applied, 1);
+  assert.equal(upCalls, 1);
+
+  const tables = (await sequelize.getQueryInterface().showAllTables())
+    .map((t) => (typeof t === 'string' ? t : t.tableName));
+  assert.ok(tables.includes('DbServiceProbe'), 'the migration reported success but created no table');
+
+  // Second run is a no-op: the recorded version says v1 is already applied.
+  const second = await db.migrationEngine.runMigrations('test-db-service');
+  assert.equal(second.applied, 0);
+  assert.equal(upCalls, 1);
 
   await db.unmount();
 });

@@ -545,7 +545,13 @@ export default class TeamBalancer extends S3PluginBase {
       // TBDatabase-compatible initDB() — returns { winStreakTeam, winStreakCount, ... isStale }
       initDB: async () => {
         try {
-          return await s3db.withTransactionWithRetry(async () => {
+          // The transaction handle MUST be threaded into every model call below.
+          // Sequelize's managed transaction does not propagate implicitly (S³ does
+          // not enable CLS), so a bare findOrCreate() opens a transaction of its
+          // own — which on SQLite, where the pool is a single connection, throws
+          // "cannot start a transaction within a transaction" and sent initDB
+          // down its catch, losing the win streak on every restart.
+          return await s3db.withTransactionWithRetry(async (t) => {
             const [record] = await TeamBalancerStateModel.findOrCreate({
               where: { id: 1 },
               defaults: {
@@ -556,10 +562,23 @@ export default class TeamBalancer extends S3PluginBase {
                 consecutiveWinsTeam: null,
                 consecutiveWinsCount: 0,
                 manuallyDisabled: false
-              }
+              },
+              transaction: t
             });
 
             const isStale = !record.lastSyncTimestamp || Date.now() - record.lastSyncTimestamp > STALE_CUTOFF_MS;
+
+            // The transaction-threading fix is only observable by its absence:
+            // before it, this line was never reached on SQLite because
+            // findOrCreate() threw "cannot start a transaction within a
+            // transaction" and initDB returned its zeroed fallback instead. A
+            // real winStreakCount here after a restart IS the proof.
+            Logger.verbose(
+              'TeamBalancer',
+              2,
+              `[7.4m] initDB read state inside transaction: winStreakTeam=${record.winStreakTeam} ` +
+              `winStreakCount=${record.winStreakCount} isStale=${isStale}`
+            );
 
             if (!isStale) {
               Logger.verbose('TeamBalancer', 4, `[7.4m] Restored state: team=${record.winStreakTeam}, count=${record.winStreakCount}`);
@@ -570,7 +589,7 @@ export default class TeamBalancer extends S3PluginBase {
               record.lastSyncTimestamp = Date.now();
               record.consecutiveWinsTeam = null;
               record.consecutiveWinsCount = 0;
-              await record.save();
+              await record.save({ transaction: t });
             }
 
             return {
@@ -598,15 +617,15 @@ export default class TeamBalancer extends S3PluginBase {
 
       saveState: async (team, count, conTeam, conCount) => {
         try {
-          return await s3db.withTransactionWithRetry(async () => {
-            const record = await TeamBalancerStateModel.findByPk(1);
+          return await s3db.withTransactionWithRetry(async (t) => {
+            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
             if (!record) return null;
             record.winStreakTeam = team;
             record.winStreakCount = count;
             record.lastSyncTimestamp = Date.now();
             record.consecutiveWinsTeam = conTeam ?? null;
             record.consecutiveWinsCount = conCount ?? 0;
-            await record.save();
+            await record.save({ transaction: t });
             return {
               winStreakTeam: record.winStreakTeam,
               winStreakCount: record.winStreakCount,
@@ -624,8 +643,8 @@ export default class TeamBalancer extends S3PluginBase {
 
       incrementStreak: async (winnerID, conTeam, conCount) => {
         try {
-          return await s3db.withTransactionWithRetry(async () => {
-            const record = await TeamBalancerStateModel.findByPk(1);
+          return await s3db.withTransactionWithRetry(async (t) => {
+            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
             if (!record) return null;
             if (record.winStreakTeam === winnerID) {
               record.winStreakCount += 1;
@@ -636,7 +655,7 @@ export default class TeamBalancer extends S3PluginBase {
             record.lastSyncTimestamp = Date.now();
             record.consecutiveWinsTeam = conTeam ?? null;
             record.consecutiveWinsCount = conCount ?? 0;
-            await record.save();
+            await record.save({ transaction: t });
             return {
               winStreakTeam: record.winStreakTeam,
               winStreakCount: record.winStreakCount,
@@ -653,11 +672,11 @@ export default class TeamBalancer extends S3PluginBase {
 
       saveScrambleTime: async (timestamp) => {
         try {
-          return await s3db.withTransactionWithRetry(async () => {
-            const record = await TeamBalancerStateModel.findByPk(1);
+          return await s3db.withTransactionWithRetry(async (t) => {
+            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
             if (!record) return null;
             record.lastScrambleTime = timestamp;
-            await record.save();
+            await record.save({ transaction: t });
             return { lastScrambleTime: record.lastScrambleTime };
           });
         } catch (err) {
@@ -668,11 +687,11 @@ export default class TeamBalancer extends S3PluginBase {
 
       saveManuallyDisabledState: async (disabled) => {
         try {
-          return await s3db.withTransactionWithRetry(async () => {
-            const record = await TeamBalancerStateModel.findByPk(1);
+          return await s3db.withTransactionWithRetry(async (t) => {
+            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
             if (!record) return null;
             record.manuallyDisabled = disabled;
-            await record.save();
+            await record.save({ transaction: t });
             return { manuallyDisabled: record.manuallyDisabled };
           });
         } catch (err) {
@@ -683,11 +702,11 @@ export default class TeamBalancer extends S3PluginBase {
 
       saveScrambleArm: async (armedBy) => {
         try {
-          return await s3db.withTransactionWithRetry(async () => {
-            const record = await TeamBalancerStateModel.findByPk(1);
+          return await s3db.withTransactionWithRetry(async (t) => {
+            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
             if (!record) return null;
             record.scrambleOnRoundEndBy = armedBy || null;
-            await record.save();
+            await record.save({ transaction: t });
             return { scrambleOnRoundEndBy: record.scrambleOnRoundEndBy };
           });
         } catch (err) {
@@ -699,7 +718,7 @@ export default class TeamBalancer extends S3PluginBase {
       insertRoundReport: async (data) => {
         if (!TBRoundReportModel) return null;
         try {
-          return await s3db.withTransactionWithRetry(async () => {
+          return await s3db.withTransactionWithRetry(async (t) => {
             const record = await TBRoundReportModel.create({
               matchId: data.matchId || null,
               roundStartTime: data.roundStartTime || null,
@@ -721,7 +740,7 @@ export default class TeamBalancer extends S3PluginBase {
               scrambled: data.scrambled,
               scrambleCondition: data.scrambleCondition,
               scrambleType: data.scrambleType
-            });
+            }, { transaction: t });
             return record.toJSON();
           });
         } catch (err) {
@@ -1160,9 +1179,13 @@ export default class TeamBalancer extends S3PluginBase {
     }
     if (this._scrambleTimeout) clearTimeout(this._scrambleTimeout);
     this._clearPendingScrambleCountdown();
-    if (this._abbreviationPollStartTimeout) clearTimeout(this._abbreviationPollStartTimeout);
     this.cleanupScrambleTracking();
-    this.stopPollingTeamAbbreviations();
+    // Removed: stopPollingTeamAbbreviations() and the _abbreviationPollStartTimeout
+    // guard. Both belonged to the local abbreviation poller deleted along with the
+    // rest of the duplicated layer stack — the method no longer exists, so this
+    // line threw TypeError and aborted unmount before ready/_isMounted were
+    // cleared. Abbreviations now come from this._s3.factions, which needs no
+    // teardown here. See test-team-balancer-plugin.js.
     this._scrambleInProgress = false;
     this._scrambleOnRoundEnd = false;
     this._scrambleOnRoundEndBy = null;

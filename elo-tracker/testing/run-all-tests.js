@@ -15,13 +15,30 @@
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
- * - Tests that require a live SquadJS server or database connector
- *   will be skipped automatically if their dependencies are absent.
+ * - No live SquadJS server is required. test-elo-database.js runs against
+ *   real SQLite; the MySQL cases inside it self-skip when unreachable.
+ *
+ * ─── A SUITE THAT FAILS TO LOAD IS A FAILURE ─────────────────────
+ *
+ * This runner used to catch ERR_MODULE_NOT_FOUND, print "Skipped", and exit
+ * 0. Two of five suites had been silently skipped that way for some time —
+ * test-elo-tracker.js could not resolve './s3-plugin-base.js' and
+ * test-clan-grouping.js pointed at the wrong directory — while the runner
+ * reported a clean run. That is worse than no runner at all, because it
+ * actively asserts coverage that does not exist.
+ *
+ * A suite that cannot be loaded is now counted as a failure and sets a
+ * non-zero exit code, same as an assertion that throws. If a suite genuinely
+ * needs to opt out of a run, it must say so itself, per-case, in its own
+ * output — never by failing to import.
  *
  */
 
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import path from 'path';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 const COLORS = {
   RESET: '\x1b[0m',
@@ -58,12 +75,16 @@ export async function runAll() {
   const suites = [
     { name: 'EloCalculator', file: './test-elo-calculator.js' },
     { name: 'EloSessionManager', file: './test-elo-session-manager.js' },
+    { name: 'EloClanGrouping', file: './test-clan-grouping.js' },
     { name: 'EloDatabase', file: './test-elo-database.js' },
     { name: 'EloTracker', file: './test-elo-tracker.js' },
     { name: 'EloSimulation', file: './test-elo-simulation.js', iterations: 20 }
   ];
 
   const results = {};
+  let totalPassed = 0;
+  let totalFailed = 0;
+  const brokenSuites = [];
 
   for (const suite of suites) {
     results[suite.name] = [];
@@ -82,43 +103,63 @@ export async function runAll() {
       const capturingRunTest = async (name, fn) => {
         const result = await runTest(name, fn);
         suiteRunData.tests.push({ name, passed: result.passed, error: result.error });
+        if (result.passed) totalPassed++;
+        else totalFailed++;
         return result.passed;
       };
 
       try {
-        // Dynamic import allows the runner to work even if files are missing during dev
         const modulePath = new URL(suite.file, import.meta.url).href;
         const module = await import(modulePath);
-        
+
         // Expecting default export to be a function accepting runTest
         if (module.default && typeof module.default === 'function') {
           await module.default(capturingRunTest);
         } else {
-          console.log(`${COLORS.RED}  Skipped: No default export function found in ${suite.file}${COLORS.RESET}`);
+          throw new Error(`no default export function in ${suite.file}`);
         }
       } catch (err) {
-        if (err.code === 'ERR_MODULE_NOT_FOUND') {
-          console.log(`${COLORS.RED}  Skipped: Module missing (${suite.file}): ${err.message}${COLORS.RESET}`);
-        } else {
-          console.error(`${COLORS.RED}  Error loading suite:${COLORS.RESET}`, err);
-        }
+        // A suite that cannot load contributes zero assertions, so counting it
+        // as anything but a failure lets coverage silently evaporate.
+        const why = err.code === 'ERR_MODULE_NOT_FOUND'
+          ? `cannot resolve an import — ${err.message.split('\n')[0]}`
+          : (err.stack || err.message || String(err));
+        console.error(`${COLORS.RED}  [BROKEN SUITE] ${suite.name}: ${why}${COLORS.RESET}`);
+        suiteRunData.tests.push({ name: `${suite.name} (suite load)`, passed: false, error: why });
+        brokenSuites.push(suite.name);
+        totalFailed++;
       }
       results[suite.name].push(suiteRunData);
       console.log('');
     }
   }
 
-  console.log(`${COLORS.CYAN}=== All Tests Completed ===${COLORS.RESET}`);
+  console.log(`${COLORS.CYAN}=== EloTracker Summary ===${COLORS.RESET}`);
+  console.log(`  Passed: ${totalPassed}`);
+  console.log(`  Failed: ${totalFailed}`);
+  if (brokenSuites.length > 0) {
+    console.log(`${COLORS.RED}  Suites that failed to load: ${brokenSuites.join(', ')}${COLORS.RESET}`);
+  }
+  console.log(
+    totalFailed === 0
+      ? `${COLORS.GREEN}  Status: ALL PASSING${COLORS.RESET}`
+      : `${COLORS.RED}  Status: HAS FAILURES${COLORS.RESET}`
+  );
 
   try {
-    fs.writeFileSync('test-results.json', JSON.stringify(results, null, 2));
-    console.log(`${COLORS.GREEN}Results saved to test-results.json${COLORS.RESET}`);
+    // Next to this file, not in the CWD — the runner is invoked from the repo
+    // root as often as from testing/, and a results file whose location depends
+    // on the caller ends up committed twice or not at all.
+    fs.writeFileSync(path.join(HERE, 'test-results.json'), JSON.stringify(results, null, 2));
   } catch (err) {
     console.error(`${COLORS.RED}Failed to save results:${COLORS.RESET}`, err);
   }
+
+  if (totalFailed > 0) process.exitCode = 1;
+  return { passed: totalPassed, failed: totalFailed };
 }
 
 // Execute if run directly
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  runAll();
+  await runAll();
 }

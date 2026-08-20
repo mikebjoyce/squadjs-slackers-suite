@@ -18,8 +18,15 @@ async function createDb() {
   await db.mount(); return db;
 }
 function defH(db) { return db.defineModel('Elo_PlayerStats', { eosID: { type: DataTypes.STRING, primaryKey: true }, rating: DataTypes.INTEGER }, { timestamps: false }); }
-function defL(db) { return db.defineModel('S3_PlayerEvents', { id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true }, event: DataTypes.STRING }, { timestamps: false }); }
-function defE(db) { return db.defineModel('S3_PlayerSessions', { eosID: { type: DataTypes.STRING, primaryKey: true }, data: DataTypes.STRING }, { timestamps: false }); }
+// NOTE: these must be the real MODEL names, matching the tier sets in
+// s3-export-import.js and what dbService.getModelNames() reports in production.
+// They previously read 'S3_PlayerEvents' and 'S3_PlayerSessions' — table-name
+// spellings that no model actually uses — so this file exercised the tier
+// machinery against fictional models and stayed green while the real logging
+// tables were absent from every export. See test-export-model-registration.js,
+// which mounts the actual services rather than defining stand-ins.
+function defL(db) { return db.defineModel('S3PlayerEvents', { id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true }, event: DataTypes.STRING }, { tableName: 'S3_PlayerEvents', timestamps: false }); }
+function defE(db) { return db.defineModel('S3_PlayerSession', { eosID: { type: DataTypes.STRING, primaryKey: true }, data: DataTypes.STRING }, { timestamps: false }); }
 async function populate(db) {
   const H = defH(db); await H.sync(); await H.create({ eosID: 'p1', rating: 1500 }); await H.create({ eosID: 'p2', rating: 1600 });
   const L = defL(db); await L.sync(); await L.create({ event: 'join' });
@@ -34,19 +41,19 @@ async function main() {
     const db = await createDb(); await populate(db);
     const r = await fns.exportToJSON(db);
     const names = Object.keys(r.tables);
-    assert.ok(names.includes('Elo_PlayerStats')); assert.ok(!names.includes('S3_PlayerEvents')); assert.ok(!names.includes('S3_PlayerSessions'));
+    assert.ok(names.includes('Elo_PlayerStats')); assert.ok(!names.includes('S3PlayerEvents')); assert.ok(!names.includes('S3_PlayerSession'));
   });
   await runTest('tier=logs includes logging', async () => {
     const db = await createDb(); await populate(db);
     const r = await fns.exportToJSON(db, { tier: 'logs' });
     const names = Object.keys(r.tables);
-    assert.ok(names.includes('S3_PlayerEvents')); assert.ok(!names.includes('S3_PlayerSessions'));
+    assert.ok(names.includes('S3PlayerEvents')); assert.ok(!names.includes('S3_PlayerSession'));
   });
   await runTest('tier=all includes all', async () => {
     const db = await createDb(); await populate(db);
     const r = await fns.exportToJSON(db, { tier: 'all' });
     const names = Object.keys(r.tables);
-    assert.ok(names.includes('Elo_PlayerStats')); assert.ok(names.includes('S3_PlayerEvents')); assert.ok(names.includes('S3_PlayerSessions'));
+    assert.ok(names.includes('Elo_PlayerStats')); assert.ok(names.includes('S3PlayerEvents')); assert.ok(names.includes('S3_PlayerSession'));
   });
   await runTest('validateImportStructure accepts valid export', async () => {
     const db = await createDb(); await populate(db);

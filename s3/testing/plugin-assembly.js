@@ -54,25 +54,62 @@ export function buildAssembly(dirName) {
   );
 
   // SquadJS's own BasePlugin lives in a deployed SquadJS install, not in this
-  // repo — the same reason core/logger.js is a shim here. Drop a minimal stand-in
-  // into the assembly (never into the source tree, where install.cjs would ship
-  // it and collide with the real one).
+  // repo — the same reason core/logger.js is a shim here. Drop a stand-in into
+  // the assembly (never into the source tree, where install.cjs would ship it
+  // and collide with the real one).
+  //
+  // The constructor is a faithful copy of SquadJS 4.1.0's
+  // squad-server/plugins/base-plugin.js, minus its `core/logger` import. That
+  // matters: it is where option defaults are applied from optionsSpecification,
+  // where `connector: true` options are swapped for the connector instance, and
+  // where `required` options are enforced. A stub that merely assigned
+  // `this.options = options` would leave every unset option undefined, so a
+  // test could pass while production — which fills the default in — took a
+  // different branch entirely.
   fs.writeFileSync(
     path.join(assemblyDir, 'plugins', 'base-plugin.js'),
-    `// Test shim — see s3/testing/plugin-assembly.js
+    `// Test shim — see s3/testing/plugin-assembly.js.
+// Mirrors SquadJS 4.1.0 squad-server/plugins/base-plugin.js.
 export default class BasePlugin {
   constructor(server, options, connectors) {
     this.server = server;
-    this.options = options;
+    this.options = {};
+    this.rawOptions = options;
     this.connectors = connectors;
+    this.logs = [];
+
+    for (const [optionName, option] of Object.entries(this.constructor.optionsSpecification)) {
+      if (option.connector) {
+        this.options[optionName] = (connectors || {})[this.rawOptions[optionName]];
+      } else {
+        if (option.required) {
+          if (!(optionName in this.rawOptions))
+            throw new Error(\`\${this.constructor.name}: \${optionName} is required but missing.\`);
+          if (option.default === this.rawOptions[optionName])
+            throw new Error(
+              \`\${this.constructor.name}: \${optionName} is required but is the default value.\`
+            );
+        }
+
+        this.options[optionName] =
+          typeof this.rawOptions[optionName] !== 'undefined'
+            ? this.rawOptions[optionName]
+            : option.default;
+      }
+    }
   }
-  static get description() { return ''; }
-  static get defaultEnabled() { return true; }
-  static get optionsSpecification() { return {}; }
+
   async prepareToMount() {}
   async mount() {}
   async unmount() {}
-  verbose() {}
+
+  static get description() { return ''; }
+  static get defaultEnabled() { return true; }
+  static get optionsSpecification() { return {}; }
+
+  // The real one delegates to core/logger. Capturing instead lets a test
+  // assert on what a plugin reported without a live Logger.
+  verbose(...args) { this.logs.push(args); }
 }
 `
   );

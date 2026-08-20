@@ -186,7 +186,8 @@ Tracks round phases (STAGING → LIVE → ENDGAME), infers gamemode/layer from s
 | `isEnding()` | `boolean` | Phase === `'ENDGAME'` |
 | `isResolving()` | `boolean` | Team data not yet trusted for this round — **any phase**, not just STAGING. Don't act on team IDs while true |
 | `getGamemode()` | `string\|null` | Inferred game mode (e.g. `'AAS'`, `'RAAS'`, `'Seed'`) |
-| `getLayerName()` | `string\|null` | Raw layer name (e.g. `'Sumari AAS v1'`) |
+| `getLayerName()` | `string\|null` | **Canonical** layer name — the SquadJS classname (e.g. `'Sumari_Seed_v1'`). Use for storage and comparisons; see §7.12 |
+| `getLayerDisplayName()` | `string\|null` | The same layer as a human reads it (e.g. `'Sumari Bala Seed v1'`). Falls back to the canonical name |
 | `isLayerResolved()` | `boolean` | `false` while the two getters above are returning the `'Unknown'` placeholder — use it before trusting a negative `isIgnoredMode()` / `isSeedMode()` |
 | `refreshLayer(source?)` | `Promise<boolean>` | Forces `server.updateServerInformation()` (5s cap) and re-resolves, instead of waiting out SquadJS's ~30s poll |
 | `getRoundStartTime()` | `number\|null` | Epoch MS of round START or LIVE transition |
@@ -962,6 +963,30 @@ const layer = gs?.getLayerName?.() ?? 'Unknown';
 
 **Fix:** never read `server.currentLayer`, `server.layerHistory`, or `server.nextLayer` from a consumer plugin. Take `getLayerName()` / `getGamemode()` / `isIgnoredMode()` from `gameState`, subscribe to `onLayerGameModeChange()` if you need to react to changes, and check `isLayerResolved()` before trusting a *negative* answer from a layer-based gate.
 
+### 7.12 — Comparing Layer Names With `===`
+
+```js
+// ❌ ANTI-PATTERN — the same layer under two names is not the same string
+if (storedLayer === gs.getLayerName()) return;      // fires on an unchanged layer
+embed.addField('Layer', gs.getLayerName());          // shows "Sumari_Seed_v1" to a human
+
+// ✅ CORRECT
+if (gs._layerNamesMatch(storedLayer, gs.getLayerName())) return;
+embed.addField('Layer', gs.getLayerDisplayName());   // "Sumari Bala Seed v1"
+```
+
+**Why it fails:** SquadJS delivers one layer under two conventions — the pretty name on `NEW_GAME` (`data.layer.name`, "Sumari Bala Seed v1") and the classname on `UPDATED_SERVER_INFORMATION` (`info.currentLayer`, "Sumari_Seed_v1"). They differ by punctuation on most layers and by a whole **word** on some, so no amount of string-stripping makes them equal in general.
+
+**What S³ does about it:** `resolveLayerInfo()` canonicalises every source onto the **classname** — the format `AdminChangeLayer` accepts, the format the DB already holds, and the format the always-fires event delivers. Every object-shaped source is a SquadJS `Layer` carrying both names, so this is a field read, not a guess.
+
+| Method | Returns | Use for |
+|--------|---------|---------|
+| `getLayerName()` | canonical classname | storage, comparisons, RCON replay |
+| `getLayerDisplayName()` | pretty name (falls back to canonical) | anything a human reads |
+| `_layerNamesMatch(a, b)` | boolean | comparing two layer names from any source |
+
+`_layerNamesMatch()` is punctuation-insensitive (`Fool's Road RAAS v1` == `FoolsRoad_RAAS_v1` — both are real production values), alias-aware, and tolerant of a map-name word the classname drops (`Sumari Bala Seed v1` == `Sumari_Seed_v1`). It is deliberately **not** tolerant past the gamemode token, so `Yehorivka_RAAS_v2` and `Yehorivka_AAS_v2` stay distinct — a same-map gamemode switch read as "no change" once left the layer stale for an entire round.
+
 ---
 
 ## §8 — S³ Plugin Base Class Guide
@@ -1522,11 +1547,22 @@ All commands in the configured `channelID` Discord channel:
 
 **Three-tier classification:**
 
-| Tier | Flag | Tables included |
+⚠️ The tier sets — and the keys of the export JSON — hold **model names**, not table
+names. Several deliberately differ (model `S3GameStateEvents` → table
+`S3_GameStateEvents`). Writing a table name into a tier matches nothing and the
+tier silently omits the table; see 11.5.
+
+| Tier | Flag | Models included |
 |------|------|-----------------|
-| Historical | (default) | `S3_SchemaVersions`, `Elo_PlayerStats`, `Elo_RoundHistory`, `Elo_RoundPlayers`, `SA_AssignmentLog`, `TB_RoundReport` |
-| Logging | `--logs` | Above + `S3_PlayerEvents`, `S3_GameStateEvents`, `S3_PlayerSnapshots` |
-| All | `--all` | Above + all auto-recoverable tables |
+| Historical | (default) | `S3SchemaVersions`, `Elo_PlayerStats`, `Elo_RoundHistory`, `Elo_RoundPlayers`, `SA_AssignmentLog`, `TB_RoundReport`, `SwitchPlugin_Settings` |
+| Logging | `--logs` | Above + `S3PlayerEvents`, `S3GameStateEvents`, `S3PlayerSnapshots` |
+| All | `--all` | Above + all auto-recoverable state: `S3GameState`, `S3_PlayerSession`, `S3PlayerReconnect`, `SwitchPlugin_PlayerCooldowns`, `SwitchPlugin_Endmatches`, `Elo_PluginState`, `TeamBalancerState` |
+
+`--all` does not consult the sets at all — it returns every registered model
+unconditionally, which is why tier-set errors stay invisible until someone takes a
+default export. A model in no set is silently missing from the default and `--logs`
+tiers; see [`TASK_EXPORT_TIER_DECLARATION.md`](../docs/dataDump/TASK_EXPORT_TIER_DECLARATION.md)
+for the planned move to per-model declaration.
 
 **Export format:**
 
@@ -1536,10 +1572,10 @@ All commands in the configured `channelID` Discord channel:
   "exportedAt": 1719547200000,
   "connector": "sqlite",
   "tables": {
-    "TableName": [ { ... row ... } ]
+    "ModelName": [ { ... row ... } ]
   },
-  "rowCounts": { "TableName": 42 },
-  "results": { "TableName": { "status": "ok", "rows": 42 } }
+  "rowCounts": { "ModelName": 42 },
+  "results": { "ModelName": { "status": "ok", "rows": 42 } }
 }
 ```
 
@@ -1573,13 +1609,22 @@ Both backup formats are always produced during pre-migration backup when SQLite 
 
 ### 11.1 — Test File Conventions
 
-All tests are in `SlackersSquadServices/testing/`. They use mock infrastructure — no live SquadJS or game server required.
+S³'s tests are in `s3/testing/`; every other plugin has a `testing/` directory of
+its own. Most use mock infrastructure and need no live SquadJS or game server —
+but see 11.4 for the cases where a mock is actively misleading.
 
-**Running a test:**
+**Running everything, from the monorepo root:**
 
 ```bash
-cd SlackersSquadServices
-node testing/test-game-state-service.js
+node testing/run-all-tests.js              # all five plugins
+node testing/run-all-tests.js --fast       # skip the slow randomised sweeps
+node testing/run-all-tests.js --plugin=s3  # one plugin
+```
+
+**Running one test:**
+
+```bash
+node s3/testing/test-game-state-service.js
 ```
 
 **Test file catalog:**
@@ -1609,8 +1654,22 @@ node testing/test-game-state-service.js
 | `test-migration-bulk-types.js` | `qi.bulkInsert`/`bulkUpdate` value typing and NULL backfills, real engines — see 11.4 |
 | `test-stderr-diagnostics.js` | Migration failures and drift reach fd 2, not stdout — see 9.9 |
 | `test-migration-permissions.js` | Migration DDL at three permission tiers, per dialect (Docker-gated) |
+| `test-export-model-registration.js` | Every registered model belongs to exactly one export tier — see 11.5 |
+| `test-resolving-cleared-logging.js` | `RESOLVING_CLEARED` rows and `S3_GameStateEvents` shape, on **SQLite and MySQL** |
+| `test-install-layout.js` | `install.cjs` output layout: flattening, per-plugin runners, no collisions |
+| `test-migration-pipeline.js` | End-to-end migration run: ordering, backup, version bump |
+| `test-migration-conformance.js` | Migration definitions match the expected shape/contract |
+| `test-migration-data-assertions.js` | Migrations' data effects are asserted, not assumed — see `TASK_MIGRATION_DATA_ASSERTIONS.md` |
+| `test-command-routing.js` | `!s3` subcommand dispatch and argument parsing |
+| `test-inspection-embeds.js` | Inspection/embed builders render without throwing on sparse data |
+| `test-sa-per-player-lock.js` | Per-player lock acquisition/release under contention |
+| `test-team-change-retry.js` | Team-change retry loop and give-up conditions |
 
 ### 11.2 — Mock Patterns
+
+These are for exercising *logic* — lifecycle, branching, event flow. They prove
+nothing about SQL, because `MockSequelize.query()` accepts and discards whatever
+it is given. Anything that depends on the engine goes through 11.4 instead.
 
 ```js
 class MockServer extends EventEmitter {
@@ -1663,6 +1722,10 @@ node s3/testing/test-migration-bulk-types.js
 docker rm -f s3-test-postgres s3-test-mysql
 ```
 
+**A green run does not mean the dialect was tested.** These suites probe the engine and *skip* when it is unreachable, so with no container running they report all-pass having exercised SQLite alone — a confident green result for code that never touched the dialect your users deploy. Read the output: it must print `mysql reachable on 127.0.0.1:3307` and end with `0 skipped`. Any new dialect-parameterised suite must count skips separately from passes and print them distinctly (`⊘ … (skipped — engine unreachable)`); one that folds a skip into its pass count is broken as a test, whatever it claims to cover.
+
+Quoting is the other half of this. MySQL parses `"double quotes"` as a **string literal**, not an identifier, so `SELECT * FROM "S3_GameStateEvents"` runs on SQLite and is unparseable on MySQL. Use `dbService.quoteIdentifier()` for every camelCase or mixed-case identifier in raw SQL — including inside test files, where this exact bug has already hidden.
+
 The same rule covers **values**, not just identifiers. SQLite columns are typeless, so a mis-serialized value is accepted on write and only explodes on read — the Switch v5 backfill (2026-08-18) wrote `lastActiveTimestamp` as an integer epoch through Sequelize's untyped bulk API and every later `findByPk` died with `date.includes is not a function`, on SQLite alone. `test-migration-bulk-types.js` asserts the stored `typeof()` directly, which is the only way to see that failure before a player does.
 
 Two conventions worth copying from that file:
@@ -1671,6 +1734,28 @@ Two conventions worth copying from that file:
 - **Assert backward compatibility explicitly.** When changing emitted SQL, prove the new statement still works against data an older build created — otherwise the fix is an upgrade hazard for live servers.
 
 > `sqlite3` will not install in the stock `node:*-slim` images (the prebuilt binding needs a newer glibc than they ship). Run the tests on the host, or build `sqlite3` from source in the container.
+
+### 11.5 — Model Definition Traps
+
+These are failure modes with no symptom at runtime — the code logs success and the data quietly goes missing.
+
+- **Always use `defineModel()`, never `sequelize.define()` directly.** Only `defineModel()` registers the model into `dbService.models`, which is what `getModelNames()` returns, which is what the exporter enumerates. A raw-defined model works perfectly for reads and writes and is invisible to *every* export tier, including `--all`. Four tables were missing from production backups for months for exactly this reason.
+- **`defineModel()` injects `freezeTableName: true`.** The **model** name becomes the table name unless you pass an explicit `tableName`. Model `S3GameStateEvents` reaching table `S3_GameStateEvents` only works because `tableName` says so.
+- **The export tier sets in `s3-export-import.js` hold model names, not table names.** Writing the table name there matches nothing and the tier silently omits the table. `s3/testing/test-export-model-registration.js` asserts the three tiers partition `getModelNames()` exhaustively — a new model must be added to a tier or that test fails, which is the intended behaviour.
+- **`Model.sync()` emits no DDL for an existing table without `alter`.** A newly added column then exists in the model and nowhere in the database. On a live server with no DDL grants the operator applies schema by hand, so a migration's *data* step must not be nested inside an `addColumn` guard — otherwise the data step is skipped on exactly the servers where the column already exists.
+- **There is no CLS transaction context.** `withTransactionWithRetry(async (t) => …)` does not propagate `t` implicitly; every model call inside must receive `{ transaction: t }`. Miss one and SQLite's single-connection pool throws "cannot start a transaction within a transaction", usually into a catch that logs and continues.
+
+### 11.6 — Pre-Push Checklist for Database Changes
+
+A change that touches Sequelize, raw SQL, a model, a migration, or an export tier is not finished until all of these have actually been run:
+
+1. `node --check` on every edited file.
+2. `node testing/run-all-tests.js` (full, not `--fast`) — all five plugins green.
+3. Both Docker engines up; dialect suites report `mysql reachable` and `0 skipped`.
+4. The affected data read **back out of MySQL**, not only SQLite.
+5. Table and column names resolved from a live `dbService` and confirmed to exist — the live MySQL user cannot create what is missing.
+6. Ranking, query, and lifecycle changes replayed against the real exports in `docs/dataDump/`.
+7. Deployed to a test server via `install.cjs` and the effect confirmed **in the database itself**, not in a log line claiming success. The `dev-harness` plugin drives the server for this.
 
 ---
 

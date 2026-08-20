@@ -444,7 +444,12 @@ await fs.rm(DATA, { recursive: true, force: true });
     assert.equal(fields.find((f) => f.name === 'Layer').value, 'Gorodok_RAAS_v1');
     assert.equal(fields.find((f) => f.name === 'Phase').value, 'STAGING');
     // args are forwarded after the subcommand word
-    assert.equal(fields.find((f) => f.name === 'Args').value, '["verbose"]');
+    // The full token list, INCLUDING the subcommand — this mirrors
+    // s3-discord.js, which builds args from everything after "!s3" and reads the
+    // subcommand as args[0]. Handlers index from args[1] onward, so passing only
+    // the tail shifted every multi-token command by one and made
+    // `db export --all` fall through to its usage text.
+    assert.equal(fields.find((f) => f.name === 'Args').value, '["gamestate","verbose"]');
     assert.deepEqual(sent, [], 'nothing may reach a real channel');
     assert.deepEqual(server.rcon.executed, [], 'discord capture must not touch RCON');
   });

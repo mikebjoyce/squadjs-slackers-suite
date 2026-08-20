@@ -883,6 +883,18 @@ export default class DBService {
       return this.models[name];
     }
 
+    // Adopt a model already present on the connector rather than redefining it.
+    // Callers that previously guarded with `sequelize.models?.X || sequelize.define(...)`
+    // relied on this to stay idempotent across a re-mount, where DBService is
+    // rebuilt but the connector is reused. Without this branch the redefine
+    // would succeed but discard the original model object, orphaning any
+    // reference a service captured on its first mount.
+    const existing = this.sequelize.models?.[name];
+    if (existing) {
+      this.models[name] = existing;
+      return existing;
+    }
+
     const opts = { freezeTableName: true, ...modelOptions };
     const model = this.sequelize.define(name, schema, opts);
     this.models[name] = model;
@@ -1366,7 +1378,14 @@ export default class DBService {
   async _initSchemaVersionModel() {
     const DataTypes = this.getDataTypes();
 
-    this.SchemaVersionsModel = this.sequelize.models?.S3SchemaVersions || this.sequelize.define(
+    // Registered via defineModel() — NOT raw sequelize.define() — so the model
+    // lands in this.models and is therefore visible to getModelNames(), which is
+    // what s3-export-import.js enumerates. Defining it raw made S3_SchemaVersions
+    // invisible to every export tier including --all, so schema version tracking
+    // was silently absent from every backup ever taken. The explicit tableName
+    // below is load-bearing: defineModel() injects freezeTableName, so without it
+    // Sequelize would target a table named 'S3SchemaVersions' instead.
+    this.SchemaVersionsModel = this.defineModel(
       'S3SchemaVersions',
       {
         id: {

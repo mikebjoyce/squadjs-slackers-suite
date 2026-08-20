@@ -18,9 +18,10 @@
  *   unmount()            — Clears timers and resets mounted state.
  *   isReady()            — Returns true when service is mounted.
  *   Phase: getPhase(), isStaging(), isLive(), isEnding(), isResolving()
- *   Layer: getGamemode(), getLayerName(), inferGameMode(layerName),
- *          resolveLayerInfo(layerData, source), isIgnoredMode(),
- *          isSeedMode(), isTrainingMode(), setIgnoredGameModes(modes)
+ *   Layer: getGamemode(), getLayerName(), getLayerDisplayName(),
+ *          inferGameMode(layerName), resolveLayerInfo(layerData, source),
+ *          isIgnoredMode(), isSeedMode(), isTrainingMode(),
+ *          setIgnoredGameModes(modes)
  *   Timing: getRoundStartTime(), getMatchId()
  *   ENDGAME sub-state: getEndgameSubState(), isEndgameScoreboard(),
  *          isEndgameLayerVote(), isEndgameFactionVote(),
@@ -51,14 +52,22 @@
  *   end early if enough players cast votes.
  * - _transitionRecoveredStateToLive() backfills roundStartTime and
  *   matchId to prevent null returns when a recovered round is invalidated.
- * - _validateRecoveredState layer-name comparison normalises names
- *   (strips all non-alphanumerics) to avoid false divergences from
- *   SquadJS layer-name format mismatches. Layer divergence is checked
- *   exclusively in handleLayerInfoUpdated (authoritative format);
- *   handleServerInfoUpdated only performs timing checks.
- * - Seed and Training modes use a short 5s staging-to-LIVE timer instead
- *   of the full stagingDurationMs, since these modes have no meaningful
- *   STAGING phase and the server sits in pre-round indefinitely.
+ * - Layer names are CANONICALISED onto the SquadJS classname
+ *   ("Sumari_Seed_v1") inside resolveLayerInfo(), so every cache,
+ *   comparison and persisted row uses one convention regardless of which
+ *   event delivered the layer. getLayerName() returns the canonical form;
+ *   getLayerDisplayName() returns the pretty one for human output.
+ *   See _canonicalLayerName().
+ * - Layer-name comparisons go through _layerNamesMatch(), which is
+ *   punctuation-insensitive, alias-aware, and tolerant of a map-name word
+ *   the classname omits — while still holding RAAS and AAS on the same map
+ *   apart. Used by handleServerInfoUpdated's change guard and by
+ *   _validateRecoveredState's divergence check.
+ * - Staging length is per-gamemode (STAGING_DURATION_MS_BY_GAMEMODE), read
+ *   through _stagingDurationForRound() and never from a cached field.
+ *   Seed and Training bypass it entirely with a 5s staging-to-LIVE timer,
+ *   since those modes have no meaningful STAGING phase and the server sits
+ *   in pre-round indefinitely.
  *
  */
 
@@ -71,13 +80,71 @@
 //   a tick before NEW_GAME). Treat this as transient while teams resolve; prior teams
 //   remain valid unless a player actually swaps during this window.
 
+/**
+ * How long after NEW_GAME a round is still STAGING, per gamemode.
+ *
+ * ── WHY THIS IS A TABLE AND NOT A CONFIG OPTION ──────────────────────
+ * Staging length is a property of the gamemode, decided by the game. There is
+ * no Server.cfg key for it and no reason an operator would ever want a
+ * different number than the true one — an option here would only be a way to
+ * get it wrong. When a value is missing or a gamemode is added, the fix is to
+ * measure the real round and correct this table.
+ *
+ * ── WHAT THE NUMBERS MEASURE ─────────────────────────────────────────
+ * Each value spans TWO things, because the clock starts at NEW_GAME:
+ *
+ *   1. the match-start countdown — players cannot spawn yet, and
+ *   2. the staging phase itself — 4 minutes, the same in every mode.
+ *
+ * Only the countdown differs by mode. RAAS and AAS run 10s (→ 250000);
+ * Invasion runs a full minute, presumably for defender setup (→ 300000).
+ * Owner-observed in-game, 2026-08-19.
+ *
+ * Corroborated independently on the test server: rolling Fallujah_Invasion_v1,
+ * `server.matchStartTime` — which SquadJS derives from the A2S PLAYTIME rule,
+ * so it is the game's own clock and not one of ours — kept sliding while the
+ * map loaded and settled ~78s after NEW_GAME, well past the 10s that RAAS
+ * takes. The dev harness records it on every lifecycle event, which is how to
+ * measure any mode added here later.
+ *
+ * The previous single 180000 was a wiki figure of unknown provenance. It ran a
+ * minute short on RAAS and TWO minutes short on Invasion, taking those rounds
+ * LIVE while players were still locked in main.
+ *
+ * Seed and Training are absent deliberately: they have no meaningful staging
+ * phase at all and are short-circuited to 5s in _startStagingLiveTimer().
+ *
+ * ── UNMEASURED MODES ─────────────────────────────────────────────────
+ * Only measured modes are listed. Anything else — TC, Skirmish, Insurgency,
+ * Destruction — falls back to DEFAULT_STAGING_DURATION_MS rather than being
+ * guessed at here, so the table never implies knowledge it does not have.
+ */
+const STAGING_DURATION_MS_BY_GAMEMODE = Object.freeze({
+  RAAS: 250000,      // 10s match-start countdown + 4min staging
+  AAS: 250000,       // same as RAAS
+  Invasion: 300000   // 1min match-start countdown + 4min staging
+});
+
+/**
+ * Fallback for an unmeasured gamemode. Set to the RAAS/AAS figure: it is the
+ * common case, and the countdown is the only part that varies. Erring long is
+ * the safer direction — a round declared LIVE early has consumer plugins
+ * acting on a round that has not started, while one declared late merely
+ * delays them.
+ */
+const DEFAULT_STAGING_DURATION_MS = 250000;
+
 export default class GameStateService {
   constructor({
     parent = null,
     server,
     verboseLogger = () => {},
     ignoredGameModes = [],
-    stagingDurationMs = 180000, //default staging phase is 3 minutes (depends on game mode, squad wiki source; veracity unknown)
+    // null means "use STAGING_DURATION_MS_BY_GAMEMODE" — the production path.
+    // A number here OVERRIDES the table for every gamemode, which exists so a
+    // test can drive a whole round in milliseconds. It is not plumbed to any
+    // config key, deliberately; see the table's header for why.
+    stagingDurationMs = null,
     maxRecoveredRoundAgeMs = 7200000,
     layerRefreshTimeoutMs = 5000,
     resolvingTimeoutMs = 120000
@@ -93,7 +160,17 @@ export default class GameStateService {
     // Internal overridable ignoredGameModes, set by S³ plugin via setIgnoredGameModes() at mount time
     this._ignoredGameModes = null;
 
-    this.stagingDurationMs = Number.isFinite(stagingDurationMs) ? stagingDurationMs : 180000;
+    // An explicit duration OVERRIDES the per-gamemode table outright — it is
+    // how tests drive a whole round in milliseconds. The S³ plugin passes
+    // nothing, so in production the table always wins and there is no config
+    // key that could set a wrong value.
+    //
+    // There is deliberately no `this.stagingDurationMs` field any more. It used
+    // to be the single source of truth and would now be a lie on every mode but
+    // RAAS/AAS: it could only hold one number, while the answer depends on the
+    // round's gamemode. Ask _stagingDurationForRound() instead — a stale field
+    // that still reads plausibly is worse than no field.
+    this.stagingDurationOverrideMs = Number.isFinite(stagingDurationMs) ? stagingDurationMs : null;
     this.maxRecoveredRoundAgeMs = Number.isFinite(maxRecoveredRoundAgeMs)
       ? maxRecoveredRoundAgeMs
       : 7200000;
@@ -126,6 +203,17 @@ export default class GameStateService {
     this.layerNameCached = null;
     this.lastKnownGoodLayer = null;
 
+    // The human-facing spelling of layerNameCached. S³ canonicalises the layer
+    // name onto the classname ("Sumari_Seed_v1") because that is what the DB,
+    // AdminChangeLayer and the reliable event all use — this keeps the pretty
+    // name ("Sumari Bala Seed v1") available for display. In-memory only; it
+    // re-derives on the next resolution. See _canonicalLayerName().
+    this.layerDisplayNameCached = null;
+
+    // normalized pretty name -> classname, learned from the Layer objects that
+    // carry both. Lets a bare pretty string be canonicalised later.
+    this._layerAliases = new Map();
+
     // True once the CURRENT round's layer has been resolved (or recovered from
     // the DB for this same round). getLayerName() happily serves the previous
     // round's layer as a fallback, which is fine for display and fatal for the
@@ -144,6 +232,7 @@ export default class GameStateService {
     // Subscription callbacks
     this._onGamePhaseChangeCallbacks = [];
     this._onLayerGameModeChangeCallbacks = [];
+    this._onResolvingChangeCallbacks = [];
 
     this.listeners = {
       handleNewGame: this.handleNewGame.bind(this),
@@ -264,6 +353,32 @@ export default class GameStateService {
     };
   }
 
+  /**
+   * Register a callback for changes to the `resolving` sub-state.
+   *
+   * This is a channel of its own rather than a phase-change payload because
+   * `resolving` no longer moves with the phase: it clears on a player-info
+   * tick, or on its own deadline, neither of which is a phase transition. Every
+   * subscriber of onGamePhaseChange() treats its payload as a transition (the
+   * LoggingService writes a PHASE_CHANGE row per call), so folding this into
+   * that channel would fabricate phase changes that never happened.
+   *
+   * @param {Function} callback - Receives
+   *   { resolving, reason, durationMs, phase, matchId, layer }
+   * @returns {Function} unsubscribe function
+   */
+  onResolvingChange(callback) {
+    if (typeof callback !== 'function') {
+      throw new Error('GameStateService.onResolvingChange requires a function callback.');
+    }
+    this._onResolvingChangeCallbacks.push(callback);
+    this.verboseLogger(4, `[GameState] Added resolving subscriber (total: ${this._onResolvingChangeCallbacks.length})`);
+    return () => {
+      this._onResolvingChangeCallbacks = this._onResolvingChangeCallbacks.filter(cb => cb !== callback);
+      this.verboseLogger(4, `[GameState] Removed resolving subscriber (total: ${this._onResolvingChangeCallbacks.length})`);
+    };
+  }
+
   // ── Notification methods ──────────────────────────────────────────
 
   _notifyGamePhaseChange(prevPhase) {
@@ -284,9 +399,68 @@ export default class GameStateService {
     }
   }
 
+  /**
+   * @param {string} reason - Which path ended the resolving window:
+   *   'PLAYERS_RESOLVED' | 'ROSTER_FALLBACK' | 'BUDGET_EXPIRED' |
+   *   'ROUND_ENDED' | 'RECOVERY_STALE' | 'RECOVERY_INVALIDATED'
+   * @param {number|null} durationMs - How long `resolving` was true, measured
+   *   from lastNewGameAt. This is the number the 120s budget question needs;
+   *   it is the reason the event carries a payload at all.
+   */
+  _notifyResolvingChange(reason, durationMs = null) {
+    const payload = {
+      resolving: this.resolving,
+      reason,
+      durationMs,
+      phase: this.phase,
+      matchId: this.matchId,
+      layer: this.layerNameCached
+    };
+    for (const cb of this._onResolvingChangeCallbacks) {
+      try {
+        cb(payload);
+      } catch (err) {
+        this.verboseLogger(1, `[GameState] Resolving callback error: ${err.message}`);
+      }
+    }
+  }
+
+  /**
+   * The single clear path for `resolving`: flag, deadline timer, persistence
+   * and notification in one place, so no future caller can clear the flag and
+   * leave the moment unrecorded — which is exactly how the observability hole
+   * this method closes was introduced.
+   *
+   * @param {string} reason - see _notifyResolvingChange
+   * @returns {Promise<boolean>} true if the flag was set and is now cleared
+   */
+  async _clearResolving(reason) {
+    if (!this.resolving) return false;
+
+    const durationMs = this.lastNewGameAt
+      ? Math.max(0, Date.now() - Number(this.lastNewGameAt))
+      : null;
+
+    this.resolving = false;
+    this._clearResolvingTimer();
+    await this._persistState();
+
+    // Notified after persistence so a subscriber that reads state back from the
+    // database sees the same thing the payload reports.
+    this.verboseLogger(
+      4,
+      `[GameState] resolving cleared: reason=${reason} durationMs=${durationMs} phase=${this.phase} ` +
+      `matchId=${this.matchId} subscribers=${this._onResolvingChangeCallbacks.length}`
+    );
+    this._notifyResolvingChange(reason, durationMs);
+    return true;
+  }
+
   _notifyLayerGameModeChange(prevLayer, prevGameMode) {
     const payload = {
       layerName: this.layerNameCached,
+      // Additive: existing subscribers read layerName and are unaffected.
+      layerDisplayName: this.layerDisplayNameCached || this.layerNameCached,
       gameMode: this.gameModeCached,
       prevLayer,
       prevGameMode
@@ -325,6 +499,18 @@ export default class GameStateService {
 
   getLayerName() {
     return this.layerNameCached || this.lastKnownGoodLayer?.name || 'Unknown';
+  }
+
+  /**
+   * The layer name as a human should read it ("Sumari Bala Seed v1").
+   *
+   * getLayerName() is canonical and stable — use it for comparisons, storage
+   * and anything replayed into AdminChangeLayer. Use this one only for output
+   * aimed at people (!s3 status, Discord embeds). Falls back to the canonical
+   * name when no prettier spelling has been seen, so it is always safe to call.
+   */
+  getLayerDisplayName() {
+    return this.layerDisplayNameCached || this.lastKnownGoodLayer?.displayName || this.getLayerName();
   }
 
   /**
@@ -372,20 +558,19 @@ export default class GameStateService {
       return false;
     }
 
-    let gamemode = 'Unknown';
-    let name = 'Unknown';
-
     // Capture previous values for notification
     const prevLayer = this.layerNameCached;
     const prevGameMode = this.gameModeCached;
 
-    if (typeof layer === 'string') {
-      name = layer;
-      gamemode = this.inferGameMode(name);
-    } else if (typeof layer === 'object') {
-      name = layer.name || layer.layer || 'Unknown';
-      gamemode = layer.gamemode || this.inferGameMode(name);
-    }
+    // ── CANONICALISE THE NAME HERE, ONCE ──────────────────────────────
+    // Every resolution path funnels through this method, so this is the one
+    // place the two SquadJS naming conventions have to be reconciled. Callers
+    // downstream — and everything they persist or compare — then only ever see
+    // the classname form. See _canonicalLayerName().
+    const { name, displayName } = this._canonicalLayerName(layer);
+    // Infer from the canonical name, not the pretty one: inferGameMode()'s TC
+    // needle is '_tc_', which only ever matches a classname.
+    const gamemode = (typeof layer === 'object' && layer?.gamemode) || this.inferGameMode(name);
 
     // ── NEVER CACHE AN "Unknown" LAYER ────────────────────────────────
     // SquadJS documents server.currentLayer / NEW_GAME data.layer as
@@ -413,11 +598,24 @@ export default class GameStateService {
 
     this.gameModeCached = gamemode;
     this.layerNameCached = name;
-    this.lastKnownGoodLayer = { gamemode, name };
+    this.layerDisplayNameCached = displayName || name;
+    this.lastKnownGoodLayer = { gamemode, name, displayName: this.layerDisplayNameCached };
     this._roundLayerTrusted = true;
     await this._persistState();
 
-    this.verboseLogger(4, `[GameState:${source}] Layer info updated: ${gamemode} / ${name}`);
+    // Both spellings and the shape they came from, because "which convention
+    // did this path deliver" is the only question that matters when a layer
+    // looks like it changed twice. `canonical=` is what everything compares and
+    // persists; `display=` is what a human sees; `via=` says whether the
+    // classname was read off a Layer object, recovered from a learned alias, or
+    // absent entirely.
+    const canonSource = typeof layer === 'object' && layer?.classname
+      ? 'object.classname'
+      : (displayName !== name ? 'alias' : 'as-given');
+    this.verboseLogger(
+      4,
+      `[GameState:${source}] Layer info updated: ${gamemode} / canonical=${name} display=${displayName} via=${canonSource}`
+    );
 
     // The staging shortcut for seed/training rounds is decided from the layer,
     // and the layer often arrives AFTER NEW_GAME (null data.layer, restart,
@@ -529,14 +727,30 @@ export default class GameStateService {
     return false;
   }
 
+  /**
+   * Both spellings of the layer name, lowercased, for the substring gates below.
+   *
+   * The gates take operator-supplied needles (ignoredGameModes defaults to
+   * ['Seed', 'Jensen'], but a server can list anything). Single words match
+   * under either convention, so the defaults never cared — but a needle with a
+   * space in it, "al basrah", only ever matched the pretty name, and
+   * canonicalisation would have silently stopped it matching. Checking both is
+   * cheaper than telling operators their config now means something else.
+   */
+  _layerNameHaystacks() {
+    const canonical = this.getLayerName().toLowerCase();
+    const display = this.getLayerDisplayName().toLowerCase();
+    return display === canonical ? [canonical] : [canonical, display];
+  }
+
   isIgnoredMode() {
     const ignoredGameModes = this._ignoredGameModes ?? this.defaultIgnoredGameModes;
     const gameMode = this.getGamemode().toLowerCase();
-    const layerName = this.getLayerName().toLowerCase();
+    const layerNames = this._layerNameHaystacks();
 
     return ignoredGameModes.some((mode) => {
       const candidate = String(mode).toLowerCase();
-      return gameMode.includes(candidate) || layerName.includes(candidate);
+      return gameMode.includes(candidate) || layerNames.some((n) => n.includes(candidate));
     });
   }
 
@@ -548,8 +762,7 @@ export default class GameStateService {
    */
   isSeedMode() {
     const gameMode = this.getGamemode().toLowerCase();
-    const layerName = this.getLayerName().toLowerCase();
-    return gameMode.includes('seed') || layerName.includes('seed');
+    return gameMode.includes('seed') || this._layerNameHaystacks().some((n) => n.includes('seed'));
   }
 
   /**
@@ -559,8 +772,7 @@ export default class GameStateService {
    */
   isTrainingMode() {
     const gameMode = this.getGamemode().toLowerCase();
-    const layerName = this.getLayerName().toLowerCase();
-    return gameMode.includes('jensen') || layerName.includes('jensen');
+    return gameMode.includes('jensen') || this._layerNameHaystacks().some((n) => n.includes('jensen'));
   }
 
   /**
@@ -645,6 +857,14 @@ export default class GameStateService {
     this._recoveredStateActive = false;
     this._clearStagingLiveTimer();
     this._clearResolvingTimer();
+    // A round can end with teams still unresolved (a short seed round, or a
+    // stall in player-info). That is its own outcome and is recorded as one —
+    // _clearResolving() is not used here because it would persist mid-transition,
+    // before the ENDGAME phase is written.
+    const wasResolving = this.resolving;
+    const resolvingDurationMs = this.lastNewGameAt
+      ? Math.max(0, now - Number(this.lastNewGameAt))
+      : null;
     this.resolving = false;
     this.phase = 'ENDGAME';
     this.lastRoundEndedAt = now;
@@ -661,6 +881,10 @@ export default class GameStateService {
 
     await this._persistState();
     this.verboseLogger(2, '[GameState] ROUND_ENDED -> ENDGAME(scoreboard).');
+    if (wasResolving) {
+      this.verboseLogger(2, `[GameState] Round ended with teams still resolving after ${resolvingDurationMs}ms.`);
+      this._notifyResolvingChange('ROUND_ENDED', resolvingDurationMs);
+    }
     this._notifyGamePhaseChange(prevPhase);
   }
 
@@ -724,8 +948,31 @@ export default class GameStateService {
     await this._validateRecoveredState('handleServerInfoUpdated', { serverLayerName: incomingName });
 
     if (!this._isKnownLayerName(incomingName)) return;
-    if (this._normalizeLayerName(this.lastKnownGoodLayer?.name) === this._normalizeLayerName(incomingName)) return;
+    // _layerNamesMatch, not raw normalized equality: NEW_GAME resolved this
+    // round from the pretty name and this poll carries the classname. On layers
+    // where the two differ by a WORD ("Sumari Bala Seed v1" vs "Sumari_Seed_v1")
+    // the normalized fingerprints disagree, so every ~30s poll re-resolved an
+    // unchanged layer and fired another onLayerGameModeChange — harmless only
+    // for as long as every subscriber stays idempotent.
+    const cachedName = this.lastKnownGoodLayer?.name;
+    if (this._layerNamesMatch(cachedName, incomingName)) {
+      // The suppression this whole change exists to produce. Logged with both
+      // sides and with the strict verdict alongside the tolerant one, so a
+      // "strict=false tolerant=true" line is direct evidence of a duplicate
+      // layer-change notification that WOULD have fired before and did not.
+      const strict = this._normalizeLayerName(cachedName) === this._normalizeLayerName(incomingName);
+      this.verboseLogger(
+        4,
+        `[GameState] Layer unchanged — no re-resolve. cached=${cachedName} incoming=${incomingName} ` +
+        `strictMatch=${strict} tolerantMatch=true${strict ? '' : ' (this poll would have re-fired onLayerGameModeChange before canonicalisation)'}`
+      );
+      return;
+    }
 
+    this.verboseLogger(
+      4,
+      `[GameState] Layer CHANGED — re-resolving. cached=${cachedName} incoming=${incomingName}`
+    );
     await this.resolveLayerInfo(info.currentLayer, 'handleServerInfoUpdated');
   }
 
@@ -758,9 +1005,7 @@ export default class GameStateService {
       const allResolved = playersService.areTeamsResolved();
       if (!allResolved) return;
 
-      this.resolving = false;
-      this._clearResolvingTimer();
-      await this._persistState();
+      await this._clearResolving('PLAYERS_RESOLVED');
       this.verboseLogger(2, `[GameState] All tracked players resolved -> resolving=false (phase ${this.phase}).`);
       return;
     }
@@ -772,9 +1017,7 @@ export default class GameStateService {
     const allResolved = players.every((p) => p?.teamID === 1 || p?.teamID === 2);
     if (!allResolved) return;
 
-    this.resolving = false;
-    this._clearResolvingTimer();
-    await this._persistState();
+    await this._clearResolving('ROSTER_FALLBACK');
     this.verboseLogger(2, `[GameState] All ${players.length} players resolved -> resolving=false (phase ${this.phase}).`);
   }
 
@@ -838,9 +1081,8 @@ export default class GameStateService {
 
     this._resolvingTimer = setTimeout(async () => {
       if (!this.resolving) return;
-      this.resolving = false;
       this._resolvingTimer = null;
-      await this._persistState();
+      await this._clearResolving('BUDGET_EXPIRED');
       this.verboseLogger(1, `[GameState] Teams never resolved within ${budget}ms — clearing resolving on the deadline (phase ${this.phase}).`);
     }, remaining);
 
@@ -870,14 +1112,34 @@ export default class GameStateService {
     // answer, and resolveLayerInfo() re-arms this timer the moment the real
     // layer lands — usually within a second or two thanks to refreshLayer().
     const shortStaging = this._roundLayerTrusted && (this.isSeedMode() || this.isTrainingMode());
-    const effectiveDuration = shortStaging ? 5000 : this.stagingDurationMs;
+
+    const effectiveDuration = shortStaging ? 5000 : this._stagingDurationForRound();
 
     if (!this._roundLayerTrusted) {
-      this.verboseLogger(3, `[GameState] Staging timer armed on an unresolved layer — using the default ${this.stagingDurationMs}ms, will re-arm when the layer resolves.`);
+      this.verboseLogger(3, `[GameState] Staging timer armed on an unresolved layer — using the default ${effectiveDuration}ms, will re-arm when the layer resolves.`);
     }
 
     const elapsed = Math.max(0, Date.now() - Number(stagingStartedAtMs || Date.now()));
     const remaining = Math.max(0, effectiveDuration - elapsed);
+
+    // Which of the four sources supplied the number. The table is only consulted
+    // once the round's own layer is trusted, so this line is also how a re-arm
+    // (unresolved -> resolved) is seen switching from the fallback to the real
+    // per-gamemode value without a second NEW_GAME.
+    const durationSource = shortStaging
+      ? 'seed/training shortcut'
+      : this.stagingDurationOverrideMs !== null
+        ? 'explicit override'
+        : !this._roundLayerTrusted
+          ? 'fallback (layer not yet resolved)'
+          : STAGING_DURATION_MS_BY_GAMEMODE[this.gameModeCached] !== undefined
+            ? `gamemode table [${this.gameModeCached}]`
+            : `fallback (gamemode ${this.gameModeCached} not in table)`;
+    this.verboseLogger(
+      4,
+      `[GameState] Staging timer armed: duration=${effectiveDuration}ms source="${durationSource}" ` +
+      `elapsed=${elapsed}ms remaining=${remaining}ms layer=${this.getLayerName()} trusted=${this._roundLayerTrusted}`
+    );
 
     this._stagingLiveTimer = setTimeout(async () => {
       if (this.phase !== 'STAGING') return;
@@ -904,6 +1166,12 @@ export default class GameStateService {
         gamemode: this.gameModeCached
       });
     }, remaining);
+
+    // Same reasoning as the resolving deadline: a phase clock is not work worth
+    // keeping the process alive for. A live SquadJS always has sockets holding
+    // the loop open. Without this a test that mounts and walks away hangs for
+    // the full staging duration — four minutes, now that the duration is right.
+    this._stagingLiveTimer.unref?.();
   }
 
   _startEndgameTimer(endgameStartedAtMs) {
@@ -1103,10 +1371,16 @@ export default class GameStateService {
 
     this.layerNameCached = state.lastLayerName || this.layerNameCached;
     this.gameModeCached = state.lastGamemode || this.gameModeCached;
+    // No prettier spelling survives a restart — the persisted column holds the
+    // canonical name and nothing else (adding a column for a cosmetic field is
+    // not worth a migration on a DB whose live user has no DDL grants). Display
+    // falls back to the canonical name until the next resolution supplies one.
+    this.layerDisplayNameCached = this.layerNameCached;
 
     if (this.layerNameCached || this.gameModeCached) {
       this.lastKnownGoodLayer = {
         name: this.layerNameCached || 'Unknown',
+        displayName: this.layerNameCached || 'Unknown',
         gamemode: this.gameModeCached || 'Unknown'
       };
       // A persisted layer belongs to the round we are resuming, not to a
@@ -1142,11 +1416,16 @@ export default class GameStateService {
     if (this.phase === 'ENDGAME' && this.lastRoundEndedAt) {
       if ((Date.now() - this.lastRoundEndedAt) > 300000) {
         const prevPhase = this.phase;
+        const wasResolving = this.resolving;
         this.phase = 'LIVE';
         this.resolving = false;
         this._recoveredStateActive = false;
         this.lastPhaseChangeAt = Date.now();
         this.verboseLogger(2, '[GameState] Recovered ENDGAME but round stale (>5min) -> LIVE.');
+        // Usually notifies into an empty subscriber list — LoggingService mounts
+        // after GameStateService — but the flag genuinely clears here, and a
+        // clear path that cannot report itself is what this channel exists for.
+        if (wasResolving) this._notifyResolvingChange('RECOVERY_STALE', null);
         this._notifyGamePhaseChange(prevPhase);
       }
       // else: stay in ENDGAME, subState=null, no timer, wait for NEW_GAME
@@ -1184,6 +1463,158 @@ export default class GameStateService {
     return String(name).toLowerCase().replace(/[^a-z0-9]/g, '');
   }
 
+  // ── LAYER NAME CANONICALISATION ─────────────────────────────────────
+  //
+  // SquadJS delivers one layer under two conventions, and which one you get
+  // depends on the event:
+  //
+  //   NEW_GAME data.layer            Layer object  .name "Sumari Bala Seed v1"
+  //                                                .classname "Sumari_Seed_v1"
+  //   UPDATED_SERVER_INFORMATION     string        "Sumari_Seed_v1"  (MapName_s)
+  //   server.currentLayer            Layer object  (same object shape)
+  //
+  // S³ canonicalises on the CLASSNAME. It is what AdminChangeLayer accepts, it
+  // is what S3GameState.lastLayerName already holds in the live DB, and it is
+  // the format the always-fires event uses — so the reliable path needs no
+  // conversion at all.
+  //
+  // The conversion is a field read, not a guess: every object-shaped source is
+  // a squad-server/layers/layer.js instance carrying BOTH names, so the pretty
+  // name never has to be reverse-engineered into a classname. Pretty names that
+  // arrive as bare strings (some callers, older persisted rows) are mapped
+  // through _layerAliases, which learns pairings from the objects it has seen.
+
+  // Gamemode words as they appear inside a layer name. Deliberately the same
+  // vocabulary inferGameMode() uses, minus the ones that are not standalone
+  // tokens.
+  static get LAYER_MODE_TOKENS() {
+    return new Set(['seed', 'invasion', 'raas', 'aas', 'tc', 'skirmish', 'insurgency', 'destruction', 'training']);
+  }
+
+  /**
+   * Split a layer name into lowercase words, bridging the two conventions.
+   * Non-alphanumerics separate, and so does a camel-case boundary, so
+   * "AlBasrah_AAS_v1" and "Al Basrah AAS v1" both tokenise to
+   * [al, basrah, aas, v1].
+   *
+   * Letter/digit boundaries are deliberately NOT split: keeping "v1" whole is
+   * what stops "…_v1" reading as a subset of "…_v10".
+   */
+  _layerNameTokens(name) {
+    if (!name) return [];
+    return String(name)
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .split(/[^A-Za-z0-9]+/)
+      .filter(Boolean)
+      .map((t) => t.toLowerCase());
+  }
+
+  /**
+   * True when two names denote the same layer under either convention.
+   *
+   * Three strategies, cheapest first:
+   *
+   *  1. Punctuation-insensitive equality (_normalizeLayerName). Covers every
+   *     difference that is only spacing or punctuation — including the
+   *     apostrophe case seen in production: "Fool's Road RAAS v1" and
+   *     "FoolsRoad_RAAS_v1" both fingerprint to "foolsroadraasv1".
+   *  2. The same comparison after resolving each side through the learned
+   *     pretty->classname aliases.
+   *  3. Word-level containment, which is the only thing that can bridge a
+   *     convention difference in WORDS: the classname drops "Bala" from
+   *     "Sumari Bala Seed v1". This is deliberately narrow — the gamemode
+   *     token and everything after it must match EXACTLY, and only the map-name
+   *     words in front of it may differ by containment. Without that restriction
+   *     the tolerance would re-open the bug this guard exists to catch: a real
+   *     RAAS->AAS switch on one map read as "no change" and ignored for the
+   *     whole round.
+   */
+  _layerNamesMatch(a, b) {
+    if (!a || !b) return false;
+    if (this._normalizeLayerName(a) === this._normalizeLayerName(b)) return true;
+
+    const aliasA = this._resolveLayerAlias(a);
+    const aliasB = this._resolveLayerAlias(b);
+    if (this._normalizeLayerName(aliasA) === this._normalizeLayerName(aliasB)) return true;
+
+    const modeTokens = GameStateService.LAYER_MODE_TOKENS;
+    const isMode = (t) => modeTokens.has(t);
+
+    const ta = this._layerNameTokens(a);
+    const tb = this._layerNameTokens(b);
+    const ia = ta.findIndex(isMode);
+    const ib = tb.findIndex(isMode);
+
+    // Needs a gamemode token with at least one map word in front of it. No
+    // gamemode token (JensensRange_USA-PLA and friends) means no tolerance:
+    // strategies 1 and 2 already had their say.
+    if (ia < 1 || ib < 1) return false;
+
+    // Gamemode + version + anything trailing must be identical, so
+    // "Narva_Invasion_v1" never matches a hypothetical "Narva_Invasion_v1_Alt".
+    if (ta.slice(ia).join('|') !== tb.slice(ib).join('|')) return false;
+
+    const prefixA = new Set(ta.slice(0, ia));
+    const prefixB = new Set(tb.slice(0, ib));
+    const [smaller, larger] = prefixA.size <= prefixB.size ? [prefixA, prefixB] : [prefixB, prefixA];
+    for (const token of smaller) {
+      if (!larger.has(token)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Remember that a pretty name and a classname are the same layer. Called
+   * whenever a Layer object arrives carrying both, which every object-shaped
+   * source does.
+   */
+  _learnLayerAlias(prettyName, classname) {
+    if (!this._isKnownLayerName(prettyName) || !this._isKnownLayerName(classname)) return;
+    const key = this._normalizeLayerName(prettyName);
+    if (!key || key === this._normalizeLayerName(classname)) return;
+    this._layerAliases.set(key, String(classname));
+  }
+
+  /** Map a name onto its classname if one has been learned; otherwise pass it through. */
+  _resolveLayerAlias(name) {
+    if (!name) return name;
+    return this._layerAliases.get(this._normalizeLayerName(name)) || name;
+  }
+
+  /**
+   * Reduce any layer source to { name, displayName }.
+   *
+   * `name` is the canonical classname wherever it is knowable — it is what
+   * every cache, every comparison and the persisted row use. `displayName` is
+   * the human-facing string, kept so `!s3 status` can still show
+   * "Sumari Bala Seed v1" rather than "Sumari_Seed_v1".
+   *
+   * displayName is in-memory only. Persisting it would need a column on
+   * S3GameState, and the live MySQL user holds no DDL grants — a schema change
+   * is not worth a cosmetic field that re-derives on the next resolution.
+   */
+  _canonicalLayerName(layer) {
+    if (typeof layer === 'string') {
+      const canonical = this._resolveLayerAlias(layer);
+      return { name: canonical, displayName: layer };
+    }
+
+    if (layer && typeof layer === 'object') {
+      const pretty = layer.name || layer.layer || null;
+      const classname = layer.classname || null;
+      this._learnLayerAlias(pretty, classname);
+
+      if (this._isKnownLayerName(classname)) {
+        return { name: String(classname), displayName: this._isKnownLayerName(pretty) ? String(pretty) : String(classname) };
+      }
+
+      const fallback = pretty || 'Unknown';
+      return { name: this._resolveLayerAlias(fallback), displayName: fallback };
+    }
+
+    return { name: 'Unknown', displayName: 'Unknown' };
+  }
+
   _isRecoveredRoundTooOld(now = Date.now()) {
     if (!this.lastNewGameAt) return false;
     // Seed and Training modes have no meaningful round lifecycle — players join/leave
@@ -1193,13 +1624,32 @@ export default class GameStateService {
     return (now - this.lastNewGameAt) > this.maxRecoveredRoundAgeMs;
   }
 
+  /**
+   * Staging length for the round in progress.
+   *
+   * The per-gamemode value is only consulted once the round's OWN layer has
+   * resolved. Reading it from a stale cached layer is how S³ once declared a
+   * full RAAS round LIVE 5 seconds in (prod log, squadjs-log (29).log ~19019):
+   * the previous round was JensensRange, the new one arrived with no layer, and
+   * the training shortcut fired. An unresolved layer therefore gets the
+   * fallback, and resolveLayerInfo() re-arms the timer the moment the real
+   * layer lands.
+   */
+  _stagingDurationForRound() {
+    if (this.stagingDurationOverrideMs !== null) return this.stagingDurationOverrideMs;
+    if (!this._roundLayerTrusted) return DEFAULT_STAGING_DURATION_MS;
+    return STAGING_DURATION_MS_BY_GAMEMODE[this.gameModeCached] ?? DEFAULT_STAGING_DURATION_MS;
+  }
+
   _isRecoveredStagingOverdue(now = Date.now()) {
     if (this.phase !== 'STAGING' || !this.lastNewGameAt) return false;
     // Seed and Training modes have no meaningful STAGING phase — the server sits in
     // pre-round indefinitely. Exclude from overdue check so recovery doesn't force
     // a premature LIVE transition on seed/training layers.
     if (this.isSeedMode() || this.isTrainingMode()) return false;
-    return (now - this.lastNewGameAt) >= this.stagingDurationMs;
+    // Same duration the live timer would have used, so a recovered round and a
+    // running one cannot disagree about when staging should have ended.
+    return (now - this.lastNewGameAt) >= this._stagingDurationForRound();
   }
 
   async _transitionRecoveredStateToLive(reason, now = Date.now()) {
@@ -1208,6 +1658,10 @@ export default class GameStateService {
     this._clearEndgameTimer();
     this._clearResolvingTimer();
     this.phase = 'LIVE';
+    const wasResolving = this.resolving;
+    const resolvingDurationMs = this.lastNewGameAt
+      ? Math.max(0, now - Number(this.lastNewGameAt))
+      : null;
     this.resolving = false;
     this.lastPhaseChangeAt = now;
     this.lastNewGameAt = null;
@@ -1237,12 +1691,14 @@ export default class GameStateService {
     // DO NOT remove this clearing — it is the only defense against stale
     // DB-persisted layer data surviving recovery invalidation.
     this.layerNameCached = null;
+    this.layerDisplayNameCached = null;
     this.gameModeCached = null;
     this.lastKnownGoodLayer = null;
     this._roundLayerTrusted = false;
     this._recoveredStateActive = false;
     await this._persistState();
     this.verboseLogger(1, `[GameState] Recovered state invalidated -> LIVE (${reason}). Layer caches cleared.`);
+    if (wasResolving) this._notifyResolvingChange('RECOVERY_INVALIDATED', resolvingDurationMs);
     this._notifyGamePhaseChange(prevPhase);
   }
 
@@ -1264,7 +1720,14 @@ export default class GameStateService {
     if (this._isKnownLayerName(serverLayerName)) {
       const recoveredLayerName = this.lastKnownGoodLayer?.name;
       if (this._isKnownLayerName(recoveredLayerName)) {
-        if (this._normalizeLayerName(recoveredLayerName) !== this._normalizeLayerName(serverLayerName)) {
+        // The highest-risk comparison in the canonicalisation change, so it uses
+        // the most tolerant form. recoveredLayerName comes out of the DB and may
+        // predate canonicalisation (rows written when the pretty name was
+        // whatever resolved last); serverLayerName is canonical. Judging those
+        // unequal invalidates a perfectly good recovered round on every restart
+        // and drops it straight to LIVE. _layerNamesMatch bridges the convention
+        // gap while still separating RAAS from AAS on the same map.
+        if (!this._layerNamesMatch(recoveredLayerName, serverLayerName)) {
           await this._transitionRecoveredStateToLive(`${source}:layer_divergence`, now);
           return;
         }

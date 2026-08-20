@@ -72,6 +72,64 @@ import BasePlugin from './base-plugin.js';
  * NEW_GAME → tick → resolving=false ordering as structured JSON, which
  * verbose logs do not.
  */
+/** Largest single string value kept verbatim in a captured payload. */
+const MAX_CAPTURED_STRING = 8000;
+
+/**
+ * Reduce a Discord payload to something safe to serialize into a result file.
+ *
+ * Attachments are the problem: `!s3 db export --all` hands Discord a gzipped
+ * backup of every table, and on a real server that is tens of megabytes. The
+ * capture path used to keep the whole buffer, then hit
+ * `JSON.stringify` → **"Invalid string length"** — Node's hard cap on string
+ * size — which threw inside the scan loop and killed the whole request. The
+ * useful information is the file's name and size, never its bytes; a harness
+ * result file is for reading, and the export already wrote the real artefact to
+ * disk itself.
+ *
+ * Long descriptions are truncated for the same reason, with a marker so a
+ * truncated value is never mistaken for the real one.
+ */
+function summarizePayload(payload) {
+  if (payload == null) return payload;
+  if (typeof payload === 'string') {
+    return payload.length > MAX_CAPTURED_STRING
+      ? `${payload.slice(0, MAX_CAPTURED_STRING)}…[truncated ${payload.length} chars]`
+      : payload;
+  }
+  if (typeof payload !== 'object') return payload;
+
+  const seen = new WeakSet();
+  const walk = (value) => {
+    if (value == null || typeof value !== 'object') {
+      return typeof value === 'string' && value.length > MAX_CAPTURED_STRING
+        ? `${value.slice(0, MAX_CAPTURED_STRING)}…[truncated ${value.length} chars]`
+        : value;
+    }
+    // Buffers/streams/typed arrays: describe, never copy.
+    if (Buffer.isBuffer(value)) return `[Buffer ${value.length} bytes]`;
+    if (ArrayBuffer.isView(value)) return `[${value.constructor.name} ${value.byteLength} bytes]`;
+    if (typeof value.pipe === 'function') return '[Stream]';
+    if (seen.has(value)) return '[Circular]';
+    seen.add(value);
+
+    if (Array.isArray(value)) return value.map(walk);
+
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      // Discord.js attachment shapes: { attachment, name } or AttachmentBuilder.
+      if (k === 'attachment' || k === 'file') {
+        out[k] = Buffer.isBuffer(v) ? `[Buffer ${v.length} bytes]` : walk(v);
+        continue;
+      }
+      out[k] = walk(v);
+    }
+    return out;
+  };
+
+  return walk(payload);
+}
+
 export default class DevRconHarness extends BasePlugin {
   static get description() {
     return 'TEST SERVERS ONLY. Executes RCON commands dropped as JSON files and records a lifecycle event tape.';
@@ -278,7 +336,14 @@ export default class DevRconHarness extends BasePlugin {
     this._scanning = true;
 
     try {
-      const entries = (await fs.readdir(this.inboxDir)).filter((f) => f.endsWith('.json')).sort();
+      // Dot-prefixed files are skipped so a writer can stage a request as
+      // `.staging-foo.json` and rename it to `foo.json` once fully written —
+      // the documented way to avoid this loop reading a half-flushed file.
+      // Without the filter the scanner claimed the staging file immediately and
+      // the rename then failed, which is exactly what it was meant to prevent.
+      const entries = (await fs.readdir(this.inboxDir))
+        .filter((f) => f.endsWith('.json') && !f.startsWith('.'))
+        .sort();
 
       for (const name of entries) {
         const request = await this.readRequest(name);
@@ -419,7 +484,7 @@ export default class DevRconHarness extends BasePlugin {
 
     const captured = [];
     const handlers = createCommandHandlers({
-      sendDiscordMessage: async (_channel, payload) => { captured.push(payload); },
+      sendDiscordMessage: async (_channel, payload) => { captured.push(summarizePayload(payload)); },
       // Mutating handlers would use these; the allowlist keeps us off those paths.
       watchManager: null,
       stagedImportRef: { current: null }
@@ -427,7 +492,15 @@ export default class DevRconHarness extends BasePlugin {
 
     const out = [];
     for (const entry of requested) {
-      const [command, ...args] = String(entry).trim().split(/\s+/);
+      // s3-discord.js builds `args` from the WHOLE token list after "!s3" and
+      // reads the subcommand as args[0] — handlers then index from args[1]
+      // onward (e.g. `db` reads args[1] for export/import/status). So `args`
+      // must include the command token, not just the tail. Passing the tail
+      // shifted every multi-token command by one; single-token commands like
+      // `gamestate` ignore args entirely, which is why this went unnoticed.
+      const tokens = String(entry).trim().split(/\s+/).filter(Boolean);
+      const command = tokens[0];
+      const args = tokens;
 
       if (!this.options.discordCommands.includes(command)) {
         out.push({ command: entry, ok: false, error: 'Subcommand is not in discordCommands.' });
@@ -443,9 +516,24 @@ export default class DevRconHarness extends BasePlugin {
       captured.length = 0;
       this.verbose(1, `DISCORD (captured, not sent): !s3 ${entry}`);
       try {
-        // A stub message: handlers only need `.channel`, which the capturing
-        // sender ignores. Nothing here can reach a real Discord channel.
-        await handler(s3, { channel: { id: 'dev-harness-capture' } }, args);
+        // A stub message. Most handlers only need `.channel`, which the
+        // capturing sender ignores — but some (the `db` family) answer via
+        // `message.reply(...)` or `channel.send(...)` instead of going through
+        // sendDiscordMessage, and would throw "message.reply is not a function".
+        // Both are captured into the same array so the result file shows every
+        // route a handler might use. Nothing here can reach a real channel.
+        await handler(
+          s3,
+          {
+            channel: {
+              id: 'dev-harness-capture',
+              send: async (payload) => { captured.push(summarizePayload(payload)); return { id: 'captured' }; }
+            },
+            author: { id: 'dev-harness', tag: 'dev-harness#0000', bot: false },
+            reply: async (payload) => { captured.push(summarizePayload(payload)); return { id: 'captured' }; }
+          },
+          args
+        );
         out.push({ command: entry, ok: true, payloads: JSON.parse(JSON.stringify(captured)) });
       } catch (err) {
         out.push({ command: entry, ok: false, error: err.message });
@@ -512,7 +600,19 @@ export default class DevRconHarness extends BasePlugin {
     if (!layer) return null;
     if (typeof layer === 'string') return layer;
     if (typeof layer.then === 'function') return '<pending promise>';
+    // Deliberately the PRETTY name, un-canonicalised. The harness records what
+    // SquadJS delivered, not what S³ made of it — that difference is the whole
+    // point of the tape. Pair it with layerClassnameOf() to see both spellings
+    // of one layer, which is how the "two layer-change notifications for one
+    // roll" symptom is confirmed or ruled out.
     return layer.name ?? layer.layerid ?? null;
+  }
+
+  /** The classname S³ canonicalises onto, when the source object carries one. */
+  layerClassnameOf(layer) {
+    if (!layer || typeof layer !== 'object') return null;
+    if (typeof layer.then === 'function') return '<pending promise>';
+    return layer.classname ?? null;
   }
 
   buildSnapshot() {
@@ -520,13 +620,24 @@ export default class DevRconHarness extends BasePlugin {
       ts: new Date().toISOString(),
       server: {
         currentLayer: this.layerNameOf(this.server.currentLayer),
+        currentLayerClassname: this.layerClassnameOf(this.server.currentLayer),
         nextLayer: this.layerNameOf(this.server.nextLayer),
         layerHistoryTop: (this.server.layerHistory ?? [])
           .slice(0, 3)
           .map((entry) => this.layerNameOf(entry?.layer)),
         playerCount: (this.server.players ?? []).length,
         a2sPlayerCount: this.server.a2sPlayerCount ?? null,
-        squadCount: (this.server.squads ?? []).length
+        squadCount: (this.server.squads ?? []).length,
+        // SquadJS derives matchStartTime from the A2S PLAYTIME_I rule
+        // (`now - playtime`), so it is the game's own clock rather than
+        // anything S³ computed. Recorded here because it is the only
+        // independent signal available for how long staging actually lasts —
+        // S³'s own STAGING→LIVE transition is a timer, so measuring the timer
+        // against itself proves nothing.
+        matchStartTime: this.server.matchStartTime instanceof Date
+          ? this.server.matchStartTime.toISOString()
+          : (this.server.matchStartTime ?? null),
+        matchTimeout: this.server.matchTimeout ?? null
       },
       s3: { present: false }
     };
@@ -549,6 +660,10 @@ export default class DevRconHarness extends BasePlugin {
         resolving: this.safeCall(() => gs.isResolving?.()),
         layerResolved: this.safeCall(() => gs.isLayerResolved?.()),
         layerName: this.safeCall(() => gs.getLayerName?.()),
+        // What S³ canonicalised to vs what it will show a human. A tape where
+        // layerName tracks the pretty spelling is a tape from before
+        // canonicalisation — or a layer whose source carried no classname.
+        layerDisplayName: this.safeCall(() => gs.getLayerDisplayName?.()),
         gamemode: this.safeCall(() => gs.getGamemode?.()),
         seedMode: this.safeCall(() => gs.isSeedMode?.()),
         trainingMode: this.safeCall(() => gs.isTrainingMode?.()),
@@ -601,6 +716,7 @@ export default class DevRconHarness extends BasePlugin {
       // NEW_GAME's own payload layer is the thing that goes null on a mid-round
       // restart, so record it next to the resolved state rather than instead of it.
       eventLayer: eventName === 'NEW_GAME' ? this.layerNameOf(data?.layer) : undefined,
+      eventLayerClassname: eventName === 'NEW_GAME' ? this.layerClassnameOf(data?.layer) : undefined,
       server: snapshot.server,
       s3: snapshot.s3.gameState
         ? { gameState: snapshot.s3.gameState, players: snapshot.s3.players ?? null }

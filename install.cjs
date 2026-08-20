@@ -177,8 +177,117 @@ function relativeToPlugin(pluginName, filePath) {
 }
 
 /**
+ * Is this a file the installer copies at all?
+ */
+function isCopyable(filePath) {
+  if (!COPY_EXTENSIONS.has(path.extname(filePath).toLowerCase())) return false;
+  const basename = path.basename(filePath).toLowerCase();
+  return basename !== 'readme.md' && basename !== 'readme.mdx';
+}
+
+/**
+ * Find the files in `testing/` and `tools/` whose relative path is claimed by
+ * more than one plugin — today only `testing/run-all-tests.js`, which all five
+ * plugins own a copy of.
+ *
+ * Computed over ALL_PLUGINS rather than the plugins being installed, so a file's
+ * target name never depends on which plugins a given install happens to select.
+ */
+function findOptInClashes() {
+  const owners = new Map(); // relativePath → Set<pluginName>
+
+  for (const pluginName of ALL_PLUGINS) {
+    for (const dirName of OPT_IN_DIRS) {
+      for (const filePath of listFilesRecursive(path.join(MONOREPO_ROOT, pluginName, dirName))) {
+        if (!isCopyable(filePath)) continue;
+        const rel = relativeToPlugin(pluginName, filePath);
+        if (!owners.has(rel)) owners.set(rel, new Set());
+        owners.get(rel).add(pluginName);
+      }
+    }
+  }
+
+  const clashes = new Set();
+  for (const [rel, plugins] of owners) {
+    if (plugins.size > 1) clashes.add(rel);
+  }
+  return clashes;
+}
+
+/**
+ * Suffix a clashing file with its owning plugin, keeping it in the same
+ * directory: "testing/run-all-tests.js" → "testing/run-all-tests-s3.js".
+ */
+function namespaceRel(rel, pluginName) {
+  const ext = path.extname(rel);
+  return `${rel.slice(0, rel.length - ext.length)}-${pluginName}${ext}`;
+}
+
+/**
+ * Every file the installer can see, for the import scan below.
+ */
+function allSuiteFiles() {
+  const results = [];
+  for (const pluginName of ALL_PLUGINS) {
+    for (const dirName of [...ALWAYS_DIRS, ...OPT_IN_DIRS]) {
+      results.push(...listFilesRecursive(path.join(MONOREPO_ROOT, pluginName, dirName)));
+    }
+  }
+  return results.filter(isCopyable);
+}
+
+/**
+ * Renaming a file at the target is only safe if it is an entry point. If
+ * anything in the suite imports it by name, the rename would break that import
+ * silently at the target, so fail loudly and let a human rename it in the repo
+ * instead.
+ */
+function assertClashingFilesAreEntryPoints(clashes) {
+  if (clashes.size === 0) return;
+
+  const clashingBasenames = new Set([...clashes].map(rel => path.basename(rel)));
+  const specifier = /(?:\bfrom\s*|\brequire\s*\(\s*|\bimport\s*\(\s*)['"]([^'"]+)['"]/g;
+  const offenders = [];
+
+  for (const filePath of allSuiteFiles()) {
+    const source = fs.readFileSync(filePath, 'utf8');
+    for (const match of source.matchAll(specifier)) {
+      const spec = match[1];
+      if (!spec.startsWith('.')) continue;
+      const base = path.basename(spec);
+      if (clashingBasenames.has(base)) {
+        offenders.push(`  ${path.relative(MONOREPO_ROOT, filePath)} imports "${spec}"`);
+      }
+    }
+  }
+
+  if (offenders.length > 0) {
+    console.error(
+      `\nCannot namespace clashing file(s) — they are imported by name:\n` +
+      `${offenders.join('\n')}\n` +
+      `\nFiles that share a name across plugins are renamed at the target, which` +
+      `\nwould break these imports. Rename the file in the repository instead.`
+    );
+    process.exit(1);
+  }
+}
+
+/**
  * Collect all files to copy for a set of plugins.
  * Returns: Map<relativePath, { source: absolutePath, plugin: pluginName }>
+ *
+ * All four source directories flatten into one namespace at the target:
+ * `s3/plugins/x.js` and `switch/utils/y.js` become `plugins/x.js` and
+ * `utils/y.js`. That is not cosmetic — the suite reaches sideways with fixed
+ * relative paths (`../utils/db-service.js`, `../plugins/base-plugin.js`,
+ * `../core/logger.js`), and flattening is precisely what makes those resolve at
+ * the target as well as in the monorepo. Moving `testing/` into per-plugin
+ * subdirectories would break roughly sixty files' imports to fix one filename
+ * clash, so the clashing *filename* is namespaced instead.
+ *
+ * For `plugins/` and `utils/` a clash is a genuine bug — two plugins shipping
+ * the same util name would overwrite each other in production — so those stay a
+ * hard error.
  */
 function collectFiles(plugins, opts) {
   const files = new Map(); // relativePath → { source, plugin }
@@ -186,6 +295,11 @@ function collectFiles(plugins, opts) {
   const dirsToCopy = [...ALWAYS_DIRS];
   if (opts.withTools) dirsToCopy.push('tools');
   if (opts.withTesting) dirsToCopy.push('testing');
+
+  const optInClashes = dirsToCopy.some(d => OPT_IN_DIRS.includes(d))
+    ? findOptInClashes()
+    : new Set();
+  assertClashingFilesAreEntryPoints(optInClashes);
 
   for (const pluginName of plugins) {
     const pluginDir = path.join(MONOREPO_ROOT, pluginName);
@@ -202,21 +316,19 @@ function collectFiles(plugins, opts) {
       const allFiles = listFilesRecursive(dirPath);
 
       for (const filePath of allFiles) {
-        const ext = path.extname(filePath).toLowerCase();
-        if (!COPY_EXTENSIONS.has(ext)) continue;
+        if (!isCopyable(filePath)) continue;
 
-        // Skip README files
-        const basename = path.basename(filePath).toLowerCase();
-        if (basename === 'readme.md' || basename === 'readme.mdx') continue;
-
-        const rel = relativeToPlugin(pluginName, filePath);
+        const sourceRel = relativeToPlugin(pluginName, filePath);
+        const rel = optInClashes.has(sourceRel)
+          ? namespaceRel(sourceRel, pluginName)
+          : sourceRel;
 
         if (files.has(rel)) {
           const existing = files.get(rel);
           console.error(
             `\nCollision detected: "${rel}"\n` +
-            `  → ${existing.plugin}/${rel}\n` +
-            `  → ${pluginName}/${rel}\n` +
+            `  → ${existing.plugin}/${sourceRel}\n` +
+            `  → ${pluginName}/${sourceRel}\n` +
             `\nRename one of the files to resolve the conflict before retrying.`
           );
           process.exit(1);

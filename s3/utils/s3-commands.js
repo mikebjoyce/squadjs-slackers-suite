@@ -210,7 +210,10 @@ export function buildStatusEmbed(plugin) {
   const phase = gs?.getPhase?.() ?? 'unknown';
   const subState = gs?.getEndgameSubState?.() ?? null;
   const mode = gs?.getGamemode?.() ?? 'N/A';
-  const layer = gs?.getLayerName?.() ?? 'N/A';
+  // Display spelling ("Sumari Bala Seed v1"), not the canonical classname S³
+  // stores and compares on. getLayerDisplayName() falls back to the canonical
+  // name, so the ?? chain only matters for a gameState that predates it.
+  const layer = gs?.getLayerDisplayName?.() ?? gs?.getLayerName?.() ?? 'N/A';
   const playerCount = players?.getAllPlayers?.()?.length ?? 0;
   const globalLockOwner = players?.isGloballyLockedBy?.() ?? null;
   const teamsResolved = players?.areTeamsResolved?.() ?? false;
@@ -347,7 +350,7 @@ export function buildServicesEmbed(plugin) {
     entries.push(`${circleEmoji('phase', phase)} **GameState** — Phase: ${phase}${resolving ? ' (resolving)' : ''}`);
     entries.push(`   MatchId: \`${matchId}\` | RoundStart: ${formatTimestamp(gs.getRoundStartTime?.())}`);
     const mode = gs.getGamemode?.() ?? 'N/A';
-    const layer = gs.getLayerName?.() ?? 'N/A';
+    const layer = gs.getLayerDisplayName?.() ?? gs.getLayerName?.() ?? 'N/A';
     entries.push(`   Mode: ${mode} | Layer: ${truncate(layer, 30)}`);
     entries.push(`   isLive: ${gs.isLive?.() ? '🟢' : '⚫'} | isStaging: ${gs.isStaging?.() ? '🟡' : '⚫'} | isEnding: ${gs.isEnding?.() ? '🔴' : '⚫'}`);
   }
@@ -413,7 +416,7 @@ export function buildGameStateEmbed(plugin) {
   const phase = gs.getPhase?.() ?? 'unknown';
   const sub = gs.getEndgameSubState?.() ?? null;
   const mode = gs.getGamemode?.() ?? 'N/A';
-  const layer = gs.getLayerName?.() ?? 'N/A';
+  const layer = gs.getLayerDisplayName?.() ?? gs.getLayerName?.() ?? 'N/A';
   const resolving = gs.isResolving?.() ?? false;
   const matchId = gs.getMatchId?.() ?? 'N/A';
   const roundStartTime = gs.getRoundStartTime?.() ?? null;
@@ -637,7 +640,7 @@ export function buildPlayersEmbeds(plugin) {
   // ── Meta embed ──────────────────────────────────────────────────
   const gs = plugin.services.gameState;
   const phase = gs?.getPhase?.() ?? 'unknown';
-  const layer = gs?.getLayerName?.() ?? 'N/A';
+  const layer = gs?.getLayerDisplayName?.() ?? gs?.getLayerName?.() ?? 'N/A';
 
   const globalOwner = players.isGloballyLockedBy?.() ?? null;
   const playerLocks = players.playerLocks ?? new Map();

@@ -103,6 +103,7 @@ export default class LoggingService {
     // Subscription references for cleanup
     this._unsubPhaseChange = null;
     this._unsubLayerChange = null;
+    this._unsubResolvingChange = null;
 
     this._eventListeners = {};
 
@@ -243,11 +244,32 @@ export default class LoggingService {
    * Log a game state event. Can be called directly or triggered automatically
    * via gameState.onGamePhaseChange().
    *
-   * @param {string} eventType  - 'PHASE_CHANGE', 'CRASH_RECOVERY', 'SERVER_START', 'SERVER_STOP'
+   * @param {string} eventType  - 'PHASE_CHANGE', 'RESOLVING_CLEARED', 'CRASH_RECOVERY', 'SERVER_START', 'SERVER_STOP'
    * @param {string} [oldPhase] - Previous phase (null for SERVER_START)
    * @param {string} [newPhase] - New phase (null for SERVER_STOP)
    * @param {Object} [metadata]
    * @param {boolean} [metadata.resolving]
+   * @param {number}  [metadata.durationMs] - JSONL mirror only; see below.
+   *
+   * ── RESOLVING_CLEARED uses the phase columns for the sub-state ──
+   * The event is a transition of `resolving`, not of `phase`, so it is written
+   * as oldPhase='RESOLVING' and newPhase=the reason it ended
+   * ('PLAYERS_RESOLVED' | 'ROSTER_FALLBACK' | 'BUDGET_EXPIRED' | 'ROUND_ENDED' |
+   * 'RECOVERY_STALE' | 'RECOVERY_INVALIDATED').
+   *
+   * `durationMs` — the number the resolving-budget question actually needs —
+   * reaches the JSONL mirror but NOT the table, which has no column for it.
+   * Adding one is DDL, and the live MySQL user has no DDL grants: the model
+   * would then name a column the server does not have and every game-state
+   * write would fail on a path that logs and continues. From the table it is
+   * derivable, since the round's opening row is written by this same method:
+   *
+   *   SELECT c.matchId, c.newPhase AS reason, c.ts - s.ts AS durationMs
+   *     FROM S3_GameStateEvents c
+   *     JOIN S3_GameStateEvents s
+   *       ON s.matchId = c.matchId
+   *      AND s.eventType = 'PHASE_CHANGE' AND s.newPhase = 'STAGING'
+   *    WHERE c.eventType = 'RESOLVING_CLEARED';
    */
   async logGameStateEvent(eventType, oldPhase = null, newPhase = null, metadata = {}) {
     if (!this._isMounted && !this.enableFileLogging) return;
@@ -264,6 +286,8 @@ export default class LoggingService {
         oldPhase,
         newPhase,
         resolving: metadata.resolving ? 1 : 0,
+        // Schemaless mirror, so the one field the table cannot hold lands here.
+        ...(Number.isFinite(metadata.durationMs) ? { durationMs: metadata.durationMs } : {}),
         layerName: this.gameState?.getLayerName?.() ?? null,
         gamemode: this.gameState?.getGamemode?.() ?? null
       });
@@ -285,6 +309,13 @@ export default class LoggingService {
           gamemode: this.gameState?.getGamemode?.() ?? null
         });
       });
+      // Confirms the row actually landed. The failure path above logs and
+      // continues by design, so without a success line an absent row and a
+      // rejected write look identical in the log.
+      this.verboseLogger(
+        4,
+        `[Logging] S3_GameStateEvents row written: ${eventType} ${oldPhase} -> ${newPhase} (matchId=${matchId})`
+      );
     } catch (err) {
       this.verboseLogger(1, `[Logging] Failed to log game state event: ${err.message}`);
     }
@@ -372,11 +403,23 @@ export default class LoggingService {
   async _initModels() {
     if (!this.dbService?.getConnector || !this.dbService.getConnector()) return;
 
-    const sequelize = this.dbService.getConnector();
     const DataTypes = this.dbService.getDataTypes();
 
+    // All three models are registered through dbService.defineModel() rather than
+    // raw sequelize.define(). Only defineModel() populates dbService.models, and
+    // getModelNames() — which s3-export-import.js enumerates — reads exactly that.
+    // Defined raw, these three tables were invisible to every export tier
+    // including --all, so the forensic log never reached a single backup.
+    //
+    // The explicit `tableName` on each is load-bearing: defineModel() injects
+    // freezeTableName: true, which makes the MODEL name the table name unless
+    // tableName overrides it. Drop it and Sequelize targets 'S3PlayerEvents'
+    // instead of 'S3_PlayerEvents' — a brand new table. On the live MySQL server
+    // the DB user has no DDL grants, so that failure surfaces at runtime on a
+    // path that logs and continues, not at review time.
+
     // ── S3_PlayerEvents ──────────────────────────────────────────
-    this.PlayerEventsModel = sequelize.models?.S3PlayerEvents || sequelize.define(
+    this.PlayerEventsModel = this.dbService.defineModel(
       'S3PlayerEvents',
       {
         id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
@@ -409,7 +452,7 @@ export default class LoggingService {
     );
 
     // ── S3_GameStateEvents ───────────────────────────────────────
-    this.GameStateEventsModel = sequelize.models?.S3GameStateEvents || sequelize.define(
+    this.GameStateEventsModel = this.dbService.defineModel(
       'S3GameStateEvents',
       {
         id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
@@ -434,7 +477,7 @@ export default class LoggingService {
     );
 
     // ── S3_PlayerSnapshots ───────────────────────────────────────
-    this.PlayerSnapshotsModel = sequelize.models?.S3PlayerSnapshots || sequelize.define(
+    this.PlayerSnapshotsModel = this.dbService.defineModel(
       'S3PlayerSnapshots',
       {
         id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
@@ -573,6 +616,25 @@ export default class LoggingService {
       }
     });
 
+    // ── Resolving sub-state changes (track in GameStateEvents) ──
+    //
+    // `resolving` used to be force-cleared by the STAGING→LIVE timer, so the
+    // PHASE_CHANGE row for that transition timestamped the clear incidentally.
+    // Decoupling the two made the flag correct and simultaneously made it
+    // invisible: it now clears on a player-info tick or its own deadline, and
+    // neither writes a row. This subscription is the replacement record.
+    //
+    // The typeof guard tolerates a GameStateService from an older deploy that
+    // has no such channel — logging degrades rather than failing to mount.
+    if (typeof this.gameState?.onResolvingChange === 'function') {
+      this._unsubResolvingChange = this.gameState.onResolvingChange((payload) => {
+        this.logGameStateEvent('RESOLVING_CLEARED', 'RESOLVING', payload.reason, {
+          resolving: payload.resolving,
+          durationMs: payload.durationMs
+        });
+      });
+    }
+
     // ── Layer/game mode changes (track in GameStateEvents) ──
     this._unsubLayerChange = this.gameState.onLayerGameModeChange((payload) => {
       // Layer changes during STAGING are normal; log as informational
@@ -590,6 +652,10 @@ export default class LoggingService {
     if (this._unsubLayerChange) {
       this._unsubLayerChange();
       this._unsubLayerChange = null;
+    }
+    if (this._unsubResolvingChange) {
+      this._unsubResolvingChange();
+      this._unsubResolvingChange = null;
     }
 
     if (this.server && typeof this.server.removeListener === 'function') {
