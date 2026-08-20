@@ -2479,19 +2479,30 @@ export function createCommandHandlers(context) {
 
         const warnLines = validation.warnings.map((w) => `⚠️ ${w}`);
 
+        // This step only ever reads and validates the attachment — it cannot
+        // write. Say so plainly: someone who has just uploaded a production
+        // backup and gets back an amber "⚠️ Confirm Import" has every reason to
+        // wonder whether it already went in.
         await sendDiscordMessage(message.channel, {
           embeds: [{
-            color: 0xf39c12,
-            title: '⚠️ Confirm Import',
+            color: 0x3498db,
+            title: '📋 Import Preview — nothing has been imported',
             description: [
+              `Read and validated the attached file. **No data has been written.**`,
+              '',
               `**${tableCount} tables**, ~${totalRows} total rows`,
               '',
               ...previewLines,
               ...warnLines,
               '',
-              'To proceed, use: `!s3 db import --confirm`',
-              'For a dry run (validate only): `!s3 db import --confirm --dry-run`',
-              'Imported tables are upserted by primary key. No existing rows are deleted.'
+              // `--dry-run` is not read at this step, so a caller who passed it
+              // must not be left believing it did something.
+              ...(isDryRun
+                ? ['ℹ️ `--dry-run` has no effect here — this step never writes. It applies to `--confirm`.', '']
+                : []),
+              '**To import for real:** `!s3 db import --confirm`',
+              '**To validate against the live database without writing:** `!s3 db import --confirm --dry-run`',
+              'Rows are upserted by primary key. No existing rows are deleted.'
             ].join('\n'),
             timestamp: new Date().toISOString()
           }]
