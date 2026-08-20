@@ -2501,7 +2501,12 @@ export function createCommandHandlers(context) {
                 ? ['ℹ️ `--dry-run` has no effect here — this step never writes. It applies to `--confirm`.', '']
                 : []),
               '**To import for real:** `!s3 db import --confirm`',
-              '**To validate against the live database without writing:** `!s3 db import --confirm --dry-run`',
+              // Be careful not to oversell --confirm --dry-run. It returns early
+              // without resolving a model or touching a column, so it re-reports
+              // the file's own row counts and adds nothing to the check already
+              // performed here. Claiming it validates against the live schema
+              // would invite someone to trust a green dry run that proves nothing.
+              '`--confirm --dry-run` re-reports these counts without writing; it does **not** check them against the live schema.',
               'Rows are upserted by primary key. No existing rows are deleted.'
             ].join('\n'),
             timestamp: new Date().toISOString()

@@ -159,15 +159,18 @@ async function main() {
       'the note must not appear when the flag was never passed');
   });
 
-  await runTest('import staging distinguishes the two dry-run checks', async () => {
-    // The staging check validates the FILE; `--confirm --dry-run` validates
-    // against the LIVE database with writes suppressed. Conflating them was the
-    // original defect, so pin that both routes are still offered by name.
+  await runTest('import staging does not oversell --confirm --dry-run', async () => {
+    // importFromJSON's dryRun branch returns before resolving any model, so it
+    // re-reports the file's own row counts and validates nothing further. An
+    // earlier draft of this embed described it as validating against the live
+    // database, which would invite trust in a green dry run that proves nothing.
     const { embed } = await stageImport(['db', 'import']);
     assert.match(embed.description, /!s3 db import --confirm`/,
       'the real-import route must be offered');
-    assert.match(embed.description, /validate against the live database without writing/i,
-      'the live-database dry run must be described as distinct from this step');
+    assert.match(embed.description, /does \*\*not\*\* check them against the live schema/,
+      'the limits of --confirm --dry-run must be stated, not glossed');
+    assert.ok(!/validate against the live database/i.test(embed.description),
+      'must not claim a live-schema validation that the dry-run path never performs');
   });
 }
 
