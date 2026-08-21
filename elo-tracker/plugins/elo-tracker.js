@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                   ELO TRACKER PLUGIN v2.1.1                   ║
+ * ║                      ELO TRACKER PLUGIN                       ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -78,8 +78,8 @@
  *   Otherwise a fresh round starts.
  * - Rating writes use bulkIncrementPlayerStats(), which INCREMENTS wins,
  *   losses, and roundsPlayed. Pass only the round delta — not cumulative totals.
- * - ignoredGameModes matches against both gamemode and layerName
- *   (case-insensitive substring). Default: ["Seed", "Jensen"].
+ * - Ignored game modes for ELO tracking are delegated to S³'s
+ *   GameStateService (configured via S³'s ignoredGameModes option).
  * - The round start embed posts after roundStartEmbedDelayMs (default 3 min)
  *   via a deferred check on UPDATED_PLAYER_INFORMATION.
  *
@@ -148,7 +148,7 @@ import { EloDiscord } from '../utils/elo-discord.js';
 import EloCommands from '../utils/elo-commands.js';
 
 export default class EloTracker extends S3PluginBase {
-  static version = '2.1.1';
+  static version = '2.1.6';
 
   static get description() {
     return 'A SquadJS plugin that tracks player participation across rounds, computes individual ELO ratings using a TrueSkill-based algorithm, and persists all data via Sequelize-compatible databases (SQLite, MySQL, PostgreSQL, etc.).';
@@ -179,7 +179,7 @@ export default class EloTracker extends S3PluginBase {
        discordAdminRoleID: { required: false, default: '', type: 'string' },
        enableDatabaseLogging: {
          required: false,
-         description: 'If true, mirrors round outcome data into database tables for querying (default: false).',
+         description: 'If true, mirrors round outcome data into database tables for querying (default: true).',
          default: true,
          type: 'boolean'
        }
@@ -236,9 +236,19 @@ export default class EloTracker extends S3PluginBase {
   /// S3PluginBase lifecycle hooks
 
   _checkS3Version() {
-    const required = '1.0.0';
+    // 1.2.2 — searchPlayer() calls _s3db.caseInsensitiveLikeLiteral(), added in
+    // S³ 1.2.2. Against an older S³ that is undefined and the name lookup throws
+    // instead of failing at mount where it is diagnosable.
+    //
+    // 1.2.4 — searchPlayers() also passes that helper `{ exact: true }`, added
+    // in S³ 1.2.4. This one degrades *silently* rather than throwing: an older
+    // S³ ignores the unknown option and returns a substring match, so every
+    // fuzzy hit would be scored as an exact-name match (tier 1) and the ranking
+    // would collapse back to the arbitrary-winner bug it was written to fix.
+    // A mount-time failure is much cheaper than a lookup that quietly lies.
+    const required = '1.2.4';
     const actual = this._s3?.version;
-    if (!actual || actual < required) {
+    if (!this._s3VersionAtLeast(required)) {
       throw new Error(
         `[EloTracker] Incompatible S³ version: got ${actual || 'unknown'}, need >=${required}. ` +
         'Please update SlackersSquadServices.'
@@ -270,7 +280,7 @@ export default class EloTracker extends S3PluginBase {
     // and removing `tableName` would cause Sequelize to look for the singular form.
     this.defineModel('Elo_PluginState', {
       id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: false, defaultValue: 1 }
-    }, { timestamps: false, tableName: 'Elo_PluginStates' });
+    }, { timestamps: false, tableName: 'Elo_PluginStates', exportTier: 'ephemeral' });
 
     this.defineModel('Elo_PlayerStats', {
       eosID: { type: this.s3db?.getDataTypes().STRING, primaryKey: true, allowNull: false },
@@ -283,7 +293,7 @@ export default class EloTracker extends S3PluginBase {
       losses: { type: this.s3db?.getDataTypes().INTEGER, defaultValue: 0 },
       roundsPlayed: { type: this.s3db?.getDataTypes().INTEGER, defaultValue: 0 },
       lastSeen: { type: this.s3db?.getDataTypes().BIGINT, allowNull: true }
-    }, { tableName: 'Elo_PlayerStats', timestamps: false, charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' });
+    }, { tableName: 'Elo_PlayerStats', timestamps: false, charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci', exportTier: 'historical' });
 
     this.defineModel('Elo_RoundHistory', {
       id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
@@ -294,7 +304,7 @@ export default class EloTracker extends S3PluginBase {
       roundDuration: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true },
       endedAt: { type: this.s3db?.getDataTypes().BIGINT, allowNull: true },
       playerCount: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true }
-    }, { timestamps: false, tableName: 'Elo_RoundHistories' });
+    }, { timestamps: false, tableName: 'Elo_RoundHistories', exportTier: 'historical' });
 
     this.defineModel('Elo_RoundPlayers', {
       id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
@@ -314,12 +324,15 @@ export default class EloTracker extends S3PluginBase {
       scaledDeltaSigma: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false },
       muAfter: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false },
       sigmaAfter: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false }
-    }, { timestamps: false, tableName: 'Elo_RoundPlayers', charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' });
+    }, { timestamps: false, tableName: 'Elo_RoundPlayers', charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci', exportTier: 'historical' });
 
     // Inject S³ DBService into EloDatabase delegate
     if (this.s3db?.isReady() && this.db) {
       this.db._s3db = this.s3db;
       this.db.verbose = (level, message) => Logger.verbose('EloTracker', level, message);
+      // Route the service's failures through the plugin's reporter so they
+      // reach stderr like every other S³ consumer's.
+      this.db.reportError = (scope, summary, err) => this.reportError(scope, summary, err);
     }
 
     // Register Elo migrations on S³ connector
@@ -336,6 +349,9 @@ export default class EloTracker extends S3PluginBase {
           // v1: create 4 tables (using plural names matching Sequelize defaults)
           version: 1,
           description: 'Create Elo_PluginStates, Elo_PlayerStats, Elo_RoundHistories, Elo_RoundPlayers',
+          touches: {
+            creates: ['Elo_PluginStates', 'Elo_PlayerStats', 'Elo_RoundHistories', 'Elo_RoundPlayers']
+          },
           up: async (qi) => {
             const existing = await qi.showAllTables();
 
@@ -465,7 +481,7 @@ export default class EloTracker extends S3PluginBase {
       if (this.options.discordAdminChannelID) {
         try {
           this.discordAdminChannel = await this.options.discordClient.channels.fetch(this.options.discordAdminChannelID);
-          Logger.verbose('EloTracker', 1, `Fetched admin Discord channel: ${this.discordAdminChannel.name}`);
+          Logger.verbose('EloTracker', 1, `Fetched admin Discord channel: ${this.discordAdminChannel.name} (ID: ${this.options.discordAdminChannelID})`);
         } catch (err) {
           Logger.verbose('EloTracker', 1, `Could not fetch admin Discord channel (ID: ${this.options.discordAdminChannelID}): ${err.message}`);
         }
@@ -473,7 +489,7 @@ export default class EloTracker extends S3PluginBase {
       if (this.options.discordPublicChannelID) {
         try {
           this.discordPublicChannel = await this.options.discordClient.channels.fetch(this.options.discordPublicChannelID);
-          Logger.verbose('EloTracker', 1, `Fetched public Discord channel: ${this.discordPublicChannel.name}`);
+          Logger.verbose('EloTracker', 1, `Fetched public Discord channel: ${this.discordPublicChannel.name} (ID: ${this.options.discordPublicChannelID})`);
         } catch (err) {
           Logger.verbose('EloTracker', 1, `Could not fetch public Discord channel (ID: ${this.options.discordPublicChannelID}): ${err.message}`);
         }
@@ -481,7 +497,7 @@ export default class EloTracker extends S3PluginBase {
       if (this.options.discordReportChannelID) {
         try {
           this.discordReportChannel = await this.options.discordClient.channels.fetch(this.options.discordReportChannelID);
-          Logger.verbose('EloTracker', 1, `Fetched report Discord channel: ${this.discordReportChannel.name}`);
+          Logger.verbose('EloTracker', 1, `Fetched report Discord channel: ${this.discordReportChannel.name} (ID: ${this.options.discordReportChannelID})`);
         } catch (err) {
           Logger.verbose('EloTracker', 1, `Could not fetch report Discord channel (ID: ${this.options.discordReportChannelID}): ${err.message}`);
         }
@@ -515,6 +531,12 @@ export default class EloTracker extends S3PluginBase {
     Logger.verbose('EloTracker', 1, 'Plugin mounted and ready.');
   }
 
+  /**
+   * NOTE: _onUnmount() is called by S3PluginBase.unmount(), but as of SquadJS v2.x
+   * the framework never calls plugin.unmount(). This cleanup is kept for
+   * future-proofing — if SquadJS ever implements dynamic mount/unmount,
+   * listeners will be cleaned up correctly.
+   */
   async _onUnmount() {
     if (!this._isMounted) {
       return;
@@ -883,7 +905,9 @@ export default class EloTracker extends S3PluginBase {
     // --- DB writes ---
     let roundRecord = null;
     try {
+      Logger.verbose('EloTracker', 2, `[onRoundEnded] Starting bulkIncrementPlayerStats for ${dbUpdates.length} players...`);
       await this.db.bulkIncrementPlayerStats(dbUpdates);
+      Logger.verbose('EloTracker', 2, '[onRoundEnded] bulkIncrementPlayerStats complete. Starting insertRoundHistory...');
 
       const gs = this._s3?.gameState;
 
@@ -896,6 +920,7 @@ export default class EloTracker extends S3PluginBase {
         endedAt: roundEndTime,
         playerCount: eligible.length
       });
+      Logger.verbose('EloTracker', 2, `[onRoundEnded] insertRoundHistory complete (id=${roundRecord?.id}).`);
     } catch (err) {
       Logger.verbose('EloTracker', 1, `[onRoundEnded] DB write failed: ${err.message}`);
     }
@@ -993,8 +1018,10 @@ export default class EloTracker extends S3PluginBase {
 
     // --- Discord post ---
     const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
+    Logger.verbose('EloTracker', 2, `[onRoundEnded] Discord target: #${targetReportChannel?.name || 'none'} (${targetReportChannel?.id || 'none'}), reportChannel=${this.discordReportChannel?.id || 'null'}, adminChannel=${this.discordAdminChannel?.id || 'null'}`);
     if (targetReportChannel) {
       try {
+        Logger.verbose('EloTracker', 2, '[onRoundEnded] Building round summary embed...');
         const liveT1 = this._getMatchMetrics(this.server.players.filter(p => p.teamID === 1));
         const liveT2 = this._getMatchMetrics(this.server.players.filter(p => p.teamID === 2));
 
@@ -1012,7 +1039,9 @@ export default class EloTracker extends S3PluginBase {
           liveT2,
           calculationDuration
         });
+        Logger.verbose('EloTracker', 2, '[onRoundEnded] Sending round summary to Discord...');
         await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+        Logger.verbose('EloTracker', 2, '[onRoundEnded] Round summary sent successfully.');
       } catch (err) {
         Logger.verbose('EloTracker', 1, `[onRoundEnded] Discord post failed: ${err.message}`);
       }

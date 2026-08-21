@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║                   TEAM BALANCER PLUGIN v4.0.1                 ║
+ * ║                     TEAM BALANCER PLUGIN                      ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -63,7 +63,7 @@
  *               getRoundStartTime() — match/mode/round identification.
  *   - factions:  isEnabled(), getTeamName(teamID) — faction name lookup.
  *   - players:   getAllPlayers(), getSquads(), lockGlobal(),
- *               unlockGlobal(), isGloballyLockedBy() — player data
+ *               unlockGlobal() — player data
  *               and concurrency control during scrambles.
  *   - clans:     isEnabled(), extractClanGroups(),
  *               options.pullEntireSquads — clan tag grouping for scrambles.
@@ -82,10 +82,12 @@
  *     winStreakTeam/winStreakCount  — dominant wins (ticket threshold met).
  *     consecutiveWinsTeam/Count    — any consecutive wins regardless of margin.
  *   Either can trigger a scramble. Resets are independent.
- * - ignoredGameModes matches against both gamemode and layerName
- *   (case-insensitive substring). Default: ["Seed", "Jensen"].
- * - enableSeedAutoScramble: scrambles automatically when a Seed round
- *   ends. Independent of streak logic.
+ * - Ignored game modes for win-streak tracking are delegated to S³'s
+ *   GameStateService (configured via S³'s ignoredGameModes option).
+ * - enableSeedAutoScramble: scrambles automatically when any Seed round
+ *   ends, regardless of ignored game mode settings. Jensen/Training
+ *   rounds are excluded (isSeedMode() returns false). Independent of
+ *   streak logic.
  * - useEloForBalance: pulls mu ratings from a running EloTracker instance
  *   at scramble time. Gracefully falls back to pure numerical balance if
  *   EloTracker is absent or the cache is empty.
@@ -120,35 +122,31 @@
  * Core:
  *   database                           - Sequelize/SQLite connector.
  *   enableWinStreakTracking             - Enable automatic win streak tracking.
- *   ignoredGameModes                   - Modes/maps excluded from tracking (default: ["Seed", "Jensen"]).
  *   enableSeedAutoScramble             - Auto-scramble at end of Seed.
  *
  * Win Streak:
  *   maxWinStreak                       - Dominant wins to trigger scramble (default: 2).
- *   maxConsecutiveWinsWithoutThreshold - Any consecutive wins to trigger scramble; 0 = disabled.
+ *   maxConsecutiveWinsWithoutThreshold - Any consecutive wins to trigger scramble; 0 = disabled (default: 3).
  *   minTicketsToCountAsDominantWin     - Ticket threshold for Standard modes (default: 150).
  *   invasionAttackTeamThreshold        - Ticket threshold for Invasion attackers (default: 300).
- *   invasionDefenceTeamThreshold       - Ticket threshold for Invasion defenders (default: 650).
- *   enableSingleRoundScramble          - Scramble on a single massive margin round.
- *   singleRoundScrambleThreshold       - Ticket margin for single-round trigger (default: 250).
+ *   invasionDefenceTeamThreshold       - Ticket threshold for Invasion defenders (default: 500).
+ *   enableSingleRoundScramble          - Scramble on a single massive margin round (default: true).
+ *   singleRoundScrambleThreshold       - Ticket margin for single-round trigger (default: 200).
  *
  * Scramble Execution:
- *   scrambleAnnouncementDelay          - Seconds before scramble executes (default: 12).
+ *   scrambleAnnouncementDelay          - Seconds before scramble executes (default: 25).
+ *   seedScrambleAnnouncementDelay      - Countdown for the seed auto-scramble only (default: 5, min 3).
+ *                                        Separate from scrambleAnnouncementDelay: the window
+ *                                        before the map change is much shorter after a Seed round.
  *   scramblePercentage                 - Fraction of players to move (default: 0.5).
- *   changeTeamRetryInterval            - RCON retry interval in ms (default: 50).
+ *   changeTeamRetryInterval            - RCON retry interval in ms (default: 100).
  *   maxScrambleCompletionTime          - Max execution time in ms (default: 15000).
  *   warnOnSwap                         - RCON warn players when swapped.
  *   requireScrambleConfirmation        - Require !scramble confirm for manual scrambles.
  *   scrambleConfirmationTimeout        - Seconds to wait for confirm (default: 60).
  *
- * Clan Tag Grouping:
- *   enableClanTagGrouping              - Keep same-team clan members together (default: false).
- *   minClanGroupSize                   - Min clan members to group (default: 2).
- *   maxClanGroupSize                   - Max clan members to group (default: 18).
- *   clanTagMaxEditDistance             - Levenshtein distance for merging tags (default: 1).
- *   clanTagCaseSensitive               - Case-sensitive tag matching (default: true).
- *   clanGroupingPullEntireSquads       - Pull non-clan teammates with clan (default: false).
- *   clanTagIgnoreList                  - Clan tags to exclude from grouping (default: []).
+ * Clan Tag Grouping (managed by S³):
+ *   (All clan tag options are configured on S³'s clans service, not on TeamBalancer.)
  *
  * Messaging:
  *   showWinStreakMessages              - Broadcast win streak updates.
@@ -163,12 +161,13 @@
  *   postScrambleDetails                - Post detailed swap plan to Discord after scramble.
  *
  * Advanced:
- *   useEloForBalance                   - Weight scrambles by EloTracker mu ratings.
+ *   useEloForBalance                   - Weight scrambles by EloTracker mu ratings (default: true).
  *
  * Dev:
  *   devMode                            - Allow commands from any player regardless of admin status.
  *   reportLogPath                      - Path to the JSONL log file for round reports.
  *   enableDatabaseLogging              - If true, round reports are also written to the database in addition to the JSONL log (default: false).
+ *   scrambleReportPath                 - Directory for per-scramble JSON reports (default: "TeamBalancerScrambleReports/").
  *
  * IMPORTANT: The "database" option specifies which Sequelize connector to use for persistence.
  * Set it to the name of your configured connector (default: "sqlite"). Examples:
@@ -188,25 +187,18 @@
  *   "enabled": true,
  *   "database": "sqlite",
  *   "enableWinStreakTracking": true,
- *   "ignoredGameModes": ["Seed", "Jensen"],
  *   "enableSeedAutoScramble": true,
  *   "maxWinStreak": 2,
- *   "maxConsecutiveWinsWithoutThreshold": 0,
- *   "enableSingleRoundScramble": false,
- *   "singleRoundScrambleThreshold": 250,
+ *   "maxConsecutiveWinsWithoutThreshold": 3,
+ *   "enableSingleRoundScramble": true,
+ *   "singleRoundScrambleThreshold": 200,
  *   "minTicketsToCountAsDominantWin": 150,
  *   "invasionAttackTeamThreshold": 300,
- *   "invasionDefenceTeamThreshold": 650,
- *   "scrambleAnnouncementDelay": 12,
+ *   "invasionDefenceTeamThreshold": 500,
+ *   "scrambleAnnouncementDelay": 25,
+ *   "seedScrambleAnnouncementDelay": 5,
  *   "scramblePercentage": 0.5,
- *   "enableClanTagGrouping": false,
- *   "minClanGroupSize": 2,
- *   "maxClanGroupSize": 18,
- *   "clanTagMaxEditDistance": 1,
- *   "clanTagCaseSensitive": true,
- *   "clanGroupingPullEntireSquads": false,
- *   "clanTagIgnoreList": [],
- *   "changeTeamRetryInterval": 50,
+ *   "changeTeamRetryInterval": 100,
  *   "maxScrambleCompletionTime": 15000,
  *   "showWinStreakMessages": true,
  *   "warnOnSwap": true,
@@ -219,7 +211,7 @@
  *   "discordAdminRoleIDs": [],
  *   "mirrorRconBroadcasts": true,
  *   "postScrambleDetails": true,
- *   "useEloForBalance": false,
+ *   "useEloForBalance": true,
  *   "devMode": false,
  *   "reportLogPath": "team-balancer-reports.jsonl",
  *   "enableDatabaseLogging": false
@@ -237,7 +229,7 @@
 
 import S3PluginBase from './s3-plugin-base.js';
 import { DiscordHelpers } from '../utils/tb-discord-helpers.js';
-import Scrambler, { scrambleAttempts } from '../utils/tb-scrambler.js';
+import Scrambler from '../utils/tb-scrambler.js';
 import SwapExecutor from '../utils/tb-swap-executor.js';
 import CommandHandlers from '../utils/tb-commands.js';
 import Logger from '../../core/logger.js';
@@ -246,7 +238,7 @@ import fs from 'fs';
 import path from 'path';
 
 export default class TeamBalancer extends S3PluginBase {
-  static version = '4.0.1';
+  static version = '4.0.6';
 
   static get description() {
     return 'Tracks dominant wins by team ID and scrambles teams if one team wins too many rounds.';
@@ -265,7 +257,7 @@ export default class TeamBalancer extends S3PluginBase {
       enableSeedAutoScramble: {
         default: true,
         type: 'boolean',
-        description: 'Automatically scramble teams when a Seed match ends.'
+        description: 'Automatically scramble teams when a Seed match ends (independent of enableWinStreakTracking; stopped by !teambalancer off).'
       },
       maxWinStreak: {
         default: 2,
@@ -299,6 +291,11 @@ export default class TeamBalancer extends S3PluginBase {
       scrambleAnnouncementDelay: {
         default: 25,
         type: 'number'
+      },
+      seedScrambleAnnouncementDelay: {
+        default: 5,
+        type: 'number',
+        description: 'Seconds between the seed auto-scramble announcement and its execution (default: 5). Independent from scrambleAnnouncementDelay — a countdown still running at NEW_GAME is discarded and the scramble never happens.'
       },
       scramblePercentage: {
         default: 0.5,
@@ -411,6 +408,13 @@ export default class TeamBalancer extends S3PluginBase {
       Logger.verbose('TeamBalancer', 1, `scrambleAnnouncementDelay (${this.options.scrambleAnnouncementDelay}s) too low. Enforcing minimum 10 seconds.`);
       this.options.scrambleAnnouncementDelay = 10;
     }
+    // Its own floor, well below the global 10s: the whole point of the option is that a Seed
+    // round's post-round window is shorter than that minimum. 3s still leaves the announcement
+    // time to reach players before the swaps start.
+    if (this.options.seedScrambleAnnouncementDelay < 3) {
+      Logger.verbose('TeamBalancer', 1, `seedScrambleAnnouncementDelay (${this.options.seedScrambleAnnouncementDelay}s) too low. Enforcing minimum 3 seconds.`);
+      this.options.seedScrambleAnnouncementDelay = 3;
+    }
     if (this.options.changeTeamRetryInterval < 50) {
       Logger.verbose('TeamBalancer', 1, `changeTeamRetryInterval (${this.options.changeTeamRetryInterval}ms) too low. Enforcing minimum 50ms.`);
       this.options.changeTeamRetryInterval = 50;
@@ -444,6 +448,7 @@ export default class TeamBalancer extends S3PluginBase {
     this.consecutiveWinsCount = 0;
     this.lastSyncTimestamp = null;
     this.manuallyDisabled = false;
+    this._roundEndInFlight = false;
     this.scrambleConfirmation = null;
     this.ready = false;
 
@@ -540,7 +545,13 @@ export default class TeamBalancer extends S3PluginBase {
       // TBDatabase-compatible initDB() — returns { winStreakTeam, winStreakCount, ... isStale }
       initDB: async () => {
         try {
-          return await s3db.withTransactionWithRetry(async () => {
+          // The transaction handle MUST be threaded into every model call below.
+          // Sequelize's managed transaction does not propagate implicitly (S³ does
+          // not enable CLS), so a bare findOrCreate() opens a transaction of its
+          // own — which on SQLite, where the pool is a single connection, throws
+          // "cannot start a transaction within a transaction" and sent initDB
+          // down its catch, losing the win streak on every restart.
+          return await s3db.withTransactionWithRetry(async (t) => {
             const [record] = await TeamBalancerStateModel.findOrCreate({
               where: { id: 1 },
               defaults: {
@@ -551,10 +562,23 @@ export default class TeamBalancer extends S3PluginBase {
                 consecutiveWinsTeam: null,
                 consecutiveWinsCount: 0,
                 manuallyDisabled: false
-              }
+              },
+              transaction: t
             });
 
             const isStale = !record.lastSyncTimestamp || Date.now() - record.lastSyncTimestamp > STALE_CUTOFF_MS;
+
+            // The transaction-threading fix is only observable by its absence:
+            // before it, this line was never reached on SQLite because
+            // findOrCreate() threw "cannot start a transaction within a
+            // transaction" and initDB returned its zeroed fallback instead. A
+            // real winStreakCount here after a restart IS the proof.
+            Logger.verbose(
+              'TeamBalancer',
+              2,
+              `[7.4m] initDB read state inside transaction: winStreakTeam=${record.winStreakTeam} ` +
+              `winStreakCount=${record.winStreakCount} isStale=${isStale}`
+            );
 
             if (!isStale) {
               Logger.verbose('TeamBalancer', 4, `[7.4m] Restored state: team=${record.winStreakTeam}, count=${record.winStreakCount}`);
@@ -565,7 +589,7 @@ export default class TeamBalancer extends S3PluginBase {
               record.lastSyncTimestamp = Date.now();
               record.consecutiveWinsTeam = null;
               record.consecutiveWinsCount = 0;
-              await record.save();
+              await record.save({ transaction: t });
             }
 
             return {
@@ -593,15 +617,15 @@ export default class TeamBalancer extends S3PluginBase {
 
       saveState: async (team, count, conTeam, conCount) => {
         try {
-          return await s3db.withTransactionWithRetry(async () => {
-            const record = await TeamBalancerStateModel.findByPk(1);
+          return await s3db.withTransactionWithRetry(async (t) => {
+            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
             if (!record) return null;
             record.winStreakTeam = team;
             record.winStreakCount = count;
             record.lastSyncTimestamp = Date.now();
             record.consecutiveWinsTeam = conTeam ?? null;
             record.consecutiveWinsCount = conCount ?? 0;
-            await record.save();
+            await record.save({ transaction: t });
             return {
               winStreakTeam: record.winStreakTeam,
               winStreakCount: record.winStreakCount,
@@ -619,8 +643,8 @@ export default class TeamBalancer extends S3PluginBase {
 
       incrementStreak: async (winnerID, conTeam, conCount) => {
         try {
-          return await s3db.withTransactionWithRetry(async () => {
-            const record = await TeamBalancerStateModel.findByPk(1);
+          return await s3db.withTransactionWithRetry(async (t) => {
+            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
             if (!record) return null;
             if (record.winStreakTeam === winnerID) {
               record.winStreakCount += 1;
@@ -631,7 +655,7 @@ export default class TeamBalancer extends S3PluginBase {
             record.lastSyncTimestamp = Date.now();
             record.consecutiveWinsTeam = conTeam ?? null;
             record.consecutiveWinsCount = conCount ?? 0;
-            await record.save();
+            await record.save({ transaction: t });
             return {
               winStreakTeam: record.winStreakTeam,
               winStreakCount: record.winStreakCount,
@@ -648,11 +672,11 @@ export default class TeamBalancer extends S3PluginBase {
 
       saveScrambleTime: async (timestamp) => {
         try {
-          return await s3db.withTransactionWithRetry(async () => {
-            const record = await TeamBalancerStateModel.findByPk(1);
+          return await s3db.withTransactionWithRetry(async (t) => {
+            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
             if (!record) return null;
             record.lastScrambleTime = timestamp;
-            await record.save();
+            await record.save({ transaction: t });
             return { lastScrambleTime: record.lastScrambleTime };
           });
         } catch (err) {
@@ -663,11 +687,11 @@ export default class TeamBalancer extends S3PluginBase {
 
       saveManuallyDisabledState: async (disabled) => {
         try {
-          return await s3db.withTransactionWithRetry(async () => {
-            const record = await TeamBalancerStateModel.findByPk(1);
+          return await s3db.withTransactionWithRetry(async (t) => {
+            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
             if (!record) return null;
             record.manuallyDisabled = disabled;
-            await record.save();
+            await record.save({ transaction: t });
             return { manuallyDisabled: record.manuallyDisabled };
           });
         } catch (err) {
@@ -678,11 +702,11 @@ export default class TeamBalancer extends S3PluginBase {
 
       saveScrambleArm: async (armedBy) => {
         try {
-          return await s3db.withTransactionWithRetry(async () => {
-            const record = await TeamBalancerStateModel.findByPk(1);
+          return await s3db.withTransactionWithRetry(async (t) => {
+            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
             if (!record) return null;
             record.scrambleOnRoundEndBy = armedBy || null;
-            await record.save();
+            await record.save({ transaction: t });
             return { scrambleOnRoundEndBy: record.scrambleOnRoundEndBy };
           });
         } catch (err) {
@@ -694,7 +718,7 @@ export default class TeamBalancer extends S3PluginBase {
       insertRoundReport: async (data) => {
         if (!TBRoundReportModel) return null;
         try {
-          return await s3db.withTransactionWithRetry(async () => {
+          return await s3db.withTransactionWithRetry(async (t) => {
             const record = await TBRoundReportModel.create({
               matchId: data.matchId || null,
               roundStartTime: data.roundStartTime || null,
@@ -716,7 +740,7 @@ export default class TeamBalancer extends S3PluginBase {
               scrambled: data.scrambled,
               scrambleCondition: data.scrambleCondition,
               scrambleType: data.scrambleType
-            });
+            }, { transaction: t });
             return record.toJSON();
           });
         } catch (err) {
@@ -736,12 +760,110 @@ export default class TeamBalancer extends S3PluginBase {
 
   // isSeedMatch() removed in Stage 6.4b — seed detection delegated to S³ GameStateService.isSeedMode()
   // Training/Jensen detection also available via S³ GameStateService.isTrainingMode()
+
+  /**
+   * Suffix for the "!teambalancer off" confirmations. The toggle stops the seed auto-scramble
+   * along with streak tracking, so a bare "Win streak tracking disabled." under-reports what the
+   * admin just did. One wording, so the confirmations can't drift apart.
+   * Only used where there is no room for a full line: the status and diag surfaces render
+   * seedAutoScrambleStatus() as their own field instead, and appending both duplicates it.
+   * Not appended to player broadcasts either: it is admin-only detail.
+   */
+  seedScrambleOffNote() {
+    // An already-ticking countdown is NOT stopped by the toggle — cancelPendingScramble is the
+    // only thing that reaches it. Warn about that first and name the command that works: an admin
+    // types "off" precisely to head off a scramble they can see coming, and telling them it
+    // stopped would send them away from the one thing that would have. Not seed-specific on
+    // purpose — the countdown could equally be a streak scramble, and the advice is the same.
+    if (this._scramblePending || this._scrambleInProgress) {
+      return ' | A scramble countdown is already running — use !scramble cancel to stop it';
+    }
+    // The seed auto-scramble trigger fires on any Seed round end (isSeedMode()) regardless of
+    // ignored game mode settings. "off while disabled" is true for any configuration.
+    return this.options.enableSeedAutoScramble ? ' | Seed auto-scramble is off too while disabled' : '';
+  }
+
+  /**
+   * Full confirmation text for "!teambalancer on" — the mirror of seedScrambleOffNote().
+   * Not a bare literal for two reasons: "Win streak tracking enabled." is false on a server
+   * running enableWinStreakTracking: false (the toggle clears the manual disable, it does not
+   * override the config flag), and "on" re-arms the seed trigger, which is a real side effect an
+   * admin should not have to discover from the next round's broadcast.
+   */
+  enableConfirmationText() {
+    const base = this.options.enableWinStreakTracking
+      ? 'Win streak tracking enabled.'
+      : 'Plugin enabled — win streak tracking stays off in config.';
+    return `${base}${this.options.enableSeedAutoScramble ? ' | Seed auto-scramble re-armed' : ''}`;
+  }
+
+  /**
+   * Seed auto-scramble state as one line, for the status and diag surfaces.
+   * Config blockers are reported BEFORE the manual toggle: both of them need a config edit plus a
+   * restart, and naming the runtime-fixable reason first sends an admin to "!teambalancer on" for
+   * a trigger that will still not fire afterwards.
+   */
+  seedAutoScrambleStatus() {
+    if (!this.options.enableSeedAutoScramble) return 'OFF (config)';
+    if (this.manuallyDisabled) return 'OFF (plugin disabled)';
+    return 'ON (at Seed round end)';
+  }
+
+  /**
+   * Parses a ROUND_ENDED payload into the round report and hands the values back to the caller.
+   * Runs once per round, before any early-returning path, so an armed match-end scramble and a
+   * seed auto-scramble log the same winner/ticket data the win-streak path does. Each field is
+   * written only when it parsed; the returned values may be NaN, which callers that need a
+   * complete outcome check for themselves.
+   */
+  _parseRoundOutcome(data, roundReport) {
+    const winnerID = parseInt(data?.winner?.team);
+    const winnerTickets = parseInt(data?.winner?.tickets);
+    const loserTickets = parseInt(data?.loser?.tickets);
+    const margin = winnerTickets - loserTickets;
+
+    if (!isNaN(winnerTickets) && !isNaN(loserTickets)) {
+      roundReport.winnerTickets = winnerTickets;
+      roundReport.loserTickets = loserTickets;
+      roundReport.ticketMargin = margin;
+    }
+
+    let winnerName = null;
+    let loserName = null;
+    if (!isNaN(winnerID)) {
+      winnerName = (this.options.useGenericTeamNamesInBroadcasts ? `Team ${winnerID}` : this.getTeamName(winnerID)) || `Team ${winnerID}`;
+      loserName = (this.options.useGenericTeamNamesInBroadcasts ? `Team ${3 - winnerID}` : this.getTeamName(3 - winnerID)) || `Team ${3 - winnerID}`;
+      roundReport.winnerName = winnerName;
+      roundReport.loserName = loserName;
+    }
+
+    return { winnerID, winnerTickets, loserTickets, margin, winnerName, loserName };
+  }
+
+  /**
+   * Substitutes the last layer that resolved when this round's own layer never did.
+   * lastKnownGoodLayer is not cleared by onNewGame, so the substitute can be the PREVIOUS round's
+   * layer — good enough to guess ticket thresholds and label the report, too weak to decide on a
+   * team shuffle. Hence it runs only on the paths that need it, never before the seed decision.
+   */
+  _applyLayerFallback(roundReport) {
+    if (this.gameModeCached !== null || this.layerNameCached !== null || this.lastKnownGoodLayer === null) return;
+    Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Warning: Layer info missing at round end. Using fallback lastKnownGoodLayer (${this.lastKnownGoodLayer.gamemode} / ${this.lastKnownGoodLayer.name})`);
+    this.gameModeCached = this.lastKnownGoodLayer.gamemode;
+    this.layerNameCached = this.lastKnownGoodLayer.name;
+    roundReport.gameMode = this.gameModeCached;
+    roundReport.layerName = this.layerNameCached;
+    // Provenance for the JSONL log: otherwise a round skipped because the layer was unknown is
+    // indistinguishable from one where the trigger was simply switched off.
+    roundReport.layerFallback = true;
+  }
+
   /// S3PluginBase lifecycle hooks
 
   _checkS3Version() {
     const required = '1.0.0';
     const actual = this._s3?.version;
-    if (!actual || actual < required) {
+    if (!this._s3VersionAtLeast(required)) {
       throw new Error(
         `[TeamBalancer] Incompatible S³ version: got ${actual || 'unknown'}, need >=${required}. ` +
         'Please update SlackersSquadServices.'
@@ -781,7 +903,7 @@ export default class TeamBalancer extends S3PluginBase {
         consecutiveWinsCount: { type: this.s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
         manuallyDisabled: { type: this.s3db.getDataTypes().BOOLEAN, allowNull: false, defaultValue: false },
         scrambleOnRoundEndBy: { type: this.s3db.getDataTypes().JSON, allowNull: true }
-      }, { timestamps: false, tableName: 'TeamBalancerState' });
+      }, { timestamps: false, tableName: 'TeamBalancerState', exportTier: 'ephemeral' });
 
       this.defineModel('TB_RoundReport', {
         id: { type: this.s3db.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
@@ -805,7 +927,7 @@ export default class TeamBalancer extends S3PluginBase {
         scrambled: { type: this.s3db.getDataTypes().BOOLEAN, allowNull: false, defaultValue: false },
         scrambleCondition: { type: this.s3db.getDataTypes().STRING(100), allowNull: true },
         scrambleType: { type: this.s3db.getDataTypes().STRING(100), allowNull: true }
-      }, { timestamps: false, tableName: 'TB_RoundReport' });
+      }, { timestamps: false, tableName: 'TB_RoundReport', exportTier: 'historical' });
 
       // Register expected version + v1 + v2 migrations
       this.registerExpectedVersion('team-balancer', 2, {
@@ -815,6 +937,9 @@ export default class TeamBalancer extends S3PluginBase {
         {
           version: 1,
           description: 'Create TeamBalancerState and TB_RoundReport',
+          touches: {
+            creates: ['TeamBalancerState', 'TB_RoundReport']
+          },
           // NOTE: v1 is the baseline migration for new installs. It MUST include ALL columns
           // that the current code expects — including columns added in later delta migrations
           // (like scrambleOnRoundEndBy from v2). If you add a column in a future vN migration,
@@ -871,6 +996,11 @@ export default class TeamBalancer extends S3PluginBase {
         {
           version: 2,
           description: 'Add scrambleOnRoundEndBy JSON column to TeamBalancerState for !scramble matchend persistence',
+          touches: {
+            columns: {
+              TeamBalancerState: ['scrambleOnRoundEndBy']
+            }
+          },
           // NOTE: This is a delta migration for existing installs that only have the v1 schema.
           // New installs get this column from v1's createTable, so we guard with describeTable()
           // to make this a safe no-op when the column already exists.
@@ -1020,6 +1150,13 @@ export default class TeamBalancer extends S3PluginBase {
     Logger.verbose('TeamBalancer', 2, '[TeamBalancer] Plugin is now fully ready.');
   }
 
+  /**
+   * NOTE: _onUnmount() is called by S3PluginBase.unmount(), but as of
+   * SquadJS v4.2.0 RC1 and earlier, the framework never calls
+   * plugin.unmount(). This cleanup is kept for future-proofing — if
+   * SquadJS ever implements dynamic mount/unmount, listeners will be
+   * cleaned up correctly.
+   */
   async _onUnmount() {
     if (!this._isMounted) {
       Logger.verbose('TeamBalancer', 1, 'Plugin not mounted, skipping unmount.');
@@ -1041,11 +1178,14 @@ export default class TeamBalancer extends S3PluginBase {
       this._unsubscribeLayerChange = null;
     }
     if (this._scrambleTimeout) clearTimeout(this._scrambleTimeout);
-    if (this._scrambleCountdownTimeout) clearTimeout(this._scrambleCountdownTimeout);
-    if (this._abbreviationPollStartTimeout) clearTimeout(this._abbreviationPollStartTimeout);
+    this._clearPendingScrambleCountdown();
     this.cleanupScrambleTracking();
-    this.stopPollingGameInfo();
-    this.stopPollingTeamAbbreviations();
+    // Removed: stopPollingTeamAbbreviations() and the _abbreviationPollStartTimeout
+    // guard. Both belonged to the local abbreviation poller deleted along with the
+    // rest of the duplicated layer stack — the method no longer exists, so this
+    // line threw TypeError and aborted unmount before ready/_isMounted were
+    // cleared. Abbreviations now come from this._s3.factions, which needs no
+    // teardown here. See test-team-balancer-plugin.js.
     this._scrambleInProgress = false;
     this._scrambleOnRoundEnd = false;
     this._scrambleOnRoundEndBy = null;
@@ -1054,138 +1194,23 @@ export default class TeamBalancer extends S3PluginBase {
   }
 
   // ╔═══════════════════════════════════════╗
-  // ║          POLLING MECHANISMS           ║
+  // ║          LAYER INFO — S³ OWNED        ║
   // ╚═══════════════════════════════════════╝
-
-  inferGameMode(layerName) {
-    if (!layerName) return 'Unknown';
-    const name = layerName.toLowerCase();
-    if (name.includes('seed')) return 'Seed';
-    if (name.includes('invasion')) return 'Invasion';
-    if (name.includes('raas')) return 'RAAS';
-    if (name.includes('aas')) return 'AAS';
-    if (name.includes('tc')) return 'TC';
-    if (name.includes('skirmish')) return 'Skirmish';
-    if (name.includes('insurgency')) return 'Insurgency';
-    if (name.includes('destruction')) return 'Destruction';
-    if (name.includes('jensen')) return 'Jensen';
-    return 'Unknown';
-  }
-
-  async resolveLayerInfo(layerData, source = 'Unknown') {
-    let layer = layerData;
-    if (layer instanceof Promise) {
-      try {
-        layer = await layer;
-      } catch (err) {
-        Logger.verbose('TeamBalancer', 1, `[${source}] Failed to resolve layer promise: ${err.message}`);
-        layer = null;
-      }
-    }
-    
-    if (!layer) {
-      Logger.verbose('TeamBalancer', 3, `[${source}] Layer object is completely null or undefined.`);
-      return false;
-    }
-    
-    let gamemode = 'Unknown';
-    let name = 'Unknown';
-
-    if (typeof layer === 'string') {
-      name = layer;
-      gamemode = this.inferGameMode(name);
-      Logger.verbose('TeamBalancer', 4, `[${source}] Layer is a string ("${layer}"), inferred gamemode: ${gamemode}.`);
-    } else if (typeof layer === 'object') {
-      name = layer.name || layer.layer || 'Unknown';
-      gamemode = layer.gamemode || this.inferGameMode(name);
-      if (gamemode === 'Unknown' || name === 'Unknown') {
-         Logger.verbose('TeamBalancer', 4, `[${source}] Layer object missing properties: ${JSON.stringify(layer)}`);
-      }
-    }
-
-    this.gameModeCached = gamemode;
-    this.layerNameCached = name;
-    this.lastKnownGoodLayer = { gamemode, name };
-    Logger.verbose('TeamBalancer', 4, `[${source}] Layer info updated: ${gamemode} / ${name}`);
-    return true;
-  }
-
-  async onLayerInfoUpdated() {
-    try {
-      const resolved = await this.resolveLayerInfo(this.server.currentLayer, 'onLayerInfoUpdated');
-      if (resolved && this._gameInfoPollingInterval) {
-        clearInterval(this._gameInfoPollingInterval);
-        this._gameInfoPollingInterval = null;
-        Logger.verbose('TeamBalancer', 4, 'Game info polling stopped (layer info updated).');
-      }
-    } catch (err) {
-      Logger.verbose('TeamBalancer', 4, `Error in onLayerInfoUpdated: ${err.message}`);
-    }
-  }
-
-  async onServerInfoUpdated(info) {
-    try {
-      if (info && info.currentLayer) {
-        const incomingName = typeof info.currentLayer === 'string'
-          ? info.currentLayer
-          : info.currentLayer?.name;
-
-        if (this.lastKnownGoodLayer?.name === incomingName) return;
-
-        const resolved = await this.resolveLayerInfo(info.currentLayer, 'onServerInfoUpdated');
-        if (resolved && this._gameInfoPollingInterval) {
-          clearInterval(this._gameInfoPollingInterval);
-          this._gameInfoPollingInterval = null;
-          Logger.verbose('TeamBalancer', 4, 'Game info polling stopped (server info updated).');
-        }
-      }
-    } catch (err) {
-      Logger.verbose('TeamBalancer', 4, `Error in onServerInfoUpdated: ${err.message}`);
-    }
-  }
-
-  async startPollingGameInfo() {
-    Logger.verbose('TeamBalancer', 4, 'Starting game info polling.');
-
-    const pollGameInfo = async () => {
-      // Guard: already resolved via onServerInfoUpdated during the initial await
-      if (this.gameModeCached && this.gameModeCached !== 'Unknown') {
-        if (this._gameInfoPollingInterval) {
-          clearInterval(this._gameInfoPollingInterval);
-          this._gameInfoPollingInterval = null;
-          Logger.verbose('TeamBalancer', 4, 'Game info polling stopped (resolved externally).');
-        }
-        return;
-      }
-      try {
-        const resolved = await this.resolveLayerInfo(this.server.currentLayer, 'startPollingGameInfo');
-        if (resolved && this._gameInfoPollingInterval) {
-          clearInterval(this._gameInfoPollingInterval);
-          this._gameInfoPollingInterval = null;
-          Logger.verbose('TeamBalancer', 4, 'Game info polling stopped.');
-        } else if (!resolved) {
-          Logger.verbose('TeamBalancer', 4, 'Game info not yet available. Retrying...');
-        }
-      } catch (err) {
-        Logger.verbose('TeamBalancer', 4, `Error during game info polling: ${err.message}`);
-      }
-    };
-
-    await pollGameInfo();
-
-    // Race condition guard: onServerInfoUpdated may have resolved during the above await
-    if (this.gameModeCached && this.gameModeCached !== 'Unknown') return;
-
-    this._gameInfoPollingInterval = setInterval(pollGameInfo, 10000);
-  }
-
-  stopPollingGameInfo() {
-    if (this._gameInfoPollingInterval) {
-      Logger.verbose('TeamBalancer', 4, 'Stopping game info polling.');
-      clearInterval(this._gameInfoPollingInterval);
-      this._gameInfoPollingInterval = null;
-    }
-  }
+  //
+  // TeamBalancer used to carry its own copy of S³'s layer stack:
+  // inferGameMode(), resolveLayerInfo(), onLayerInfoUpdated(),
+  // onServerInfoUpdated() and a 10s startPollingGameInfo() fallback loop.
+  // All of it was removed — it had already been orphaned (mount() stopped
+  // binding UPDATED_LAYER_INFORMATION / UPDATED_SERVER_INFORMATION and
+  // nothing called startPollingGameInfo), and two of those methods read
+  // this.server.currentLayer, which is null after a mid-round SquadJS
+  // restart and would have re-introduced "Unknown" layers here.
+  //
+  // gameModeCached / layerNameCached / lastKnownGoodLayer are now a pure
+  // mirror of S³, fed by the gameState.onLayerGameModeChange() subscription
+  // registered in mount(). Read S³ directly for live values —
+  // this._s3.gameState.getLayerName() / getGamemode() — and DO NOT re-add a
+  // local resolver or a server.currentLayer read.
 
   getTeamName(teamID) {
     if (this.options.useGenericTeamNamesInBroadcasts) {
@@ -1432,7 +1457,7 @@ export default class TeamBalancer extends S3PluginBase {
           Logger.verbose('TeamBalancer', 1, `[DB] Failed to persist enabled state: ${err.message}`);
         }
       }
-      await message.reply('✅ Win streak tracking enabled.');
+      await message.reply(`✅ ${this.enableConfirmationText()}`);
       await this.server.rcon.broadcast(`${this.RconMessages.prefix} ${this.RconMessages.system.trackingEnabled}`);
       this.mirrorRconToDiscord(this.RconMessages.system.trackingEnabled, 'info');
     } else {
@@ -1445,7 +1470,7 @@ export default class TeamBalancer extends S3PluginBase {
           Logger.verbose('TeamBalancer', 1, `[DB] Failed to persist disabled state: ${err.message}`);
         }
       }
-      await message.reply('✅ Win streak tracking disabled.');
+      await message.reply(`✅ Win streak tracking disabled.${this.seedScrambleOffNote()}`);
       await this.resetStreak('Manual disable via Discord');
       await this.server.rcon.broadcast(`${this.RconMessages.prefix} ${this.RconMessages.system.trackingDisabled}`);
       this.mirrorRconToDiscord(this.RconMessages.system.trackingDisabled, 'info');
@@ -1472,7 +1497,15 @@ export default class TeamBalancer extends S3PluginBase {
       this.gameModeCached = null;
       this.layerNameCached = null;
       this._scrambleInProgress = false;
-      this._scramblePending = false;
+      // A countdown armed in the previous round must not fire into this one: teams are freshly assigned
+      // at NEW_GAME (teamIDs stay null for 30-60s), so it would scramble the wrong round. Driven off the
+      // timer handle, not _scramblePending — resetStreak() clears that flag while the timer still runs.
+      // Level 1, not 2: players were already told a scramble was coming and it silently is not. That
+      // is the one signal an operator has to tune the announcement delays against, so it belongs in
+      // the default log output — a too-long delay does not postpone the scramble, it cancels it.
+      if (this._clearPendingScrambleCountdown()) {
+        Logger.verbose('TeamBalancer', 1, '[TeamBalancer] Discarding pending scramble countdown (new game started before it could execute). The announcement delay outlasted the round — lower it if this repeats.');
+      }
 
       // Discard any armed "!scramble matchend" — a new round has started without consuming it.
       if (this._scrambleOnRoundEnd) {
@@ -1511,7 +1544,7 @@ export default class TeamBalancer extends S3PluginBase {
         Logger.verbose('TeamBalancer', 1, `[DB] onNewGame fallback saveState failed: ${err.message}`);
       }
       this._scrambleInProgress = false;
-      this._scramblePending = false;
+      this._clearPendingScrambleCountdown();
       this.cleanupScrambleTracking();
     }
   }
@@ -1523,9 +1556,19 @@ export default class TeamBalancer extends S3PluginBase {
   async onRoundEnded(data) {
     if (!this.ready) return;
 
-    // Note: roundReport is initialized early to capture state, but will be silently 
-    // abandoned (not logged to JSONL) if the match ends in a draw, is disabled, 
-    // or is an ignored mode before reaching the end of the method.
+    // Re-entrancy guard. Every branch below awaits RCON/DB calls before it claims the round, so a
+    // second ROUND_ENDED for the same round (a re-emitted log line, a log-reader reconnect) used to
+    // slip into those windows and arm a second scramble — or arm the seed trigger while the
+    // match-end path was still parked on its broadcast. Claiming synchronously here closes all of
+    // those at once, which is why the individual blocks can keep the natural announce-then-arm order.
+    if (this._roundEndInFlight) {
+      Logger.verbose('TeamBalancer', 2, '[TeamBalancer] Duplicate ROUND_ENDED ignored: the previous one is still being processed.');
+      return;
+    }
+
+    // Note: roundReport is initialized early to capture state. It is always written by the
+    // finally block, even when the method returns early (draw, tracking disabled, ignored
+    // mode) — those rounds are logged with the fields that were filled in before the return.
     const s3Players = this._s3?.players?.getAllPlayers?.();
     const s3PlayersCount = s3Players ? s3Players.length : 0;
     const gs = this._s3?.gameState;
@@ -1543,8 +1586,19 @@ export default class TeamBalancer extends S3PluginBase {
     let isDominant = false;
     let isStomp = false;
 
+    // Claimed here, not at the guard above: only the finally below releases it, so a throw in the
+    // prologue would latch it forever and drop every later ROUND_ENDED. Nothing awaits between the
+    // guard and this line, so the check-and-claim is still atomic.
+    this._roundEndInFlight = true;
+
     try {
       Logger.verbose('TeamBalancer', 4, `Round ended event received: ${JSON.stringify(data)}`);
+
+      // Parse the outcome once, before any early-returning path below, so the finally block logs
+      // the winner and tickets for EVERY round — an armed match-end scramble and a seed
+      // auto-scramble return before the win-streak evaluation but are still reported in full.
+      const outcome = this._parseRoundOutcome(data, roundReport);
+      if (!isNaN(outcome.winnerID)) winnerID = outcome.winnerID;
 
       // ── "!scramble matchend" stale-arm guard + execution ──────────
       // Consumed FIRST, before any win-streak/disabled/ignored checks, so it fires
@@ -1566,13 +1620,9 @@ export default class TeamBalancer extends S3PluginBase {
           // Same round — fire the deferred scramble.
           await this._setScrambleArm(null);
 
-          // Populate the round report's layer fallback and outcome fields for the finally block.
-          if (this.gameModeCached === null && this.layerNameCached === null && this.lastKnownGoodLayer !== null) {
-            this.gameModeCached = this.lastKnownGoodLayer.gamemode;
-            this.layerNameCached = this.lastKnownGoodLayer.name;
-            roundReport.gameMode = this.gameModeCached;
-            roundReport.layerName = this.layerNameCached;
-          }
+          // The early return below skips the main path, but the finally block still logs this
+          // round — give the report a layer even when this round's own never resolved.
+          this._applyLayerFallback(roundReport);
           roundReport.scrambled = true;
           roundReport.scrambleCondition = 'Match End (Manual)';
 
@@ -1596,12 +1646,52 @@ export default class TeamBalancer extends S3PluginBase {
         }
       }
 
+      // Seed auto-scramble: fires on any Seed round end, independent of win-streak tracking or
+      // ignored mode settings. isSeedMode() excludes Jensen/Training rounds naturally. Consumed
+      // after the armed match-end scramble so an admin's explicit command wins.
+      // Gated on manuallyDisabled: "!teambalancer off" is the admin kill switch. Note the
+      // asymmetry — enableWinStreakTracking is about STREAKS and never governed seeding.
+      // The layer fallback has deliberately NOT run yet — a round whose own layer never resolved
+      // must not be shuffled on the strength of the previous round's layer.
+      if (this._s3?.gameState?.isSeedMode?.() && this.options.enableSeedAutoScramble && !this.manuallyDisabled) {
+        // Don't announce or claim attribution for a scramble initiateScramble would refuse — but a
+        // Seed round still never feeds the streak, so clear it on the way out.
+        if (this._scramblePending || this._scrambleInProgress) {
+          Logger.verbose('TeamBalancer', 2, '[TeamBalancer] Seed auto-scramble skipped: another scramble is already pending or in progress.');
+          await this.resetStreak('Seed round ended (scramble already pending)');
+          return;
+        }
+        roundReport.scrambled = true;
+        roundReport.scrambleCondition = 'Seed Auto Scramble';
+        Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Seed match ended with ${this.server.players.length} players. Triggering auto-scramble.`);
+        // Bound once and used for the announcement AND the countdown — the text must never quote a
+        // delay the timer does not actually run on.
+        const seedDelay = this.options.seedScrambleAnnouncementDelay;
+        const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.seedScrambleAnnouncement, { delay: seedDelay })}`;
+        try {
+          await this.server.rcon.broadcast(msg);
+        } catch (err) {
+          Logger.verbose('TeamBalancer', 1, `Failed to broadcast seed scramble announcement: ${err.message}`);
+        }
+        this.mirrorRconToDiscord(msg, 'warning');
+        this.initiateScramble(false, false, null, null, seedDelay).catch(err =>
+          Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
+        );
+        // Seed rounds never feed the streak, so clear it here rather than leaving it to
+        // executeScramble — that reset is skipped when the scrambler returns an empty plan.
+        await this.resetStreak('Seed round ended');
+        return;
+      }
+
       if (!this.options.enableWinStreakTracking || this.manuallyDisabled) {
         Logger.verbose('TeamBalancer', 4, 'Win streak tracking disabled, skipping round evaluation.');
         return;
       }
 
       // Layer reads are served from S³ gameState (standalone polling removed in Stage 4)
+      // Only now: everything below reads the layer for thresholds, ignored-mode matching and the
+      // report, all of which tolerate the previous round's layer as a guess.
+      this._applyLayerFallback(roundReport);
 
       // Check for Draw (Winner is null)
       if (!data || !data.winner) {
@@ -1616,24 +1706,12 @@ export default class TeamBalancer extends S3PluginBase {
         return await this.resetStreak('Draw');
       }
 
-      winnerID = parseInt(data?.winner?.team);
-      const winnerTickets = parseInt(data?.winner?.tickets);
-      const loserTickets = parseInt(data?.loser?.tickets);
-      const margin = winnerTickets - loserTickets;
-
-      if (isNaN(winnerID) || isNaN(winnerTickets) || isNaN(loserTickets)) {
+      // Already parsed into the report above; the win-streak evaluation needs it complete.
+      const { winnerTickets, loserTickets, margin, winnerName, loserName } = outcome;
+      if (isNaN(outcome.winnerID) || isNaN(winnerTickets) || isNaN(loserTickets)) {
         Logger.verbose('TeamBalancer', 1, 'Could not parse round end data, skipping evaluation.');
         return;
       }
-
-      const winnerName = (this.options.useGenericTeamNamesInBroadcasts ? `Team ${winnerID}` : this.getTeamName(winnerID)) || `Team ${winnerID}`;
-      const loserName = (this.options.useGenericTeamNamesInBroadcasts ? `Team ${3 - winnerID}` : this.getTeamName(3 - winnerID)) || `Team ${3 - winnerID}`;
-
-      roundReport.winnerTickets = winnerTickets;
-      roundReport.loserTickets = loserTickets;
-      roundReport.ticketMargin = margin;
-      roundReport.winnerName = winnerName;
-      roundReport.loserName = loserName;
 
       Logger.verbose('TeamBalancer', 4, `Parsed winnerID=${winnerID}, winnerTickets=${winnerTickets}, loserTickets=${loserTickets}, margin=${margin}`);
 
@@ -1641,54 +1719,28 @@ export default class TeamBalancer extends S3PluginBase {
 
       if (this.isIgnoredMatch()) {
         Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Ignored match ended (${this.gameModeCached} / ${this.layerNameCached}). Resetting streak metrics.`);
-        
-        let shouldScramble = false;
-        // S³ GameStateService.isSeedMode() distinguishes Seed from Jensen — auto-scramble
-        // on Seed only, not on Training/Jensen's Range rounds.
-        if (this._s3?.gameState?.isSeedMode?.() && this.options.enableSeedAutoScramble) {
-          const playerCount = this._s3?.players?.getAllPlayers
-            ? this._s3?.players.getAllPlayers().length
-            : this.server.players.length;
-          shouldScramble = true;
-          roundReport.scrambled = true;
-          roundReport.scrambleCondition = 'Seed Auto Scramble';
-          Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Seed match ended with ${playerCount} players. Triggering auto-scramble.`);
-          const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.seedScrambleAnnouncement, { delay: this.options.scrambleAnnouncementDelay })}`;
-          try {
-            await this.server.rcon.broadcast(msg);
-          } catch (err) {
-            Logger.verbose('TeamBalancer', 1, `Failed to broadcast seed scramble announcement: ${err.message}`);
-          }
-          this.mirrorRconToDiscord(msg, 'warning');
-          this.initiateScramble(false, false).catch(err =>
-            Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
-          );
-        }
 
-        if (!shouldScramble) {
-          // If we aren't scrambling, broadcast the standard win message
-          let broadcastWinnerName = winnerName;
-          let broadcastLoserName = loserName;
-          if (!this.options.useGenericTeamNamesInBroadcasts) {
-            if (!/^The\s+/i.test(winnerName) && !winnerName.startsWith('Team ')) broadcastWinnerName = 'The ' + winnerName;
-            if (!/^The\s+/i.test(loserName) && !loserName.startsWith('Team ')) broadcastLoserName = 'The ' + loserName;
-          }
-          const msg = `${this.RconMessages.prefix} ${broadcastWinnerName} defeated ${broadcastLoserName} | (${margin} tickets)`;
-          try {
-            await this.server.rcon.broadcast(msg);
-          } catch (err) {
-            Logger.verbose('TeamBalancer', 1, `Failed to broadcast standard seed win message: ${err.message}`);
-          }
-          this.mirrorRconToDiscord(msg, 'info');
+        // Reached only when no seed auto-scramble fired — that path returned above.
+        let broadcastWinnerName = winnerName;
+        let broadcastLoserName = loserName;
+        if (!this.options.useGenericTeamNamesInBroadcasts) {
+          if (!/^The\s+/i.test(winnerName) && !winnerName.startsWith('Team ')) broadcastWinnerName = 'The ' + winnerName;
+          if (!/^The\s+/i.test(loserName) && !loserName.startsWith('Team ')) broadcastLoserName = 'The ' + loserName;
         }
+        const msg = `${this.RconMessages.prefix} ${broadcastWinnerName} defeated ${broadcastLoserName} | (${margin} tickets)`;
+        try {
+          await this.server.rcon.broadcast(msg);
+        } catch (err) {
+          Logger.verbose('TeamBalancer', 1, `Failed to broadcast standard seed win message: ${err.message}`);
+        }
+        this.mirrorRconToDiscord(msg, 'info');
 
         await this.resetStreak('Ignored match ended');
         return;
       }
 
-      // --- Consecutive Wins Tracking (Independent of Dominance) ---
-      // All non-ignored modes track consecutive wins.
-      // Seed/Jensen are already handled by the early return above.
+      // ── Consecutive Wins Tracking ──────────────────────────────
+      // Track every non-ignored win regardless of margin.
       if (this.consecutiveWinsTeam === winnerID) {
         this.consecutiveWinsCount++;
       } else {
@@ -1697,70 +1749,87 @@ export default class TeamBalancer extends S3PluginBase {
       }
       Logger.verbose('TeamBalancer', 4, `Consecutive wins: Team ${this.consecutiveWinsTeam} has ${this.consecutiveWinsCount} wins.`);
 
-      if (this._scramblePending || this._scrambleInProgress) return;
-
-      if (this.options.maxConsecutiveWinsWithoutThreshold > 0 && this.consecutiveWinsCount >= this.options.maxConsecutiveWinsWithoutThreshold) {
-        roundReport.scrambled = true;
-        roundReport.scrambleCondition = 'Consecutive Wins';
-        Logger.verbose('TeamBalancer', 2, `[ConsecutiveWins] Triggered! Count: ${this.consecutiveWinsCount} >= Threshold: ${this.options.maxConsecutiveWinsWithoutThreshold}`);
-        const message = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.consecutiveWinsScramble, {
-          team: this.getTeamName(winnerID),
-          count: this.consecutiveWinsCount,
-          delay: this.options.scrambleAnnouncementDelay
-        })}`;
-        
-        try {
-          await this.server.rcon.broadcast(message);
-        } catch (e) {
-          Logger.verbose('TeamBalancer', 1, `Failed to broadcast consecutive wins scramble message: ${e.message}`);
+      // Persist consecutive state immediately so it survives a crash before the
+      // dominant path commits.
+      try {
+        const dbRes = await this.db.saveState(this.winStreakTeam, this.winStreakCount, this.consecutiveWinsTeam, this.consecutiveWinsCount);
+        if (dbRes) {
+          this.consecutiveWinsTeam = dbRes.consecutiveWinsTeam;
+          this.consecutiveWinsCount = dbRes.consecutiveWinsCount;
         }
-        this.mirrorRconToDiscord(message, 'warning');
-        this.initiateScramble(false, false).catch(err =>
-          Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
-        );
-        return;
+      } catch (err) {
+        Logger.verbose('TeamBalancer', 1, `[DB] consecutive saveState failed: ${err.message}`);
+      }
+
+      // ── Consecutive Wins Scramble Check ────────────────────────
+      if (!this._scramblePending && !this._scrambleInProgress) {
+        if (this.options.maxConsecutiveWinsWithoutThreshold > 0 && this.consecutiveWinsCount >= this.options.maxConsecutiveWinsWithoutThreshold) {
+          roundReport.scrambled = true;
+          roundReport.scrambleCondition = 'Consecutive Wins';
+          Logger.verbose('TeamBalancer', 2, `[ConsecutiveWins] Triggered! Count: ${this.consecutiveWinsCount} >= Threshold: ${this.options.maxConsecutiveWinsWithoutThreshold}`);
+          const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.consecutiveWinsScramble, {
+            team: this.getTeamName(winnerID),
+            count: this.consecutiveWinsCount,
+            delay: this.options.scrambleAnnouncementDelay
+          })}`;
+          try {
+            await this.server.rcon.broadcast(msg);
+          } catch (broadcastErr) {
+            Logger.verbose('TeamBalancer', 1, `Failed to broadcast consecutive wins scramble: ${broadcastErr.message}`);
+          }
+          this.mirrorRconToDiscord(msg, 'warning');
+          this.initiateScramble(false, false).catch(err =>
+            Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
+          );
+          return; // Scramble triggered — skip dominant/non-dominant evaluation
+        }
+      }
+
+      let broadcastWinnerName = winnerName;
+      let broadcastLoserName = loserName;
+      if (!this.options.useGenericTeamNamesInBroadcasts) {
+        if (!/^The\s+/i.test(winnerName) && !winnerName.startsWith('Team ')) {
+          broadcastWinnerName = 'The ' + winnerName;
+        }
+        if (!/^The\s+/i.test(loserName) && !loserName.startsWith('Team ')) {
+          broadcastLoserName = 'The ' + loserName;
+        }
       }
 
       const isInvasion = gameMode.includes('invasion');
 
-      if (this.options.enableSingleRoundScramble && !isInvasion && margin >= this.options.singleRoundScrambleThreshold) {
-        roundReport.scrambled = true;
-        roundReport.scrambleCondition = 'Single Round Margin';
-        Logger.verbose('TeamBalancer', 2, `[SingleRoundScramble] Triggered! Margin: ${margin} >= Threshold: ${this.options.singleRoundScrambleThreshold}`);
-        const message = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.singleRoundScramble, {
-          margin,
-          delay: this.options.scrambleAnnouncementDelay
-        })}`;
-        try {
-          await this.server.rcon.broadcast(message);
-        } catch (broadcastErr) {
-          Logger.verbose('TeamBalancer', 1, `Failed to broadcast single-round scramble message: ${broadcastErr.message}`);
+      // ── Single Round Scramble Check ────────────────────────────
+      // Triggers on a single massive-margin round regardless of streak.
+      if (!this._scramblePending && !this._scrambleInProgress) {
+        if (this.options.enableSingleRoundScramble && !isInvasion && margin >= this.options.singleRoundScrambleThreshold) {
+          roundReport.scrambled = true;
+          roundReport.scrambleCondition = 'Single Round Margin';
+          Logger.verbose('TeamBalancer', 2, `[SingleRoundScramble] Triggered! Margin: ${margin} >= Threshold: ${this.options.singleRoundScrambleThreshold}`);
+          const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.singleRoundScramble, {
+            margin,
+            delay: this.options.scrambleAnnouncementDelay
+          })}`;
+          try {
+            await this.server.rcon.broadcast(msg);
+          } catch (broadcastErr) {
+            Logger.verbose('TeamBalancer', 1, `Failed to broadcast single-round scramble: ${broadcastErr.message}`);
+          }
+          this.mirrorRconToDiscord(msg, 'warning');
+          this.initiateScramble(false, false).catch(err =>
+            Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
+          );
+          return; // Scramble triggered — skip dominant/non-dominant evaluation
         }
-        this.mirrorRconToDiscord(message, 'warning');
-        this.initiateScramble(false, false).catch(err =>
-          Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
-        );
-        return;
       }
 
+      // ── Dominant Win Detection ─────────────────────────────────
+      // Determine whether the ticket margin crosses the dominant threshold.
       const dominantThreshold = this.options.minTicketsToCountAsDominantWin ?? 175;
       const stompThreshold = Math.floor(dominantThreshold * 1.5);
-      const closeGameMargin = Math.floor(dominantThreshold * 0.34);
-      const moderateWinThreshold = Math.floor((dominantThreshold + closeGameMargin) / 2);
-
-      Logger.verbose('TeamBalancer', 4, `Thresholds computed: {
-        gameMode: ${this.gameModeCached},
-        isInvasion: ${isInvasion},
-        dominantThreshold: ${dominantThreshold},
-        stompThreshold: ${stompThreshold},
-        closeGameMargin: ${closeGameMargin},
-        moderateWinThreshold: ${moderateWinThreshold}
-      }`);
-
-      const invasionAttackThreshold = this.options.invasionAttackTeamThreshold ?? 300;
-      const invasionDefenceThreshold = this.options.invasionDefenceTeamThreshold ?? 650;
 
       if (isInvasion) {
+        const invasionAttackThreshold = this.options.invasionAttackTeamThreshold ?? 300;
+        const invasionDefenceThreshold = this.options.invasionDefenceTeamThreshold ?? 650;
         if (
           (winnerID === 1 && margin >= invasionAttackThreshold) ||
           (winnerID === 2 && margin >= invasionDefenceThreshold)
@@ -1773,19 +1842,6 @@ export default class TeamBalancer extends S3PluginBase {
         isStomp = margin >= stompThreshold;
       }
       Logger.verbose('TeamBalancer', 4, `Dominance state: isDominant=${isDominant}, isStomp=${isStomp}`);
-
-      Logger.verbose('TeamBalancer', 4, `Team names for broadcast: winnerName=${winnerName}, loserName=${loserName}`);
-
-      let broadcastWinnerName = winnerName;
-      let broadcastLoserName = loserName;
-      if (!this.options.useGenericTeamNamesInBroadcasts) {
-        if (!/^The\s+/i.test(winnerName) && !winnerName.startsWith('Team ')) {
-          broadcastWinnerName = 'The ' + winnerName;
-        }
-        if (!/^The\s+/i.test(loserName) && !loserName.startsWith('Team ')) {
-          broadcastLoserName = 'The ' + loserName;
-        }
-      }
 
       const teamNames = { winnerName: broadcastWinnerName, loserName: broadcastLoserName };
       Logger.verbose('TeamBalancer', 4, `Final team names for broadcast: winnerName=${teamNames.winnerName}, loserName=${teamNames.loserName}`);
@@ -1952,9 +2008,10 @@ export default class TeamBalancer extends S3PluginBase {
       this.winStreakTeam = null;
       this.winStreakCount = 0;
       this._scrambleInProgress = false;
-      this._scramblePending = false;
+      this._clearPendingScrambleCountdown();
       this.cleanupScrambleTracking();
      } finally {
+       this._roundEndInFlight = false;
        roundReport.isDominantWin = isDominant ?? null;
        roundReport.winStreak = this.winStreakCount;
        roundReport.consecutiveWins = this.consecutiveWinsCount;
@@ -2075,14 +2132,13 @@ export default class TeamBalancer extends S3PluginBase {
     } catch (err) {
       Logger.verbose('TeamBalancer', 1, `[DB] resetStreak saveState failed: ${err.message}`);
     }
-    this._scramblePending = false;
   }
 
   // ╔═══════════════════════════════════════╗
   // ║        SCRAMBLE EXECUTION FLOW        ║
   // ╚═══════════════════════════════════════╝
 
-  async initiateScramble(isSimulated = false, immediate = false, steamID = null, player = null) {
+  async initiateScramble(isSimulated = false, immediate = false, steamID = null, player = null, delaySeconds = null) {
     if (this._scramblePending || this._scrambleInProgress) {
       Logger.verbose('TeamBalancer', 4, 'Scramble initiation blocked: scramble already pending or in progress.');
       return false;
@@ -2097,11 +2153,18 @@ export default class TeamBalancer extends S3PluginBase {
     
     if (!immediate) {      
       this._scramblePending = true;
-      const delaySeconds = this.options.scrambleAnnouncementDelay;
+      // Callers with a timing window of their own pass it in — the seed auto-scramble does, because
+      // the gap between a Seed round ending and the map change is far shorter than the global delay
+      // (and a countdown still armed at NEW_GAME is discarded, i.e. the scramble never happens).
+      // ?? not ||, so a deliberately small delay is not thrown away as falsy.
+      const delay = delaySeconds ?? this.options.scrambleAnnouncementDelay;
       this._scrambleCountdownTimeout = setTimeout(async () => {
+        // Drop the handle first: a non-null handle must mean "a countdown is still armed", which is
+        // what NEW_GAME/unmount/cancel check before tearing it down.
+        this._scrambleCountdownTimeout = null;
         Logger.verbose('TeamBalancer', 4, 'Scramble countdown finished, executing scramble.');
         await this.executeScramble(false, steamID, player);
-      }, delaySeconds * 1000);
+      }, delay * 1000);
       return true;
     } else {      
       Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Immediate live scramble initiated by ${adminName}`);
@@ -2206,14 +2269,28 @@ export default class TeamBalancer extends S3PluginBase {
       return false;
     }
 
-    // Acquire S³ global lock before scramble (prevents SA from acting during TB scramble)
+    // Acquire S³ global lock before scramble (prevents SA from acting during TB scramble).
+    //
+    // IMPORTANT — use lockGlobal() directly, NOT isGloballyLockedBy() as a gate:
+    //
+    //   isGloballyLockedBy() returns truthy for ANY held lock regardless of priority,
+    //   so a lower-priority transient lock (SmartAssign priority 2, e.g. a 5s join
+    //   processing lock) would veto TeamBalancer (priority 3) outright. That is
+    //   never acceptable — a scramble is the highest-priority operation.
+    //
+    //   lockGlobal() implements priority-based preemption: it returns true when
+    //   the caller has priority >= any existing holder, which for TeamBalancer at
+    //   priority 3 means it can always preempt SmartAssign or Switch. It only
+    //   returns false when something of equal-or-higher priority already holds the
+    //   lock (i.e. another TeamBalancer scramble). That is the only condition that
+    //   should prevent a scramble from executing.
     let globalLockAcquired = false;
     if (this._s3?.players?.isReady() && !isSimulated) {
-      if (this._s3.players.isGloballyLockedBy()) {
-        Logger.verbose('TeamBalancer', 1, '[S3] Global lock held — another scramble may be in progress.');
+      const locked = this._s3.players.lockGlobal('TeamBalancer', this.options.maxScrambleCompletionTime + 5000);
+      if (!locked) {
+        Logger.verbose('TeamBalancer', 1, '[S3] Global lock denied — held by equal/higher priority (likely another TB scramble).');
         return false;
       }
-      this._s3.players.lockGlobal('TeamBalancer', this.options.maxScrambleCompletionTime + 5000);
       globalLockAcquired = true;
       Logger.verbose('TeamBalancer', 4, '[S3] Global lock acquired for scramble.');
     }
@@ -2381,9 +2458,13 @@ export default class TeamBalancer extends S3PluginBase {
       });
 
       const targetReportChannel = this.discordReportChannel || this.discordChannel;
-      if (targetReportChannel && this.options.postScrambleDetails) {
+      // Dry runs (isSimulated=true) post to the admin command channel (this.discordChannel)
+      // so the admin sees the plan inline with their !scramble dry command.
+      // Live scrambles post to the report channel (targetReportChannel) for archival.
+      const postChannel = isSimulated ? this.discordChannel : targetReportChannel;
+      if (postChannel && this.options.postScrambleDetails) {
         const embed = await DiscordHelpers.createScrambleDetailsMessage(swapPlan, isSimulated, this, eloMap);
-        DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+        DiscordHelpers.sendDiscordMessage(postChannel, { embeds: [embed] });
       }
 
       if (swapPlan && swapPlan.length > 0) {
@@ -2416,15 +2497,24 @@ export default class TeamBalancer extends S3PluginBase {
           const sessionReport = this.swapExecutor?.getLastSessionReport?.();
           const failedEosIDs = new Set(sessionReport?.failedEosIDs || []);
           const affectedPlayers = [];
+          const failedPlayers = [];
           for (const move of swapPlan) {
             const player = this.server.players.find(p => p.eosID === move.eosID);
-            if (player && !failedEosIDs.has(move.eosID)) {
+            if (!player) continue;
+            if (failedEosIDs.has(move.eosID)) {
+              failedPlayers.push({ eosID: player.eosID, steamID: player.steamID ?? null, name: player.name });
+            } else {
               affectedPlayers.push({ eosID: player.eosID, steamID: player.steamID ?? null, name: player.name });
             }
           }
-          if (affectedPlayers.length > 0) {
+          // Emit when either list is non-empty. If every move fails, affectedPlayers
+          // is empty but failedPlayers is not — Switch still needs to remediate.
+          // Disconnected players are handled via S³ reconnect memory overwrite in
+          // tb-swap-executor.js — no need to emit them here.
+          if (affectedPlayers.length > 0 || failedPlayers.length > 0) {
             this.server.emit('TEAM_BALANCER_SCRAMBLE_EXECUTED', {
-              affectedPlayers
+              affectedPlayers,
+              failedPlayers
             });
           }
 
@@ -2466,9 +2556,12 @@ export default class TeamBalancer extends S3PluginBase {
           }
           this.mirrorRconToDiscord(msg, 'warning');
           const targetReportChannel = this.discordReportChannel || this.discordChannel;
-          if (targetReportChannel) {
+          // Same routing as the success path: dry run failures go to the admin command channel
+          // (this.discordChannel), live scramble failures go to the report channel (targetReportChannel).
+          const failChannel = isSimulated ? this.discordChannel : targetReportChannel;
+          if (failChannel) {
             const embed = DiscordHelpers.buildScrambleFailedEmbed('No valid swap solution found.', swapPlan?.calculationTime || 0, this);
-            DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+            DiscordHelpers.sendDiscordMessage(failChannel, { embeds: [embed] });
           }
           // Note: We do NOT reset the streak here, as the imbalance likely persists.
         } else {
@@ -2502,8 +2595,12 @@ export default class TeamBalancer extends S3PluginBase {
       }
       // Write scramble report JSON (includes swap plan and execution results)
       if (swapPlan) {
-        this._writeScrambleReport(swapPlan, swapPlan.calculationTime || 0, isSimulated, preScrambleState, scrambleAttempts);
+        this._writeScrambleReport(swapPlan, swapPlan.calculationTime || 0, isSimulated, preScrambleState);
       }
+      // The countdown that armed this run is consumed by now, whatever the outcome (moves made,
+      // empty swap plan, or a throw) — so the pending flag ends here, not in resetStreak. Same
+      // helper the other teardown paths use, so "no countdown outstanding" has one meaning.
+      this._clearPendingScrambleCountdown();
       this._scrambleInProgress = false;
       Logger.verbose('TeamBalancer', 4, 'Scramble finished');
     }
@@ -2522,12 +2619,7 @@ export default class TeamBalancer extends S3PluginBase {
       return false;
     }
 
-    if (this._scrambleCountdownTimeout) {
-      clearTimeout(this._scrambleCountdownTimeout);
-      this._scrambleCountdownTimeout = null;
-    }
-
-    this._scramblePending = false;
+    this._clearPendingScrambleCountdown();
 
     const adminName = player?.name || steamID; // Prioritize player name
     const cancelReason = isAutomatic ? 'automatically' : `by admin ${adminName}`;
@@ -2571,6 +2663,21 @@ export default class TeamBalancer extends S3PluginBase {
       this.swapExecutor.cleanup();
     }
     this._scrambleInProgress = false;
+  }
+
+  /**
+   * Tears down an armed scramble countdown. The timer handle and _scramblePending are one unit —
+   * clearing the flag alone leaves the timer running, and it then fires into a round it was never
+   * armed for. Returns true if a countdown was actually still armed.
+   */
+  _clearPendingScrambleCountdown() {
+    const wasArmed = !!this._scrambleCountdownTimeout;
+    if (wasArmed) {
+      clearTimeout(this._scrambleCountdownTimeout);
+      this._scrambleCountdownTimeout = null;
+    }
+    this._scramblePending = false;
+    return wasArmed;
   }
 
   /**
@@ -2620,7 +2727,7 @@ export default class TeamBalancer extends S3PluginBase {
           winStreakTeam: this.winStreakTeam,
           winStreakCount: this.winStreakCount
         },
-        scrambleAttempts: attempts || scrambleAttempts || []
+        scrambleAttempts: attempts || []
       };
 
       await fs.promises.writeFile(reportPath, JSON.stringify(report, null, 2));

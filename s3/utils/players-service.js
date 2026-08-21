@@ -35,6 +35,9 @@
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
+ * - Registry rows are refreshed in place every tick: name, teamID, squadID
+ *   and isLeader all track the live server.players entry, so leadership
+ *   reflects the current SL rather than the state at first registration.
  * - Lock priority ordering: TeamBalancer(3) > SmartAssign(2) > Switch(1).
  * - registerPriority('MyPlugin', 4) allows third-party plugins to
  *   register a custom priority level — extensible beyond the hardcoded map.
@@ -73,6 +76,83 @@ const DEFAULT_REFRESH_NOW_FLOOR_MS = 1000;      // minimum gap for refreshNow() 
 const DEFAULT_SESSION_EXPIRY_MS = 30 * 60 * 1000; // 30 min — how long without activity before a session expires
 const DEFAULT_SESSION_UPDATE_INTERVAL_MS = 5 * 60 * 1000; // 5 min — how often to refresh lastActivity in DB
 const DEFAULT_RCON_RECOVERY_GRACE_MS = 30000; // 30s — suppress leave detection for this long after an RCON_ERROR
+// How long a single player may sit at teamID N/A before they stop counting
+// against the roster-wide resolution gate. The legitimate post-NEW_GAME null
+// window clears in seconds, so this is deliberately far longer than it needs to
+// be: quarantining a player who was about to resolve is the worse mistake, and
+// waiting costs nothing because the clock is cleared the moment they report a
+// real team or leave. Longer than GameStateService's 120s resolving budget,
+// which means the round a client first wedges still ends its resolving window
+// on the deadline — every subsequent round resolves normally.
+const DEFAULT_UNRESOLVED_GRACE_MS = 180000;
+
+/**
+ * Coerce a raw SquadJS `isLeader` into a boolean, distinguishing "not a leader"
+ * from "the source did not say".
+ *
+ * SquadJS documents Player.isLeader as a bool, but its sibling Squad.locked
+ * arrives as the string "True"/"False" straight out of the RCON parse, so the
+ * string form is accepted here too — LoggingService already normalises it the
+ * same way. Sources that carry no leadership information at all (the
+ * PLAYER_CONNECTED payload, for one) must not be read as a demotion, so
+ * null/undefined returns `fallback` rather than false.
+ *
+ * @param {*} raw - Value from the SquadJS player object.
+ * @param {boolean} fallback - Returned when `raw` is null/undefined.
+ * @returns {boolean} Normalised leadership flag.
+ */
+function normalizeIsLeader(raw, fallback = false) {
+  if (raw === null || raw === undefined) return fallback === true;
+  return raw === true || raw === 'True';
+}
+
+/* ────────────────────────── BOOTSTRAP DDL ──────────────────────────
+ *
+ * S3_PlayerReconnects and S3_PlayerSessions are infrastructure tables created
+ * by raw DDL at mount (rather than by model sync) so they exist before any
+ * query runs. The DDL is emitted from these builders, in one place, because it
+ * runs from FOUR call sites — the two bootstrap paths in _initSessionPersistence
+ * / _initReconnectPersistence, and the two migration up() bodies that re-run it
+ * through the migration engine's query interface.
+ *
+ * Every identifier is quoted. Unquoted, Postgres folds them to lower case and
+ * creates `s3_playerreconnects(eosid, updatedat, …)`, while the Sequelize models
+ * below declare `tableName: 'S3_PlayerReconnects'` and are quoted by Sequelize —
+ * so the models address a table that does not exist and every read and write
+ * against them fails. SQLite ignores identifier case and MySQL column names are
+ * case-insensitive, which is why the unquoted form worked for years.
+ *
+ * Quoting is backward-compatible on SQLite and MySQL: `CREATE TABLE IF NOT
+ * EXISTS "S3_PlayerReconnects"` matches a table an older build created unquoted,
+ * so no second table appears and existing rows stay reachable. Verified against
+ * SQLite, MySQL 8 and Postgres 16 in s3/testing/test-dialect-portability.js.
+ *
+ * @param {(id: string) => string} q - Identifier quoter (DBService.quoteIdentifier).
+ */
+function reconnectsTableDDL(q) {
+  return `
+      CREATE TABLE IF NOT EXISTS ${q('S3_PlayerReconnects')} (
+        ${q('eosID')} VARCHAR(64) PRIMARY KEY,
+        ${q('steamID')} VARCHAR(64) NULL,
+        ${q('playerName')} VARCHAR(255) NULL,
+        ${q('lastTeamID')} INTEGER NULL,
+        ${q('lastSeenAt')} BIGINT NULL,
+        ${q('updatedAt')} BIGINT NOT NULL
+      );
+    `;
+}
+
+function sessionsTableDDL(q) {
+  return `
+      CREATE TABLE IF NOT EXISTS ${q('S3_PlayerSessions')} (
+        ${q('eosID')} VARCHAR(64) PRIMARY KEY,
+        ${q('steamID')} VARCHAR(64) NULL,
+        ${q('playerName')} VARCHAR(255) NULL,
+        ${q('sessionStart')} BIGINT NOT NULL,
+        ${q('lastActivity')} BIGINT NOT NULL
+      );
+    `;
+}
 
 export default class PlayersService {
   constructor({
@@ -87,7 +167,8 @@ export default class PlayersService {
     refreshDebounceWindowMs = DEFAULT_REFRESH_DEBOUNCE_WINDOW_MS,
     refreshNowFloorMs = DEFAULT_REFRESH_NOW_FLOOR_MS,
     sessionExpiryMs = DEFAULT_SESSION_EXPIRY_MS,
-    sessionUpdateIntervalMs = DEFAULT_SESSION_UPDATE_INTERVAL_MS
+    sessionUpdateIntervalMs = DEFAULT_SESSION_UPDATE_INTERVAL_MS,
+    unresolvedGraceMs = DEFAULT_UNRESOLVED_GRACE_MS
   } = {}) {
     this.parent = parent;
     this.server = server;
@@ -102,6 +183,7 @@ export default class PlayersService {
     this.refreshNowFloorMs = Number.isFinite(refreshNowFloorMs) ? Math.max(500, refreshNowFloorMs) : DEFAULT_REFRESH_NOW_FLOOR_MS;
     this.sessionExpiryMs = Number.isFinite(sessionExpiryMs) ? Math.max(60000, sessionExpiryMs) : DEFAULT_SESSION_EXPIRY_MS;
     this.sessionUpdateIntervalMs = Number.isFinite(sessionUpdateIntervalMs) ? Math.max(60000, sessionUpdateIntervalMs) : DEFAULT_SESSION_UPDATE_INTERVAL_MS;
+    this.unresolvedGraceMs = Number.isFinite(unresolvedGraceMs) ? Math.max(0, unresolvedGraceMs) : DEFAULT_UNRESOLVED_GRACE_MS;
 
     this.registry = new Map(); // key (prefer EOS ID; fallback to steamID) -> player state
     // Optional index for legacy/secondary IDs. steamID may be undefined for EOS-only players.
@@ -138,6 +220,15 @@ export default class PlayersService {
     // Snapshot of this.server.squads (raw SquadJS squad objects), refreshed each tick
     // when teams are fully resolved. Used by getSquads() to serve full squad metadata.
     this._squadsCache = null;
+    // key -> { since, warned } for every player currently reporting an unreal
+    // teamID. Once `since` is older than the grace window the player is treated
+    // as stuck and excluded from the roster-wide gate. See _ageUnresolvedPlayers.
+    this._unresolvedSince = new Map();
+    // Keys quarantined by the pass above — exposed via getStuckPlayerKeys().
+    this._stuckKeys = new Set();
+    // Edge-triggers the mass-unresolved log so a round transition does not
+    // reprint it on every tick.
+    this._systemicUnresolved = false;
 
     this.PRIORITY = {
       TeamBalancer: 3,
@@ -231,6 +322,11 @@ export default class PlayersService {
     this._isMounted = false;
     this._initialSyncComplete = false;
     this._lastRconErrorTime = 0;
+    // Drop the unreal-teamID clocks with the rest of the resolution state. A
+    // remount re-runs initial sync, so a clock left over from before it would
+    // quarantine a player on their first tick back without any grace.
+    this._unresolvedSince.clear();
+    this._stuckKeys.clear();
     this.verboseLogger(2, '[Players] Unmounted.');
   }
 
@@ -342,20 +438,58 @@ export default class PlayersService {
     return player?.joinTime || 0;
   }
 
+  /**
+   * Resets a player's joinTime to now, reopening their switch eligibility window.
+   * Called by Switch when granting remediation tokens so the player can actually
+   * use !switch without being gated by a stale connection window.
+   *
+   * Mutates the registry state directly (not the getPlayer() copy) and fire-and-forget
+   * upserts S3_PlayerSessions so a future SquadJS restart doesn't resurrect the old time.
+   *
+   * @param {string} eosIDOrSteamID - Player EOS ID or Steam ID
+   * @returns {boolean} true if the player was found and joinTime was reset
+   */
+  resetJoinTime(eosIDOrSteamID) {
+    const key = this._resolvePlayerKey(eosIDOrSteamID);
+    if (!key) return false;
+
+    // Mutate the live registry state (or projected state during null-window).
+    const state = this.registry.get(key) || this._projectedPlayers?.get(key);
+    if (!state) return false;
+
+    const now = Date.now();
+    state.joinTime = now;
+
+    // Persist so _recoverSessionTimes() on next mount doesn't resurrect the old time.
+    if (state.eosID) {
+      this._upsertSessionRow(state.eosID, state.steamID, state.name, now, now).catch((err) => {
+        this.verboseLogger(2, `[Players] resetJoinTime session upsert failed for ${state.name || key}: ${err.message}`);
+      });
+    }
+
+    this.verboseLogger(2, `[Players] resetJoinTime: ${state.name || key} joinTime reset to now`);
+    return true;
+  }
+
   getSquads() {
     // Returns cached SquadJS squad objects enriched with leader-first player lists.
     // Array of { squadID, teamID, squadName, locked (bool), players: eosID[] }
     const squads = this._squadsCache || [];
     const active = this._getActiveRegistry();
 
-    // Build squadID -> { leaders[], members[] } from player registry
+    // Build "teamID:squadID" -> { leaders[], members[] } from player registry.
+    // Squad numbers restart per team (both teams have a squad 1), so keying on
+    // squadID alone merges the two teams' same-numbered squads into one bucket.
+    const squadKey = (teamID, squadID) => `${Number(teamID)}:${Number(squadID)}`;
+
     const bySquad = new Map();
     for (const [, p] of active) {
       if (p.squadID == null) continue;
-      if (!bySquad.has(p.squadID)) {
-        bySquad.set(p.squadID, { leaders: [], members: [] });
+      const key = squadKey(p.teamID, p.squadID);
+      if (!bySquad.has(key)) {
+        bySquad.set(key, { leaders: [], members: [] });
       }
-      const entry = bySquad.get(p.squadID);
+      const entry = bySquad.get(key);
       if (p.isLeader) {
         entry.leaders.push(p.eosID);
       } else {
@@ -364,22 +498,43 @@ export default class PlayersService {
     }
 
     return squads
-      .map((s) => ({
-        squadID: s.squadID,
-        teamID: s.teamID,
-        squadName: s.squadName,
-        locked: s.locked === 'True' || s.locked === true,
-        players: bySquad.has(s.squadID)
-          ? [...bySquad.get(s.squadID).leaders, ...bySquad.get(s.squadID).members]
-          : []
-      }))
+      .map((s) => {
+        const entry = bySquad.get(squadKey(s.teamID, s.squadID));
+        return {
+          squadID: s.squadID,
+          teamID: s.teamID,
+          squadName: s.squadName,
+          locked: s.locked === 'True' || s.locked === true,
+          players: entry ? [...entry.leaders, ...entry.members] : []
+        };
+      })
       .filter((s) => s.players.length > 0);
   }
 
   areTeamsResolved() {
-    const players = [...this.registry.values()];
-    if (!players.length) return false;
-    return players.every((player) => player?.teamID === 1 || player?.teamID === 2);
+    const entries = [...this.registry.entries()];
+    if (!entries.length) return false;
+    // A quarantined player does not count against this. Without that, one stuck
+    // client meant GameStateService could only ever leave `resolving` on the
+    // BUDGET_EXPIRED deadline rather than on PLAYERS_RESOLVED — for every round
+    // that player stayed connected.
+    if (!entries.some(([, p]) => this._isRealTeam(p?.teamID))) return false;
+    return entries.every(([key, p]) => this._isRealTeam(p?.teamID) || this._stuckKeys.has(key));
+  }
+
+  /**
+   * How often the registry is actually refreshed, in ms — clamp(fastest
+   * registered interval, refreshMinIntervalMs, refreshMaxIntervalMs), or null
+   * when nothing has registered interest.
+   *
+   * Exposed because it is the unit any "how long should I wait for team data"
+   * budget has to be measured in: areTeamsResolved() can only change on a tick,
+   * so a timeout shorter than a few of these expires before the answer could
+   * possibly have arrived. GameStateService uses it to floor its resolving
+   * deadline.
+   */
+  getEffectiveRefreshIntervalMs() {
+    return this._refreshState?.effectiveInterval || null;
   }
 
   // ---------------------------------------------------------------------------
@@ -797,14 +952,19 @@ export default class PlayersService {
     const now = Date.now();
     const current = new Set();
     const isInitialSync = !this._initialSyncComplete;
-    // If any player reports a non-1/2 teamID, we are in the null-teamID window.
-    const hasNullTeams = players.some((player) => !this._isRealTeam(player?.teamID));
-    const allResolved = players.length > 0 && !hasNullTeams;
+    // Players reporting a non-1/2 teamID who are still inside the grace window —
+    // i.e. genuinely mid-resolve rather than stuck. Anyone past the window has
+    // been quarantined and no longer holds the whole lobby hostage.
+    const { blocking, keyed } = this._ageUnresolvedPlayers(players, now);
+    const hasNullTeams = blocking.size > 0;
+    // `keyed`, not players.length: a roster S³ could not key a single player
+    // out of has resolved nothing, and must not be reported as settled.
+    const allResolved = keyed > 0 && !hasNullTeams;
     let joinCount = 0;
     let leaveCount = 0;
     let teamChangeCount = 0;
 
-    this.verboseLogger(2, `[Players] UPDATED_PLAYER_INFORMATION: ${players.length} server players, ${this.registry.size} tracked, initialSync=${isInitialSync}, hasNullTeams=${hasNullTeams}`);
+    this.verboseLogger(2, `[Players] UPDATED_PLAYER_INFORMATION: ${players.length} server players, ${this.registry.size} tracked, initialSync=${isInitialSync}, hasNullTeams=${hasNullTeams}, stuck=${this._stuckKeys.size}`);
 
     for (const rawPlayer of players) {
       const result = this._registerPlayer(rawPlayer, now, {
@@ -999,6 +1159,142 @@ export default class PlayersService {
     return teamID === 1 || teamID === 2;
   }
 
+  /**
+   * "Name (eosID)" where the registry knows the player, bare key otherwise.
+   * A stuck-client log naming only an EOS ID is not actionable by an admin who
+   * has to go find that player in game.
+   */
+  _describeKey(key) {
+    const name = this.registry.get(key)?.name;
+    return name ? `${name} (${key})` : key;
+  }
+
+  /**
+   * How long a player may report an unreal teamID before being quarantined.
+   *
+   * Floored at three refresh ticks for the same reason the resolving deadline
+   * is floored at four: the answer can only change on a tick, so a window
+   * shorter than the cadence would quarantine players who simply have not been
+   * looked at yet.
+   */
+  _unresolvedGraceWindowMs() {
+    const tickMs = this.getEffectiveRefreshIntervalMs() || 0;
+    return Math.max(this.unresolvedGraceMs, tickMs * 3);
+  }
+
+  /**
+   * Age the unreal-teamID clock for every player on the server and return the
+   * set of keys that should still block the roster-wide resolution gate.
+   *
+   * BUG HISTORY: `allResolved` used to be a flat `players.some(...)` over the
+   * raw roster, so a SINGLE player whose client wedged at `Team ID: N/A` — one
+   * did, stuck on the previous layer across a whole round — pinned it false
+   * indefinitely. That froze `_lastStablePlayers` and `_squadsCache`, and, far
+   * worse, suppressed S3_PLAYER_TEAM_CHANGED for EVERY player for the whole
+   * round, blinding TeamBalancer, SmartAssign and Switch. `resolving` had a
+   * deadline to escape on; this gate had none.
+   *
+   * The transient window that gate exists for is a property of the round
+   * transition, where the roster goes null en masse and clears in seconds. So
+   * quarantine is deliberately withheld while HALF OR MORE of the roster is
+   * unreal: that shape is either a real transition or a systemic RCON/parse
+   * failure, and in neither case should S³ declare teams resolved.
+   */
+  _ageUnresolvedPlayers(players, now) {
+    const blocking = new Set();
+    const seen = new Set();
+    const unresolved = [];
+
+    for (const raw of players) {
+      const key = this._selectPlayerKey(raw);
+      if (!key) continue;
+      seen.add(key);
+
+      if (this._isRealTeam(raw?.teamID)) {
+        if (this._unresolvedSince.has(key)) {
+          const entry = this._unresolvedSince.get(key);
+          this._unresolvedSince.delete(key);
+          this._stuckKeys.delete(key);
+          if (entry.warned) {
+            this.verboseLogger(1, `[Players] ${this._describeKey(key)} reports team ${raw.teamID} again after ${Math.round((now - entry.since) / 1000)}s stuck — back in the resolution gate.`);
+          }
+        }
+        continue;
+      }
+
+      unresolved.push(key);
+      if (!this._unresolvedSince.has(key)) {
+        this._unresolvedSince.set(key, { since: now, warned: false });
+      }
+    }
+
+    // Forget anyone who left, so a reconnect starts a fresh clock.
+    for (const key of [...this._unresolvedSince.keys()]) {
+      if (!seen.has(key)) {
+        this._unresolvedSince.delete(key);
+        this._stuckKeys.delete(key);
+      }
+    }
+    for (const key of [...this._stuckKeys]) {
+      if (!seen.has(key)) this._stuckKeys.delete(key);
+    }
+
+    // Mass-unresolved: a transition or a systemic failure, never one bad client.
+    // Measured against the players S³ can actually key, not the raw list — a row
+    // with neither ID is invisible to the registry, and counting it in the
+    // denominator would drag the ratio down and quarantine people early.
+    const systemic = unresolved.length * 2 >= seen.size;
+
+    // Edge-triggered on purpose: this fires on every legitimate round
+    // transition, and printing it per tick would bury it. What makes it worth
+    // logging at all is the case it is NOT designed for — if this state is
+    // entered and never left, quarantine can never engage, and this line is the
+    // only evidence of why the resolution gate is still down.
+    if (systemic !== this._systemicUnresolved) {
+      this._systemicUnresolved = systemic;
+      if (systemic && seen.size > 0) {
+        this.verboseLogger(2, `[Players] ${unresolved.length}/${seen.size} players report no teamID — mass window (transition or RCON fault), quarantine withheld.`);
+      } else if (!systemic) {
+        this.verboseLogger(2, `[Players] Mass null-teamID window cleared — ${unresolved.length}/${seen.size} still unresolved.`);
+      }
+    }
+
+    if (systemic) {
+      if (unresolved.length > 0) this._stuckKeys.clear();
+      return { blocking: new Set(unresolved), keyed: seen.size };
+    }
+
+    const grace = this._unresolvedGraceWindowMs();
+    for (const key of unresolved) {
+      const entry = this._unresolvedSince.get(key);
+      if (now - entry.since < grace) {
+        blocking.add(key);
+        continue;
+      }
+
+      this._stuckKeys.add(key);
+      if (!entry.warned) {
+        entry.warned = true;
+        this.verboseLogger(1, `[Players] ${this._describeKey(key)} has reported no teamID for ${Math.round((now - entry.since) / 1000)}s — treating as a stuck client and excluding it from the team-resolution gate. They usually need to reconnect.`);
+      }
+    }
+
+    return { blocking, keyed: seen.size };
+  }
+
+  /**
+   * Keys of players excluded from the resolution gate because their client is
+   * wedged at teamID N/A. They are still tracked and still in the registry —
+   * they just no longer speak for whether the lobby's teams are settled.
+   */
+  getStuckPlayerKeys() {
+    return new Set(this._stuckKeys);
+  }
+
+  isPlayerStuck(key) {
+    return this._stuckKeys.has(this._normalizeIdentifier(key));
+  }
+
   _getActiveRegistry() {
     return this._projectedPlayers || this.registry;
   }
@@ -1154,6 +1450,7 @@ export default class PlayersService {
       projected.eosID = registryState.eosID;
       projected.steamID = registryState.steamID;
       projected.squadID = registryState.squadID;
+      projected.isLeader = registryState.isLeader;
       projected.lastSeenAt = registryState.lastSeenAt;
 
       // Overwrite projected team if the real team is resolved mid-window.
@@ -1215,7 +1512,7 @@ export default class PlayersService {
       name: player?.name || 'Unknown',
       teamID: player?.teamID ?? null,
       squadID: player?.squadID ?? null,
-      isLeader: player?.isLeader ?? false,
+      isLeader: normalizeIsLeader(player?.isLeader, false),
       joinTime: now,
       lastSeenAt: now,
       joinEmitted
@@ -1403,6 +1700,14 @@ export default class PlayersService {
     state.squadID = rawPlayer?.squadID ?? state.squadID;
     state.eosID = rawPlayer?.eosID || state.eosID;
     state.steamID = rawPlayer?.steamID || state.steamID;
+    // Leadership is per-tick state, not join-time state: a player connects as a
+    // non-leader and only becomes SL later, and can be demoted at any point.
+    // Omitting this line pinned isLeader to whatever it was on the tick the
+    // player was first registered — which for anyone who joined and *then* made
+    // a squad meant a permanent false, so getSquads() sorted them as a grunt and
+    // `!s3 players` never crowned them. PLAYER_CONNECTED carries no isLeader at
+    // all, hence the undefined-means-keep guard rather than a bare `??`.
+    state.isLeader = normalizeIsLeader(rawPlayer?.isLeader, state.isLeader);
     state.lastSeenAt = now;
 
     this._indexPlayer(state, key);
@@ -1485,9 +1790,11 @@ export default class PlayersService {
     if (connector && typeof connector.query === 'function') {
       try {
         await dbService.executeWithRetry(async () => {
-          await connector.query('DELETE FROM S3_PlayerReconnects WHERE updatedAt < :cutoff', {
-            replacements: { cutoff }
-          });
+          await connector.query(
+            `DELETE FROM ${dbService.quoteIdentifier('S3_PlayerReconnects')} ` +
+            `WHERE ${dbService.quoteIdentifier('updatedAt')} < :cutoff`,
+            { replacements: { cutoff } }
+          );
         });
       } catch (err) {
         this.verboseLogger(1, `[Players] Failed pruning reconnect DB rows: ${err.message}`);
@@ -1550,24 +1857,18 @@ export default class PlayersService {
 
     // Bootstrap DDL — ensures S3_PlayerSessions exists unconditionally at mount.
     // Infrastructure table, not a migration — no confirmation needed.
-    await connector.query(`
-      CREATE TABLE IF NOT EXISTS S3_PlayerSessions (
-        eosID VARCHAR(64) PRIMARY KEY,
-        steamID VARCHAR(64) NULL,
-        playerName VARCHAR(255) NULL,
-        sessionStart BIGINT NOT NULL,
-        lastActivity BIGINT NOT NULL
-      );
-    `);
+    const q = (id) => dbService.quoteIdentifier(id);
+    await connector.query(sessionsTableDDL(q));
 
     // Clean up stale session rows (>24h inactive). These are never used for
     // session recovery — _recoverSessionTimes() treats anything >30min as stale.
     // Mount-time cleanup is sufficient; no periodic timer needed.
     try {
       const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-      await connector.query('DELETE FROM S3_PlayerSessions WHERE lastActivity < :cutoff', {
-        replacements: { cutoff }
-      });
+      await connector.query(
+        `DELETE FROM ${q('S3_PlayerSessions')} WHERE ${q('lastActivity')} < :cutoff`,
+        { replacements: { cutoff } }
+      );
       this.verboseLogger(3, `[Players] Session cleanup: removed rows with lastActivity < ${new Date(cutoff).toISOString()}`);
     } catch (err) {
       this.verboseLogger(2, `[Players] Session cleanup failed (non-fatal): ${err.message}`);
@@ -1599,7 +1900,10 @@ export default class PlayersService {
       },
       {
         tableName: 'S3_PlayerSessions',
-        timestamps: false
+        timestamps: false,
+        // Session start times are rebuilt from live play on the next tick, and
+        // stale rows are pruned by the cleanup above.
+        exportTier: 'ephemeral'
       }
     ) || null;
   }
@@ -1880,16 +2184,7 @@ export default class PlayersService {
     // The migration registration below also runs idempotent DDL through
     // the migration engine's query interface so verification passes on
     // fresh databases (see NOTE below for details).
-    await connector.query(`
-      CREATE TABLE IF NOT EXISTS S3_PlayerReconnects (
-        eosID VARCHAR(64) PRIMARY KEY,
-        steamID VARCHAR(64) NULL,
-        playerName VARCHAR(255) NULL,
-        lastTeamID INTEGER NULL,
-        lastSeenAt BIGINT NULL,
-        updatedAt BIGINT NOT NULL
-      );
-    `);
+    await connector.query(reconnectsTableDDL((id) => dbService.quoteIdentifier(id)));
 
     // ── Migration registration ─────────────────────────────────────
     // NOTE: The bootstrap DDL above (connector.query) creates tables before
@@ -1918,16 +2213,7 @@ export default class PlayersService {
           up: async (qi) => {
             // Run through qi so verification sees the table on the same connection.
             // Idempotent — safe if bootstrap DDL already created it.
-            await qi.rawQuery(`
-              CREATE TABLE IF NOT EXISTS S3_PlayerReconnects (
-                eosID VARCHAR(64) PRIMARY KEY,
-                steamID VARCHAR(64) NULL,
-                playerName VARCHAR(255) NULL,
-                lastTeamID INTEGER NULL,
-                lastSeenAt BIGINT NULL,
-                updatedAt BIGINT NOT NULL
-              );
-            `);
+            await qi.rawQuery(reconnectsTableDDL((id) => dbService.quoteIdentifier(id)));
           }
         },
         {
@@ -1942,15 +2228,7 @@ export default class PlayersService {
           up: async (qi) => {
             // Run through qi so verification sees the table on the same connection.
             // Idempotent — safe if bootstrap DDL already created it.
-            await qi.rawQuery(`
-              CREATE TABLE IF NOT EXISTS S3_PlayerSessions (
-                eosID VARCHAR(64) PRIMARY KEY,
-                steamID VARCHAR(64) NULL,
-                playerName VARCHAR(255) NULL,
-                sessionStart BIGINT NOT NULL,
-                lastActivity BIGINT NOT NULL
-              );
-            `);
+            await qi.rawQuery(sessionsTableDDL((id) => dbService.quoteIdentifier(id)));
           }
         }
       ]);
@@ -1996,7 +2274,10 @@ export default class PlayersService {
       },
       {
         tableName: 'S3_PlayerReconnects',
-        timestamps: false
+        timestamps: false,
+        // Reconnect memory — repopulated from live play, and entries expire on
+        // their own.
+        exportTier: 'ephemeral'
       }
     ) || null;
   }

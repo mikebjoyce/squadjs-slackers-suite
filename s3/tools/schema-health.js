@@ -35,9 +35,16 @@
  *
  */
 
-const { resolve, dirname } = require('path');
-const { existsSync } = require('fs');
-const { Sequelize } = require('sequelize');
+// ESM, not CommonJS. The repo's package.json sets "type": "module", so a .js
+// file using require() throws ReferenceError at load and the tool never runs at
+// all — which is how it sat broken behind a doc disclaimer that described a
+// subtler failure (every table reported missing) that nobody could have seen.
+import { resolve, dirname } from 'node:path';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { Sequelize } from 'sequelize';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ─── Expected Tables ──────────────────────────────────────────────
 //
@@ -161,7 +168,12 @@ function padRight(str, len) {
 
 async function checkAllTables(sequelize) {
   // Get all tables in the DB
-  const [allTablesRaw] = await sequelize.query(
+  // QueryTypes.SELECT already unwraps to a row array — it does NOT return the
+  // [rows, metadata] tuple the raw query form does. Destructuring it here took
+  // the first *row* instead of the row array, failed the Array.isArray check
+  // below, and left allTableNames empty, so every table reported ❌ missing
+  // whatever the database actually held.
+  const allTablesRaw = await sequelize.query(
     "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
     { type: Sequelize.QueryTypes.SELECT }
   );
@@ -189,7 +201,7 @@ async function checkAllTables(sequelize) {
     }
 
     // Get columns from PRAGMA
-    const [colResults] = await sequelize.query(
+    const colResults = await sequelize.query(
       `PRAGMA table_info('${table}')`,
       { type: Sequelize.QueryTypes.SELECT }
     );
@@ -277,7 +289,7 @@ function formatHuman({ results, totalChecks, totalPassed, totalWarnings, totalFa
 
   if (totalFailed > 0) {
     lines.push('');
-    lines.push('  ❗ Some checks failed. Run `node build/schema-version.cjs check`');
+    lines.push('  ❗ Some checks failed. Run `node s3/tools/schema-version.mjs check`');
     lines.push('     for per-plugin version status. If this is a fresh install,');
     lines.push('     tables will be created on next S³ mount.');
   }

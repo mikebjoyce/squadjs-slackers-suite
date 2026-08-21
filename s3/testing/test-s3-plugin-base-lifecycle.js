@@ -23,6 +23,8 @@
 
 import assert from 'node:assert/strict';
 
+import { versionAtLeast } from '../utils/s3-common.js';
+
 // ── S3PluginBase stub (mirrors plugins/s3-plugin-base.js) ────────
 
 class S3PluginBaseStub {
@@ -463,6 +465,53 @@ async function main() {
 
     await plugin.unmount();
     assert.equal(plugin._s3db, null);
+  });
+
+  // ──────────────────────────────────────
+  // _s3VersionAtLeast() — numeric, not lexicographic
+  //
+  // All four consumers gate mounting on this. The comparison it replaced was
+  // `actual < required` on raw strings, which is right only while every
+  // component stays a single digit: '1.10.0' < '1.4.0' is true as text, so the
+  // first two-digit minor release would have locked every plugin out of
+  // mounting. The double-digit cases below are the whole point of the test —
+  // they all passed the old implementation's inverse.
+  // ──────────────────────────────────────
+  await runTest('versionAtLeast() compares version components numerically', () => {
+    // The real utils/s3-common.js, not the stub — the whole point is that the
+    // gate the plugins actually call is correct, and every other test in this
+    // file goes through an inlined copy of the base class.
+    const at = versionAtLeast;
+
+    // Equal, and the plain single-digit cases the old code got right.
+    assert.equal(at('1.4.0', '1.4.0'), true, '1.4.0 >= 1.4.0');
+    assert.equal(at('1.5.0', '1.4.0'), true, '1.5.0 >= 1.4.0');
+    assert.equal(at('1.2.0', '1.4.0'), false, '1.2.0 < 1.4.0');
+    assert.equal(at('2.0.0', '1.9.9'), true, '2.0.0 >= 1.9.9');
+
+    // The regression: two-digit components. Lexicographically each of these
+    // compares the wrong way round.
+    assert.equal(at('1.10.0', '1.4.0'), true, '1.10.0 >= 1.4.0');
+    assert.equal(at('1.10.0', '1.9.0'), true, '1.10.0 >= 1.9.0');
+    assert.equal(at('10.0.0', '9.0.0'), true, '10.0.0 >= 9.0.0');
+    assert.equal(at('1.4.10', '1.4.9'), true, '1.4.10 >= 1.4.9');
+    assert.equal(at('1.4.0', '1.10.0'), false, '1.4.0 < 1.10.0');
+
+    // Uneven component counts pad with zero rather than short-circuiting.
+    assert.equal(at('1.4', '1.4.0'), true, '1.4 >= 1.4.0');
+    assert.equal(at('1.4', '1.4.1'), false, '1.4 < 1.4.1');
+    assert.equal(at('1.4.0.1', '1.4.0'), true, '1.4.0.1 >= 1.4.0');
+
+    // A prerelease suffix is dropped before parsing.
+    assert.equal(at('1.5.0-rc1', '1.4.0'), true, '1.5.0-rc1 >= 1.4.0');
+
+    // Fails closed — an unusable version must not pass the gate.
+    assert.equal(at(undefined, '1.0.0'), false, 'missing version');
+    assert.equal(at(null, '1.0.0'), false, 'null version');
+    assert.equal(at('', '1.0.0'), false, 'empty version');
+    assert.equal(at('not-a-version', '1.0.0'), false, 'unparseable version');
+    assert.equal(at(1.4, '1.0.0'), false, 'non-string version');
+    assert.equal(at('1.4.0', 'nonsense'), false, 'unparseable requirement');
   });
 }
 

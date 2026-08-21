@@ -48,6 +48,7 @@
  *   db              - DBService instance (access to models, connectors)
  *   transaction     - Active Sequelize transaction
  *   addColumn, removeColumn, addIndex, removeIndex, rawQuery
+ *   bulkInsert, bulkUpdate, bulkDelete
  *
  * ─── DEPENDENCIES ───────────────────────────────────────────────
  *
@@ -70,8 +71,35 @@
  */
 
 import crypto from 'node:crypto';
+import SequelizeLib from 'sequelize';
 import { createBackup } from './s3-backup.js';
 import { exportToFile as jsonExportToFile } from './s3-export-import.js';
+import { stderrError } from './s3-stderr.js';
+
+/**
+ * Count rows whose `column` is SQL NULL, through the model so the comparison is
+ * typed and dialect-agnostic.
+ *
+ * Op.is is spelled out rather than relying on `{ column: null }` shorthand. The
+ * shorthand does render as IS NULL today, but the same assumption made at the
+ * raw-query layer is exactly what produced the SQLite `= NULL` bug this whole
+ * mechanism exists to catch, so the intent is stated rather than inferred.
+ *
+ * Exported for the drift path in db-service.js, which asks the identical
+ * question on every mount and must not answer it a second, subtly different way.
+ *
+ * @param {Object} model - Sequelize model owning the column
+ * @param {string} column - Column (attribute) name to test
+ * @param {Object|null} [transaction=null] - Transaction, or null for committed state
+ * @returns {Promise<number>} count of rows with NULL in that column
+ */
+export async function countNullColumn(model, column, transaction = null) {
+  const Op = model.sequelize?.constructor?.Op || SequelizeLib.Op;
+  return model.count({
+    where: { [column]: { [Op.is]: null } },
+    transaction: transaction || null
+  });
+}
 
 /**
  * Create a QueryInterface object bound to a specific DBService + transaction.
@@ -80,10 +108,47 @@ import { exportToFile as jsonExportToFile } from './s3-export-import.js';
 function createQueryInterface(sequelize, db, transaction) {
   const DataTypes = db.getDataTypes();
 
+  /**
+   * Find the registered model backing a raw table name, so bulk operations can
+   * be given real attribute types.
+   *
+   * Without types, Sequelize's low-level bulk API escapes values by their JS
+   * shape alone — and on SQLite a JS Date then lands in the column as an integer
+   * epoch instead of the 'YYYY-MM-DD HH:MM:SS.SSS +00:00' TEXT that DataTypes.DATE
+   * reads back. Every later read of that row throws "date.includes is not a
+   * function". MySQL and Postgres escape Dates to a datetime literal regardless,
+   * which is exactly why this class of bug reaches production on SQLite only.
+   *
+   * The model is needed in TWO places, and supplying only one is a trap:
+   *   - `attributes` types the SET values.
+   *   - `options.model` types the WHERE values.
+   * Verified: updating `{ ts: <Date> }` as a WHERE with attributes but no model
+   * matches zero rows on SQLite and reports success, because the comparison is
+   * against a mis-escaped literal. Both are passed below.
+   *
+   * Models are keyed by model name, which is not always the table name, so match
+   * on either.
+   * @param {string} tableName
+   * @returns {Object|null} the Sequelize model, or null if none owns the table
+   */
+  function modelForTable(tableName) {
+    const direct = db.getModel(tableName);
+    if (direct?.rawAttributes) return direct;
+    for (const name of db.getModelNames?.() || []) {
+      const model = db.getModel(name);
+      if (model && (model.tableName || model.name) === tableName) return model;
+    }
+    return null;
+  }
+
   return {
     sequelize,
     db,
     transaction,
+    // Exposed so post-commit verification resolves models the same way bulk
+    // operations do. db.getModel() alone misses any model whose name differs
+    // from its table (e.g. model 'Elo_PluginState' → table 'Elo_PluginStates').
+    modelForTable,
 
     async addColumn(tableName, columnName, columnDef) {
       const qi = sequelize.getQueryInterface();
@@ -139,9 +204,64 @@ function createQueryInterface(sequelize, db, transaction) {
       await qi.createTable(tableName, attributes, { ...options, transaction });
     },
 
+    /**
+     * Bulk INSERT inside the migration transaction.
+     * Attribute types are resolved from the registered model for the same
+     * SQLite serialization reason described on bulkUpdate; `options.attributes`
+     * overrides the lookup.
+     */
     async bulkInsert(tableName, records, options = {}) {
       const qi = sequelize.getQueryInterface();
-      await qi.bulkInsert(tableName, records, { ...options, transaction });
+      const { attributes: override, ...rest } = options;
+      const attributes = override || modelForTable(tableName)?.rawAttributes || null;
+      await qi.bulkInsert(tableName, records, { ...rest, transaction }, attributes);
+    },
+
+    /**
+     * Bulk UPDATE inside the migration transaction.
+     * `where` is a Sequelize where-object; pass {} to update every row.
+     * Use this for backfills — the query generator handles dialect-correct
+     * identifier quoting, so camelCase columns survive on Postgres.
+     *
+     * The registered model is resolved automatically (see modelForTable) and
+     * supplied twice — as `attributes` for the SET values and as `options.model`
+     * for the WHERE values — so DATE/BOOLEAN/JSON serialize correctly on SQLite
+     * on both sides of the statement. Pass `options.attributes` / `options.model`
+     * only to override that lookup, e.g. for a table with no registered model.
+     * @param {string} tableName
+     * @param {Object} values - column → new value
+     * @param {Object} [where] - where-object; {} means all rows
+     */
+    async bulkUpdate(tableName, values, where = {}, options = {}) {
+      const qi = sequelize.getQueryInterface();
+      const { attributes: attrOverride, model: modelOverride, ...rest } = options;
+      const model = modelOverride || modelForTable(tableName);
+      const attributes = attrOverride || model?.rawAttributes || null;
+      await qi.bulkUpdate(
+        tableName,
+        values,
+        where,
+        { ...rest, transaction, ...(model ? { model } : {}) },
+        attributes
+      );
+    },
+
+    /**
+     * Bulk DELETE inside the migration transaction.
+     * `where` is a Sequelize where-object; pass {} to delete every row.
+     *
+     * The model is passed as Sequelize's fourth argument, which is what types
+     * the WHERE values — without it, deleting `{ someDate: <Date> }` matches
+     * nothing on SQLite and still reports success. Override with
+     * `options.model` for a table with no registered model.
+     * @param {string} tableName
+     * @param {Object} [where] - where-object; {} means all rows
+     */
+    async bulkDelete(tableName, where = {}, options = {}) {
+      const qi = sequelize.getQueryInterface();
+      const { model: modelOverride, ...rest } = options;
+      const model = modelOverride || modelForTable(tableName);
+      await qi.bulkDelete(tableName, where, { ...rest, transaction }, model || undefined);
     },
 
     /**
@@ -259,8 +379,35 @@ export default class MigrationEngine {
         );
       }
 
-      // ── touches (optional — structural validation) ────────────────
-      if (m.touches !== undefined) {
+      // ── touches (required) ────────────────────────────────────────
+      // Every migration MUST declare the tables, columns, and data rows it
+      // creates/alters/inserts. This enables _verifyMigrationResult() to confirm
+      // the DDL/DML actually took effect after the migration commits, catching
+      // permission issues that would otherwise go unnoticed (e.g. silent ADD
+      // COLUMN failures when the MySQL user lacks ALTER TABLE privileges, or
+      // silent row-insert failures from prior runs lost during a connector switch).
+      //
+      // Correct format:
+      //   touches: {
+      //     creates: ['TableA', 'TableB'],                        // new tables
+      //     columns: { TableA: ['col1', 'col2'] },                // columns on existing tables
+      //     rows: { TableA: [{ key: 'col', value: 'expected' }] } // seed rows (key=col to match, value=expected value)
+      //   }
+      //
+      // A migration that touches no schema (e.g. a pure data migration) should
+      // explicitly set touches: {} to indicate "intentionally no schema changes".
+      // However, data-only migrations SHOULD declare touches.rows so drift
+      // detection can confirm the seed rows actually exist on every mount.
+      if (!m.touches || typeof m.touches !== 'object') {
+        throw new Error(
+          `Migration v${m.version} in "${pluginName}" is missing a "touches" declaration. ` +
+          `Add touches: { creates: ['TableName'], columns: { TableName: ['col1','col2'] } } ` +
+          `or touches: {} if the migration makes no schema changes.`
+        );
+      }
+
+      // ── touches structural validation ────────────────────────────
+      if (m.touches) {
         if (typeof m.touches !== 'object' || m.touches === null || Array.isArray(m.touches)) {
           throw new Error(
             `Migration v${m.version} in "${pluginName}": touches must be an object if provided.`
@@ -287,10 +434,88 @@ export default class MigrationEngine {
             }
           }
         }
+        // ── touches.rows validation ────────────────────────────
+        // Each entry is a tableName → array of { key, value } objects
+        // that must exist in the table after the migration commits.
+        if (m.touches.rows !== undefined) {
+          if (typeof m.touches.rows !== 'object' || m.touches.rows === null || Array.isArray(m.touches.rows)) {
+            throw new Error(
+              `Migration v${m.version} in "${pluginName}": touches.rows must be a Record<string, Array<{key, value}>>.`
+            );
+          }
+          for (const [tableName, rowDefs] of Object.entries(m.touches.rows)) {
+            if (!Array.isArray(rowDefs) || !rowDefs.every(r =>
+              r && typeof r === 'object' && !Array.isArray(r) &&
+              typeof r.key === 'string' && typeof r.value === 'string'
+            )) {
+              throw new Error(
+                `Migration v${m.version} in "${pluginName}": touches.rows["${tableName}"] must be an array of { key: string, value: string } objects.`
+              );
+            }
+          }
+        }
+        // ── touches.data validation ────────────────────────────
+        // Post-conditions on column *values*, as opposed to touches.columns
+        // which only asserts a column exists. A migration that adds a column
+        // and backfills it can have the backfill silently do nothing — no rows
+        // matched, an early return, a guard that skipped the branch — and
+        // without this the version records as applied regardless.
+        //
+        //   data: { TableA: [{ column: 'col', notNull: true }] }
+        //
+        // An explicitly empty array means "author considered this table and
+        // there is no invariant to assert"; the conformance harness treats it
+        // as a deliberate opt-out rather than an omission.
+        //
+        // The predicate vocabulary is deliberately one word long. Every
+        // predicate added is another thing that can be subtly wrong in a way
+        // no one tests, and a rich assertion DSL becomes a second, worse
+        // migration language. Add `equals` only when a real case demands it.
+        if (m.touches.data !== undefined) {
+          if (typeof m.touches.data !== 'object' || m.touches.data === null || Array.isArray(m.touches.data)) {
+            throw new Error(
+              `Migration v${m.version} in "${pluginName}": touches.data must be a Record<string, Array<{column, notNull}>>.`
+            );
+          }
+          const KNOWN_PREDICATES = new Set(['column', 'notNull']);
+          for (const [tableName, dataDefs] of Object.entries(m.touches.data)) {
+            if (!Array.isArray(dataDefs)) {
+              throw new Error(
+                `Migration v${m.version} in "${pluginName}": touches.data["${tableName}"] must be an array of { column: string, notNull?: boolean } objects.`
+              );
+            }
+            for (const def of dataDefs) {
+              if (!def || typeof def !== 'object' || Array.isArray(def) || typeof def.column !== 'string' || def.column.length === 0) {
+                throw new Error(
+                  `Migration v${m.version} in "${pluginName}": touches.data["${tableName}"] entries must be objects with a non-empty "column" string.`
+                );
+              }
+              // A typo'd predicate that silently passes is worse than no
+              // assertion at all — the author believes they are covered.
+              const unknown = Object.keys(def).filter(k => !KNOWN_PREDICATES.has(k));
+              if (unknown.length > 0) {
+                throw new Error(
+                  `Migration v${m.version} in "${pluginName}": touches.data["${tableName}"].${def.column} has unknown predicate key(s): ${unknown.join(', ')}. Supported: notNull.`
+                );
+              }
+              if (def.notNull !== undefined && typeof def.notNull !== 'boolean') {
+                throw new Error(
+                  `Migration v${m.version} in "${pluginName}": touches.data["${tableName}"].${def.column}.notNull must be a boolean.`
+                );
+              }
+              if (def.notNull !== true) {
+                throw new Error(
+                  `Migration v${m.version} in "${pluginName}": touches.data["${tableName}"].${def.column} declares no assertion. Set notNull: true, or drop the entry.`
+                );
+              }
+            }
+          }
+        }
       }
     }
 
     // Sort ascending by version
+
     const sorted = [...migrations].sort((a, b) => a.version - b.version);
 
     // Check for gaps only if there are existing registrations
@@ -473,6 +698,8 @@ export default class MigrationEngine {
       if (!fileCopyResult && !jsonExportResult) {
         const msg = `[MigrationEngine] Backup FAILED for "${pluginName}" — aborting migration. Both file copy and JSON export failed. Check disk space, permissions, and DB connectivity.`;
         this.verboseLogger(1, msg);
+        stderrError('MigrationEngine', `Backup failed for "${pluginName}" — migration aborted before any schema change.`,
+          'Both the file copy and the JSON export failed. Check disk space, file permissions on the backup directory, and DB connectivity.');
         throw new Error(msg);
       }
 
@@ -501,6 +728,18 @@ export default class MigrationEngine {
           this.verboseLogger(3, `[MigrationEngine] Applied v${migration.version} for "${pluginName}".`);
           applied += 1;
         } catch (err) {
+          // Single choke point for migration failure diagnostics: every caller
+          // (autoMigrate, !s3 migrate force, !s3 confirm, a plugin's own
+          // verifyAndRunMigrations) funnels through this loop, and the Discord
+          // embed only carries err.message — the stack dies here otherwise.
+          // Mirrored to stderr so `2>` redirection captures it, then re-thrown
+          // unchanged so existing handling is untouched.
+          stderrError(
+            'MigrationEngine',
+            `"${pluginName}" v${appliedVersion} -> v${migration.version} failed: ${err.message}`,
+            err
+          );
+          this.verboseLogger(1, `[MigrationEngine] "${pluginName}" v${migration.version} failed: ${err.message}`);
           throw err; // Re-throw so the calling code knows the batch failed
         }
       }
@@ -652,37 +891,120 @@ export default class MigrationEngine {
   }
 
   /**
-   * Verify that the DDL declared in migration.touches actually took effect
+   * Verify that everything declared in migration.touches actually took effect
    * after up() committed. Runs outside any transaction to avoid dialect-specific
    * issues with describeTable inside user transactions.
    *
    * - If migration.touches is absent, verification is skipped (backward compatible).
    * - Checks showAllTables() for each entry in touches.creates.
-   * - Checks describeTable() for each column in touches.columns.
+   * - Checks describeTable() for every table named in touches.columns, whether
+   *   or not that table is also in touches.creates.
+   * - Checks touches.rows exist, via the owning model.
+   * - Checks touches.data post-conditions hold, via a per-column count().
    * - Collects all failures and throws one composite error.
    *
-   * @param {{ touches?: { creates?: string[], columns?: Record<string, string[]> } }} migration
+   * @param {{ touches?: { creates?: string[], columns?: Record<string, string[]>, rows?: Object, data?: Object } }} migration
    * @param {Object} qi - QueryInterface object (transaction must be null for DDL state checks)
-   * @throws {Error} If any table or column declared in touches is absent from the live schema
+   * @throws {Error} If any declared effect is absent from the live database
    */
   async _verifyMigrationResult(migration, qi) {
     if (!migration.touches) return;
 
     const failures = [];
 
+    // ── Verify touches.creates ───────────────────────────────
+    // Tables that failed to appear are recorded so the column, row and data
+    // checks below can skip them — a table that does not exist would otherwise
+    // produce a second failure for every column and every assertion on it,
+    // burying the one line that says what actually went wrong.
+    const missingTables = new Set();
     if (migration.touches.creates) {
       const existing = await qi.showAllTables();
       for (const tableName of migration.touches.creates) {
         if (!existing.includes(tableName)) {
           failures.push(`Table "${tableName}" was not created (permission denied?)`);
+          missingTables.add(tableName);
+        }
+      }
+    }
+
+    // ── Verify touches.columns ───────────────────────────────
+    // Every table named in touches.columns is described, not only those also
+    // listed in touches.creates. addColumn on a pre-existing table is the
+    // common case (and the one that fails on a DB user without ALTER grants),
+    // so restricting this to created tables verified nothing where it mattered.
+    if (migration.touches.columns) {
+      for (const [tableName, cols] of Object.entries(migration.touches.columns)) {
+        // A table we already reported as uncreated would only produce a second,
+        // noisier failure for each of its columns.
+        if (missingTables.has(tableName)) continue;
+        let actual;
+        try {
+          actual = await qi.sequelize.getQueryInterface().describeTable(tableName);
+        } catch (err) {
+          failures.push(`Column verification: cannot describe "${tableName}": ${err.message}`);
           continue;
         }
-        if (migration.touches.columns?.[tableName]) {
-          const actual = await qi.sequelize.getQueryInterface().describeTable(tableName);
-          for (const col of migration.touches.columns[tableName]) {
-            if (!actual[col]) {
-              failures.push(`Column "${tableName}.${col}" missing after migration`);
-            }
+        for (const col of cols) {
+          if (!actual[col]) {
+            failures.push(`Column "${tableName}.${col}" missing after migration`);
+          }
+        }
+      }
+    }
+
+    // ── Verify touches.rows ──────────────────────────────────
+    // For each declared row, query the model to confirm the row exists.
+    // Uses model-based lookup (dialect-agnostic) with null transaction so
+    // the query sees committed state.
+    if (migration.touches.rows) {
+      for (const [tableName, rowDefs] of Object.entries(migration.touches.rows)) {
+        if (missingTables.has(tableName)) continue;
+        const model = qi.modelForTable(tableName);
+        if (!model) {
+          failures.push(`Row verification: model "${tableName}" not found in registry`);
+          continue;
+        }
+        for (const { key, value } of rowDefs) {
+          const row = await model.findOne({
+            where: { [key]: value },
+            transaction: qi.transaction
+          });
+          if (!row) {
+            failures.push(`Row "${key}=${value}" not found in "${tableName}" after migration`);
+          }
+        }
+      }
+    }
+
+    // ── Verify touches.data ──────────────────────────────────
+    // The column existing proves the DDL ran; it says nothing about whether the
+    // backfill that was supposed to populate it did anything. On a server whose
+    // DB user has no ALTER grant the schema is applied by hand, so the data step
+    // is the only part of up() the engine actually executes — a silent no-op
+    // there is invisible by construction unless something counts the rows.
+    if (migration.touches.data) {
+      for (const [tableName, dataDefs] of Object.entries(migration.touches.data)) {
+        if (dataDefs.length === 0) continue; // explicit "no invariant here"
+        if (missingTables.has(tableName)) continue;
+        const model = qi.modelForTable(tableName);
+        if (!model) {
+          failures.push(`Data verification: model "${tableName}" not found in registry`);
+          continue;
+        }
+        for (const def of dataDefs) {
+          let offenders;
+          try {
+            offenders = await countNullColumn(model, def.column, qi.transaction);
+          } catch (err) {
+            failures.push(`Data verification failed for "${tableName}.${def.column}": ${err.message}`);
+            continue;
+          }
+          if (offenders > 0) {
+            failures.push(
+              `${offenders} row(s) in "${tableName}" still have NULL "${def.column}" after migration ` +
+              `(the backfill matched nothing — check the guard around it)`
+            );
           }
         }
       }
@@ -693,5 +1015,83 @@ export default class MigrationEngine {
         `Migration v${migration.version} reported success but verification failed:\n${failures.join('\n')}`
       );
     }
+  }
+
+  /* ─────────────────────── ROW DRIFT EXPOSURE ─────────────────────── */
+
+  /**
+   * Aggregate all touches.rows declarations from ALL registered migrations
+   * across ALL plugins. Returns a Map<tableName → Array<{ key, value }>>.
+   *
+   * This is consumed by DBService.verifyLiveSchema() so that ongoing drift
+   * detection (on every mount) can confirm seed rows still exist — not just
+   * at migration time, but across restarts, connector changes, and DB restores.
+   *
+   * @returns {Map<string, Array<{key: string, value: string}>>}
+   */
+  getExpectedRows() {
+    const result = new Map();
+    for (const migrations of this._migrations.values()) {
+      for (const m of migrations) {
+        if (m.touches?.rows) {
+          for (const [tableName, rowDefs] of Object.entries(m.touches.rows)) {
+            if (!result.has(tableName)) {
+              result.set(tableName, []);
+            }
+            // Merge in new rows, avoiding duplicates (same key+value)
+            const existing = result.get(tableName);
+            for (const def of rowDefs) {
+              const alreadyExists = existing.some(
+                e => e.key === def.key && e.value === def.value
+              );
+              if (!alreadyExists) {
+                existing.push({ key: def.key, value: def.value });
+              }
+            }
+          }
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Aggregate all touches.data declarations from ALL registered migrations
+   * across ALL plugins. Returns a Map<tableName → Array<{ column, notNull }>>.
+   *
+   * Consumed by DBService.verifyLiveSchema() so a declared data post-condition
+   * is re-checked on every mount, not only in the moments after the migration
+   * ran. A migration recorded as applied on a server that then loses the data —
+   * a restore from an older dump, a connector switch, a hand-run UPDATE — would
+   * otherwise never be looked at again, because nothing re-runs a version the
+   * tracker already considers current.
+   *
+   * Only ever declare a predicate here that holds for the lifetime of the table.
+   * A column that legitimately accepts NULL for rows written *after* the
+   * migration is not an invariant, and asserting it as one puts the plugin into
+   * a rollback-and-re-gate loop on every mount forever.
+   *
+   * @returns {Map<string, Array<{column: string, notNull: boolean}>>}
+   */
+  getExpectedData() {
+    const result = new Map();
+    for (const migrations of this._migrations.values()) {
+      for (const m of migrations) {
+        if (!m.touches?.data) continue;
+        for (const [tableName, dataDefs] of Object.entries(m.touches.data)) {
+          if (dataDefs.length === 0) continue; // explicit "no invariant here"
+          if (!result.has(tableName)) {
+            result.set(tableName, []);
+          }
+          const existing = result.get(tableName);
+          for (const def of dataDefs) {
+            if (!existing.some(e => e.column === def.column)) {
+              existing.push({ column: def.column, notNull: def.notNull === true });
+            }
+          }
+        }
+      }
+    }
+    return result;
   }
 }

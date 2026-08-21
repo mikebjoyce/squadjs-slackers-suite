@@ -1,4 +1,4 @@
-# Team Balancer Plugin v4.0.1
+# Team Balancer Plugin v4.0.6
 
 **SquadJS Plugin for Fair Match Enforcement**
 
@@ -14,7 +14,7 @@ Scramble execution swaps entire squads or unassigned players, balancing team siz
 
 * **Dual Win Streak Tracking**:
   - **Dominant Win Streaks**: Tracks wins that meet ticket margin thresholds (default: 150+ tickets). Triggers scramble after X dominant wins (default: 2).
-  - **Consecutive Win Streaks**: Tracks ANY consecutive wins regardless of margin. Optional secondary trigger (default: disabled). Useful for preventing prolonged one-sided matches even when margins are close.
+  - **Consecutive Win Streaks**: Tracks ANY consecutive wins regardless of margin. Secondary trigger, **on by default at 3** (`maxConsecutiveWinsWithoutThreshold`); set it to `0` to disable. Useful for preventing prolonged one-sided matches even when margins are close.
 
 * **Single-Round Scramble**: Optional "Mercy Rule" to scramble immediately after a single game with extreme ticket disparity.
 
@@ -56,7 +56,7 @@ Tracks per-player TrueSkill ratings (μ/σ) across rounds. When `useEloForBalanc
 
 **[squadjs-switch-teambalancer-aware](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/switch)**
 
-Prevents players from changing teams immediately after a scramble. When TeamBalancer executes a scramble, it fires the `TEAM_BALANCER_SCRAMBLE_EXECUTED` event. The Switch plugin listens for this event and automatically locks all players from switching teams for a configurable duration (default: 20 minutes).
+Prevents players from changing teams immediately after a scramble. When TeamBalancer executes a scramble, it fires the `TEAM_BALANCER_SCRAMBLE_EXECUTED` event. The Switch plugin listens for this event and automatically locks all players from switching teams for a configurable duration (Switch's `scrambleLockdownDurationMinutes`, default 30 minutes).
 
 **Why this matters**: Without this plugin, players moved during a scramble can immediately switch back to their original team, defeating the purpose of team balancing.
 
@@ -74,7 +74,9 @@ S³ is the centralised service container for shared state across Slacker's Squad
 
 **Why this matters**: Rather than maintaining its own duplicate caches, TeamBalancer reads ground-truth data from S³ — player/squad snapshots via `players.getAllPlayers()` / `players.getSquads()`, faction names via `factions.getTeamName()`, game-mode/layer detection via `gameState.getGamemode()` / `gameState.getLayerName()`, ignored-mode checks via `gameState.isIgnoredMode()`, and clan grouping via `clans.extractClanGroups()`. During scrambles, S³'s global-lock mechanism (`players.lockGlobal()` / `players.unlockGlobal()`) prevents concurrent scrambles from conflicting.
 
-**Setup**: Install S³ alongside TeamBalancer. S³ is auto-discovered at runtime via `this.server.plugins`. If S³ is absent, TeamBalancer falls back to raw SquadJS data for all services.
+**Setup**: Install S³ in `config.json` **before** TeamBalancer, so it mounts first. S³ is auto-discovered at runtime via `this.server.plugins`.
+
+S³ is **required, not optional** — there is no fallback to raw SquadJS data. `S3PluginBase._resolveS3()` throws if SlackersSquadServices is not found, so TeamBalancer fails to mount rather than degrading quietly.
 
 **Important**: The following settings have been **delegated to S³'s configuration** and are no longer read from the TeamBalancer plugin config:
 
@@ -85,29 +87,24 @@ S³ is the centralised service container for shared state across Slacker's Squad
 
 ## Scramble Algorithm (Optimal Exhaustive Search)
 
-Operates using a four-phase dynamic escalation system to ensure perfect numerical parity while protecting the core identity and cohesion of existing teams.
+Runs a single-phase exhaustive search over 2000 randomized candidate plans and keeps the best-scoring one. Every move is a whole-squad move — there is no escalation tier that breaks a squad open, so a plan that cannot be reached with intact squads is simply not reached.
 
 * **Data Prep**: Normalizes squad snapshots and treats unassigned players as individual "pseudo-squads" for maximum movement flexibility.
 
 * **Target Calc**: Computes ideal player swap targets (default 50% churn) adjusted by current team population deltas.
 
-* **Tiered Optimization (2000 Iterations)**:
-  * **Phase 1 (Pure Swaps)**: Focuses exclusively on whole-squad moves to maximize friend-group cohesion.
-  * **Phase 2 (Surgical Unlocked)**: Dynamically shatters one random unlocked squad if balance remains poor to provide precision adjustments.
-  * **Phase 3 (Surgical Locked)**: A late-stage fallback that allows breaking a single locked squad to resolve extreme parity issues.
-  * **Phase 4 (Nuclear Option)**: A final resort that decomposes all squads to achieve maximum numerical balance. Runs for the last 5 iterations.
-  * **With Clan Tag Grouping enabled**: same-team clan members are folded into "virtual squads" anchored on the squad with the most clan members; Phase 1 swaps them as one unit, and Phases 2/3 only shatter a virtual squad when no non-clan squad is eligible. Clan grouping configuration is managed by S³.
+* **Squad-Level Search (2000 Iterations)**: Each iteration reshuffles both teams' candidate lists and picks squads to swap until the churn target is met, with a 3-player grace so a squad that slightly overshoots still qualifies. The atoms are whole squads, unassigned players (size-1 pseudo-squads), and — with Clan Tag Grouping on — virtual clan squads. All 2000 iterations work the same way; nothing is decomposed at any stage.
 
 * **ELO Integration (Optional)**: When ELO data is available, the scrambler uses a dedicated ELO-weighted scoring branch (composite Mean/Top-15 ELO diff + veteran parity + numerical balance). Standard heuristic penalties like churn, anchor rules, and cohesion weights are disabled in favor of ELO parity.
 
 * **Identity Preservation**: In heuristic (non-ELO) mode, a penalty discourages moving more than 2 large infantry squads from a single team per scramble.
 
-* **Cap Enforcement**: A final corrective pass trims overages in priority order: Unassigned → Unlocked Squad Members. Locked players are never moved during cap enforcement.
+* **Cap Enforcement**: A final corrective pass trims teams over the cap using unassigned players only — never squad members, never clan members. If no eligible unassigned player is left, the overage is tolerated and logged rather than breaking a squad.
 
 ### Performance Benchmarks
-* **Execution Time**: ~70–95ms per search (exhaustive 2000-attempt pass).
-* **Balance Success**: 99.9% rate of achieving a team differential of ≤ 2 players.
-* **Cohesion**: Locked squads are preserved during Phases 1–2. Phase 3 may split one locked squad as a late-stage fallback. Phase 4 decomposes all squads.
+* **Execution Time**: ~30ms average per search (2500-run bulk test, exhaustive 2000-attempt pass).
+* **Balance Success**: 100% of runs land within 1 player without clan grouping. With clan grouping on, ~97% land within 2 — clan cohesion is a hard constraint and can rule out the otherwise perfect split.
+* **Cohesion**: No squad is ever split, locked or not, and no clan group ever ends up on both teams.
 
 ### Clan Tag Grouping (Managed by S³)
 
@@ -118,9 +115,19 @@ When clan tag grouping is enabled on S³, the scrambler keeps players who share 
 * **Tag detection**: Player names are scanned for a leading clan tag via a five-strategy detector (ported from [squadjs-elo-tracker](https://github.com/mikebjoyce/squadjs-slackers-suite/tree/master/elo-tracker)), tried in order: bracket pairs (`[TAG]`, `╔TAG╗`), explicit separators (`TAG | Name`, `TAG // Name`), 2+ space gap, short ASCII ALL-CAPS (`KM Lookout`), and a bare-prefix fallback for Unicode/mixed-case prefixes (`KeyErrorZ Korven`). Names with no visible tag/name boundary (e.g. `ABCJohnSmith`) yield no group.
 * **Matching**: Case-sensitive by default. Set `clanTagCaseSensitive: false` to normalize via NFD-decompose, lookalike mapping (`λ`→`a`, `я`→`r`, …), and uppercase, collapsing variants like `[Café]` / `[CAFE]` / `[CΛFE]`. Tags within `clanTagMaxEditDistance` Levenshtein distance are iteratively merged so transitive matches (`[AAA] ↔ [AAB] ↔ [ABB]`) collapse into one group.
 * **Virtual squads**: Per team, clan members are folded into a virtual squad anchored on the squad already holding the most clan members (tiebreak: larger size, lower ID). `clanGroupingPullEntireSquads` toggles whether non-clan teammates travel along (default: only clan members are pulled).
-* **Phase behavior**: Phase 1 swaps virtual squads atomically. Phases 2/3 prefer non-clan victims and only break a virtual squad when no other option exists; a soft scoring penalty further discourages re-splitting once decomposition begins.
+* **Overlapping clans**: Clans sitting in disjoint squads get one virtual squad each. Clans that share a squad merge into a single unit that moves as a whole — pulling one clan's members back out of another clan's virtual squad would break the very cohesion the grouping exists to provide.
+* **Cohesion guarantee**: A candidate plan that would place one clan group on both teams is rejected outright (score = `Infinity`), in ELO and heuristic mode alike. This is a hard constraint rather than a preference: it can cost a player or two of numerical balance, and that is the intended trade-off.
 
 **Cross-team clans are intentionally not consolidated** — if a clan starts split across teams, each side is treated independently.
+
+**In the Discord report**, every unit the scrambler moves is one block, naming each clan tag merged into it, its anchor squad (`⚓`) when the unit spans several in-game squads, and each player's original squad — `◆` for players carrying one of the block's tags, `◇` for the ones pulled along:
+
+```text
+Virtual Squad: [3DP] + [KMP] 6p · Ø27.5μ · ⚓Alpha
+  30.0★  ◆ Alpha     [3DP] Sparrow
+  28.0★  ◇ Alpha     Halloway
+  27.0★  ◆ Bravo     KMP | Okonkwo
+```
 
 ---
 
@@ -132,19 +139,19 @@ Add to your `config.json`:
 {
   "plugin": "TeamBalancer",
   "enabled": true,
-  "database": "sqlite",
   "enableWinStreakTracking": true,
   "enableSeedAutoScramble": true,
   "maxWinStreak": 2,
-  "maxConsecutiveWinsWithoutThreshold": 0,
-  "enableSingleRoundScramble": false,
-  "singleRoundScrambleThreshold": 250,
+  "maxConsecutiveWinsWithoutThreshold": 3,
+  "enableSingleRoundScramble": true,
+  "singleRoundScrambleThreshold": 200,
   "minTicketsToCountAsDominantWin": 150,
   "invasionAttackTeamThreshold": 300,
-  "invasionDefenceTeamThreshold": 650,
-  "scrambleAnnouncementDelay": 12,
+  "invasionDefenceTeamThreshold": 500,
+  "scrambleAnnouncementDelay": 25,
+  "seedScrambleAnnouncementDelay": 5,
   "scramblePercentage": 0.5,
-  "changeTeamRetryInterval": 50,
+  "changeTeamRetryInterval": 100,
   "maxScrambleCompletionTime": 15000,
   "showWinStreakMessages": true,
   "warnOnSwap": true,
@@ -157,16 +164,16 @@ Add to your `config.json`:
   "discordAdminRoleIDs": [],
   "mirrorRconBroadcasts": true,
   "postScrambleDetails": true,
-  "useEloForBalance": false,
+  "useEloForBalance": true,
   "devMode": false,
   "reportLogPath": "team-balancer-reports.jsonl",
   "enableDatabaseLogging": false
 }
 ```
 
-> **Note**: Clan tag grouping options (`enableClanTagGrouping`, `minClanGroupSize`, `maxClanGroupSize`, `clanTagMaxEditDistance`, `clanTagCaseSensitive`, `clanGroupingPullEntireSquads`) and `ignoredGameModes` are no longer configured on TeamBalancer — they are managed by S³. See the [S³ section](#s%C2%B3-slackers-squad-services) above.
+> **Note**: Clan tag grouping options (`enableClanTagGrouping`, `minClanGroupSize`, `maxClanGroupSize`, `clanTagMaxEditDistance`, `clanTagCaseSensitive`, `clanGroupingPullEntireSquads`) and `ignoredGameModes` are no longer configured on TeamBalancer — they are managed by S³. See the [S³ section](#s-slackers-squad-services) above.
 
-**Database Options:** The `"database"` option should match a connector name from your SquadJS connectors config. Use `"sqlite"` for file-based storage (default), `"mysql"` for MySQL, or `"postgres"` for PostgreSQL. Any Sequelize-compatible backend is supported.
+**Database:** TeamBalancer has no `database` option and never opens a connector of its own. It defines its models on S³'s connector, so the engine is whatever `database` is set to on the **SlackersSquadServices** plugin.
 
 **File Placement**: Move the project files into your SquadJS directory's squad-server folder.
 
@@ -181,11 +188,15 @@ squad-server/
 │   ├── tb-discord-helpers.js
 │   └── tb-swap-executor.js
 └── testing/ (optional)
+    ├── run-all-tests.js
     ├── scrambler-test-runner.js
+    ├── plugin-logic-test-runner.js
     ├── historical-scramble-test.js
     ├── historical-elo-backbone-test.js
-    ├── plugin-logic-test-runner.js
-    ├── elo-integration-test.js
+    ├── test-tb-elo-scramble.js
+    ├── test-team-balancer-plugin.js
+    ├── test-cross-clan-squad-collision.js
+    ├── embed-format-test.js
     └── mock-data-generator.js
 ```
 
@@ -219,34 +230,35 @@ Admin Commands:
 
 | Option | Required | Type | Default | Description |
 |--------|----------|------|---------|-------------|
-| `database` | yes | string | `"sqlite"` | Sequelize connector name for persistence (SQLite, MySQL, PostgreSQL, etc.) |
 | `enableWinStreakTracking` | no | boolean | `true` | Enable/disable automatic win streak tracking |
 | `enableSeedAutoScramble` | no | boolean | `true` | Auto-scramble teams at the end of a Seed round |
 | `maxWinStreak` | no | number | `2` | Dominant wins in a row to trigger a scramble |
-| `maxConsecutiveWinsWithoutThreshold` | no | number | `0` | Any consecutive wins to trigger scramble; `0` = disabled |
-| `enableSingleRoundScramble` | no | boolean | `false` | Scramble after a single round with extreme ticket margin |
-| `singleRoundScrambleThreshold` | no | number | `250` | Ticket margin for single-round scramble trigger |
+| `maxConsecutiveWinsWithoutThreshold` | no | number | `3` | Any consecutive wins to trigger scramble; `0` = disabled |
+| `enableSingleRoundScramble` | no | boolean | `true` | Scramble after a single round with extreme ticket margin |
+| `singleRoundScrambleThreshold` | no | number | `200` | Ticket margin for single-round scramble trigger |
 | `minTicketsToCountAsDominantWin` | no | number | `150` | Minimum ticket difference for a dominant win in Standard modes |
 | `invasionAttackTeamThreshold` | no | number | `300` | Ticket difference for Invasion attackers to count as dominant |
-| `invasionDefenceTeamThreshold` | no | number | `650` | Ticket difference for Invasion defenders to count as dominant |
-| `scrambleAnnouncementDelay` | no | number | `12` | Seconds before scramble executes after announcement |
+| `invasionDefenceTeamThreshold` | no | number | `500` | Ticket difference for Invasion defenders to count as dominant |
+| `scrambleAnnouncementDelay` | no | number | `25` | Seconds before scramble executes after announcement |
+| `seedScrambleAnnouncementDelay` | no | number | `5` | Countdown for the seed auto-scramble only, in seconds (minimum 3). Separate from `scrambleAnnouncementDelay` because the window before the map change is much shorter after a Seed round |
 | `scramblePercentage` | no | number | `0.5` | Fraction of players to move (0.0–1.0) |
-| `changeTeamRetryInterval` | no | number | `50` | RCON retry interval in ms |
+| `changeTeamRetryInterval` | no | number | `100` | RCON retry interval in ms |
 | `maxScrambleCompletionTime` | no | number | `15000` | Maximum time in ms for all swaps to complete |
 | `warnOnSwap` | no | boolean | `true` | Send RCON warning to players when swapped |
 | `requireScrambleConfirmation` | no | boolean | `true` | Require `!scramble confirm` before executing manual scrambles |
 | `scrambleConfirmationTimeout` | no | number | `60` | Seconds to wait for scramble confirmation |
 | `showWinStreakMessages` | no | boolean | `true` | Broadcast win streak updates after each round |
 | `useGenericTeamNamesInBroadcasts` | no | boolean | `false` | Use "Team 1"/"Team 2" instead of faction names in broadcasts |
-| `discordClient` | no | string | — | Discord connector name for Discord integration |
+| `discordClient` | no | string | `"discord"` | Discord connector name for Discord integration |
 | `discordAdminChannelID` | no | string | `""` | Discord channel ID for admin commands |
 | `discordReportChannelID` | no | string | `""` | Discord channel ID for automated reports (defaults to admin channel if unset) |
 | `discordAdminRoleIDs` | no | array | `[]` | Array of Discord role IDs required for admin commands (empty = all in channel) |
 | `mirrorRconBroadcasts` | no | boolean | `true` | Mirror RCON broadcasts to Discord |
 | `postScrambleDetails` | no | boolean | `true` | Post detailed swap plan to Discord after scramble |
-| `useEloForBalance` | no | boolean | `false` | Weight scrambles by EloTracker mu ratings (requires EloTracker plugin; falls back to numerical balance if absent) |
+| `useEloForBalance` | no | boolean | `true` | Weight scrambles by EloTracker mu ratings (requires EloTracker plugin; falls back to numerical balance if absent) |
 | `devMode` | no | boolean | `false` | Allow commands from any player regardless of admin status |
 | `reportLogPath` | no | string | `"team-balancer-reports.jsonl"` | Path to the JSONL log file for round reports |
+| `scrambleReportPath` | no | string | `"TeamBalancerScrambleReports/"` | Directory for per-scramble report files |
 | `enableDatabaseLogging` | no | boolean | `false` | If true, round reports are also written to database tables |
 
 > **S³-Managed Options**: The following settings are no longer configured on the TeamBalancer plugin. They are now managed by S³:
@@ -260,7 +272,7 @@ Admin Commands:
 
 - **RAAS / AAS**: Uses `minTicketsToCountAsDominantWin` threshold.
 - **Invasion**: Uses separate thresholds for attackers (`invasionAttackTeamThreshold`) and defenders (`invasionDefenceTeamThreshold`).
-- **Seed**: Excluded from win streak tracking. Optional auto-scramble at round end via `enableSeedAutoScramble`.
+- **Seed**: Excluded from win streak tracking. Optional auto-scramble at round end via `enableSeedAutoScramble`. This trigger runs on its own countdown, `seedScrambleAnnouncementDelay` (default 5s), not the global `scrambleAnnouncementDelay` — the gap between a Seed round ending and the map change is much shorter.
 - Other modes and map names can be excluded via `ignoredGameModes` (configured on S³).
 
 ---
@@ -272,16 +284,16 @@ The plugin operates two independent win tracking systems that can each trigger s
 ### Dominant Win Streaks (Primary)
 Tracks wins where the victor exceeded configured ticket margin thresholds:
 - **Standard modes (RAAS/AAS)**: `minTicketsToCountAsDominantWin` (default: 150)
-- **Invasion mode**: Separate thresholds for attackers (`invasionAttackTeamThreshold`: 300) and defenders (`invasionDefenceTeamThreshold`: 650)
+- **Invasion mode**: Separate thresholds for attackers (`invasionAttackTeamThreshold`: 300) and defenders (`invasionDefenceTeamThreshold`: 500)
 
 A scramble triggers when one team achieves `maxWinStreak` dominant victories in a row (default: 2).
 
 **Use case**: Prevents sustained one-sided stomps where skill or strategy gap is clear.
 
-### Consecutive Win Streaks (Secondary — Optional)
+### Consecutive Win Streaks (Secondary)
 Tracks ANY consecutive wins regardless of ticket margin. Controlled via `maxConsecutiveWinsWithoutThreshold`:
-- **Set to 0** (default): Feature disabled.
-- **Set to X > 0**: Triggers scramble after X consecutive wins, even if margins were close.
+- **Set to X > 0** — triggers a scramble after X consecutive wins, even if margins were close. **Defaults to 3, so this trigger is active out of the box.**
+- **Set to 0** — feature disabled.
 
 **Use case**: Prevents prolonged one-sided outcomes across matches with consistent but narrow victories.
 
@@ -344,6 +356,8 @@ TimeBeforeVote=45
 
 > [!IMPORTANT]
 > Ensure your `scrambleAnnouncementDelay` gives the plugin enough time to calculate and execute all swaps before the Map Voting phase concludes. If the plugin is still executing when Faction Voting begins, the remaining players will not be swapped successfully.
+
+**Seed rounds run on a shorter clock.** The window between a Seed round ending and the next map loading can be far shorter than the timings above, which is why the seed auto-scramble has its own `seedScrambleAnnouncementDelay` (default 5s, minimum 3s) instead of the global 25s/30s value. This matters because a countdown that has not fired by the time `NEW_GAME` arrives is discarded outright — teams are freshly assigned at that point, so firing into the new round would scramble the wrong one. Too long a seed delay therefore does not merely delay the scramble, it cancels it. If your seed rounds still end without a scramble, lower this value further.
 
 ---
 

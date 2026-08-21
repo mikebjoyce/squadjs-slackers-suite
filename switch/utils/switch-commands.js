@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║              SWITCH PLUGIN — COMMAND HANDLING                 ║
+ * ║              SWITCH PLUGIN — COMMAND HANDLING                  ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -41,6 +41,7 @@
  */
 
 import { setTimeout as delay } from "timers/promises";
+import SwitchExplain from '../utils/switch-explain.js';
 
 const SwitchCommands = {
   /**
@@ -64,10 +65,11 @@ const SwitchCommands = {
     // ── In-game chat command handler ───────────────────────────
 
     plugin.onChatMessage = async function (info) {
+      let eosID, steamID, playerName;
       try {
-        const eosID = info.player?.eosID;
-        const steamID = info.player?.steamID;
-        const playerName = info.player?.name;
+        eosID = info.player?.eosID;
+        steamID = info.player?.steamID;
+        playerName = info.player?.name;
         // Use S³ authoritative registry for teamID (includes null-teamID projection during STAGING)
         // Falls back to raw CHAT_MESSAGE event data if S³ isn't ready.
         const s3Player = plugin._s3?.players?.isReady() ? plugin._s3.players.getPlayer(eosID) : null;
@@ -104,7 +106,7 @@ const SwitchCommands = {
                 return;
               }
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
-              pl = plugin.getPlayerByUsernameOrSteamID(steamID, commandSplit.splice(1).join(' '))
+              pl = plugin.getPlayerByUsernameOrSteamID(eosID, commandSplit.splice(1).join(' '))
               if (pl) {
                 plugin._taggedSwitchPlayer(pl.eosID, 'Admin-Force').catch(err => {
                   plugin.verbose(1, `Admin switch now failed: ${err.message}`);
@@ -121,8 +123,8 @@ const SwitchCommands = {
                 const swapArgs = commandSplit.splice(1).join(' ').split(' ');
                 const name1 = swapArgs[0];
                 const name2 = swapArgs[1];
-                const p1 = plugin.getPlayerByUsernameOrSteamID(steamID, name1);
-                const p2 = plugin.getPlayerByUsernameOrSteamID(steamID, name2);
+                const p1 = plugin.getPlayerByUsernameOrSteamID(eosID, name1);
+                const p2 = plugin.getPlayerByUsernameOrSteamID(eosID, name2);
                 if (p1 && p2) {
                   await plugin._taggedSwitchPlayer(p1.eosID, 'Admin-Force');
                   await plugin._taggedSwitchPlayer(p2.eosID, 'Admin-Force');
@@ -138,7 +140,7 @@ const SwitchCommands = {
                 return;
               }
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
-              pl = plugin.getPlayerByUsernameOrSteamID(steamID, commandSplit.splice(1).join(' '))
+              pl = plugin.getPlayerByUsernameOrSteamID(eosID, commandSplit.splice(1).join(' '))
               if (pl) {
                 await plugin.doubleSwitchPlayer(pl.eosID, true);
               }
@@ -170,9 +172,21 @@ const SwitchCommands = {
               }
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
               await plugin.server.updatePlayerList();
-              pl = plugin.getPlayerByUsernameOrSteamID(steamID, commandSplit.splice(1).join(' '));
-              plugin.warn(eosID, `Player "${pl.name}" queued for switch at match end.`);
-              plugin.addPlayerToMatchendSwitches(pl);
+              // v2.5.6: pl can be undefined (no match / ambiguous name) — the
+              // old code dereferenced pl.name and threw, and the throw landed
+              // in the handler-wide catch, so the admin saw nothing at all.
+              // The confirmation also fired before the un-awaited insert.
+              pl = plugin.getPlayerByUsernameOrSteamID(eosID, commandSplit.splice(1).join(' '));
+              if (!pl) break;
+              try {
+                const queued = await plugin.addPlayerToMatchendSwitches(pl);
+                plugin.warn(eosID, queued
+                  ? `Player "${pl.name}" queued for switch at match end.`
+                  : `Player "${pl.name}" was already queued for match end — no change.`);
+              } catch (err) {
+                plugin.verbose(1, `[Switch] matchend enqueue failed for ${pl.name}: ${err.message || err}`);
+                plugin.warn(eosID, `Failed to queue "${pl.name}": ${err.message || err}`);
+              }
               break;
             case "doublesquad":
               if (!isAdmin) {
@@ -192,8 +206,15 @@ const SwitchCommands = {
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
               await plugin.server.updateSquadList();
               await plugin.server.updatePlayerList();
-              plugin.warn(eosID, `Squad ${commandSplit[1]} (${commandSplit[2]}) queued for switch at match end.`);
-              await plugin.addSquadToMatchendSwitches(+commandSplit[1], commandSplit[2]);
+              try {
+                const queuedCount = await plugin.addSquadToMatchendSwitches(+commandSplit[1], commandSplit[2]);
+                plugin.warn(eosID, queuedCount
+                  ? `Squad ${commandSplit[1]} (${commandSplit[2]}): ${queuedCount} player(s) queued for switch at match end.`
+                  : `Squad ${commandSplit[1]} (${commandSplit[2]}): nobody queued (empty squad, or all members already queued).`);
+              } catch (err) {
+                plugin.verbose(1, `[Switch] matchendsquad enqueue failed: ${err.message || err}`);
+                plugin.warn(eosID, `Failed to queue squad ${commandSplit[1]}: ${err.message || err}`);
+              }
               break;
             case "triggermatchend":
               if (!isAdmin) {
@@ -222,18 +243,36 @@ const SwitchCommands = {
               break;
             case "explain":
               {
+                const showTokenMessaging = plugin.options.maxSwitchTokens > 1;
                 const cooldownHours = plugin.options.switchCooldownMinutes > 0
                   ? (plugin.options.switchCooldownMinutes / 60).toFixed(1)
                   : plugin.options.switchCooldownHours;
-                plugin.warn(eosID, `[Switch] How It Works (1/5)\nYou can request a switch in the first ${plugin.options.switchEnabledMinutes}m after joining or after match start — whichever gives you more time.`);
+                const totalSteps = showTokenMessaging ? 6 : 5;
+                plugin.warn(eosID, `[Switch] How It Works (1/${totalSteps})\nYou can request a switch in the first ${plugin.options.switchEnabledMinutes}m after joining or after match start — whichever gives you more time.`);
                 await delay(5000);
-                plugin.warn(eosID, `[Switch] How It Works (2/5)\nIf teams are uneven, you are queued until a slot opens or a swap partner on the other team is found.`);
+                plugin.warn(eosID, `[Switch] How It Works (2/${totalSteps})\nIf teams are uneven, you are queued until a slot opens or a swap partner on the other team is found.`);
                 await delay(5000);
-                plugin.warn(eosID, `[Switch] How It Works (3/5)\nOnce in the queue, you have ${plugin.options.queueTimeoutMinutes}m before your request expires. Use !switch check to see your status.`);
+                plugin.warn(eosID, `[Switch] How It Works (3/${totalSteps})\nOnce in the queue, you have ${plugin.options.queueTimeoutMinutes}m before your request expires. Use !switch check to see your status.`);
                 await delay(5000);
-                plugin.warn(eosID, `[Switch] How It Works (4/5)\nAfter switching, there is a ${cooldownHours}h cooldown before you can switch again.`);
-                await delay(5000);
-                plugin.warn(eosID, `[Switch] How It Works (5/5)\nAfter a scramble, switches are locked for ${plugin.options.scrambleLockdownDurationMinutes}m.\nUse !switch check to see your current status.`);
+                // Per §3.6 of the spec: when maxSwitchTokens == 1 (legacy flat-cooldown mode),
+          // showTokenMessaging is false and we use the 5-step explain flow identical to
+          // the pre-token version. When maxSwitchTokens > 1, we show the 6-step token-aware flow.
+          if (showTokenMessaging) {
+                  plugin.warn(eosID, `[Switch] How It Works (4/6)\nEach switch costs 1 token. You hold up to ${plugin.options.maxSwitchTokens} tokens, and each refills individually every ${cooldownHours}h. Use !switch check to see your balance.`);
+                  await delay(5000);
+                  const seedBonusEnabled = plugin._isSeedBonusEnabled?.() ?? (plugin.options.seedTokenBonusAmount > 0 && plugin.options.seedTokenBonusMinutes > 0);
+                  const seedMinPlayers = plugin.options.seedTokenBonusMinPlayers ?? 0;
+                  const seedMinNote = seedMinPlayers > 0 ? ` (requires ${seedMinPlayers}+ players online)` : '';
+                  plugin.warn(eosID, seedBonusEnabled
+                    ? `[Switch] How It Works (5/6)\nDuring seed rounds, you earn +1 bonus switch token for every ${plugin.options.seedTokenBonusMinutes} minutes of presence${seedMinNote} (up to ${plugin.options.seedTokenBonusAmount} per round). Bonus tokens stack above your normal ${plugin.options.maxSwitchTokens}-token cap.`
+                    : `[Switch] How It Works (5/6)\nSeed bonus tokens are disabled on this server.`);
+                  await delay(5000);
+                  plugin.warn(eosID, `[Switch] How It Works (6/6)\nAfter a scramble, switches are locked for ${plugin.options.scrambleLockdownDurationMinutes}m.\nUse !switch check to see your current status.`);
+                } else {
+                  plugin.warn(eosID, `[Switch] How It Works (4/5)\nAfter switching, there is a ${cooldownHours}h cooldown before you can switch again.`);
+                  await delay(5000);
+                  plugin.warn(eosID, `[Switch] How It Works (5/5)\nAfter a scramble, switches are locked for ${plugin.options.scrambleLockdownDurationMinutes}m.\nUse !switch check to see your current status.`);
+                }
               }
               break;
             case "check":
@@ -252,10 +291,36 @@ const SwitchCommands = {
                   else {
                     const now = new Date();
                     const locked = result.scrambleLockdownExpiry && result.scrambleLockdownExpiry > now;
-                    const cooldownDuration = plugin.options.switchCooldownMinutes > 0 ? plugin.options.switchCooldownMinutes * 60 * 1000 : plugin.options.switchCooldownHours * 60 * 60 * 1000;
-                    const cooldown = result.lastSwitchTimestamp && (new Date(result.lastSwitchTimestamp.getTime() + cooldownDuration) > now);
-                    plugin.warn(eosID, `Status: ${result.playerName || result.steamID} | Locked: ${locked ? 'Yes' : 'No'} | Cooldown: ${cooldown ? 'Yes' : 'No'}`);
-                    plugin.verbose(1, `[Check] Admin check result: player=${result.playerName || result.steamID}, locked=${locked}, cooldown=${cooldown}`);
+                    const showTokenMessaging = plugin.options.maxSwitchTokens > 1;
+
+                    let cooldownMsg;
+                    if (showTokenMessaging) {
+                      const row = {
+                        tokenBalance: result.tokenBalance != null ? result.tokenBalance : plugin.options.maxSwitchTokens,
+                        tokenRegenAnchor: result.tokenRegenAnchor
+                      };
+                      plugin._regenTokens(row);
+                      if (row.tokenBalance < 1) {
+                        const cooldownDuration = plugin.options.switchCooldownMinutes > 0
+                          ? plugin.options.switchCooldownMinutes * 60 * 1000
+                          : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+                        const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
+                        const remaining = Math.ceil((cooldownDuration - (Date.now() - anchor)) / 60000);
+                        cooldownMsg = `Tokens: 0/${plugin.options.maxSwitchTokens}, next in ${remaining}m`;
+                      } else {
+                        cooldownMsg = `Tokens: ${row.tokenBalance}/${plugin.options.maxSwitchTokens}`;
+                      }
+                      plugin.verbose(1, `[Check] Admin check result: player=${result.playerName || result.steamID}, locked=${locked}, tokenBalance=${row.tokenBalance}`);
+                    } else {
+                      const cooldownDuration = plugin.options.switchCooldownMinutes > 0
+                        ? plugin.options.switchCooldownMinutes * 60 * 1000
+                        : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+                      const cooldown = result.lastSwitchTimestamp && (new Date(result.lastSwitchTimestamp.getTime() + cooldownDuration) > now);
+                      cooldownMsg = `Cooldown: ${cooldown ? 'Yes' : 'No'}`;
+                      plugin.verbose(1, `[Check] Admin check result: player=${result.playerName || result.steamID}, locked=${locked}, cooldown=${cooldown}`);
+                    }
+
+                    plugin.warn(eosID, `Status: ${result.playerName || result.steamID} | Locked: ${locked ? 'Yes' : 'No'} | ${cooldownMsg}`);
                   }
                 } else {
                   const eosID = info.player?.eosID;
@@ -287,17 +352,29 @@ const SwitchCommands = {
                     timeWindowMsg = `Closed (${connMin}m join, ${matchMin}m match)`;
                   }
 
+                  const showTokenMessaging = plugin.options.maxSwitchTokens > 1;
                   const cooldownDuration = plugin.options.switchCooldownMinutes > 0
                     ? plugin.options.switchCooldownMinutes * 60 * 1000
                     : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+                  const row = cooldownData
+                    ? { tokenBalance: cooldownData.tokenBalance, tokenRegenAnchor: cooldownData.tokenRegenAnchor }
+                    : { tokenBalance: plugin.options.maxSwitchTokens, tokenRegenAnchor: null };
+                  plugin._regenTokens(row);
+
                   let cooldownOK = true;
                   let cooldownMsg = 'Clear';
-                  if (!isLiberal && cooldownData && cooldownData.lastSwitchTimestamp) {
-                    const lastSwitchTime = new Date(cooldownData.lastSwitchTimestamp).getTime();
-                    if (now - lastSwitchTime < cooldownDuration) {
+                  if (!isLiberal) {
+                    if (row.tokenBalance < 1) {
                       cooldownOK = false;
-                      const remaining = Math.ceil((cooldownDuration - (now - lastSwitchTime)) / 60000);
-                      cooldownMsg = `${remaining}m remaining`;
+                      const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : now;
+                      const remaining = Math.ceil((cooldownDuration - (now - anchor)) / 60000);
+                      if (showTokenMessaging) {
+                        cooldownMsg = `0/${plugin.options.maxSwitchTokens} tokens, next in ${remaining}m`;
+                      } else {
+                        cooldownMsg = `${remaining}m remaining`;
+                      }
+                    } else if (showTokenMessaging) {
+                      cooldownMsg = `${row.tokenBalance}/${plugin.options.maxSwitchTokens} tokens`;
                     }
                   }
 
@@ -314,7 +391,7 @@ const SwitchCommands = {
 
                   if (isLiberal) {
                     statusMsg += `[OK] Time       | Seed Mode\n`;
-                    statusMsg += `[OK] Cooldown   | Seed Mode\n`;
+                    statusMsg += `[OK] Cooldown   | Seed Mode${showTokenMessaging ? ` (${row.tokenBalance}/${plugin.options.maxSwitchTokens} tokens)` : ''}\n`;
                   } else {
                     statusMsg += `[${timeWindowOK ? 'OK' : 'X '}] Time       | ${timeWindowMsg}\n`;
                     statusMsg += `[${cooldownOK ? 'OK' : 'X '}] Cooldown   | ${cooldownMsg}\n`;
@@ -355,13 +432,17 @@ const SwitchCommands = {
                   plugin.warn(eosID, 'Player not found or multiple matches.');
                   return;
                 }
-                const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
-                if (PlayerCooldowns) {
-                  await plugin._withDb(async (t) => {
-                    await PlayerCooldowns.destroy({ where: { eosID: result.eosID }, transaction: t });
-                  });
+                // Reported inline rather than left to the handler's catch-all.
+                // The catch-all is 300 lines below and replies nothing, which is
+                // how `clearall` stayed broken on a live MySQL server for so
+                // long: the admin saw silence and assumed success.
+                try {
+                  await plugin.adminClearPlayer(result.eosID);
+                  plugin.warn(eosID, `Cleared restrictions for ${result.playerName || result.steamID} (seed tokens kept).`);
+                } catch (err) {
+                  plugin.verbose(1, `[Admin] clear failed for ${result.playerName || result.eosID}: ${err.message}`);
+                  plugin.warn(eosID, `Clear failed: ${err.message}`);
                 }
-                plugin.warn(eosID, `Cleared cooldowns for ${result.playerName || result.steamID}`);
               }
               break;
             case "clearall":
@@ -370,15 +451,40 @@ const SwitchCommands = {
                 return;
               }
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
+              try {
+                const { toppedUp, locksCleared } = await plugin.adminClearAllRestrictions();
+                plugin.warn(eosID, `Restrictions cleared — ${toppedUp} topped up, ${locksCleared} scramble locks lifted. Seed tokens kept. Use !switch wipe confirm to delete all rows.`);
+              } catch (err) {
+                plugin.verbose(1, `[Admin] clearall failed: ${err.message}`);
+                plugin.warn(eosID, `Clear all failed: ${err.message}`);
+              }
+              break;
+            case "wipe":
+              if (!isAdmin) {
+                plugin.verbose(1, `[Denied] Player ${playerName} (not admin) attempted admin command: ${subCommand}`);
+                return;
+              }
+              plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
               {
-                const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
-                if (PlayerCooldowns) {
-                  await plugin._withDb(async (t) => {
-                    await PlayerCooldowns.destroy({ where: {}, truncate: true, transaction: t });
-                  });
+                // `wipe` is the only command that destroys earned seed tokens,
+                // and there is no undo. It sits one keystroke away from
+                // `clearall`, which deletes nothing — so the confirm word is
+                // what separates "lift everyone's locks" from "take everyone's
+                // seed bonus away" when an admin types the wrong one in a hurry.
+                if ((commandSplit[1] || '').toLowerCase() !== 'confirm') {
+                  plugin.warn(eosID,
+                    'Wipe DELETES every cooldown row, including earned seed tokens. This cannot be undone. ' +
+                    'Type !switch wipe confirm to proceed, or !switch clearall to lift restrictions without deleting anything.');
+                  return;
+                }
+                try {
+                  const deleted = await plugin.adminWipeAll();
+                  plugin.warn(eosID, `Wiped ${deleted} cooldown rows — every player is back to a clean default.`);
+                } catch (err) {
+                  plugin.verbose(1, `[Admin] wipe failed: ${err.message}`);
+                  plugin.warn(eosID, `Wipe failed: ${err.message}`);
                 }
               }
-              plugin.warn(eosID, "All player cooldowns cleared.");
               break;
             case 'cancel':
               if (!plugin.options.queueEnabled) {
@@ -444,7 +550,11 @@ const SwitchCommands = {
               plugin.verbose(1, `[Switch] Denied ${playerName}: Match time limit exceeded.`);
               plugin._trackDenial(eosID, playerName, 'time_window');
             } else if (eligibility.reason === 'cooldown') {
-              plugin.warn(eosID, `[Switch] On cooldown — available in ${eligibility.remaining}m.\nUse !switch check to see your full status.`);
+              if (plugin.options.maxSwitchTokens > 1) {
+                plugin.warn(eosID, `[Switch] Out of switch tokens — next one in ${eligibility.remaining}m.\nUse !switch check to see your full status.`);
+              } else {
+                plugin.warn(eosID, `[Switch] On cooldown — available in ${eligibility.remaining}m.\nUse !switch check to see your full status.`);
+              }
               plugin.verbose(1, `[Switch] Denied ${playerName}: Cooldown active.`);
               plugin._trackDenial(eosID, playerName, 'cooldown');
             }
@@ -469,6 +579,20 @@ const SwitchCommands = {
               await plugin._enqueuePlayer(info.player, 'Your request has been queued.');
               return;
             }
+          }
+
+          // ── Post-async liveness check ──────────────────────────────
+          // Guard: if the player disconnected while we were waiting on async
+          // operations (e.g. DB queries queued behind a pool exhaustion spike),
+          // don't proceed to enqueue or switch a ghost entry. The most recent
+          // async work was _checkSwitchEligibility (line 502), which may have
+          // blocked on the DB pool for many seconds.
+          const s3PlayerNow = plugin._s3?.players?.isReady()
+            ? plugin._s3.players.getPlayer(eosID)
+            : null;
+          if (!s3PlayerNow) {
+            plugin.verbose(2, `[Switch] ${playerName}: disconnected during async processing — aborting.`);
+            return;
           }
 
           const isLiberal = plugin.isLiberalMode();
@@ -558,15 +682,24 @@ const SwitchCommands = {
                 if (!eosID) {
                   plugin.verbose(1, `[PlayerCooldowns] Missing eosID for player ${playerName}, skipping cooldown write`);
                 } else {
-                  const now = new Date();
-                  plugin.verbose(1, `[Switch] Writing cooldown for ${playerName} (eosID=${eosID}) at ${now.toISOString()}`);
+                  plugin.verbose(1, `[Switch] Writing token spend for ${playerName} (eosID=${eosID})`);
                   const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
                   if (PlayerCooldowns) {
                     await plugin._withDb(async (t) => {
-                      await PlayerCooldowns.upsert({ eosID, steamID, playerName, lastSwitchTimestamp: now }, { transaction: t });
+                      // §3.3 of switch-token-system-spec: load → regen → spend → upsert
+                      let row = await PlayerCooldowns.findByPk(eosID, { transaction: t });
+                      if (!row) {
+                        row = { eosID, steamID, playerName, tokenBalance: plugin.options.maxSwitchTokens, tokenRegenAnchor: null };
+                      }
+                      plugin._regenTokens(row);
+                      plugin._spendToken(row);
+                      await PlayerCooldowns.upsert(
+                        { eosID, steamID, playerName, tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor, lastActiveTimestamp: new Date() },
+                        { transaction: t }
+                      );
                     });
                   }
-                  plugin.verbose(1, `[Switch] Cooldown written successfully for ${playerName}`);
+                  plugin.verbose(1, `[Switch] Token spend written successfully for ${playerName}`);
                 }
               } catch (dbErr) {
                 plugin.verbose(1, `[Switch] Database update failed: ${dbErr.message}`);
@@ -586,27 +719,247 @@ const SwitchCommands = {
               plugin._updateMaxQueueSize();
             }
 
+            // Post-switch token notice (gated on showTokenMessaging)
+            // NOTE: Read-after-write — same rationale as the queue post-switch notices.
+            // The token-spend transaction above has already committed by this point;
+            // this is a fresh read for display purposes only. A missed read (due to
+            // a concurrent modification in the single-digit-ms window) means one
+            // missing notification, which is harmless.
+            if (!isLiberal && plugin.options.maxSwitchTokens > 1) {
+              try {
+                const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
+                if (PlayerCooldowns) {
+                  const row = await PlayerCooldowns.findByPk(eosID);
+                  if (row) {
+                    const balance = row.tokenBalance != null ? row.tokenBalance : plugin.options.maxSwitchTokens;
+                    if (balance > 0) {
+                      plugin.warn(eosID, `[Switch] Switched! ${balance}/${plugin.options.maxSwitchTokens} tokens remaining.`);
+                    } else {
+                      const cooldownDuration = plugin.options.switchCooldownMinutes > 0
+                        ? plugin.options.switchCooldownMinutes * 60 * 1000
+                        : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+                      const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
+                      const remaining = Math.ceil((cooldownDuration - (Date.now() - anchor)) / 60000);
+                      plugin.warn(eosID, `[Switch] Switched! You're out of tokens — next one in ~${remaining}m.`);
+                    }
+                  }
+                }
+              } catch (e) {
+                plugin.verbose(1, `[Switch] Token notice read failed for ${playerName}: ${e.message}`);
+              }
+            }
+
             plugin.verbose(1, `[Switch] Executed for ${playerName}.`);
           } else {
             plugin.verbose(1, `[Switch] NOT recording cooldown for ${playerName} — switchSuccess=${switchSuccess}`);
           }
         }
       } catch (err) {
-        // Track denied switch (only for unexpected errors — gameplay denials are tracked inline)
+        // Track denied switch (only for unexpected errors — gameplay denials are tracked inline).
+        // Reason is hardcoded to 'unexpected error' to prevent raw SQL/RCON error messages
+        // (e.g. "Unknown column 'tokenBalance' in 'field list'") from leaking into the
+        // Discord round summary embed. Full error details are logged via verbose() below.
+        // NOTE: This bypasses _trackDenial() — no per-player dedup. If the same player
+        // triggers multiple unexpected errors in one round, they'll appear multiple times.
         if (plugin._roundStats) {
           const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
           plugin._roundStats.deniedSwitches.push({
-            name: playerName || 'unknown',
+            // Use info.player?.name rather than playerName because playerName is declared with
+            // let inside the try block and may be undefined in the catch block if the error
+            // occurred before playerName was assigned (e.g. at the top-level eosID/steamID guard).
+            // info.player is always in scope since it's the function argument.
+            name: info.player?.name || 'unknown',
             eosID: eosID || 'unknown',
-            reason: err.message || 'unknown',
+            reason: 'unexpected error',
             gamePhase
           });
         }
-        plugin.verbose(1, `Error in onChatMessage: ${err.stack}`);
+        // Mirrored to stderr: this catch-all is the one an operator sees repeat
+        // during an incident (it fired every !switch when v5's column was
+        // missing), so it belongs in the error file, deduped.
+        //
+        // Guarded because this is a catch-all: if a caller passes a plugin
+        // stand-in without reportError (the mock harness did), an unguarded call
+        // would throw from inside the catch and replace the real error with a
+        // TypeError — losing exactly the diagnostic this block exists to emit.
+        if (typeof plugin.reportError === 'function') {
+          plugin.reportError('Commands', `Error in onChatMessage: ${err.message}`, err, { includeStackInLog: true });
+        } else {
+          plugin.verbose(1, `Error in onChatMessage: ${err.stack}`);
+        }
       }
     };
 
     // ── Discord stats scraper ──────────────────────────────────
+
+    /**
+     * Parse the mode from a round summary embed.
+     *
+     * Reads the "📊 Stats" field and checks the `**Mode:**` line to determine
+     * if the round was played under liberal (Seed/Jensen) rules or standard
+     * rules. Liberal rounds are excluded from the aggregate stats embed
+     * (see `_handleStatsCommand` line 663-666), so correct classification
+     * is essential to avoid polluting standard-round aggregates with
+     * liberal-mode data.
+     *
+     * Format matched:
+     *   `**Mode:** Liberal (Seed/Jensen)`   → 'liberal'
+     *   `**Mode:** Standard`                → 'standard'
+     *   No Stats field / no **Mode:** line  → 'standard' (covers pre-v2.2.0 embeds)
+     *
+     * @param {object} embed — Discord embed object from a "Switch Round Summary" message
+     * @returns {'liberal'|'standard'}
+     */
+    plugin._parseMode = function (embed) {
+      // Locate the 📊 Stats field by name — this is the first field in the embed
+      const statsField = embed.fields?.find(f => f.name?.includes('Stats'));
+      // If the Stats field is entirely absent (e.g. old-format embed or data loss),
+      // default to 'standard' so the round is included rather than silently skipped.
+      if (!statsField?.value) return 'standard';
+      // The embed builder at switch-output.js:383 writes the **Mode:** line as:
+      //   `**Mode:** Liberal (Seed/Jensen)` or `**Mode:** Standard`
+      // We match case-insensitively on "Liberal" to handle any future wording changes.
+      if (/\*\*Mode:\*\*.*Liberal/i.test(statsField.value)) return 'liberal';
+      // Any other value (Standard, missing, unknown) → standard.
+      return 'standard';
+    };
+
+    /**
+     * Parse movement type counts from a round summary embed.
+     *
+     * Reads the "🔄 Switch Methods" field and extracts the parenthetical
+     * count from each sub-section header. Each header is only rendered
+     * by `_buildRoundSummaryEmbed()` when its count is > 0, so a missing
+     * header naturally returns 0 via `_parseStatsNum`'s no-match behaviour.
+     *
+     * Sub-section headers and their embed builder lines:
+     *   `**Instant Switches (N)**`        — switch-output.js:408 (s.instantSwitches.length)
+     *   `**Queue Normal (N)**`            — switch-output.js:419 (s.queueNormal.length)
+     *   `**Queue Team Trade (N)**`        — switch-output.js:429 (s.queueTeamTrades.length)
+     *   `**Queue Join Swap (N)**`         — switch-output.js:440 (s.queueJoinSwaps.length)
+     *   `**Queue Timeout Switch (N)**`    — switch-output.js:451 (s.queueTimeoutSwitches.length)
+     *
+     * @param {object} embed — Discord embed object from a "Switch Round Summary" message
+     * @returns {{ instant: number, queueNormal: number, queueTeamTrade: number, queueJoinSwap: number, queueTimeoutSwitch: number }}
+     */
+    plugin._parseMoveTypes = function (embed) {
+      // The Switch Methods field is only present when there is at least one
+      // successful switch of any type. If absent, all counts default to 0.
+      const field = embed.fields?.find(f => f.name?.includes('Switch Methods'));
+      const v = field?.value || '';
+      return {
+        // Each regex matches the sub-section header format: **{Label} (N)**\n...
+        // The capture group extracts N, and _parseStatsNum handles non-matches → 0.
+        instant:             plugin._parseStatsNum(/\*\*Instant Switches\s*\((\d+)\)/, v),
+        queueNormal:         plugin._parseStatsNum(/\*\*Queue Normal\s*\((\d+)\)/, v),
+        queueTeamTrade:      plugin._parseStatsNum(/\*\*Queue Team Trade\s*\((\d+)\)/, v),
+        queueJoinSwap:       plugin._parseStatsNum(/\*\*Queue Join Swap\s*\((\d+)\)/, v),
+        queueTimeoutSwitch:  plugin._parseStatsNum(/\*\*Queue Timeout Switch\s*\((\d+)\)/, v),
+      };
+    };
+
+    /**
+     * Parse denial reason counts from a round summary embed.
+     *
+     * Reads the "📊 Stats" field and extracts the per-reason breakdown
+     * from the `**Denied:**` line, e.g.:
+     *   `**Denied:** 5 players (3 cooldown, 1 time_window, 1 scramble_lock)`
+     *
+     * The denial breakdown string is built by `_buildRoundSummaryEmbed()` at
+     * switch-output.js:378-380 from `s.deniedSwitches` array, grouping by
+     * `reason` property. The possible reasons are:
+     *   - `cooldown`      — player is within their switch cooldown window
+     *   - `time_window`   — player joined after the switch eligibility window closed
+     *   - `scramble_lock` — player is under scramble lockdown
+     *
+     * If no denials occurred this round, the `**Denied:**` line is absent
+     * (guarded by `if (totalDenied > 0)` at switch-output.js:386), so the
+     * regex won't match and we return zeroes.
+     *
+     * @param {object} embed — Discord embed object from a "Switch Round Summary" message
+     * @returns {{ cooldown: number, time_window: number, scramble_lock: number }}
+     */
+    plugin._parseDenialReasons = function (embed) {
+      // The Stats field is always present for rounds that produced a summary
+      // (it's the first field in the embed), but guard anyway for safety.
+      const statsField = embed.fields?.find(f => f.name?.includes('Stats'));
+      const v = statsField?.value || '';
+      // Match the entire Denied line and capture the parenthesised breakdown.
+      // Pattern breakdown:
+      //   \*\*Denied:\*\*       — literal "**Denied:**"
+      //   \s*\d+\s*players?\s*  — space, count, "player" or "players", space
+      //   \((.+?)\)             — capture the parenthesised breakdown (non-greedy)
+      const denyMatch = v.match(/\*\*Denied:\*\*\s*\d+\s*players?\s*\((.+?)\)/);
+      // No Denied line → no denials this round → return zeroes.
+      if (!denyMatch) return { cooldown: 0, time_window: 0, scramble_lock: 0 };
+      // Capture group 1 contains e.g. "3 cooldown, 1 time_window, 1 scramble_lock"
+      const parts = denyMatch[1];
+      return {
+        // Each sub-regex extracts the number before the reason keyword.
+        // _parseStatsNum returns 0 if the keyword is not found in the breakdown.
+        cooldown:      plugin._parseStatsNum(/(\d+)\s+cooldown/, parts),
+        time_window:   plugin._parseStatsNum(/(\d+)\s+time_window/, parts),
+        scramble_lock: plugin._parseStatsNum(/(\d+)\s+scramble_lock/, parts),
+      };
+    };
+
+    /**
+     * Parse queue outcome counts from a round summary embed.
+     *
+     * Reads the "ℹ️ Queue Activity" field and extracts the parenthetical
+     * count from each non-success outcome header. Each header is only
+     * rendered by `_buildRoundSummaryEmbed()` when its count is > 0,
+     * so missing headers naturally return 0.
+     *
+     * Unlike movement types (which represent successes), queue outcomes
+     * represent terminal states that did NOT result in a switch:
+     *
+     *   `**Expired (N)**`            — queue timeout without timeout-switch enabled
+     *   `**DC'd in Queue (N)**`      — player disconnected while in queue
+     *   `**Cancelled (N)**`          — player manually left the queue
+     *   `**Removed (N)**`            — removed due to team change (scramble, admin, etc.)
+     *
+     * Sub-section header embed builder lines:
+     *   expired   — switch-output.js:466
+     *   dc        — switch-output.js:486
+     *   cancelled — switch-output.js:497
+     *   removed   — switch-output.js:504
+     *
+     * @param {object} embed — Discord embed object from a "Switch Round Summary" message
+     * @returns {{ expired: number, dc: number, cancelled: number, removed: number }}
+     */
+    plugin._parseQueueOutcomes = function (embed) {
+      // The Queue Activity field is only present when there is at least one
+      // non-success queue outcome or denied switch. If absent, all counts default to 0.
+      const field = embed.fields?.find(f => f.name?.includes('Queue Activity'));
+      const v = field?.value || '';
+      return {
+        // Each regex matches the sub-section header format: **{Label} (N)**\n...
+        // The capture group extracts N, and _parseStatsNum handles non-matches → 0.
+        expired:   plugin._parseStatsNum(/\*\*Expired\s*\((\d+)\)/, v),
+        dc:        plugin._parseStatsNum(/\*\*DC'd in Queue\s*\((\d+)\)/, v),
+        cancelled: plugin._parseStatsNum(/\*\*Cancelled\s*\((\d+)\)/, v),
+        removed:   plugin._parseStatsNum(/\*\*Removed\s*\((\d+)\)/, v),
+      };
+    };
+
+    /**
+     * Compute the median of a numeric array using zero-copy sort.
+     * Returns 0 for empty/null input.
+     *
+     * NOTE: Duplicated from switch-output.js. If the algorithm changes,
+     * update both copies.
+     *
+     * @param {number[]|null} arr — array of millisecond durations
+     * @returns {number} median in milliseconds, or 0
+     */
+    plugin._computeMedianFromMs = function (arr) {
+      if (!arr || arr.length === 0) return 0;
+      const sorted = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      if (sorted.length % 2 === 0) return Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+      return sorted[mid];
+    };
 
     plugin._handleStatsCommand = async function (message, args) {
       const daysArg = args.find(a => /^\d+$/.test(a));
@@ -615,36 +968,132 @@ const SwitchCommands = {
 
       await message.channel.send(`🔍 Scraping switch stats from the last ${STATS_LOOKBACK_DAYS} days...`);
 
-      const totals = { rounds: 0, success: 0, failed: 0, denied: 0, toT1: 0, toT2: 0 };
-      let before = message.id;
+      // ── Aggregate containers ──
+      const totals = {
+        rounds: 0,
+        standardRounds: 0,
+        liberalRounds: 0,
+        // Summary
+        success: 0, failed: 0, denied: 0, toT1: 0, toT2: 0,
+        maxQueueSize: 0,
+        // Movement types
+        instant: 0, queueNormal: 0, queueTeamTrade: 0, queueJoinSwap: 0, queueTimeoutSwitch: 0,
+        // Denial reasons
+        denialCooldown: 0, denialTimeWindow: 0, denialScrambleLock: 0,
+        // Queue outcomes
+        outcomeExpired: 0, outcomeDC: 0, outcomeCancelled: 0, outcomeRemoved: 0,
+        // All denied from Queue Activity (distinct from denial reasons)
+        deniedInQueueActivity: 0,
+        // Data quality
+        incompleteRounds: 0,
+        totalQueueEntries: 0,
+        queueDurationsMs: [],
+        medianDurationsMs: [],  // per-round medians scraped from embeds
+        missingMedian: 0        // rounds without median data (old-format embeds)
+      };
+
+      let before = undefined;
       let keepGoing = true;
 
       try {
+        const reportChan = plugin.channel;
+        if (!reportChan) {
+          await message.channel.send('❌ Reporting channel is not available.');
+          return;
+        }
         while (keepGoing) {
-          const batch = await message.channel.messages.fetch({ limit: 100, before });
+          const batch = await reportChan.messages.fetch({ limit: 100, before });
           if (batch.size === 0) break;
 
           for (const msg of batch.values()) {
             if (msg.createdAt < afterDate) { keepGoing = false; break; }
 
             const embed = msg.embeds.find(e => e.title === 'Switch Round Summary');
-            if (embed) {
-              const statsField = embed.fields?.find(f => f.name.includes('Stats'));
-              if (statsField) {
-                const s = plugin._parseRoundStatsField(statsField.value);
-                totals.rounds++;
-                totals.success += s.success;
-                totals.failed += s.failed;
-                totals.denied += s.denied;
-                totals.toT1 += s.toT1;
-                totals.toT2 += s.toT2;
+            if (!embed) continue;
+
+            totals.rounds++;
+
+            // Determine mode
+            const mode = plugin._parseMode(embed);
+            if (mode === 'liberal') {
+              totals.liberalRounds++;
+              continue; // skip liberal rounds from aggregate
+            }
+            totals.standardRounds++;
+            const isOldFormat = !embed.fields?.find(f => f.name && f.name.includes('Stats'))?.value?.includes('**Mode:**');
+
+            // Parse stats field (high-level numbers)
+            const statsField = embed.fields?.find(f => f.name && f.name.includes('Stats'));
+            if (statsField?.value) {
+              const s = plugin._parseRoundStatsField(statsField.value);
+              totals.success += s.success;
+              totals.failed += s.failed;
+              totals.denied += s.denied;
+              totals.toT1 += s.toT1;
+              totals.toT2 += s.toT2;
+
+              // Extract max queue size
+              const mqMatch = statsField.value.match(/\*\*Max Queue Size:\*\*\s*(\d+)/);
+              if (mqMatch) {
+                const mq = parseInt(mqMatch[1], 10);
+                if (mq > totals.maxQueueSize) totals.maxQueueSize = mq;
               }
+
+              // Extract queue wait (new format: mean + median, or old: avg only)
+              const newMatch = statsField.value.match(/\*\*Queue Wait:\*\* mean\s*(?:(\d+)m )?(\d+)s, median\s*(?:(\d+)m )?(\d+)s/);
+              if (newMatch) {
+                const wm = newMatch[1] ? parseInt(newMatch[1], 10) : 0;
+                const ws = parseInt(newMatch[2], 10);
+                totals.queueDurationsMs.push((wm * 60 + ws) * 1000);
+                const mm = newMatch[3] ? parseInt(newMatch[3], 10) : 0;
+                const ms = parseInt(newMatch[4], 10);
+                totals.medianDurationsMs.push((mm * 60 + ms) * 1000);
+              } else {
+                // Old format: "**Avg Queue Wait:** 2m 15s"
+                const oldMatch = statsField.value.match(/\*\*Avg Queue Wait:\*\*\s*(?:(\d+)m )?(\d+)s/);
+                if (oldMatch) {
+                  const wm = oldMatch[1] ? parseInt(oldMatch[1], 10) : 0;
+                  const ws = parseInt(oldMatch[2], 10);
+                  totals.queueDurationsMs.push((wm * 60 + ws) * 1000);
+                  totals.missingMedian++;
+                }
+              }
+            }
+
+            // Parse movement types
+            const moves = plugin._parseMoveTypes(embed);
+            totals.instant += moves.instant;
+            totals.queueNormal += moves.queueNormal;
+            totals.queueTeamTrade += moves.queueTeamTrade;
+            totals.queueJoinSwap += moves.queueJoinSwap;
+            totals.queueTimeoutSwitch += moves.queueTimeoutSwitch;
+
+            // Parse denial reasons from stats field
+            const denialReasons = plugin._parseDenialReasons(embed);
+            totals.denialCooldown += denialReasons.cooldown;
+            totals.denialTimeWindow += denialReasons.time_window;
+            totals.denialScrambleLock += denialReasons.scramble_lock;
+
+            // Parse queue outcomes
+            const outcomes = plugin._parseQueueOutcomes(embed);
+            totals.outcomeExpired += outcomes.expired;
+            totals.outcomeDC += outcomes.dc;
+            totals.outcomeCancelled += outcomes.cancelled;
+            totals.outcomeRemoved += outcomes.removed;
+
+            // Total queue entries per round = all movement types with queue + all queue outcomes
+            totals.totalQueueEntries += moves.queueNormal + moves.queueTeamTrade + moves.queueJoinSwap + moves.queueTimeoutSwitch
+              + outcomes.expired + outcomes.dc + outcomes.cancelled + outcomes.removed;
+
+            // Check for incomplete old-format rounds
+            if (isOldFormat) {
+              totals.incompleteRounds++;
             }
           }
 
           before = batch.last()?.id;
           if (batch.size < 100) break;
-          await delay(300);
+          await plugin.server?.constructor?.delay ? plugin.server.constructor.delay(300) : new Promise(r => setTimeout(r, 300));
         }
       } catch (err) {
         plugin.verbose(1, `[Switch] Stats scrape failed: ${err.message}`);
@@ -652,26 +1101,129 @@ const SwitchCommands = {
         return;
       }
 
+      // ── Build embed ──
       const totalRequests = totals.success + totals.failed + totals.denied;
       const attemptedRequests = totals.success + totals.failed;
       const successRate = attemptedRequests > 0 ? ((totals.success / attemptedRequests) * 100).toFixed(1) : 'n/a';
       const failRate = attemptedRequests > 0 ? ((totals.failed / attemptedRequests) * 100).toFixed(1) : 'n/a';
       const denyRate = totalRequests > 0 ? ((totals.denied / totalRequests) * 100).toFixed(1) : 'n/a';
+      const successPctOfTotal = totalRequests > 0 ? ((totals.success / totalRequests) * 100).toFixed(1) : '\u2014';
+      const deniedPctOfTotal = totalRequests > 0 ? ((totals.denied / totalRequests) * 100).toFixed(1) : '\u2014';
+      const failedPctOfTotal = totalRequests > 0 ? ((totals.failed / totalRequests) * 100).toFixed(1) : '\u2014';
+
+      // Average queue wait
+      const avgQueueMs = totals.queueDurationsMs.length > 0
+        ? totals.queueDurationsMs.reduce((a, b) => a + b, 0) / totals.queueDurationsMs.length
+        : 0;
+      const avgMin = Math.floor(avgQueueMs / 60000);
+      const avgSec = Math.round((avgQueueMs % 60000) / 1000);
+      const avgStr = avgMin > 0 ? `${avgMin}m ${avgSec}s` : `${avgSec}s`;
+
+      // Global median queue wait
+      const globalMedianMs = plugin._computeMedianFromMs(totals.medianDurationsMs);
+      const medMin = Math.floor(globalMedianMs / 60000);
+      const medSec = Math.round((globalMedianMs % 60000) / 1000);
+      const medStr = medMin > 0 ? `${medMin}m ${medSec}s` : `${medSec}s`;
+
+      // Movement type percentages
+      const pct = (n) => totals.standardRounds > 0 && n > 0 ? ` (${((n / totals.success) * 100).toFixed(1)}%)` : '';
+      const dpct = (n) => totals.denied > 0 && n > 0 ? ` (${((n / totals.denied) * 100).toFixed(1)}%)` : '';
+      const qpct = (n) => totals.totalQueueEntries > 0 && n > 0 ? ` (${((n / totals.totalQueueEntries) * 100).toFixed(1)}%)` : '';
+
+      const fields = [];
+
+      // ── Summary field ──
+      const summaryLines = [];
+      summaryLines.push(`**Rounds scraped:** ${totals.standardRounds}`);
+      if (totals.standardRounds > 0) summaryLines.push(`**Requests/round:** ${(totalRequests / totals.standardRounds).toFixed(1)}`);
+      summaryLines.push('');
+      summaryLines.push(`**Total requests:** ${totalRequests}`);
+      summaryLines.push(`  ✅ Succeeded    ${totals.success}  (${successPctOfTotal}% of total)`);
+      summaryLines.push(`  ⛔ Denied         ${totals.denied}  (${deniedPctOfTotal}% of total)`);
+      summaryLines.push(`  ❌ Failed           ${totals.failed}  (${failedPctOfTotal}% of total)`);
+      summaryLines.push('');
+      summaryLines.push(`**Success rate (excl. denials):** ${successRate}%  (${totals.success}/${attemptedRequests})`);
+      summaryLines.push('');
+      const totalMoves = totals.toT1 + totals.toT2;
+      if (totalMoves > 0) {
+        summaryLines.push(`**Direction:**`);
+        const dirPct1 = ` (${((totals.toT1 / totalMoves) * 100).toFixed(1)}%)`;
+        const dirPct2 = ` (${((totals.toT2 / totalMoves) * 100).toFixed(1)}%)`;
+        summaryLines.push(`→ T1: ${totals.toT1}${dirPct1}`);
+        summaryLines.push(`→ T2: ${totals.toT2}${dirPct2}`);
+      }
+      summaryLines.push('');
+      summaryLines.push(`**Max queue size reached:** ${totals.maxQueueSize}`);
+      if (totals.queueDurationsMs.length > 0) {
+        const medianPart = totals.medianDurationsMs.length > 0 ? `, median ${medStr}` : '';
+        summaryLines.push(`**Queue wait:** mean ${avgStr}${medianPart}`);
+      }
+
+      fields.push({ name: '📊 Summary', value: summaryLines.join('\n'), inline: false });
+
+      // ── Movement Types field ──
+      if (totals.success > 0) {
+        const moveLines = [];
+        moveLines.push(`Instant            ${totals.instant}${pct(totals.instant)}`);
+        moveLines.push(`Queue Solo         ${totals.queueNormal}${pct(totals.queueNormal)}`);
+        moveLines.push(`Queue Pair Trade   ${totals.queueTeamTrade}${pct(totals.queueTeamTrade)}`);
+        moveLines.push(`Join Swap          ${totals.queueJoinSwap}${pct(totals.queueJoinSwap)}`);
+        moveLines.push(`Timeout Switch     ${totals.queueTimeoutSwitch}${pct(totals.queueTimeoutSwitch)}`);
+        fields.push({ name: `🔄 Movement Types (all ${totals.success} successes)`, value: moveLines.join('\n'), inline: false });
+      }
+
+      // ── Denial Reasons field ──
+      if (totals.denied > 0) {
+        const denialLines = [];
+        denialLines.push(`Cooldown           ${totals.denialCooldown}${dpct(totals.denialCooldown)}`);
+        denialLines.push(`Time Window        ${totals.denialTimeWindow}${dpct(totals.denialTimeWindow)}`);
+        denialLines.push(`Scramble Lock     ${totals.denialScrambleLock}${dpct(totals.denialScrambleLock)}`);
+        fields.push({ name: `⛔ Denial Reasons (all ${totals.denied} denials)`, value: denialLines.join('\n'), inline: false });
+      }
+
+      // ── Queue Outcomes field ──
+      if (totals.totalQueueEntries > 0) {
+        const outcomeLines = [];
+        // Succeeded = all queue-based movement types
+        const succeeded = totals.queueNormal + totals.queueTeamTrade + totals.queueJoinSwap + totals.queueTimeoutSwitch;
+        outcomeLines.push(`Succeeded          ${succeeded}${qpct(succeeded)}`);
+        outcomeLines.push(`Disconnected      ${totals.outcomeDC}${qpct(totals.outcomeDC)}`);
+        outcomeLines.push(`Cancelled          ${totals.outcomeCancelled}${qpct(totals.outcomeCancelled)}`);
+        outcomeLines.push(`Expired              ${totals.outcomeExpired}${qpct(totals.outcomeExpired)}`);
+        outcomeLines.push(`Removed            ${totals.outcomeRemoved}${qpct(totals.outcomeRemoved)}`);
+
+        if (totals.outcomeExpired > 0) {
+          outcomeLines.push('');
+          outcomeLines.push(`\u2020 Expired entries are from rounds where\n  queueTimeoutSwitchEnabled was off.`);
+        }
+
+        fields.push({ name: `📋 Queue Outcomes (all ${totals.totalQueueEntries} queue entries)`, value: outcomeLines.join('\n'), inline: false });
+      }
+
+      // ── Data Quality field (conditional) ──
+      const qualityLines = [];
+      if (totals.liberalRounds > 0) {
+        qualityLines.push(`${totals.liberalRounds} liberal-mode rounds excluded`);
+      }
+      if (totals.incompleteRounds > 0) {
+        qualityLines.push(`${totals.incompleteRounds} rounds had incomplete data (pre-v2.2.0 format)`);
+      }
+      if (totals.missingMedian > 0) {
+        qualityLines.push(`${totals.missingMedian} rounds lack median data (pre-median embed format)`);
+      }
+      if (qualityLines.length > 0) {
+        fields.push({ name: '⚠️ Data Quality', value: qualityLines.join('\n'), inline: false });
+      }
+
+      if (!fields.length) {
+        fields.push({ name: 'No Data', value: 'No switch round summaries found in the lookback period.', inline: false });
+      }
 
       const embed = {
         title: 'Switch Global Stats',
+        description: `${STATS_LOOKBACK_DAYS}-day aggregate \u00B7 standard-mode rounds`,
         color: 0x3498DB,
-        fields: [{
-          name: '📊 Aggregate',
-          value:
-            `**Rounds Scraped:** ${totals.rounds}\n` +
-            `**Requests:** ${totalRequests} (${totals.success} succeeded, ${totals.denied} denied, ${totals.failed} failed)\n` +
-            `**Success Rate:** ${successRate}%\n` +
-            `**Denial Rate:** ${denyRate}%\n` +
-            `**Fail Rate:** ${failRate}%\n` +
-            `**To T1 / To T2:** ${totals.toT1} / ${totals.toT2}`,
-          inline: false
-        }],
+        fields,
         timestamp: new Date(),
         footer: { text: `Switch v${plugin.constructor.version}` }
       };
@@ -683,7 +1235,18 @@ const SwitchCommands = {
 
     plugin.onDiscordMessage = async function (message) {
       if (message.author.bot) return;
-      if (plugin.options.channelID && message.channel.id !== plugin.options.channelID) return;
+
+      // ── Channel gate ──────────────────────────────────────────────
+      // Listens for admin !switch commands in adminCommandChannelID
+      // (if set) or falls back to channelID (single‑channel mode).
+      // Round summaries, scramble notifications, and other automated
+      // reports flow independently via sendDiscordMessage() to this.channel
+      // (the reporting channel) — that path is untouched here.
+      // Admin responses use message.channel.send() / message.reply() so
+      // they self‑route to whichever channel the command was received in.
+      // ───────────────────────────────────────────────────────────────
+      const adminChanId = plugin.options.adminCommandChannelID || plugin.options.channelID;
+      if (adminChanId && message.channel.id !== adminChanId) return;
 
       const content = message.content.trim();
       const args = content.split(' ');
@@ -708,6 +1271,7 @@ const SwitchCommands = {
           await plugin.safeDiscordReply(message, '⚠️ Ambiguous result: Multiple matches found. Please refine your search string or use a SteamID.');
         } else {
           const now = new Date();
+          const showTokenMessaging = plugin.options.maxSwitchTokens > 1;
           let desc = `**SteamID:** ${result.steamID}\n**Name:** ${result.playerName || 'Unknown'}\n`;
 
           if (result.scrambleLockdownExpiry && result.scrambleLockdownExpiry > now) {
@@ -716,20 +1280,43 @@ const SwitchCommands = {
             desc += `🟢 **Scramble Lock:** None\n`;
           }
 
-          if (result.lastSwitchTimestamp) {
-            const cooldownDuration = plugin.options.switchCooldownMinutes > 0 ? plugin.options.switchCooldownMinutes * 60 * 1000 : plugin.options.switchCooldownHours * 60 * 60 * 1000;
-            const nextSwitch = new Date(result.lastSwitchTimestamp.getTime() + cooldownDuration);
-            if (nextSwitch > now) {
+          // Token-aware cooldown display
+          const row = {
+            tokenBalance: result.tokenBalance != null ? result.tokenBalance : plugin.options.maxSwitchTokens,
+            tokenRegenAnchor: result.tokenRegenAnchor
+          };
+          plugin._regenTokens(row);
+
+          if (showTokenMessaging) {
+            if (row.tokenBalance < 1) {
+              const cooldownDuration = plugin.options.switchCooldownMinutes > 0 ? plugin.options.switchCooldownMinutes * 60 * 1000 : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+              const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
+              const nextToken = new Date(anchor + cooldownDuration);
+              desc += `🔴 **Switch Cooldown:** ${row.tokenBalance}/${plugin.options.maxSwitchTokens} tokens, next at <t:${Math.floor(nextToken.getTime() / 1000)}:R>\n`;
+            } else {
+              desc += `🟢 **Switch Cooldown:** ${row.tokenBalance}/${plugin.options.maxSwitchTokens} tokens\n`;
+            }
+          } else {
+            // Legacy binary display (maxSwitchTokens === 1)
+            if (row.tokenBalance < 1) {
+              const cooldownDuration = plugin.options.switchCooldownMinutes > 0 ? plugin.options.switchCooldownMinutes * 60 * 1000 : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+              const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
+              const nextSwitch = new Date(anchor + cooldownDuration);
               desc += `🔴 **Switch Cooldown:** <t:${Math.floor(nextSwitch.getTime() / 1000)}:R>\n`;
             } else {
               desc += `🟢 **Switch Cooldown:** Ready\n`;
             }
-          } else {
-            desc += `🟢 **Switch Cooldown:** Ready\n`;
           }
 
+          // Two distinct facts, deliberately shown side by side. firstSeenTimestamp
+          // is set once at row creation and never updated — it means "first tracked",
+          // which is why labelling it "Joined" was misleading. lastActiveTimestamp is
+          // the live one and drives row retention.
           if (result.firstSeenTimestamp) {
-            desc += `⏱️ **Joined:** <t:${Math.floor(new Date(result.firstSeenTimestamp).getTime() / 1000)}:f>\n`;
+            desc += `📅 **First Tracked:** <t:${Math.floor(new Date(result.firstSeenTimestamp).getTime() / 1000)}:f>\n`;
+          }
+          if (result.lastActiveTimestamp) {
+            desc += `⏱️ **Last Active:** <t:${Math.floor(new Date(result.lastActiveTimestamp).getTime() / 1000)}:f>\n`;
           }
 
           await message.channel.send({ embeds: [{ title: '🔍 Player Status', description: desc, color: 0x3498db }] });
@@ -745,21 +1332,41 @@ const SwitchCommands = {
           await plugin.safeDiscordReply(message, 'Player not found or multiple matches.');
           return;
         }
-        const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
-        if (PlayerCooldowns) {
-          await plugin._withDb(async (t) => {
-            await PlayerCooldowns.destroy({ where: { eosID: result.eosID }, transaction: t });
-          });
+        try {
+          const summary = await plugin.adminClearPlayer(result.eosID);
+          const detail = summary
+            ? `${summary.tokensBefore} → ${summary.tokensAfter} tokens${summary.lockCleared ? ', scramble lock lifted' : ''}`
+            : 'no row found — already unrestricted';
+          await plugin.safeDiscordReply(message, `✅ Cleared restrictions for **${result.playerName || result.steamID}** (${detail}). Seed tokens kept.`);
+        } catch (err) {
+          plugin.verbose(1, `[Admin] clear failed for ${result.playerName || result.eosID}: ${err.message}`);
+          await plugin.safeDiscordReply(message, `❌ Clear failed: ${err.message}`);
         }
-        await plugin.safeDiscordReply(message, `✅ Cleared cooldowns for **${result.playerName || result.steamID}**.`);
       } else if (subCommand === 'clearall') {
-        const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
-        if (PlayerCooldowns) {
-          await plugin._withDb(async (t) => {
-            await PlayerCooldowns.destroy({ where: {}, truncate: true, transaction: t });
-          });
+        try {
+          const { toppedUp, locksCleared } = await plugin.adminClearAllRestrictions();
+          await plugin.safeDiscordReply(message,
+            `✅ Restrictions cleared — **${toppedUp}** topped up to ${plugin.options.maxSwitchTokens}, **${locksCleared}** scramble locks lifted. Earned seed tokens kept; use \`!switch wipe confirm\` to delete every row.`
+          );
+        } catch (err) {
+          plugin.verbose(1, `[Admin] clearall failed: ${err.message}`);
+          await plugin.safeDiscordReply(message, `❌ Clear all failed: ${err.message}`);
         }
-        await plugin.safeDiscordReply(message, '🗑️ All player cooldowns cleared.');
+      } else if (subCommand === 'wipe') {
+        // See the in-game `wipe` case — same guard, same reason.
+        if ((args[2] || '').toLowerCase() !== 'confirm') {
+          await plugin.safeDiscordReply(message,
+            '⚠️ `!switch wipe` **deletes every cooldown row**, including earned seed tokens. This cannot be undone.\n' +
+            'Run `!switch wipe confirm` to proceed, or `!switch clearall` to lift restrictions without deleting anything.');
+          return;
+        }
+        try {
+          const deleted = await plugin.adminWipeAll();
+          await plugin.safeDiscordReply(message, `🗑️ Wiped **${deleted}** cooldown rows — every player is back to a clean default.`);
+        } catch (err) {
+          plugin.verbose(1, `[Admin] wipe failed: ${err.message}`);
+          await plugin.safeDiscordReply(message, `❌ Wipe failed: ${err.message}`);
+        }
       } else if (subCommand === 'timelimit' && ['on', 'off'].includes(args[2])) {
         const enabled = args[2] === 'on';
         try {
@@ -774,6 +1381,30 @@ const SwitchCommands = {
       } else if (subCommand === 'stats') {
         const args2 = args.slice(2);
         await plugin._handleStatsCommand(message, args2);
+      } else if (subCommand === 'explain') {
+        try {
+          const embeds = plugin._buildExplainMessages();
+          if (!embeds || embeds.length === 0) {
+            await plugin.safeDiscordReply(message, 'Could not generate explain content at this time.');
+            return;
+          }
+          // Append 7-day reliability stats embed (gracefully degrades to null if no data)
+          try {
+            const statsEmbed = await plugin._buildSevenDayStatsEmbed();
+            if (statsEmbed) embeds.push(statsEmbed);
+          } catch (_) {
+            // Stats embed is optional — silently skip on failure
+          }
+          for (const embed of embeds) {
+            await message.channel.send({ embeds: [embed] });
+            // Small delay between sends to avoid Discord rate limits
+            // and give messages time to render as separate entries.
+            await new Promise(r => setTimeout(r, 250));
+          }
+        } catch (err) {
+          plugin.verbose(1, `[Explain] Failed to generate explain embeds: ${err.message}`);
+          await plugin.safeDiscordReply(message, `Failed to generate explain output: ${err.message}`);
+        }
       } else if (subCommand === 'help') {
         const embed = {
           title: '📜 Switch Plugin Commands',
@@ -781,10 +1412,12 @@ const SwitchCommands = {
           fields: [
             { name: '!switch status', value: 'Show database diagnostics and active locks.' },
             { name: '!switch check <ident>', value: 'Check cooldown status for a player.' },
-            { name: '!switch clear <ident>', value: 'Clear cooldowns for a specific player.' },
-            { name: '!switch clearall', value: 'Clear all player cooldowns.' },
+            { name: '!switch clear <ident>', value: 'Lift one player\'s restrictions (keeps earned seed tokens).' },
+            { name: '!switch clearall', value: 'Lift restrictions for everyone (keeps earned seed tokens).' },
+            { name: '!switch wipe confirm', value: 'Delete every cooldown row — a full reset, seed tokens included. The word `confirm` is required.' },
             { name: '!switch timelimit on|off', value: 'Admin: Toggle join/match time limit for queue entry.' },
             { name: '!switch stats [days]', value: 'Scrape the last N days of round summaries (default 60).' },
+            { name: '!switch explain', value: 'Generate a detailed explanation of how team switching works.' },
             { name: '!switch help', value: 'Show this help message.' }
           ]
         };
@@ -797,10 +1430,12 @@ const SwitchCommands = {
           fields: [
             { name: '!switch status', value: 'Show database diagnostics and active locks.' },
             { name: '!switch check <ident>', value: 'Check cooldown status for a player.' },
-            { name: '!switch clear <ident>', value: 'Clear cooldowns for a specific player.' },
-            { name: '!switch clearall', value: 'Clear all player cooldowns.' },
+            { name: '!switch clear <ident>', value: 'Lift one player\'s restrictions (keeps earned seed tokens).' },
+            { name: '!switch clearall', value: 'Lift restrictions for everyone (keeps earned seed tokens).' },
+            { name: '!switch wipe confirm', value: 'Delete every cooldown row — a full reset, seed tokens included. The word `confirm` is required.' },
             { name: '!switch timelimit on|off', value: 'Admin: Toggle join/match time limit for queue entry.' },
             { name: '!switch stats [days]', value: 'Scrape the last N days of round summaries (default 60).' },
+            { name: '!switch explain', value: 'Generate a detailed explanation of how team switching works.' },
             { name: '!switch help', value: 'Show this help message.' }
           ]
         };

@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║              SWITCH PLUGIN — QUEUE SUBSYSTEM                  ║
+ * ║              SWITCH PLUGIN — QUEUE SUBSYSTEM                   ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -26,8 +26,15 @@
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
- * - Queue uses a stability gate: solo switches are only processed
- *   when team counts are stable across two consecutive polls.
+ * - Queue gates switches at two independent points:
+ *   1. canAct() per-player concurrency gate — checked before every
+ *      pair trade and solo switch. If another plugin (e.g. SmartAssign)
+ *      holds a player lock, that specific switch is deferred but the
+ *      rest of the queue continues processing.
+ *   2. Stability gate — solo switches only execute when team counts
+ *      are identical across two consecutive polls. This prevents
+ *      acting on a momentary blip. Pair trades bypass the stability
+ *      gate since they are net-zero on balance.
  * - Refresh interest is registered conditionally when queue goes
  *   0→1 and unregistered when →0, avoiding unnecessary polling.
  * - _queueProcessing flag prevents concurrent _processQueue() calls.
@@ -209,7 +216,57 @@ const SwitchQueue = {
       plugin.verbose(1, `[Queue] forceQueueSwap: Initiating handshake swap for ${entry.playerName}. Queue size: ${plugin._getQueueSize()}`);
 
       try {
+        plugin.warn(entry.eosID, '[Switch Queue] Swap partner found — switching now.');
         await plugin._taggedSwitchPlayer(eosID, 'Handshake-Swap');
+
+        if (!plugin.isLiberalMode()) {
+          const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
+          if (PlayerCooldowns) {
+            try {
+              await plugin._withDb(async (t) => {
+                // §3.3 of switch-token-system-spec: load → regen → spend → upsert
+                let row = await PlayerCooldowns.findByPk(entry.eosID, { transaction: t });
+                if (!row) {
+                  row = { eosID: entry.eosID, steamID: entry.steamID, playerName: entry.playerName, tokenBalance: plugin.options.maxSwitchTokens, tokenRegenAnchor: null };
+                }
+                plugin._regenTokens(row);
+                plugin._spendToken(row);
+                await PlayerCooldowns.upsert(
+                  { eosID: entry.eosID, steamID: entry.steamID, playerName: entry.playerName, tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor, lastActiveTimestamp: new Date() },
+                  { transaction: t }
+                );
+              });
+            } catch (dbErr) {
+              plugin.verbose(1, `[Queue] Token spend failed for ${entry.playerName}: ${dbErr.message}`);
+            }
+          }
+        }
+
+        // Post-switch token notice for handshake swap (gated on showTokenMessaging)
+        if (plugin.options.maxSwitchTokens > 1 && !plugin.isLiberalMode()) {
+          try {
+            const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
+            if (PlayerCooldowns) {
+              const row = await PlayerCooldowns.findByPk(entry.eosID);
+              if (row) {
+                const balance = row.tokenBalance != null ? row.tokenBalance : plugin.options.maxSwitchTokens;
+                if (balance > 0) {
+                  plugin.warn(entry.eosID, `[Switch] Switched! ${balance}/${plugin.options.maxSwitchTokens} tokens remaining.`);
+                } else {
+                  const cooldownDuration = plugin.options.switchCooldownMinutes > 0
+                    ? plugin.options.switchCooldownMinutes * 60 * 1000
+                    : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+                  const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
+                  const remaining = Math.ceil((cooldownDuration - (Date.now() - anchor)) / 60000);
+                  plugin.warn(entry.eosID, `[Switch] Switched! You're out of tokens — next one in ~${remaining}m.`);
+                }
+              }
+            }
+          } catch (e) {
+            plugin.verbose(1, `[Queue] Token notice read failed for ${entry.playerName}: ${e.message}`);
+          }
+        }
+
         if (plugin._roundStats) {
           const qDuration = Math.round((Date.now() - entry.queuedAt) / 1000);
           const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
@@ -262,7 +319,7 @@ const SwitchQueue = {
           const arr = plugin._switchQueue[subQueue];
           for (let i = arr.length - 1; i >= 0; i--) {
             const entry = arr[i];
-            if (plugin.timeLimitEnabled && (nowTs - entry.queuedAt) >= queueTimeoutMs) {
+            if (!plugin.options.queueTimeoutSwitchEnabled && plugin.timeLimitEnabled && (nowTs - entry.queuedAt) >= queueTimeoutMs) {
               clearInterval(entry.warnInterval);
               arr.splice(i, 1);
               if (plugin._roundStats) {
@@ -393,19 +450,58 @@ const SwitchQueue = {
           await plugin._taggedSwitchPlayer(p2.eosID, 'Player-Queue');
 
           if (!plugin.isLiberalMode()) {
-            const now = new Date();
             const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
             if (PlayerCooldowns) {
               for (const p of [p1, p2]) {
                 try {
                   await plugin._withDb(async (t) => {
+                    // §3.3 of switch-token-system-spec: load → regen → spend → upsert
+                    let row = await PlayerCooldowns.findByPk(p.eosID, { transaction: t });
+                    if (!row) {
+                      row = { eosID: p.eosID, steamID: p.steamID, playerName: p.playerName, tokenBalance: plugin.options.maxSwitchTokens, tokenRegenAnchor: null };
+                    }
+                    plugin._regenTokens(row);
+                    plugin._spendToken(row);
                     await PlayerCooldowns.upsert(
-                      { eosID: p.eosID, steamID: p.steamID, playerName: p.playerName, lastSwitchTimestamp: now },
+                      { eosID: p.eosID, steamID: p.steamID, playerName: p.playerName, tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor, lastActiveTimestamp: new Date() },
                       { transaction: t }
                     );
                   });
                 } catch (dbErr) {
-                  plugin.verbose(1, `[Queue] Cooldown write failed for ${p.playerName}: ${dbErr.message}`);
+                  plugin.verbose(1, `[Queue] Token spend failed for ${p.playerName}: ${dbErr.message}`);
+                }
+              }
+            }
+          }
+
+          // Post-switch token notice for pair trade (gated on showTokenMessaging)
+          // NOTE: This is a read-after-write — it reads the DB row AFTER the token-spend
+          // transaction above has committed. There's a narrow window where another
+          // operation could modify the row between write and read, but in practice
+          // the player is the only actor on their row at this moment. The consequence
+          // of a missed read is one missing notification (the token display is
+          // informational, not authoritative).
+          if (plugin.options.maxSwitchTokens > 1) {
+            const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
+            if (PlayerCooldowns && !plugin.isLiberalMode()) {
+              for (const p of [p1, p2]) {
+                try {
+                  const row = await PlayerCooldowns.findByPk(p.eosID);
+                  if (row) {
+                    const balance = row.tokenBalance != null ? row.tokenBalance : plugin.options.maxSwitchTokens;
+                    if (balance > 0) {
+                      plugin.warn(p.eosID, `[Switch] Switched! ${balance}/${plugin.options.maxSwitchTokens} tokens remaining.`);
+                    } else {
+                      const cooldownDuration = plugin.options.switchCooldownMinutes > 0
+                        ? plugin.options.switchCooldownMinutes * 60 * 1000
+                        : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+                      const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
+                      const remaining = Math.ceil((cooldownDuration - (Date.now() - anchor)) / 60000);
+                      plugin.warn(p.eosID, `[Switch] Switched! You're out of tokens — next one in ~${remaining}m.`);
+                    }
+                  }
+                } catch (e) {
+                  plugin.verbose(1, `[Queue] Token notice read failed for ${p.playerName}: ${e.message}`);
                 }
               }
             }
@@ -477,8 +573,22 @@ const SwitchQueue = {
             continue;
           }
 
-          const effectiveCap = plugin.isLiberalMode() ? plugin.options.liberalSwitchMaxUnbalancedSlots : null;
-          const slots = plugin.getSwitchSlotsPerTeam(entry.currentTeamID, effectiveCap);
+          // v2.2.0: Queue timeout switch — when a player has waited longer than queueTimeoutMinutes,
+          // they are force-switched with a relaxed balance gate instead of being removed from the queue.
+          // The effectiveCap is bumped by queueTimeoutExtraSlots on top of maxUnbalancedSlots + dynamic extras,
+          // and skipHardCap bypasses the 50/50 max-team-size check entirely.
+          // Rationale: being 2-3 players over the 50/50 split is preferable to removing the player from
+          // the queue after they waited the full timeout duration. Without this, the player would have
+          // waited and then been kicked — a poor experience. The extra imbalance is temporary and will
+          // self-correct as players join/leave.
+          const timedOut = plugin.timeLimitEnabled && plugin.options.queueTimeoutSwitchEnabled && (nowTs - entry.queuedAt) >= queueTimeoutMs;
+          let effectiveCap = plugin.isLiberalMode() ? plugin.options.liberalSwitchMaxUnbalancedSlots : null;
+          let skipHardCap = false;
+          if (timedOut) {
+            effectiveCap = plugin.options.maxUnbalancedSlots + plugin.getDynamicExtraSlots() + plugin.options.queueTimeoutExtraSlots;
+            skipHardCap = true;
+          }
+          const slots = plugin.getSwitchSlotsPerTeam(entry.currentTeamID, effectiveCap, skipHardCap);
           if (slots > 0) {
             // Per-player lock gate: only proceed if this specific player is not locked by a
             // higher-priority plugin. The old top-level canAct(null) check blocked the entire
@@ -491,7 +601,7 @@ const SwitchQueue = {
 
             plugin._removePlayerFromQueue(entry.eosID);
 
-            plugin.warn(entry.eosID, '[Switch Queue] Balance slot opened — switching now.');
+            plugin.warn(entry.eosID, timedOut ? '[Switch Queue] Queue timeout — switching now.' : '[Switch Queue] Balance slot opened — switching now.');
             await plugin._taggedSwitchPlayer(entry.eosID, 'Player-Queue');
 
             if (!plugin.isLiberalMode()) {
@@ -499,14 +609,48 @@ const SwitchQueue = {
               if (PlayerCooldowns) {
                 try {
                   await plugin._withDb(async (t) => {
+                    // §3.3 of switch-token-system-spec: load → regen → spend → upsert
+                    let row = await PlayerCooldowns.findByPk(entry.eosID, { transaction: t });
+                    if (!row) {
+                      row = { eosID: entry.eosID, steamID: entry.steamID, playerName: entry.playerName, tokenBalance: plugin.options.maxSwitchTokens, tokenRegenAnchor: null };
+                    }
+                    plugin._regenTokens(row);
+                    plugin._spendToken(row);
                     await PlayerCooldowns.upsert(
-                      { eosID: entry.eosID, steamID: entry.steamID, playerName: entry.playerName, lastSwitchTimestamp: new Date() },
+                      { eosID: entry.eosID, steamID: entry.steamID, playerName: entry.playerName, tokenBalance: row.tokenBalance, tokenRegenAnchor: row.tokenRegenAnchor, lastActiveTimestamp: new Date() },
                       { transaction: t }
                     );
                   });
                 } catch (dbErr) {
-                  plugin.verbose(1, `[Queue] Cooldown write failed for ${entry.playerName}: ${dbErr.message}`);
+                  plugin.verbose(1, `[Queue] Token spend failed for ${entry.playerName}: ${dbErr.message}`);
                 }
+              }
+            }
+
+            // Post-switch token notice for solo/timeout switch (gated on showTokenMessaging)
+            // NOTE: Read-after-write race — same rationale as the pair trade notice above.
+            // Informational only; a missed read is harmless.
+            if (plugin.options.maxSwitchTokens > 1 && !plugin.isLiberalMode()) {
+              try {
+                const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
+                if (PlayerCooldowns) {
+                  const row = await PlayerCooldowns.findByPk(entry.eosID);
+                  if (row) {
+                    const balance = row.tokenBalance != null ? row.tokenBalance : plugin.options.maxSwitchTokens;
+                    if (balance > 0) {
+                      plugin.warn(entry.eosID, `[Switch] Switched! ${balance}/${plugin.options.maxSwitchTokens} tokens remaining.`);
+                    } else {
+                      const cooldownDuration = plugin.options.switchCooldownMinutes > 0
+                        ? plugin.options.switchCooldownMinutes * 60 * 1000
+                        : plugin.options.switchCooldownHours * 60 * 60 * 1000;
+                      const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
+                      const remaining = Math.ceil((cooldownDuration - (Date.now() - anchor)) / 60000);
+                      plugin.warn(entry.eosID, `[Switch] Switched! You're out of tokens — next one in ~${remaining}m.`);
+                    }
+                  }
+                }
+              } catch (e) {
+                plugin.verbose(1, `[Queue] Token notice read failed for ${entry.playerName}: ${e.message}`);
               }
             }
 
@@ -514,7 +658,17 @@ const SwitchQueue = {
             if (plugin._roundStats) {
               const qDuration = Math.round((Date.now() - entry.queuedAt) / 1000);
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
-              plugin._roundStats.queueNormal.push({
+              if (timedOut) {
+            plugin._roundStats.queueTimeoutSwitches.push({
+              name: entry.playerName,
+              eosID: entry.eosID,
+              currentTeamID: entry.currentTeamID,
+              toTeam: entry.currentTeamID === 1 ? 2 : 1,
+              queueDurationSeconds: qDuration,
+              gamePhase
+            });
+          } else {
+            plugin._roundStats.queueNormal.push({
                 name: entry.playerName,
                 eosID: entry.eosID,
                 currentTeamID: entry.currentTeamID,
@@ -524,8 +678,9 @@ const SwitchQueue = {
               });
               plugin._roundStats.queueDurationsMs.push(qDuration * 1000);
             }
+            }
 
-            plugin.verbose(1, `[Queue] Solo switch fired for ${entry.playerName} (T${entry.currentTeamID})`);
+            plugin.verbose(1, `[Queue] ${timedOut ? 'Timeout switch' : 'Solo switch'} fired for ${entry.playerName} (T${entry.currentTeamID})`);
 
             break;
           }

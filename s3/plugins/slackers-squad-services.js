@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║           SLACKERS SQUAD SERVICES PLUGIN v1.1.0              ║
+ * ║              SLACKERS SQUAD SERVICES PLUGIN                  ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -27,7 +27,11 @@
  *     handleNewGame(data)         — Delegates NEW_GAME to gameState and factions.
  *     handleRoundEnded(data)      — Delegates ROUND_ENDED to gameState and factions.
  *     handleLayerInfoUpdated(d)   — Delegates UPDATED_LAYER_INFORMATION to gameState.
+ *                                   (recovery-timing only — that event carries no
+ *                                   layer and server.currentLayer is unreliable)
  *     handleServerInfoUpdated(d)  — Delegates UPDATED_SERVER_INFORMATION to gameState.
+ *                                   THE layer resolution path: info.currentLayer is the
+ *                                   only place SquadJS reliably delivers layer data.
  *     handleUpdatedPlayerInfo(d)  — Delegates UPDATED_PLAYER_INFORMATION to gameState, factions, players.
  *     handlePlayerConnected(d)    — Delegates PLAYER_CONNECTED to players.
  *
@@ -149,6 +153,7 @@ import ServerConfigService from '../utils/server-config-service.js';
 import LoggingService from '../utils/logging-service.js';
 import crypto from 'node:crypto';
 import { registerS3DiscordCommands } from '../utils/s3-discord.js';
+import { configureStderrDiagnostics, flushStderrDiagnostics, stderrError } from '../utils/s3-stderr.js';
 import { buildMigrationEmbed } from '../utils/s3-migration-discord.js';
 export default class SlackersSquadServices extends BasePlugin {
   static get description() {
@@ -159,7 +164,7 @@ export default class SlackersSquadServices extends BasePlugin {
     return false;
   }
 
-  static get version() { return '1.1.0'; }
+  static get version() { return '1.4.0'; }
 
   static get optionsSpecification() {
     return {
@@ -262,6 +267,20 @@ export default class SlackersSquadServices extends BasePlugin {
         type: 'boolean',
         description: 'When true, pending schema migrations are applied automatically on startup without Discord confirmation. Defaults to false.',
         default: false
+      },
+      stderrDiagnostics: {
+        required: false,
+        type: 'string',
+        description:
+          "Whether S³ failures are also copied to stderr. 'off' (default) changes nothing — everything goes to the SquadJS log as before. Set 'mirror' if you split the streams (`node index.js > squadjs.log 2> squadjs.err`, or pm2's separate out/err files) and want migration failures, DB errors and schema drift to land in the error file with their stack traces. 'auto' copies only when stdout and stderr lead to different places, for a config shared between a console session and a redirected service. Under Docker's default log driver or systemd/journald both streams end up in one sink, so 'mirror' there means every error appears twice.",
+        default: 'off'
+      },
+      stderrDedupeWindowSeconds: {
+        required: false,
+        type: 'number',
+        description:
+          'Identical stderr events inside this window are counted rather than written, with the tally emitted afterwards. Stops a DB outage — which throws on every tick — from filling the error file. Defaults to 60.',
+        default: 60
       }
     };
   }
@@ -319,6 +338,16 @@ export default class SlackersSquadServices extends BasePlugin {
   }
 
   async prepareToMount() {
+    // Configure the stderr channel here, not in mount(). SquadJS calls
+    // prepareToMount() on every plugin before mounting any of them, and S³ is
+    // required to be first in the plugins array — so this is the earliest point
+    // at which the operator's setting is known, and it lands before any consumer
+    // plugin can fail. Doing it in mount() was too late for a whole class of
+    // failure: S3DiscordPluginBase fetches its channel during prepareToMount, so
+    // a bad channelID reported through reportError() was always suppressed by the
+    // 'off' default and never reached the error file. Caught on a live server.
+    this._configureStderrDiagnostics();
+
     this.services.db = new DBService({
       parent: this,
       server: this.server,
@@ -332,6 +361,9 @@ export default class SlackersSquadServices extends BasePlugin {
       parent: this,
       server: this.server,
       ignoredGameModes: this.options.ignoredGameModes,
+      // Staging duration is deliberately NOT a config option: it is a property
+      // of the gamemode, not of the server. See STAGING_DURATION_MS_BY_GAMEMODE
+      // in game-state-service.js.
       verboseLogger: (...args) => this.verbose(...args)
     });
 
@@ -381,42 +413,136 @@ export default class SlackersSquadServices extends BasePlugin {
     });
   }
 
+  /**
+   * Apply the operator's stderr settings to the diagnostic channel.
+   *
+   * Called from prepareToMount() so it takes effect before any plugin can fail,
+   * and again from mount() so a host that mounts without preparing (tests, or a
+   * future SquadJS change) still gets configured. Idempotent.
+   */
+  _configureStderrDiagnostics() {
+    const stderrMode = ['auto', 'mirror', 'off'].includes(this.options.stderrDiagnostics)
+      ? this.options.stderrDiagnostics
+      : 'off';
+    configureStderrDiagnostics({
+      mode: stderrMode,
+      windowMs: Math.max(0, Number(this.options.stderrDedupeWindowSeconds ?? 60)) * 1000
+    });
+  }
+
+  /**
+   * Mount one service, naming it if it throws.
+   *
+   * SquadJS mounts plugins with `Promise.all(...)` from an un-caught `main()`,
+   * so a rejection here surfaces as an unhandled rejection rather than as
+   * anything a caller handles. Once DBService has mounted it has also installed
+   * a process-level listener for those, which means the server keeps running
+   * with a half-mounted S³ — so a service failing after `db` needs to announce
+   * itself or it announces nothing. Reporting the service by name is the
+   * difference between "S³ is broken" and "PlayersService could not create its
+   * table". Re-thrown unchanged: this adds a diagnostic, it does not decide
+   * that a failed mount is survivable.
+   *
+   * Reports through stderrError directly rather than reportError(): this class
+   * extends SquadJS's BasePlugin, not S3PluginBase, so it has no reportError.
+   *
+   * @param {string} name - Service key, used in the message
+   * @param {Function} fn - Async thunk performing the mount
+   */
+  async _mountService(name, fn) {
+    try {
+      await fn();
+    } catch (err) {
+      this.verbose(1, `[S3] ${name} service failed to mount: ${err.message}`);
+      stderrError(
+        'S3Mount',
+        `${name} service failed to mount — S³ is only partially available.`,
+        err
+      );
+      throw err;
+    }
+  }
+
   async mount() {
+    // Belt and braces — prepareToMount() has normally already done this.
+    this._configureStderrDiagnostics();
+
     if (this.services.serverConfig) {
-      await this.services.serverConfig.mount();
+      await this._mountService('serverConfig', () => this.services.serverConfig.mount());
     }
 
     if (this.services.db) {
-      await this.services.db.mount();
+      await this._mountService('db', () => this.services.db.mount());
     }
 
     if (this.services.gameState) {
       // Push S³'s ignoredGameModes config into GameStateService before mount
       // so isIgnoredMode() reads the single source of truth.
       this.services.gameState.setIgnoredGameModes(this.options.ignoredGameModes);
-      await this.services.gameState.mount();
+      await this._mountService('gameState', () => this.services.gameState.mount());
     }
 
     if (this.services.factions) {
-      await this.services.factions.mount();
+      await this._mountService('factions', () => this.services.factions.mount());
     }
 
     if (this.services.clans) {
-      await this.services.clans.mount();
+      await this._mountService('clans', () => this.services.clans.mount());
     }
 
     if (this.services.players) {
-      await this.services.players.mount();
+      await this._mountService('players', () => this.services.players.mount());
     }
 
     if (this.services.logging) {
-      await this.services.logging.mount();
+      await this._mountService('logging', () => this.services.logging.mount());
     }
 
     this._bindServerEvents();
 
     // Register Discord !s3 commands (gracefully degrades if no discordClient configured)
     this._s3DiscordCleanup = registerS3DiscordCommands(this);
+
+    // Register drift alert callback — when post-migration schema drift is detected,
+    // DBService fires this to post a warning embed in the admin Discord channel.
+    if (this.services.db) {
+      this.services.db._driftAlertCallback = (drift, pluginNames) => {
+        this.verbose(1, `[S3] Schema drift alert triggered for: ${pluginNames.join(', ')}`);
+        const discordClient = this.options.discordClient;
+        const channelID = this.options.channelID;
+        if (discordClient && channelID) {
+          const parts = [];
+          const missingCols = drift
+            .filter(e => e.missing)
+            .map(e => `- **${e.table}**: ${e.missing.join(', ')}`);
+          if (missingCols.length > 0) parts.push(missingCols.join('\n'));
+          const missingRows = drift
+            .filter(e => e.missingRows)
+            .map(e => `- **${e.table}**: ${e.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
+          if (missingRows.length > 0) parts.push(missingRows.join('\n'));
+          const dataViolations = drift
+            .filter(e => e.dataViolations)
+            .map(e => `- **${e.table}**: ${e.dataViolations.map(v => `${v.offenders} row(s) with empty \`${v.column}\``).join(', ')}`);
+          if (dataViolations.length > 0) parts.push(dataViolations.join('\n'));
+          const description = parts.length > 0
+            ? `Schema or data drift detected — expected state is missing from the live database.\nUse \`!s3 migrate force\` to re-apply.\n\n${parts.join('\n')}`
+            : `Schema drift detected — use \`!s3 migrate verify\` for details.`;
+          discordClient.channels.fetch(channelID).then(channel => {
+            if (channel) {
+              channel.send({
+                embeds: [{
+                  color: 0xe74c3c,
+                  title: '⚠️ Schema Drift Detected',
+                  description,
+                  timestamp: new Date().toISOString(),
+                  footer: { text: 'S³ Schema Verification' }
+                }]
+              }).catch(() => {});
+            }
+          }).catch(() => {});
+        }
+      };
+    }
 
     // Check for pending migrations and prompt via Discord if any
     this._scheduleMigrationPrompt();
@@ -427,7 +553,18 @@ export default class SlackersSquadServices extends BasePlugin {
     this._resolveReady();
   }
 
+  /**
+   * NOTE: unmount() is defined here for correctness, but as of SquadJS v4.2.0 RC1
+   * and earlier, the framework never calls plugin.unmount(). This method is kept
+   * for future-proofing — if SquadJS ever implements dynamic mount/unmount,
+   * cleanup will work correctly.
+   */
   async unmount() {
+    // Emit any suppressed stderr tallies before shutting down — a burst that
+    // stopped before its dedupe window closed would otherwise never report its
+    // final count, which is exactly the number an operator wants after an outage.
+    flushStderrDiagnostics();
+
     // Clean up migration prompt debounce timer
     if (this._migrationPromptTimer) {
       clearTimeout(this._migrationPromptTimer);
@@ -591,6 +728,28 @@ export default class SlackersSquadServices extends BasePlugin {
 
     if (!pending || pending.length === 0) {
       this.verbose(3, '[S3 Migration] No pending migrations.');
+      // Run live schema verification now that all consumer plugins have registered
+      // their models. The initial verifyLiveSchema() during db.mount() ran before
+      // any models were registered, so it could not detect drift. This second pass
+      // captures the actual schema state — on a server where S3_SchemaVersions
+      // already matches the expected version but the actual DB columns are missing
+      // (e.g. a prior migration's ADD COLUMN silently failed due to MySQL permissions),
+      // this will detect the drift and trigger recovery.
+      const drift = await db.verifyLiveSchema();
+      db._lastDriftResult = drift;
+      if (drift.length > 0) {
+        this.verbose(1, `[S3 Migration] Schema drift detected on up-to-date server — ${drift.length} issue(s).`);
+        await db._handleDetectedDrift(drift);
+        // Only re-schedule the migration prompt if the drift includes missing
+        // columns, missing rows, or violated data post-conditions — extra-only
+        // drift is informational and does not require admin intervention.
+        // _handleDetectedDrift() only re-opens the migration gate for those
+        // three; unconditionally re-scheduling here would create an infinite
+        // loop since extra-only drift never creates a pending migration.
+        if (drift.some(e => e.missing || e.missingRows || e.dataViolations)) {
+          this._scheduleMigrationPrompt();
+        }
+      }
       return;
     }
 
@@ -675,12 +834,20 @@ export default class SlackersSquadServices extends BasePlugin {
   /**
    * Debounced migration prompt scheduler. Called by consumer plugins via
    * verifyAndRunMigrations() when they detect pending-but-unconfirmed
-   * migrations. Multiple plugins may call this in rapid succession during
+   * migrations, AND by the drift-recovery path after _handleDetectedDrift()
+   * repopulates _pendingMigrations for affected plugins.
+   *
+   * Multiple callers may invoke this in rapid succession during
    * initialisation — the 500ms debounce ensures only one Discord embed is
    * posted after all plugins have registered their expected versions.
+   * Each call to verifyAndRunMigrations() from a consumer plugin resets
+   * the timer, so the prompt fires 500ms after the LAST consumer registers.
    *
    * Idempotency guard: if a valid unexpired token already exists on the
    * MigrationEngine, the prompt was already posted and this is a no-op.
+   * The drift-recovery path may still bypass this if the token expired
+   * but the gate is still re-open — _handleDetectedDrift() creates a new
+   * gate and nullifies any stale token, so the next call will proceed.
    */
   _scheduleMigrationPrompt() {
     // Idempotency: if a valid token already exists, prompt was already posted

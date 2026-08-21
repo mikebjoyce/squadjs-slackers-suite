@@ -30,6 +30,7 @@
 
 import Sequelize from 'sequelize';
 import EloDatabase from '../utils/elo-database.js';
+import DBService from '../../s3/utils/db-service.js';
 
 const { Op } = Sequelize;
 
@@ -37,12 +38,32 @@ const { Op } = Sequelize;
  * Build a lightweight S³ DBService shim around a raw Sequelize instance.
  * This lets EloDatabase methods (getModel, withTransaction, etc.) work
  * without a live S³ plugin.
+ *
+ * ⚠️ The SQL-building helpers are **delegated to the real DBService**, never
+ * re-implemented here. Identifier quoting, collation and `LIKE ... ESCAPE`
+ * parsing are properties of the engine, not of the code, so a hand-written
+ * stand-in would happily report green on SQL the database rejects. Those
+ * methods depend only on `this.sequelize`, so an object with DBService's
+ * prototype and that one field runs the production code path verbatim.
+ *
+ * (This shim previously omitted caseInsensitiveLikeLiteral entirely, so every
+ * name search threw a TypeError that searchPlayer swallowed into a null — the
+ * two search tests below were failing before this was added.)
  */
 function createS3dbShim(sequelize) {
+  const real = Object.create(DBService.prototype);
+  real.sequelize = sequelize;
+
   return {
     getModel(name) {
       return sequelize.models[name] || null;
     },
+    getDialect: () => real.getDialect(),
+    quoteIdentifier: (identifier) => real.quoteIdentifier(identifier),
+    escapeValue: (value) => real.escapeValue(value),
+    caseInsensitiveLikeOp: () => real.caseInsensitiveLikeOp(),
+    caseInsensitiveLikeLiteral: (column, term, opts) =>
+      real.caseInsensitiveLikeLiteral(column, term, opts),
     isReady() {
       return true;
     },
@@ -264,5 +285,210 @@ export default async function runDatabaseTests(runTest) {
     const result = await s3dbShim.withTransactionWithRetry(flakyFn);
     if (result !== 'success') throw new Error('Retry logic failed to return result');
     if (attempts !== 2) throw new Error(`Expected 2 attempts (1 fail + 1 retry), got ${attempts}`);
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // Test 5: Ranked search — the "!elo cerv" ambiguity
+  //
+  // Regression cover for the reported bug: `!elo cerv` returned "Cerveira"
+  // (2 rounds) instead of "[NL] Cerv" (267 rounds). searchPlayer() used to
+  // be an unordered findOne, so the winner was decided by row order.
+  //
+  // Rows are inserted with the low-round decoy FIRST, so a regression to
+  // unordered findOne fails this test on SQLite rather than passing by luck.
+  // ────────────────────────────────────────────────────────────────
+  await runTest('Search: Ranked disambiguation and case-insensitivity', async () => {
+    const roster = [
+      { eosID: 'eos_cerveira', steamID: 'steam_cerveira', name: 'Cerveira', roundsPlayed: 2, wins: 1, losses: 1 },
+      { eosID: 'eos_cerv', steamID: '76561198962436118', name: '[NL] Cerv', roundsPlayed: 267, wins: 134, losses: 133 },
+      { eosID: 'eos_cervmain', steamID: 'steam_cervmain', name: 'CervTheThird', roundsPlayed: 40, wins: 20, losses: 20 }
+    ];
+    for (const p of roster) await db.upsertPlayerStats(p.eosID, p);
+
+    // 1. The reported case — most-played prefix match wins over the decoy.
+    const cerv = await db.searchPlayer('cerv');
+    if (!cerv) throw new Error('Ranked search found nothing for "cerv"');
+    if (cerv.eosID !== 'eos_cerv') throw new Error(`Expected [NL] Cerv, got ${cerv.name}`);
+
+    // 2. Clan tags are transparent: "cerv" hits tier 1 on the tag-stripped
+    //    name, the same tier a literally-stored "Cerv" would occupy.
+    if (cerv._matchTier !== 1) throw new Error(`Expected tier 1 (exact minus tag), got ${cerv._matchTier}`);
+
+    // 3. Case-insensitive on every dialect, including the exact-name query.
+    const upper = await db.searchPlayer('CERVEIRA');
+    if (!upper || upper.eosID !== 'eos_cerveira') throw new Error('Exact name match is case-sensitive');
+    if (upper._matchTier !== 1) throw new Error(`Expected tier 1 for exact name, got ${upper._matchTier}`);
+
+    // 4. An exact ID always wins outright, however few rounds it has.
+    const byId = await db.searchPlayer('76561198962436118');
+    if (!byId || byId.eosID !== 'eos_cerv') throw new Error('SteamID lookup failed');
+    if (byId._matchTier !== 0) throw new Error(`Expected tier 0 for ID, got ${byId._matchTier}`);
+
+    // 5. All three rows are returned as candidates, best-first, so callers can
+    //    report runners-up when the top hit was a guess.
+    const candidates = await db.searchPlayers('cerv');
+    if (candidates.length !== 3) throw new Error(`Expected 3 candidates, got ${candidates.length}`);
+
+    // 6. No "Also matched" line here, nor on a plain exact name: [NL] Cerv is
+    //    the sole tier-1 hit, so the answer is not a guess and the trailing
+    //    prefix matches are noise. The hint is reserved for genuine ambiguity
+    //    — see the tier-1 contest test below.
+    if (EloDatabase.formatOtherMatches(candidates) !== null) {
+      throw new Error('Unique exact match should not emit an "Also matched" hint');
+    }
+    if (EloDatabase.formatOtherMatches(await db.searchPlayers('CERVEIRA')) !== null) {
+      throw new Error('Exact match should not emit an "Also matched" hint');
+    }
+
+    // 7. Online players win ties *within* a tier. Cerveira (2 rounds) and
+    //    CervTheThird (40 rounds) are both tier 2 prefix matches, so rounds
+    //    normally put CervTheThird ahead; marking Cerveira online flips them.
+    const offline = await db.searchPlayers('cerv');
+    if (offline.findIndex(p => p.eosID === 'eos_cerveira') <
+        offline.findIndex(p => p.eosID === 'eos_cervmain')) {
+      throw new Error('Baseline wrong: expected the higher-round tier-2 match first');
+    }
+    const online = await db.searchPlayers('cerv', { onlineIDs: new Set(['eos_cerveira']) });
+    if (online.findIndex(p => p.eosID === 'eos_cerveira') >
+        online.findIndex(p => p.eosID === 'eos_cervmain')) {
+      throw new Error('Online tiebreak not applied within tier');
+    }
+
+    // 8. Online must NOT override tier: [NL] Cerv is a tier-1 match and still
+    //    outranks an online tier-2 match.
+    if (online[0].eosID !== 'eos_cerv') throw new Error('Online bump wrongly crossed tier boundary');
+
+    // 9. The destructive-command gate. "cerv" uniquely strips to [NL] Cerv, so
+    //    a reset may proceed; "cerve" is only a prefix guess, so it may not.
+    if (!EloDatabase.isUnambiguous(candidates)) throw new Error('Unique tag-stripped match should be resettable');
+    if (EloDatabase.isUnambiguous(await db.searchPlayers('cerve'))) throw new Error('Prefix guess must not be resettable');
+
+    // 10. …and a tag-stripped COLLISION must block it, even though one side
+    //     ranks higher. This is the case that makes tier alone insufficient:
+    //     without the uniqueness rule, "cerv" would silently reset whichever
+    //     clan's Cerv had more rounds.
+    await db.upsertPlayerStats('eos_uscerv', { steamID: 'steam_uscerv', name: '[US] Cerv', roundsPlayed: 99, wins: 50, losses: 49 });
+    const collision = await db.searchPlayers('cerv');
+    if (collision.filter(p => p._matchTier === 1).length !== 2) throw new Error('Expected two tier-1 candidates');
+    if (EloDatabase.isUnambiguous(collision)) throw new Error('Tag-stripped collision must not be resettable');
+    // An exact ID stays resettable regardless of the collision.
+    if (!EloDatabase.isUnambiguous(await db.searchPlayers('76561198962436118'))) {
+      throw new Error('Exact ID must always be resettable');
+    }
+    await s3dbShim.getModel('Elo_PlayerStats').destroy({ where: { eosID: 'eos_uscerv' } });
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // Test 5a2: Literal vs tag-stripped exact match — the "Hunty" case.
+  //
+  // Reported from production: `!elo hunty` returned a 12-round " Hunty" over
+  // the 384-round "[✦NL✦] Hunty". Literal exact used to be its own tier above
+  // tag-stripped exact, so rounds never got a say and the footer was suppressed
+  // as well — wrong player AND no hint that another existed.
+  //
+  // Both stored names are used verbatim from the 2026-08-17 export, padding
+  // included, since the leading space on " Hunty" is what makes it a literal
+  // exact match for the term "hunty" in the first place.
+  // ────────────────────────────────────────────────────────────────
+  await runTest('Search: literal and tag-stripped exact names compete on rounds', async () => {
+    await db.upsertPlayerStats('eos_hunty_bare', { steamID: 'steam_hunty_bare', name: ' Hunty', roundsPlayed: 12, wins: 5, losses: 7 });
+    await db.upsertPlayerStats('eos_hunty_nl', { steamID: 'steam_hunty_nl', name: '[✦NL✦] Hunty', roundsPlayed: 384, wins: 201, losses: 183 });
+
+    const candidates = await db.searchPlayers('hunty');
+    if (candidates.length !== 2) throw new Error(`Expected 2 candidates, got ${candidates.length}`);
+
+    // 1. Both sit at tier 1 — the merge is the whole fix.
+    if (candidates.filter(p => p._matchTier === 1).length !== 2) {
+      throw new Error(`Expected both at tier 1, got ${candidates.map(p => p._matchTier).join(',')}`);
+    }
+
+    // 2. Rounds decide, so the tagged regular wins.
+    if (candidates[0].eosID !== 'eos_hunty_nl') {
+      throw new Error(`Expected [NL] Hunty, got ${JSON.stringify(candidates[0].name)}`);
+    }
+
+    // 3. The displaced account is named, so the asker can see it exists.
+    const hint = EloDatabase.formatOtherMatches(candidates);
+    if (!hint || !hint.includes('Hunty (12 rds)')) {
+      throw new Error(`Expected an "Also matched" hint naming the 12-round account, got ${hint}`);
+    }
+
+    // 4. Online still outranks rounds within the tier — a bare-named player
+    //    actually in the match beats a tagged one who logged off.
+    const online = await db.searchPlayers('hunty', { onlineIDs: new Set(['eos_hunty_bare']) });
+    if (online[0].eosID !== 'eos_hunty_bare') throw new Error('Online tiebreak not applied at tier 1');
+
+    // 5. A tier-1 contest blocks resets: `reset hunty` must not pick a side.
+    if (EloDatabase.isUnambiguous(candidates)) throw new Error('Tier-1 contest must not be resettable');
+    if (!EloDatabase.isUnambiguous(await db.searchPlayers('steam_hunty_bare'))) {
+      throw new Error('SteamID must stay resettable — it is the documented escape hatch');
+    }
+
+    const model = s3dbShim.getModel('Elo_PlayerStats');
+    await model.destroy({ where: { eosID: ['eos_hunty_bare', 'eos_hunty_nl'] } });
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // Test 5b: Whitespace-padded stored names.
+  //
+  // Squad stores most names with a leading space — 10,604 of 11,787 rows in
+  // the production export used to validate this. The exact-name query must
+  // compare against TRIM(name) or it matches nothing in production, and every
+  // real exact match falls through to the LIMITed fuzzy pass where a common
+  // substring can truncate it away.
+  //
+  // The padded player is given a LOW round count and buried under many
+  // higher-round substring matches, so the fuzzy pass alone cannot save it —
+  // only the trimmed exact query can.
+  // ────────────────────────────────────────────────────────────────
+  await runTest('Search: whitespace-padded stored names still match exactly', async () => {
+    await db.upsertPlayerStats('eos_padded', { steamID: 'steam_padded', name: ' Ice', roundsPlayed: 3, wins: 1, losses: 2 });
+    for (let i = 0; i < 40; i++) {
+      await db.upsertPlayerStats(`eos_icefill${i}`, {
+        steamID: `steam_icefill${i}`, name: `Icemodai${i}`, roundsPlayed: 100 + i, wins: 50, losses: 50
+      });
+    }
+
+    const hit = await db.searchPlayer('Ice');
+    if (!hit) throw new Error('Padded name not found at all');
+    if (hit.eosID !== 'eos_padded') {
+      throw new Error(`Expected the padded " Ice" (3 rds), got ${JSON.stringify(hit.name)} (${hit.roundsPlayed} rds)`);
+    }
+    if (hit._matchTier !== 1) throw new Error(`Expected tier 1 for a padded exact name, got ${hit._matchTier}`);
+
+    // Trailing padding too, and case-insensitively.
+    await db.upsertPlayerStats('eos_pad2', { steamID: 'steam_pad2', name: 'Reaper  ', roundsPlayed: 1 });
+    const trailing = await db.searchPlayer('reaper');
+    if (!trailing || trailing.eosID !== 'eos_pad2') throw new Error('Trailing-padded name not matched');
+    if (trailing._matchTier !== 1) throw new Error(`Expected tier 1, got ${trailing._matchTier}`);
+
+    // Cleanup so later assertions are not affected by the filler rows.
+    const model = s3dbShim.getModel('Elo_PlayerStats');
+    await model.destroy({ where: { eosID: ['eos_padded', 'eos_pad2'] } });
+    for (let i = 0; i < 40; i++) await model.destroy({ where: { eosID: `eos_icefill${i}` } });
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // Test 6: stripClanTags — pure function, no DB needed.
+  // Guards the deliberate narrowness vs ClansService.extractRawPrefix():
+  // unbracketed first words must survive, or ordinary two-word names would
+  // exact-match a search for their surname.
+  // ────────────────────────────────────────────────────────────────
+  await runTest('Search: stripClanTags is conservative', async () => {
+    const cases = [
+      ['[NL] Cerv', 'Cerv'],
+      ['(NL) Cerv', 'Cerv'],
+      ['=NL= Cerv', 'Cerv'],
+      ['Cerv [NL]', 'Cerv'],
+      ['John Smith', 'John Smith'],   // no bracket — must not lose "John"
+      ['[NL]', '[NL]'],               // tag only — never collapses to empty
+      ['Cerv', 'Cerv']
+    ];
+    for (const [input, expected] of cases) {
+      const actual = EloDatabase.stripClanTags(input);
+      if (actual !== expected) {
+        throw new Error(`stripClanTags(${JSON.stringify(input)}) → ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`);
+      }
+    }
   });
 }

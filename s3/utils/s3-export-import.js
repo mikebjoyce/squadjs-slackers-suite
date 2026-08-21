@@ -17,6 +17,16 @@
  *   All (--all)          — Everything including auto-recoverable plugin
  *     persistence tables.
  *
+ * Each model declares its own tier where it is defined:
+ *
+ *     defineModel('Elo_PlayerStats', schema, { exportTier: 'historical' })
+ *
+ * This file does not own the classification and no plugin needs to edit it to
+ * have its tables backed up. `filterByTier()` reads the declarations back out
+ * of DBService. An undeclared model is exported at the default tier and warned
+ * about — see DEFAULT_EXPORT_TIER in db-service.js for why the fallback errs
+ * towards including too much.
+ *
  * Additions:
  *   exportToFile() — Writes export to a timestamped .s3backup.json file
  *     in the backup directory. Used by MigrationEngine as the fallback
@@ -65,21 +75,52 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { restoreBackup, listBackups } from './s3-backup.js';
+import { formatSize, timestampString, parseTimestamp } from './s3-common.js';
 
 // ─── TABLE CLASSIFICATION ────────────────────────────────────────────
+
+/*
+ * ⚠️ THESE SETS ARE NO LONGER THE ALLOWLIST. They are the test fixture.
+ *
+ * Classification now lives at each model's definition site:
+ *
+ *     defineModel('SwitchPlugin_Settings', schema, { exportTier: 'historical' })
+ *
+ * filterByTier() reads dbService.getEffectiveModelTier(), so a third-party S³
+ * consumer plugin can classify its own tables without editing this file. A
+ * model that declares no tier is exported at the DEFAULT tier and warned about
+ * when it is defined — over-exporting fails visibly (Discord's size limit),
+ * under-exporting fails silently and permanently.
+ *
+ * The sets below are retained deliberately, as the expected classification that
+ * `test-export-model-registration.js` asserts each in-repo model's *declared*
+ * tier against. Moving a table between tiers therefore takes two deliberate
+ * edits — the definition site and this fixture — rather than one word that
+ * quietly changes what lands in every operator's backup. They were verified
+ * against a real production export on 2026-08-19.
+ *
+ * ⚠️ They hold MODEL names, not table names. Several models deliberately pair a
+ * non-underscored model name with an underscored table name (model
+ * `S3GameStateEvents` → table `S3_GameStateEvents`), so a table name written
+ * here matches no model at all.
+ */
 
 /**
  * Historical tables — irreplaceable data exported by default.
  * Player ratings, round histories, match reports, assignment logs,
- * and schema version tracking.
+ * operator-configured settings, and schema version tracking.
  */
 const HISTORICAL_TABLES = new Set([
-  'S3_SchemaVersions',
+  'S3SchemaVersions',
   'Elo_PlayerStats',
   'Elo_RoundHistory',
   'Elo_RoundPlayers',
   'SA_AssignmentLog',
-  'TB_RoundReport'
+  'TB_RoundReport',
+  // Operator-configured Switch settings. Not auto-recoverable — if lost, an
+  // admin has to re-enter them by hand — so this belongs in the default tier
+  // rather than with the ephemeral state. It was previously in no tier at all.
+  'SwitchPlugin_Settings'
 ]);
 
 /**
@@ -87,9 +128,9 @@ const HISTORICAL_TABLES = new Set([
  * Included when the --logs flag is passed.
  */
 const LOGGING_TABLES = new Set([
-  'S3_PlayerEvents',
-  'S3_GameStateEvents',
-  'S3_PlayerSnapshots'
+  'S3PlayerEvents',
+  'S3GameStateEvents',
+  'S3PlayerSnapshots'
 ]);
 
 /**
@@ -97,34 +138,69 @@ const LOGGING_TABLES = new Set([
  * Only included when the --all flag is passed.
  */
 const EPHEMERAL_TABLES = new Set([
-  'S3_GameState',
-  'S3_PlayerSessions',
+  'S3GameState',
+  'S3_PlayerSession',
+  // Reconnect memory — rebuilt from live play, and entries expire on their own.
+  // Previously in no tier at all.
+  'S3PlayerReconnect',
   'SwitchPlugin_PlayerCooldowns',
   'SwitchPlugin_Endmatches',
   'Elo_PluginState',
   'TeamBalancerState'
 ]);
 
+/**
+ * The three tiers, exposed as the **expected classification fixture**. A test
+ * asserts every in-repo model's declared `exportTier` equals its entry here,
+ * and that these partition getModelNames() exhaustively. Nothing in the export
+ * path reads them.
+ */
+export const TIER_SETS = Object.freeze({
+  historical: HISTORICAL_TABLES,
+  logging: LOGGING_TABLES,
+  ephemeral: EPHEMERAL_TABLES
+});
+
 // ─── HELPERS ─────────────────────────────────────────────────────────
+
+/**
+ * Map the operator-facing export flag onto the set of model tiers it covers.
+ *
+ * The two vocabularies are deliberately distinct: `--logs` is a *cumulative*
+ * CLI flag ("also give me the logs"), while `logging` is one exclusive tier a
+ * model belongs to. Conflating them is how a model ends up in a flag nobody
+ * expected.
+ */
+const TIERS_FOR_FLAG = Object.freeze({
+  historical: ['historical'],
+  logs: ['historical', 'logging'],
+  all: ['historical', 'logging', 'ephemeral']
+});
 
 /**
  * Determine which model names to include based on export flags.
  *
- * @param {string[]} modelNames - All model names available
+ * Reads each model's declared tier from the dbService registry — see
+ * `defineModel()`'s `exportTier` option. Models that declared no tier fall back
+ * to DBService's DEFAULT_EXPORT_TIER, so a forgotten declaration over-exports
+ * (visible, recoverable) rather than silently omitting the table.
+ *
+ * @param {object} dbService - DBService instance
  * @param {object} options
  * @param {string} [options.tier] - 'historical' (default), 'logs', or 'all'
  * @returns {string[]} Filtered model names in declaration order
  */
-function filterByTier(modelNames, { tier = 'historical' } = {}) {
+function filterByTier(dbService, { tier = 'historical' } = {}) {
+  const modelNames = dbService.getModelNames();
+
+  // `--all` still short-circuits, but now it is a superset of the tier logic
+  // rather than a path that bypasses it: every model has an effective tier, and
+  // all three are listed for this flag.
   if (tier === 'all') return [...modelNames];
 
-  const included = new Set(HISTORICAL_TABLES);
+  const includedTiers = TIERS_FOR_FLAG[tier] || TIERS_FOR_FLAG.historical;
 
-  if (tier === 'logs') {
-    for (const t of LOGGING_TABLES) included.add(t);
-  }
-
-  return modelNames.filter((name) => included.has(name));
+  return modelNames.filter((name) => includedTiers.includes(dbService.getEffectiveModelTier(name)));
 }
 
 /**
@@ -132,56 +208,61 @@ function filterByTier(modelNames, { tier = 'historical' } = {}) {
  * transaction. Dialect-agnostic — handles SQLite, Postgres, MySQL.
  * SQLite: no-op (FK checks off by default via WAL pragmas).
  *
+ * The two dialect branches used to be transposed: `SET session_replication_role`
+ * is a *Postgres* setting and was being sent to MySQL, which rejects it with
+ * "Unknown system variable 'session_replication_role'" and aborted the restore.
+ * MySQL's equivalent is `SET FOREIGN_KEY_CHECKS`.
+ *
+ * On Postgres, `session_replication_role = replica` is the only statement that
+ * genuinely suppresses FK triggers, but setting it requires superuser. When the
+ * connection lacks that, fall back to `SET CONSTRAINTS ALL DEFERRED`, which any
+ * role may issue — it only defers constraints declared DEFERRABLE, so it is a
+ * partial measure, but it is strictly better than aborting the import.
+ *
  * @param {import('sequelize').Sequelize} connector
+ * @param {(level: number, msg: string) => void} [verboseLogger]
  * @returns {Promise<void>}
  */
-async function disableForeignKeyChecks(connector) {
+async function disableForeignKeyChecks(connector, verboseLogger = () => {}) {
   if (!connector || typeof connector.query !== 'function') return;
   const dialect = typeof connector.getDialect === 'function' ? connector.getDialect() : 'sqlite';
 
   if (dialect === 'postgres') {
-    await connector.query('SET CONSTRAINTS ALL DEFERRED');
+    try {
+      await connector.query('SET session_replication_role = replica');
+    } catch (err) {
+      verboseLogger(2, `[ExportImport] session_replication_role unavailable (${err.message}) — falling back to SET CONSTRAINTS ALL DEFERRED. FK checks are only deferred for DEFERRABLE constraints.`);
+      await connector.query('SET CONSTRAINTS ALL DEFERRED');
+    }
   } else if (dialect === 'mysql') {
-    await connector.query('SET session_replication_role = replica');
+    await connector.query('SET FOREIGN_KEY_CHECKS = 0');
   }
   // SQLite: FK checks are off by default — no-op
 }
 
 /**
  * Re-enable foreign key constraint checks after an import transaction.
+ * Mirrors disableForeignKeyChecks(), including the Postgres fallback.
  *
  * @param {import('sequelize').Sequelize} connector
+ * @param {(level: number, msg: string) => void} [verboseLogger]
  * @returns {Promise<void>}
  */
-async function enableForeignKeyChecks(connector) {
+async function enableForeignKeyChecks(connector, verboseLogger = () => {}) {
   if (!connector || typeof connector.query !== 'function') return;
   const dialect = typeof connector.getDialect === 'function' ? connector.getDialect() : 'sqlite';
 
   if (dialect === 'postgres') {
-    await connector.query('SET CONSTRAINTS ALL IMMEDIATE');
+    try {
+      await connector.query('SET session_replication_role = DEFAULT');
+    } catch (err) {
+      verboseLogger(2, `[ExportImport] Could not restore session_replication_role (${err.message}) — restoring constraints via SET CONSTRAINTS ALL IMMEDIATE.`);
+      await connector.query('SET CONSTRAINTS ALL IMMEDIATE');
+    }
   } else if (dialect === 'mysql') {
-    await connector.query('SET session_replication_role = DEFAULT');
+    await connector.query('SET FOREIGN_KEY_CHECKS = 1');
   }
   // SQLite: no-op
-}
-
-/**
- * Format a Unix-ms timestamp to YYYY-MM-DD-HHmmss (matching s3-backup.js).
- */
-function timestampString(ts) {
-  const d = new Date(ts);
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-` +
-    `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-}
-
-/**
- * Format byte count to a human-readable string.
- */
-function formatSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /**
@@ -247,21 +328,40 @@ export async function exportToJSON(dbService, { tier = 'historical' } = {}) {
     throw new Error('DBService is not ready.');
   }
 
-  const modelNames = dbService.getModelNames();
-  const selected = filterByTier(modelNames, { tier });
+  const selected = filterByTier(dbService, { tier });
   const connector = dbService.getConnector();
   const connectorName = connector && typeof connector.getDialect === 'function'
     ? connector.getDialect()
     : dbService.getConnectorName() || 'unknown';
 
+  // `tier` and `tiers` are additive, so this stays s3ExportVersion 1 and older
+  // readers ignore them. They make a backup self-describing: a restore can tell
+  // an operator "this file was taken at the default tier, so ephemeral state is
+  // not in it" rather than leaving them to infer it from absence. Importers
+  // must tolerate their absence — v1 files predating this change have neither.
   const result = {
     s3ExportVersion: 1,
     exportedAt: Date.now(),
     connector: connectorName,
+    tier,
+    tiers: Object.fromEntries(selected.map((name) => [name, dbService.getEffectiveModelTier(name)])),
     tables: {},
     rowCounts: {},
     results: {}
   };
+
+  // Surface anything riding the default-tier fallback into the export result,
+  // so an operator taking a backup sees it rather than only the author who
+  // happened to be reading the mount log.
+  const undeclared = typeof dbService.getUndeclaredModelNames === 'function'
+    ? dbService.getUndeclaredModelNames().filter((name) => selected.includes(name))
+    : [];
+  if (undeclared.length > 0) {
+    result.warnings = [
+      `These models declare no exportTier and were exported at the default tier: ` +
+      `${undeclared.join(', ')}. Declare one at each defineModel() call site.`
+    ];
+  }
 
   const missing = selected.filter((name) => !dbService.getModel(name));
   for (const name of missing) {
@@ -326,7 +426,8 @@ export async function importFromJSON(dbService, json, { dryRun = false } = {}) {
 
   // Execute inside a single transaction
   if (connector && typeof connector.transaction === 'function') {
-    await disableForeignKeyChecks(connector);
+    const fkLogger = typeof dbService.verboseLogger === 'function' ? dbService.verboseLogger : () => {};
+    await disableForeignKeyChecks(connector, fkLogger);
     try {
       await connector.transaction(async (transaction) => {
         for (const [tableName, rows] of Object.entries(json.tables)) {
@@ -354,7 +455,7 @@ export async function importFromJSON(dbService, json, { dryRun = false } = {}) {
         }
       });
     } finally {
-      await enableForeignKeyChecks(connector);
+      await enableForeignKeyChecks(connector, fkLogger);
     }
   } else {
     // Fallback: no transaction support — upsert directly
@@ -676,14 +777,3 @@ export function listJsonBackups(backupDir = null) {
   return backups;
 }
 
-/**
- * Parse a YYYY-MM-DD-HHmmss timestamp string to Unix ms.
- */
-function parseTimestamp(str) {
-  const match = str.match(/^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})(\d{2})$/);
-  if (!match) return null;
-
-  const [, year, month, day, hour, min, sec] = match.map(Number);
-  const d = new Date(year, month - 1, day, hour, min, sec);
-  return d.getTime();
-}

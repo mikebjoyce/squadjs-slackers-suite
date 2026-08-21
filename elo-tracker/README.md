@@ -1,4 +1,4 @@
-# EloTracker Plugin v2.1.1
+# EloTracker Plugin v2.1.6
 
 **SquadJS Plugin for Skill-Based Player Rating**
 
@@ -71,11 +71,13 @@ No additional configuration is needed on the EloTracker side. TeamBalancer finds
 
 S³ is the centralised service container for shared state across Slacker's Squad plugins. EloTracker uses it as the primary data source for game-state metadata — round start time, layer name, gamemode, and ignored-mode detection.
 
-**Requires S³ ≥1.0.0.**
+**Requires S³ ≥1.2.4.**
 
 **Why this matters**: Rather than maintaining its own round-time tracking, EloTracker reads ground-truth data from S³'s `gameState` service — `getRoundStartTime()`, `getLayerName()`, `getGamemode()`, and `isIgnoredMode()`. This ensures cross-plugin consistency: SA and TB refer to the same roundStartTime and matchId during team assignment and balancing. EloTracker also listens for `TEAM_BALANCER_SCRAMBLE_EXECUTED` to capture a team-balance snapshot post-scramble for Discord reporting.
 
-**Setup**: Install S³ alongside EloTracker. S³ is auto-discovered at runtime via `this.server.plugins`. If S³ is absent, EloTracker falls back to its own direct SquadJS event data for all services.
+**Setup**: Install S³ in `config.json` **before** EloTracker, so it mounts first. S³ is auto-discovered at runtime via `this.server.plugins`.
+
+S³ is **required, not optional** — there is no fallback path. `S3PluginBase._resolveS3()` throws if it cannot find SlackersSquadServices, and `_checkS3Version()` throws if the version is below the floor. Either way EloTracker fails to mount rather than degrading quietly.
 
 ---
 
@@ -116,7 +118,6 @@ Add the following to your `config.json`:
   {
     "plugin": "EloTracker",
     "enabled": true,
-    "database": "sqlite",
     "discordClient": "discord",
     "discordPublicChannelID": "YOUR_CHANNEL_ID",
     "discordAdminChannelID": "YOUR_ADMIN_CHANNEL_ID",
@@ -127,14 +128,13 @@ Add the following to your `config.json`:
     "minPlayersForElo": 80,
     "minRoundsForLeaderboard": 10,
     "roundStartEmbedDelayMs": 180000,
-    "ignoredGameModes": ["Seed", "Jensen"],
     "enablePublicIngameCommands": true,
-    "enableDatabaseLogging": false
+    "enableDatabaseLogging": true
   }
 ]
 ```
 
-**Database Options:** The `"database"` option should match a connector name from above. Use `"sqlite"` for file-based storage (default), `"mysql"` for MySQL, or `"postgres"` for PostgreSQL. Any Sequelize-compatible backend is supported.
+**Database:** EloTracker has no `database` option and never opens a connector of its own. It defines its models on S³'s connector, so the engine is whatever `database` is set to on the **SlackersSquadServices** plugin — SQLite, MySQL, Postgres, or any Sequelize-compatible backend. The commented-out connectors above are there so you can point S³ at one.
 
 ### 2. File Placement
 
@@ -175,8 +175,7 @@ squad-server/
 
 | Option | Required | Type | Default | Description |
 |--------|----------|------|---------|-------------|
-| `database` | yes | string | `"sqlite"` | Sequelize connector name for persistence (SQLite, MySQL, PostgreSQL, etc.) |
-| `discordClient` | no | string | — | Discord connector name for Discord integration |
+| `discordClient` | no | string | `"discord"` | Discord connector name for Discord integration |
 | `discordPublicChannelID` | no | string | `""` | Discord channel ID for public commands (`!elo`, `!elo leaderboard`, etc.) |
 | `discordAdminChannelID` | no | string | `""` | Discord channel ID for admin commands (`!elo status`, `!elo backup`, etc.) |
 | `discordReportChannelID` | no | string | `""` | Discord channel ID for automated round reports (defaults to admin channel if unset) |
@@ -186,9 +185,8 @@ squad-server/
 | `minPlayersForElo` | no | number | `80` | Minimum connected players required to calculate ELO updates |
 | `minRoundsForLeaderboard` | no | number | `10` | Minimum rounds played before a player appears on the leaderboard |
 | `roundStartEmbedDelayMs` | no | number | `180000` | Delay in ms before posting the round-start Discord embed (default: 3 minutes) |
-| `ignoredGameModes` | no | array | `["Seed", "Jensen"]` | Array of layer/gamemode substrings where ELO tracking is skipped |
 | `enablePublicIngameCommands` | no | boolean | `false` | Enable public in-game commands (`!elo`, `!elo leaderboard`) |
-| `enableDatabaseLogging` | no | boolean | `false` | If true, round outcome data is also written to database tables |
+| `enableDatabaseLogging` | no | boolean | `true` | If true, round outcome data is also written to database tables |
 
 ---
 
@@ -211,7 +209,7 @@ squad-server/
 **Admin (ChatAdmin channel only):**
 
 - `!eloadmin status` — Plugin status, session count, and round info.
-- `!eloadmin reset <name | steamID>` — Reset a player to default rating.
+- `!eloadmin reset <name | steamID>` — Reset a player to default rating. Requires an **exact** identifier (see [Name Lookup](#name-lookup)); a partial name is refused with the list of candidates.
 
 ### Discord Commands
 
@@ -233,6 +231,54 @@ squad-server/
 - `!elo backup` — Export player stats as JSON.
 - `!elo restore` — Restore from an attached JSON backup.
 - `!elo reset confirm` — Wipe **ALL** database ratings.
+- `!elo reset <name | steamID>` — Reset one player. Like the in-game form, requires an exact identifier.
+
+---
+
+## Name Lookup
+
+Every `!elo <identifier>` path — in game and in Discord — resolves the term
+through one ranked search, so all of them pick the same player.
+
+Candidates fall into tiers, and the best tier present wins outright:
+
+| Tier | Match |
+|------|-------|
+| 0 | Exact `eosID` or `steamID` |
+| 1 | Exact name, case-insensitive — either as stored (compared against `TRIM(name)`, since Squad stores most names with a leading space) or once clan tags are stripped (`[NL] Cerv` → `Cerv`) |
+| 2 | Prefix of the raw or tag-stripped name |
+| 3 | Substring anywhere in the name |
+
+Ties **within** a tier are broken by: currently on the server, then most rounds
+played, then most recently seen. Online never beats a better tier.
+
+A clan tag is treated as decoration, not identity, so a stored name and a
+tag-stripped one compete on equal footing and rounds played decides. `!elo hunty`
+returns the 384-round `[✦NL✦] Hunty`, not the 12-round ` Hunty` that happens to
+hold the bare string. The trade-off: an account whose stored name equals another
+player's tag-stripped name can no longer be reached by name — use its SteamID, or
+bare `!elo` if it is your own. On the production data set 51 names of 11,484 are
+affected.
+
+When the result was a guess — the top tier is a prefix or substring hit, or two
+players tie at the best tier — the reply names the runners-up
+(`Also matched: Hunty (12 rds)…`) rather than silently resolving to one of them.
+A unique exact match shows no such line. Searches are case-insensitive on every
+supported database engine.
+
+Destructive commands (`!eloadmin reset`, `!elo reset <identifier>`) require an
+**unambiguous** match: tier 0–1 **and** nobody else matching at that same tier.
+So `reset cerv` works when one player strips to `Cerv`, but is refused when both
+`[NL] Cerv` and `[US] Cerv` exist — otherwise it would silently wipe whichever
+had more rounds. Anything less lists the candidates and changes nothing.
+
+On the production data set this refuses roughly 3% of full-name resets: mostly
+genuine duplicate names (23 players are named `Reaper`), plus the 41 rows where a
+stored name ties a tag-stripped one. Use a SteamID for those.
+
+> Before this was ranked, the lookup was an unordered `findOne`: any substring
+> hit could win depending on row order, so `!elo cerv` could return a 2-round
+> `Cerveira` instead of the 267-round `[NL] Cerv`.
 
 ---
 

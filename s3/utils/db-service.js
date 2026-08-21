@@ -1,4 +1,4 @@
-/**
+ /**
  * ╔═══════════════════════════════════════════════════════════════╗
  * ║               DB SERVICE                                     ║
  * ╚═══════════════════════════════════════════════════════════════╝
@@ -20,11 +20,28 @@
  *   isReady()                   — Returns true when service is mounted.
  *   getConnector()              — Returns the underlying Sequelize instance.
  *   getConnectorName()          — Returns dialect name or connector label.
+ *   getDialect()                — Returns the TRUE SQL dialect (use this, not
+ *                                  getConnectorName(), to branch on SQL syntax).
+ *   quoteIdentifier(name)       — Dialect-correct identifier quoting.
+ *   escapeValue(value)          — Dialect-correct SQL string literal escaping.
+ *   incrementLiteral(col, n)    — Portable atomic `col + n` update expression.
+ *   caseInsensitiveLikeOp()     — Op.iLike on Postgres, Op.like elsewhere.
+ *   caseInsensitiveLikeLiteral(col, term, opts) — Portable case-insensitive LIKE
+ *                                  literal with a working ESCAPE clause.
+ *                                  `{ exact: true }` drops the wildcards for a
+ *                                  whole-value compare that stays
+ *                                  case-insensitive on every dialect.
  *   acquireAdvisoryLock(key, timeoutMs) — Acquire cross-process advisory lock
  *   releaseAdvisoryLock(key)            — Release advisory lock
  *   getDataTypes()              — Resolves Sequelize DataTypes from connector.
  *   getDatabasePath()           — Returns the SQLite file path used for backup.
  *   defineModel(name, schema, opts) — Defines and caches a Sequelize model.
+ *                                  `opts.exportTier` declares which backup tier
+ *                                  the model belongs to (see EXPORT_TIERS).
+ *   getModelTier(name)          — Declared tier, or null if undeclared.
+ *   getEffectiveModelTier(name) — Declared tier, or DEFAULT_EXPORT_TIER.
+ *   getModelsByTier(tier)       — Model names whose effective tier is `tier`.
+ *   getUndeclaredModelNames()   — Models relying on the default-tier fallback.
  *   registerExpectedVersion(pluginName, version) — Declares a plugin's expected
  *                                  schema version for verification.
  *   verifySchemaVersions()      — Returns { upToDate, pending } comparing
@@ -59,11 +76,59 @@
  *   map and warns if backup/migration coverage is partial. See getDatabasePath().
  * - getModelNames() returns all Sequelize model names registered with
  *   defineModel(), used by s3-export-import.js for backup/restore.
+ * - Export tiers are declared per model, at its definition site, via
+ *   `defineModel(name, schema, { exportTier })` — NOT by a central list inside
+ *   s3-export-import.js. A third-party S³ consumer plugin can therefore classify
+ *   its own tables without editing S³. A model that declares nothing is exported
+ *   at the default tier and warned about at mount; see DEFAULT_EXPORT_TIER for
+ *   why the fallback is the inclusive direction.
  * - canBackup(connector) returns true for all connectors, enabling the
  *   connector-agnostic JSON export/import fallback in s3-export-import.js.
+ * - Dialect portability: any raw SQL (Sequelize.literal, connector.query(),
+ *   bootstrap DDL) that names a camelCase identifier MUST quote it via
+ *   quoteIdentifier(). Postgres folds unquoted identifiers to lower case while
+ *   Sequelize creates camelCase columns quoted, so the two stop agreeing —
+ *   invisibly on SQLite and MySQL, fatally on Postgres. See the helper block
+ *   under "DIALECT PORTABILITY" and s3/testing/test-dialect-portability.js.
  *
  */
-import MigrationEngine from './migration-engine.js';
+import SequelizeLib from 'sequelize';
+import MigrationEngine, { countNullColumn } from './migration-engine.js';
+import { stderrError, stderrWarn } from './s3-stderr.js';
+
+/**
+ * The three export tiers a model may declare via `defineModel(name, schema,
+ * { exportTier })`.
+ *
+ * This list is **fixed** and plugins may not extend it. The tiers are an
+ * operator-facing CLI surface (`!s3 db export`, `--logs`, `--all`); if a plugin
+ * could mint a new tier name, the flag list would depend on which plugins
+ * happen to be loaded, two plugins could collide on a name, and an operator
+ * would have no way to know what a given flag covers. Plugins classify *into*
+ * this set; they do not add to it.
+ *
+ *   historical — irreplaceable. Losing it costs data that cannot be regenerated.
+ *   logging    — forensic. Useful, bulky, roughly reproducible.
+ *   ephemeral  — auto-recoverable plugin state, rebuilt from live play.
+ *
+ * Lives here rather than in s3-export-import.js so `defineModel()` can validate
+ * a declaration without importing the exporter (which imports s3-backup.js and
+ * would close an import cycle).
+ */
+export const EXPORT_TIERS = Object.freeze(['historical', 'logging', 'ephemeral']);
+
+/**
+ * The tier an undeclared model falls into.
+ *
+ * Deliberately the most inclusive tier, because the two failure directions are
+ * not symmetric. Over-exporting fails **visibly and recoverably** — the
+ * exporter already errors with "exceeds Discord's 25 MB limit. Try without
+ * `--all`". Under-exporting fails **silently and permanently**: the backup is
+ * taken, reports success, and is missing a table nobody notices until they try
+ * to restore it. An unclassified model is therefore treated as irreplaceable
+ * until its author says otherwise.
+ */
+export const DEFAULT_EXPORT_TIER = 'historical';
 
 export default class DBService {
   constructor({
@@ -92,6 +157,8 @@ export default class DBService {
     this._databaseOption = databaseOption ?? null;
 
     this.models = {};
+    this._modelTiers = new Map();       // model name → declared exportTier (undeclared models are absent)
+    this._tierWarned = new Set();       // model names already warned about, so a re-mount does not re-spam
     this._isMounted = false;
     this.SchemaVersionsModel = null;
     this._expectedVersions = new Map();
@@ -104,6 +171,9 @@ export default class DBService {
     this._lastDriftResult = null;       // result of the last verifyLiveSchema() call (cached for !s3 diag display)
     this._migrationGate = null;         // Promise that consumers await
     this._resolveMigrationGateFn = null; // Resolver for the gate
+
+    // Drift alert callback — called when post-migration drift is detected
+    this._driftAlertCallback = null;     // Set by S³ plugin owner to fire Discord notifications
 
     // Network backoff — after a network-level DB failure, all calls return null
     // for a cooldown period rather than retrying on every tick.
@@ -354,13 +424,39 @@ export default class DBService {
     // When the DB is unreachable, Sequelize's connection pool may leak
     // rejections that aren't chained to any consumer promise. This handler
     // catches those at the process level and logs them at level 4 (debug).
+    //
+    // CRITICAL: registering ANY unhandledRejection listener replaces Node's
+    // default handler for the WHOLE process — not just for the rejections this
+    // one recognises. Node does not print, and does not exit, once a listener
+    // exists. So an early `return` on the branch below would silently swallow
+    // every unhandled rejection in SquadJS, ours and every other plugin's, from
+    // the moment this service mounts.
+    //
+    // That is not hypothetical: it hid a failed S³ mount completely. A DB user
+    // without a CREATE grant made PlayersService's bootstrap DDL throw, the
+    // rejection propagated to SquadJS's un-caught `main()`, and the result was
+    // a half-mounted S³ with zero output on either stream — the server carried
+    // on as if nothing had happened.
+    //
+    // So anything this handler does not positively recognise is reported, not
+    // dropped. It is deliberately not re-thrown: restoring the crash would let
+    // any unrelated plugin's stray rejection take the game server down, which
+    // is a worse failure than a loud log line.
     this._unhandledRejectionHandler = (reason) => {
       if (
         reason &&
         (DBService.isNetworkError(reason) || reason.name === 'SequelizeConnectionError')
       ) {
         this.verboseLogger(4, `[DB] Suppressed unhandled rejection (Sequelize internal): ${reason?.message || reason}`);
+        return;
       }
+      const message = reason?.message || String(reason);
+      this.verboseLogger(1, `[DB] UNHANDLED REJECTION: ${message}`);
+      stderrError(
+        'UnhandledRejection',
+        `An unhandled promise rejection reached the process: ${message}`,
+        reason instanceof Error ? reason : undefined
+      );
     };
     process.on('unhandledRejection', this._unhandledRejectionHandler);
 
@@ -400,6 +496,181 @@ export default class DBService {
     return this.sequelize ? 'sequelize' : null;
   }
 
+  /* ────────────────────────────────────── DIALECT PORTABILITY ────────────────────────────────────── */
+
+  /**
+   * The true SQL dialect of the active connector.
+   *
+   * Prefer this over getConnectorName() whenever the answer decides which SQL
+   * to emit. getConnectorName() returns the *connector label* from config.json
+   * (`databaseOption`), which is only conventionally the dialect name — a
+   * connector keyed as "main" or "s3" would return that string and silently
+   * miss every dialect branch.
+   *
+   * @returns {'sqlite'|'mysql'|'postgres'|string|null} dialect, or null with no connector.
+   */
+  getDialect() {
+    if (this.sequelize && typeof this.sequelize.getDialect === 'function') {
+      return this.sequelize.getDialect();
+    }
+    // Raw config object (not a live Sequelize instance) — resolveConnector may
+    // hand back the config straight from the connectors map.
+    if (this.sequelize && typeof this.sequelize.dialect === 'string') {
+      return this.sequelize.dialect;
+    }
+    if (this.sequelize && typeof this.sequelize.storage === 'string') {
+      return 'sqlite';
+    }
+    return null;
+  }
+
+  /**
+   * Quote a table or column identifier for the active dialect.
+   *
+   * **Why this exists.** Postgres folds unquoted identifiers to lower case.
+   * Sequelize creates camelCase columns *quoted* (`"tokenBalance"`), so any raw
+   * SQL that names one unquoted resolves to `tokenbalance` and errors with
+   * `column "tokenbalance" does not exist`. SQLite ignores identifier case and
+   * MySQL column names are case-insensitive, which is why this class of defect
+   * is invisible until a Postgres URL is pointed at the suite.
+   *
+   * **The rule:** a raw SQL fragment — `Sequelize.literal`, `connector.query()`,
+   * bootstrap DDL — is Postgres-safe only if every identifier it names is
+   * already all-lowercase. Anything camelCase must come through here.
+   *
+   * @param {string} identifier - Bare table or column name.
+   * @returns {string} Dialect-quoted identifier (`"x"` on Postgres, `` `x` `` elsewhere).
+   */
+  quoteIdentifier(identifier) {
+    const name = String(identifier);
+    if (this.sequelize && typeof this.sequelize.getQueryInterface === 'function') {
+      try {
+        return this.sequelize.getQueryInterface().quoteIdentifier(name);
+      } catch {
+        // Fall through to the static form below.
+      }
+    }
+    // No live connector (no-op mode / raw config). Emit the ANSI form, which is
+    // correct for SQLite and Postgres; MySQL only differs when ANSI_QUOTES is off,
+    // and without a connector there is nothing to execute the SQL against anyway.
+    return `"${name.replace(/"/g, '""')}"`;
+  }
+
+  /**
+   * Escape a value into a literal SQL string constant for the active dialect.
+   * Use when a value must be inlined into a `Sequelize.literal` rather than bound.
+   *
+   * @param {*} value
+   * @returns {string} Quoted, escaped SQL literal (e.g. `'%O''Brien%'`).
+   */
+  escapeValue(value) {
+    if (this.sequelize && typeof this.sequelize.escape === 'function') {
+      return this.sequelize.escape(value);
+    }
+    return `'${String(value).replace(/'/g, "''")}'`;
+  }
+
+  /**
+   * Build a dialect-safe atomic increment expression for `Model.update()`.
+   *
+   * Use instead of a hand-written `Sequelize.literal('col + 1')` whenever the
+   * column is camelCase. `Model.increment()` is preferable for a *pure*
+   * increment, but does not fit when the same statement must also set other
+   * columns atomically (as the Switch seed-bonus grants do).
+   *
+   * @param {string} column     - Column name (quoted for you).
+   * @param {number} [amount=1] - Integer amount to add; may be negative.
+   * @returns {object} A Sequelize literal suitable as an update field value.
+   */
+  incrementLiteral(column, amount = 1) {
+    const n = Number(amount);
+    if (!Number.isFinite(n)) {
+      throw new Error(`incrementLiteral requires a finite numeric amount, got ${amount}`);
+    }
+    const expr = `${this.quoteIdentifier(column)} ${n < 0 ? '-' : '+'} ${Math.abs(n)}`;
+    const literal = this.sequelize && typeof this.sequelize.literal === 'function'
+      ? this.sequelize.literal.bind(this.sequelize)
+      : null;
+    if (!literal) {
+      // No-op mode: hand back a shape the mock/no-connector paths still recognise.
+      return { val: expr };
+    }
+    return literal(expr);
+  }
+
+  /**
+   * The Sequelize operator giving case-INsensitive `LIKE` on the active dialect.
+   *
+   * MySQL's default collation is case-insensitive and SQLite's `LIKE` is
+   * case-insensitive for ASCII, so `Op.like` already behaves this way on both.
+   * Postgres `LIKE` is case-sensitive and needs `Op.iLike` — which is a syntax
+   * error on the other two, so the branch is mandatory rather than cosmetic.
+   *
+   * @returns {symbol} `Op.iLike` on Postgres, `Op.like` elsewhere.
+   */
+  caseInsensitiveLikeOp() {
+    const Op = this.sequelize?.constructor?.Op || SequelizeLib.Op;
+    return this.getDialect() === 'postgres' ? Op.iLike : Op.like;
+  }
+
+  /**
+   * Build a case-insensitive substring match as a raw literal, for the cases
+   * that also need a `LIKE ... ESCAPE` clause (which `Op.like` cannot express).
+   *
+   * Handles three things that are easy to get wrong by hand:
+   *   1. The column is quoted, so camelCase survives Postgres identifier folding.
+   *   2. The term is escaped through the connector, so an apostrophe in a player
+   *      name cannot break — or inject into — the statement.
+   *   3. `%`, `_` and the escape character itself are neutralised so they match
+   *      literally instead of acting as wildcards.
+   *
+   * **The escape character is `!`, not `\`.** A backslash cannot be made
+   * portable: MySQL processes backslash escapes inside string literals (so the
+   * escape char must be written `'\\'`), while SQLite and Postgres do not (so it
+   * must be written `'\'`). Either spelling is a hard error on the other engines
+   * — `'\\'` fails on SQLite with *"ESCAPE expression must be a single
+   * character"*. `!` needs no escaping in any of the three.
+   *
+   * Pass `{ exact: true }` to drop the surrounding wildcards and compare the
+   * whole column case-insensitively. That is not the same as `col = 'term'`:
+   * equality is case-**sensitive** on Postgres and on any binary-collated MySQL
+   * column, whereas a wildcard-free LIKE/ILIKE stays case-insensitive on all
+   * three engines while still escaping the term literally.
+   *
+   * Pass `{ trimColumn: true }` to compare against `TRIM(col)` rather than the
+   * stored value. Mostly pointless for a substring match, but essential with
+   * `exact`: game clients routinely store names with surrounding whitespace
+   * (in one production Squad data set 10,604 of 11,787 player names had a
+   * leading space), so an exact compare against the raw column silently matches
+   * almost nothing. `TRIM()` is standard SQL and behaves identically on SQLite,
+   * MySQL and Postgres. Note this defeats an index on the column — fine for a
+   * player-name lookup, think twice on a hot path.
+   *
+   * @param {string} column - Column to match against (quoted for you).
+   * @param {string} term   - Raw user-supplied search term.
+   * @param {object} [opts]
+   * @param {boolean} [opts.exact=false] - Match the whole value instead of a substring.
+   * @param {boolean} [opts.trimColumn=false] - Compare against TRIM(column).
+   * @returns {object} A Sequelize literal usable as a `where`, including inside `Op.or`.
+   */
+  caseInsensitiveLikeLiteral(column, term, opts = {}) {
+    const escaped = String(term)
+      .replace(/!/g, '!!')
+      .replace(/%/g, '!%')
+      .replace(/_/g, '!_');
+    const keyword = this.getDialect() === 'postgres' ? 'ILIKE' : 'LIKE';
+    const pattern = opts.exact ? escaped : `%${escaped}%`;
+    const target = opts.trimColumn
+      ? `TRIM(${this.quoteIdentifier(column)})`
+      : this.quoteIdentifier(column);
+    const expr =
+      `${target} ${keyword} ${this.escapeValue(pattern)} ESCAPE '!'`;
+    const literal = this.sequelize && typeof this.sequelize.literal === 'function'
+      ? this.sequelize.literal.bind(this.sequelize)
+      : null;
+    return literal ? literal(expr) : { val: expr };
+  }
+
   /**
    * Acquire an advisory lock scoped to a logical key (e.g. 's3_migrate_s3-players').
    * Prevents concurrent execution of critical sections across multiple processes.
@@ -407,6 +678,24 @@ export default class DBService {
    * - SQLite: already serialized by _s3_mutex — returns true immediately.
    * - Postgres: uses pg_try_advisory_lock(hashtext(key)) — non-blocking, returns false if held.
    * - MySQL: uses GET_LOCK(key, timeout) — waits up to timeoutMs.
+   *
+   * ⚠️ **KNOWN LIMITATION — branches on the connector LABEL, not the dialect.**
+   * `getConnectorName()` returns `databaseOption`, which is the key of the
+   * connector in `config.json`'s `connectors` block. SquadJS does not constrain
+   * that key: `squad-server/factory.js` reads the dialect from the connector's
+   * *config value* and uses the key only for a log line, so
+   * `connectors: { squadDB: { dialect: 'postgres', … } }` is entirely legal.
+   * With such a name this falls through to the "unknown dialect" branch below
+   * and returns true **unprotected** — the cross-process migration lock in
+   * MigrationEngine.runMigrations() silently stops guarding anything.
+   *
+   * Deliberately left as-is (2026-08-18): every known deployment names the
+   * connector after its dialect, which is the documented SquadJS convention, and
+   * SQLite is unaffected either way (both the sqlite branch and the unknown
+   * branch return true). Changing it would start taking real locks where none
+   * are taken today — a concurrency behaviour change not worth making blind.
+   * The fix, if ever wanted, is to consult `getDialect()` in the unknown branch.
+   * See docs/TASK_POSTGRES_PORTABILITY.md.
    *
    * @param {string} key        - Logical lock name (e.g. 's3_migrate_s3-players')
    * @param {number} [timeoutMs=30000] - Max wait time in ms (MySQL only; Postgres is non-blocking)
@@ -478,6 +767,10 @@ export default class DBService {
    * - SQLite: no-op (mutex auto-releases via promise chain).
    * - Postgres: pg_advisory_unlock(hashtext(key)).
    * - MySQL: DO RELEASE_LOCK(key).
+   *
+   * ⚠️ Same connector-label limitation as acquireAdvisoryLock() — see the note
+   * there. The two must keep using the SAME detection: if one resolves the
+   * dialect and the other does not, a lock would be taken and never released.
    *
    * @param {string} key - Logical lock name (must match acquireAdvisoryLock call)
    * @returns {Promise<void>}
@@ -634,14 +927,130 @@ export default class DBService {
       throw new Error('defineModel called without a valid sequelize connector.');
     }
 
+    // `exportTier` is ours, not Sequelize's — record it and strip it before the
+    // rest is forwarded to define(). Recorded BEFORE the idempotency returns
+    // below, so a model adopted from the connector on a re-mount still lands in
+    // the tier registry.
+    const { exportTier, ...defineOptions } = modelOptions;
+    this._recordExportTier(name, exportTier);
+
     if (this.models[name]) {
       return this.models[name];
     }
 
-    const opts = { freezeTableName: true, ...modelOptions };
+    // Adopt a model already present on the connector rather than redefining it.
+    // Callers that previously guarded with `sequelize.models?.X || sequelize.define(...)`
+    // relied on this to stay idempotent across a re-mount, where DBService is
+    // rebuilt but the connector is reused. Without this branch the redefine
+    // would succeed but discard the original model object, orphaning any
+    // reference a service captured on its first mount.
+    const existing = this.sequelize.models?.[name];
+    if (existing) {
+      this.models[name] = existing;
+      return existing;
+    }
+
+    const opts = { freezeTableName: true, ...defineOptions };
     const model = this.sequelize.define(name, schema, opts);
     this.models[name] = model;
     return model;
+  }
+
+  /* ────────────────────────────────────── EXPORT TIER REGISTRY ────────────────────────────────────── */
+
+  /**
+   * Record (and validate) a model's declared export tier.
+   *
+   * An invalid tier throws **at definition time**, which surfaces on the
+   * author's own server during mount rather than months later when someone
+   * discovers the table missing from a restore.
+   *
+   * @param {string} name - Model name
+   * @param {string|undefined} tier - Declared tier, or undefined when omitted
+   * @private
+   */
+  _recordExportTier(name, tier) {
+    if (tier === undefined || tier === null) {
+      if (!this._modelTiers.has(name) && !this._tierWarned.has(name)) {
+        this._tierWarned.add(name);
+        this.verboseLogger(
+          1,
+          `[DB] Model "${name}" was defined without an exportTier — it will be exported ` +
+          `at the "${DEFAULT_EXPORT_TIER}" (default) tier. Declare one explicitly: ` +
+          `defineModel('${name}', schema, { exportTier: '${EXPORT_TIERS.join("' | '")}' }).`
+        );
+      }
+      return;
+    }
+
+    if (!EXPORT_TIERS.includes(tier)) {
+      throw new Error(
+        `defineModel("${name}") was given exportTier "${tier}", which is not a valid tier. ` +
+        `Valid tiers are: ${EXPORT_TIERS.join(', ')}. Plugins classify into this fixed set; ` +
+        `they cannot define new tiers.`
+      );
+    }
+
+    const previous = this._modelTiers.get(name);
+    if (previous && previous !== tier) {
+      // Keep the first declaration — a later caller silently retiering someone
+      // else's model is exactly the kind of quiet reclassification this task
+      // exists to prevent.
+      this.verboseLogger(
+        1,
+        `[DB] Model "${name}" was re-declared with exportTier "${tier}" but is already ` +
+        `registered as "${previous}". Keeping "${previous}".`
+      );
+      return;
+    }
+
+    this._modelTiers.set(name, tier);
+  }
+
+  /**
+   * The tier a model **declared**, or null if it declared none.
+   * Use getEffectiveModelTier() when you need a tier for every model.
+   *
+   * @param {string} name - Model name
+   * @returns {string|null}
+   */
+  getModelTier(name) {
+    return this._modelTiers.get(name) ?? null;
+  }
+
+  /**
+   * The tier a model is actually treated as, falling back to
+   * DEFAULT_EXPORT_TIER when it declared none.
+   *
+   * @param {string} name - Model name
+   * @returns {string}
+   */
+  getEffectiveModelTier(name) {
+    return this._modelTiers.get(name) ?? DEFAULT_EXPORT_TIER;
+  }
+
+  /**
+   * Registered model names that declared no tier and are therefore relying on
+   * the default-tier fallback. Should be empty on a clean install — a non-empty
+   * result is what the mount-time warning reports.
+   *
+   * @returns {string[]}
+   */
+  getUndeclaredModelNames() {
+    return this.getModelNames().filter((name) => !this._modelTiers.has(name));
+  }
+
+  /**
+   * Registered model names whose effective tier is `tier`.
+   *
+   * @param {string} tier - One of EXPORT_TIERS
+   * @returns {string[]} Model names in declaration order
+   */
+  getModelsByTier(tier) {
+    if (!EXPORT_TIERS.includes(tier)) {
+      throw new Error(`getModelsByTier("${tier}") — valid tiers are: ${EXPORT_TIERS.join(', ')}.`);
+    }
+    return this.getModelNames().filter((name) => this.getEffectiveModelTier(name) === tier);
   }
 
    /* ────────────────────────────────────── SCHEMA VERSION PUBLIC API ────────────────────────────────────── */
@@ -672,8 +1081,10 @@ export default class DBService {
     this._expectedVersions.set(pluginName, version);
     if (options.models) {
       this._pluginModels.set(pluginName, options.models);
+      this.verboseLogger(3, `[DB] Registered ${options.models.length} model(s) for drift detection for "${pluginName}": ${options.models.join(', ')}`);
+    } else {
+      this.verboseLogger(3, `[DB] Registered expected version v${version} for "${pluginName}" — no models registered for drift detection.`);
     }
-    this.verboseLogger(4, `[DB] Registered expected version v${version} for "${pluginName}".`);
   }
 
   /**
@@ -752,7 +1163,17 @@ export default class DBService {
    * waitForMigrations(). Called by the Discord confirmation handler after
    * migrations complete, are cancelled, or time out.
    *
-   * @param {boolean} [wasApplied=false] - If true, pending migrations were applied
+   * **Always re-runs verifyLiveSchema()** regardless of wasApplied — the initial
+   * drift check during db.mount() ran before any consumer models were registered,
+   * so it could not detect silently-failed migrations. This second pass catches
+   * missing columns on servers where S3_SchemaVersions is already up to date.
+   *
+   * Only invokes drift recovery (rollback + re-gate) when drifts have missing
+   * columns — extra-only drifts (columns in the DB but not in the model) are
+   * informational only and do not block consumer plugins.
+   *
+   * @param {boolean} [wasApplied=false] - If true, pending migrations were applied.
+   *   Drift detection runs unconditionally regardless of this flag.
    */
   _resolveMigrationGate(wasApplied = false) {
     if (this._resolveMigrationGateFn) {
@@ -762,30 +1183,185 @@ export default class DBService {
     if (wasApplied) {
       this._pendingMigrations = []; // Clear pending — they're applied now
     }
-    this._migrationGate = null;
-    this.verboseLogger(2, `[DB] Migration gate resolved (wasApplied=${wasApplied}). Consumer plugins unblocked.`);
+    // Re-run live schema verification now that all plugins have registered their
+    // models via registerExpectedVersion() during _onS3Ready(). The initial
+    // verifyLiveSchema() during mount() ran before any models were registered, so
+    // it could not detect drift. This second pass captures the actual schema state
+    // regardless of whether migrations were applied — on a server where the
+    // SchemaVersion already matches, the gate resolves with wasApplied=false but
+    // drift may still exist (e.g. from a prior migration that silently failed).
+    //
+    // IMPORTANT: All gate state management (nulling _migrationGate, logging) happens
+    // INSIDE the .then() callback, not after it. verifyLiveSchema() returns a Promise
+    // that resolves asynchronously — setting _migrationGate = null outside the .then()
+    // callback would create a race: consumers calling waitForMigrations() would see
+    // no gate and proceed with sync({ alter: true }) before the drift check completed.
+    // By keeping the close-out inside the callback, consumers remain blocked until
+    // the drift check finishes.
+    this.verifyLiveSchema().then(async drift => {
+      this._lastDriftResult = drift;
+      // Only invoke recovery for missing columns, missing rows, or violated data
+      // post-conditions — extra-only drift does not block the gate.
+      // _handleDetectedDrift() re-opens the gate and returns without closing it;
+      // the caller must not fall through to gate-null.
+      const hasMissing = drift.some(e => e.missing || e.missingRows || e.dataViolations);
+      if (hasMissing) {
+        await this._handleDetectedDrift(drift);
+        return;
+      }
+      // No drift detected, or drift with extra columns only.
+      // Close the gate so consumer plugins can proceed with sync({ alter: true }).
+      this._migrationGate = null;
+      this.verboseLogger(2, `[DB] Migration gate resolved (wasApplied=${wasApplied}). Consumer plugins unblocked.`);
+    }).catch(err => {
+      this.verboseLogger(1, `[DB] Post-migration drift check failed: ${err.message}`);
+      // Null the gate so consumers don't hang forever on a transient DB error.
+      // This is a safe fail-open: if we can't verify the schema, let consumers
+      // proceed rather than deadlocking until process restart.
+      this._migrationGate = null;
+    });
   }
 
+  /**
+   * Handle schema drift detected by verifyLiveSchema().
+   * Rolls back S3_SchemaVersions records for affected plugins, creates a new
+   * migration gate so consumer plugins remain blocked, and fires the drift
+   * alert callback (Discord notification) so the admin can re-apply the
+   * idempotent migration via !s3 migrate force.
+   *
+   * Called both from _resolveMigrationGate() (post-migration verification) and
+   * from _checkAndPromptMigrations() (startup drift check when all versions are
+   * up to date).  This ensures drift detection also fires on servers where
+   * S3_SchemaVersions already matches the expected version but the actual DB
+   * columns are missing (e.g. a prior migration's ADD COLUMN silently failed
+   * due to MySQL permissions).
+   *
+   * @param {Array<{pluginName: string, table: string, model?: string, missing?: string[], missingRows?: Array<{key: string, value: string}>, dataViolations?: Array<{column: string, offenders: number}>, extra?: string[], error?: string}>} drift
+   */
+  async _handleDetectedDrift(drift) {
+    const stderrLines = [];
+    for (const entry of drift) {
+      if (entry.missing) {
+        this.verboseLogger(1, `[DB] POST-MIGRATION DRIFT: ${entry.table} missing columns: ${entry.missing.join(', ')}`);
+        stderrLines.push(`${entry.pluginName}: ${entry.table} missing column(s): ${entry.missing.join(', ')}`);
+      }
+      if (entry.missingRows) {
+        this.verboseLogger(1, `[DB] POST-MIGRATION ROW DRIFT: ${entry.table} missing row(s): ${entry.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
+        stderrLines.push(`${entry.pluginName}: ${entry.table} missing row(s): ${entry.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
+      }
+      if (entry.dataViolations) {
+        const summary = entry.dataViolations.map(v => `${v.offenders} row(s) with NULL "${v.column}"`).join('; ');
+        this.verboseLogger(1, `[DB] POST-MIGRATION DATA DRIFT: ${entry.table}: ${summary}`);
+        stderrLines.push(`${entry.pluginName}: ${entry.table}: ${summary}`);
+      }
+    }
+    // Mirror to stderr for operators who split the streams. WARN rather than
+    // ERROR: drift is a state the operator must act on (!s3 migrate force), not
+    // a failure that just happened. Extra-only drift is deliberately excluded —
+    // it is informational and would put noise in the error file on every mount.
+    if (stderrLines.length > 0) {
+      stderrWarn(
+        'SchemaDrift',
+        `Expected schema or data is missing from the live database — run '!s3 migrate force' to re-apply.`,
+        stderrLines.join('\n')
+      );
+    }
+    // Only act on missing columns, missing rows, or violated data post-conditions
+    // — extra columns are informational only
+    const pluginNames = [...new Set(drift.filter(e => e.missing || e.missingRows || e.dataViolations).map(e => e.pluginName))];
+    if (pluginNames.length === 0) {
+      this.verboseLogger(2, '[DB] Drift detected but only extra columns — no recovery needed.');
+      return;
+    }
+    // Populate pending migrations for the affected plugins so the Discord
+    // prompt renders "v2 → v3" rather than "v-1 → v3". The S3_SchemaVersions
+    // DB row is also rolled back below, so runMigrations() will detect the
+    // gap and re-apply the idempotent migration.
+    this._pendingMigrations = pluginNames.map(pn => ({
+      pluginName: pn,
+      currentVersion: (this._expectedVersions.get(pn) || 1) - 1,
+      expectedVersion: this._expectedVersions.get(pn) || -1,
+      behind: 1
+    }));
+    // Roll back S3_SchemaVersions records so runMigrations() sees a pending
+    // migration and re-applies the idempotent up(). Without this, !s3 migrate
+    // force would skip the migration because the DB still says e.g. v3 is
+    // applied, even though columns are missing.
+    for (const pn of pluginNames) {
+      const prevVersion = Math.max(0, (this._expectedVersions.get(pn) || 1) - 1);
+      if (this.SchemaVersionsModel) {
+        try {
+          const existing = await this.SchemaVersionsModel.findOne({ where: { pluginName: pn } });
+          if (existing) {
+            await existing.update({ version: prevVersion, appliedAt: Date.now(), migrationHash: 'drift-recovery' });
+          } else {
+            await this.SchemaVersionsModel.create({
+              pluginName: pn,
+              version: prevVersion,
+              appliedAt: Date.now(),
+              migrationHash: 'drift-recovery',
+              description: 'Rolled back due to schema drift'
+            });
+          }
+          this.verboseLogger(2, `[DB] Rolled back "${pn}" to v${prevVersion} for drift recovery.`);
+        } catch (rollbackErr) {
+          this.verboseLogger(1, `[DB] Failed to roll back "${pn}" version for drift recovery: ${rollbackErr.message}`);
+        }
+      }
+    }
+    // Create a new gate so consumer plugins stay blocked and the migration
+    // prompt re-appears in Discord for a re-confirmation.
+    this._migrationGate = new Promise((resolve) => {
+      this._resolveMigrationGateFn = resolve;
+    });
+    // Fire external alert callback (e.g. Discord notification handled by S³ plugin)
+    if (typeof this._driftAlertCallback === 'function') {
+      this._driftAlertCallback(drift, pluginNames);
+    }
+    // Gate is re-open — do NOT log "resolved". The admin must re-confirm
+    // (!s3 confirm <token> or !s3 migrate force) which will call
+    // _resolveMigrationGate(wasApplied=true) again.
+    //
+    // Potential retry loop: If the re-applied migration also silently fails
+    // (e.g. persistent MySQL permission denial for ALTER TABLE), drift will
+    // be re-detected and the gate re-opened on this next call. This creates
+    // an intentional retry loop that prompts the admin each round until the
+    // underlying issue (permissions, connectivity) is resolved. The
+    // migration's up() must be idempotent for re-application to succeed.
+  }
   /* ────────────────────────────────────── SCHEMA DRIFT DETECTION ────────────────────────────────────── */
 
   /**
    * Verify live schema against registered Sequelize model definitions.
    * Diffs each plugin's registered models' rawAttributes against the actual
    * database columns via describeTable(). Returns an array of drift entries.
-   * Called on every mount (metadata-only, negligible cost).
+   * Called on every mount. Schema checks are metadata-only. The data checks add
+   * one COUNT per declared post-condition, and only migrations that declare
+   * touches.data contribute any. Each COUNT is an unindexed scan, so declaring
+   * one on a table with millions of rows wants an index on the asserted column.
    *
    * Drift entry shapes:
-   *   { pluginName, table, error }       — describeTable() failure
-   *   { pluginName, table, missing }     — columns expected in model but absent from DB
-   *   { pluginName, table, extra }       — columns in DB but not in model
+   *   { pluginName, table, error }          — describeTable() failure, or row/data verification error
+   *   { pluginName, table, missing }        — columns expected in model but absent from DB
+   *   { pluginName, table, missingRows }    — seed rows declared via migration touches.rows absent from DB
+   *   { pluginName, table, dataViolations } — touches.data post-conditions no longer hold
+   *   { pluginName, table, extra }          — columns in DB but not in model
    *
-   * @returns {Promise<Array<{pluginName: string, table: string, model?: string, missing?: string[], extra?: string[], error?: string}>>}
+   * @returns {Promise<Array<{pluginName: string, table: string, model?: string, missing?: string[], missingRows?: Array<{key: string, value: string}>, dataViolations?: Array<{column: string, offenders: number}>, extra?: string[], error?: string}>>}
    */
   async verifyLiveSchema() {
     if (this._pluginModels.size === 0) {
       this.verboseLogger(3, '[DB] No plugin models registered for drift detection — skipping verifyLiveSchema.');
+      this._lastDriftResult = [];
       return [];
     }
+
+    // Log which plugins/models are about to be checked so admins can
+    // confirm drift detection coverage during troubleshooting.
+    const summary = [...this._pluginModels.entries()]
+      .map(([pn, models]) => `${pn} (${models.length} model(s))`)
+      .join(', ');
+    this.verboseLogger(3, `[DB] Running drift detection on ${this._pluginModels.size} plugin(s): ${summary}`);
 
     const drift = [];
 
@@ -826,6 +1402,70 @@ export default class DBService {
       }
     }
 
+    // ── Row drift detection ──────────────────────────────────
+    // Check that seed rows declared via migration touches.rows still exist.
+    // This catches silent data loss from prior buggy migrations, connector
+    // switches, or DB restores that wiped data but left the version tracker intact.
+    if (this._migrationEngine) {
+      const expectedRows = this._migrationEngine.getExpectedRows();
+      for (const [tableName, rowDefs] of expectedRows.entries()) {
+        const owner = this._resolveTableOwner(tableName);
+        if (!owner) {
+          // No registered plugin claims this table — skip to avoid false positives
+          continue;
+        }
+        const { pluginName: owningPlugin, model: rowModel } = owner;
+        if (!rowModel) {
+          drift.push({ pluginName: owningPlugin, table: tableName, error: 'Row verification: model not found in registry' });
+          continue;
+        }
+
+        for (const { key, value } of rowDefs) {
+          try {
+            const row = await rowModel.findOne({ where: { [key]: value } });
+            if (!row) {
+              drift.push({ pluginName: owningPlugin, table: tableName, missingRows: [{ key, value }] });
+            }
+          } catch (err) {
+            drift.push({ pluginName: owningPlugin, table: tableName, error: `Row verification failed: ${err.message}` });
+          }
+        }
+      }
+
+      // ── Data drift detection ─────────────────────────────────
+      // Re-check touches.data post-conditions on every mount. The migration-time
+      // check in _verifyMigrationResult() only sees the moment after up() ran;
+      // this sees a database that has since been restored from an older dump,
+      // switched connectors, or edited by hand. Nothing else would look, because
+      // nothing re-runs a version the tracker already considers current.
+      const expectedData = this._migrationEngine.getExpectedData?.() || new Map();
+      for (const [tableName, dataDefs] of expectedData.entries()) {
+        const owner = this._resolveTableOwner(tableName);
+        if (!owner) continue;
+        const { pluginName: owningPlugin, model: dataModel } = owner;
+        if (!dataModel) {
+          drift.push({ pluginName: owningPlugin, table: tableName, error: 'Data verification: model not found in registry' });
+          continue;
+        }
+
+        const violations = [];
+        for (const def of dataDefs) {
+          if (def.notNull !== true) continue;
+          try {
+            const offenders = await countNullColumn(dataModel, def.column);
+            if (offenders > 0) {
+              violations.push({ column: def.column, offenders });
+            }
+          } catch (err) {
+            drift.push({ pluginName: owningPlugin, table: tableName, error: `Data verification failed for "${def.column}": ${err.message}` });
+          }
+        }
+        if (violations.length > 0) {
+          drift.push({ pluginName: owningPlugin, table: tableName, dataViolations: violations });
+        }
+      }
+    }
+
     // Log results
     if (drift.length === 0) {
       this.verboseLogger(3, '[DB] Schema drift check passed — all registered models match live database.');
@@ -837,13 +1477,55 @@ export default class DBService {
         if (entry.missing) {
           this.verboseLogger(1, `[DB] DRIFT: ${entry.table} missing columns: ${entry.missing.join(', ')}`);
         }
+        if (entry.missingRows) {
+          this.verboseLogger(1, `[DB] ROW DRIFT: ${entry.table} missing row(s): ${entry.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
+        }
+        if (entry.dataViolations) {
+          this.verboseLogger(1, `[DB] DATA DRIFT: ${entry.table} ${entry.dataViolations.map(v => `${v.offenders} row(s) with NULL ${v.column}`).join('; ')}`);
+        }
         if (entry.extra) {
           this.verboseLogger(2, `[DB] DRIFT: ${entry.table} has extra columns: ${entry.extra.join(', ')}`);
         }
       }
     }
 
+    // Cache here rather than at each call site. Two callers already did this by
+    // hand and a third (`!s3 migrate verify`) would have had to remember; a
+    // caller that forgot would leave `!s3 diag` reporting a stale verdict that
+    // contradicts the check just run.
+    this._lastDriftResult = drift;
+
     return drift;
+  }
+
+  /**
+   * Resolve which registered plugin owns a raw table name, and that plugin's
+   * model for it. Model names are not always table names — a model registered
+   * as 'Elo_PluginState' backs the table 'Elo_PluginStates' — so both the
+   * ownership lookup and the model lookup match on tableName with a fallback
+   * to the model name, exactly as verifyLiveSchema does for column drift.
+   *
+   * Returns null when no registered plugin claims the table — callers skip
+   * rather than report a false drift, because a table nobody registered a model
+   * for is not something this service can have an opinion about.
+   *
+   * `model` is non-null whenever a result is returned (ownership is established
+   * *by* finding the model). Callers still guard, so that a future change to the
+   * matching rule surfaces as a drift entry rather than a TypeError mid-mount.
+   *
+   * @param {string} tableName
+   * @returns {{ pluginName: string, model: Object }|null}
+   */
+  _resolveTableOwner(tableName) {
+    for (const [pluginName, modelNames] of this._pluginModels.entries()) {
+      for (const mn of modelNames) {
+        const m = this.models[mn];
+        if (m && (m.tableName || m.name) === tableName) {
+          return { pluginName, model: m };
+        }
+      }
+    }
+    return null;
   }
 
   /* ────────────────────────────────────── INTERNAL ────────────────────────────────────── */
@@ -855,7 +1537,14 @@ export default class DBService {
   async _initSchemaVersionModel() {
     const DataTypes = this.getDataTypes();
 
-    this.SchemaVersionsModel = this.sequelize.models?.S3SchemaVersions || this.sequelize.define(
+    // Registered via defineModel() — NOT raw sequelize.define() — so the model
+    // lands in this.models and is therefore visible to getModelNames(), which is
+    // what s3-export-import.js enumerates. Defining it raw made S3_SchemaVersions
+    // invisible to every export tier including --all, so schema version tracking
+    // was silently absent from every backup ever taken. The explicit tableName
+    // below is load-bearing: defineModel() injects freezeTableName, so without it
+    // Sequelize would target a table named 'S3SchemaVersions' instead.
+    this.SchemaVersionsModel = this.defineModel(
       'S3SchemaVersions',
       {
         id: {
@@ -888,7 +1577,11 @@ export default class DBService {
       },
       {
         tableName: 'S3_SchemaVersions',
-        timestamps: false
+        timestamps: false,
+        // Not regenerable: it records which migrations a database has already
+        // applied. A restore without it re-runs migrations against data that
+        // already has them.
+        exportTier: 'historical'
       }
     );
 

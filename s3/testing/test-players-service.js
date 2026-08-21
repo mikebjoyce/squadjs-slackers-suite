@@ -174,6 +174,220 @@ await runTest('areTeamsResolved returns true only when all tracked players are o
   await service.unmount();
 });
 
+// ─────────────────────────────────────────────────────────────────
+// Stuck-client quarantine.
+//
+// One player whose client wedged at `Team ID: N/A` used to pin the
+// roster-wide gate false for as long as they stayed connected, which
+// froze _squadsCache and _lastStablePlayers and suppressed
+// S3_PLAYER_TEAM_CHANGED for EVERYONE. These cases pin the escape.
+// ─────────────────────────────────────────────────────────────────
+
+// The roster the stuck-client cases run against: nine resolved players plus
+// one wedged. The wedged player has to stay a clear minority, or the systemic
+// guard (correctly) declines to quarantine anybody.
+function rosterWithOneStuck(stuckTeamID = null) {
+  const players = [];
+  for (let i = 1; i <= 9; i++) {
+    players.push({ eosID: `e${i}`, steamID: `s${i}`, name: `P${i}`, teamID: i % 2 === 0 ? 2 : 1, squadID: 1 });
+  }
+  players.push({ eosID: 'stuck', steamID: 'sStuck', name: 'Wedged', teamID: stuckTeamID, squadID: null });
+  return players;
+}
+
+// Age a player's unreal-teamID clock by rewriting it rather than sleeping.
+// These cases are all about the grace boundary, and a real sleep sized to a
+// short window makes them hostage to machine load — this suite is run
+// alongside four others and the sleeping version flaked under that.
+const GRACE_MS = 60000;
+function ageClock(service, key, ms = GRACE_MS * 2) {
+  const entry = service._unresolvedSince.get(key);
+  assert.ok(entry, `expected an unresolved-teamID clock for ${key}`);
+  entry.since -= ms;
+}
+
+await runTest('one stuck player stops blocking the gate once the grace window passes', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({ server, unresolvedGraceMs: GRACE_MS });
+  await service.mount();
+
+  server.players = rosterWithOneStuck();
+  await service.handleUpdatedPlayerInfo();
+
+  // Inside the window they still block — a player mid-resolve must not be
+  // written off on the first tick that sees them.
+  assert.equal(service.areTeamsResolved(), false);
+  assert.equal(service.getStuckPlayerKeys().size, 0);
+
+  ageClock(service, 'stuck');
+  await service.handleUpdatedPlayerInfo();
+
+  assert.equal(service.getStuckPlayerKeys().has('stuck'), true);
+  assert.equal(service.isPlayerStuck('stuck'), true);
+  assert.equal(service.areTeamsResolved(), true);
+
+  await service.unmount();
+});
+
+await runTest('quarantine unfreezes the squad cache and team-change events for everyone else', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({ server, unresolvedGraceMs: GRACE_MS });
+  await service.mount();
+
+  server.squads = [{ squadID: 1, teamID: 1, squadName: 'Alpha', locked: 'False' }];
+  server.players = rosterWithOneStuck();
+  await service.handleUpdatedPlayerInfo();
+
+  // Blocked: this is exactly the state the bug left the server in all round.
+  assert.equal(service._squadsCache, null);
+
+  ageClock(service, 'stuck');
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service._squadsCache?.length, 1);
+
+  // And a genuine swap by an unrelated player now emits instead of being
+  // swallowed by the null-teams guard.
+  server.take('S3_PLAYER_TEAM_CHANGED');
+  const moved = rosterWithOneStuck();
+  moved[0].teamID = 2;
+  server.players = moved;
+  await service.handleUpdatedPlayerInfo();
+
+  const events = server.take('S3_PLAYER_TEAM_CHANGED');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].payload.player.eosID, 'e1');
+
+  await service.unmount();
+});
+
+await runTest('a mass null-teamID window is never quarantined', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({ server, unresolvedGraceMs: GRACE_MS });
+  await service.mount();
+
+  server.players = rosterWithOneStuck();
+  await service.handleUpdatedPlayerInfo();
+  ageClock(service, 'stuck');
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.isPlayerStuck('stuck'), true);
+
+  // Round transition: the whole roster goes null at once. Even with every clock
+  // aged well past the grace window, this shape is a transition (or a systemic
+  // RCON failure) and must not be read as "teams resolved".
+  server.players = rosterWithOneStuck().map((p) => ({ ...p, teamID: null }));
+  await service.handleUpdatedPlayerInfo();
+  for (const key of service._unresolvedSince.keys()) ageClock(service, key);
+  await service.handleUpdatedPlayerInfo();
+
+  assert.equal(service.getStuckPlayerKeys().size, 0);
+  assert.equal(service.areTeamsResolved(), false);
+
+  await service.unmount();
+});
+
+await runTest('the stuck clock clears when the player unbugs or leaves', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({ server, unresolvedGraceMs: GRACE_MS });
+  await service.mount();
+
+  server.players = rosterWithOneStuck();
+  await service.handleUpdatedPlayerInfo();
+  ageClock(service, 'stuck');
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.isPlayerStuck('stuck'), true);
+
+  // Unbugged in place — no reconnect needed for S³ to take them back.
+  server.players = rosterWithOneStuck(2);
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.isPlayerStuck('stuck'), false);
+  assert.equal(service._unresolvedSince.has('stuck'), false);
+
+  // Wedge again, then disconnect: the clock must not survive them, or a
+  // reconnecting player would be quarantined on their very first tick.
+  server.players = rosterWithOneStuck();
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service._unresolvedSince.has('stuck'), true);
+
+  server.players = rosterWithOneStuck().filter((p) => p.eosID !== 'stuck');
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service._unresolvedSince.has('stuck'), false);
+  assert.equal(service.isPlayerStuck('stuck'), false);
+
+  await service.unmount();
+});
+
+await runTest('a remount gives a stuck player their grace window back', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({ server, unresolvedGraceMs: GRACE_MS });
+  await service.mount();
+
+  server.players = rosterWithOneStuck();
+  await service.handleUpdatedPlayerInfo();
+  ageClock(service, 'stuck');
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.isPlayerStuck('stuck'), true);
+
+  await service.unmount();
+  assert.equal(service._unresolvedSince.size, 0);
+  assert.equal(service._stuckKeys.size, 0);
+
+  // Remount re-runs initial sync; a leftover clock would quarantine them on
+  // the first tick back with no grace at all.
+  await service.mount();
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.isPlayerStuck('stuck'), false);
+
+  await service.unmount();
+});
+
+await runTest('an unkeyable roster never reports resolved teams', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({ server, unresolvedGraceMs: 10 });
+  await service.mount();
+
+  // Neither identifier — invisible to the registry. Counting these towards the
+  // gate would report a fully-resolved lobby S³ is tracking nobody in.
+  server.players = [{ eosID: null, steamID: null, name: 'Ghost', teamID: null }];
+  await service.handleUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
+
+  assert.equal(service._squadsCache, null);
+  assert.equal(service.areTeamsResolved(), false);
+
+  await service.unmount();
+});
+
+await runTest('an empty roster is handled without quarantining anything', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({ server, unresolvedGraceMs: 10 });
+  await service.mount();
+
+  server.players = [];
+  await service.handleUpdatedPlayerInfo();
+
+  assert.equal(service.getStuckPlayerKeys().size, 0);
+  assert.equal(service.areTeamsResolved(), false);
+
+  await service.unmount();
+});
+
+await runTest('areTeamsResolved stays false when nobody has a real team', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({ server, unresolvedGraceMs: 10 });
+  await service.mount();
+
+  server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: null, squadID: 1 }];
+  await service.handleUpdatedPlayerInfo();
+  ageClock(service, 'e1');
+  await service.handleUpdatedPlayerInfo();
+
+  // Quarantining the entire roster would report resolved teams for a lobby
+  // S³ knows nothing about.
+  assert.equal(service.areTeamsResolved(), false);
+
+  await service.unmount();
+});
+
 await runTest('team changes emit only for real team transitions (null guard)', async () => {
   const server = new MockServer();
   const service = new PlayersService({ server });
@@ -371,6 +585,75 @@ await runTest('reconnect persistence helpers use db-backed model when provided',
 
   await service.clearReconnects();
   assert.equal(await service.getReconnect('e1'), null);
+
+  await service.unmount();
+});
+
+await runTest('isLeader tracks the live tick, not the tick the player was first seen', async () => {
+  // Regression: the update path in _registerPlayer() refreshed name/team/squad
+  // but not isLeader, so the flag was frozen at whatever the player had when
+  // they were first registered. Anyone who connected (never a leader) and then
+  // created a squad stayed isLeader=false forever, which made getSquads() rank
+  // them as a grunt and left `!s3 players` with no crown on any SL.
+  const server = new MockServer();
+  const service = new PlayersService({ server });
+  await service.mount();
+
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: null, isLeader: false },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 1, squadID: null, isLeader: false }
+  ];
+  server.squads = [];
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.getPlayer('e1').isLeader, false);
+
+  // Alpha creates squad 1; Bravo joins it.
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1, isLeader: true },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 1, squadID: 1, isLeader: false }
+  ];
+  server.squads = [{ squadID: 1, teamID: 1, squadName: 'INFANTRY', locked: 'False' }];
+  await service.handleUpdatedPlayerInfo();
+
+  assert.equal(service.getPlayer('e1').isLeader, true, 'promotion must be picked up');
+  // getSquads() sorts leaders first — that ordering is what the embed relies on.
+  assert.deepEqual(service.getSquads()[0].players, ['e1', 'e2']);
+
+  // Handover: Bravo takes the squad. A demotion must be picked up too.
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1, isLeader: false },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 1, squadID: 1, isLeader: true }
+  ];
+  await service.handleUpdatedPlayerInfo();
+
+  assert.equal(service.getPlayer('e1').isLeader, false, 'demotion must be picked up');
+  assert.equal(service.getPlayer('e2').isLeader, true);
+  assert.deepEqual(service.getSquads()[0].players, ['e2', 'e1']);
+
+  // A source that omits isLeader entirely (the PLAYER_CONNECTED payload shape)
+  // is missing data, not a demotion — it must not strip the flag.
+  await service.handlePlayerConnected({
+    player: { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 1, squadID: 1 }
+  });
+  assert.equal(service.getPlayer('e2').isLeader, true, 'absent isLeader must not demote');
+
+  await service.unmount();
+});
+
+await runTest('isLeader accepts the RCON string form', async () => {
+  // Squad.locked arrives from the RCON parse as "True"/"False"; normalise the
+  // same way for isLeader so a parser change cannot silently drop every crown.
+  const server = new MockServer();
+  const service = new PlayersService({ server });
+  await service.mount();
+
+  server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1, isLeader: 'True' }];
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.getPlayer('e1').isLeader, true);
+
+  server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1, isLeader: 'False' }];
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.getPlayer('e1').isLeader, false);
 
   await service.unmount();
 });

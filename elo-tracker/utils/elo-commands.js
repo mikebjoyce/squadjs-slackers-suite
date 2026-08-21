@@ -23,6 +23,8 @@
  * Logger (../../core/logger.js)
  *   Verbose logging for command responses, lookup failures, and
  *   rcon.warn errors.
+ * EloDatabase (./elo-database.js)
+ *   Static formatOtherMatches() for the ambiguous-lookup hint line.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
@@ -32,9 +34,16 @@
  * - onEloAdminCommand enforces ChatAdmin channel restriction internally.
  *   The caller must still register the event listener.
  * - !eloadmin reset resets mu, sigma, wins, losses, and roundsPlayed
- *   to defaults. It does NOT delete the DB record.
+ *   to defaults. It does NOT delete the DB record. It acts only on an
+ *   unambiguous match (EloDatabase.isUnambiguous): a good tier AND no
+ *   equally-good rival. Anything less lists the candidates and resets
+ *   nothing.
  * - !elo with no sub-command shows the caller's own rating.
- * - !elo <name|steamID> looks up another player.
+ * - !elo <name|steamID> looks up another player. The name search is
+ *   ranked (see searchPlayers() in elo-database.js) and appends an
+ *   "Also matched" line whenever the term was not an exact hit.
+ * - Sub-commands are matched case-insensitively; SquadJS lowercases the
+ *   command word itself before emitting CHAT_COMMAND:*, so `!ELO` works.
  * - Unknown sub-commands show help text.
  *
  *   Calculates and displays a "Competitive Skill Rank" (CSR) (μ - 3.0σ)
@@ -52,6 +61,7 @@
 
 import Logger from '../../core/logger.js';
 import EloCalculator from './elo-calculator.js';
+import EloDatabase from './elo-database.js';
 
 const EloCommands = {
   register(tracker) {
@@ -73,7 +83,11 @@ const EloCommands = {
 
     // ─── Helper — shared lookup logic ─────────────────────────────────
     async function _lookupAndRespond(trackerCtx, player, identifier) {
-      const record = await trackerCtx._findPlayerByIdentifier(identifier);
+      // Ranked candidates rather than a single row: the best match is what we
+      // display, and the rest become the "Also matched" hint below so a player
+      // whose partial name was ambiguous can see what else it could have been.
+      const candidates = await trackerCtx._findPlayerCandidates(identifier);
+      const record = candidates.length ? candidates[0] : null;
       if (!record) {
         return await trackerCtx.respond(player, [
           `No ELO record found for: ${identifier}`,
@@ -92,13 +106,17 @@ const EloCommands = {
         rankLine = `Rank: #${rank} (of ${total} total)`;
       }
 
+      // null whenever the match was exact — see EloDatabase.formatOtherMatches().
+      const otherMatches = EloDatabase.formatOtherMatches(candidates);
+
       return await trackerCtx.respond(player, [
         `=== ${record.name} ===`,
         rankLine,
         `CSR: ${consRating.toFixed(2)} (μ - 3.0σ)`,
         `Estimated Skill: ${record.mu.toFixed(2)} μ | Certainty: ${record.sigma.toFixed(2)} σ`,
-        `Record: ${record.wins}W / ${record.losses}L (${record.roundsPlayed} rounds)`
-      ].join('\n'));
+        `Record: ${record.wins}W / ${record.losses}L (${record.roundsPlayed} rounds)`,
+        otherMatches
+      ].filter(Boolean).join('\n'));
     }
 
     // Public in-game command handler
@@ -211,9 +229,23 @@ const EloCommands = {
           return await this.respond(player, 'Usage: !eloadmin reset <name | steamID | eosID>');
         }
         try {
-          const record = await this._findPlayerByIdentifier(identifier);
+          // Reset is destructive and irreversible, so unlike !elo it refuses to
+          // act on a guess — see EloDatabase.isUnambiguous() for the rule.
+          // Without this gate, `!eloadmin reset cerv` would wipe whichever
+          // "cerv*" account the ranker happened to favour.
+          const candidates = await this._findPlayerCandidates(identifier);
+          const record = candidates.length ? candidates[0] : null;
           if (!record) {
             return await this.respond(player, `No player found: ${identifier}`);
+          }
+          if (!EloDatabase.isUnambiguous(candidates)) {
+            const names = candidates.slice(0, 5)
+              .map((p) => `${String(p.name || '?').trim()} (${p.roundsPlayed || 0} rds)`);
+            return await this.respond(player, [
+              `Ambiguous: "${identifier}" is not an exact match.`,
+              `Matched: ${names.join(', ')}`,
+              'Re-run with the full name or a SteamID/EOS ID.'
+            ].join('\n'));
           }
           const defaults = { mu: EloCalculator.MU_DEFAULT, sigma: EloCalculator.SIGMA_DEFAULT, wins: 0, losses: 0, roundsPlayed: 0 };
           await this.db.upsertPlayerStats(record.eosID, defaults);

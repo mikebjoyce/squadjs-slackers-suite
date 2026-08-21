@@ -223,6 +223,83 @@ export function generateScenario_ClanSimilarity() {
 }
 
 /**
+ * Scenario: two clans on Team 1 that share squad 4.
+ * [AAA] has 3 in squad 4 + 2 in squad 5; [BBB] has 3 in squad 4 + 2 in squad 6.
+ * The clan processed first claims squad 4 as its anchor; the second clan must
+ * still be able to pull its 3 members out of it. Regression guard — those
+ * members used to be orphaned inside the first clan's virtual squad and
+ * travelled with the wrong clan.
+ */
+export function generateScenario_ClanSquadCollision() {
+  const players = generateMockPlayers(80, 0.5, 0);
+  injectClanTags(players, [
+    { tag: 'AAA', count: 3, teamID: 1, squadID: 4 },
+    { tag: 'BBB', count: 3, teamID: 1, squadID: 4 },
+    { tag: 'AAA', count: 2, teamID: 1, squadID: 5 },
+    { tag: 'BBB', count: 2, teamID: 1, squadID: 6 }
+  ]);
+  const squads = generateMockSquads(players);
+  return { players, squads };
+}
+
+/**
+ * Scenario: three clans on Team 1 that all share squad 4.
+ * [AAA] has 3 in squad 4 + 2 in squad 5; [BBB] has 3 in squad 4 + 2 in squad 6;
+ * [CCC] has 3 in squad 4 + 2 in squad 7. The largest clan (or first in tie) claims
+ * squad 4; the second and third must each find different unclaimed squads from the
+ * anchor pool, or fall back to the claimed squad if no alternatives exist.
+ */
+export function generateScenario_TripleClanCollision() {
+  const players = generateMockPlayers(100, 0.5, 0);
+  injectClanTags(players, [
+    { tag: 'AAA', count: 3, teamID: 1, squadID: 4 },
+    { tag: 'BBB', count: 3, teamID: 1, squadID: 4 },
+    { tag: 'CCC', count: 3, teamID: 1, squadID: 4 },
+    { tag: 'AAA', count: 2, teamID: 1, squadID: 5 },
+    { tag: 'BBB', count: 2, teamID: 1, squadID: 6 },
+    { tag: 'CCC', count: 2, teamID: 1, squadID: 7 }
+  ]);
+  const squads = generateMockSquads(players);
+  return { players, squads };
+}
+
+/**
+ * Scenario: clan B is entirely contained inside Clan A's anchor squad.
+ * [AAA] has 3 in squad 4 + 2 in squad 5; [BBB] has all 5 members in squad 4
+ * and nowhere else. When AAA is processed first and claims squad 4, BBB's
+ * anchorPool is empty — it must fall back to anchoring on the claimed squad.
+ * The two clans merge into a single virtual unit (documented merge behavior).
+ */
+export function generateScenario_ClanInsideAnothersAnchor() {
+  const players = generateMockPlayers(80, 0.5, 0);
+  injectClanTags(players, [
+    { tag: 'AAA', count: 3, teamID: 1, squadID: 4 },
+    { tag: 'AAA', count: 2, teamID: 1, squadID: 5 },
+    { tag: 'BBB', count: 5, teamID: 1, squadID: 4 }
+  ]);
+  const squads = generateMockSquads(players);
+  return { players, squads };
+}
+
+/**
+ * Scenario: large and small clan share squad 4; the large clan should claim it.
+ * [BIG] has 8 members in squad 4; [SML] has 3 in squad 4 + 2 in squad 5.
+ * BIG is processed first (sorted by size) and claims squad 4 as anchor.
+ * SML must use squad 5 (its only other squad) as anchor via the anchorPool filter.
+ * Both must stay independently cohesive.
+ */
+export function generateScenario_ClanSizeOrdering() {
+  const players = generateMockPlayers(80, 0.5, 0);
+  injectClanTags(players, [
+    { tag: 'BIG', count: 8, teamID: 1, squadID: 4 },
+    { tag: 'SML', count: 3, teamID: 1, squadID: 4 },
+    { tag: 'SML', count: 2, teamID: 1, squadID: 5 }
+  ]);
+  const squads = generateMockSquads(players);
+  return { players, squads };
+}
+
+/**
  * Scenario: low-pop server with a 15-member clan spread across three squads
  * on Team 1, paired with a low scramble percentage. With Phase 1's fixed
  * 3-player grace and a per-side target of ~6 (60 players × 0.2), a 15-player

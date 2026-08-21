@@ -75,7 +75,7 @@ export default class SwapExecutor {
     });
 
     const p = this.server.players.find(pl => pl.eosID === eosID);
-    this.sessionMoves.set(eosID, { targetTeamID, name: p?.name || 'Unknown' });
+    this.sessionMoves.set(eosID, { targetTeamID, name: p?.name || 'Unknown', steamID: p?.steamID || null });
 
     Logger.verbose('TeamBalancer', 4, `[SwapExecutor] Queued move for ${p?.name || eosID} -> ${targetTeamID}`);
 
@@ -186,37 +186,57 @@ export default class SwapExecutor {
         };
       }
 
-      const verified = { moved: 0, failed: 0, disconnected: 0, failedNames: [], failedEosIDs: [] };
+       const verified = { moved: 0, failed: 0, disconnected: 0, failedNames: [], failedEosIDs: [] };
 
-      for (const [eosID, moveData] of this.sessionMoves.entries()) {
-        const player = (this.teamBalancer?._s3?.players?.getPlayer(eosID)) || this.server.players.find(p => p.eosID === eosID);
+       for (const [eosID, moveData] of this.sessionMoves.entries()) {
+         const player = (this.teamBalancer?._s3?.players?.getPlayer(eosID)) || this.server.players.find(p => p.eosID === eosID);
 
-        if (!player) {
-          // Player disconnected mid-scramble. Do NOT push to failedEosIDs —
-          // these players should still receive the scramble lockdown when they
-          // rejoin, preventing players from disconnecting to dodge it.
-          verified.disconnected++;
-        } else if (String(player.teamID) === String(moveData.targetTeamID)) {
-          verified.moved++; // Successfully on correct team
-       } else {
-         // RCON genuinely failed — player is still on the server on their old
-         // team. These are the only players we exclude from scramble lockdown.
-         verified.failed++;
-         verified.failedNames.push(moveData.name || player.name || `EOS:${eosID.slice(0, 8)}`);
-         verified.failedEosIDs.push(eosID);
-       }
-     }
+          if (!player) {
+            // Player disconnected mid-scramble. Overwrite their S³ reconnect record
+            // with the scramble's intended destination team instead of their actual
+            // last team. When they reconnect, SmartAssign routes them to this team
+            // (with cross-round 1↔2 flip handled automatically by S³'s players service).
+            // Do NOT push to failedEosIDs — these players should still receive the
+            // scramble lockdown when they rejoin, preventing disconnect-dodging.
+            verified.disconnected++;
+            try {
+              // Overwrite the reconnect record's lastTeamID with the scramble
+              // target. lastSeenAt defaults to Date.now() (scramble time), which
+              // is correct for same-round disconnects (no cross-round flip needed).
+              // Cross-round edge case (player disconnected before NEW_GAME, then
+              // scramble fires while they're still gone): the original pre-round
+              // lastSeenAt is lost, so the 1↔2 flip won't fire. This scenario is
+              // vanishingly rare — a player would need to disconnect before round
+              // end AND a scramble fires in the new round before they return.
+              await this.teamBalancer?._s3?.players?.rememberReconnect(eosID, {
+                steamID: moveData.steamID || null,
+                playerName: moveData.name || `EOS:${eosID.slice(0, 8)}`,
+                lastTeamID: moveData.targetTeamID
+              });
+            } catch (err) {
+              Logger.verbose('TeamBalancer', 1, `[SwapExecutor] Failed to overwrite reconnect record for ${eosID}: ${err.message}`);
+            }
+         } else if (String(player.teamID) === String(moveData.targetTeamID)) {
+           verified.moved++; // Successfully on correct team
+        } else {
+          // RCON genuinely failed — player is still on the server on their old
+          // team. These are the only players we exclude from scramble lockdown.
+          verified.failed++;
+          verified.failedNames.push(moveData.name || player.name || `EOS:${eosID.slice(0, 8)}`);
+          verified.failedEosIDs.push(eosID);
+        }
+      }
 
      Logger.verbose('TeamBalancer', 2, `[SwapExecutor][Verification] ${verified.moved} moved, ${verified.disconnected} disconnected, ${verified.failed} failed (${this.sessionMoves.size} total)`);
 
-     return {
-       totalMoves: this.sessionMoves.size,
-       movedSuccessfully: verified.moved,
-       failedToMove: verified.failed,
-       disconnected: verified.disconnected,
-       failedNames: verified.failedNames,
-       failedEosIDs: verified.failedEosIDs
-     };
+      return {
+        totalMoves: this.sessionMoves.size,
+        movedSuccessfully: verified.moved,
+        failedToMove: verified.failed,
+        disconnected: verified.disconnected,
+        failedNames: verified.failedNames,
+        failedEosIDs: verified.failedEosIDs
+      };
    }
 
   async completeSession() {
@@ -255,16 +275,19 @@ export default class SwapExecutor {
       Logger.verbose('TeamBalancer', 1, `[SwapExecutor] ${failedToMove} players failed to move; manual action may be required.`);
     }
 
-    if (this.teamBalancer && this.teamBalancer.discordChannel) {
-      const embed = DiscordHelpers.buildScrambleCompletedEmbed(
-        totalMoves,
-        movedSuccessfully,
-        failedToMove,
-        disconnected,
-        duration,
-        failedNames || []
-      );
-      DiscordHelpers.sendDiscordMessage(this.teamBalancer.discordChannel, { embeds: [embed] });
+    if (this.teamBalancer) {
+      const targetReportChannel = this.teamBalancer.discordReportChannel || this.teamBalancer.discordChannel;
+      if (targetReportChannel) {
+        const embed = DiscordHelpers.buildScrambleCompletedEmbed(
+          totalMoves,
+          movedSuccessfully,
+          failedToMove,
+          disconnected,
+          duration,
+          failedNames || []
+        );
+        DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+      }
     }
 
     this.pendingPlayerMoves.clear();

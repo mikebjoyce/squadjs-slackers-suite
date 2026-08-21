@@ -1,6 +1,6 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
- * ║              SWITCH PLUGIN — OUTPUT LAYER                     ║
+ * ║              SWITCH PLUGIN — OUTPUT LAYER                      ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
@@ -21,10 +21,11 @@
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
- * Sequelize (Op) — query operators for getDiagnosticInfo() and
- *   _buildSwitchDiagEmbed().
- * All other dependencies are accessed via plugin.* (the live plugin
- * instance passed to register()).
+ * All dependencies are accessed via plugin.* (the live plugin
+ * instance passed to register()). As of v2.5.6 this module issues no
+ * queries of its own: getDiagnosticInfo() and _buildSwitchDiagEmbed()
+ * both read plugin.getLiveRestrictionState() (switch-db.js), which is
+ * the single place lazy token regeneration is applied for display.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
@@ -44,8 +45,6 @@
  * ═══════════════════════════════════════════════════════════════
  */
 
-import Sequelize from 'sequelize';
-const { Op } = Sequelize;
 
 const SwitchOutput = {
   /**
@@ -91,6 +90,8 @@ const SwitchOutput = {
         queueCancels: [],       // { name, eosID }
         queueRemovals: [],      // { name, eosID, reason, gamePhase } — removed due to team change / other
         maxQueueSize: 0,        // peak _getQueueSize() during the round
+        queueTimeoutSwitches: [],  // { name, eosID, currentTeamID, toTeam, queueDurationSeconds, gamePhase }
+        wasLiberalMode: false,         // cached at round-end
         queueDurationsMs: [],   // cumulative — used for average wait time
       };
     };
@@ -121,10 +122,18 @@ const SwitchOutput = {
     /**
      * Start broadcast timers for the switch window.
      * Called from onNewGame().
+     *
+     * NOTE: Guard against unset _gameStartTs. The S³ onLayerGameModeChange
+     * subscription (in _onLayerChanged) may fire before SquadJS's onNewGame
+     * event sets _gameStartTs, causing Date.now() - undefined = NaN which
+     * broadcasts "~NaNm remaining". When _gameStartTs is unset, this method
+     * silently returns — _onLayerChanged will re-trigger the correct broadcast
+     * path once onNewGame eventually sets _gameStartTs.
      */
     plugin._startBroadcastTimers = function () {
       if (!plugin.options.broadcastSwitchWindowMessages) return;
       if (!plugin.timeLimitEnabled) return;
+      if (!Number.isFinite(plugin._gameStartTs)) return;
 
       plugin._clearBroadcastTimers();
 
@@ -134,6 +143,7 @@ const SwitchOutput = {
 
       // First broadcast after delay
       plugin._broadcastTimers.firstBroadcast = setTimeout(() => {
+        if (!Number.isFinite(plugin._gameStartTs)) return;
         const remainingMin = Math.floor((windowMs - delayMs) / 60000);
         plugin.broadcast(`[Switch] Team switching is open. Use '!switch help' for details. Window: ~${remainingMin}m.`);
       }, delayMs);
@@ -141,6 +151,7 @@ const SwitchOutput = {
       // Periodic reminders
       if (intervalMs > 0) {
         plugin._broadcastTimers.reminderInterval = setInterval(() => {
+          if (!Number.isFinite(plugin._gameStartTs)) return;
           const elapsed = Date.now() - plugin._gameStartTs;
           const remainingMs = windowMs - elapsed;
           if (remainingMs <= 0) {
@@ -176,12 +187,24 @@ const SwitchOutput = {
         clearInterval(plugin._broadcastTimers.genericInfoTimer);
         plugin._broadcastTimers.genericInfoTimer = null;
       }
+      // seedBonusTimer was removed as part of the broadcast consolidation —
+      // the incentive broadcast was merged into the primary 5-minute message.
     };
 
     /**
      * Start periodic liberal-mode (Seed/Jensen) broadcast timer.
      * Runs every 5 minutes while the round is active.
      * Called from onNewGame() when isLiberalMode() is true.
+     *
+     * Seed bonus messaging is gated on isSeedMode() AND the seed bonus being
+     * enabled (seedTokenBonusAmount > 0 AND seedTokenBonusMinutes > 0),
+     * NOT on maxSwitchTokens > 1 — the two are independent config options.
+     * On Jensen/Training (liberal but not seed), the fallback message simply says
+     * switches are unrestricted, without mentioning token earning.
+     *
+     * Previously there was a separate 10-minute "incentive" broadcast for seed
+     * bonus reminders. It was removed as redundant — the primary 5-minute broadcast
+     * now carries the complete seed bonus message.
      */
     plugin._startLiberalBroadcastTimers = function () {
       if (!plugin.options.broadcastSwitchWindowMessages) return;
@@ -190,9 +213,28 @@ const SwitchOutput = {
 
       plugin._clearBroadcastTimers();
 
-      plugin._broadcastTimers.reminderInterval = setInterval(() => {
-        plugin.broadcast(`[Switch] No cooldown restrictions on this game mode. Use '!switch' to change teams anytime.`);
-      }, intervalMs);
+      // Broadcast: seed mode status or legacy fallback
+      // Gated on isSeedMode() (not isLiberalMode()) to avoid showing seed bonus
+      // messages during Jensen/Training rounds where the mechanic doesn't apply.
+       plugin._broadcastTimers.reminderInterval = setInterval(() => {
+         const isSeed = plugin._s3?.gameState?.isSeedMode?.() || false;
+         const bonusAmount = plugin.options.seedTokenBonusAmount;
+         const bonusEnabled = plugin._isSeedBonusEnabled?.() ?? (bonusAmount > 0);
+         const minPlayers = plugin.options.seedTokenBonusMinPlayers ?? 0;
+         if (isSeed && bonusEnabled) {
+           const minNote = minPlayers > 0
+             ? ` (requires ${minPlayers}+ players online)`
+             : '';
+           plugin.broadcast(`[Switch] Seed mode — switches are free (no token cost). You earn +1 bonus switch token for every ${plugin.options.seedTokenBonusMinutes}m of helping seed${minNote}, up to ${bonusAmount} per round — or stay until the round ends and get it anyway. Use '!switch check' to see your balance.`);
+         } else if (isSeed && !bonusEnabled) {
+           plugin.broadcast(`[Switch] Seed mode — switches are free (no token cost). Use '!switch' to change teams anytime.`);
+         } else {
+           plugin.broadcast(`[Switch] No cooldown restrictions on this game mode. Use '!switch' to change teams anytime.`);
+         }
+       }, intervalMs);
+
+      // NOTE: A separate 10-minute incentive broadcast was removed as redundant.
+      // The primary 5-minute broadcast above carries the complete seed bonus message.
     };
 
     /**
@@ -257,6 +299,21 @@ const SwitchOutput = {
                (layerName || '').toLowerCase().includes(candidate);
       });
 
+      const isSeed = plugin._s3?.gameState?.isSeedMode?.() || false;
+
+      // v2.5.0: This handler no longer participates in the seed bonus at all.
+      //
+      // The consolation grant moved to the ENDGAME phase transition (see
+      // _grantSeedBonusAtEndgame, subscribed in _onS3Ready). The layer edge was the
+      // wrong trigger twice over: it never fired on back-to-back seed rounds, and it
+      // ran at the exact moment the S³ roster is mid-refresh, so a connected-only
+      // check could silently match nobody with no retry.
+      //
+      // The non-seed → seed bootstrap (previously _initSeedPresenceForAll) is
+      // handled by the self-healing tick in _checkSeedBonusGrants, which creates
+      // rows for connected players and resets stale ones on every
+      // S3_PLAYERS_UPDATED tick while accrual is active. No event-edge init here.
+
       plugin._clearBroadcastTimers();
 
       if (plugin._scrambleHappened) {
@@ -313,12 +370,30 @@ const SwitchOutput = {
       return m > 0 ? `${m}m ${s}s` : `${s}s`;
     };
 
+    /**
+     * Compute the median of a numeric array using zero-copy sort.
+     * Returns 0 for empty/null input.
+     *
+     * NOTE: Duplicated in switch-commands.js. If the algorithm changes,
+     * update both copies.
+     *
+     * @param {number[]|null} arr — array of millisecond durations
+     * @returns {number} median in milliseconds, or 0
+     */
+    plugin._computeMedian = function (arr) {
+      if (!arr || arr.length === 0) return 0;
+      const sorted = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      if (sorted.length % 2 === 0) return Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+      return sorted[mid];
+    };
+
     plugin._buildRoundSummaryEmbed = function () {
       const s = plugin._roundStats;
       if (!s) return null;
 
       const totalSuccess = s.instantSwitches.length + s.queueNormal.length +
-        s.queueTeamTrades.length + s.queueJoinSwaps.length;
+        s.queueTeamTrades.length + s.queueJoinSwaps.length + s.queueTimeoutSwitches.length;
       const totalFailed = s.queueExpiries.length;
 
       // Average queue wait (only queue-based successes, not instant)
@@ -330,6 +405,12 @@ const SwitchOutput = {
       const avgSec = avgQueueSec % 60;
       const avgStr = avgMin > 0 ? `${avgMin}m ${avgSec}s` : `${avgSec}s`;
 
+      // Median queue wait
+      const medianQueueMs = plugin._computeMedian(queueDurations);
+      const medianMin = Math.floor(medianQueueMs / 60000);
+      const medianSec = Math.round((medianQueueMs % 60000) / 1000);
+      const medianStr = medianMin > 0 ? `${medianMin}m ${medianSec}s` : `${medianSec}s`;
+
       // Per-team destination counts (all success types)
       let toT1 = 0, toT2 = 0;
       for (const p of s.instantSwitches) {
@@ -339,6 +420,9 @@ const SwitchOutput = {
         if (p.toTeam === 1) toT1++; else toT2++;
       }
       for (const p of s.queueJoinSwaps) {
+        if (p.toTeam === 1) toT1++; else toT2++;
+      }
+      for (const p of s.queueTimeoutSwitches) {
         if (p.toTeam === 1) toT1++; else toT2++;
       }
       for (const p of s.queueTeamTrades) {
@@ -365,16 +449,27 @@ const SwitchOutput = {
       const failRate = attemptedRequests > 0 ? Math.round((totalFailed / attemptedRequests) * 100) : 0;
       const denyRate = totalRequests > 0 ? Math.round((totalDenied / totalRequests) * 100) : 0;
 
-      // Denial reason breakdown
+      // Denial reason breakdown — only render known categories. Unrecognized
+      // reason strings (e.g. 'unexpected error' from the onChatMessage catch-all,
+      // or any raw SQL/RCON error messages that bypassed sanitization) are
+      // bucketed as "other" to prevent ugly text from leaking into the embed.
+      const KNOWN_DENIAL_REASONS = ['cooldown', 'time_window', 'scramble_lock'];
       const denialReasons = {};
+      let otherDenialCount = 0;
       for (const d of s.deniedSwitches) {
-        denialReasons[d.reason] = (denialReasons[d.reason] || 0) + 1;
+        if (KNOWN_DENIAL_REASONS.includes(d.reason)) {
+          denialReasons[d.reason] = (denialReasons[d.reason] || 0) + 1;
+        } else {
+          otherDenialCount++;
+        }
       }
-      const denialBreakdown = Object.entries(denialReasons)
-        .map(([reason, count]) => `${count} ${reason}`)
-        .join(', ');
+      const denialParts = Object.entries(denialReasons)
+        .map(([reason, count]) => `${count} ${reason}`);
+      if (otherDenialCount > 0) denialParts.push(`${otherDenialCount} other`);
+      const denialBreakdown = denialParts.join(', ');
 
       const statsLines = [];
+      statsLines.push(`**Mode:** ${s.wasLiberalMode ? 'Liberal (Seed/Jensen)' : 'Standard'}`);
       statsLines.push(`**Requests:** ${totalRequests} (${totalSuccess} succeeded, ${totalDenied} denied, ${totalFailed} failed)`);
       statsLines.push(`**Success Rate:** ${successRate}%`);
       if (totalDenied > 0) {
@@ -385,9 +480,15 @@ const SwitchOutput = {
         statsLines.push(`**Fail Rate:** ${failRate}% (${totalFailed} expired)`);
       }
       statsLines.push(`**Max Queue Size:** ${s.maxQueueSize}`);
-      if (queueDurations.length > 0) statsLines.push(`**Avg Queue Wait:** ${avgStr}`);
-      statsLines.push(`**To T1:** ${toT1}`);
-      statsLines.push(`**To T2:** ${toT2}`);
+      if (queueDurations.length > 0) statsLines.push(`**Queue Wait:** mean ${avgStr}, median ${medianStr}`);
+      const totalMoves = toT1 + toT2;
+      if (totalMoves > 0) {
+        const dirPct1 = ` (${((toT1 / totalMoves) * 100).toFixed(1)}%)`;
+        const dirPct2 = ` (${((toT2 / totalMoves) * 100).toFixed(1)}%)`;
+        statsLines.push(`**Direction:**`);
+        statsLines.push(`→ T1: ${toT1}${dirPct1}`);
+        statsLines.push(`→ T2: ${toT2}${dirPct2}`);
+      }
 
       fields.push({ name: '📊 Stats', value: statsLines.join('\n'), inline: false });
 
@@ -432,6 +533,17 @@ const SwitchOutput = {
         });
         if (s.queueJoinSwaps.length > 10) names.push(`+ ${s.queueJoinSwaps.length - 10} more...`);
         methodLines.push(`**Queue Join Swap (${s.queueJoinSwaps.length})**\n${names.join('\n')}`);
+      }
+
+      if (s.queueTimeoutSwitches.length) {
+        const names = s.queueTimeoutSwitches.slice(0, 10).map(p => {
+          const m = Math.floor(p.queueDurationSeconds / 60);
+          const sec = p.queueDurationSeconds % 60;
+          const dur = m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+          return `${p.name} ${plugin._formatGamePhase(p.gamePhase)} (T${p.currentTeamID || '?'}→T${p.toTeam}, ${dur})`;
+        });
+        if (s.queueTimeoutSwitches.length > 10) names.push(`+ ${s.queueTimeoutSwitches.length - 10} more...`);
+        methodLines.push(`**Queue Timeout Switch (${s.queueTimeoutSwitches.length})**\n${names.join('\n')}`);
       }
 
       if (methodLines.length > 0) {
@@ -514,7 +626,7 @@ const SwitchOutput = {
         const s = plugin._roundStats;
         plugin.verbose(1, `[Summary] Round ended: ` +
           `${s.instantSwitches.length} instant, ${s.queueNormal.length} normal, ${s.queueTeamTrades.length} trades, ` +
-          `${s.queueJoinSwaps.length} join-swaps, ${s.deniedSwitches.length} denied (unique players), ` +
+          `${s.queueJoinSwaps.length} join-swaps, ${s.queueTimeoutSwitches.length} timeout-switches, ${s.deniedSwitches.length} denied (unique players), ` +
           `${s.queueExpiries.length} expired, ${s.queueDisconnects.length} DC, ${s.queueCancels.length} cancel. ` +
           `Max queue: ${s.maxQueueSize}.`
         );
@@ -538,21 +650,16 @@ const SwitchOutput = {
           dbStatus = 'S³ DB not available';
         }
 
-        const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
-        if (PlayerCooldowns) {
-          totalStoredPlayers = await PlayerCooldowns.count();
-
-          const cooldownDurationMs = plugin.options.switchCooldownMinutes > 0 ? plugin.options.switchCooldownMinutes * 60 * 1000 : plugin.options.switchCooldownHours * 60 * 60 * 1000;
-          const cooldownCutoff = new Date(Date.now() - cooldownDurationMs);
-
-          activeLocks = await PlayerCooldowns.count({
-            where: {
-              [Op.or]: [
-                { scrambleLockdownExpiry: { [Op.gt]: new Date() } },
-                { lastSwitchTimestamp: { [Op.gt]: cooldownCutoff } }
-              ]
-            }
-          });
+        // v2.5.6: shares getLiveRestrictionState() with the Discord embed.
+        // This used to count `tokenBalance < maxTokens` straight off the stored
+        // column, with no lazy regeneration and no expiry check on the lock —
+        // against the 2026-08-20 production export it would have reported 114
+        // "active locks" when the true number was 0. "Active" now means a player
+        // who genuinely cannot switch at this instant.
+        const state = await plugin.getLiveRestrictionState();
+        if (state) {
+          totalStoredPlayers = state.total;
+          activeLocks = state.blocked.length;
         }
       } catch (e) {
         dbStatus = `Error: ${e.message}`;
@@ -614,76 +721,151 @@ const SwitchOutput = {
         `${s3Ok ? '🟢' : s3Label === 'Partial' ? '🟠' : '🔴'} S³ Integration   ${s3Label}`
       ].join('\n');
 
+      // ── Config snapshot ──
+      //
+      // isLiberalMode() internally accesses _s3.gameState — guard against _s3
+      // being unavailable (e.g. S³ unmounted mid-round). Fall back to false.
+      const isLiberal = (plugin._s3 && plugin.isLiberalMode?.()) || false;
+      // 'now' is shared between config timing (switch window) and the cooldown
+      // cutoff computation below. Use a single snapshot to keep them consistent.
+      const now = new Date();
+      const configLines = [];
+
+      if (plugin.timeLimitEnabled && plugin._gameStartTs) {
+        const elapsed = Date.now() - plugin._gameStartTs;
+        const remainingMs = plugin.options.switchEnabledMinutes * 60 * 1000 - elapsed;
+        if (remainingMs <= 0) {
+          configLines.push(`**Switching:** Closed`);
+        } else {
+          const remainingMin = Math.ceil(remainingMs / 60000);
+          configLines.push(`**Switching:** Open (~${remainingMin}m remaining)`);
+        }
+      } else if (plugin.timeLimitEnabled) {
+        configLines.push(`**Switching:** Limit enabled (not yet started)`);
+      } else {
+        configLines.push(`**Switching:** No time limit`);
+      }
+      configLines.push(`**Mode:** ${isLiberal ? 'Liberal (Seed/Jensen)' : 'Standard'}`);
+      // Scramble lockdown is tracked per-player in the DB (scrambleLockdownExpiry).
+      // Show the config duration rather than a transient runtime flag — the flag
+      // is consumed by _onLayerChanged() for broadcast routing and is only briefly
+      // true between round end and layer resolution.
+      const scrambleMinutes = plugin.options.scrambleLockdownDurationMinutes;
+      configLines.push(`**Scramble Lockdown:** ${scrambleMinutes} min per player`);
+      // v2.3.0: Show token bucket config
+      const maxTokens = plugin.options.maxSwitchTokens;
+      configLines.push(`**Switch Tokens:** ${maxTokens}`);
+      // Cooldown duration is a static config value — show it here alongside
+      // the other durations (Scramble Lockdown, Queue Timeout) for consistency.
+      const cooldownDurationLabel = plugin.options.switchCooldownMinutes > 0
+        ? `${plugin.options.switchCooldownMinutes} min`
+        : `${plugin.options.switchCooldownHours}h`;
+      configLines.push(`**Token Refill:** ${cooldownDurationLabel} per token`);
+      // "AllowTeamChanges" = RCON AllowTeamChanges setting. When off, players
+      // cannot use the in-game scoreboard to swap teams — they must use !switch.
+      configLines.push(`**AllowTeamChanges:** ${plugin._changeTeamDisabled ? 'Off' : 'On'}`);
+      configLines.push(`**Queue Timeout:** ${plugin.options.queueTimeoutMinutes}m`);
+
       // ── Queue status ──
+      //
+      // Discord embed field values are capped at 1024 characters. To stay well
+      // under that limit, we merge both sub-queues, sort by oldest-first, and
+      // display at most 10 entries with an overflow line for any remainder.
       const t1Count = plugin._switchQueue?.t1?.length ?? 0;
       const t2Count = plugin._switchQueue?.t2?.length ?? 0;
       const totalQueued = t1Count + t2Count;
 
-      // Compute oldest wait time across both queues
-      let oldestWait = null;
-      for (const entry of [...(plugin._switchQueue?.t1 ?? []), ...(plugin._switchQueue?.t2 ?? [])]) {
-        if (oldestWait === null || entry.queuedAt < oldestWait) oldestWait = entry.queuedAt;
+      const queueLines = [];
+      if (totalQueued === 0) {
+        queueLines.push('⚫ Empty');
+      } else {
+        // Use live Date.now() here rather than the shared 'now' snapshot — queue
+        // wait times are relative and should be accurate to the moment of display.
+        const formatWait = (queuedAt) => {
+          const sec = Math.round((Date.now() - queuedAt) / 1000);
+          const m = Math.floor(sec / 60);
+          const s = sec % 60;
+          return m > 0 ? `${m}m ${s}s` : `${s}s`;
+        };
+        // Merge both sub-queues and sort oldest-first for a unified view.
+        const allEntries = [
+          ...(plugin._switchQueue?.t1 ?? []).map(e => ({ ...e, _dir: 'T1 → T2' })),
+          ...(plugin._switchQueue?.t2 ?? []).map(e => ({ ...e, _dir: 'T2 → T1' }))
+        ].sort((a, b) => a.queuedAt - b.queuedAt);
+
+        const display = allEntries.slice(0, 10);
+        for (const entry of display) {
+          queueLines.push(`${entry._dir}: **${entry.playerName}** (${formatWait(entry.queuedAt)})`);
+        }
+        if (allEntries.length > 10) {
+          queueLines.push(`... and ${allEntries.length - 10} more`);
+        }
       }
-      const waitStr = oldestWait !== null ? `${Math.round((Date.now() - oldestWait) / 1000)}s` : '\u2014';
 
-      const queueLines = [
-        `${totalQueued > 0 ? '🟢' : '⚫'} Players in Queue    ${totalQueued > 0 ? `${totalQueued} (t1: ${t1Count}, t2: ${t2Count})` : 'Empty'}`,
-        `   Oldest wait: ${waitStr}`
-      ].join('\n');
-
-      // ── Cooldown statistics ──
-      const now = new Date();
+      // ── Cooldown statistics (token-aware) ──
+      //
+      // NOTE: This block duplicates much of the query logic in getDiagnosticInfo()
+      // (above). The two methods serve different callers (Discord embed vs. general
+      // health check) and have slightly different output shapes. If the table schema
+      // changes, update both methods.
+      // maxTokens is already declared above in the Config section
       const cooldownDurationMs = plugin.options.switchCooldownMinutes > 0
         ? plugin.options.switchCooldownMinutes * 60 * 1000
         : plugin.options.switchCooldownHours * 60 * 60 * 1000;
-      const cooldownCutoff = new Date(now.getTime() - cooldownDurationMs);
 
-      let standardCooldowns = 0;
-      let scrambleLocks = 0;
-      let playerList = 'None';
-
+      // v2.5.6: one pass over the table, every number below derived from it.
+      // Previously this block issued four separate queries, two of which applied
+      // lazy regeneration and two of which did not — which is how the embed came
+      // to print "Players Below Cap: 0" directly above five players listed as
+      // restricted, each showing "2/2 tokens (full)".
+      let state = null;
       try {
-        const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
-        if (PlayerCooldowns) {
-          standardCooldowns = await PlayerCooldowns.count({
-            where: { lastSwitchTimestamp: { [Op.gt]: cooldownCutoff } }
-          });
-          scrambleLocks = await PlayerCooldowns.count({
-            where: { scrambleLockdownExpiry: { [Op.gt]: now } }
-          });
-
-          const lockedPlayers = await PlayerCooldowns.findAll({
-            where: {
-              [Op.or]: [
-                { scrambleLockdownExpiry: { [Op.gt]: now } },
-                { lastSwitchTimestamp: { [Op.gt]: cooldownCutoff } }
-              ]
-            },
-            order: [['scrambleLockdownExpiry', 'DESC'], ['lastSwitchTimestamp', 'DESC']],
-            limit: 5
-          });
-
-          if (lockedPlayers.length > 0) {
-            playerList = lockedPlayers.map(p => {
-              const parts = [];
-              if (p.scrambleLockdownExpiry && p.scrambleLockdownExpiry > now) {
-                parts.push(`🌪️ <t:${Math.floor(p.scrambleLockdownExpiry.getTime() / 1000)}:R>`);
-              }
-              if (p.lastSwitchTimestamp && new Date(p.lastSwitchTimestamp.getTime() + cooldownDurationMs) > now) {
-                const expiry = new Date(p.lastSwitchTimestamp.getTime() + cooldownDurationMs);
-                parts.push(`⏳ <t:${Math.floor(expiry.getTime() / 1000)}:R>`);
-              }
-              return `**${p.playerName || p.steamID}**: ${parts.join(' ')}`;
-            }).join('\n');
-          }
-        }
+        state = await plugin.getLiveRestrictionState();
       } catch (err) {
-        // cooldown stats silently degrade — shown as 0/None
+        // Degrade quietly. A transient DB error should not stop System Health,
+        // Config and Queue from rendering.
+        plugin.verbose(2, `[Diag] Live restriction state unavailable: ${err.message}`);
       }
 
-      const cooldownDurationLabel = plugin.options.switchCooldownMinutes > 0
-        ? `${plugin.options.switchCooldownMinutes} min`
-        : `${plugin.options.switchCooldownHours}h`;
+      const cooldownLines = [];
+      let playerList = '⚫ Nobody is blocked from switching';
+
+      if (!state) {
+        cooldownLines.push('Unavailable — database not ready');
+        playerList = '⚫ Unavailable';
+      } else {
+        // "Out of Tokens" replaces "Players Below Cap". Below-cap was never a
+        // restriction: with maxSwitchTokens at 2, a player holding 1 can still
+        // switch. Only an empty wallet actually blocks anyone.
+        cooldownLines.push(`Out of Tokens:         ${state.outOfTokens}`);
+        cooldownLines.push(`Scramble Locked:       ${state.scrambleLocked}`);
+        cooldownLines.push(`Holding <${maxTokens} tokens:    ${state.belowCap}`);
+        // Qualified as "online" because the count only includes connected
+        // players now — an offline row's presence clock accrues nothing, and
+        // counting those was reporting 75 seeders on an empty server.
+        cooldownLines.push(`Seed Accruing (online): ${state.seedAccruing}${state.rosterReady ? '' : ' (roster unavailable)'}`);
+        // Explicitly labelled as retention, not surveillance. "Tracked Players:
+        // 378" read as though the plugin were watching 378 people; it is simply
+        // how many rows are inside the pruning window.
+        cooldownLines.push(`Rows (${plugin.options.pruneInactivePlayerDays}d retention):  ${state.total}`);
+
+        if (state.blocked.length > 0) {
+          const shown = state.blocked.slice(0, 5);
+          playerList = shown.map(p => {
+            const parts = [];
+            if (p.lockExpiry) parts.push(`🌪️ <t:${Math.floor(p.lockExpiry.getTime() / 1000)}:R>`);
+            if (p.tokenBalance < 1) {
+              const anchor = p.tokenRegenAnchor ? new Date(p.tokenRegenAnchor).getTime() : Date.now();
+              const nextAt = Math.floor((anchor + cooldownDurationMs) / 1000);
+              parts.push(`🎫 0/${maxTokens}, next <t:${nextAt}:R>`);
+            }
+            return `${p.online ? '🟢' : '⚫'} **${p.playerName || p.steamID || p.eosID}**: ${parts.join(' ')}`;
+          }).join('\n');
+          if (state.blocked.length > shown.length) {
+            playerList += `\n... and ${state.blocked.length - shown.length} more`;
+          }
+        }
+      }
 
       // ── Color logic ──
       const allOk = dbOk && rconOk && s3Ok;
@@ -696,9 +878,20 @@ const SwitchOutput = {
         color,
         fields: [
           { name: 'System Health', value: healthLines, inline: false },
-          { name: 'Queue Status', value: queueLines, inline: false },
-          { name: 'Cooldown Statistics', value: `Standard Cooldowns:  ${standardCooldowns}\t Duration:  ${cooldownDurationLabel}\nScramble Locks:  ${scrambleLocks}`, inline: false },
-          { name: 'Active Locks', value: playerList, inline: false }
+          { name: '\u{1F4CB} Config', value: configLines.join('\n'), inline: false },
+          { name: `\u{1F465} Queue (${totalQueued})`, value: queueLines.join('\n'), inline: false },
+          { name: '\u{1F550} Token & Lock Summary', value: cooldownLines.join('\n'), inline: false },
+          // Renamed from "Restricted Players (top 5)", which was neither: the
+          // sort key was a mostly-expired lockdown timestamp, and the players it
+          // listed were not restricted. This field now answers one question —
+          // who cannot switch right now — and says so plainly when nobody can.
+          {
+            name: state && state.blocked.length > 0
+              ? `\u{1F512} Currently Blocked (${state.blocked.length})`
+              : '\u{1F513} Currently Blocked',
+            value: playerList,
+            inline: false
+          }
         ]
       };
     };
@@ -729,8 +922,11 @@ const SwitchOutput = {
         success,
         failed,
         denied,
-        toT1: plugin._parseStatsNum(/\*\*To T1:\*\*\s*(\d+)/, value),
-        toT2: plugin._parseStatsNum(/\*\*To T2:\*\*\s*(\d+)/, value)
+        // v2.3.0: new format "→ T1: N (X%)" — try first, fall back to old "**To T1:** N"
+        toT1: plugin._parseStatsNum(/→ T1:\s*(\d+)/, value) ||
+              plugin._parseStatsNum(/\*\*To T1:\*\*\s*(\d+)/, value),
+        toT2: plugin._parseStatsNum(/→ T2:\s*(\d+)/, value) ||
+              plugin._parseStatsNum(/\*\*To T2:\*\*\s*(\d+)/, value)
       };
     };
   }

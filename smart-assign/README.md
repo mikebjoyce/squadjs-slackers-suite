@@ -1,4 +1,4 @@
-# SmartAssign Plugin v2.1.0
+# SmartAssign Plugin v2.1.1
 
 **Elo-Aware Auto Assignment & Player Lifecycle Logger**
 
@@ -87,16 +87,13 @@ Add the following to your `config.json`:
   {
     "plugin": "SmartAssign",
     "enabled": true,
-    "database": "sqlite",
     "logPath": "./smart-assign-log.jsonl",
-    "enableSmartAssign": true,
-    "enableEventLogging": true,
-    "enableDatabaseLogging": false
+    "enableEventLogging": true
   }
 ]
 ```
 
-**Database Options:** The `"database"` option should match a connector name from the connectors block. Use `"sqlite"` for file-based storage (default), `"mysql"` for MySQL, or `"postgres"` for PostgreSQL. Any Sequelize-compatible backend is supported.
+**Database:** SmartAssign has no `database` option — do not put one in its config block. It defines its models on S³'s connector, so the engine is whatever `database` is set to on the **SlackersSquadServices** plugin. The connectors block above exists so you can point S³ at one.
 
 ### 2. File Placement
 
@@ -130,16 +127,16 @@ The Switch Handshake feature allows SmartAssign to optionally include Switch-que
 1. **Discovery:** At mount time, SmartAssign detects the Switch plugin via `this.server.plugins.find()`. If found with version ≥2.0.0 and the required public API, the handshake is available.
 2. **Frontloading:** When a player joins, SmartAssign fires `getQueueSnapshot()` asynchronously (before the main evaluation), so the snapshot is ready when needed.
 3. **Evaluation:** After `evaluateTeamAssignment()` returns a baseline result, SmartAssign checks the relevant sub-queue (players whose target team matches the baseline). If the head candidate passes all filters (F1–F6), virtual scoring is computed.
-4. **Decision:** In `eloGated` mode (default), the swap is adopted only if the virtual score is within `handshakeScoreThreshold` of the baseline. In `queueDrain` mode, any candidate passing hard constraints is swapped regardless of score.
+4. **Decision:** In `queueDrain` mode (default), any candidate passing hard constraints is swapped regardless of score. In `eloGated` mode, the swap is adopted only if the virtual score is within `handshakeScoreThreshold` of the baseline.
 5. **Execution:** SmartAssign queues both RCON moves through its own executor and calls `forceQueueSwap()` on the Switch plugin to clean up queue bookkeeping.
 
 ### Configuration
 
 | Option | Required | Type | Default | Description |
 |--------|----------|------|---------|-------------|
-| `handshakeWithSwitch` | no | boolean | `false` | Enable handshake with Switch queue (requires Switch plugin v2.0.0+). |
+| `handshakeWithSwitch` | no | boolean | `true` | Enable handshake with Switch queue (requires Switch plugin v2.0.0+). |
 | `handshakeScoreThreshold` | no | number | `0.5` | How much worse the swap score can be vs baseline before rejecting (lower = stricter, `eloGated` mode only). |
-| `handshakeMode` | no | string | `"eloGated"` | `"eloGated"` — scoring gates the swap; `"queueDrain"` — swap if hard constraints pass, ignore scoring. |
+| `handshakeMode` | no | string | `"queueDrain"` | `"queueDrain"` — swap if hard constraints pass, ignore scoring; `"eloGated"` — scoring gates the swap. |
 
 ### Graceful Degradation
 
@@ -158,14 +155,9 @@ The Switch Handshake feature allows SmartAssign to optionally include Switch-que
 
 | Option | Required | Type | Default | Description |
 |--------|----------|------|---------|-------------|
-| `database` | yes | string | `"sqlite"` | Sequelize connector name for reconnect memory storage (SQLite, MySQL, PostgreSQL, etc.) |
 | `enableSmartAssign` | no | boolean | `true` | If true, runs the assignment algorithm and moves players. If false, only logs real server events (passive mode). |
-| `enableEventLogging` | no | boolean | `true` | Toggle the JSONL lifecycle event logging output entirely |
+| `enableEventLogging` | no | boolean | `false` | Toggle the JSONL lifecycle event logging output entirely |
 | `logPath` | no | string | `"./smart-assign-log.jsonl"` | File path for JSONL player lifecycle events |
-| `ignoredGameModes` | no | array | `["Seed", "Jensen"]` | Array of layer/gamemode substrings where SmartAssign should not alter teams |
-| `enableClanGrouping` | no | boolean | `true` | If true, players in clans will be kept together on the same team if all clan mates are on one team |
-| `clanGroupMinSize` | no | number | `2` | Minimum number of players to consider a group as a clan for grouping purposes |
-| `clanGroupCaseSensitive` | no | boolean | `false` | If false, clan tags are case-insensitive and diacritics/gamer-character lookalikes are normalised |
 | `enableDatabaseLogging` | no | boolean | `false` | If true, mirrors JSONL event data into database tables for querying |
 
 ---

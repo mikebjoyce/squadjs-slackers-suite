@@ -33,3 +33,12 @@ npm-debug.log*
 
 # Test Output
 test-results.json
+
+# Plugin runtime artefacts. These are the DEFAULT output paths of shipped
+# options (team-balancer's reportLogPath / scrambleReportPath, elo-tracker's
+# eloLogPath), all resolved against process.cwd() — so running the suite from
+# the repo root drops a live server's file layout into the repo root. They are
+# generated data, never source.
+team-balancer-reports.jsonl
+elo-match-log.jsonl
+TeamBalancerScrambleReports/

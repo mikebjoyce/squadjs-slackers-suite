@@ -282,8 +282,14 @@ await runTest('crash ENDGAME recent <5min — stays ENDGAME, null subState (by d
   await service.unmount();
 });
 
-// ── Test 6: Crash during ENDGAME — game server advanced (matchStartTime divergence) ──
-await runTest('crash ENDGAME but server advanced — matchStartTime divergence → LIVE', async () => {
+// ── Test 6: Crash during ENDGAME — game server advanced ──────────
+// This test used to assert that a diverging server.matchStartTime moved the
+// recovered state to LIVE. S³ deliberately stopped trusting matchStartTime
+// (SquadJS sets it per process lifetime, so it is not comparable across a
+// restart — see handleNewGame) and owns roundStartTime itself. The
+// authoritative "the server has moved on" signal is now the layer name
+// carried by UPDATED_SERVER_INFORMATION, so that is what this asserts.
+await runTest('crash ENDGAME but server advanced — layer divergence → LIVE', async () => {
   const sequelize = new MockSequelize();
 
   const roundEnded = Date.now() - 120000; // 2 min ago (under stale threshold)
@@ -302,14 +308,20 @@ await runTest('crash ENDGAME but server advanced — matchStartTime divergence �
   });
 
   const server = new MockServer();
-  // matchStartTime diverges — server has advanced to a new round
+  // matchStartTime diverges — deliberately ignored by S³
   server.matchStartTime = new Date(roundEnded + 10000);
 
   const service = createRecoveryService({ sequelize, server });
 
   await service.mount();
-  // matchStartTime divergence (>5000ms) should trigger transition to LIVE
+  // Recovered ENDGAME stands: nothing authoritative has contradicted it yet.
+  assert.equal(service.getPhase(), 'ENDGAME');
+  assert.equal(service._recoveredStateActive, true);
+
+  // The server reports a different layer — the round really did advance.
+  await service.handleServerInfoUpdated({ currentLayer: 'Yehorivka_RAAS_v1' });
   assert.equal(service.getPhase(), 'LIVE');
+  assert.equal(service._recoveredStateActive, false);
 
   await service.unmount();
 });
@@ -341,12 +353,17 @@ await runTest('fast restart — matchStartTime matches, layer matches — stays 
   await service.mount();
   // Should stay in LIVE — no divergence detected
   assert.equal(service.getPhase(), 'LIVE');
+  assert.equal(service.getLayerName(), 'Mutaha_RAAS_v3');
 
-  // After handleLayerInfoUpdated with matching layer, _recoveredStateActive clears
-  assert.equal(service._recoveredStateActive, true); // still active before validation
-  server.currentLayer = 'Mutaha_RAAS_v3';
-  await service.handleLayerInfoUpdated();
-  assert.equal(service._recoveredStateActive, false); // cleared by matching layer
+  // mount()'s layer bootstrap already resolved server.currentLayer, and that
+  // resolution validates the recovered state against it — a matching layer
+  // confirms recovery, so the flag is cleared by the time mount() returns.
+  assert.equal(service._recoveredStateActive, false);
+
+  // A matching layer arriving later changes nothing.
+  await service.handleServerInfoUpdated({ currentLayer: 'Mutaha_RAAS_v3' });
+  assert.equal(service.getPhase(), 'LIVE');
+  assert.equal(service._recoveredStateActive, false);
 
   await service.unmount();
 });
@@ -372,19 +389,26 @@ await runTest('fast restart — layer divergence → transition to LIVE', async 
 
   const server = new MockServer();
   server.matchStartTime = new Date(roundStart);
-  // Do NOT set server.currentLayer before mount — mount would resolveLayerInfo it and
-  // overwrite the recovered lastKnownGoodLayer, preventing divergence detection.
+  // Leave server.currentLayer null: this is the mid-round-restart case where
+  // SquadJS has not repopulated it, so mount() has nothing to bootstrap from
+  // and the recovered layer stands.
   const service = createRecoveryService({ sequelize, server });
 
   await service.mount();
   // Still in STAGING on mount — recovery restored the old layer
   assert.equal(service.getPhase(), 'STAGING');
+  assert.equal(service.getLayerName(), 'OldLayer_RAAS_v1');
 
-  // handleLayerInfoUpdated with a different layer triggers _validateRecoveredState
+  // UPDATED_LAYER_INFORMATION carries no layer and must not decide anything,
+  // even with server.currentLayer set — it is not a trustworthy source.
   server.currentLayer = 'NewLayer_AAS_v2';
   await service.handleLayerInfoUpdated();
-  // Layer divergence should trigger transition to LIVE
+  assert.equal(service.getPhase(), 'STAGING');
+
+  // UPDATED_SERVER_INFORMATION carries the real layer: divergence → LIVE.
+  await service.handleServerInfoUpdated({ currentLayer: 'NewLayer_AAS_v2' });
   assert.equal(service.getPhase(), 'LIVE');
+  assert.equal(service.getLayerName(), 'NewLayer_AAS_v2');
 
   await service.unmount();
 });

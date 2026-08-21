@@ -107,9 +107,13 @@ export default class S3DiscordPluginBase extends S3PluginBase {
       );
     } catch (error) {
       this.channel = null;
-      this.verbose(
-        1,
-        `Could not fetch Discord channel with channelID "${this.options.channelID}". Error: ${error.message}`
+      // A startup misconfiguration the operator must fix — and one that
+      // guarantees no Discord reporting for the rest of the run, so stderr is
+      // the only channel that can carry it.
+      this.reportError(
+        'Discord',
+        `Could not fetch Discord channel with channelID "${this.options.channelID}". Error: ${error.message}`,
+        error
       );
       this.verbose(2, `${error.stack}`);
     }
@@ -160,10 +164,13 @@ export default class S3DiscordPluginBase extends S3PluginBase {
         try {
           await this.channel.send(message);
         } catch (retryError) {
-          this.verbose(1, `Failed to send Discord message after retry: ${retryError.message}`, retryError);
+          // Mirrored: a dropped embed is silent from the operator's side —
+          // Discord is where these plugins report, so its failures cannot be
+          // reported there.
+          this.reportError('Discord', `Failed to send Discord message after retry: ${retryError.message}`, retryError, { includeStackInLog: true });
         }
       } else {
-        this.verbose(1, `Failed to send Discord message: ${error.message}`, error);
+        this.reportError('Discord', `Failed to send Discord message: ${error.message}`, error, { includeStackInLog: true });
       }
     }
   }

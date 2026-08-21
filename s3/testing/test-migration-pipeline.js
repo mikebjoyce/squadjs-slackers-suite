@@ -224,12 +224,12 @@ test('MigrationEngine registers per-plugin migrations', async () => {
     const { engine } = harness;
 
     const saMigrations = [
-      { version: 1, description: 'Create SA_AssignmentLog', up: async () => {} },
-      { version: 2, description: 'Add teamID column', up: async () => {} }
+      { version: 1, description: 'Create SA_AssignmentLog', touches: {}, up: async () => {} },
+      { version: 2, description: 'Add teamID column', touches: {}, up: async () => {} }
     ];
 
     const eloMigrations = [
-      { version: 1, description: 'Create Elo_PlayerStats', up: async () => {} }
+      { version: 1, description: 'Create Elo_PlayerStats', touches: {}, up: async () => {} }
     ];
 
     engine.registerMigrations('smart-assign', saMigrations);
@@ -252,15 +252,15 @@ test('Invalid migrations (non-monotonic versions) are rejected', async () => {
 
     // First register v1 to establish a baseline
     engine.registerMigrations('test-plugin', [
-      { version: 1, description: 'v1', up: async () => {} }
+      { version: 1, description: 'v1', touches: {}, up: async () => {} }
     ]);
 
     // Then try to append migrations whose lowest version (1) is <= the
     // highest existing version (1) — this triggers the "strictly increasing" guard.
     assert.throws(() => {
       engine.registerMigrations('test-plugin', [
-        { version: 2, description: 'v2', up: async () => {} },
-        { version: 1, description: 'v1 (duplicate)', up: async () => {} }
+        { version: 2, description: 'v2', touches: {}, up: async () => {} },
+        { version: 1, description: 'v1 (duplicate)', touches: {}, up: async () => {} }
       ]);
     }, /strictly increasing/);
   } finally {
@@ -275,7 +275,9 @@ test('Invalid migrations (missing up()) are rejected', async () => {
 
     assert.throws(() => {
       engine.registerMigrations('test-plugin', [
-        { version: 1, description: 'v1 with no up function', up: undefined }
+        // touches is declared so the rejection can only come from the missing
+        // up() — otherwise this passes for the wrong reason.
+        { version: 1, description: 'v1 with no up function', touches: {}, up: undefined }
       ]);
     }, /missing an up/);
   } finally {
@@ -293,6 +295,7 @@ test('Running migrations creates tables via up()', async () => {
       {
         version: 1,
         description: 'Create TestTable',
+        touches: { creates: ['TestTable'] },
         up: async (mqi) => {
           await mqi.createTable('TestTable', {
             id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
@@ -304,6 +307,7 @@ test('Running migrations creates tables via up()', async () => {
       {
         version: 2,
         description: 'Add comment column',
+        touches: { columns: { TestTable: ['comment'] } },
         up: async (mqi) => {
           await mqi.addColumn('TestTable', 'comment', {
             type: DataTypes.STRING,
@@ -339,9 +343,9 @@ test('Pending migrations are detected correctly', async () => {
     const { engine } = harness;
 
     const migrations = [
-      { version: 1, description: 'v1', up: async () => {} },
-      { version: 2, description: 'v2', up: async () => {} },
-      { version: 3, description: 'v3', up: async () => {} }
+      { version: 1, description: 'v1', touches: {}, up: async () => {} },
+      { version: 2, description: 'v2', touches: {}, up: async () => {} },
+      { version: 3, description: 'v3', touches: {}, up: async () => {} }
     ];
 
     engine.registerMigrations('test-plugin', migrations);
@@ -360,7 +364,7 @@ test('Pending migrations are detected correctly', async () => {
 
     // Add a new migration v4
     engine._migrations.get('test-plugin').push({
-      version: 4, description: 'v4', up: async () => {}
+      version: 4, description: 'v4', touches: {}, up: async () => {}
     });
 
     pending = await engine.pendingMigrations('test-plugin');
@@ -377,8 +381,8 @@ test('Already-applied migrations are skipped', async () => {
     const { engine } = harness;
 
     const migrations = [
-      { version: 1, description: 'v1', up: async () => {} },
-      { version: 2, description: 'v2', up: async () => {} }
+      { version: 1, description: 'v1', touches: {}, up: async () => {} },
+      { version: 2, description: 'v2', touches: {}, up: async () => {} }
     ];
 
     engine.registerMigrations('test-plugin', migrations);
@@ -407,9 +411,9 @@ test('getAppliedVersion returns correct current version', async () => {
     assert.equal(pendingUnregistered.length, 0, 'unknown plugin returns no pending');
 
     const migrations = [
-      { version: 1, description: 'v1', up: async () => {} },
-      { version: 2, description: 'v2', up: async () => {} },
-      { version: 3, description: 'v3', up: async () => {} }
+      { version: 1, description: 'v1', touches: {}, up: async () => {} },
+      { version: 2, description: 'v2', touches: {}, up: async () => {} },
+      { version: 3, description: 'v3', touches: {}, up: async () => {} }
     ];
 
     engine.registerMigrations('test-plugin', migrations);
@@ -439,8 +443,8 @@ test('verifySchemaVersions-like check detects out-of-date', async () => {
     const { engine, dbService } = harness;
 
     const migrations = [
-      { version: 1, description: 'v1', up: async () => {} },
-      { version: 2, description: 'v2', up: async () => {} }
+      { version: 1, description: 'v1', touches: {}, up: async () => {} },
+      { version: 2, description: 'v2', touches: {}, up: async () => {} }
     ];
 
     engine.registerMigrations('test-plugin', migrations);
@@ -475,8 +479,8 @@ test('Migration state is tracked in SchemaVersion table', async () => {
     const { engine, dbService } = harness;
 
     const migrations = [
-      { version: 1, description: 'Initial schema', up: async () => {} },
-      { version: 2, description: 'Add rating column', up: async () => {} }
+      { version: 1, description: 'Initial schema', touches: {}, up: async () => {} },
+      { version: 2, description: 'Add rating column', touches: {}, up: async () => {} }
     ];
 
     engine.registerMigrations('elo-tracker', migrations);
@@ -553,7 +557,7 @@ test('Read-only SQLite file causes runMigrations() to reject (reproduces origina
   let harness1 = await createFileBasedHarness(dbPath, backupDir);
   try {
     harness1.engine.registerMigrations('bootstrap', [
-      { version: 1, description: 'Admin setup', up: async () => {} }
+      { version: 1, description: 'Admin setup', touches: {}, up: async () => {} }
     ]);
     harness1.engine.confirmToken('__auto__');
     await harness1.engine.runMigrations('bootstrap');
@@ -574,6 +578,7 @@ test('Read-only SQLite file causes runMigrations() to reject (reproduces origina
       {
         version: 1,
         description: 'Should fail — DB is read-only',
+        touches: { creates: ['ShouldNotExist'] },
         up: async (qi) => {
           await qi.createTable('ShouldNotExist', {
             id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true }

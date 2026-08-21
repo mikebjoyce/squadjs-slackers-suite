@@ -39,10 +39,51 @@ const CATEGORY_TESTS = {
     'test-s3-discord-plugin-base.js',
     'test-s3-export-import.js',
     'test-s3-commands.js',
+    'test-inspection-embeds.js',
     'test-command-standardization.js',
     'test-migration-backup.js',
     'test-auto-migrate.js',
-    'test-db-connector-compat.js'
+    'test-db-connector-compat.js',
+    // Was never listed in any category, so nothing ran it — which is how its
+    // migration case sat calling a db.registerMigration() that has never
+    // existed on DBService, throwing TypeError, unnoticed.
+    'test-db-service.js',
+    // The five core services, plus their two supporting cases. These were
+    // uncategorized too — the runner listed them under "uncategorized test
+    // files" and ran none of them, which is how the two endgame sub-state
+    // cases in test-game-state-service.js could sit failing on a poll race.
+    'test-game-state-service.js',
+    'test-players-service.js',
+    'test-clans-service.js',
+    'test-factions-service.js',
+    'test-server-config-service.js',
+    'test-crash-recovery.js',
+    'test-sa-per-player-lock.js',
+    // SQLite coverage always runs; the MySQL/Postgres cases self-skip when
+    // those engines are unreachable, so this stays a Category 1 test.
+    'test-dialect-portability.js',
+    // Same shape: SQLite always runs, MySQL/Postgres self-skip when unreachable.
+    'test-migration-bulk-types.js',
+    // touches.data post-conditions: same shape again, all three engines.
+    'test-migration-data-assertions.js',
+    // Spawns child processes to assert stdout/stderr separation.
+    'test-stderr-diagnostics.js',
+    // Replays every plugin's real migrations across DB states, so it is slower
+    // than the rest.
+    'test-migration-conformance.js',
+    // Runs the real install.cjs into throwaway directories and asserts the
+    // target layout — including that dev-harness/ can never be deployed.
+    'test-install-layout.js',
+    // Mounts the real DBService/LoggingService against real engines and asserts
+    // what they register. SQLite always runs; MySQL self-skips when unreachable.
+    'test-export-model-registration.js',
+    // Real SQLite, real GameStateService + LoggingService: asserts the
+    // resolving-clear rows actually land in S3_GameStateEvents.
+    'test-resolving-cleared-logging.js',
+    // Parses S3_DEVELOPER_GUIDE.md and checks its command table, option
+    // defaults and test catalog against source. No engine, no I/O beyond
+    // reading three files.
+    'test-developer-guide-accuracy.js'
   ],
   2: [
     'test-join-pipeline.js',

@@ -232,7 +232,7 @@ const CommandHandlers = {
               Logger.verbose('TeamBalancer', 1, `[DB] Failed to persist enabled state: ${err.message}`);
             }
             Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Win streak tracking enabled by ${adminName}`);
-            const response = await this.respond(player, 'Win streak tracking enabled.');
+            const response = await this.respond(player, this.enableConfirmationText());
             try {
               await this.server.rcon.broadcast(
                 `${this.RconMessages.prefix} ${this.RconMessages.system.trackingEnabled}`
@@ -245,7 +245,7 @@ const CommandHandlers = {
                 color: 0x3498db,
                 title: '🎮 In-Game Command: !teambalancer on',
                 description: `Executed by **${adminName}**`,
-                fields: [{ name: 'Response', value: 'Win streak tracking enabled.', inline: false }],
+                fields: [{ name: 'Response', value: this.enableConfirmationText(), inline: false }],
                 timestamp: new Date().toISOString()
               };
               await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
@@ -263,7 +263,7 @@ const CommandHandlers = {
               Logger.verbose('TeamBalancer', 1, `[DB] Failed to persist disabled state: ${err.message}`);
             }
             Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Win streak tracking disabled by ${adminName}`);
-            const response = await this.respond(player, 'Win streak tracking disabled.');
+            const response = await this.respond(player, `Win streak tracking disabled.${this.seedScrambleOffNote()}`);
             try {
               await this.server.rcon.broadcast(
                 `${this.RconMessages.prefix} ${this.RconMessages.system.trackingDisabled}`
@@ -277,7 +277,7 @@ const CommandHandlers = {
                   color: 0x3498db,
                   title: '🎮 In-Game Command: !teambalancer off',
                   description: `Executed by **${adminName}**`,
-                  fields: [{ name: 'Response', value: 'Win streak tracking disabled.', inline: false }],
+                fields: [{ name: 'Response', value: `Win streak tracking disabled.${this.seedScrambleOffNote()}`, inline: false }],
                   timestamp: new Date().toISOString()
                 };
                 await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
@@ -329,8 +329,9 @@ const CommandHandlers = {
             const t1Count = players.filter((p) => p.teamID === 1).length;
             const t2Count = players.filter((p) => p.teamID === 2).length;
 
-            // Layer
-            const currentLayer = this.server.currentLayer?.name || 'Unknown';
+            // Layer — from S³, never server.currentLayer (null after a
+            // mid-round SquadJS restart, which made this read "Unknown").
+            const currentLayer = this._s3?.gameState?.getLayerName?.() || this.layerNameCached || 'Unknown';
 
             const eloTrackerPlugin = this.server.plugins?.find(p => p.constructor.name === 'EloTracker');
             const eloStatus = this.options?.useEloForBalance ? (eloTrackerPlugin ? 'Active' : 'Unavailable') : 'Disabled';
@@ -343,6 +344,7 @@ const CommandHandlers = {
               `Elo Integration: ${eloStatus}`,
               `Win Streak: ${winStreakText}`,
               `Consecutive Wins: ${consecText}`,
+              `Seed Auto Scramble: ${this.seedAutoScrambleStatus()}`,
               `Last Scramble: ${lastScrambleText}`,
               `Players: ${players.length} (T1: ${t1Count} | T2: ${t2Count})`,
               `Layer: ${currentLayer}`,
@@ -385,9 +387,11 @@ const CommandHandlers = {
             const t2Players = players.filter((p) => p.teamID === 2);
             const t1Squads = squads.filter((s) => s.teamID === 1);
             const t2Squads = squads.filter((s) => s.teamID === 2);
-            const layer = await this.server.currentLayer;
-            const layerName = layer?.name || 'Unknown';
-            const gameMode = this.gameModeCached || 'N/A';
+            // Layer/gamemode from S³ (single resolver); the local caches are
+            // only a mirror of it, kept as a fallback if S³ is unavailable.
+            const gs = this._s3?.gameState;
+            const layerName = gs?.getLayerName?.() || this.layerNameCached || 'Unknown';
+            const gameMode = gs?.getGamemode?.() || this.gameModeCached || 'N/A';
             const team1Name = this.getTeamName(1);
             const team2Name = this.getTeamName(2);
 
@@ -403,7 +407,7 @@ const CommandHandlers = {
             // Page 3/3: Key config
             await this.respond(player, [
               `Thresholds: ${this.options.maxWinStreak} wins / ${this.options?.minTicketsToCountAsDominantWin || 150} tix`,
-              `Scramble: ${(this.options?.scramblePercentage || 0.5) * 100}% | ${this.options?.scrambleAnnouncementDelay}s | ${this.options?.maxScrambleCompletionTime}ms`,
+              `Scramble: ${(this.options?.scramblePercentage || 0.5) * 100}% | ${this.options?.scrambleAnnouncementDelay}s (Seed: ${this.options?.seedScrambleAnnouncementDelay}s) | ${this.options?.maxScrambleCompletionTime}ms`,
               `Teams: ${team1Name} | ${team2Name}`,
               `1-Round: ${this.options?.enableSingleRoundScramble ? `ON (> ${this.options?.singleRoundScrambleThreshold} tix)` : 'OFF'}`,
               `Invasion: Atk ${this.options?.invasionAttackTeamThreshold} | Def ${this.options?.invasionDefenceTeamThreshold}`

@@ -39,32 +39,16 @@
  *
  * ─── DEPENDENCIES ───────────────────────────────────────────────
  *
- * Node fs, path — no external dependencies.
+ * Node fs, path; db-service.js for the connector; s3-common.js for the
+ * timestamp/size helpers it shares with s3-export-import.js. No external
+ * dependencies.
  *
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import DBService from './db-service.js';
-
-/**
- * Format byte count to a human-readable string.
- */
-function formatSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-/**
- * Format a Unix-ms timestamp to YYYY-MM-DD-HHmmss.
- */
-function timestampString(ts) {
-  const d = new Date(ts);
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-` +
-    `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-}
+import { formatSize, timestampString, parseTimestamp } from './s3-common.js';
 
 /**
  * Check if the given connector can be backed up.
@@ -279,18 +263,6 @@ export function restoreBackup(filename, dbPath, backupDir = null) {
 }
 
 /* ────────────────────────────────────── INTERNAL ────────────────────────────────────── */
-
-/**
- * Parse a YYYY-MM-DD-HHmmss timestamp string to Unix ms.
- */
-function parseTimestamp(str) {
-  const match = str.match(/^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})(\d{2})$/);
-  if (!match) return null;
-
-  const [, year, month, day, hour, min, sec] = match.map(Number);
-  const d = new Date(year, month - 1, day, hour, min, sec);
-  return d.getTime();
-}
 
 /**
  * Enforce retention limit — delete oldest backup files if count exceeds max.

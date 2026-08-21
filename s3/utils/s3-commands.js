@@ -19,8 +19,10 @@
  * Utility:  formatDuration, phaseEmoji, circleEmoji, serviceCircle,
  *           checkmark (kept for legacy compat), truncate
  * Embeds:   buildStatusEmbed, buildServicesEmbed, buildGameStateEmbed,
- *           buildFactionsEmbed, buildPlayersEmbed, buildClansEmbed,
- *           buildLocksEmbed, buildConfigEmbed, buildHelpEmbed
+ *           buildFactionsEmbed, buildLocksEmbed, buildConfigEmbed,
+ *           buildHelpEmbed
+ * Embed sets (return an array — one Discord message, several embeds):
+ *           buildPlayersEmbeds, buildClansEmbeds
  * Tests:    runDiagnostic  (inject sendDiscordMessage)
  *
  * ─── DEPRECATED ─────────────────────────────────────────────────
@@ -50,6 +52,7 @@
  * s3-migration-discord.js — buildMigrationEmbed
  * s3-backup.js           — canBackup, listBackups, restoreBackup
  * s3-export-import.js    — exportToJSON, importFromJSON, etc.
+ * s3-common.js           — formatSize
  *
  */
 import { buildMigrationEmbed } from './s3-migration-discord.js';
@@ -62,6 +65,7 @@ import {
   restoreFromFile,
   exportToFile
 } from './s3-export-import.js';
+import { formatSize } from './s3-common.js';
 
 // ============================================================================
 // Emoji Utilities
@@ -207,7 +211,10 @@ export function buildStatusEmbed(plugin) {
   const phase = gs?.getPhase?.() ?? 'unknown';
   const subState = gs?.getEndgameSubState?.() ?? null;
   const mode = gs?.getGamemode?.() ?? 'N/A';
-  const layer = gs?.getLayerName?.() ?? 'N/A';
+  // Display spelling ("Sumari Bala Seed v1"), not the canonical classname S³
+  // stores and compares on. getLayerDisplayName() falls back to the canonical
+  // name, so the ?? chain only matters for a gameState that predates it.
+  const layer = gs?.getLayerDisplayName?.() ?? gs?.getLayerName?.() ?? 'N/A';
   const playerCount = players?.getAllPlayers?.()?.length ?? 0;
   const globalLockOwner = players?.isGloballyLockedBy?.() ?? null;
   const teamsResolved = players?.areTeamsResolved?.() ?? false;
@@ -344,7 +351,7 @@ export function buildServicesEmbed(plugin) {
     entries.push(`${circleEmoji('phase', phase)} **GameState** — Phase: ${phase}${resolving ? ' (resolving)' : ''}`);
     entries.push(`   MatchId: \`${matchId}\` | RoundStart: ${formatTimestamp(gs.getRoundStartTime?.())}`);
     const mode = gs.getGamemode?.() ?? 'N/A';
-    const layer = gs.getLayerName?.() ?? 'N/A';
+    const layer = gs.getLayerDisplayName?.() ?? gs.getLayerName?.() ?? 'N/A';
     entries.push(`   Mode: ${mode} | Layer: ${truncate(layer, 30)}`);
     entries.push(`   isLive: ${gs.isLive?.() ? '🟢' : '⚫'} | isStaging: ${gs.isStaging?.() ? '🟡' : '⚫'} | isEnding: ${gs.isEnding?.() ? '🔴' : '⚫'}`);
   }
@@ -410,7 +417,7 @@ export function buildGameStateEmbed(plugin) {
   const phase = gs.getPhase?.() ?? 'unknown';
   const sub = gs.getEndgameSubState?.() ?? null;
   const mode = gs.getGamemode?.() ?? 'N/A';
-  const layer = gs.getLayerName?.() ?? 'N/A';
+  const layer = gs.getLayerDisplayName?.() ?? gs.getLayerName?.() ?? 'N/A';
   const resolving = gs.isResolving?.() ?? false;
   const matchId = gs.getMatchId?.() ?? 'N/A';
   const roundStartTime = gs.getRoundStartTime?.() ?? null;
@@ -426,7 +433,9 @@ export function buildGameStateEmbed(plugin) {
     { name: 'isStaging', value: gs.isStaging?.() ? '🟡' : '⚫', inline: true },
     { name: 'isEnding', value: gs.isEnding?.() ? '🔴' : '⚫', inline: true },
     { name: 'Gamemode', value: mode, inline: true },
-    { name: 'Layer', value: truncate(layer, 50), inline: true },
+    // ⚠️ marks a layer S³ has not actually resolved yet (the 'Unknown'
+    // placeholder), so operators can tell it apart from a real layer name.
+    { name: 'Layer', value: `${gs.isLayerResolved?.() === false ? '⚠️ ' : ''}${truncate(layer, 50)}`, inline: true },
     { name: 'isIgnoredMode', value: gs.isIgnoredMode?.() ? '🟡' : '⚫', inline: true },
     { name: 'MatchId', value: `\`${matchId}\``, inline: true },
     { name: 'Round Start', value: formatTimestamp(roundStartTime), inline: true },
@@ -486,125 +495,518 @@ export function buildFactionsEmbed(plugin) {
   };
 }
 
-export function buildPlayersEmbed(plugin) {
+/**
+ * Push a list of lines as one or more embed fields, respecting Discord's
+ * 1024-character-per-field-value cap. Overflow spills into `name (cont.)`
+ * fields up to `maxFields`; anything beyond that is summarised as a count.
+ *
+ * @param {Array} fields - Field array to append to (mutated).
+ * @param {string} name - Field name for the first chunk.
+ * @param {string[]} lines - Lines to render.
+ * @param {object} [opts]
+ * @param {number} [opts.maxFields=3] - Max fields to spend on this list.
+ * @param {boolean} [opts.inline=false]
+ */
+function pushLineField(fields, name, lines, opts = {}) {
+  const { maxFields = 3, inline = false } = opts;
+  if (!lines?.length) return;
+
+  const chunks = [];
+  let current = [];
+  let currentLen = 0;
+
+  for (const line of lines) {
+    // +1 for the joining newline.
+    if (currentLen + line.length + 1 > 1024 && current.length > 0) {
+      chunks.push(current);
+      current = [];
+      currentLen = 0;
+    }
+    current.push(line);
+    currentLen += line.length + 1;
+  }
+  if (current.length > 0) chunks.push(current);
+
+  const shown = chunks.slice(0, maxFields);
+  shown.forEach((chunk, i) => {
+    fields.push({
+      name: i === 0 ? name : `${truncate(name, 240)} (cont.)`,
+      value: truncate(chunk.join('\n'), 1024),
+      inline
+    });
+  });
+
+  const droppedLines = chunks.slice(maxFields).reduce((n, c) => n + c.length, 0);
+  if (droppedLines > 0) {
+    fields.push({
+      name: `${truncate(name, 230)} (cont.)`,
+      value: `*…and ${droppedLines} more (output truncated).*`,
+      inline: false
+    });
+  }
+}
+
+/**
+ * Escape Discord markdown control characters in untrusted text.
+ *
+ * Player names and clan tags routinely contain these — `extractRawPrefix()`
+ * treats `|` and `*` as tag separators, so names like `TAG | Player` and
+ * `[*ACE*] Player` are common. Left raw they corrupt the surrounding embed
+ * formatting. Truncate before escaping so a backslash is never left dangling.
+ *
+ * @param {string} str
+ * @returns {string}
+ */
+function escapeMarkdown(str) {
+  return String(str ?? '').replace(/([\\*_`~|>])/g, '\\$1');
+}
+
+/**
+ * Format one player line for the team embeds.
+ *
+ * @param {object} p - Player state from PlayersService.
+ * @param {object} players - PlayersService instance (for lock lookup).
+ * @param {boolean} [asLeader=false] - Render with the squad-leader marker.
+ * @returns {string}
+ */
+function formatPlayerLine(p, players, asLeader = false) {
+  const marker = asLeader ? '👑' : '·';
+  const lockOwner = players.isLockedBy?.(p.eosID || p.steamID);
+  const lockStr = lockOwner ? ` 🔒${truncate(String(lockOwner), 14)}` : '';
+  return `${marker} ${escapeMarkdown(truncate(p.name ?? p.eosID ?? '?', 26))}${lockStr}`;
+}
+
+/**
+ * Build the `!s3 players` embed set: a meta/population embed followed by one
+ * embed per team, each broken down by squad with squad leaders marked.
+ *
+ * Returned as an array because Discord caps a single embed at 6000 characters
+ * and 25 fields — a full 100-player server does not fit in one.
+ *
+ * @param {object} plugin - The S³ plugin instance.
+ * @returns {object[]} Array of Discord embed objects.
+ */
+export function buildPlayersEmbeds(plugin) {
   const players = plugin.services.players;
   if (!players) {
-    return { color: 0xe74c3c, title: '🔴 Players Service Not Available' };
+    return [{ color: 0xe74c3c, title: '🔴 Players Service Not Available' }];
   }
 
   const all = players.getAllPlayers?.() ?? [];
+  const squads = players.getSquads?.() ?? [];
   const teamsResolved = players.areTeamsResolved?.() ?? false;
   const projected = players._projectedPlayers !== null;
   const initialSync = players._initialSyncComplete ?? false;
 
-  const team1Players = all.filter((p) => p.teamID === 1);
-  const team2Players = all.filter((p) => p.teamID === 2);
-  const unknownPlayers = all.filter((p) => p.teamID !== 1 && p.teamID !== 2);
+  const byEosID = new Map();
+  for (const p of all) {
+    if (p?.eosID) byEosID.set(p.eosID, p);
+  }
 
-  const formatPlayerLine = (p) => {
-    const clanTag = plugin.services.clans?.extractRawPrefix?.(p.name) ?? '';
-    const tag = clanTag ? `[${clanTag}] ` : '';
-    const lockOwner = players.isLockedBy?.(p.eosID || p.steamID);
-    const lockStr = lockOwner ? ` 🔒${lockOwner}` : '';
-    return `${tag}**${truncate(p.name, 24)}** (t:${p.teamID})${lockStr}`;
+  const team1 = all.filter((p) => p.teamID === 1);
+  const team2 = all.filter((p) => p.teamID === 2);
+
+  // Every connected player in Squad is on team 1 or 2 — there is no teamless
+  // state in-game. A null teamID here is therefore a *tracking* gap, not a
+  // player state: either initial sync is still running or we are inside the
+  // null-teamID window that follows NEW_GAME. Surfaced as a warning, not as a
+  // population bucket.
+  const unresolved = all.filter((p) => p.teamID !== 1 && p.teamID !== 2);
+
+  // PlayersService only snapshots server.squads on a tick where every player
+  // has a resolved teamID, so _squadsCache is null until the first such tick.
+  // Until then getSquads() returns [] — which is indistinguishable from "nobody
+  // is in a squad" unless we check. Reporting 0 squads in that window would be
+  // the same mistake as treating a null teamID as a real player state.
+  const squadDataPending = players._squadsCache == null;
+
+  // "Unassigned" = not in a squad (the community term). Squad membership is
+  // derived from getSquads() rather than from p.squadID so a stale squad cache
+  // cannot silently hide players from the roster.
+  const inSquadIDs = new Set();
+  for (const s of squads) {
+    for (const id of s.players ?? []) inSquadIDs.add(id);
+  }
+
+  const squadsForTeam = (teamID) => squads
+    .filter((s) => Number(s.teamID) === teamID)
+    .sort((a, b) => Number(a.squadID) - Number(b.squadID));
+
+  const factions = plugin.services.factions;
+  const teamLabel = (teamID) => {
+    const name = factions?.getTeamName?.(teamID);
+    return name && name !== `Team ${teamID}` ? `${name}` : `Team ${teamID}`;
   };
 
-  const fields = [
-    { name: 'Total', value: `${all.length}`, inline: true },
+  // ── Meta embed ──────────────────────────────────────────────────
+  const gs = plugin.services.gameState;
+  const phase = gs?.getPhase?.() ?? 'unknown';
+  const layer = gs?.getLayerDisplayName?.() ?? gs?.getLayerName?.() ?? 'N/A';
+
+  const globalOwner = players.isGloballyLockedBy?.() ?? null;
+  const playerLocks = players.playerLocks ?? new Map();
+  const activeLockCount = [...playerLocks.values()].filter((l) => l.expiresAt > Date.now()).length;
+
+  const delta = team1.length - team2.length;
+  const deltaStr = delta === 0
+    ? '⚖️ Even'
+    : `${delta > 0 ? 'Team 1' : 'Team 2'} +${Math.abs(delta)}`;
+
+  const metaFields = [
+    { name: '👥 Population', value: `**${all.length}** tracked`, inline: true },
+    {
+      name: `🟦 ${truncate(teamLabel(1), 200)}`,
+      value: `**${team1.length}** in ${squadsForTeam(1).length} squad(s)`,
+      inline: true
+    },
+    {
+      name: `🟥 ${truncate(teamLabel(2), 200)}`,
+      value: `**${team2.length}** in ${squadsForTeam(2).length} squad(s)`,
+      inline: true
+    },
+    { name: 'Balance', value: deltaStr, inline: true },
+    {
+      name: 'Unassigned',
+      value: squadDataPending ? '⚪ Unknown' : `${all.length - inSquadIDs.size} not in a squad`,
+      inline: true
+    },
     { name: 'Teams Resolved', value: teamsResolved ? '🟢 Yes' : '🟡 No', inline: true },
     { name: 'Initial Sync', value: initialSync ? '🟢 Complete' : '🟡 Pending', inline: true },
-    { name: 'Projection Active', value: projected ? '🟡 Yes' : '⚫ No', inline: true }
+    { name: 'Projection', value: projected ? '🟡 Active' : '⚫ None', inline: true },
+    {
+      name: '🔒 Locks',
+      value: [
+        globalOwner ? `Global: 🔒 **${globalOwner}**` : 'Global: 🟢 None',
+        `Per-player: ${activeLockCount} active`
+      ].join(' · '),
+      inline: false
+    }
   ];
 
-  if (team1Players.length > 0) {
-    fields.push({
-      name: `Team 1 (${team1Players.length})`,
-      value: truncate(team1Players.map(formatPlayerLine).join('\n'), 1024),
+  if (squadDataPending) {
+    metaFields.push({
+      name: '⚠️ Squad Data Pending',
+      value: 'S³ has not snapshotted `server.squads` yet — it only does so on a tick '
+        + 'where every player has a resolved teamID. Rosters below are flat until then.',
       inline: false
     });
   }
 
-  if (team2Players.length > 0) {
-    fields.push({
-      name: `Team 2 (${team2Players.length})`,
-      value: truncate(team2Players.map(formatPlayerLine).join('\n'), 1024),
+  // A player whose client wedges at `Team ID: N/A` never resolves on their own —
+  // it takes a reconnect. Those are quarantined so they stop holding the
+  // resolution gate down, and they need to read differently from a player who is
+  // simply mid-transition, because only one of the two clears by waiting.
+  const stuckKeys = players.getStuckPlayerKeys?.() ?? new Set();
+  const isStuck = (p) => stuckKeys.has(p?.eosID) || stuckKeys.has(p?.steamID);
+  const stuck = unresolved.filter(isStuck);
+  const awaiting = unresolved.filter((p) => !isStuck(p));
+
+  if (awaiting.length > 0) {
+    metaFields.push({
+      name: `⚠️ Team Unresolved (${awaiting.length})`,
+      value: 'S³ has no teamID for these players yet — initial sync or the '
+        + 'post-`NEW_GAME` null window. Not a game state; it should clear on its own.',
       inline: false
     });
+    pushLineField(
+      metaFields,
+      'Awaiting teamID',
+      awaiting.map((p) => formatPlayerLine(p, players)),
+      { maxFields: 1 }
+    );
   }
 
-  if (unknownPlayers.length > 0) {
-    fields.push({
-      name: `Unassigned (${unknownPlayers.length})`,
-      value: truncate(unknownPlayers.map(formatPlayerLine).join('\n'), 512),
+  if (stuck.length > 0) {
+    metaFields.push({
+      name: `🩹 Stuck Client (${stuck.length})`,
+      value: 'These players have reported no teamID for far longer than a round '
+        + 'transition takes, so S³ has stopped counting them towards team resolution — '
+        + 'the rest of the lobby is unaffected. This clears when they reconnect.',
       inline: false
     });
+    pushLineField(
+      metaFields,
+      'Ignored for resolution',
+      stuck.map((p) => formatPlayerLine(p, players)),
+      { maxFields: 1 }
+    );
   }
 
-  return {
+  const embeds = [{
     color: 0x1abc9c,
-    title: '👥 Players',
-    fields,
+    title: '👥 Players — Overview',
+    description: `Phase **${phaseEmoji(phase)} ${phase}** · Layer \`${truncate(layer, 60)}\``,
+    fields: metaFields,
     timestamp: new Date().toISOString()
+  }];
+
+  // ── Per-team embeds ─────────────────────────────────────────────
+  const buildTeamEmbed = (teamID, teamPlayers, color, emoji) => {
+    const teamSquads = squadsForTeam(teamID);
+    const fields = [];
+
+    for (const s of teamSquads) {
+      const members = (s.players ?? [])
+        .map((id) => byEosID.get(id))
+        .filter(Boolean);
+      if (members.length === 0) continue;
+
+      // getSquads() returns leaders first, so the head of the list is the SL.
+      const lines = members.map((p) => formatPlayerLine(p, players, p.isLeader === true));
+      const lockIcon = s.locked ? ' 🔒' : '';
+      const name = `#${s.squadID} · ${truncate(s.squadName || 'Unnamed', 40)} (${members.length})${lockIcon}`;
+
+      pushLineField(fields, name, lines, { maxFields: 2, inline: true });
+    }
+
+    const leftover = teamPlayers.filter((p) => !inSquadIDs.has(p.eosID));
+    if (leftover.length > 0) {
+      // Without a squad snapshot these players are not known to be squadless —
+      // we simply have no squad data for them yet. Label accordingly.
+      const label = squadDataPending
+        ? `Roster (${leftover.length}) — squad data pending`
+        : `Unassigned (${leftover.length})`;
+      pushLineField(
+        fields,
+        label,
+        leftover.map((p) => formatPlayerLine(p, players)),
+        { maxFields: 2 }
+      );
+    }
+
+    if (fields.length === 0) {
+      fields.push({ name: 'Roster', value: '*No players on this team.*', inline: false });
+    }
+
+    // Discord hard-caps an embed at 25 fields.
+    const trimmed = fields.slice(0, 24);
+    if (fields.length > trimmed.length) {
+      trimmed.push({
+        name: 'Truncated',
+        value: `*${fields.length - trimmed.length} more field(s) omitted — Discord embed limit.*`,
+        inline: false
+      });
+    }
+
+    return {
+      color,
+      title: `${emoji} ${truncate(teamLabel(teamID), 200)} — ${teamPlayers.length} player(s), ${teamSquads.length} squad(s)`,
+      fields: trimmed
+    };
   };
+
+  embeds.push(buildTeamEmbed(1, team1, 0x3498db, '🟦'));
+  embeds.push(buildTeamEmbed(2, team2, 0xe74c3c, '🟥'));
+
+  return embeds;
 }
 
-export function buildClansEmbed(plugin) {
+/**
+ * Build the `!s3 clans` embed set: the surviving clan groups plus a full
+ * account of why every other candidate tag was excluded or merged.
+ *
+ * @param {object} plugin - The S³ plugin instance.
+ * @returns {object[]} Array of Discord embed objects.
+ */
+export function buildClansEmbeds(plugin) {
   const clans = plugin.services.clans;
   if (!clans) {
-    return { color: 0xe74c3c, title: '🔴 Clans Service Not Available' };
+    return [{ color: 0xe74c3c, title: '🔴 Clans Service Not Available' }];
   }
 
   if (!clans.isEnabled?.()) {
-    return {
+    return [{
       color: 0x95a5a6,
       title: '🛡️ Clans — ⚫ Disabled',
       description: 'Clan tag grouping is not enabled in S³ configuration.'
-    };
+    }];
   }
 
   const players = plugin.services.players?.getAllPlayers?.() ?? [];
-  const groups = clans.extractClanGroups?.(players) ?? {};
 
-  // Build eosID → name map for display
-  const nameMap = new Map();
-  for (const p of players) {
-    if (p.eosID && p.name) nameMap.set(p.eosID, p.name);
+  // explainClanGroups() runs the identical pipeline to extractClanGroups(),
+  // so what is displayed here is exactly what SmartAssign and TeamBalancer see.
+  if (typeof clans.explainClanGroups !== 'function') {
+    return [{
+      color: 0xe74c3c,
+      title: '🔴 Clans Service Outdated',
+      description: 'This S³ build predates `explainClanGroups()` — cannot render exclusion detail.'
+    }];
   }
 
-  // Convert object { TAG: [eosID,...] } to sorted entries (largest first)
-  const groupEntries = Object.entries(groups)
-    .sort(([, a], [, b]) => b.length - a.length);
+  const { groups, trace, options } = clans.explainClanGroups(players);
 
-  const fields = [
-    { name: 'Total Players Scanned', value: `${players.length}`, inline: true },
-    { name: 'Clan Groups Found', value: `${groupEntries.length}`, inline: true },
+  // Clan tags are only alphanumeric when caseSensitive is false; with it on the
+  // raw tag is used verbatim and can carry markdown characters, as can any name.
+  const nameOf = (id) => escapeMarkdown(truncate(trace.memberNames.get(id) ?? id, 18));
+  const tagOf = (tag) => escapeMarkdown(truncate(String(tag), 24));
+  const memberList = (ids, cap = 6) => {
+    const shown = ids.slice(0, cap).map(nameOf).join(', ');
+    return ids.length > cap ? `${shown}, +${ids.length - cap} more` : shown;
+  };
+
+  // Resolve merge chains so an absorbed tag reports the group it ended up in,
+  // not just its immediate absorber (A→B→C must report C).
+  const absorbedInto = new Map();
+  for (const m of trace.merged) absorbedInto.set(m.absorbed, m.keep);
+  const finalTag = (tag) => {
+    let cur = tag;
+    const seen = new Set([cur]);
+    while (absorbedInto.has(cur)) {
+      cur = absorbedInto.get(cur);
+      if (seen.has(cur)) break;
+      seen.add(cur);
+    }
+    return cur;
+  };
+
+  const groupEntries = Object.entries(groups).sort(([, a], [, b]) => b.length - a.length);
+  const groupedPlayerCount = groupEntries.reduce((n, [, ids]) => n + ids.length, 0);
+  const excludedCount = trace.ignored.length + trace.sizeExcluded.length;
+
+  // ── Summary embed ───────────────────────────────────────────────
+  const summaryFields = [
+    { name: 'Players Scanned', value: `${trace.scanned}`, inline: true },
+    { name: 'Groups Active', value: `🟢 ${groupEntries.length}`, inline: true },
+    { name: 'Tags Excluded', value: excludedCount ? `🟠 ${excludedCount}` : '⚫ 0', inline: true },
+    { name: 'Players Grouped', value: `${groupedPlayerCount}`, inline: true },
+    { name: 'No Tag Detected', value: `${trace.noTag.length}`, inline: true },
+    { name: 'Tags Merged', value: trace.merged.length ? `🟣 ${trace.merged.length}` : '⚫ 0', inline: true },
     {
-      name: 'Config',
-      value: `minSize: ${clans.options?.minSize ?? 2}, maxSize: ${clans.options?.maxSize ?? 18}, caseSensitive: ${clans.options?.caseSensitive ?? false}`,
+      name: '⚙️ Grouping Config',
+      value: [
+        `minSize: \`${options.minSize}\` · maxSize: \`${options.maxSize}\``,
+        `maxEditDistance: \`${options.maxEditDistance}\` · caseSensitive: \`${options.caseSensitive}\``,
+        `recruitSuffixes: \`${options.recruitSuffixes.length ? options.recruitSuffixes.join(', ') : 'none'}\``,
+        `ignoreList: \`${options.ignoreList.length ? options.ignoreList.join(', ') : 'none'}\``
+      ].join('\n'),
       inline: false
     }
   ];
 
   if (groupEntries.length > 0) {
-    const showCount = Math.min(groupEntries.length, 15);
-    const groupLines = groupEntries.slice(0, showCount).map(([tag, eosIDs]) => {
-      const members = eosIDs.map((id) => truncate(nameMap.get(id) ?? id, 16)).join(', ');
-      return `**${tag}** (${eosIDs.length}): ${truncate(members, 80)}`;
-    });
-
-    fields.push({
-      name: `Clan Groups (showing ${showCount} of ${groupEntries.length})`,
-      value: truncate(groupLines.join('\n'), 1024),
+    pushLineField(
+      summaryFields,
+      `🛡️ Active Clan Groups (${groupEntries.length})`,
+      groupEntries.map(([tag, ids]) => `**${tagOf(tag)}** (${ids.length}) — ${memberList(ids)}`),
+      { maxFields: 3 }
+    );
+  } else {
+    summaryFields.push({
+      name: '🛡️ Active Clan Groups',
+      value: '*None survived the grouping pipeline.*',
       inline: false
     });
   }
 
-  return {
+  const embeds = [{
     color: 0xf1c40f,
     title: '🛡️ Clan Groups',
-    fields,
+    description: 'Pipeline order: extract → strip recruit suffix → normalize → '
+      + 'ignoreList → Levenshtein merge → size bounds.',
+    fields: summaryFields,
     timestamp: new Date().toISOString()
-  };
+  }];
+
+  // ── Exclusions & merges embed ───────────────────────────────────
+  const detailFields = [];
+
+  if (trace.sizeExcluded.length > 0) {
+    const lines = [...trace.sizeExcluded]
+      .sort((a, b) => b.size - a.size)
+      .map((e) => {
+        const why = e.reason === 'minSize'
+          ? `below minSize \`${e.bound}\``
+          : `above maxSize \`${e.bound}\``;
+        const merged = trace.merged.some((m) => m.keep === e.tag)
+          ? ' *(post-merge)*'
+          : '';
+        return `**${tagOf(e.tag)}** (${e.size}) — ${why}${merged} — ${memberList(e.members, 4)}`;
+      });
+    pushLineField(detailFields, `📏 Excluded by Size (${trace.sizeExcluded.length})`, lines, { maxFields: 2 });
+  }
+
+  if (trace.ignored.length > 0) {
+    const lines = trace.ignored.map(
+      (e) => `**${tagOf(e.tag)}** (${e.size}) — on \`ignoreList\` — ${memberList(e.members, 4)}`
+    );
+    pushLineField(detailFields, `🚫 Excluded by Config (${trace.ignored.length})`, lines, { maxFields: 2 });
+  }
+
+  if (trace.merged.length > 0) {
+    // Collapse to one line per surviving group: ACE ⟵ AC3 (d1), ACES (d1)
+    const byKeep = new Map();
+    for (const m of trace.merged) {
+      const dest = finalTag(m.keep);
+      if (!byKeep.has(dest)) byKeep.set(dest, []);
+      byKeep.get(dest).push(`${tagOf(m.absorbed)} (d${m.distance})`);
+    }
+    const lines = [...byKeep.entries()].map(([dest, sources]) => {
+      const alive = Object.prototype.hasOwnProperty.call(groups, dest) ? '' : ' *(later excluded)*';
+      return `**${tagOf(dest)}**${alive} ⟵ ${sources.join(', ')}`;
+    });
+    pushLineField(
+      detailFields,
+      `🔗 Merged by Levenshtein ≤ ${options.maxEditDistance} (${trace.merged.length})`,
+      lines,
+      { maxFields: 2 }
+    );
+  }
+
+  if (trace.recruitStripped.length > 0) {
+    const byRule = new Map();
+    for (const r of trace.recruitStripped) {
+      // Escaped rather than wrapped in a code span: a backtick in a raw tag
+      // would terminate the span and mangle the rest of the field.
+      const key = `${tagOf(r.from)} → ${tagOf(r.to)}`;
+      byRule.set(key, (byRule.get(key) ?? 0) + 1);
+    }
+    pushLineField(
+      detailFields,
+      `🎓 Recruit Suffix Stripped (${trace.recruitStripped.length})`,
+      [...byRule.entries()].map(([rule, n]) => `**${rule}** — ${n} player(s)`),
+      { maxFields: 1 }
+    );
+  }
+
+  if (trace.unnormalizable.length > 0) {
+    pushLineField(
+      detailFields,
+      `⚪ Tag Normalized to Empty (${trace.unnormalizable.length})`,
+      trace.unnormalizable.map((e) => `**${tagOf(e.raw)}** — ${nameOf(e.eosID)}`),
+      { maxFields: 1 }
+    );
+  }
+
+  if (trace.noTag.length > 0) {
+    detailFields.push({
+      name: `⚫ No Tag Detected (${trace.noTag.length})`,
+      value: truncate(
+        `${trace.noTag.slice(0, 12).map((e) => truncate(e.name, 18)).join(', ')}`
+        + (trace.noTag.length > 12 ? `, +${trace.noTag.length - 12} more` : ''),
+        1024
+      ),
+      inline: false
+    });
+  }
+
+  if (trace.skipped.length > 0) {
+    detailFields.push({
+      name: '⚠️ Skipped (missing name or eosID)',
+      value: `${trace.skipped.length} record(s) — these never reach clan grouping.`,
+      inline: false
+    });
+  }
+
+  if (detailFields.length > 0) {
+    embeds.push({
+      color: 0xe67e22,
+      title: '🔍 Clan Grouping — Exclusions & Merges',
+      fields: detailFields.slice(0, 25)
+    });
+  }
+
+  return embeds;
 }
 
 export function buildLocksEmbed(plugin) {
@@ -710,8 +1112,8 @@ export function buildHelpEmbed() {
           '`!s3 services` — Per-service mount status with detail',
           '`!s3 gamestate` — Detailed game state (phase, matchId, timer)',
           '`!s3 factions` — Team names, abbreviations, polling status',
-          '`!s3 players` — Full player list with locks',
-          '`!s3 clans` — Detected clan groups',
+          '`!s3 players` — Population overview + per-team squad rosters',
+          '`!s3 clans` — Clan groups, plus why tags were excluded or merged',
           '`!s3 locks` — Global and per-player locks',
           '`!s3 config` — Server configuration values'
         ].join('\n'),
@@ -951,13 +1353,13 @@ export function createCommandHandlers(context) {
   });
 
   handlers.set('players', async (plugin, message, args) => {
-    const embed = buildPlayersEmbed(plugin);
-    await sendDiscordMessage(message.channel, { embeds: [embed] }, 'S3', (...a) => plugin.verbose(...a));
+    const embeds = buildPlayersEmbeds(plugin);
+    await sendDiscordMessage(message.channel, { embeds }, 'S3', (...a) => plugin.verbose(...a));
   });
 
   handlers.set('clans', async (plugin, message, args) => {
-    const embed = buildClansEmbed(plugin);
-    await sendDiscordMessage(message.channel, { embeds: [embed] }, 'S3', (...a) => plugin.verbose(...a));
+    const embeds = buildClansEmbeds(plugin);
+    await sendDiscordMessage(message.channel, { embeds }, 'S3', (...a) => plugin.verbose(...a));
   });
 
   handlers.set('locks', async (plugin, message, args) => {
@@ -1280,6 +1682,8 @@ export function createCommandHandlers(context) {
       // Categorise drift entries
       const errors = drift.filter(d => d.error);
       const missing = drift.filter(d => d.missing && d.missing.length > 0);
+      const missingRows = drift.filter(d => d.missingRows && d.missingRows.length > 0);
+      const dataViolations = drift.filter(d => d.dataViolations && d.dataViolations.length > 0);
       const extra = drift.filter(d => d.extra && d.extra.length > 0);
 
       const lines = [];
@@ -1300,6 +1704,22 @@ export function createCommandHandlers(context) {
         lines.push('');
       }
 
+      if (missingRows.length > 0) {
+        lines.push('**🧩 Missing Rows**');
+        for (const r of missingRows) {
+          lines.push(`  • \`${r.table}\`: ${r.missingRows.map(row => `\`${row.key}=${row.value}\``).join(', ')}`);
+        }
+        lines.push('');
+      }
+
+      if (dataViolations.length > 0) {
+        lines.push('**🕳️ Unpopulated Data**');
+        for (const dv of dataViolations) {
+          lines.push(`  • \`${dv.table}\`: ${dv.dataViolations.map(v => `${v.offenders} row(s) with empty \`${v.column}\``).join(', ')}`);
+        }
+        lines.push('');
+      }
+
       if (extra.length > 0) {
         lines.push('**📦 Extra Columns**');
         for (const x of extra) {
@@ -1308,8 +1728,8 @@ export function createCommandHandlers(context) {
         lines.push('');
       }
 
-      // Severity: red if errors or missing, orange if extra-only
-      const hasCritical = errors.length > 0 || missing.length > 0;
+      // Severity: red if errors, missing schema, or unpopulated data; orange if extra-only
+      const hasCritical = errors.length > 0 || missing.length > 0 || missingRows.length > 0 || dataViolations.length > 0;
       const color = hasCritical ? 0xe74c3c : 0xf39c12;
 
       await sendDiscordMessage(message.channel, {
@@ -1649,6 +2069,19 @@ export function createCommandHandlers(context) {
       const dbPath = me?.dbPath;
       const db = plugin.services?.db;
 
+      // Acknowledge before starting — a JSON restore upserts every row in the
+      // file and can run for minutes on a production-sized export. Without this
+      // the command looks dead while the DB is mid-write, which is the worst
+      // moment for an admin to conclude nothing happened and re-run it.
+      await sendDiscordMessage(message.channel, {
+        embeds: [{
+          color: 0xf39c12,
+          title: '⏳ Restoring Database…',
+          description: `Reading \`${filename}\` and upserting rows. This can take several minutes on a large backup — the result will be posted here when it finishes. **Do not re-run this command in the meantime.**`,
+          timestamp: new Date().toISOString()
+        }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+
       try {
         const result = await restoreFromFile(filename, db, null, dbPath);
 
@@ -1688,6 +2121,18 @@ export function createCommandHandlers(context) {
         return;
       }
 
+      // Acknowledge before starting. A full-tier export walks every table and
+      // can take tens of seconds on a mature database (a production export runs
+      // ~100 MB), during which the command looks ignored and admins re-run it.
+      await sendDiscordMessage(message.channel, {
+        embeds: [{
+          color: 0xf39c12,
+          title: '⏳ Creating Backup…',
+          description: 'Exporting all tables to JSON. This can take a while on a large database — the result will be posted here when it finishes.',
+          timestamp: new Date().toISOString()
+        }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+
       try {
         const result = await exportToFile(db, null, { tier: 'all', retention: 5 });
         if (!result) {
@@ -1701,7 +2146,7 @@ export function createCommandHandlers(context) {
           embeds: [{
             color: 0x2ecc71,
             title: '✅ Backup Created',
-            description: `Saved \`${result.filename}\` (${result.sizeBytes} bytes) to \`backups/\` directory.`,
+            description: `Saved \`${result.filename}\` (${formatSize(result.sizeBytes)}) to \`backups/\` directory.`,
             fields: [{
               name: 'ℹ️',
               value: 'Use `!s3 backup list` to see all available backups.',
@@ -1826,6 +2271,17 @@ export function createCommandHandlers(context) {
 
       // ── --to-file: write to server filesystem ───────────────
       if (hasToFile) {
+        // Same acknowledgement as `!s3 backup create` — this is the same export,
+        // and the 'all' tier is the slow one.
+        await sendDiscordMessage(message.channel, {
+          embeds: [{
+            color: 0xf39c12,
+            title: `⏳ Exporting to File (${tier})…`,
+            description: 'Writing tables to JSON. This can take a while on a large database — the result will be posted here when it finishes.',
+            timestamp: new Date().toISOString()
+          }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+
         try {
           const result = await exportToFile(db, null, { tier, retention: 5 });
           if (!result) {
@@ -1838,7 +2294,7 @@ export function createCommandHandlers(context) {
             embeds: [{
               color: 0x2ecc71,
               title: `✅ Exported to File (${tier})`,
-              description: `Saved \`${result.filename}\` (${result.sizeBytes} bytes) to \`backups/\` directory.`,
+              description: `Saved \`${result.filename}\` (${formatSize(result.sizeBytes)}) to \`backups/\` directory.`,
               timestamp: new Date().toISOString()
             }]
           }, 'S3', (...a) => plugin.verbose(...a));
@@ -1869,6 +2325,11 @@ export function createCommandHandlers(context) {
             ? `✅ **${name}**: ${r.rows} rows`
             : `❌ **${name}**: ${r.error}`
         );
+
+        // A model that declared no exportTier was included here by the default-tier
+        // fallback. Say so on the backup itself — the mount-time warning is only
+        // seen by whoever was reading the log at the time.
+        for (const w of exportObj.warnings || []) statusLines.push(`⚠️ ${w}`);
 
         // Serialize for Discord attachment
         let attachment;
@@ -2044,19 +2505,35 @@ export function createCommandHandlers(context) {
 
         const warnLines = validation.warnings.map((w) => `⚠️ ${w}`);
 
+        // This step only ever reads and validates the attachment — it cannot
+        // write. Say so plainly: someone who has just uploaded a production
+        // backup and gets back an amber "⚠️ Confirm Import" has every reason to
+        // wonder whether it already went in.
         await sendDiscordMessage(message.channel, {
           embeds: [{
-            color: 0xf39c12,
-            title: '⚠️ Confirm Import',
+            color: 0x3498db,
+            title: '📋 Import Preview — nothing has been imported',
             description: [
+              `Read and validated the attached file. **No data has been written.**`,
+              '',
               `**${tableCount} tables**, ~${totalRows} total rows`,
               '',
               ...previewLines,
               ...warnLines,
               '',
-              'To proceed, use: `!s3 db import --confirm`',
-              'For a dry run (validate only): `!s3 db import --confirm --dry-run`',
-              'Imported tables are upserted by primary key. No existing rows are deleted.'
+              // `--dry-run` is not read at this step, so a caller who passed it
+              // must not be left believing it did something.
+              ...(isDryRun
+                ? ['ℹ️ `--dry-run` has no effect here — this step never writes. It applies to `--confirm`.', '']
+                : []),
+              '**To import for real:** `!s3 db import --confirm`',
+              // Be careful not to oversell --confirm --dry-run. It returns early
+              // without resolving a model or touching a column, so it re-reports
+              // the file's own row counts and adds nothing to the check already
+              // performed here. Claiming it validates against the live schema
+              // would invite someone to trust a green dry run that proves nothing.
+              '`--confirm --dry-run` re-reports these counts without writing; it does **not** check them against the live schema.',
+              'Rows are upserted by primary key. No existing rows are deleted.'
             ].join('\n'),
             timestamp: new Date().toISOString()
           }]
