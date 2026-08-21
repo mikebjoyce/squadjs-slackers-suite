@@ -169,7 +169,7 @@ r = 0.828 — largely the same measurement counted twice.
 the scrambler saturates at 0.09μ under every weighting. If touching that code
 anyway, `1.0 * meanDiff` is simpler and mildly better.
 
-### 2.8 SmartAssign: failures are map-travel, and are accepted
+### 2.8 SmartAssign: failures are an engine limitation, not a bug
 
 Went live 2026-07-01 (clean activation). 13.5% of attempted moves fail. Located
 precisely:
@@ -183,8 +183,16 @@ precisely:
 | 3–4m | 163 | 93.9% |
 
 **94.6% of all failures** are in this window (z = 62). Within live play the rate
-never leaves 0.3–1.7%, including the final 60 seconds. It is **not** the endgame of
-live play — it is map travel, when the level is unloaded.
+never leaves 0.3–1.7%, including the final 60 seconds.
+
+**Root cause (confirmed by operator, corrects an earlier wrong guess in this
+doc): the Squad engine itself blocks team-change requests once the post-round
+faction-vote phase starts, as an anti-abuse measure** — not "map travel" or
+the level being unloaded, which was this doc's original, incorrect
+explanation for the timing. The 1–4 minute window lines up with that vote
+phase, which is why the failure rate there is ~94–100% and drops back to
+near-zero once live play resumes. This is an engine-level restriction outside
+SquadJS's control, not something SmartAssign is doing wrong.
 
 **Decision (operator): accept these failures.** A gate would convert failures into
 non-moves — identical outcome, tidier logs. SmartAssign's value is moving people
@@ -335,7 +343,13 @@ evaluate one fixed roster — it searches over swaps, and a weighted objective c
 steer the search toward a different swap than an unweighted one would have picked.
 Whether that different swap is actually better has to be checked separately.
 
-**Part 3 — implemented and replayed. Verdict: not worth it, and mildly worse.**
+**Part 3 — implemented and replayed at the time. Verdict: not worth it, and
+mildly worse.** [**2026-08-21 correction:** `git grep stayerWeightingEnabled
+team-balancer/utils/tb-scrambler.js` now returns nothing — this code was
+never actually committed and is gone, same failure mode as the `eloSummary`
+regression noted in §10. The result below is preserved as-is because it's
+the reason NOT to rebuild this feature, but if anyone needs to re-verify it,
+the code needs to be re-implemented first.]
 `stayerWeightingEnabled` was added to `tb-scrambler.js` (off by default): when
 set, `scoreSwap()`'s mean-mu term is computed as a P(stay)-weighted average
 instead of a naive one (top-15 term left unweighted, matching what Part 2 actually
@@ -1096,7 +1110,7 @@ strength it creates.
 4. **Raid nights need no change.** Turning the balancer off is already the right call
    and the data cannot say otherwise.
 
-### Implemented and replayed
+### Implemented and replayed (at the time — see 2026-08-21 correction below)
 
 Item 1 is now real code: `clanBlockPenaltyEnabled` in `tb-scrambler.js`, **off by
 default**, gated so production behaviour is byte-identical when unset (all 8 suites
@@ -1106,6 +1120,21 @@ effect size above, and runs it through the same `getPenalty()` curve as the exis
 μ term — no new scoring language, just a new input to the one that already exists.
 `clanGroups` comes straight from `extractClanGroups()`, which already excludes the
 house tag via `ignoreList`, so no tag logic was duplicated.
+
+**2026-08-21 correction: this code is no longer in `tb-scrambler.js`, confirmed
+both by inspection and by re-running the replay.** `git grep
+clanBlockPenaltyEnabled team-balancer/utils/tb-scrambler.js` returns nothing —
+only `clanGroups`-driven virtual-squad grouping (keeping a clan together as one
+atomic unit while shuffling) remains; the scoring penalty described above was
+never actually committed and is gone, the same failure mode as the
+`eloSummary` regression documented in §10. Re-running `analysis/scramble-replay.js`
+against the current code proves the flag is now a silent no-op: `clan-priced`
+comes out statistically identical to `production` (zero-imbalance lobbies
+47.3% vs 47.5%, improves 16/worsens 18 of 400 sampled lobbies — noise, not the
+58.0%/"improves 96, worsens 2" result quoted below). Whoever wants to act on
+this needs to re-implement `clanBlockPenaltyEnabled` from this description
+first and re-run `scramble-replay.js` to confirm a real effect returns before
+shipping — the table below is a target to reproduce, not a current result.
 
 `analysis/scramble-replay.js` now replays it against all 793 eligible real lobbies,
 with churn held identical to production (`clan-priced` config = production's floor
@@ -1178,6 +1207,8 @@ nothing here is ever deployed.
 | `analysis/ticket-margin-drivers.js` | Does population, round duration, or map identity explain ticket margin beyond mu (§4 direction 6) — result: no, 95%+ stays unexplained by anything pre-round |
 | `analysis/predictive-trigger-simulate.js` | Simulates a predictive pre-round μ-gap trigger on real rounds (§4 direction 1) |
 | `analysis/coplay-affinity.js` | Learned co-play groups vs clan tags, exposure curve, post-scramble subset (§7) |
+| `analysis/reactive-threshold-sweep.js` | Would lowering the reactive Consecutive-Wins/Single-Round-Margin/Dominant-Win thresholds fire more often, and what would the real scrambler do to the newly-triggered rounds? (§10) |
+| `analysis/elo-margin-weighting-test.js` | Does scaling Elo rating updates by each round's own ticket margin improve win prediction or ticket-margin predictability? (§4 direction 6 confirmation) — result: win-prediction yes (modestly), ticket-margin no |
 
 Run with `node --max-old-space-size=4096` — the exports are ~200 MB.
 
@@ -1202,15 +1233,17 @@ Two directions cleared the bar for production (real, positive, measured effect o
 with no case to flip it (3), a reporting change (6), or informational (5, 2).
 Ordered by expected value per §4's ranking.
 
-### 1. Predictive pre-round scramble trigger (direction 1 — highest EV)
+### 1. Direct skill-gap scramble trigger (direction 1 — highest EV)
 
-- [ ] Add a new trigger path in `team-balancer/plugins/team-balancer.js` alongside
-      the existing reactive ones (`Consecutive Wins`, `Single Round Margin`, `Win
-      Streak Threshold` — around line 1800–2032): fire when the pre-round μ-gap
-      (computed from `eloMap` the same way `scoreSwap()` does, on the LIVE roster
-      once the round is full/settled) is **≥ 0.4μ**. Below 0.4μ, do not scramble —
-      §2.5/`predictive-trigger-simulate.js` showed scrambling an already-close
-      lobby makes the gap worse 18.6–24% of the time.
+- [ ] Add a fourth trigger condition in `team-balancer/plugins/team-balancer.js`
+      alongside the existing three (`Consecutive Wins`, `Single Round Margin`, `Win
+      Streak Threshold` — around line 1800–2032), evaluated at the same point and
+      in the same way those already are: fire when the team μ-gap itself
+      (computed the same way `scoreSwap()` does) is **≥ 0.4μ**. Below 0.4μ, do not
+      scramble on this condition — §2.5/`predictive-trigger-simulate.js` showed
+      scrambling an already-close lobby makes the gap worse 18.6–24% of the time.
+      This is not a new execution window; it's a fourth independent condition
+      checked at the same point the other three already are.
 - [ ] Reuse the existing `CHURN_FLOOR_MU`-equivalent constant rather than a new
       magic number — same 0.4 already validated for the reactive floor logic, so
       this is one threshold with two call sites, not two threshold decisions.
@@ -1232,14 +1265,18 @@ Ordered by expected value per §4's ranking.
 
 ### 2. Clan-block penalty (direction 4 — second highest EV)
 
-- [ ] Flip `clanBlockPenaltyEnabled: true` in the team-balancer plugin's scrambler
-      call (`tb-scrambler.js` already implements it, off by default; see §7
-      "Implemented and replayed" — 793-lobby replay: zero-clan-block-imbalance
-      lobbies 47.5%→58.0%, cost +0.01 mean μ gap, +0.1 players moved, worsens only
-      2 of 793 lobbies).
-- [ ] No code change needed beyond the flag — `clanGroups` already flows from
-      `ClansService.extractClanGroups()` with the house tag excluded via
-      `ignoreList`, same as production's existing clan logic.
+- [ ] **Correction (2026-08-21): `clanBlockPenaltyEnabled` no longer exists in
+      `tb-scrambler.js` — re-implement it** per §7's description (converts
+      clan-block headcount imbalance to an equivalent μ-of-team-mean diff via
+      the 13.93 effect size, run through the existing `getPenalty()` curve).
+      The 793-lobby replay result quoted below (zero-clan-block-imbalance
+      lobbies 47.5%→58.0%, cost +0.01 mean μ gap, +0.1 players moved, worsens
+      only 2 of 793 lobbies) is from a past session where the code did exist
+      — treat it as a target to reproduce, not a guarantee, and re-run
+      `scramble-replay.js` after rebuilding it.
+- [ ] `clanGroups` already flows from `ClansService.extractClanGroups()` with
+      the house tag excluded via `ignoreList`, same as production's existing
+      clan logic — that part doesn't need rebuilding.
 - [ ] **Post-ship watch**: same caveat as direction 1 — §7's caveats section
       found no significant ticket-margin effect for clan-block imbalance
       specifically (`clan-block-margin.js`: R² 0.0245→0.0283, p=0.197). Watch
@@ -1276,3 +1313,80 @@ Ordered by expected value per §4's ranking.
       395 scrambled rounds recorded — the column records nothing. Worth a
       one-line fix whenever someone's in that code path; not blocking anything
       above.
+
+---
+
+## 10. Reactive threshold sweep — tech-chat proposal (Fiercer/Slacker)
+
+Prompted by a tech-chat proposal to lower the REACTIVE trigger thresholds
+(`minTicketsToCountAsDominantWin`, `singleRoundScrambleThreshold`,
+`maxConsecutiveWinsWithoutThreshold`) rather than adding the predictive
+pre-round trigger (direction 1). Fiercer's own objection is correct: a full
+season can't be replayed under a different policy from history, since a
+scramble that fires changes who's on the server for the next round's streak
+counters. `analysis/reactive-threshold-sweep.js` answers the two things that
+*can* be answered honestly instead: (1) a from-scratch port of the reactive
+state machine, replayed chronologically over the real `(winner, margin)`
+sequence — including non-RAAS rounds, since the real consecutive-win/win-streak
+counters are fed by every non-ignored-mode round, not just RAAS — giving how
+much more often each config would have fired; (2) for only the newly-triggered
+rounds, the real `Scrambler` run against the real historical ENDGAME roster.
+
+Validation: the ported state machine reproduces 262 of the real 288 RAAS
+scrambled-round total under production's own thresholds (91%, within the 10%
+tolerance) — condition-by-condition it skews slightly toward Single Round
+Margin (161 sim vs 141 recorded) and under toward Consecutive Wins (96 vs 138),
+most plausibly because production doesn't reset the streak counters until the
+scramble actually *executes* (`resetStreak()` fires from "Post-scramble
+cleanup", not the instant a trigger condition is met), which this replay
+approximates as instantaneous. Good enough to trust the totals and the
+marginal-round set, not exact enough to trust the condition breakdown to the
+round.
+
+**Two candidate configs swept:**
+
+| config | total fires | new rounds vs the simulated production baseline (262) |
+|---|---|---|
+| A: dominant 150→100, single-round 200→150 | 403 (36.2% of RAAS rounds) | +164 |
+| B: dominant gate removed, single-round 200→150, consecutive 3→2 | 521 (46.8%) | +317 |
+
+On just the newly-triggered rounds, replayed through the real `Scrambler`
+against their actual ENDGAME rosters (85/164 and 154/317 had a usable
+snapshot — coverage starts 2026-07-02, so earlier rounds can't be replayed):
+
+| config | pre-scramble mean μ gap | post-scramble mean μ gap | mean players moved |
+|---|---|---|---|
+| A | 0.97 | 0.06 | 35.0 |
+| B | 0.89 | 0.07 | 35.9 |
+
+Both configs would meaningfully **raise the scramble rate** (from today's 26%
+of RAAS rounds to 36–47% — roughly 1.4–1.8x, not the "triple" this doc
+originally and incorrectly claimed) and the scrambler does close the gap hard
+on the newly-caught
+rounds. But this is exactly the same lever as direction 1 (predictive pre-round
+trigger, §9 item 1) — already validated earlier in this investigation with a
+cleaner mechanism, and for a good structural reason Fiercer's own objection
+points at: a reactive threshold can only fire *after* a round has already gone
+lopsided, so lowering it trades "wait for a worse stomp" for "wait for a
+smaller stomp" — it never prevents the bad round from happening, it only
+reduces the pain reactively. The predictive trigger fires on the pre-round
+gap before either team has played a hand, so it doesn't require a bad result
+to already exist. Recommendation: don't tune these reactive thresholds — ship
+direction 1 instead, which structurally subsumes what this proposal is trying
+to do.
+
+**Regression found in the process, unrelated to the sweep itself — now fixed.**
+This replay (and independently, `scramble-replay.js`) both call
+`Scrambler.scrambleTeamsPreservingSquads(...).eloSummary` — that property had
+never actually been committed to `team-balancer/utils/tb-scrambler.js` on
+*any* branch (`git log -S"eloSummary" --all` across the whole repo comes up
+empty), despite §8's "related plugin changes" entry documenting it as added —
+it was written in a past session's working tree and lost before ever being
+committed, the same failure mode as the previously-known-lost
+`clanBlockPenaltyEnabled`/`stayerWeightingEnabled` features. Re-implemented
+fresh on the current `tb-scrambler.js` (which already correctly had both
+master's virtual-squad features and this branch's elo-tuning calibration —
+nothing else was actually lost in the merge). `reactive-threshold-sweep.js`
+still computes the gap from the plan's own move list rather than relying on
+it, but `scramble-replay.js` now gets real, non-NaN `eloSummary` output again
+(re-validated by running it after the fix).

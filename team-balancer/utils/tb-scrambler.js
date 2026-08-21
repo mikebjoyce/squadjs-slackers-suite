@@ -18,7 +18,9 @@
  *       scramblePercentage, eloMap, debug, clanGroups, pullEntireSquads,
  *       minPlayersToMove, maxPlayersToMove })
  *       Returns an Array of { eosID, targetTeamID } move objects,
- *       with a calculationTime property attached to the array, plus a
+ *       with a calculationTime property attached to the array, an
+ *       eloSummary property ({ preMeanDiff, postMeanDiff, preTop15Diff,
+ *       postTop15Diff }) when eloMap was non-empty, plus a
  *       virtualSquads property when clan grouping built at least one
  *       virtual squad — one entry per physical unit the scrambler moves:
  *       [{ teamID, tags, tag, anchorEosID, members, pulled }]. Clans that
@@ -799,6 +801,40 @@ export const Scrambler = {
 
     const result = Array.from(finalPlayerMovesMap.values());
     result.calculationTime = duration;
+    // eloSummary: pre/post mean and top-15 mu-gap for the plan actually chosen, using the
+    // same weighting inputs scoreSwap() searched against. Point-in-time only — playerEloMap
+    // is whatever the caller passed in for this round, not re-read later, so offline replays
+    // that stamp historical mu values here get historically-accurate summaries.
+    if (playerEloMap.size > 0) {
+      const getElo = (id) => playerEloMap.get(id) ?? defaultMu;
+      const getAvg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : defaultMu);
+      const getTop15Avg = (arr) => {
+        if (!arr.length) return defaultMu;
+        const sorted = [...arr].sort((a, b) => b - a);
+        const slice = sorted.slice(0, 15);
+        return slice.reduce((a, b) => a + b, 0) / slice.length;
+      };
+      const diffFor = (teamOf) => {
+        const t1 = [];
+        const t2 = [];
+        for (const p of workingPlayers) {
+          const team = teamOf(p) ?? p.teamID;
+          (team === '1' ? t1 : t2).push(getElo(p.eosID));
+        }
+        return {
+          meanDiff: Math.abs(getAvg(t1) - getAvg(t2)),
+          top15Diff: Math.abs(getTop15Avg(t1) - getTop15Avg(t2))
+        };
+      };
+      const pre = diffFor((p) => p.teamID);
+      const post = diffFor((p) => finalPlayerMovesMap.get(p.eosID)?.targetTeamID);
+      result.eloSummary = {
+        preMeanDiff: pre.meanDiff,
+        postMeanDiff: post.meanDiff,
+        preTop15Diff: pre.top15Diff,
+        postTop15Diff: post.top15Diff
+      };
+    }
     // Only present when clan grouping actually built virtual squads, so consumers can treat
     // "property exists" as "the feature was used this round".
     if (virtualSquadsByTag.size > 0) {
