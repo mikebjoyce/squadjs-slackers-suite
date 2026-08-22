@@ -1767,6 +1767,7 @@ node s3/testing/test-game-state-service.js
 | `test-inspection-embeds.js` | Inspection/embed builders render without throwing on sparse data |
 | `test-sa-per-player-lock.js` | Per-player lock acquisition/release under contention |
 | `test-team-change-retry.js` | Team-change retry loop and give-up conditions |
+| `test-request-team-change-eosid.js` | `_requestTeamChange()` sends RCON `switchTeam(eosID)` — a single unambiguous arg, never playerName or a second targetTeamID arg |
 | `test-developer-guide-accuracy.js` | This guide's command table, option defaults and test catalog still match the source — see 11.8 |
 
 The harness's own suite lives outside `s3/`: `dev-harness/testing/test-dev-rcon-harness.js`

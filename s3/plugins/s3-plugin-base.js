@@ -71,6 +71,11 @@ import BasePlugin from './base-plugin.js';
 import { stderrError } from '../utils/s3-stderr.js';
 import { versionAtLeast } from '../utils/s3-common.js';
 
+// Module-scope, not per-instance: SmartAssign, Switch and TeamBalancer each
+// extend this class and would otherwise each print their own copy of the
+// same discovery the first time any of them hits it.
+let eosRejectionWarned = false;
+
 export default class S3PluginBase extends BasePlugin {
   constructor(server, options, connectors) {
     super(server, options, connectors);
@@ -449,12 +454,156 @@ export default class S3PluginBase extends BasePlugin {
   // ═══════════════════════════════════════════════════════════════
 
   /**
+   * Sends AdminForceTeamChange, cascading through identifiers until one is
+   * accepted. Squad's admin command parser rejects an unrecognised
+   * identifier with a response containing "Unable to find player" instead
+   * of throwing — a plain rcon.switchTeam()/execute() call can't see that,
+   * so this calls rcon.execute() directly to inspect the response text.
+   *
+   * Tries, in order: eosID, steamID (if the player has one), playerName.
+   * eosID and steamID are exact matches; playerName is a last resort
+   * because Squad partial-matches plain names (the "Hunt"/"Hunty" bug: a
+   * short name like "Hunt" can hit an unrelated player whose name merely
+   * contains it, e.g. "Hunty"). AdminForceTeamChange does not reliably
+   * accept every identifier for every player: on our test server, a
+   * player's eosID (bare and "EOS:"-prefixed) was rejected outright and
+   * only steamID/playerName worked; on the production server, the same
+   * player's bare eosID was accepted. The two sessions differed in how the
+   * player connected (their steamID was null in one, populated in the
+   * other), which is the more likely explanation than any difference
+   * between the two Squad servers themselves. Either way, no single tier
+   * can be trusted to work for a given player on a given connection, which
+   * is why this always cascades rather than sending eosID alone.
+   *
+   * Because the name tier can hit the wrong player, it is never sent blind:
+   * _findNameCollision() checks whether any OTHER connected player's name
+   * contains the value about to be sent, and refuses to send it at all if
+   * so. This is prevention only, deliberately with no after-the-fact
+   * revert: a revert can only fire by diffing the roster across the RCON
+   * round-trip, and that window is wide enough for something unrelated to
+   * legitimately change a bystander's team (another admin's command,
+   * SmartAssign/TeamBalancer, the player self-switching) — an automated
+   * revert can't tell that apart from a real collision and would silently
+   * undo a legitimate change. If _findNameCollision's substring heuristic
+   * misses a real Squad-side match, the wrong player's team stays flipped
+   * until a human notices; that's judged safer than a revert mechanism
+   * that can itself flip the wrong player's team.
+   *
+   * @param {object} player - Player state with eosID/steamID/name.
+   * @param {string} playerName - Fallback label for logging.
+   * @returns {Promise<{ok: boolean, type: string|null, response: string|null}>}
+   */
+  async _sendTeamChangeCommand(player, playerName) {
+    const identifiers = [
+      { type: 'eosID', value: player?.eosID },
+      { type: 'steamID', value: player?.steamID },
+      { type: 'name', value: player?.name || playerName }
+    ];
+
+    for (const { type, value } of identifiers) {
+      if (!value) continue;
+
+      if (type === 'name') {
+        // Refuse to gamble: check for an ambiguous name BEFORE sending, so a
+        // known-bad command is never fired in the first place. A collateral
+        // team change is a real, disruptive mistake even when it gets
+        // reverted a moment later — prevention beats cleanup.
+        const collision = this._findNameCollision(value, player?.eosID);
+        if (collision) {
+          this.verbose(
+            1,
+            `[TC] WARNING: name collision — refusing to send AdminForceTeamChange "${value}" for ` +
+            `${playerName}. ${collision.name} is also connected and their name contains this ` +
+            `substring, so Squad's admin parser could hit either player. No safer identifier ` +
+            `(eosID/steamID) is available. Skipping until the ambiguity clears.`
+          );
+          continue;
+        }
+      }
+
+      const attempt = await this._tryOneIdentifier(type, value);
+      if (!attempt.ok) continue; // RCON error, already logged
+      if (attempt.rejected) continue;
+
+      return { ok: true, type, response: attempt.response };
+    }
+
+    this.verbose(2, `[TC] All identifiers rejected for ${playerName}.`);
+    return { ok: false, type: null, response: null };
+  }
+
+  /**
+   * Sends a single AdminForceTeamChange attempt for one identifier and
+   * classifies the response. Split out of _sendTeamChangeCommand() so the
+   * rejection-detection logic lives in one place.
+   *
+   * @param {string} type - 'eosID' | 'steamID' | 'name', for logging only.
+   * @param {string} value - The identifier value to send.
+   * @returns {Promise<{ok: boolean, rejected: boolean, response: string|null}>}
+   *   ok=false means the RCON call itself errored (network/transport, not a
+   *   game-side rejection); rejected=true means Squad responded "Unable to
+   *   find player".
+   */
+  async _tryOneIdentifier(type, value) {
+    let response;
+    try {
+      response = await this.server.rcon.execute(`AdminForceTeamChange "${value}"`);
+    } catch (err) {
+      this.verbose(2, `[TC] RCON error for ${type}="${value}": ${err.message}`);
+      return { ok: false, rejected: false, response: null };
+    }
+
+    const rejected = typeof response === 'string' && /unable to find player/i.test(response);
+    if (rejected) {
+      this.verbose(3, `[TC] Identifier ${type}="${value}" rejected — trying next.`);
+
+      if (type === 'eosID' && !eosRejectionWarned) {
+        eosRejectionWarned = true;
+        this.verbose(
+          1,
+          `[TC] WARNING: this server rejects eosID in AdminForceTeamChange — falling ` +
+          `back to steamID/playerName. Team changes still work, but every attempt now ` +
+          `costs an extra RCON round-trip. This is the Squad game server's own ` +
+          `admin-command parser, not a SquadJS version issue.`
+        );
+      }
+
+      return { ok: true, rejected: true, response };
+    }
+
+    this.verbose(3, `[TC] Identifier ${type}="${value}" accepted.`);
+    return { ok: true, rejected: false, response };
+  }
+
+  /**
+   * Checks whether sending `value` as a name-tier AdminForceTeamChange could
+   * plausibly hit someone other than the intended target — i.e. whether any
+   * OTHER connected player's name contains `value` as a substring, the same
+   * direction Squad's own admin parser matched on in the "Hunt"/"Hunty" bug
+   * (identifier "Hunt" found inside player name "Hunty").
+   *
+   * @param {string} value - The name about to be sent.
+   * @param {string} excludeEosID - The intended target; never their own collision.
+   * @returns {object|null} The colliding player, or null if none found.
+   */
+  _findNameCollision(value, excludeEosID) {
+    const all = this.players?.getAllPlayers?.() ?? [];
+    const needle = String(value).toLowerCase();
+    return (
+      all.find(
+        (p) => p.eosID !== excludeEosID && typeof p.name === 'string' && p.name.toLowerCase().includes(needle)
+      ) ?? null
+    );
+  }
+
+  /**
    * Requests an RCON team change for a player, with retry and S³-based
    * verification.
    *
-   * Sends AdminForceTeamChange via the SquadJS core wrapper (rcon.switchTeam),
-   * then uses S³'s players service to verify the player landed on the
-   * opposite team. After each RCON attempt, `refreshNow()` forces
+   * Sends AdminForceTeamChange, trying eosID, then steamID, then playerName
+   * until one is accepted (see _sendTeamChangeCommand), then uses S³'s
+   * players service to verify the player landed on the opposite team.
+   * After each RCON attempt, `refreshNow()` forces
    * an immediate player-list refresh via S³ so verification reads fresh
    * data instead of stale cache. Retries on failure up to maxAttempts,
    * then returns the outcome.
@@ -546,10 +695,21 @@ export default class S3PluginBase extends BasePlugin {
         this.verbose(2, `[TC] recordMove warning: ${err.message}`);
       }
 
-      // Send RCON command
+      // Send RCON command. Tries eosID, then steamID, then playerName, in
+      // that order — cascading past a rejection so we never fall back to a
+      // weaker identifier than this connection actually needs. Squad's
+      // AdminForceTeamChange partial-matches plain names, so a shorter name
+      // (e.g. "Hunt") can hit an unrelated player whose name contains it
+      // (e.g. "Hunty"); eosID/steamID are exact matches and avoid that
+      // entirely. Live RCON testing found eosID rejected for a player on one
+      // server and accepted for the same player on another — the
+      // difference tracked with whether steamID was populated for that
+      // connection, not the server itself — so no single identifier can be
+      // trusted to work, which is why this cascades instead of trusting
+      // eosID alone.
       try {
         this.verbose(3, `[TC] Attempt ${attempts + 1}/${maxAttempts}: switching ${playerName}...`);
-        await this.server.rcon.switchTeam(playerName, targetTeamID);
+        await this._sendTeamChangeCommand(current, playerName);
       } catch (err) {
         this.verbose(2, `[TC] Attempt ${attempts + 1} RCON failed for ${playerName}: ${err.message}`);
       }

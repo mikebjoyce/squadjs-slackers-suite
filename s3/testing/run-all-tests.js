@@ -90,6 +90,7 @@ const CATEGORY_TESTS = {
     'test-handshake-flow.js',
     'test-player-session-persistence.js',
     'test-team-change-retry.js',
+    'test-request-team-change-eosid.js',
     'test-migration-pipeline.js',
     'test-command-routing.js'
   ],
