@@ -838,21 +838,21 @@ export function buildClansEmbeds(plugin) {
 
   // Clan tags are only alphanumeric when caseSensitive is false; with it on the
   // raw tag is used verbatim and can carry markdown characters, as can any name.
-  // Strategy ('bracket'/'separator'/'confirmed'/'doublespace'/'shorttag'/'bare')
-  // comes from trace.memberStrategies, populated alongside memberNames by the
-  // identical pipeline explainClanGroups() runs — never read ClansService's
-  // internal _playerTagStrategy map directly here (see
+  // Strategy ('bracket'/'separator'/'prefixSymbol'/'confirmed'/'doublespace'/
+  // 'shorttag'/'bare') comes from trace.memberStrategies, populated alongside
+  // memberNames by the identical pipeline explainClanGroups() runs — never
+  // read ClansService's internal _playerTagStrategy map directly here (see
   // docs/clan-tag-confirmation-rework.md §3.3).
   //
   // Confidence marker per player, appended after their name: ✓ confirmed
   // (ground truth from an observed name-transition), • high-confidence
-  // (explicit bracket/separator formatting), ◦ corroborated low-confidence
-  // (a bare/doublespace/shorttag guess vouched for by another player's
-  // high-confidence tag). Flat symbolic glyphs, not per-strategy emoji —
-  // three confidence tiers, not six strategy names.
+  // (explicit bracket/separator/hash-prefix formatting), ◦ corroborated
+  // low-confidence (a bare/doublespace/shorttag guess vouched for by another
+  // player's high-confidence tag). Flat symbolic glyphs, not per-strategy
+  // emoji — three confidence tiers, not seven strategy names.
   const strategyMarker = (strategy) => {
     if (strategy === 'confirmed') return '✓';
-    if (strategy === 'bracket' || strategy === 'separator') return '•';
+    if (strategy === 'bracket' || strategy === 'separator' || strategy === 'prefixSymbol') return '•';
     if (strategy) return '◦';
     return '';
   };
