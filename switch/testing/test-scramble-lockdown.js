@@ -217,6 +217,87 @@ await runTest('no NULL lastActiveTimestamp remains after a scramble', async () =
   await seq.close();
 });
 
+// ── Elo-diff micro scramble: no lockdown write ─────────────────────
+// The lockout guard exists to stop players exploiting a just-corrected
+// imbalance after a full reactive scramble. Disproportionate for a micro
+// scramble whose entire premise is "no blowout happened, just a small
+// post-round gap."
+await runTest('an EloDiff scramble writes no lockdown rows at all', async () => {
+  const players = [P('eos-a', 'Alpha'), P('eos-b', 'Bravo'), P('eos-c', 'Charlie')];
+  const { plugin, model, seq } = await buildPlugin({ players });
+
+  await plugin.onScrambleExecuted({ affectedPlayers: players, failedPlayers: [], scrambleType: 'EloDiff' });
+
+  assert.strictEqual(await model.count(), 0, 'EloDiff scramble should never write a lockdown row');
+  await seq.close();
+});
+
+await runTest('an EloDiff scramble does not arm the post-scramble broadcast flag', async () => {
+  // _scrambleHappened drives _startPostScrambleBroadcastTimers() at the next NEW_GAME, which
+  // broadcasts "Returning players cannot change teams this round" — actively false when no
+  // lockdown row was written, so it must stay false for this scramble type.
+  const players = [P('eos-a', 'Alpha')];
+  const { plugin, seq } = await buildPlugin({ players });
+
+  assert.strictEqual(plugin._scrambleHappened, false, 'precondition: flag starts false');
+  await plugin.onScrambleExecuted({ affectedPlayers: players, failedPlayers: [], scrambleType: 'EloDiff' });
+  assert.strictEqual(plugin._scrambleHappened, false, '_scrambleHappened must not be armed by an EloDiff scramble');
+  await seq.close();
+});
+
+await runTest('a normal (non-EloDiff) scramble still arms the post-scramble broadcast flag', async () => {
+  // The converse of the case above — the reorder that fixed the EloDiff leak must not have
+  // broken the flag for the three original scramble triggers, which still want the lockdown
+  // broadcast for the whole next round.
+  const players = [P('eos-a', 'Alpha')];
+  const { plugin, seq } = await buildPlugin({ players });
+
+  await plugin.onScrambleExecuted({ affectedPlayers: players, failedPlayers: [] });
+  assert.strictEqual(plugin._scrambleHappened, true, '_scrambleHappened should still be armed for a real lockdown scramble');
+  await seq.close();
+});
+
+await runTest('an EloDiff scramble still clears the switch queue', async () => {
+  const players = [P('eos-a', 'Alpha'), P('eos-b', 'Bravo')];
+  const { plugin, seq } = await buildPlugin({ players, queued: ['eos-a'] });
+
+  let clearedReason = null;
+  plugin._clearAllQueueEntries = (reason) => { clearedReason = reason; };
+
+  await plugin.onScrambleExecuted({ affectedPlayers: players, failedPlayers: [], scrambleType: 'EloDiff' });
+  assert.strictEqual(clearedReason, 'Scramble', 'queue clear must run unconditionally, including for EloDiff');
+  await seq.close();
+});
+
+await runTest('an EloDiff scramble still remediates failed-to-move players', async () => {
+  // Failed-move remediation (+1 token grant) is documented to run unconditionally, independent
+  // of the lockdown write this scramble type skips.
+  const players = [P('eos-a', 'Alpha'), P('eos-b', 'Bravo')];
+  const { plugin, seq } = await buildPlugin({ players });
+
+  let remediatedEosID = null;
+  plugin._resetPlayerLockouts = async (eosID) => { remediatedEosID = eosID; return true; };
+
+  await plugin.onScrambleExecuted({
+    affectedPlayers: players,
+    failedPlayers: [{ eosID: 'eos-b', name: 'Bravo' }],
+    scrambleType: 'EloDiff'
+  });
+
+  assert.strictEqual(remediatedEosID, 'eos-b', 'failed-move remediation should still fire for an EloDiff scramble');
+  await seq.close();
+});
+
+await runTest('an EloDiff scramble respects the low-population guard, same as a normal scramble', async () => {
+  const players = [P('eos-a', 'Alpha')];
+  const { plugin, model, seq } = await buildPlugin({ players, minPlayers: 60 });
+
+  await plugin.onScrambleExecuted({ affectedPlayers: players, failedPlayers: [], scrambleType: 'EloDiff' });
+  assert.strictEqual(await model.count(), 0, 'below-threshold population should still skip everything');
+  assert.strictEqual(plugin._scrambleHappened, false, 'flag should not be armed on the low-pop exit either');
+  await seq.close();
+});
+
 console.log('');
 console.log(`📊 Results: ${passed}/${passed + failed} passed, ${failed} failed`);
 console.log('');

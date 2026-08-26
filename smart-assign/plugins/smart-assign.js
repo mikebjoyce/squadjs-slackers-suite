@@ -67,7 +67,10 @@
  *   - S3_PLAYER_JOINED: Triggers the full join assignment pipeline.
  *   - S3_PLAYER_LEFT:   Triggers disconnect handling and reconnect memory save.
  *   - S3_ROUND_LIVE:    Fires round snapshot with full player roster.
- *   - TEAM_BALANCER_SCRAMBLE_EXECUTED: Detects scrambles for coordination.
+ *   - TEAM_BALANCER_SCRAMBLE_EXECUTED: Logs that a scramble happened; does not
+ *     read the payload (affectedPlayers/failedPlayers/scrambleType) or branch
+ *     on scramble type — same handling for a full scramble and an 'EloDiff'
+ *     micro scramble.
  *   Team change events (S3_PLAYER_TEAM_CHANGED) are no longer listened to
  *   by SA — they are handled by S³ LoggingService for persistence.
  *

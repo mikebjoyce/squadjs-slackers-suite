@@ -42,6 +42,8 @@ Provides squad-preserving scramble functionality. When a scramble is executed, T
 
 **Why this matters**: Without this plugin, players moved during a scramble can immediately switch back to their original team, defeating the purpose of team balancing.
 
+**Exception — Elo-diff micro scrambles**: TeamBalancer's small EloTracker-driven "micro scramble" (`!scramble elo`, or its automatic trigger) does not apply a switch lockdown. It moves too few players, over too small a gap, for the anti-exploit lockdown to be proportionate.
+
 **Setup**: Install TeamBalancer alongside Switch. No additional configuration needed — the event integration is automatic.
 
 ---

@@ -69,8 +69,10 @@
  *               options.pullEntireSquads — clan tag grouping for scrambles.
  *
  * Emitted Events:
- *   - TEAM_BALANCER_SCRAMBLE_EXECUTED — Fired before RCON moves execute.
- *     Payload: { affectedPlayers: Array<{ eosID, steamID, name }> }.
+ *   - TEAM_BALANCER_SCRAMBLE_EXECUTED — Fired after all RCON moves complete and are verified,
+ *     not before. Payload: { affectedPlayers: Array<{ eosID, steamID, name }>,
+ *     failedPlayers: Array<{ eosID, steamID, name }>, scrambleType }. scrambleType is 'EloDiff'
+ *     for a micro scramble, null for a normal one — Switch skips its lockdown for 'EloDiff'.
  *     The Switch plugin listens for this to lock team-switching post-scramble.
  *
  * Listened Events:
@@ -91,10 +93,20 @@
  * - useEloForBalance: pulls mu ratings from a running EloTracker instance
  *   at scramble time. Gracefully falls back to pure numerical balance if
  *   EloTracker is absent or the cache is empty.
- * - TEAM_BALANCER_SCRAMBLE_EXECUTED event is emitted before RCON moves fire.
- *   The Switch plugin listens for this to lock team-switching post-scramble.
+ * - enableEloDiffScramble: an independent, opt-in "micro scramble" trigger — moves a small,
+ *   escalating-budget number of players (capped by microScrambleMaxMovePercent) when the
+ *   post-round average mu gap (measured from the round that just ended) meets
+ *   eloDiffScrambleThreshold, stopping once
+ *   microScrambleParityTarget is reached. Requires EloTracker. Lowest-precedence of all
+ *   triggers: it only arms if the other three haven't already claimed the scramble slot for
+ *   this round. Can also be triggered manually via "!scramble elo" regardless of this option.
+ * - TEAM_BALANCER_SCRAMBLE_EXECUTED event is emitted after all RCON moves complete and are
+ *   verified, not before. The Switch plugin listens for this to lock team-switching
+ *   post-scramble — except for an 'EloDiff' scrambleType, which Switch does not lock.
  * - requireScrambleConfirmation: manual scrambles require !scramble confirm
- *   within scrambleConfirmationTimeout seconds. Auto-scrambles bypass this.
+ *   within scrambleConfirmationTimeout seconds. "!scramble matchend" is the one exception —
+ *   it arms immediately without confirmation, since it can be undone anytime with
+ *   "!scramble cancel" before it fires. Auto-scrambles also bypass confirmation entirely.
  *
  * ─── COMMANDS ────────────────────────────────────────────────────
  *
@@ -113,9 +125,14 @@
  *   !scramble                      → Manually trigger scramble with countdown.
  *   !scramble now                  → Immediate scramble (no countdown).
  *   !scramble dry                  → Dry-run scramble (simulation only).
- *   !scramble matchend             → Schedule a scramble to fire at the end of the current round.
+ *   !scramble matchend             → Arm a scramble to fire when the current round ends
+ *                                    (bypasses confirmation; use "!scramble cancel" to undo).
  *   !scramble confirm              → Confirm a pending scramble request.
- *   !scramble cancel               → Cancel a pending scramble countdown.
+ *   !scramble cancel               → Cancel a pending scramble countdown, or an armed
+ *                                    matchend scramble.
+ *   !scramble elo                  → Composable with the above ("!scramble elo now",
+ *                                    "!scramble elo matchend", etc.) — runs the small
+ *                                    EloTracker-driven micro scramble instead of a full one.
  *
  * ─── CONFIGURATION ───────────────────────────────────────────────
  *
@@ -162,6 +179,13 @@
  *
  * Advanced:
  *   useEloForBalance                   - Weight scrambles by EloTracker mu ratings (default: true).
+ *   enableEloDiffScramble              - Opt-in Elo-diff micro scramble trigger, independent of
+ *                                        the three win-streak triggers (default: false).
+ *   eloDiffScrambleThreshold           - Average mu gap that arms the micro scramble (default: 1.2).
+ *   microScrambleParityTarget          - Post-swap mu gap the micro scramble's search stops
+ *                                        at once reached (default: 0.05).
+ *   microScrambleMaxMovePercent        - Safety ceiling: max fraction of the round's population
+ *                                        the micro scramble may move (default: 0.10).
  *
  * Dev:
  *   devMode                            - Allow commands from any player regardless of admin status.
@@ -212,6 +236,10 @@
  *   "mirrorRconBroadcasts": true,
  *   "postScrambleDetails": true,
  *   "useEloForBalance": true,
+ *   "enableEloDiffScramble": false,
+ *   "eloDiffScrambleThreshold": 1.2,
+ *   "microScrambleParityTarget": 0.05,
+ *   "microScrambleMaxMovePercent": 0.10,
  *   "devMode": false,
  *   "reportLogPath": "team-balancer-reports.jsonl",
  *   "enableDatabaseLogging": false
@@ -368,6 +396,26 @@ export default class TeamBalancer extends S3PluginBase {
         type: 'boolean',
         description: 'Use EloTracker ratings to influence team balance during scrambles. Requires EloTracker plugin to be active.'
       },
+      enableEloDiffScramble: {
+        default: false,
+        type: 'boolean',
+        description: 'Trigger a small "micro scramble" when the average Elo (mu) gap between teams from the round that just ended meets eloDiffScrambleThreshold, independent of the three reactive triggers. Opt-in — requires EloTracker to be active.'
+      },
+      eloDiffScrambleThreshold: {
+        default: 1.2,
+        type: 'number',
+        description: 'Average mu gap between teams (abs value) that arms the Elo-diff micro scramble. Calibrated against real round history to target roughly the top quartile of real imbalance rather than firing on nearly every round.'
+      },
+      microScrambleParityTarget: {
+        default: 0.05,
+        type: 'number',
+        description: 'Post-swap average mu gap the Elo-diff micro scramble\'s escalating search stops at once reached.'
+      },
+      microScrambleMaxMovePercent: {
+        default: 0.10,
+        type: 'number',
+        description: 'Safety ceiling for the Elo-diff micro scramble: max fraction of the current round\'s total population (both teams combined) that may be moved.'
+      },
       devMode: {
         default: false,
         type: 'boolean'
@@ -454,12 +502,16 @@ export default class TeamBalancer extends S3PluginBase {
 
     this._isMounted = false;
     this._scramblePending = false;
+    // Set only on the paths in initiateScramble() that actually arm a scramble, and captured
+    // (then cleared) at the top of executeScramble() — never leaks into a later, unrelated
+    // scramble if a given attempt is rejected by the concurrency guard above.
+    this._pendingScrambleType = null;
     // "!scramble matchend" arm. Persisted to the DB (see _setScrambleArm), stamped with S3's
     // matchId, so it survives a SquadJS restart mid-round: restored in _onS3Ready(), and in
     // onRoundEnded it fires only if the current round's matchId matches the stamp — a
     // restart that crosses a round boundary discards the stale arm instead of scrambling the wrong round.
     this._scrambleOnRoundEnd = false;
-    this._scrambleOnRoundEndBy = null; // { name, eosID, matchId } — arming admin + round fingerprint, for the gate + discard notices
+    this._scrambleOnRoundEndBy = null; // { name, eosID, matchId, scrambleType } — arming admin + round fingerprint, for the gate + discard notices. scrambleType is 'EloDiff' for "!scramble elo matchend", null otherwise.
     this._scrambleTimeout = null;
     this._scrambleCountdownTimeout = null;
     this._flippedAfterScramble = false;
@@ -1355,10 +1407,10 @@ export default class TeamBalancer extends S3PluginBase {
     // scrambleConfirmation state. A typo (e.g. "!scramble confiirm") would
     // otherwise fall through to the bare-scramble path, overwriting a
     // pending confirmation and triggering a live broadcast.
-    const VALID_SCRAMBLE_ARGS = ['now', 'dry', 'matchend', 'cancel', 'confirm'];
+    const VALID_SCRAMBLE_ARGS = ['now', 'dry', 'matchend', 'cancel', 'confirm', 'elo'];
     const badArg = args.find(a => !VALID_SCRAMBLE_ARGS.includes(a));
     if (badArg) {
-      await message.reply(`❌ Unknown argument "${badArg}". Usage: \`!scramble [now|dry|matchend|cancel|confirm]\``);
+      await message.reply(`❌ Unknown argument "${badArg}". Usage: \`!scramble [now|dry|matchend|cancel|confirm|elo]\``);
       return;
     }
 
@@ -1383,6 +1435,8 @@ export default class TeamBalancer extends S3PluginBase {
     const hasDry = args.includes('dry');
     const isCancel = args.includes('cancel');
     const isMatchEnd = args.includes('matchend');
+    const hasElo = args.includes('elo');
+    const scrambleType = hasElo ? 'EloDiff' : null;
 
     if (isMatchEnd) {
       if (hasNow || hasDry) {
@@ -1390,13 +1444,15 @@ export default class TeamBalancer extends S3PluginBase {
         return;
       }
       if (this._scrambleOnRoundEnd) {
-        await message.reply('⚠️ A match-end scramble is already scheduled. It will fire when this round ends.');
+        await message.reply('⚠️ A match-end scramble is already scheduled. It will fire when this round ends. Use `!scramble cancel` to cancel it.');
         return;
       }
       const adminName = message.author?.username || 'unknown';
-      await this._setScrambleArm({ name: adminName, eosID: null });
-      Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Match-end scramble armed by ${adminName} (Discord)`);
-      await message.reply('✅ Scramble scheduled for the end of this round. It will fire automatically when the round ends.');
+      await this._setScrambleArm({ name: adminName, eosID: null, scrambleType });
+      Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Match-end ${hasElo ? 'micro ' : ''}scramble armed by ${adminName} (Discord)`);
+      await message.reply(hasElo
+        ? '✅ Micro scramble scheduled for the end of this round. It will fire automatically when the round ends. Use `!scramble cancel` to cancel it.'
+        : '✅ Scramble scheduled for the end of this round. It will fire automatically when the round ends. Use `!scramble cancel` to cancel it.');
       return;
     }
 
@@ -1415,17 +1471,22 @@ export default class TeamBalancer extends S3PluginBase {
 
       if (this.options.requireScrambleConfirmation && !hasDry && !isConfirm) {
         this.scrambleConfirmation = { timestamp: Date.now(), args: args };
-        const type = hasNow ? 'IMMEDIATE' : 'scheduled';
+        const scrambleKind = hasElo ? 'micro' : 'full';
+        const timing = hasNow
+          ? 'immediately, with no countdown'
+          : `in ${this.options.scrambleAnnouncementDelay}s, after a countdown broadcast`;
         const timeoutSec = this.options.scrambleConfirmationTimeout || 60;
-        await message.reply(`⚠️ Please confirm ${type} scramble by typing \`!scramble confirm\` within ${timeoutSec} seconds.`);
+        await message.reply(`⚠️ Confirming will execute a ${scrambleKind} scramble ${timing}. Type \`!scramble confirm\` within ${timeoutSec}s to proceed.`);
         return;
       }
 
       if (!hasDry) {
+        const immediateMsgKey = hasElo ? 'immediateManualMicroScramble' : 'immediateManualScramble';
+        const announcementMsgKey = hasElo ? 'manualMicroScrambleAnnouncement' : 'manualScrambleAnnouncement';
         const broadcastMsg = hasNow
-          ? `${this.RconMessages.prefix} ${this.RconMessages.immediateManualScramble}`
+          ? `${this.RconMessages.prefix} ${this.RconMessages[immediateMsgKey]}`
           : `${this.RconMessages.prefix} ${this.formatMessage(
-              this.RconMessages.manualScrambleAnnouncement,
+              this.RconMessages[announcementMsgKey],
               { delay: this.options.scrambleAnnouncementDelay }
             )}`;
         try {
@@ -1435,13 +1496,14 @@ export default class TeamBalancer extends S3PluginBase {
         }
       }
 
-      const actionDesc = hasDry ? 'dry run scramble (immediate)' : hasNow ? 'immediate scramble' : 'scramble with countdown';
+      const microLabel = hasElo ? 'micro ' : '';
+      const actionDesc = hasDry ? `dry run ${microLabel}scramble (immediate)` : hasNow ? `immediate ${microLabel}scramble` : `${microLabel}scramble with countdown`;
       let replyMsg = `🔄 Initiating ${actionDesc}...`;
       if (!hasDry && !hasNow) {
         replyMsg += `\n⏳ Countdown: ${this.options.scrambleAnnouncementDelay}s\n📢 Broadcast sent to server.`;
       }
       await message.reply(replyMsg);
-      const success = await this.initiateScramble(hasDry, hasDry || hasNow, null, null);
+      const success = await this.initiateScramble(hasDry, hasDry || hasNow, null, null, null, scrambleType);
       if (!success) await message.reply('❌ Failed to initiate scramble.');
     }
   }
@@ -1619,27 +1681,33 @@ export default class TeamBalancer extends S3PluginBase {
         } else {
           // Same round — fire the deferred scramble.
           await this._setScrambleArm(null);
+          const isMicro = armedBy?.scrambleType === 'EloDiff';
 
           // The early return below skips the main path, but the finally block still logs this
           // round — give the report a layer even when this round's own never resolved.
           this._applyLayerFallback(roundReport);
           roundReport.scrambled = true;
-          roundReport.scrambleCondition = 'Match End (Manual)';
+          roundReport.scrambleCondition = isMicro ? 'Match End (Manual Micro)' : 'Match End (Manual)';
+          if (isMicro) roundReport.scrambleType = 'EloDiff';
 
-          Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Firing match-end scramble (armed by ${armedBy?.name || 'unknown'}).`);
-          const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.scrambleAnnouncement, {
-            team: 'Match End',
-            count: 0,
-            margin: 0,
-            delay: this.options.scrambleAnnouncementDelay
-          })}`;
+          Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Firing match-end ${isMicro ? 'micro ' : ''}scramble (armed by ${armedBy?.name || 'unknown'}).`);
+          const msg = isMicro
+            ? `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.manualMicroScrambleAnnouncement, {
+                delay: this.options.scrambleAnnouncementDelay
+              })}`
+            : `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.scrambleAnnouncement, {
+                team: 'Match End',
+                count: 0,
+                margin: 0,
+                delay: this.options.scrambleAnnouncementDelay
+              })}`;
           try {
             await this.server.rcon.broadcast(msg);
           } catch (err) {
             Logger.verbose('TeamBalancer', 1, `Failed to broadcast match-end scramble announcement: ${err.message}`);
           }
           this.mirrorRconToDiscord(msg, 'warning');
-          this.initiateScramble(false, false).catch(err =>
+          this.initiateScramble(false, false, null, null, null, isMicro ? 'EloDiff' : null).catch(err =>
             Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
           );
           return; // Early return — the finally block still logs this round.
@@ -1819,6 +1887,33 @@ export default class TeamBalancer extends S3PluginBase {
             Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
           );
           return; // Scramble triggered — skip dominant/non-dominant evaluation
+        }
+      }
+
+      // ── Elo-Diff Scramble Check ─────────────────────────────────
+      // Scheduled here — before the dominant/non-dominant fork, unconditional on isDominant —
+      // so it stays reachable on both forks: the non-dominant branch returns before the
+      // win-streak check ever runs (below), and non-dominant wins are exactly the rounds this
+      // trigger needs to catch. The actual scramble decision is deferred to
+      // _evaluateEloDiffTrigger(), once EloTracker's per-round ratings-committed promise
+      // resolves — nothing here decides anything synchronously, and a same-round win-streak
+      // scramble racing ahead of that resolution is exactly what makes this trigger lowest
+      // effective precedence — the other three arm synchronously within this same call and
+      // will already hold _scramblePending/_scrambleInProgress by the time this one resolves.
+      // isSeedMode() is checked explicitly here, independent of enableSeedAutoScramble — this
+      // trigger must never fire on a Seed round regardless of that option.
+      if (this.options.enableEloDiffScramble && !this._s3?.gameState?.isSeedMode?.()) {
+        const eloTrackerPlugin = this.server.plugins?.find(p => p.constructor.name === 'EloTracker');
+        if (eloTrackerPlugin?.awaitRatingsCommitted) {
+          const currentPlayers = this._s3?.players?.getAllPlayers?.() ?? this.server.players ?? [];
+          const team1EosIDs = currentPlayers.filter(p => String(p.teamID) === '1').map(p => p.eosID);
+          const team2EosIDs = currentPlayers.filter(p => String(p.teamID) === '2').map(p => p.eosID);
+          const ticketMargin = margin;
+          eloTrackerPlugin.awaitRatingsCommitted().then(({ snapshot }) =>
+            this._evaluateEloDiffTrigger({ team1EosIDs, team2EosIDs, ticketMargin, snapshot })
+          ).catch(err =>
+            Logger.verbose('TeamBalancer', 1, `[EloDiff] Unhandled error: ${err.message}`)
+          );
         }
       }
 
@@ -2134,25 +2229,78 @@ export default class TeamBalancer extends S3PluginBase {
     }
   }
 
+  /**
+   * Resolves the Elo-diff micro-scramble trigger once EloTracker's per-round ratings-committed
+   * promise resolves. Computes the average mu gap between the rosters captured at scheduling
+   * time (in onRoundEnded()) against the resolved snapshot, and arms a 'EloDiff'-typed scramble
+   * if the gap clears eloDiffScrambleThreshold. The armed-gate on the announcement broadcast is
+   * deliberate: broadcasting before initiateScramble() resolves would show a phantom
+   * announcement whenever this trigger loses the race to a same-round win-streak scramble,
+   * which is the designed (not rare) outcome of this trigger's precedence.
+   */
+  async _evaluateEloDiffTrigger({ team1EosIDs, team2EosIDs, ticketMargin, snapshot }) {
+    const defaultMu = 25.0;
+    const avgMu = (eosIDs) => {
+      if (!eosIDs || eosIDs.length === 0) return defaultMu;
+      let total = 0;
+      for (const eosID of eosIDs) {
+        const rating = snapshot?.get?.(eosID);
+        total += rating ? rating.mu : defaultMu;
+      }
+      return total / eosIDs.length;
+    };
+
+    const avgTeam1Mu = avgMu(team1EosIDs);
+    const avgTeam2Mu = avgMu(team2EosIDs);
+    const diff = Math.abs(avgTeam1Mu - avgTeam2Mu);
+
+    Logger.verbose('TeamBalancer', 4, `[EloDiff] avgTeam1Mu=${avgTeam1Mu.toFixed(2)}, avgTeam2Mu=${avgTeam2Mu.toFixed(2)}, diff=${diff.toFixed(2)}, threshold=${this.options.eloDiffScrambleThreshold}`);
+
+    if (diff < this.options.eloDiffScrambleThreshold) return;
+
+    Logger.verbose('TeamBalancer', 2, `[EloDiff] Triggered! diff=${diff.toFixed(2)} >= threshold=${this.options.eloDiffScrambleThreshold}`);
+
+    // No separate _scramblePending/_scrambleInProgress pre-check — initiateScramble() already
+    // re-checks that guard at the moment it matters, and its return value IS the check.
+    const armed = await this.initiateScramble(false, false, null, null, null, 'EloDiff');
+    if (!armed) {
+      Logger.verbose('TeamBalancer', 2, '[EloDiff] Scramble not armed — lost to a same-round competitor (e.g. win-streak).');
+      return;
+    }
+
+    const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.microScrambleAnnouncement, {
+      margin: ticketMargin,
+      delay: this.options.scrambleAnnouncementDelay
+    })}`;
+    try {
+      await this.server.rcon.broadcast(msg);
+    } catch (err) {
+      Logger.verbose('TeamBalancer', 1, `Failed to broadcast micro scramble announcement: ${err.message}`);
+    }
+    this.mirrorRconToDiscord(msg, 'warning');
+  }
+
   // ╔═══════════════════════════════════════╗
   // ║        SCRAMBLE EXECUTION FLOW        ║
   // ╚═══════════════════════════════════════╝
 
-  async initiateScramble(isSimulated = false, immediate = false, steamID = null, player = null, delaySeconds = null) {
+  async initiateScramble(isSimulated = false, immediate = false, steamID = null, player = null, delaySeconds = null, scrambleType = null) {
     if (this._scramblePending || this._scrambleInProgress) {
       Logger.verbose('TeamBalancer', 4, 'Scramble initiation blocked: scramble already pending or in progress.');
       return false;
     }
     const adminName = player?.name || (steamID ? `admin ${steamID}` : 'system');
-    
+
     if (isSimulated) {
       Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Simulating immediate scramble initiated by ${adminName}`);
+      this._pendingScrambleType = scrambleType;
       await this.executeScramble(true, steamID, player);
       return true;
     }
-    
-    if (!immediate) {      
+
+    if (!immediate) {
       this._scramblePending = true;
+      this._pendingScrambleType = scrambleType;
       // Callers with a timing window of their own pass it in — the seed auto-scramble does, because
       // the gap between a Seed round ending and the map change is far shorter than the global delay
       // (and a countdown still armed at NEW_GAME is discarded, i.e. the scramble never happens).
@@ -2166,8 +2314,9 @@ export default class TeamBalancer extends S3PluginBase {
         await this.executeScramble(false, steamID, player);
       }, delay * 1000);
       return true;
-    } else {      
+    } else {
       Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Immediate live scramble initiated by ${adminName}`);
+      this._pendingScrambleType = scrambleType;
       await this.executeScramble(false, steamID, player);
       return true;
     }
@@ -2263,7 +2412,99 @@ export default class TeamBalancer extends S3PluginBase {
     };
   }
 
+  /**
+   * Average mu gap between teams after applying a candidate swap plan on top of transformedPlayers'
+   * current teamID. Missing ratings fall back to defaultMu 25.0, same as the forced-churn hack.
+   */
+  _computePostSwapMuDiff(transformedPlayers, swapPlan, eloMap) {
+    const defaultMu = 25.0;
+    const moveMap = new Map((swapPlan || []).map(m => [m.eosID, m.targetTeamID]));
+    let t1Mu = 0, t2Mu = 0, t1Count = 0, t2Count = 0;
+    for (const p of transformedPlayers) {
+      const finalTeamID = moveMap.get(p.eosID) ?? p.teamID;
+      const rating = eloMap?.get?.(p.eosID);
+      const mu = rating ? rating.mu : defaultMu;
+      if (finalTeamID === '1') { t1Mu += mu; t1Count++; }
+      else if (finalTeamID === '2') { t2Mu += mu; t2Count++; }
+    }
+    const avgT1 = t1Count > 0 ? t1Mu / t1Count : defaultMu;
+    const avgT2 = t2Count > 0 ? t2Mu / t2Count : defaultMu;
+    return Math.abs(avgT1 - avgT2);
+  }
+
+  /**
+   * Escalating search for the Elo-diff micro scramble: starts at a 2-player move budget and
+   * steps up by 2, calling the unmodified scrambler at each step and keeping the lowest post-swap
+   * mu-diff plan found, stopping early once microScrambleParityTarget is reached. Capped at
+   * microScrambleMaxMovePercent of the current round's population (both teams combined) — the
+   * safety ceiling that stops the search climbing indefinitely against an unreachable target
+   * (e.g. clan-cohesion constraints blocking every candidate swap). That cap is enforced on the
+   * scrambler's actual return, not just the budget requested from it — squad atomicity
+   * (SQUAD_FIT_GRACE, pullEntireSquads) can hand back more players than asked for, and any plan
+   * that overshoots the ceiling is discarded rather than accepted.
+   */
+  async _runEloDiffMicroScrambleSearch({ transformedSquads, transformedPlayers, eloMap, clanGroups }) {
+    // No ratings, no micro scramble — must never silently fall back to the default
+    // scramblePercentage budget (a near-full scramble), which is exactly what this feature
+    // exists to avoid. See "Second high-risk finding".
+    if (!eloMap || eloMap.size === 0) {
+      Logger.verbose('TeamBalancer', 1, '[EloDiff] No ELO ratings available at execution time — skipping micro scramble.');
+      return [];
+    }
+
+    const population = transformedPlayers.length;
+    const maxBudget = Math.ceil(this.options.microScrambleMaxMovePercent * population);
+    const parityTarget = this.options.microScrambleParityTarget;
+
+    let bestPlan = null;
+    let bestDiff = Infinity;
+
+    for (let budget = 2; budget <= maxBudget; budget += 2) {
+      const plan = await Scrambler.scrambleTeamsPreservingSquads({
+        squads: transformedSquads,
+        players: transformedPlayers,
+        winStreakTeam: this.winStreakTeam,
+        scramblePercentage: this.options.scramblePercentage,
+        debug: this.options.debugLogs,
+        eloMap,
+        minPlayersToMove: budget,
+        maxPlayersToMove: budget,
+        clanGroups,
+        pullEntireSquads: this._s3?.clans?.options?.pullEntireSquads || false
+      });
+
+      // Squad atomicity (SQUAD_FIT_GRACE, pullEntireSquads) can hand back a plan larger than the
+      // budget requested — the scrambler treats minPlayersToMove/maxPlayersToMove as a target it
+      // tries to hit, not a hard cap. microScrambleMaxMovePercent is a safety ceiling on the
+      // ACTUAL number of players moved, so an oversized plan is rejected outright rather than
+      // accepted just because it happened to also reach parity.
+      if (plan && plan.length > maxBudget) {
+        Logger.verbose('TeamBalancer', 2, `[EloDiff] Budget ${budget}: scrambler returned a ${plan.length}-player plan, exceeding the ${maxBudget}-player safety ceiling (squad atomicity) — discarding.`);
+        continue;
+      }
+
+      const diff = this._computePostSwapMuDiff(transformedPlayers, plan, eloMap);
+      Logger.verbose('TeamBalancer', 4, `[EloDiff] Budget ${budget}: post-swap diff ${diff.toFixed(3)}μ (plan size ${plan?.length ?? 0}).`);
+
+      if (plan && plan.length > 0 && diff < bestDiff) {
+        bestDiff = diff;
+        bestPlan = plan;
+      }
+
+      if (plan && plan.length > 0 && diff <= parityTarget) {
+        return plan;
+      }
+    }
+
+    return bestPlan || [];
+  }
+
   async executeScramble(isSimulated = false, steamID = null, player = null) {
+    // Captured then cleared immediately — same capture-then-clear pattern as EloTracker's
+    // resolveRatingsCommitted, so a rejected/unrelated future scramble never inherits this value.
+    const scrambleType = this._pendingScrambleType;
+    this._pendingScrambleType = null;
+
     if (this._scrambleInProgress) {
       Logger.verbose('TeamBalancer', 1, 'Scramble already in progress.');
       return false;
@@ -2376,7 +2617,11 @@ export default class TeamBalancer extends S3PluginBase {
       let minPlayersToMove = 0;
       let maxPlayersToMove = 0;
 
-      if (this.options.useEloForBalance) {
+      // The Elo lookup for the 'EloDiff' micro-scramble path runs unconditionally, independent
+      // of useEloForBalance — that option only governs whether the *existing three* triggers'
+      // scrambles use Elo to steer swaps, and this execution mode is meaningless without
+      // per-player ratings.
+      if (scrambleType === 'EloDiff' || this.options.useEloForBalance) {
         const eloTrackerPlugin = this.server.plugins?.find(p => p.constructor.name === 'EloTracker');
         if (eloTrackerPlugin) {
           try {
@@ -2391,26 +2636,32 @@ export default class TeamBalancer extends S3PluginBase {
             }
 
             // --- Enforce 40-55 Person Scramble for Edge Cases ---
-            // If teams are already extremely close in ELO (diff < 0.4), the scrambler 
-            // has no mathematical incentive to move players. To ensure a fresh match 
-            // feeling, we forcefully increase the churn bounds to a minimum of 40 
+            // If teams are already extremely close in ELO (diff < 0.4), the scrambler
+            // has no mathematical incentive to move players. To ensure a fresh match
+            // feeling, we forcefully increase the churn bounds to a minimum of 40
             // and maximum of 55 players.
-            let t1Mu = 0, t2Mu = 0, t1Count = 0, t2Count = 0;
-            const defaultMu = 25.0;
-            for (const p of transformedPlayers) {
-              const rating = eloMap.get(p.eosID);
-              const mu = rating ? rating.mu : defaultMu;
-              if (p.teamID === '1') { t1Mu += mu; t1Count++; }
-              else if (p.teamID === '2') { t2Mu += mu; t2Count++; }
-            }
-            const avgT1 = t1Count > 0 ? (t1Mu / t1Count) : defaultMu;
-            const avgT2 = t2Count > 0 ? (t2Mu / t2Count) : defaultMu;
-            const muDelta = Math.abs(avgT1 - avgT2);
+            // Skipped outright for scrambleType === 'EloDiff' by the guard below — that path
+            // already confirmed diff >= eloDiffScrambleThreshold before arming, so recomputing
+            // muDelta here to compare against this unrelated hack's own fixed 0.4 cutoff would
+            // be redundant, not a correctness requirement.
+            if (scrambleType !== 'EloDiff') {
+              let t1Mu = 0, t2Mu = 0, t1Count = 0, t2Count = 0;
+              const defaultMu = 25.0;
+              for (const p of transformedPlayers) {
+                const rating = eloMap.get(p.eosID);
+                const mu = rating ? rating.mu : defaultMu;
+                if (p.teamID === '1') { t1Mu += mu; t1Count++; }
+                else if (p.teamID === '2') { t2Mu += mu; t2Count++; }
+              }
+              const avgT1 = t1Count > 0 ? (t1Mu / t1Count) : defaultMu;
+              const avgT2 = t2Count > 0 ? (t2Mu / t2Count) : defaultMu;
+              const muDelta = Math.abs(avgT1 - avgT2);
 
-            if (muDelta < 0.4) {
-              Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Pre-scramble ELO diff is extremely small (${muDelta.toFixed(2)}μ). Enforcing 40-55 person scramble bound.`);
-              minPlayersToMove = 40;
-              maxPlayersToMove = 55;
+              if (muDelta < 0.4) {
+                Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Pre-scramble ELO diff is extremely small (${muDelta.toFixed(2)}μ). Enforcing 40-55 person scramble bound.`);
+                minPlayersToMove = 40;
+                maxPlayersToMove = 55;
+              }
             }
 
           } catch (err) {
@@ -2444,18 +2695,30 @@ export default class TeamBalancer extends S3PluginBase {
 
       Logger.verbose('TeamBalancer', 4, `Calling scrambler with ${transformedSquads.length} squads and ${transformedPlayers.length} players`);
 
-      swapPlan = await Scrambler.scrambleTeamsPreservingSquads({
-        squads: transformedSquads,
-        players: transformedPlayers,
-        winStreakTeam: this.winStreakTeam,
-        scramblePercentage: this.options.scramblePercentage,
-        debug: this.options.debugLogs,
-        eloMap,
-        minPlayersToMove,
-        maxPlayersToMove,
-        clanGroups,
-        pullEntireSquads: this._s3?.clans?.options?.pullEntireSquads || false
-      });
+      if (scrambleType === 'EloDiff') {
+        // Micro scramble: an escalating search for the smallest move-count budget that reaches
+        // parity, run live (against the current roster/squad state) rather than as an earlier
+        // preview.
+        swapPlan = await this._runEloDiffMicroScrambleSearch({
+          transformedSquads,
+          transformedPlayers,
+          eloMap,
+          clanGroups
+        });
+      } else {
+        swapPlan = await Scrambler.scrambleTeamsPreservingSquads({
+          squads: transformedSquads,
+          players: transformedPlayers,
+          winStreakTeam: this.winStreakTeam,
+          scramblePercentage: this.options.scramblePercentage,
+          debug: this.options.debugLogs,
+          eloMap,
+          minPlayersToMove,
+          maxPlayersToMove,
+          clanGroups,
+          pullEntireSquads: this._s3?.clans?.options?.pullEntireSquads || false
+        });
+      }
 
       const targetReportChannel = this.discordReportChannel || this.discordChannel;
       // Dry runs (isSimulated=true) post to the admin command channel (this.discordChannel)
@@ -2514,11 +2777,15 @@ export default class TeamBalancer extends S3PluginBase {
           if (affectedPlayers.length > 0 || failedPlayers.length > 0) {
             this.server.emit('TEAM_BALANCER_SCRAMBLE_EXECUTED', {
               affectedPlayers,
-              failedPlayers
+              failedPlayers,
+              scrambleType
             });
           }
 
-          const msg = `${this.RconMessages.prefix} ${this.RconMessages.scrambleCompleteMessage.trim()}`;
+          const completeMessage = scrambleType === 'EloDiff'
+            ? this.RconMessages.microScrambleCompleteMessage
+            : this.RconMessages.scrambleCompleteMessage;
+          const msg = `${this.RconMessages.prefix} ${completeMessage.trim()}`;
           Logger.verbose('TeamBalancer', 4, `Broadcasting: "${msg}"`);
           try {
             await this.server.rcon.broadcast(msg);
@@ -2534,7 +2801,13 @@ export default class TeamBalancer extends S3PluginBase {
           } catch (err) {
             Logger.verbose('TeamBalancer', 1, `[DB] saveScrambleTime failed: ${err.message}`);
           }
-          await this.resetStreak('Post-scramble cleanup');
+          // Do NOT reset win-streak state for the Elo-diff micro scramble — it moves a
+          // deliberately small number of players and isn't trying to guarantee full parity, so a
+          // persistent streak across rounds is still real signal for the existing triggers to
+          // escalate on.
+          if (scrambleType !== 'EloDiff') {
+            await this.resetStreak('Post-scramble cleanup');
+          }
         } else {
           Logger.verbose('TeamBalancer', 2, `Dry run: Would have queued ${swapPlan.length} player moves.`);
           for (const move of swapPlan) {

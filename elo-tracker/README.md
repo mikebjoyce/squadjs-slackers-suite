@@ -63,6 +63,8 @@ When `useEloForBalance: true` is set in TeamBalancer, its scoring function switc
 
 No additional configuration is needed on the EloTracker side. TeamBalancer finds the EloTracker instance automatically at runtime and falls back to pure numerical balance silently if EloTracker data is unavailable.
 
+TeamBalancer's optional Elo-diff "micro scramble" trigger (`enableEloDiffScramble`, or manually via `!scramble elo`) requires EloTracker to be active. It schedules its threshold check off EloTracker's `awaitRatingsCommitted()` promise rather than a fixed delay, since `ROUND_ENDED` gives no ordering guarantee between the two plugins' listeners.
+
 ---
 
 ### S³ (Slacker's Squad Services)

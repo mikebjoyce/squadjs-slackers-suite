@@ -98,7 +98,8 @@ import SwitchExplain from '../utils/switch-explain.js';
  *   - S3_PLAYER_LEFT: stores disconnection state; removes player from switch queue.
  *   - S3_PLAYER_TEAM_CHANGED: triggers queue re-evaluation.
  *   - TEAM_BALANCER_SCRAMBLE_EXECUTED: applies scramble lockdown to affected
- *     players for a configurable duration.
+ *     players for a configurable duration. Skipped entirely for TeamBalancer's
+ *     'EloDiff' micro scramble.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
@@ -108,6 +109,11 @@ import SwitchExplain from '../utils/switch-explain.js';
  *   window (join or match start) and players who were actively queued
  *   for a switch, since they had no opportunity to exploit pre-scramble
  *   imbalance.
+ * - Scramble lockdown is skipped entirely (no rows written, no
+ *   _scrambleHappened broadcast armed) when TEAM_BALANCER_SCRAMBLE_EXECUTED
+ *   carries scrambleType 'EloDiff' — TeamBalancer's small EloTracker-driven
+ *   micro scramble. Disproportionate to lock the whole server down over a
+ *   correction that moved a handful of players.
  * - Liberal game modes (default: Seed, Jensen) relax cooldown and time
  *   limits. Configured via liberalSwitchGameModes and
  *   liberalSwitchMaxUnbalancedSlots. Liberal-mode broadcast interval
@@ -2379,7 +2385,7 @@ export default class Switch extends S3DiscordPluginBase {
      *   6. Post Discord notification with lockdown summary
      */
     onScrambleExecuted = async (data) => {
-        const { affectedPlayers, failedPlayers } = data;
+        const { affectedPlayers, failedPlayers, scrambleType } = data;
         this.verbose(2, `[SCRAMBLE_EVENT] onScrambleExecuted called with data: ${JSON.stringify(data)}`);
 
         // Snapshot queued player eosIDs before clearing — these players
@@ -2412,9 +2418,6 @@ export default class Switch extends S3DiscordPluginBase {
             this.verbose(1, `[SCRAMBLE_EVENT] Server population (${totalPlayers}) below scrambleLockdownMinPlayers (${minPlayers}) — queue cleared, no lockdown applied.`);
             return;
         }
-
-        // v2.0.0: Defer post-scramble broadcast to next NEW_GAME
-        this._scrambleHappened = true;
 
         // ── Lockdown applies to ALL server players, not just those moved ──
         // The scramble invalidates team balance for everyone, so the entire
@@ -2484,6 +2487,22 @@ export default class Switch extends S3DiscordPluginBase {
             }
             lockoutPlayers.push(p);
         }
+
+        // Elo-diff micro scramble: no lockdown write. The lockout guard exists to stop players
+        // exploiting a just-corrected imbalance after a full reactive scramble — disproportionate
+        // here, where the entire premise is "no blowout happened, just a small post-round gap."
+        // Queue clear (above) and failed-move remediation (in the loop above) still run
+        // unconditionally. _scrambleHappened is also deliberately NOT set here (it's set below,
+        // past this return) — that flag drives next round's "returning players cannot switch"
+        // broadcast timer via _startPostScrambleBroadcastTimers(), which would be actively false
+        // for a scramble that writes no lockdown rows.
+        if (scrambleType === 'EloDiff') {
+            this.verbose(1, `[SCRAMBLE_EVENT] Elo-diff micro scramble — queue cleared, no lockdown applied (${lockoutPlayers.length} would-be lockout players skipped).`);
+            return;
+        }
+
+        // v2.0.0: Defer post-scramble broadcast to next NEW_GAME
+        this._scrambleHappened = true;
 
         const lockdownDuration = this.options.scrambleLockdownDurationMinutes * 60 * 1000;
         const expiry = new Date(Date.now() + lockdownDuration);

@@ -510,7 +510,8 @@ function _buildScrambleEmbed(plugin) {
     `- You are still within your **${plugin.options.switchEnabledMinutes || 10}-minute** join/match window.`,
     '- You were already in the switch queue before the scramble fired.',
     '- The scramble **failed to move you** (RCON error). Your scramble lock is cleared and you may receive a **+1 switch token** so you can use `!switch` immediately to rejoin your group.',
-    '- The scramble failed to keep your squad or clan together. In this case, you are given extra leniency to switch back to your group when your join/match window opens.'
+    '- The scramble failed to keep your squad or clan together. In this case, you are given extra leniency to switch back to your group when your join/match window opens.',
+    '- The scramble was a small Elo-correction ("micro scramble") rather than a full rebalance — those move too few players to warrant a lockout, so **no one is locked**.'
   ];
 
   const reconnectText = [

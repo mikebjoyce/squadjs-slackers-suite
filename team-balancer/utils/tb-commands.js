@@ -112,12 +112,19 @@ const CommandHandlers = {
       manualScrambleAnnouncement:
         'Manual team balance triggered by admin | Scrambling in {delay}s...',
       immediateManualScramble: 'Manual team balance triggered by admin | Scrambling teams...',
+      manualMicroScrambleAnnouncement:
+        'Manual micro scramble triggered by admin | Scrambling in {delay}s...',
+      immediateManualMicroScramble:
+        'Manual micro scramble triggered by admin | Scrambling teams...',
       executeScrambleMessage: 'Executing scramble...',
       executeDryRunMessage: 'Dry Run: Simulating scramble...',
       scrambleCompleteMessage: 'Balance has been restored.',
       scrambleFailedMessage: 'Scramble failed! No valid solution found.',
-      playerScrambledWarning: "You've been scrambled.", 
+      playerScrambledWarning: "You've been scrambled.",
       seedScrambleAnnouncement: 'Seed match complete! Scrambling teams in {delay}s...',
+      microScrambleAnnouncement:
+        'Team imbalance detected ({margin}-ticket margin) | Micro scramble in {delay}s...',
+      microScrambleCompleteMessage: 'Balance has been restored. (Micro scramble)',
 
       system: {
         trackingEnabled: 'Team Balancer has been enabled.',
@@ -450,14 +457,18 @@ const CommandHandlers = {
       // scrambleConfirmation state. A typo (e.g. "!scramble confiirm") would
       // otherwise fall through to the bare-scramble path, overwriting a
       // pending confirmation and triggering a live broadcast.
-      const VALID_SCRAMBLE_ARGS = ['now', 'dry', 'matchend', 'cancel', 'confirm'];
+      const VALID_SCRAMBLE_ARGS = ['now', 'dry', 'matchend', 'cancel', 'confirm', 'elo'];
       const badArg = args.find(a => !VALID_SCRAMBLE_ARGS.includes(a));
       if (badArg) {
         return await this.respond(
           command.player,
-          `Unknown argument "${badArg}". Usage: !scramble [now|dry|matchend|cancel|confirm]`
+          `Unknown argument "${badArg}". Usage: !scramble [now|dry|matchend|cancel|confirm|elo]`
         );
       }
+
+      const steamID = command.steamID;
+      const player = command.player;
+      const adminName = player?.name || steamID;
 
       const isConfirm = args.includes('confirm');
 
@@ -478,10 +489,8 @@ const CommandHandlers = {
       const hasDry = args.includes('dry');
       const isCancel = args.includes('cancel');
       const isMatchEnd = args.includes('matchend');
-
-      const steamID = command.steamID;
-      const player = command.player;
-      const adminName = player?.name || steamID;
+      const hasElo = args.includes('elo');
+      const scrambleType = hasElo ? 'EloDiff' : null;
 
       try {
         // Handle "!scramble matchend" — arm a deferred scramble for the end of this round.
@@ -490,17 +499,20 @@ const CommandHandlers = {
             return await this.respond(player, '"!scramble matchend" cannot be combined with "now" or "dry".');
           }
           if (this._scrambleOnRoundEnd) {
-            return await this.respond(player, 'A match-end scramble is already scheduled. It will fire when this round ends.');
+            return await this.respond(player, 'A match-end scramble is already scheduled. It will fire when this round ends. Use "!scramble cancel" to cancel it.');
           }
-          await this._setScrambleArm({ name: adminName, eosID: player?.eosID ?? null });
-          Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Match-end scramble armed by ${adminName}`);
-          const response = await this.respond(player, 'Scramble scheduled for the end of this round. It will fire automatically when the round ends.');
+          await this._setScrambleArm({ name: adminName, eosID: player?.eosID ?? null, scrambleType });
+          Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Match-end ${hasElo ? 'micro ' : ''}scramble armed by ${adminName}`);
+          const armResponseMsg = hasElo
+            ? 'Micro scramble scheduled for the end of this round. It will fire automatically when the round ends. Use "!scramble cancel" to cancel it.'
+            : 'Scramble scheduled for the end of this round. It will fire automatically when the round ends. Use "!scramble cancel" to cancel it.';
+          const response = await this.respond(player, armResponseMsg);
           if (this.discordChannel) {
             const embed = {
               color: 0x3498db,
-              title: '🎮 In-Game Command: !scramble matchend',
+              title: `🎮 In-Game Command: !scramble matchend${hasElo ? ' elo' : ''}`,
               description: `Executed by **${adminName}**`,
-              fields: [{ name: 'Response', value: 'Scramble scheduled for the end of this round.', inline: false }],
+              fields: [{ name: 'Response', value: armResponseMsg, inline: false }],
               timestamp: new Date().toISOString()
             };
             await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
@@ -545,9 +557,15 @@ const CommandHandlers = {
         // Require confirmation for live scrambles
         if (this.options.requireScrambleConfirmation && !hasDry && !isConfirm) {
           this.scrambleConfirmation = { timestamp: Date.now(), args: args };
-          const type = hasNow ? 'IMMEDIATE' : 'scheduled';
+          const scrambleKind = hasElo ? 'micro' : 'full';
+          const timing = hasNow
+            ? 'immediately, with no countdown'
+            : `in ${this.options.scrambleAnnouncementDelay}s, after a countdown broadcast`;
           const timeoutSec = this.options.scrambleConfirmationTimeout || 60;
-          return await this.respond(player, `Please confirm ${type} scramble by typing "!scramble confirm" within ${timeoutSec} seconds.`);
+          return await this.respond(
+            player,
+            `Confirming will execute a ${scrambleKind} scramble ${timing}. Type "!scramble confirm" within ${timeoutSec}s to proceed.`
+          );
         }
 
         // Dry runs are ALWAYS immediate (no countdown for simulations)
@@ -556,10 +574,12 @@ const CommandHandlers = {
 
         // Broadcast only for LIVE scrambles (dry runs are silent to players)
         if (!isSimulated) {
+          const immediateMsgKey = hasElo ? 'immediateManualMicroScramble' : 'immediateManualScramble';
+          const announcementMsgKey = hasElo ? 'manualMicroScrambleAnnouncement' : 'manualScrambleAnnouncement';
           const broadcastMsg = immediate
-            ? `${this.RconMessages.prefix} ${this.RconMessages.immediateManualScramble}`
+            ? `${this.RconMessages.prefix} ${this.RconMessages[immediateMsgKey]}`
             : `${this.RconMessages.prefix} ${this.formatMessage(
-                this.RconMessages.manualScrambleAnnouncement,
+                this.RconMessages[announcementMsgKey],
                 { delay: this.options.scrambleAnnouncementDelay }
               )}`;
 
@@ -571,24 +591,24 @@ const CommandHandlers = {
         }
 
         // Log action
-        const actionDesc = isSimulated 
-          ? `dry run scramble${immediate ? ' (immediate)' : ''}`
-          : `live scramble${immediate ? ' (immediate)' : ''}`;
+        const actionDesc = isSimulated
+          ? `dry run ${hasElo ? 'micro ' : ''}scramble${immediate ? ' (immediate)' : ''}`
+          : `live ${hasElo ? 'micro ' : ''}scramble${immediate ? ' (immediate)' : ''}`;
         Logger.verbose('TeamBalancer', 2, `[TeamBalancer] ${adminName} initiated ${actionDesc}`);
 
         // Respond to admin
         let responseMsg;
         if (isSimulated) {
-          responseMsg = 'Initiating dry run scramble (immediate)...';
+          responseMsg = `Initiating dry run ${hasElo ? 'micro ' : ''}scramble (immediate)...`;
         } else {
-          responseMsg = immediate 
-            ? 'Initiating immediate scramble...'
-            : 'Initiating scramble with countdown...';
+          responseMsg = immediate
+            ? `Initiating immediate ${hasElo ? 'micro ' : ''}scramble...`
+            : `Initiating ${hasElo ? 'micro ' : ''}scramble with countdown...`;
         }
         if (this.discordChannel) {
           const embed = {
             color: 0x3498db,
-            title: `🎮 In-Game Command: !scramble ${immediate ? 'now' : ''} ${isSimulated ? 'dry' : ''}`,
+            title: `🎮 In-Game Command: !scramble ${immediate ? 'now' : ''} ${isSimulated ? 'dry' : ''} ${hasElo ? 'elo' : ''}`,
             description: `Executed by **${adminName}**`,
             fields: [{ name: 'Response', value: responseMsg, inline: false }],
             timestamp: new Date().toISOString()
@@ -602,7 +622,9 @@ const CommandHandlers = {
           isSimulated,  // dry flag determines simulation
           immediate,    // dry runs force immediate execution
           steamID,
-          player
+          player,
+          null,
+          scrambleType
         );
 
         if (!success) {

@@ -24,6 +24,12 @@
  *     getTeamElo(players)         — Returns average mu for a player array.
  *     getRatingsByEosIDs(eosIDs)  — Batch DB lookup; returns Map<eosID, rating>.
  *     buildRoundStartData()       — Builds team balance snapshot for Discord embeds.
+ *     awaitRatingsCommitted()     — Promise resolving once onRoundEnded() has committed this
+ *                                   round's ratings (or, on a skipped round, whatever the last
+ *                                   processed round left in lastRoundSnapshot). Consumed by
+ *                                   TeamBalancer's Elo-diff micro-scramble trigger, which has
+ *                                   no ordering guarantee against this plugin's own ROUND_ENDED
+ *                                   listener.
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
@@ -219,6 +225,12 @@ export default class EloTracker extends S3PluginBase {
     this._roundStartEmbedPending = null;
     this.lastRoundSnapshot = null;
     this._scrambleEmbedTimer = null;
+
+    // Per-round ratings-committed promise — resolved once onRoundEnded() has updated
+    // eloCache/lastRoundSnapshot for the round. Must start pending (not pre-resolved): a
+    // mid-round restart resumes the round without onNewGame() firing again, so this
+    // constructor default is the only promise object that will ever exist for that round.
+    this._ratingsCommittedPromise = new Promise(resolve => { this._ratingsCommittedResolve = resolve; });
 
     // Bound listeners — mirror TeamBalancer pattern exactly
     this.listeners = {};
@@ -581,6 +593,7 @@ export default class EloTracker extends S3PluginBase {
       this.lastRoundSnapshot = null;
      this.eloCache.clear();
      this._roundStartEmbedPending = Date.now();
+     this._ratingsCommittedPromise = new Promise(resolve => { this._ratingsCommittedResolve = resolve; });
 
      // NOTE (null-teamID transient): SquadJS RCON polling may return players with 
      // teamID === null immediately after NEW_GAME fires (see SQUADJS_PLUGIN_DEV_REFERENCE.md, 
@@ -718,6 +731,10 @@ export default class EloTracker extends S3PluginBase {
   }
 
   async onRoundEnded(data) {
+    // Captured once, up front — never read this._ratingsCommittedResolve again below,
+    // so a concurrent onNewGame() for the next round can't redirect this round's resolve.
+    const resolveRatingsCommitted = this._ratingsCommittedResolve;
+    try {
     const gameMode = this._getGamemode();
     const layerName = this._getLayerName();
 
@@ -902,6 +919,10 @@ export default class EloTracker extends S3PluginBase {
     const team1Summary = processTeam(team1Eligible, team1Updates, team1IsWinner, team2IsWinner);
     const team2Summary = processTeam(team2Eligible, team2Updates, team2IsWinner, team1IsWinner);
 
+    // --- Ratings committed for this round — snapshot and resolve before any DB/Discord awaits ---
+    this.lastRoundSnapshot = new Map(this.eloCache);
+    resolveRatingsCommitted({ snapshot: this.lastRoundSnapshot });
+
     // --- DB writes ---
     let roundRecord = null;
     try {
@@ -1048,9 +1069,14 @@ export default class EloTracker extends S3PluginBase {
     }
 
     // --- Flush cache ---
-    this.lastRoundSnapshot = new Map(this.eloCache);
     this.eloCache.clear();
     Logger.verbose('EloTracker', 1, `[onRoundEnded] ELO update complete. ${eligible.length} players updated.`);
+    } finally {
+      // No-op on the normal path (already resolved above, right after processTeam()) —
+      // this only matters for early-return paths, resolving with whatever
+      // lastRoundSnapshot currently holds (the last actually-processed round's ratings).
+      resolveRatingsCommitted({ snapshot: this.lastRoundSnapshot });
+    }
   }
 
   buildRoundStartData() {
@@ -1200,6 +1226,15 @@ export default class EloTracker extends S3PluginBase {
     if (!eosIDs || eosIDs.length === 0) return new Map();
     const results = await this.db.getPlayerStatsBatch(eosIDs);
     return results || new Map();
+  }
+
+  /**
+   * Resolves once onRoundEnded() has committed this round's ratings to lastRoundSnapshot
+   * (or, for a round onRoundEnded() skips processing, resolves via the finally-block with
+   * whatever lastRoundSnapshot already held — the last actually processed round's ratings).
+   */
+  awaitRatingsCommitted() {
+    return this._ratingsCommittedPromise;
   }
 
   // ----- DEPRECATED (preserved for team-balancer compatibility) -----

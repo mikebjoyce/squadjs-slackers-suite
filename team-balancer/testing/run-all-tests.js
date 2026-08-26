@@ -53,6 +53,7 @@ const SUITES = [
   { file: 'test-team-balancer-plugin.js', desc: 'plugin lifecycle + layer mirror' },
   { file: 'plugin-logic-test-runner.js', desc: 'streak tracking, scramble triggers, mode detection' },
   { file: 'test-tb-elo-scramble.js', desc: 'ELO-weighted scramble, squad atomicity' },
+  { file: 'test-elo-diff-scramble.js', desc: 'Elo-diff micro scramble trigger, budget search, scrambleType plumbing' },
   { file: 'test-cross-clan-squad-collision.js', desc: 'cross-clan squad collisions' },
   { file: 'embed-format-test.js', desc: 'Discord embed chunking' },
   // ~4 minutes: thousands of randomised scrambles looking for cohesion

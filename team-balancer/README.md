@@ -220,8 +220,12 @@ Admin Commands:
 !scramble                      → Manually trigger scramble with countdown.
 !scramble now                  → Immediate scramble (no countdown).
 !scramble dry                  → Dry-run scramble (simulation only).
+!scramble matchend             → Arm a scramble to fire automatically when this round ends.
 !scramble confirm              → Confirm a pending scramble request.
-!scramble cancel               → Cancel pending scramble countdown.
+!scramble cancel               → Cancel a pending scramble, or an armed matchend scramble.
+!scramble elo                  → Composable with the above — runs a small "micro scramble"
+                                  (EloTracker-driven) instead of a full scramble, e.g.
+                                  "!scramble elo now" or "!scramble elo matchend".
 ```
 
 ---
@@ -256,6 +260,10 @@ Admin Commands:
 | `mirrorRconBroadcasts` | no | boolean | `true` | Mirror RCON broadcasts to Discord |
 | `postScrambleDetails` | no | boolean | `true` | Post detailed swap plan to Discord after scramble |
 | `useEloForBalance` | no | boolean | `true` | Weight scrambles by EloTracker mu ratings (requires EloTracker plugin; falls back to numerical balance if absent) |
+| `enableEloDiffScramble` | no | boolean | `false` | Trigger a small "micro scramble" when the average Elo (mu) gap between teams from the round that just ended meets `eloDiffScrambleThreshold`, independent of the three reactive triggers. Opt-in — requires EloTracker to be active. Can also be triggered manually via `!scramble elo` regardless of this setting. |
+| `eloDiffScrambleThreshold` | no | number | `1.2` | Average mu gap between teams (abs value) that arms the Elo-diff micro scramble |
+| `microScrambleParityTarget` | no | number | `0.05` | Post-swap average mu gap the Elo-diff micro scramble's escalating search stops at once reached |
+| `microScrambleMaxMovePercent` | no | number | `0.10` | Safety ceiling for the Elo-diff micro scramble: max fraction of the current round's population (both teams combined) that may be moved |
 | `devMode` | no | boolean | `false` | Allow commands from any player regardless of admin status |
 | `reportLogPath` | no | string | `"team-balancer-reports.jsonl"` | Path to the JSONL log file for round reports |
 | `scrambleReportPath` | no | string | `"TeamBalancerScrambleReports/"` | Directory for per-scramble report files |
