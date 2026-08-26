@@ -316,8 +316,14 @@ const SwitchOutput = {
 
       plugin._clearBroadcastTimers();
 
+      // Do NOT clear _scrambleHappened here. This runs twice per round start
+      // (direct call from onNewGame(), then again from the onLayerGameModeChange
+      // subscription once S³ resolves the layer) — clearing it on the first call
+      // meant the second call always fell through to the normal/liberal branch
+      // and clobbered the pending post-scramble broadcast before its delayed
+      // setTimeout fired. It stays true for the whole round; onRoundEnded()
+      // is the single place that resets it, once the round is actually over.
       if (plugin._scrambleHappened) {
-        plugin._scrambleHappened = false;
         plugin._startPostScrambleBroadcastTimers();
       } else if (isLiberal) {
         plugin._startLiberalBroadcastTimers();
