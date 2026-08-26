@@ -298,7 +298,7 @@ This service provides **building blocks** for clan-aware plugin behaviour (team 
 | `isEnabled()` | `boolean` | Clan grouping enabled in config |
 | `extractRawPrefix(name)` | `string\|null` | Extract clan tag from player name |
 | `normalizeTag(raw)` | `string` | Normalise for comparison (case, special chars) |
-| `levenshteinDistance(a, b)` | `number` | Edit distance for fuzzy matching |
+| `damerauLevenshteinDistance(a, b)` | `number` | Edit distance for fuzzy matching (adjacent-character transposition counts as 1 edit, not 2) |
 | `extractClanGroups(players, opts?)` | `object[]` | Grouped clans with members |
 | `explainClanGroups(players, opts?)` | `{groups, trace, options}` | Same pipeline as `extractClanGroups()`, plus a trace of every exclusion and merge. Diagnostic only — grouping consumers should call `extractClanGroups()`. |
 | `buildPlayerTagCache(players, opts?)` | `Map<eosID, tag>` | Pre-computed tag map |
@@ -1584,7 +1584,7 @@ All commands in the configured `channelID` Discord channel:
 | `!s3 gamestate` | Phase, mode, layer, sub-state, round timing |
 | `!s3 factions` | Team 1/2 abbreviations, faction IDs |
 | `!s3 players` | Population overview embed + one embed per team, broken down by squad with squad leaders marked (👑), squad locks, per-player locks, and an "Unassigned" (not in a squad) bucket |
-| `!s3 clans` | Active clan groups, plus a second embed explaining every exclusion (size bounds, `ignoreList`, unnormalizable tag) and every Levenshtein merge and recruit-suffix strip |
+| `!s3 clans` | Active clan groups, plus a second embed explaining every exclusion (size bounds, `ignoreList`, unnormalizable tag) and every Damerau-Levenshtein merge and recruit-suffix strip |
 | `!s3 locks` | Global lock + per-player locks |
 | `!s3 config` | Server config values |
 | `!s3 watch <service>` | Relay verbose logs for a service to Discord |
@@ -1964,7 +1964,8 @@ S³ must appear **before** consumer plugins:
 | `enableClanTagGrouping` | boolean | `true` | Enable clan grouping |
 | `minClanGroupSize` | number | `2` | Minimum clan group size |
 | `maxClanGroupSize` | number | `18` | Maximum clan group size |
-| `clanTagMaxEditDistance` | number | `1` | Levenshtein distance for merging similar tags |
+| `clanTagMaxEditDistance` | number | `1` | Damerau-Levenshtein distance for merging similar tags (adjacent-character transpositions count as 1 edit) |
+| `clanTagMinMergeLength` | number | `4` | Minimum normalized tag length eligible for Damerau-Levenshtein merging; shorter tags require an exact match |
 | `clanTagCaseSensitive` | boolean | `false` | If false, tags are normalised before grouping |
 | `clanTagIgnoreList` | array | `[]` | Tags excluded from grouping |
 | `clanRecruitSuffixes` | array | `["r", "-r"]` | Suffixes to strip from clan tags when the base tag (without suffix) exists on other players. Enabled by default for common recruit tags (case-insensitive, so "R" and "-R" are also matched). Set to `[]` to disable. Stripping only occurs when the base tag is present on at least one other player in the data set. |

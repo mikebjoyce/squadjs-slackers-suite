@@ -164,7 +164,7 @@ export default class SlackersSquadServices extends BasePlugin {
     return false;
   }
 
-  static get version() { return '1.4.0'; }
+  static get version() { return '1.5.0'; }
 
   static get optionsSpecification() {
     return {
@@ -217,8 +217,14 @@ export default class SlackersSquadServices extends BasePlugin {
       clanTagMaxEditDistance: {
         required: false,
         type: 'number',
-        description: 'Maximum Levenshtein edit distance used when merging similar clan tags.',
+        description: 'Maximum Damerau-Levenshtein edit distance used when merging similar clan tags. Counts an adjacent-character transposition (e.g. "PHNTM" vs "PHTNM") as a single edit rather than two substitutions.',
         default: 1
+      },
+      clanTagMinMergeLength: {
+        required: false,
+        type: 'number',
+        description: 'Minimum normalized tag length required for two tags to be eligible for Damerau-Levenshtein merging. Tags shorter than this only group together on an exact match — a 1-character edit is far less discriminating on a short tag (e.g. "CB" vs "8B") than on a long one.',
+        default: 4
       },
       clanTagCaseSensitive: {
         required: false,
@@ -382,6 +388,7 @@ export default class SlackersSquadServices extends BasePlugin {
         minSize: this.options.minClanGroupSize,
         maxSize: this.options.maxClanGroupSize,
         maxEditDistance: this.options.clanTagMaxEditDistance,
+        minMergeLength: this.options.clanTagMinMergeLength,
         caseSensitive: this.options.clanTagCaseSensitive,
         ignoreList: this.options.clanTagIgnoreList,
         pullEntireSquads: this.options.clanGroupingPullEntireSquads,

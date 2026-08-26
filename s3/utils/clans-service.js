@@ -7,7 +7,7 @@
  *
  * Extracts and groups player clan tags from player names using
  * multiple regex strategies. Groups players by normalized tag with
- * configurable size limits, Levenshtein-distance merge, and
+ * configurable size limits, Damerau-Levenshtein-distance merge, and
  * ignore-list filtering. Provides per-player tag caching and
  * clan-team lookup for join-time assignment decisions.
  *
@@ -26,9 +26,13 @@
  *                             using 5 regex strategies.
  *   normalizeTag(raw)       — Normalizes a tag (NFD unicode, ASCII
  *                             folding, uppercase).
- *   levenshteinDistance(a, b) — Computes edit distance between tags.
+ *   damerauLevenshteinDistance(a, b) — Computes edit distance between tags,
+ *                             counting an adjacent-character transposition
+ *                             (e.g. 'PHNTM' -> 'PHTNM') as a single edit
+ *                             rather than two substitutions.
  *   extractClanGroups(rawPlayers, opts) — Groups players by clan tag
- *                              with size filtering and Levenshtein merge.
+ *                              with size filtering and Damerau-Levenshtein
+ *                              merge.
  *   explainClanGroups(rawPlayers, opts) — Same pipeline, but also returns a
  *                              trace of every exclusion and merge. For the
  *                              `!s3 clans` admin view.
@@ -38,6 +42,9 @@
  *                                is concentrated.
  *   getPlayerTag(eosID)        — Gets cached tag for a player.
  *   addPlayerToCache(eosID, name) — Adds/updates single player's tag.
+ *   recordConfirmedTag(eosID, rawPrefix) — Records a tag directly observed
+ *                              via a name-transition; high-confidence.
+ *   clearConfirmedTag(eosID)   — Clears an observed-transition tag.
  *   removePlayerFromCache(eosID) — Removes player from tag cache.
  *   clearPlayerTagCache()      — Clears all cached tags.
  *   getPlayerTagCache()        — Returns a copy of the tag cache.
@@ -53,7 +60,13 @@
  * - Five regex strategies for tag extraction: bracket, separator,
  *   double-space, short-tag, and bare prefix.
  * - Unicode-to-ASCII folding via NON_ASCII_MAP (const at end of file).
- * - Levenshtein merge coalesces near-matching tags within maxEditDistance.
+ * - Damerau-Levenshtein merge coalesces near-matching tags within
+ *   maxEditDistance, but only when both tags are at least minMergeLength
+ *   long — a 1-character edit is far less discriminating on a short tag
+ *   (e.g. 'CB' vs '8B') than on a long one, so short tags require an exact
+ *   match to group together. An adjacent-character transposition (e.g.
+ *   'PHNTM' -> 'PHTNM') counts as a single edit, not two substitutions —
+ *   empirically the dominant real-world typo shape for clan tags.
  * - Ignore-list filtering supports case-sensitive and case-insensitive modes.
  * - Per-player _playerTagCache supports incremental add/remove/clear
  *   for closed-loop updates from PlayersService.
@@ -81,6 +94,7 @@ export default class ClansService {
       minSize: 2,
       maxSize: 18,
       maxEditDistance: 1,
+      minMergeLength: 4,
       caseSensitive: false,
       ignoreList: [],
       pullEntireSquads: false,
@@ -102,6 +116,34 @@ export default class ClansService {
      * future guard logic.
      */
     this._playerTagCache = new Map();
+
+    /**
+     * @private Extraction strategy ('bracket'/'separator'/'doublespace'/
+     * 'shorttag'/'bare') behind each cached tag, tracked alongside
+     * _playerTagCache so addPlayerToCache() can corroborate a new
+     * low-confidence extraction against other already-cached players'
+     * high-confidence ones.
+     */
+    this._playerTagStrategy = new Map();
+
+    /**
+     * @private eosID -> tag directly observed via a name-transition (append/
+     * shrink/swap of Squad's own in-game clan-tag system), never a shape
+     * guess. See docs/clan-tag-confirmation-rework.md §2/§3.1. Treated as
+     * high-confidence — it corroborates other players' low-confidence
+     * extractions of the same tag.
+     */
+    this._confirmedTags = new Map();
+
+    /**
+     * @private eosID -> candidate tag rejected only for lack of corroboration
+     * (NOT rejected via ignoreList — that rejection is permanent, not
+     * pending). Re-checked by _healPendingLowConfidenceTag() whenever a new
+     * high-confidence/confirmed tag appears, so a bracketless clan doesn't
+     * stay invisible to the incremental cache just because of unlucky join
+     * order. See docs/clan-tag-confirmation-rework.md §3.5.
+     */
+    this._pendingLowConfidenceTags = new Map();
   }
 
   async mount() {
@@ -135,6 +177,7 @@ export default class ClansService {
       minSize: resolved.minSize,
       maxSize: resolved.maxSize,
       maxEditDistance: resolved.maxEditDistance,
+      minMergeLength: resolved.minMergeLength,
       caseSensitive: resolved.caseSensitive,
       ignoreList: Array.isArray(resolved.ignoreList) ? resolved.ignoreList : [],
       recruitSuffixes: Array.isArray(resolved.recruitSuffixes) ? resolved.recruitSuffixes : []
@@ -142,29 +185,51 @@ export default class ClansService {
   }
 
   extractRawPrefix(name) {
-    if (!name || typeof name !== 'string') return null;
+    return this._extractRawPrefixWithStrategy(name).raw;
+  }
 
-    const bracketRegex = /^\s*[\[\(【「『《╔├↾╬✦⟦╟|=<\{~\*](.+?)[\]\)】」』》╗┤↿╬✦⟧╢|=<>~\*\}]/;
+  /**
+   * Same detection as extractRawPrefix(), but also reports which strategy
+   * matched. 'bracket' and 'separator' require an explicit, deliberate tag
+   * delimiter and are treated as high-confidence; 'doublespace', 'shorttag',
+   * and 'bare' are heuristics over plain whitespace and routinely fire on
+   * ordinary words ('BIG', 'THE', 'MR') that aren't clan tags at all. The
+   * corroboration gate in _computeClanGroups() / buildPlayerTagCache() uses
+   * this distinction to decide which extractions can be trusted on their own.
+   *
+   * @private
+   * @param {string} name
+   * @returns {{raw: string|null, strategy: string|null}}
+   */
+  _extractRawPrefixWithStrategy(name) {
+    if (!name || typeof name !== 'string') return { raw: null, strategy: null };
+
+    const bracketRegex = /^\s*[\[\(【「『《╔├↾╬✦⟦╟|=<\{~\*%❀⇃←⌈](.+?)[\]\)】」』》╗┤↿╬✦⟧╢|=<>~\*\}%❀⇂→⌋]/;
     let match = name.match(bracketRegex);
-    if (match) return match[1].trim();
+    if (match) return { raw: match[1].trim(), strategy: 'bracket' };
 
-    const sepRegex = /^\s*(.{1,10}?)\s*(?:\/\/|\||-|:|\:\(|\:\)|†|™|✯|~|\*)\s+/;
+    const sepRegex = /^\s*(.{1,10}?)\s*(?:\/\/|\||-|:|\:\(|\:\)|†|™|✯|~|\*|↯|♠)\s+/;
     match = name.match(sepRegex);
-    if (match) return match[1].trim();
+    if (match) return { raw: match[1].trim(), strategy: 'separator' };
 
     const spaceRegex = /^\s*(.{1,10}?)\s{2,}/;
     match = name.match(spaceRegex);
-    if (match) return match[1].trim();
+    if (match) return { raw: match[1].trim(), strategy: 'doublespace' };
 
     const shortTagRegex = /^\s*([A-Z0-9]{2,4})\s+[A-Z]/;
     match = name.match(shortTagRegex);
-    if (match) return match[1].trim();
+    if (match) return { raw: match[1].trim(), strategy: 'shorttag' };
 
     const bareRegex = /^[\[<({]?([^\s\[\](){}<>]{2,7})\s+\S/u;
     match = name.match(bareRegex);
-    if (match) return match[1].trim();
+    if (match) return { raw: match[1].trim(), strategy: 'bare' };
 
-    return null;
+    return { raw: null, strategy: null };
+  }
+
+  /** @private True for strategies that require an explicit, deliberate tag delimiter. */
+  _isHighConfidenceStrategy(strategy) {
+    return strategy === 'bracket' || strategy === 'separator' || strategy === 'confirmed';
   }
 
   normalizeTag(raw) {
@@ -176,7 +241,14 @@ export default class ClansService {
       norm = norm.replace(new RegExp(key, 'gi'), val);
     }
 
-    norm = norm.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+    // Strip whitespace/punctuation/symbols/emoji, but keep any Unicode
+    // letter or number in ANY script — not just ASCII. A tag that's a real
+    // word in Cyrillic, Greek, or CJK (e.g. 'Ш', 'ネズミ') is identity-bearing
+    // and must survive; the NON_ASCII_MAP pass above already converted the
+    // Latin-lookalike characters (я→r, ν→v, …) to ASCII before this point,
+    // so what's left here is either genuine ASCII, a real non-Latin word, or
+    // decoration — and \p{L}/\p{N} is exactly the line between the last two.
+    norm = norm.replace(/[^\p{L}\p{N}]/gu, '').toUpperCase();
     return norm || null;
   }
 
@@ -215,34 +287,45 @@ export default class ClansService {
     return rawTag;
   }
 
-  levenshteinDistance(a, b) {
+  /**
+   * Optimal-string-alignment (restricted) Damerau-Levenshtein distance:
+   * standard insertion/deletion/substitution, plus an adjacent-character
+   * transposition ('PHNTM' -> 'PHTNM') counted as a single edit instead of
+   * two substitutions. Needs the full (m+1)x(n+1) table (not the rolling
+   * single-row trick plain Levenshtein uses) because a transposition looks
+   * back two rows and two columns — irrelevant cost at clan-tag lengths.
+   */
+  damerauLevenshteinDistance(a, b) {
     if (a === b) return 0;
     if (!a?.length) return b?.length || 0;
     if (!b?.length) return a.length;
 
-    let left = a;
-    let right = b;
-    if (left.length > right.length) {
-      [left, right] = [right, left];
-    }
+    const m = a.length;
+    const n = b.length;
+    const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
 
-    const m = left.length;
-    const n = right.length;
-    const dp = Array.from({ length: m + 1 }, (_, i) => i);
+    for (let i = 0; i <= m; i++) dp[i][0] = i;
+    for (let j = 0; j <= n; j++) dp[0][j] = j;
 
-    for (let j = 1; j <= n; j++) {
-      let prev = dp[0];
-      dp[0] = j;
-      for (let i = 1; i <= m; i++) {
-        const tmp = dp[i];
-        dp[i] = left[i - 1] === right[j - 1]
-          ? prev
-          : 1 + Math.min(prev, dp[i], dp[i - 1]);
-        prev = tmp;
+    for (let i = 1; i <= m; i++) {
+      for (let j = 1; j <= n; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        dp[i][j] = Math.min(
+          dp[i - 1][j] + 1,
+          dp[i][j - 1] + 1,
+          dp[i - 1][j - 1] + cost
+        );
+        if (
+          i > 1 && j > 1 &&
+          a[i - 1] === b[j - 2] &&
+          a[i - 2] === b[j - 1]
+        ) {
+          dp[i][j] = Math.min(dp[i][j], dp[i - 2][j - 2] + 1);
+        }
       }
     }
 
-    return dp[m];
+    return dp[m][n];
   }
 
   extractClanGroups(rawPlayers, options = {}) {
@@ -272,8 +355,20 @@ export default class ClansService {
    * grouping SmartAssign and TeamBalancer actually consume.
    *
    * Pipeline order matters and is reflected in the trace: extract → strip
-   * recruit suffix → normalize → ignore-list → Levenshtein merge → size bounds.
-   * A tag can therefore be merged and *then* fall outside the size bounds.
+   * recruit suffix → normalize → corroboration gate → ignore-list →
+   * Damerau-Levenshtein merge → size bounds. A tag can therefore be merged
+   * and *then* fall outside the size bounds.
+   * Damerau-Levenshtein merge only considers tag pairs where both tags are
+   * at least minMergeLength long, so short tags (e.g. 2-3 chars) never
+   * fuzzy-merge.
+   *
+   * Corroboration gate: 'bracket' and 'separator' extraction (an explicit
+   * `[TAG]` or `TAG //`) is high-confidence — deliberate formatting. The
+   * whitespace-only heuristics ('doublespace', 'shorttag', 'bare') routinely
+   * fire on ordinary words ('BIG', 'THE', 'MR', 'RAT') that aren't clan tags
+   * at all. A low-confidence extraction only survives if the SAME final key
+   * is also established by a high-confidence extraction from some other
+   * player — one real bracketed/separated member vouches for the rest.
    *
    * @private
    * @param {Array<{eosID: string, name: string}>} rawPlayers
@@ -285,6 +380,7 @@ export default class ClansService {
       minSize,
       maxSize,
       maxEditDistance,
+      minMergeLength,
       caseSensitive,
       ignoreList
     } = this.getGroupingOptions(options);
@@ -295,21 +391,64 @@ export default class ClansService {
       noTag: [],
       unnormalizable: [],
       recruitStripped: [],
+      uncorroborated: [],
       ignored: [],
       merged: [],
       sizeExcluded: [],
-      memberNames: new Map()
+      memberNames: new Map(),
+      memberStrategies: new Map()
     };
 
     // Pass 1: collect all normalized raw prefixes for context-aware suffix stripping
     const allNormalizedPrefixes = new Set();
     for (const player of rawPlayers || []) {
       if (!player?.name || !player?.eosID) continue;
+      const confirmedTag = this._confirmedTags.get(player.eosID);
+      if (confirmedTag) {
+        allNormalizedPrefixes.add(confirmedTag);
+        continue;
+      }
       const raw = this.extractRawPrefix(player.name);
       if (!raw) continue;
       const norm = this.normalizeTag(raw);
       if (norm) allNormalizedPrefixes.add(norm);
     }
+
+    // Pass 2: resolve each player's final key + extraction strategy, and
+    // collect which final keys are backed by at least one high-confidence
+    // (bracket/separator) extraction. Needed before bucketing so a
+    // low-confidence player can be checked against the WHOLE population's
+    // corroboration, not just players seen earlier in iteration order.
+    const resolved = [];
+    const highConfidenceKeys = new Set();
+    for (const player of rawPlayers || []) {
+      if (!player?.name || !player?.eosID) continue;
+
+      const confirmedTag = this._confirmedTags.get(player.eosID);
+      if (confirmedTag) {
+        resolved.push({
+          player,
+          original: confirmedTag,
+          raw: confirmedTag,
+          strategy: 'confirmed',
+          key: confirmedTag
+        });
+        highConfidenceKeys.add(confirmedTag);
+        continue;
+      }
+
+      const { raw: original, strategy } = this._extractRawPrefixWithStrategy(player.name);
+      if (!original) continue;
+
+      const raw = this._stripRecruitSuffixIfBaseExists(original, allNormalizedPrefixes);
+      const key = caseSensitive ? raw : this.normalizeTag(raw);
+      resolved.push({ player, original, raw, strategy, key });
+
+      if (key && this._isHighConfidenceStrategy(strategy)) {
+        highConfidenceKeys.add(key);
+      }
+    }
+    const resolvedByEosID = new Map(resolved.map((r) => [r.player.eosID, r]));
 
     const groups = {};
     for (const player of rawPlayers || []) {
@@ -322,14 +461,15 @@ export default class ClansService {
 
       trace.memberNames.set(player.eosID, player.name);
 
-      const original = this.extractRawPrefix(player.name);
-      if (!original) {
+      const entry = resolvedByEosID.get(player.eosID);
+      if (!entry) {
         trace.noTag.push({ eosID: player.eosID, name: player.name });
         continue;
       }
 
-      // Strip recruit suffix if base tag exists elsewhere
-      const raw = this._stripRecruitSuffixIfBaseExists(original, allNormalizedPrefixes);
+      trace.memberStrategies.set(player.eosID, entry.strategy);
+
+      const { original, raw, strategy, key } = entry;
       if (raw !== original) {
         trace.recruitStripped.push({
           eosID: player.eosID,
@@ -339,9 +479,13 @@ export default class ClansService {
         });
       }
 
-      const key = caseSensitive ? raw : this.normalizeTag(raw);
       if (!key) {
         trace.unnormalizable.push({ eosID: player.eosID, name: player.name, raw });
+        continue;
+      }
+
+      if (!this._isHighConfidenceStrategy(strategy) && !highConfidenceKeys.has(key)) {
+        trace.uncorroborated.push({ eosID: player.eosID, name: player.name, tag: key });
         continue;
       }
 
@@ -374,7 +518,13 @@ export default class ClansService {
 
         for (let i = 0; i < tags.length && !merged; i++) {
           for (let j = i + 1; j < tags.length && !merged; j++) {
-            const distance = this.levenshteinDistance(tags[i], tags[j]);
+            // A single-character edit is far more discriminating on a long tag
+            // than a short one — 'CB' vs '8B' is a coinflip, not a typo. Below
+            // minMergeLength, only an exact match (already bucketed together
+            // above) counts; fuzzy merging only kicks in at minMergeLength+.
+            if (Math.min(tags[i].length, tags[j].length) < minMergeLength) continue;
+
+            const distance = this.damerauLevenshteinDistance(tags[i], tags[j]);
             if (distance <= maxEditDistance) {
               const [keep, absorb] = groups[tags[i]].length >= groups[tags[j]].length
                 ? [tags[i], tags[j]]
@@ -434,23 +584,58 @@ export default class ClansService {
     const allNormalizedPrefixes = new Set();
     for (const player of players || []) {
       if (!player?.eosID) continue;
+      const confirmedTag = this._confirmedTags.get(player.eosID);
+      if (confirmedTag) {
+        allNormalizedPrefixes.add(confirmedTag);
+        continue;
+      }
       const raw = this.extractRawPrefix(player.name);
       if (!raw) continue;
       const norm = this.normalizeTag(raw);
       if (norm) allNormalizedPrefixes.add(norm);
     }
 
+    // Pass 2: resolve each player's final key + extraction strategy, and
+    // collect which final keys are backed by at least one high-confidence
+    // (bracket/separator) extraction. See _computeClanGroups() for why —
+    // this batch method must gate the same way or SmartAssign's join-time
+    // routing (which reads this cache) would drift from what TeamBalancer's
+    // extractClanGroups() decides for the same population.
+    const resolved = new Map();
+    const highConfidenceKeys = new Set();
     for (const player of players || []) {
       if (!player?.eosID) continue;
 
-      let raw = this.extractRawPrefix(player.name);
-
-      // Strip recruit suffix if base tag exists elsewhere
-      if (raw) {
-        raw = this._stripRecruitSuffixIfBaseExists(raw, allNormalizedPrefixes);
+      const confirmedTag = this._confirmedTags.get(player.eosID);
+      if (confirmedTag) {
+        resolved.set(player.eosID, { key: confirmedTag, strategy: 'confirmed' });
+        highConfidenceKeys.add(confirmedTag);
+        continue;
       }
 
-      let tag = raw ? (caseSensitive ? raw : this.normalizeTag(raw)) : null;
+      const { raw: original, strategy } = this._extractRawPrefixWithStrategy(player.name);
+      if (!original) {
+        resolved.set(player.eosID, { key: null, strategy: null });
+        continue;
+      }
+
+      const raw = this._stripRecruitSuffixIfBaseExists(original, allNormalizedPrefixes);
+      const key = raw ? (caseSensitive ? raw : this.normalizeTag(raw)) : null;
+      resolved.set(player.eosID, { key, strategy });
+
+      if (key && this._isHighConfidenceStrategy(strategy)) {
+        highConfidenceKeys.add(key);
+      }
+    }
+
+    for (const player of players || []) {
+      if (!player?.eosID) continue;
+
+      let { key: tag, strategy } = resolved.get(player.eosID);
+
+      if (tag && !this._isHighConfidenceStrategy(strategy) && !highConfidenceKeys.has(tag)) {
+        tag = null;
+      }
 
       // Filter out ignored clan tags — set cache entry to null so
       // the player is treated as clanless for all downstream lookups.
@@ -513,7 +698,10 @@ export default class ClansService {
 
   addPlayerToCache(eosID, name) {
     if (!eosID || !name) return;
-    let raw = this.extractRawPrefix(name);
+    if (this._confirmedTags.has(eosID)) return;
+
+    const { raw: original, strategy } = this._extractRawPrefixWithStrategy(name);
+    let raw = original;
 
     // Strip recruit suffix if base tag exists in the existing cache
     if (raw && this.options.recruitSuffixes?.length) {
@@ -524,29 +712,122 @@ export default class ClansService {
       raw = this._stripRecruitSuffixIfBaseExists(raw, existingTags);
     }
 
-    let tag = raw ? (this.options.caseSensitive ? raw : this.normalizeTag(raw)) : null;
+    let candidateTag = raw ? (this.options.caseSensitive ? raw : this.normalizeTag(raw)) : null;
 
-    // Filter out ignored clan tags — set cache entry to null so
-    // the player is treated as clanless for all downstream lookups.
-    if (tag && this.options.ignoreList?.length > 0) {
+    // Ignore-listed tags are permanently unusable — filter BEFORE the
+    // corroboration check, not after. If this ran after, a tag that is BOTH
+    // ignore-listed AND uncorroborated would already be null by the time the
+    // ignore check's guard runs, so rejectedForCorroboration would
+    // incorrectly stay true — silently filing an ignored word into the
+    // pending-heal map. Filtering here means an ignored candidate never
+    // enters the corroboration logic at all.
+    if (candidateTag && this.options.ignoreList?.length > 0) {
       const normalizedIgnores = this.options.caseSensitive
         ? new Set(this.options.ignoreList)
         : new Set(this.options.ignoreList.map((t) => this.normalizeTag(t)).filter(Boolean));
-      if (normalizedIgnores.has(tag)) {
+      if (normalizedIgnores.has(candidateTag)) candidateTag = null;
+    }
+
+    let tag = candidateTag;
+    let rejectedForCorroboration = false;
+
+    // Low-confidence extractions ('doublespace'/'shorttag'/'bare' — ordinary
+    // words like 'BIG'/'THE' routinely match these) only count if some OTHER
+    // currently-cached player already established the same tag via an
+    // explicit bracket/separator/confirmed source. Mirrors the batch-path
+    // gate in _computeClanGroups()/buildPlayerTagCache() for this
+    // incremental, per-join path. A rejected candidate is remembered in
+    // _pendingLowConfidenceTags and retroactively healed the moment a
+    // matching high-confidence tag appears — see _healPendingLowConfidenceTag().
+    if (tag && !this._isHighConfidenceStrategy(strategy)) {
+      let corroborated = false;
+      for (const [otherEosID, otherTag] of this._playerTagCache) {
+        if (otherEosID === eosID || otherTag !== tag) continue;
+        if (this._isHighConfidenceStrategy(this._playerTagStrategy.get(otherEosID))) {
+          corroborated = true;
+          break;
+        }
+      }
+      if (!corroborated) {
         tag = null;
+        rejectedForCorroboration = true;
       }
     }
 
     this._playerTagCache.set(eosID, tag);
+    this._playerTagStrategy.set(eosID, strategy);
+
+    if (rejectedForCorroboration && candidateTag) {
+      this._pendingLowConfidenceTags.set(eosID, candidateTag);
+    } else {
+      this._pendingLowConfidenceTags.delete(eosID);
+    }
+
+    if (tag && this._isHighConfidenceStrategy(strategy)) {
+      this._healPendingLowConfidenceTag(tag);
+    }
+  }
+
+  /**
+   * Records a clan tag directly observed via a name-transition (append/
+   * shrink/swap), never a shape guess. Treated as high-confidence — it
+   * corroborates other players' low-confidence extractions of the same tag.
+   * Only recordConfirmedTag()/clearConfirmedTag() may change a confirmed
+   * entry; addPlayerToCache() early-returns for an already-confirmed player.
+   * See docs/clan-tag-confirmation-rework.md §3.1.
+   */
+  recordConfirmedTag(eosID, rawPrefix) {
+    if (!eosID || !rawPrefix) return;
+    let tag = this.options.caseSensitive ? rawPrefix : this.normalizeTag(rawPrefix);
+    if (!tag) return;
+    if (this.options.ignoreList?.length > 0) {
+      const normalizedIgnores = this.options.caseSensitive
+        ? new Set(this.options.ignoreList)
+        : new Set(this.options.ignoreList.map((t) => this.normalizeTag(t)).filter(Boolean));
+      if (normalizedIgnores.has(tag)) return;
+    }
+    this._confirmedTags.set(eosID, tag);
+    this._playerTagCache.set(eosID, tag);
+    this._playerTagStrategy.set(eosID, 'confirmed');
+    this._healPendingLowConfidenceTag(tag);
+  }
+
+  clearConfirmedTag(eosID) {
+    if (!eosID || !this._confirmedTags.has(eosID)) return;
+    this._confirmedTags.delete(eosID);
+    this._playerTagCache.delete(eosID);
+    this._playerTagStrategy.delete(eosID);
+  }
+
+  /**
+   * Retroactively promotes any pending low-confidence candidate matching
+   * `tag` now that a high-confidence/confirmed source has corroborated it.
+   * Bounded by the number of currently-pending uncorroborated players —
+   * realistically single digits — so no batching/debouncing is needed.
+   * See docs/clan-tag-confirmation-rework.md §3.5.
+   * @private
+   */
+  _healPendingLowConfidenceTag(tag) {
+    for (const [pendingEosID, pendingTag] of this._pendingLowConfidenceTags) {
+      if (pendingTag !== tag) continue;
+      this._playerTagCache.set(pendingEosID, tag);
+      this._pendingLowConfidenceTags.delete(pendingEosID);
+    }
   }
 
   removePlayerFromCache(eosID) {
     if (!eosID) return;
     this._playerTagCache.delete(eosID);
+    this._playerTagStrategy.delete(eosID);
+    this._confirmedTags.delete(eosID);
+    this._pendingLowConfidenceTags.delete(eosID);
   }
 
   clearPlayerTagCache() {
     this._playerTagCache.clear();
+    this._playerTagStrategy.clear();
+    this._confirmedTags.clear();
+    this._pendingLowConfidenceTags.clear();
   }
 
   getPlayerTagCache() {
@@ -555,10 +836,23 @@ export default class ClansService {
 
   rebuildFromAllPlayers(players) {
     this._playerTagCache.clear();
+    this._playerTagStrategy.clear();
+
     for (const p of players || []) {
       if (!p?.eosID) continue;
-      this.addPlayerToCache(p.eosID, p.name);
+      const { strategy } = this._extractRawPrefixWithStrategy(p.name);
+      this._playerTagStrategy.set(p.eosID, strategy);
     }
+
+    // Delegate to the corroboration-aware batch method rather than looping
+    // addPlayerToCache() — a full rebuild sees the whole population at once,
+    // so it should reach the exact same answer as extractClanGroups() does
+    // for that population, with no dependency on join order.
+    const cache = this.buildPlayerTagCache(players || []);
+    for (const [eosID, tag] of cache) {
+      this._playerTagCache.set(eosID, tag);
+    }
+
     this.verboseLogger(2, `[Clans] Tag cache rebuilt: ${this._playerTagCache.size} players.`);
   }
 }

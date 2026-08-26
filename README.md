@@ -94,7 +94,7 @@ Consumer plugins discover S³ at runtime and access services through flat getter
 
 ## S³ Version Compatibility
 
-S³ is currently **v1.4.0**. Each consumer plugin declares its own floor — they are
+S³ is currently **v1.5.0**. Each consumer plugin declares its own floor — they are
 not all the same, so pinning S³ to the lowest one will stop the others mounting:
 
 | Consumer | Requires S³ ≥ | Why |

@@ -461,7 +461,7 @@ await runTest('buildPlayersEmbeds stays within Discord limits on a full 100-play
 /**
  * A clan fixture that trips every exclusion path at once:
  *   ACE  (3)  → survives
- *   ACS  (1)  → merged into ACE (Levenshtein 1)
+ *   ACS  (1)  → merged into ACE (Damerau-Levenshtein 1)
  *   BIG  (5)  → excluded, above maxSize 4
  *   SML  (1)  → excluded, below minSize 2
  *   MOD  (2)  → excluded, on ignoreList
@@ -501,6 +501,7 @@ function clanFixture() {
       minSize: 2,
       maxSize: 4,
       maxEditDistance: 1,
+      minMergeLength: 0,
       caseSensitive: false,
       ignoreList: ['MOD'],
       recruitSuffixes: ['r', '-r']
@@ -517,6 +518,41 @@ await runTest('buildClansEmbeds reports the active groups', async () => {
   // ACE absorbed ACS → 4 members; KM absorbed the KMr recruit → 3 members.
   assert.match(active.value, /\*\*ACE\*\* \(4\)/);
   assert.match(active.value, /\*\*KM\*\* \(3\)/);
+});
+
+await runTest('buildClansEmbeds marks high-confidence members with the • glyph', async () => {
+  const plugin = makePlugin(clanFixture());
+  const active = buildClansEmbeds(plugin)[0].fields.find((f) => f.name.includes('Active Clan Groups'));
+
+  // Every member of this fixture is bracket-extracted (high-confidence).
+  assert.match(active.value, /One•/);
+  assert.match(active.value, /Thirteen•/);
+});
+
+await runTest('buildClansEmbeds marks a confirmed player with the ✓ glyph and reports the Confirmed tile', async () => {
+  const fixture = clanFixture();
+  const plugin = makePlugin(fixture);
+
+  // Confirm a player's tag via the observed-transition path rather than
+  // relying on their name shape, then render the embed from that state.
+  plugin.services.clans.recordConfirmedTag('c1', 'ACE');
+
+  const embeds = buildClansEmbeds(plugin);
+  const active = embeds[0].fields.find((f) => f.name.includes('Active Clan Groups'));
+  assert.match(active.value, /One✓/);
+
+  const confirmedTile = embeds[0].fields.find((f) => f.name === 'Confirmed');
+  assert.ok(confirmedTile, 'expected a Confirmed tile');
+  assert.equal(confirmedTile.value, '✓ 1');
+});
+
+await runTest('buildClansEmbeds reports the Confirmed tile as zero when nobody is confirmed', async () => {
+  const plugin = makePlugin(clanFixture());
+  const embeds = buildClansEmbeds(plugin);
+
+  const confirmedTile = embeds[0].fields.find((f) => f.name === 'Confirmed');
+  assert.ok(confirmedTile, 'expected a Confirmed tile');
+  assert.equal(confirmedTile.value, '⚫ 0');
 });
 
 await runTest('buildClansEmbeds explains size-bound exclusions with the bound that failed', async () => {
@@ -538,12 +574,12 @@ await runTest('buildClansEmbeds explains ignoreList exclusions', async () => {
   assert.match(cfgField.value, /\*\*MOD\*\* \(2\) — on `ignoreList`/);
 });
 
-await runTest('buildClansEmbeds explains Levenshtein merges with the distance', async () => {
+await runTest('buildClansEmbeds explains Damerau-Levenshtein merges with the distance', async () => {
   const plugin = makePlugin(clanFixture());
   const detail = buildClansEmbeds(plugin)[1];
-  const mergeField = detail.fields.find((f) => f.name.includes('Merged by Levenshtein'));
+  const mergeField = detail.fields.find((f) => f.name.includes('Merged by Damerau-Levenshtein'));
 
-  assert.ok(mergeField, 'expected a Merged by Levenshtein field');
+  assert.ok(mergeField, 'expected a Merged by Damerau-Levenshtein field');
   assert.match(mergeField.name, /≤ 1/);
   assert.match(mergeField.value, /\*\*ACE\*\* ⟵ ACS \(d1\)/);
 });
@@ -575,6 +611,7 @@ await runTest('buildClansEmbeds surfaces the grouping config that produced the r
   assert.match(cfg.value, /minSize: `2`/);
   assert.match(cfg.value, /maxSize: `4`/);
   assert.match(cfg.value, /maxEditDistance: `1`/);
+  assert.match(cfg.value, /minMergeLength: `0`/);
   assert.match(cfg.value, /ignoreList: `MOD`/);
   assert.match(cfg.value, /recruitSuffixes: `r, -r`/);
 });
@@ -587,7 +624,7 @@ await runTest('buildClansEmbeds flags a merged group that then failed the size b
       { eosID: 'm2', name: '[AAB] Two', teamID: 1, squadID: null }
     ],
     squads: [],
-    clanOptions: { minSize: 3, maxSize: 10, maxEditDistance: 1 }
+    clanOptions: { minSize: 3, maxSize: 10, maxEditDistance: 1, minMergeLength: 0 }
   });
   const detail = buildClansEmbeds(plugin)[1];
   const sizeField = detail.fields.find((f) => f.name.includes('Excluded by Size'));
@@ -595,7 +632,7 @@ await runTest('buildClansEmbeds flags a merged group that then failed the size b
   assert.ok(sizeField, 'expected an Excluded by Size field');
   assert.match(sizeField.value, /\(2\) — below minSize `3` \*\(post-merge\)\*/);
 
-  const mergeField = detail.fields.find((f) => f.name.includes('Merged by Levenshtein'));
+  const mergeField = detail.fields.find((f) => f.name.includes('Merged by Damerau-Levenshtein'));
   assert.match(mergeField.value, /\*\(later excluded\)\*/);
 });
 

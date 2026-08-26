@@ -838,7 +838,29 @@ export function buildClansEmbeds(plugin) {
 
   // Clan tags are only alphanumeric when caseSensitive is false; with it on the
   // raw tag is used verbatim and can carry markdown characters, as can any name.
-  const nameOf = (id) => escapeMarkdown(truncate(trace.memberNames.get(id) ?? id, 18));
+  // Strategy ('bracket'/'separator'/'confirmed'/'doublespace'/'shorttag'/'bare')
+  // comes from trace.memberStrategies, populated alongside memberNames by the
+  // identical pipeline explainClanGroups() runs — never read ClansService's
+  // internal _playerTagStrategy map directly here (see
+  // docs/clan-tag-confirmation-rework.md §3.3).
+  //
+  // Confidence marker per player, appended after their name: ✓ confirmed
+  // (ground truth from an observed name-transition), • high-confidence
+  // (explicit bracket/separator formatting), ◦ corroborated low-confidence
+  // (a bare/doublespace/shorttag guess vouched for by another player's
+  // high-confidence tag). Flat symbolic glyphs, not per-strategy emoji —
+  // three confidence tiers, not six strategy names.
+  const strategyMarker = (strategy) => {
+    if (strategy === 'confirmed') return '✓';
+    if (strategy === 'bracket' || strategy === 'separator') return '•';
+    if (strategy) return '◦';
+    return '';
+  };
+  const nameOf = (id) => {
+    const base = escapeMarkdown(truncate(trace.memberNames.get(id) ?? id, 18));
+    const marker = strategyMarker(trace.memberStrategies?.get(id));
+    return marker ? `${base}${marker}` : base;
+  };
   const tagOf = (tag) => escapeMarkdown(truncate(String(tag), 24));
   const memberList = (ids, cap = 6) => {
     const shown = ids.slice(0, cap).map(nameOf).join(', ');
@@ -863,11 +885,16 @@ export function buildClansEmbeds(plugin) {
   const groupEntries = Object.entries(groups).sort(([, a], [, b]) => b.length - a.length);
   const groupedPlayerCount = groupEntries.reduce((n, [, ids]) => n + ids.length, 0);
   const excludedCount = trace.ignored.length + trace.sizeExcluded.length;
+  let confirmedCount = 0;
+  for (const strategy of trace.memberStrategies?.values() ?? []) {
+    if (strategy === 'confirmed') confirmedCount += 1;
+  }
 
   // ── Summary embed ───────────────────────────────────────────────
   const summaryFields = [
     { name: 'Players Scanned', value: `${trace.scanned}`, inline: true },
     { name: 'Groups Active', value: `🟢 ${groupEntries.length}`, inline: true },
+    { name: 'Confirmed', value: confirmedCount ? `✓ ${confirmedCount}` : '⚫ 0', inline: true },
     { name: 'Tags Excluded', value: excludedCount ? `🟠 ${excludedCount}` : '⚫ 0', inline: true },
     { name: 'Players Grouped', value: `${groupedPlayerCount}`, inline: true },
     { name: 'No Tag Detected', value: `${trace.noTag.length}`, inline: true },
@@ -876,7 +903,7 @@ export function buildClansEmbeds(plugin) {
       name: '⚙️ Grouping Config',
       value: [
         `minSize: \`${options.minSize}\` · maxSize: \`${options.maxSize}\``,
-        `maxEditDistance: \`${options.maxEditDistance}\` · caseSensitive: \`${options.caseSensitive}\``,
+        `maxEditDistance: \`${options.maxEditDistance}\` · minMergeLength: \`${options.minMergeLength}\` · caseSensitive: \`${options.caseSensitive}\``,
         `recruitSuffixes: \`${options.recruitSuffixes.length ? options.recruitSuffixes.join(', ') : 'none'}\``,
         `ignoreList: \`${options.ignoreList.length ? options.ignoreList.join(', ') : 'none'}\``
       ].join('\n'),
@@ -903,7 +930,8 @@ export function buildClansEmbeds(plugin) {
     color: 0xf1c40f,
     title: '🛡️ Clan Groups',
     description: 'Pipeline order: extract → strip recruit suffix → normalize → '
-      + 'ignoreList → Levenshtein merge → size bounds.',
+      + 'corroboration gate → ignoreList → Damerau-Levenshtein merge → size bounds.\n'
+      + '*Markers: ✓ confirmed · • high-confidence · ◦ corroborated*',
     fields: summaryFields,
     timestamp: new Date().toISOString()
   }];
@@ -947,7 +975,7 @@ export function buildClansEmbeds(plugin) {
     });
     pushLineField(
       detailFields,
-      `🔗 Merged by Levenshtein ≤ ${options.maxEditDistance} (${trace.merged.length})`,
+      `🔗 Merged by Damerau-Levenshtein ≤ ${options.maxEditDistance}, ≥${options.minMergeLength} chars (${trace.merged.length})`,
       lines,
       { maxFields: 2 }
     );
@@ -988,6 +1016,15 @@ export function buildClansEmbeds(plugin) {
       ),
       inline: false
     });
+  }
+
+  if (trace.uncorroborated?.length > 0) {
+    pushLineField(
+      detailFields,
+      `🔍 Uncorroborated (${trace.uncorroborated.length})`,
+      trace.uncorroborated.map((e) => `**${tagOf(e.tag)}** — ${nameOf(e.eosID)}`),
+      { maxFields: 1 }
+    );
   }
 
   if (trace.skipped.length > 0) {

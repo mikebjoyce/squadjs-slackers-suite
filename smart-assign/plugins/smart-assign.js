@@ -90,8 +90,8 @@
  *        Elo scoring). On disconnect, the Map is updated synchronously and the DB
  *        is written async (fire-and-forget) for crash recovery.
  *     3.5. Clan Grouping: If a player is in a clan and ALL clan mates are on one
- *        team, route the player there (provided pop cap allows). Uses lightweight
- *        _playerTagCache for fast tag lookups via S³ ClansService.
+ *        team, route the player there (provided pop cap allows). Reads the shared
+ *        S³ ClansService tag cache directly — SA holds no local copy.
  *     4. Elo Balancing: Combines three metrics—Mean ELO difference (0.6x), Top-15
  *        ELO difference (0.4x), and Veteran Parity Penalty (300x)—passed through a
  *        non-linear penalty curve to find the team placement with the lowest
@@ -127,9 +127,9 @@
  * enableEventLogging: Toggle JSONL event logging (default: true).
  * enableDatabaseLogging: If true, mirrors JSONL event data into database tables
  *   for querying (default: false).
- * handshakeWithSwitch: Enable SA-Switch handshake for queued swaps (default: false).
+ * handshakeWithSwitch: Enable SA-Switch handshake for queued swaps (default: true).
  * handshakeScoreThreshold: Scoring threshold for eloGated handshake (default: 0.5).
- * handshakeMode: Handshake mode — "eloGated" or "queueDrain" (default: 'eloGated').
+ * handshakeMode: Handshake mode — "eloGated" or "queueDrain" (default: 'queueDrain').
  *
  * ─── AUTHOR ──────────────────────────────────────────────────────
  *
@@ -147,7 +147,7 @@ import SAEventLogger from '../utils/sa-event-logger.js';
 import { evaluateTeamAssignment, getRating, getPenalty, computeScore } from '../utils/sa-team-evaluator.js';
 
 export default class SmartAssign extends S3PluginBase {
-  static version = '2.1.1';
+  static version = '2.1.2';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';

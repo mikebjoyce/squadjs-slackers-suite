@@ -1,4 +1,4 @@
-# SlackersSquadServices (S³) Plugin v1.4.0
+# SlackersSquadServices (S³) Plugin v1.5.0
 
 **Centralised service container for shared state across SquadJS plugins**
 
@@ -146,7 +146,7 @@ The `!s3` admin command surface is organised across:
 | Command | Handler | Description |
 |---------|---------|-------------|
 | `!s3 players` | `s3-commands.js` | Population overview + one embed per team, broken down by squad. Marks squad leaders (👑), locked squads, and per-player locks. "Unassigned" means not in a squad. |
-| `!s3 clans` | `s3-commands.js` | Active clan groups, plus a second embed explaining why every other tag was excluded (below `minSize`, above `maxSize`, on `ignoreList`, unnormalizable) and every Levenshtein merge and recruit-suffix strip |
+| `!s3 clans` | `s3-commands.js` | Active clan groups, plus a second embed explaining why every other tag was excluded (below `minSize`, above `maxSize`, on `ignoreList`, unnormalizable) and every Damerau-Levenshtein merge and recruit-suffix strip |
 | `!s3 db status` | `s3-commands.js` | Connector, pending migrations, per-plugin schema versions |
 | `!s3 db export` | `s3-export-import.js` | JSON export. Models declare an `exportTier` — `historical` and `logging` are included by default, `ephemeral` is not |
 | `!s3 db export --all` | `s3-export-import.js` | Also includes the `ephemeral` tier |
@@ -225,7 +225,8 @@ current number.
 | `enableClanTagGrouping` | no | boolean | `true` | Enable clan-aware team grouping |
 | `minClanGroupSize` | no | number | `2` | Minimum members to group as a clan |
 | `maxClanGroupSize` | no | number | `18` | Maximum members to group as a clan |
-| `clanTagMaxEditDistance` | no | number | `1` | Levenshtein distance for tag merging |
+| `clanTagMaxEditDistance` | no | number | `1` | Damerau-Levenshtein distance for tag merging (adjacent-character transpositions count as 1 edit) |
+| `clanTagMinMergeLength` | no | number | `4` | Minimum tag length eligible for Damerau-Levenshtein merging; shorter tags need an exact match |
 | `clanTagCaseSensitive` | no | boolean | `false` | Case-insensitive tag normalisation with lookalike mapping |
 | `clanTagIgnoreList` | no | array | `[]` | Clan tags excluded from grouping |
 | `clanRecruitSuffixes` | no | array | `["r", "-r"]` | Suffixes to strip from clan tags when the base tag (without suffix) exists on other players. Enabled by default for common recruit tags (case-insensitive, so "R" and "-R" are also matched). Set to `[]` to disable. Stripping only occurs when the base tag is present on at least one other player in the data set. |

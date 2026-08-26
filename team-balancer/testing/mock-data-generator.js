@@ -421,7 +421,7 @@ export function generateScenario_RealWorldNames() {
   // Bracketed pair + bare prefix. Strategy 1 captures `♣ΛCE` and `♣ΛC€`
   // from the bracketed names; strategy 5 captures `♣ΛCE` from the bare
   // one. The Real-world test runs with `maxEditDistance: 1`, so the
-  // `♣ΛC€` variant merges into `♣ΛCE` (Levenshtein 1) and all three
+  // `♣ΛC€` variant merges into `♣ΛCE` (edit distance 1) and all three
   // players group together. In `caseSensitive: false` deployments the
   // `€ → e` entry in NON_ASCII_MAP would also collapse them.
   push(15, 2, 10, '[♣ΛCE] Hans_Wurst');

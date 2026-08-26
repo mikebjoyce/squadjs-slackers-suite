@@ -658,6 +658,117 @@ await runTest('isLeader accepts the RCON string form', async () => {
   await service.unmount();
 });
 
+await runTest('a name change after initial registration refreshes the ClansService tag cache', async () => {
+  // Real prod scenario: a clan tag is resolved server-side after connect and
+  // isn't in the PLAYER_CONNECTED name yet, so the very first addPlayerToCache()
+  // call (in the S3_PLAYER_JOINED path) sees a tagless name and caches null.
+  // Nothing used to ever call addPlayerToCache() again for that player, so a
+  // late-arriving tag stayed invisible to clan grouping for their whole
+  // session. The update path in _registerPlayer() must re-push the cache
+  // whenever a name actually changes.
+  const addPlayerToCacheCalls = [];
+  const clans = {
+    addPlayerToCache: (eosID, name) => addPlayerToCacheCalls.push({ eosID, name }),
+    recordConfirmedTag: () => {},
+    clearConfirmedTag: () => {},
+    rebuildFromAllPlayers: () => {}
+  };
+  const server = new MockServer();
+  const service = new PlayersService({ server, parent: { services: { clans } } });
+  await service.mount();
+
+  server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: null, isLeader: false }];
+  await service.handleUpdatedPlayerInfo();
+  addPlayerToCacheCalls.length = 0; // ignore the initial-registration call; test the refresh path only
+
+  // No-op tick: name unchanged, must not re-scan the cache.
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(addPlayerToCacheCalls.length, 0, 'unchanged name must not trigger a refresh');
+
+  // The clan tag lands in the name on a later poll.
+  server.players = [{ eosID: 'e1', steamID: 's1', name: '[ABC] Alpha', teamID: 1, squadID: null, isLeader: false }];
+  await service.handleUpdatedPlayerInfo();
+
+  assert.equal(addPlayerToCacheCalls.length, 1);
+  assert.deepEqual(addPlayerToCacheCalls[0], { eosID: 'e1', name: '[ABC] Alpha' });
+
+  await service.unmount();
+});
+
+// ─── Observed name-transition confirmed-tag detection (§3.2) ──────
+
+function makeClansSpy() {
+  const calls = { addPlayerToCache: [], recordConfirmedTag: [], clearConfirmedTag: [] };
+  const clans = {
+    addPlayerToCache: (eosID, name) => calls.addPlayerToCache.push({ eosID, name }),
+    recordConfirmedTag: (eosID, rawPrefix) => calls.recordConfirmedTag.push({ eosID, rawPrefix }),
+    clearConfirmedTag: (eosID) => calls.clearConfirmedTag.push({ eosID }),
+    rebuildFromAllPlayers: () => {}
+  };
+  return { clans, calls };
+}
+
+async function registerThenRename(firstName, secondName) {
+  const { clans, calls } = makeClansSpy();
+  const server = new MockServer();
+  const service = new PlayersService({ server, parent: { services: { clans } } });
+  await service.mount();
+
+  server.players = [{ eosID: 'e1', steamID: 's1', name: firstName, teamID: 1, squadID: null, isLeader: false }];
+  await service.handleUpdatedPlayerInfo();
+
+  server.players = [{ eosID: 'e1', steamID: 's1', name: secondName, teamID: 1, squadID: null, isLeader: false }];
+  await service.handleUpdatedPlayerInfo();
+
+  await service.unmount();
+  return calls;
+}
+
+await runTest('append transition (tag arrives) calls recordConfirmedTag with the new leading tokens', async () => {
+  const calls = await registerThenRename('Alpha', 'XYZ Alpha');
+  assert.deepEqual(calls.recordConfirmedTag, [{ eosID: 'e1', rawPrefix: 'XYZ' }]);
+  assert.equal(calls.clearConfirmedTag.length, 0);
+});
+
+await runTest('shrink transition (tag removed) calls clearConfirmedTag', async () => {
+  const calls = await registerThenRename('XYZ Alpha', 'Alpha');
+  assert.deepEqual(calls.clearConfirmedTag, [{ eosID: 'e1' }]);
+  assert.equal(calls.recordConfirmedTag.length, 0);
+});
+
+await runTest('swap transition (same trailing tokens, leading token differs) calls recordConfirmedTag with the new tag', async () => {
+  const calls = await registerThenRename('XYZ Alpha', 'ABC Alpha');
+  assert.deepEqual(calls.recordConfirmedTag, [{ eosID: 'e1', rawPrefix: 'ABC' }]);
+  assert.equal(calls.clearConfirmedTag.length, 0);
+});
+
+await runTest('non-transition rename with differing token counts and no shared trailing tokens calls neither', async () => {
+  const calls1 = await registerThenRename('Alpha', 'John Smith');
+  assert.equal(calls1.recordConfirmedTag.length, 0);
+  assert.equal(calls1.clearConfirmedTag.length, 0);
+
+  const calls2 = await registerThenRename('John Smith', 'Bob');
+  assert.equal(calls2.recordConfirmedTag.length, 0);
+  assert.equal(calls2.clearConfirmedTag.length, 0);
+});
+
+await runTest('non-transition rename with same token count but no shared tokens calls neither (regression: swap fix)', async () => {
+  // Critical regression test: an earlier draft checked only "does the
+  // leading token differ," which would have wrongly confirmed 'Charlie' as
+  // this player's clan tag. The correct condition additionally requires
+  // every token after the first to match exactly between old and new name.
+  const calls = await registerThenRename('Alpha Bravo', 'Charlie Delta');
+  assert.equal(calls.recordConfirmedTag.length, 0);
+  assert.equal(calls.clearConfirmedTag.length, 0);
+});
+
+await runTest('non-transition rename with single token on both sides calls neither', async () => {
+  // A single-token name has no base name to anchor a swap against.
+  const calls = await registerThenRename('Alpha', 'Bob');
+  assert.equal(calls.recordConfirmedTag.length, 0);
+  assert.equal(calls.clearConfirmedTag.length, 0);
+});
+
 if (!process.exitCode) {
   console.log('\nAll players-service tests passed.');
 }

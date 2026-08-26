@@ -1694,6 +1694,7 @@ export default class PlayersService {
     }
 
     const previousTeamID = state.teamID;
+    const previousName = state.name;
 
     state.name = rawPlayer?.name || state.name;
     state.teamID = rawPlayer?.teamID ?? null;
@@ -1709,6 +1710,64 @@ export default class PlayersService {
     // all, hence the undefined-means-keep guard rather than a bare `??`.
     state.isLeader = normalizeIsLeader(rawPlayer?.isLeader, state.isLeader);
     state.lastSeenAt = now;
+
+    // Refresh the ClansService tag cache when a name change lands after the
+    // player's initial registration. A clan tag is resolved server-side and
+    // often isn't present yet on PLAYER_CONNECTED's name — it can land a
+    // few RCON polls later — but addPlayerToCache() only ever ran once, at
+    // that first (possibly tagless) name. Without this, a player whose tag
+    // arrived late stayed invisible to clan grouping for their whole
+    // session. Gated on an actual name change so this doesn't re-run the
+    // cache's corroboration scan on every tick for every unchanged player.
+    //
+    // Squad's own in-game clan-tag system prepends the tag onto the
+    // already-visible name a few seconds after it resolves, producing one of
+    // three observable transitions (see docs/clan-tag-confirmation-rework.md
+    // §2): append (tag arrives — old name is a trailing run of tokens of the
+    // new name), shrink (tag removed — new name is a trailing run of tokens
+    // of the old name), or swap (tag changed directly — same token count,
+    // only the leading token differs, every other token matches exactly).
+    // These are ground truth, not a shape guess, so they're recorded as
+    // "confirmed" tags that corroborate other players' low-confidence
+    // extractions of the same tag. Token-based comparison (not raw-character
+    // endsWith) is required — a character-level suffix check misclassifies
+    // swaps whose old/new leading tokens happen to share a trailing
+    // character (e.g. "meep"/"moop").
+    if (state.eosID && rawPlayer?.name && rawPlayer.name !== previousName && this.parent?.services?.clans) {
+      const clans = this.parent.services.clans;
+      const oldTokens = (previousName || '').trim().split(/\s+/).filter(Boolean);
+      const newTokens = rawPlayer.name.trim().split(/\s+/).filter(Boolean);
+
+      const isSuffixOf = (shorter, longer) =>
+        shorter.length > 0 && longer.length > shorter.length &&
+        shorter.every((tok, i) => tok === longer[longer.length - shorter.length + i]);
+
+      if (isSuffixOf(oldTokens, newTokens)) {
+        // Append: tag arrived. old name is preserved as a trailing run of tokens.
+        const confirmedRaw = newTokens.slice(0, newTokens.length - oldTokens.length).join(' ');
+        if (confirmedRaw) clans.recordConfirmedTag(state.eosID, confirmedRaw);
+      } else if (isSuffixOf(newTokens, oldTokens)) {
+        // Shrink: tag removed. new name is preserved as a trailing run of tokens.
+        clans.clearConfirmedTag(state.eosID);
+      } else if (
+        oldTokens.length > 1 &&
+        oldTokens.length === newTokens.length &&
+        oldTokens[0] !== newTokens[0] &&
+        oldTokens.slice(1).every((tok, i) => tok === newTokens[i + 1])
+      ) {
+        // Swap: same token count, only the leading token differs, every other
+        // token matches exactly (the base name is unchanged). Treat the new
+        // leading token as a new confirmed tag. No further length/shape
+        // gating on the TAG itself, but the base-name-must-match requirement
+        // is NOT optional: without it this branch would also fire on
+        // unrelated renames that share no trailing tokens at all.
+        // oldTokens.length > 1 excludes single-token names, which have no
+        // base name to anchor a swap against.
+        clans.recordConfirmedTag(state.eosID, newTokens[0]);
+      }
+
+      clans.addPlayerToCache(state.eosID, rawPlayer.name);
+    }
 
     this._indexPlayer(state, key);
 
