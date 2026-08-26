@@ -101,7 +101,7 @@ const EloCommands = {
       if (record.roundsPlayed < minRounds) {
         rankLine = `Rank: Provisional (${record.roundsPlayed}/${minRounds} rounds)`;
       } else {
-        const rank = await trackerCtx.db.getPlayerRank(consRating, minRounds);
+        const rank = await trackerCtx.db.getPlayerRank(record.eosID, minRounds);
         const total = await trackerCtx.db.getTotalPlayers();
         rankLine = `Rank: #${rank} (of ${total} total)`;
       }

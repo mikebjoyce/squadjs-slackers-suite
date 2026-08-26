@@ -491,4 +491,52 @@ export default async function runDatabaseTests(runTest) {
       }
     }
   });
+
+  // ────────────────────────────────────────────────────────────────
+  // Test 7: getPlayerRank — the "!elo slacker" self-comparison bug.
+  //
+  // Reported from production: the header said "Rank #2 of 2,637" for a
+  // player the Local Leaderboard's own ORDER BY put in the #1 slot. The old
+  // getPlayerRank(consRating, minRounds) computed the player's CSR once in
+  // JS, then re-injected it as a literal into `WHERE (mu - 3*sigma) > lit`,
+  // making the player's own row a party to its own rank comparison — any
+  // float representation drift between "what V8 computed" and "what the SQL
+  // engine computes from its own stored columns" could make a row satisfy
+  // `>` against itself and inflate the rank by one.
+  //
+  // getPlayerRank(eosID, minRounds) now resolves the comparison value with a
+  // correlated subquery, so both sides are the same expression evaluated by
+  // the same engine — a row can never rank above itself, by construction.
+  // ────────────────────────────────────────────────────────────────
+  await runTest('getPlayerRank: ordering matches getLeaderboard, no self-rank inflation', async () => {
+    const roster = [
+      { eosID: 'eos_rank_first', name: 'Slacker', mu: 46.8057, sigma: 5.84185, roundsPlayed: 418, wins: 262, losses: 156 },
+      { eosID: 'eos_rank_second', name: 'TheGreatGrub', mu: 44.36, sigma: 5.485, roundsPlayed: 519, wins: 326, losses: 193 },
+      { eosID: 'eos_rank_third', name: 'GGpuff', mu: 40.02, sigma: 5.0245, roundsPlayed: 491, wins: 313, losses: 178 }
+    ];
+    for (const p of roster) await db.upsertPlayerStats(p.eosID, p);
+
+    // 1. The top CSR player must rank #1 — not #2 — matching the row
+    //    getLeaderboard() itself places first.
+    const topRank = await db.getPlayerRank('eos_rank_first', 10);
+    if (topRank !== 1) throw new Error(`Expected the top CSR player to rank #1, got #${topRank}`);
+
+    const leaderboard = await db.getLeaderboard(9, 10, 0);
+    if (!leaderboard.length || leaderboard[0].eosID !== 'eos_rank_first') {
+      throw new Error(`getLeaderboard()'s own ORDER BY disagrees with rank #1: got ${leaderboard[0]?.eosID}`);
+    }
+
+    // 2. Full ordering agrees between the two independent computations.
+    const secondRank = await db.getPlayerRank('eos_rank_second', 10);
+    const thirdRank = await db.getPlayerRank('eos_rank_third', 10);
+    if (secondRank !== 2) throw new Error(`Expected #2, got #${secondRank}`);
+    if (thirdRank !== 3) throw new Error(`Expected #3, got #${thirdRank}`);
+
+    // 3. Unknown/missing eosID does not throw — degrades to a defined value.
+    const missing = await db.getPlayerRank('eos_does_not_exist', 10);
+    if (typeof missing !== 'number') throw new Error('Expected a numeric rank for a missing eosID');
+
+    const model = s3dbShim.getModel('Elo_PlayerStats');
+    await model.destroy({ where: { eosID: roster.map(p => p.eosID) } });
+  });
 }

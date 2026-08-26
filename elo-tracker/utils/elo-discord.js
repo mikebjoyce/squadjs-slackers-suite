@@ -991,7 +991,7 @@ export const EloDiscord = {
 
         const minRounds = this.options.minRoundsForLeaderboard;
         const provisional = player.roundsPlayed < minRounds;
-        const rank = provisional ? null : await this.db.getPlayerRank(player.mu - (EloCalculator.SIGMA_MULTIPLIER * player.sigma), minRounds);
+        const rank = provisional ? null : await this.db.getPlayerRank(player.eosID, minRounds);
         const totalRanked = await this.db.getTotalRankedPlayers(minRounds);
         const totalPlayers = await this.db.getTotalPlayers();
 
@@ -1163,7 +1163,7 @@ export const EloDiscord = {
 
       const minRounds = this.options.minRoundsForLeaderboard;
       const provisional = player.roundsPlayed < minRounds;
-      const rank = provisional ? null : await this.db.getPlayerRank(player.mu - (EloCalculator.SIGMA_MULTIPLIER * player.sigma), minRounds);
+      const rank = provisional ? null : await this.db.getPlayerRank(player.eosID, minRounds);
       const totalRanked = await this.db.getTotalRankedPlayers(minRounds);
       const totalPlayers = await this.db.getTotalPlayers();
 

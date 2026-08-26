@@ -25,7 +25,7 @@
   *     bulkIncrementPlayerStats(updates) — Batch increment in one transaction.
   *     insertRoundHistory(data)         — Append a round record.
   *     getLeaderboard(limit, minRounds, offset) — Top players by CSR.
-  *     getPlayerRank(consRating, minRounds) — Rank of a given CSR value.
+  *     getPlayerRank(eosID, minRounds)  — Rank of a player, by self-referential SQL.
   *     getTotalRankedPlayers(minRounds) — Count of players meeting min rounds.
   *     exportPlayerStats()              — Full table dump as plain objects.
   *     importPlayerStats(records)       — Bulk restore from export.
@@ -660,22 +660,58 @@ export default class EloDatabase {
     }
   }
 
-  async getPlayerRank(consRating, minRounds = 0) {
-    if (!this.isReady()) return 0;
+  /**
+   * Rank of a player by CSR (μ - SIGMA_MULTIPLIER·σ), computed by comparing
+   * every row against the player's OWN row inside a single SQL statement —
+   * never by round-tripping a CSR value through JavaScript.
+   *
+   * This used to take a `consRating` computed in JS (`record.mu - SIGMA_MULTIPLIER
+   * * record.sigma`) and re-inject it as a literal into `WHERE (mu - 3*sigma) > <literal>`.
+   * That makes the player's own row a party to the comparison: if the SQL
+   * engine's computation of `mu - 3*sigma` for that row ever differs — by even
+   * a hair — from the value V8 computed and serialized back into the query
+   * string, the engine can conclude the player outranks themselves and inflate
+   * their displayed rank by one. It did, in production (see the `!elo slacker`
+   * report where the header said "Rank #2" while the leaderboard's own
+   * ORDER BY put the same player in the #1 slot).
+   *
+   * Resolving the comparison value with a correlated subquery instead means
+   * both sides are the same expression, evaluated by the same engine, and for
+   * a self-comparison, against the literal same row — so `csr > csr` for that
+   * row is false by construction, on every dialect, regardless of column
+   * precision. This closes the bug class rather than one instance of it.
+   *
+   * @param {string} eosID - Primary key of the player being ranked.
+   * @param {number} [minRounds=0] - Minimum roundsPlayed to be considered ranked.
+   * @returns {Promise<number>} 1-based rank, or 0 if not ready/found.
+   */
+  async getPlayerRank(eosID, minRounds = 0) {
+    if (!this.isReady() || !eosID) return 0;
     try {
       return await this._s3db.withTransactionWithRetry(async (t) => {
         const model = this._s3db.getModel('Elo_PlayerStats');
+        // mu/sigma are lowercase (no quoting needed); eosID is camelCase and
+        // must be quoted per DBService "DIALECT PORTABILITY" — see quoteIdentifier().
+        const csrExpr = `(mu - (${EloCalculator.SIGMA_MULTIPLIER} * sigma))`;
+        // model.tableName || model.name — same table-name resolution the rest
+        // of DBService uses (see db-service.js "singular model \ plural table").
+        const quotedTable = this._s3db.quoteIdentifier(model.tableName || model.name);
+        const quotedEosCol = this._s3db.quoteIdentifier('eosID');
+        const escapedEosID = this._s3db.escapeValue(String(eosID));
+
         // Op imported from Sequelize at module level
         const whereClause = minRounds > 0
           ? { roundsPlayed: { [Op.gte]: minRounds } }
           : {};
-        whereClause[Op.and] = Sequelize.literal(`(mu - (${EloCalculator.SIGMA_MULTIPLIER} * sigma)) > ${Number(consRating)}`);
+        whereClause[Op.and] = Sequelize.literal(
+          `${csrExpr} > (SELECT ${csrExpr} FROM ${quotedTable} WHERE ${quotedEosCol} = ${escapedEosID})`
+        );
 
         const higherRanked = await model.count({ where: whereClause, transaction: t });
         return higherRanked + 1;
       });
     } catch (error) {
-      this.verbose(1, `[DB] Error fetching player rank for consRating ${consRating}: ${error.message}`);
+      this.verbose(1, `[DB] Error fetching player rank for eosID ${eosID}: ${error.message}`);
       return 0;
     }
   }
