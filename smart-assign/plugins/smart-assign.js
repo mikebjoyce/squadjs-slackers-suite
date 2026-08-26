@@ -295,7 +295,7 @@ export default class SmartAssign extends S3PluginBase {
     this.server.on('S3_PLAYER_JOINED', this.onS3PlayerJoined);
     this.server.on('S3_PLAYER_LEFT', this.onS3PlayerLeft);
     this.ready = true;
-    Logger.verbose('SmartAssign', 1, 'SmartAssign mounted successfully.');
+    Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.mounted'));
   }
 
   /**
@@ -313,17 +313,17 @@ export default class SmartAssign extends S3PluginBase {
         'Please update SlackersSquadServices.'
       );
     }
-    Logger.verbose('SmartAssign', 2, `[S3] Version check passed: S³ v${actual} >= required v${required}`);
+    Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.versionCheckPassed', { actual, required }));
   }
 
   async _onS3Ready() {
     this._checkS3Version();
-    Logger.verbose('SmartAssign', 1, 'S³ ready — initialising SA services.');
+    Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.s3Ready'));
 
     // EloTracker discovery
     this.eloTracker = this.server.plugins.find((p) => p.constructor.name === 'EloTracker') || null;
     if (this.eloTracker && typeof this.eloTracker.getRating !== 'function') {
-      Logger.verbose('SmartAssign', 1, '[SmartAssign] Warning: EloTracker found but getRating() is missing. Falling back to population-only/internal-props.');
+      Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.eloTrackerWarning'));
     }
 
     // Update executor's S³ reference for canAct guard
@@ -364,9 +364,9 @@ export default class SmartAssign extends S3PluginBase {
         ]
       });
 
-      Logger.verbose('SmartAssign', 2, 'SA_AssignmentLog model defined on S³ connector.');
+      Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.modelDefined'));
     } else {
-      Logger.verbose('SmartAssign', 1, 'S³ DB not ready — SA_AssignmentLog model not defined.');
+      Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.s3DbNotReady'));
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -379,10 +379,6 @@ export default class SmartAssign extends S3PluginBase {
         });
         this.registerMigrations('smart-assign', [
           {
-            // Merged v1+v2: v1 and v2 were developed as two parts of the same migration
-            // migration pipeline, but always shipped together — no production DB ever
-            // existed at the intermediate v1-only state. The merged migration creates
-            // SA_AssignmentLog AND drops the 4 orphan tables in a single step.
             version: 1,
             description: 'Create SA_AssignmentLog table + drop 4 orphan tables',
             touches: {
@@ -434,10 +430,10 @@ export default class SmartAssign extends S3PluginBase {
         ]);
         await this.verifyAndRunMigrations('smart-assign');
       } else {
-        Logger.verbose('SmartAssign', 1, 'S³ DB or migrationEngine not available — skipping migration registration.');
+        Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.migrationSkipped'));
       }
     } catch (err) {
-      Logger.verbose('SmartAssign', 1, `Migration registration error: ${err.message}`);
+      Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.migrationError', { message: err.message }));
     }
 
     // Switch plugin discovery for handshake integration (7.1c)
@@ -448,7 +444,7 @@ export default class SmartAssign extends S3PluginBase {
         try {
           pluginVersion = switchPlugin.constructor.version;
         } catch (_) {
-          Logger.verbose('SmartAssign', 1, '[Handshake] Switch plugin found but no static version property (pre-2.0). Handshake unavailable.');
+          Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.handshakeSwitchPreV2'));
         }
         const versionOk = pluginVersion && parseInt(String(pluginVersion).split('.')[0], 10) >= 2;
         if (typeof switchPlugin.getQueueSnapshot === 'function'
@@ -456,22 +452,23 @@ export default class SmartAssign extends S3PluginBase {
             && versionOk) {
           this._switchPlugin = switchPlugin;
           this._handshakeEnabled = this.options.handshakeWithSwitch === true;
-          Logger.verbose('SmartAssign', 1, `[Handshake] Switch plugin v${pluginVersion} discovered. Handshake ${this._handshakeEnabled ? 'enabled' : 'disabled (toggle off)'}.`);
+          const status = this._handshakeEnabled ? 'enabled' : 'disabled (toggle off)';
+          Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.handshakeSwitchFound', { version: pluginVersion, status }));
         } else {
-          Logger.verbose('SmartAssign', 1, `[Handshake] Switch plugin found but incompatible version (${pluginVersion || 'unknown'}). Handshake unavailable.`);
+          Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.handshakeIncompatible', { version: pluginVersion || 'unknown' }));
         }
       } else {
-        Logger.verbose('SmartAssign', 1, '[Handshake] Switch plugin not found. Handshake unavailable.');
+        Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.handshakeNotFound'));
       }
     } catch (err) {
-      Logger.verbose('SmartAssign', 1, `[Handshake] Error discovering Switch plugin: ${err.message}`);
+      Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.handshakeError', { message: err.message }));
     }
 
     // Register refresh interest with S³ PlayersService for fast join detection
     const mountPlayers = this._s3?.players;
     if (mountPlayers?.isReady() && mountPlayers.registerRefreshInterest) {
       mountPlayers.registerRefreshInterest('SmartAssign', { maxStalenessMs: 20000 });
-      Logger.verbose('SmartAssign', 2, '[S3] Registered SmartAssign refresh interest (maxStalenessMs=20000).');
+      Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.refreshInterestRegistered', { maxStalenessMs: 20000 }));
     }
 
     // DB maintenance: SA_AssignmentLog is lazily synced on first write.
@@ -479,9 +476,9 @@ export default class SmartAssign extends S3PluginBase {
     const gs = this._s3?.gameState;
     const recoveredStart = gs?.isReady?.() ? gs.getRoundStartTime() : null;
     if (recoveredStart) {
-      Logger.verbose('SmartAssign', 1, `Restart detected. Resuming round from S³ roundStartTime: ${new Date(recoveredStart).toISOString()}`);
+      Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.restartDetected', { roundStartTime: new Date(recoveredStart).toISOString() }));
     } else {
-      Logger.verbose('SmartAssign', 1, 'New round or no persisted S³ state. Starting fresh.');
+      Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.startingFresh'));
       await this.eventLogger.flushAssignmentLog();
     }
   }
@@ -516,7 +513,7 @@ export default class SmartAssign extends S3PluginBase {
     this.server.removeListener('S3_PLAYER_LEFT', this.onS3PlayerLeft);
     this._pendingPlayerMoves.clear();
     this.executor.cleanup();
-    Logger.verbose('SmartAssign', 1, 'SmartAssign unmounted.');
+    Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.unmounted'));
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════════
@@ -526,7 +523,7 @@ export default class SmartAssign extends S3PluginBase {
   // ═══════════════════════════════════════════════════════════════════════════════════
   async onNewGame(info) {
     if (!this.ready) return;
-      Logger.verbose('SmartAssign', 1, 'NEW_GAME detected. Flushing assignment log.');
+    Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.newGame'));
 
     await this.eventLogger.flushAssignmentLog();
 
@@ -545,7 +542,7 @@ export default class SmartAssign extends S3PluginBase {
   // ═══════════════════════════════════════════════════════════════════════════════════
   async onRoundEnded(info) {
     if (!this.ready) return;
-    Logger.verbose('SmartAssign', 1, 'ROUND_ENDED detected.');
+    Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.roundEnded'));
 
     // Capture round metadata from S³ before NEW_GAME resets it
     const gs = this._s3?.gameState;
@@ -555,13 +552,16 @@ export default class SmartAssign extends S3PluginBase {
       this.previousRoundStartTime = gs.getRoundStartTime();
       this.previousMatchId = gs.getMatchId();
     }
-    Logger.verbose('SmartAssign', 2, `[Layer] Captured at ROUND_ENDED: ${this.previousRoundLayerName || 'Unknown'} (${this.previousRoundGamemode || 'Unknown'})`);
+    Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.layerCaptured', {
+      layerName: this.previousRoundLayerName || 'Unknown',
+      gamemode: this.previousRoundGamemode || 'Unknown'
+    }));
   }
 
-    async onScrambleExecuted() {
-      if (!this.ready) return;
-      Logger.verbose('SmartAssign', 1, 'TeamBalancer Scramble detected.');
-    }
+  async onScrambleExecuted() {
+    if (!this.ready) return;
+    Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.scrambleDetected'));
+  }
 
   // RCON IDENTIFIER MIGRATION: Event handlers now extract playerKey from data and use dual-key lookups
   async onMoveFailed(data) {
@@ -588,7 +588,12 @@ export default class SmartAssign extends S3PluginBase {
     }
 
     const p = this.server.players.find((x) => (x.eosID || x.steamID) === pid) || { steamID: pid, name: playerName || 'Unknown' };
-    Logger.verbose('SmartAssign', 1, `[SmartAssign] Abandoned move for ${p.name} (${pid}) -> Team ${failedTeamID} — ${reason}`);
+    Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.abandonedMove', {
+      name: p.name,
+      pid,
+      teamID: failedTeamID,
+      reason
+    }));
     this.logEvent('MOVE_FAILED', p, { reason, teamID: failedTeamID }, false);
   }
 
@@ -615,7 +620,11 @@ export default class SmartAssign extends S3PluginBase {
 
     const p = this.server.players.find((x) => (x.eosID || x.steamID) === pid || x.name === data.name);
     if (p) {
-      Logger.verbose('SmartAssign', 2, `[SmartAssign] Verified move success for ${p.name} (${pid}) to Team ${teamID}`);
+      Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.verifiedMoveSuccess', {
+        name: p.name,
+        pid,
+        teamID
+      }));
       this.logEvent('MOVE_SUCCESS', p, { teamID }, false);
     }
   }
@@ -626,15 +635,21 @@ export default class SmartAssign extends S3PluginBase {
     const pid = playerKey || data.steamID;
     const p = this.server.players.find((x) => (x.eosID || x.steamID) === pid || x.name === playerName);
     if (p) {
-      Logger.verbose('SmartAssign', 3, `[SmartAssign] Retrying move for ${p.name} (${pid}) | Attempt: ${attempt} | Method: ${method}`);
+      Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.retryingMove', {
+        name: p.name,
+        pid,
+        attempt,
+        method
+      }));
       this.logEvent('MOVE_RETRY', p, { attempt, method }, false);
     }
   }
 
-  async handlePlayerJoin(player, reconnectTeam = null) {
+
+ async handlePlayerJoin(player, reconnectTeam = null) {
     const lockKey = player.eosID || player.steamID;
     if (!lockKey) {
-      Logger.verbose('SmartAssign', 1, `[SmartAssign] Cannot process join for ${player.name} - missing eosID/steamID.`);
+      Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.missingIdentifiers', { name: player.name }));
       return;
     }
 
@@ -665,33 +680,33 @@ export default class SmartAssign extends S3PluginBase {
              const dbTag = await this._queryEloDBForTag(player.eosID);
              if (dbTag) {
                joinPlayerTag = dbTag;
-               Logger.verbose('SmartAssign', 3, `[Clan] Tag resolved from EloTracker DB for ${player.name}: "${dbTag}"`);
+               Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.clanTagFromEloDB', { name: player.name, tag: dbTag }));
              }
            }
          }
        }
 
-       Logger.verbose('SmartAssign', 3, `[JOIN] Player connected: ${player.name} (${playerKey})`);
+       Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.playerConnected', { name: player.name, playerKey }));
 
        // ═══════════════════════════════════════════════════════════════════════════
        // PHASE CHECK: Only block during faction voting (engine-level team change lockout).
        // ═══════════════════════════════════════════════════════════════════════════
        if (this._s3?.gameState?.isEndgameFactionVote?.()) {
-         Logger.verbose('SmartAssign', 3, `[Join] S³ gameState: faction vote in progress — skipping assignment for ${player.name}.`);
+         Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.skipFactionVote', { name: player.name }));
          await this._remediateBlockedReconnect(player, reconnectTeam);
          return;
        }
 
        // Check if the current layer/gamemode is ignored (via S³ gameState)
         if (this._s3?.gameState?.isIgnoredMode?.()) {
-         Logger.verbose('SmartAssign', 3, `[SmartAssign] Ignored game mode detected. Skipping Elo-based assignment for ${player.name}.`);
+         Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.skipIgnoredMode', { name: player.name }));
          await this._remediateBlockedReconnect(player, reconnectTeam);
          return;
        }
 
       // Passive mode: skip algorithm and ASSIGNMENT logging entirely
       if (this.options.enableSmartAssign === false) {
-        Logger.verbose('SmartAssign', 3, `[SmartAssign] Passive mode: algorithm skipped for ${player.name}.`);
+        Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.skipPassiveMode', { name: player.name }));
         await this._remediateBlockedReconnect(player, reconnectTeam);
         return;
       }
@@ -748,14 +763,23 @@ export default class SmartAssign extends S3PluginBase {
           const playerTag = debugInfo?.playerTag || 'null';
           const clanTeam = debugInfo?.clanTeam || 'none';
 
-          Logger.verbose('SmartAssign', 3, `[TIMING] ${player.name} join pipeline: tag=${playerTag}, clanTeam=${clanTeam}, mu=${timemarks.preWarmMu?.toFixed(2) ?? 'N/A'} | preWarm=${timemarks.preWarmMs}ms, reconnect=${timemarks.reconnectTeamMs}ms (in-memory), evaluate=${timemarks.evaluateMs}ms, total=${timemarks.totalPipelineMs}ms`);
+          Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.joinPipelineTiming', {
+            name: player.name,
+            tag: playerTag,
+            clanTeam,
+            mu: timemarks.preWarmMu?.toFixed(2) ?? 'N/A',
+            preWarmMs: timemarks.preWarmMs,
+            reconnectTeamMs: timemarks.reconnectTeamMs,
+            evaluateMs: timemarks.evaluateMs,
+            totalPipelineMs: timemarks.totalPipelineMs
+          }));
 
           if (reconnectTeam && reconnectTeam === targetTeam) {
-            Logger.verbose('SmartAssign', 3, `[SmartAssign] Applied reconnect memory for ${player.name} -> Team ${targetTeam} (${reason})`);
+            Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.appliedReconnect', { name: player.name, targetTeam, reason }));
           } else if (reconnectTeam && reconnectTeam !== targetTeam) {
-            Logger.verbose('SmartAssign', 3, `[SmartAssign] Ignored reconnect memory for ${player.name} (Previous: Team ${reconnectTeam}) -> Team ${targetTeam} (${reason})`);
+            Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.ignoredReconnect', { name: player.name, reconnectTeam, targetTeam, reason }));
           } else {
-            Logger.verbose('SmartAssign', 3, `[SmartAssign] Evaluated fresh join for ${player.name} -> Team ${targetTeam} (${reason})`);
+            Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.evaluatedFreshJoin', { name: player.name, targetTeam, reason }));
           }
 
           // ═══════════════════════════════════════════════════════════════════════════
@@ -772,12 +796,17 @@ export default class SmartAssign extends S3PluginBase {
                 finalTargetTeam = hsResult.joiningPlayerTargetTeam;
                 handshakeSwitchPlayerEosID = hsResult.switchPlayerEosID;
                 handshakeActive = true;
-                Logger.verbose('SmartAssign', 2, `[Handshake] Swap approved for ${player.name}: joining → Team ${finalTargetTeam}, switch player ${hsResult.switchPlayerName}. Reason: ${hsResult.reason}`);
+                Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.handshakeSwapApproved', {
+                  name: player.name,
+                  targetTeam: finalTargetTeam,
+                  switchPlayerName: hsResult.switchPlayerName,
+                  reason: hsResult.reason
+                }));
               } else {
-                Logger.verbose('SmartAssign', 3, `[Handshake] No swap for ${player.name}: ${hsResult.reason}`);
+                Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.handshakeNoSwap', { name: player.name, reason: hsResult.reason }));
               }
             } catch (hsErr) {
-              Logger.verbose('SmartAssign', 2, `[Handshake] Evaluation error for ${player.name}: ${hsErr.message}. Falling back to baseline.`);
+              Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.handshakeEvalError', { name: player.name, message: hsErr.message }));
             }
           }
 
@@ -809,7 +838,7 @@ export default class SmartAssign extends S3PluginBase {
             if (perPlayerLockPlayers?.isReady() && playerKey) {
               perPlayerLockAcquired = perPlayerLockPlayers.lock(playerKey, 'SmartAssign', 5000);
               if (!perPlayerLockAcquired) {
-                Logger.verbose('SmartAssign', 1, `[SmartAssign] Cannot acquire per-player lock for ${player.name} — preempted by higher-priority actor. Skipping move.`);
+                Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.perPlayerLockFailed', { name: player.name }));
                 // Roll back pending assignment counters since we're aborting
                 this._pendingAssignments[finalTargetTeam] = Math.max(0, this._pendingAssignments[finalTargetTeam] - 1);
                 this._pendingMu[finalTargetTeam] = Math.max(0, this._pendingMu[finalTargetTeam] - pendingPlayerMu);
@@ -824,7 +853,12 @@ export default class SmartAssign extends S3PluginBase {
             this._pendingPlayerMoves.set(playerKey, { targetTeam: finalTargetTeam, mu: pendingPlayerMu, isVeteran });
 
             this.executor.queueMove(playerKey, player.name, player.eosID, finalTargetTeam);
-            Logger.verbose('SmartAssign', 3, `[SmartAssign] Move queued: ${player.name} (Team ${effectiveTeamID} -> Team ${finalTargetTeam}, reason: ${reason})`);
+            Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.moveQueued', {
+              name: player.name,
+              effectiveTeamID,
+              targetTeam: finalTargetTeam,
+              reason
+            }));
 
             // S³ attribution: record the move so S³'s S3_PLAYER_TEAM_CHANGED fires with source='SmartAssign'
             const recordPlayers = this._s3?.players;
@@ -843,18 +877,18 @@ export default class SmartAssign extends S3PluginBase {
               try {
                 const swapResult = await this._switchPlugin.forceQueueSwap(handshakeSwitchPlayerEosID);
                 if (swapResult) {
-                  Logger.verbose('SmartAssign', 2, `[Handshake] Switch player consumed via forceQueueSwap successfully.`);
+                  Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.handshakeForceSwapSuccess'));
                 } else {
-                  Logger.verbose('SmartAssign', 2, `[Handshake] forceQueueSwap returned false (player already gone). Joining player move still queued.`);
+                  Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.handshakeForceSwapGone'));
                 }
               } catch (fqsErr) {
-                Logger.verbose('SmartAssign', 2, `[Handshake] forceQueueSwap error: ${fqsErr.message}. Joining player move is unaffected.`);
+                Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.handshakeForceSwapError', { message: fqsErr.message }));
               }
             }
           } else if (finalTargetTeam !== null) {
-            Logger.verbose('SmartAssign', 3, `[SmartAssign] No move needed: ${player.name} already on Team ${finalTargetTeam} (reason: ${reason})`);
+            Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.noMoveAlreadyOnTeam', { name: player.name, targetTeam: finalTargetTeam, reason }));
           } else {
-            Logger.verbose('SmartAssign', 3, `[SmartAssign] No move queued: ${player.name} — finalTargetTeam is null (reason: ${reason})`);
+            Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.noMoveTargetNull', { name: player.name, reason }));
           }
         } finally {
           release();
@@ -873,7 +907,11 @@ export default class SmartAssign extends S3PluginBase {
     const player = data?.player;
     if (!player) return;
     const previousTeamID = data?.previousTeamID ?? null;
-    Logger.verbose('SmartAssign', 3, `[S3] JOIN: ${player.name || player.eosID} team=${player.teamID}, previousTeamID=${previousTeamID}`);
+    Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.s3Join', {
+      name: player.name || player.eosID,
+      teamID: player.teamID,
+      previousTeamID
+    }));
 
     // Acquire global lock before processing — blocks lower-priority plugins (e.g., Switch)
     // from processing queue ticks while SA evaluates this join.
@@ -883,7 +921,7 @@ export default class SmartAssign extends S3PluginBase {
     if (lockPlayers?.isReady()) {
       globalLockAcquired = lockPlayers.lockGlobal('SmartAssign', 5000);
       if (!globalLockAcquired) {
-        Logger.verbose('SmartAssign', 1, `[SmartAssign] Cannot acquire global lock — higher-priority plugin active. Skipping join for ${player.name}.`);
+        Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.globalLockFailed', { name: player.name }));
         return;
       }
     }
@@ -901,7 +939,7 @@ export default class SmartAssign extends S3PluginBase {
     if (!this.ready) return;
     const player = data?.player;
     if (!player) return;
-    Logger.verbose('SmartAssign', 3, `[S3] LEAVE: ${player.name || player.eosID}`);
+    Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.s3Leave', { name: player.name || player.eosID }));
     await this.handlePlayerLeave(player);
   }
 
@@ -909,7 +947,11 @@ export default class SmartAssign extends S3PluginBase {
     const playerKey = player.eosID || player.steamID;
     this._sessionJoinTimes.delete(playerKey);
 
-    Logger.verbose('SmartAssign', 3, `[LEAVE] Player disconnected: ${player.name} (${playerKey}) from Team ${player.teamID}`);
+    Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.playerDisconnected', {
+      name: player.name,
+      playerKey,
+      teamID: player.teamID
+    }));
 
     // If this player has a pending move, release locks and clean up pending state
     if (playerKey && this._pendingPlayerMoves.has(playerKey)) {
@@ -971,19 +1013,19 @@ export default class SmartAssign extends S3PluginBase {
     if (player.teamID === reconnectTeam) return;
 
     if (!this._switchPlugin) {
-      Logger.verbose('SmartAssign', 3, `[_remediateBlockedReconnect] Switch plugin not available — skipping remediation for ${player.name || player.eosID}.`);
+      Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.remediateSwitchUnavailable', { name: player.name || player.eosID }));
       return;
     }
     if (typeof this._switchPlugin._resetPlayerLockouts !== 'function') {
-      Logger.verbose('SmartAssign', 1, `[_remediateBlockedReconnect] Switch plugin does not expose _resetPlayerLockouts — skipping remediation for ${player.name || player.eosID}.`);
+      Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.remediateSwitchMethodMissing', { name: player.name || player.eosID }));
       return;
     }
 
     try {
       await this._switchPlugin._resetPlayerLockouts(player.eosID);
-      Logger.verbose('SmartAssign', 2, `[_remediateBlockedReconnect] Reset lockouts for ${player.name || player.eosID} (SA blocked from placing on correct team).`);
+      Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.remediateSuccess', { name: player.name || player.eosID }));
     } catch (err) {
-      Logger.verbose('SmartAssign', 1, `[_remediateBlockedReconnect] Failed to reset lockouts for ${player.name || player.eosID}: ${err.message}`);
+      Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.remediateFailed', { name: player.name || player.eosID, message: err.message }));
     }
   }
 
@@ -1017,7 +1059,10 @@ export default class SmartAssign extends S3PluginBase {
     // P4: Don't override reconnect priority or clan grouping
     const skipReasons = ['Reconnect Memory (Priority)', 'Clan Grouping'];
     if (skipReasons.some(r => baselineResult.reason && baselineResult.reason.startsWith(r))) {
-      Logger.verbose('SmartAssign', 3, `[Handshake] Skipped for ${player.name}: baseline reason is "${baselineResult.reason}".`);
+      Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.handshakeSkippedReason', {
+        name: player.name,
+        reason: baselineResult.reason
+      }));
       return { shouldOverride: false, reason: `P4: baseline is ${baselineResult.reason}` };
     }
 
@@ -1026,7 +1071,10 @@ export default class SmartAssign extends S3PluginBase {
     try {
       snapshot = await snapshotPromise;
     } catch (err) {
-      Logger.verbose('SmartAssign', 2, `[Handshake] Snapshot fetch failed for ${player.name}: ${err.message}`);
+      Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.handshakeSnapshotFailed', {
+        name: player.name,
+        message: err.message
+      }));
       return { shouldOverride: false, reason: 'Snapshot fetch failed' };
     }
     if (!snapshot) {
@@ -1187,7 +1235,7 @@ export default class SmartAssign extends S3PluginBase {
     // Mode: queueDrain → skip scoring, always swap
     const handshakeMode = this.options.handshakeMode || 'eloGated';
     if (handshakeMode === 'queueDrain') {
-      Logger.verbose('SmartAssign', 2, `[Handshake] queueDrain mode: swap approved for ${candidate.playerName} (hard constraints passed).`);
+      Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.handshakeQueueDrainApproved', { candidateName: candidate.playerName }));
       return {
         shouldOverride: true,
         joiningPlayerTargetTeam: candidateCurrent,
@@ -1254,7 +1302,12 @@ export default class SmartAssign extends S3PluginBase {
     const virtualScore = computeScore(scoreT1Mus, scoreT2Mus, scoreT1Vets, scoreT2Vets, scoreT1Count, scoreT2Count);
     const threshold = this.options.handshakeScoreThreshold || 0.5;
 
-    Logger.verbose('SmartAssign', 2, `[Handshake] ${player.name}: baselineScore=${baselineScore.toFixed(2)}, virtualScore=${virtualScore.toFixed(2)}, threshold=${threshold}`);
+    Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.handshakeScoreComparison', {
+      name: player.name,
+      baselineScore: baselineScore.toFixed(2),
+      virtualScore: virtualScore.toFixed(2),
+      threshold
+    }));
 
     if (virtualScore <= baselineScore + threshold) {
       return {
@@ -1282,7 +1335,7 @@ export default class SmartAssign extends S3PluginBase {
     await this._withDb(async (t) => {
       const model = this._getModel('SA_AssignmentLog');
       if (!model) {
-        Logger.verbose('SmartAssign', 1, '[DB] SA_AssignmentLog model not found on S³ connector. Skipping write.');
+        Logger.verbose('SmartAssign', 1, this.t('smartAssign.verbose.modelNotFound'));
         return;
       }
       await model.create({
@@ -1307,13 +1360,13 @@ export default class SmartAssign extends S3PluginBase {
       const playerStats = await this.eloTracker.db.getPlayerStats(eosID);
 
       if (!playerStats || !playerStats.name) {
-        Logger.verbose('SmartAssign', 3, `[Clan] No EloTracker record found for eosID ${eosID}`);
+        Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.clanNoEloRecord', { eosID }));
         return null;
       }
 
       const raw = this._s3?.clans?.extractRawPrefix(playerStats.name) || null;
       if (!raw) {
-        Logger.verbose('SmartAssign', 3, `[Clan] EloTracker record found for eosID ${eosID}, but no tag extractable from name: "${playerStats.name}"`);
+        Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.clanNoExtractableTag', { eosID, name: playerStats.name }));
         return null;
       }
 
@@ -1323,7 +1376,7 @@ export default class SmartAssign extends S3PluginBase {
 
       return tag || null;
     } catch (err) {
-      Logger.verbose('SmartAssign', 3, `[Clan] EloTracker DB query error for ${eosID}: ${err?.message}`);
+      Logger.verbose('SmartAssign', 3, this.t('smartAssign.verbose.clanEloDbQueryError', { eosID, message: err?.message }));
       return null;
     }
   }
@@ -1395,7 +1448,7 @@ export default class SmartAssign extends S3PluginBase {
 
   async flushAssignmentLog() {
     if (this._isFinalizingRound) {
-      Logger.verbose('SmartAssign', 2, '[Flush] Concurrent flush blocked — already in progress.');
+      Logger.verbose('SmartAssign', 2, this.t('smartAssign.verbose.flushBlockedConcurrent'));
       return;
     }
      this._isFinalizingRound = true;
@@ -1413,5 +1466,4 @@ export default class SmartAssign extends S3PluginBase {
        this._isFinalizingRound = false;
      }
   }
-
 }
