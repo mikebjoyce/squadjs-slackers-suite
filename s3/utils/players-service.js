@@ -1007,7 +1007,7 @@ export default class PlayersService {
         this._isRealTeam(nextTeamID)
       ) {
         teamChangeCount++;
-        const attribution = this._consumeMoveAttribution(result.state, nextTeamID) || 'Manual/Game';
+        const attribution = this._consumeMoveAttribution(result.state, nextTeamID) || this._defaultTeamChangeSource();
         const playerName = result.state.name || result.key;
         this.verboseLogger(1, `[Players] TEAM_CHANGE: ${playerName} (${result.key}) ${previousTeamID}→${nextTeamID}, source=${attribution}`);
         this.server.emit('S3_PLAYER_TEAM_CHANGED', {
@@ -1602,6 +1602,17 @@ export default class PlayersService {
     }
 
     return null;
+  }
+
+  // When AllowTeamChanges is off, players cannot self-switch via the scoreboard,
+  // so a team change with no plugin attribution can only have come from an
+  // admin RCON command (AdminForceTeamChange, etc.) issued outside the suite.
+  _defaultTeamChangeSource() {
+    const serverConfig = this.parent?.services?.serverConfig;
+    if (serverConfig?.isReady?.() && serverConfig.getAllowTeamChanges() === false) {
+      return 'Admin';
+    }
+    return 'Manual/Game';
   }
 
   _cleanupExpiredState() {
