@@ -1,0 +1,90 @@
+{
+  "s3DiscordPluginBase": {
+    "errors": {
+      "channelFetchFailed": "Could not fetch Discord channel with channelID \"{channelID}\". Error: {error}",
+      "sendFailed": "Failed to send Discord message: {error}",
+      "sendFailedRetry": "Failed to send Discord message after retry: {error}"
+    },
+    "verbose": {
+      "channelNotInitialized": "Could not send Discord Message. Channel not initialized.",
+      "rateLimitRetry": "Rate limit hit, attempting retry in {waitTime}ms..."
+    },
+    "defaults": {
+      "embedFooter": "Slackers Squad Services"
+    }
+  },
+  "s3PluginBase": {
+    "errors": {
+      "pluginsNotAvailable": "[S3] server.plugins not available. Cannot discover SlackersSquadServices.",
+      "servicesRequired": "[S3] SlackersSquadServices is required for this plugin. Ensure it is in config.json before this plugin and restart.",
+      "notDiscovered": "[S3] S³ not discovered. Call _resolveS3() or ensure prepareToMount() ran.",
+      "readyTimeout": "[S3] S³ not ready after {timeoutMs}ms timeout. Check that SlackersSquadServices is mounted and not crashing."
+    },
+    "verbose": {
+      "discovered": "[S3] Discovered SlackersSquadServices.",
+      "readyPromiseRejected": "[S3] ready() promise rejected: {message}",
+      "readyDbAvailable": "[S3] S³ is ready. DB available: {available}",
+      "notDiscoveredBeforeMount": "[S3] S³ not discovered before mount() — _onS3Ready will run without S³.",
+      "registeredModelsForDrift": "[{pluginName}] Registered {count} model(s) for drift detection: {models}",
+      "migrationsPending": "[{pluginName}] Migrations pending but not confirmed. Use !s3 confirm <token> or set autoMigrate: true in S³ config."
+    },
+    "teamChange": {
+      "warnings": {
+        "nameCollision": "[TC] WARNING: name collision — refusing to send AdminForceTeamChange \"{value}\" for {playerName}. {collisionName} is also connected and their name contains this substring, so Squad's admin parser could hit either player. No safer identifier (eosID/steamID) is available. Skipping until the ambiguity clears.",
+        "eosRejected": "[TC] WARNING: this server rejects eosID in AdminForceTeamChange — falling back to steamID/playerName. Team changes still work, but every attempt now costs an extra RCON round-trip. This is the Squad game server's own admin-command parser, not a SquadJS version issue."
+      },
+      "verbose": {
+        "allRejected": "[TC] All identifiers rejected for {playerName}.",
+        "rconError": "[TC] RCON error for {type}=\"{value}\": {error}",
+        "identifierRejected": "[TC] Identifier {type}=\"{value}\" rejected — trying next.",
+        "identifierAccepted": "[TC] Identifier {type}=\"{value}\" accepted.",
+        "playerNotFound": "[TC] Player {eosID} not found in S³ registry — aborting.",
+        "requesting": "[TC] Requesting team change for {playerName} ({eosID}) -> T{targetTeamID} (source: {source})",
+        "disconnected": "[TC] {playerName} disconnected during retry — aborting.",
+        "alreadyOnTarget": "[TC] {playerName} already on target team T{targetTeamID}.",
+        "recordMoveWarning": "[TC] recordMove warning: {error}",
+        "attempting": "[TC] Attempt {attempt}/{maxAttempts}: switching {playerName}...",
+        "attemptRconFailed": "[TC] Attempt {attempt} RCON failed for {playerName}: {error}",
+        "verifiedOnTarget": "[TC] ✅ {playerName} verified on T{targetTeamID} after {attempts} attempts.",
+        "warnFailed": "[TC] Warn failed for {playerName}: {error}",
+        "allAttemptsExhausted": "[TC] ❌ {playerName} — all {maxAttempts} attempts exhausted."
+      },
+      "defaults": {
+        "warnMessage": "You have been scrambled"
+      }
+    }
+  },
+  "slackersSquadServices": {
+    "drift": {
+      "alertTriggered": "[S3] Schema drift alert triggered for: {pluginNames}",
+      "embedTitle": "⚠️ Schema Drift Detected",
+      "footer": "S³ Schema Verification",
+      "descriptionSummary": "Schema or data drift detected — expected state is missing from the live database.\nUse `!s3 migrate force` to re-apply.\n\n{parts}",
+      "descriptionFallback": "Schema drift detected — use `!s3 migrate verify` for details."
+    },
+    "verbose": {
+      "mounted": "Mounted SlackerSquadServices with gameState, factions, clans, db, players, serverConfig, and logging services.",
+      "unmounted": "Unmounted SlackerSquadServices and shared services.",
+      "mountError": "[S3] {name} service failed to mount: {message}",
+      "mountErrorStderr": "{name} service failed to mount — S³ is only partially available.",
+      "updatedPlayerInfoTick": "[S3] UPDATED_PLAYER_INFORMATION tick: {playerCount} players",
+      "playerConnected": "[S3] PLAYER_CONNECTED: {playerName} (eosID={eosID})",
+      "migrationDbNotReady": "[S3 Migration] DB not ready yet — skipping migration check.",
+      "noPendingMigrations": "[S3 Migration] No pending migrations.",
+      "pendingCount": "[S3 Migration] Found {count} pending migration(s) across {plugins} plugin(s).",
+      "autoMigrateEnabled": "[S3 Migration] autoMigrate: true — applying pending migrations automatically...",
+      "applyingPlugin": "[S3 Migration] Applying {count} migration(s) for plugin: {pluginName}...",
+      "migrationApplied": "[S3 Migration] Applied: {description}",
+      "allMigrationsApplied": "[S3 Migration] All pending migrations applied successfully.",
+      "autoMigrateFailed": "[S3 Migration] Auto-migration failed: {message}",
+      "tokenGenerated": "[S3 Migration] Confirmation token generated: {confirmToken} (expires in 10 minutes)",
+      "promptSent": "[S3 Migration] Migration confirmation prompt posted to Discord channel {channelID}.",
+      "promptFailed": "[S3 Migration] Failed to send Discord migration prompt: {message}",
+      "noChannel": "[S3 Migration] Pending migrations require confirmation, but no valid Discord channel is configured. Use !s3 confirm <token> or set autoMigrate: true in config.json."
+    },
+    "driftViolations": {
+      "emptyRows": "{offenders} row(s) with empty `{column}`"
+    }
+  }
+
+}

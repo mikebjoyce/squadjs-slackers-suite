@@ -61,6 +61,7 @@
  */
 
 import S3PluginBase from './s3-plugin-base.js';
+import { t } from './i18n.js';
 
 export default class S3DiscordPluginBase extends S3PluginBase {
   static get optionsSpecification() {
@@ -95,6 +96,13 @@ export default class S3DiscordPluginBase extends S3PluginBase {
   }
 
   /**
+   * Helper to retrieve configured language or default to English.
+   */
+  get lang() {
+    return this.options?.language || 'en';
+  }
+
+  /**
    * Prepares the plugin: discovers S³ (via super), then fetches
    * the Discord channel.
    */
@@ -112,7 +120,7 @@ export default class S3DiscordPluginBase extends S3PluginBase {
       // the only channel that can carry it.
       this.reportError(
         'Discord',
-        `Could not fetch Discord channel with channelID "${this.options.channelID}". Error: ${error.message}`,
+        t('s3DiscordPluginBase.errors.channelFetchFailed', { channelID: this.options.channelID, error: error.message }, this.lang),
         error
       );
       this.verbose(2, `${error.stack}`);
@@ -135,13 +143,13 @@ export default class S3DiscordPluginBase extends S3PluginBase {
    */
   async sendDiscordMessage(message) {
     if (!this.channel) {
-      this.verbose(1, 'Could not send Discord Message. Channel not initialized.');
+      this.verbose(1, t('s3DiscordPluginBase.verbose.channelNotInitialized', {}, this.lang));
       return;
     }
 
     if (typeof message === 'object' && 'embed' in message) {
       message.embed.footer = message.embed.footer || {
-        text: 'Slackers Squad Services'
+        text: t('s3DiscordPluginBase.defaults.embedFooter', {}, this.lang)
       };
       if (typeof message.embed.color === 'string') {
         message.embed.color = parseInt(message.embed.color, 16);
@@ -159,7 +167,7 @@ export default class S3DiscordPluginBase extends S3PluginBase {
         } else if (error.headers && error.headers['retry-after']) {
           waitTime = parseFloat(error.headers['retry-after']) * 1000;
         }
-        this.verbose(1, `Rate limit hit, attempting retry in ${waitTime}ms...`);
+        this.verbose(1, t('s3DiscordPluginBase.verbose.rateLimitRetry', { waitTime }, this.lang));
         await new Promise((resolve) => setTimeout(resolve, waitTime));
         try {
           await this.channel.send(message);
@@ -167,10 +175,10 @@ export default class S3DiscordPluginBase extends S3PluginBase {
           // Mirrored: a dropped embed is silent from the operator's side —
           // Discord is where these plugins report, so its failures cannot be
           // reported there.
-          this.reportError('Discord', `Failed to send Discord message after retry: ${retryError.message}`, retryError, { includeStackInLog: true });
+          this.reportError('Discord', t('s3DiscordPluginBase.errors.sendFailedRetry', { error: retryError.message }, this.lang), retryError, { includeStackInLog: true });
         }
       } else {
-        this.reportError('Discord', `Failed to send Discord message: ${error.message}`, error, { includeStackInLog: true });
+        this.reportError('Discord', t('s3DiscordPluginBase.errors.sendFailed', { error: error.message }, this.lang), error, { includeStackInLog: true });
       }
     }
   }
