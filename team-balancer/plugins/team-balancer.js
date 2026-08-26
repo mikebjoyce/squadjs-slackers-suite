@@ -412,7 +412,7 @@ export default class TeamBalancer extends S3PluginBase {
         description: 'Post-swap average mu gap the Elo-diff micro scramble\'s escalating search stops at once reached.'
       },
       microScrambleMaxMovePercent: {
-        default: 0.10,
+        default: 0.20,
         type: 'number',
         description: 'Safety ceiling for the Elo-diff micro scramble: max fraction of the current round\'s total population (both teams combined) that may be moved.'
       },
