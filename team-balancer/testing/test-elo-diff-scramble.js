@@ -201,6 +201,7 @@ async function buildPlugin(optionOverrides = {}) {
     scrambleCompleteMessage: 'Scramble complete.',
     microScrambleCompleteMessage: 'Micro Elo-diff scramble complete.',
     scrambleFailedMessage: 'Scramble failed.',
+    microScrambleFailedMessage: 'Micro Elo-diff scramble found no change needed.',
     manualScrambleAnnouncement: 'Manual scramble in {delay}s',
     immediateManualScramble: 'Scrambling now!',
     manualMicroScrambleAnnouncement: 'Manual micro scramble in {delay}s',
@@ -471,7 +472,7 @@ async function runTests() {
       return stub;
     })(),
     async () => {
-      const { tb, mockS3 } = await buildPlugin({ eloDiffScrambleThreshold: 100 }); // never fires via the trigger path
+      const { tb, mockS3, capturedBroadcasts } = await buildPlugin({ eloDiffScrambleThreshold: 100 }); // never fires via the trigger path
       seedRoster({ tb, mockS3 }, { t1Count: 5, t2Count: 5 });
       tb._pendingScrambleType = 'EloDiff';
       await tb.executeScramble(false);
@@ -479,6 +480,18 @@ async function runTests() {
       assert(
         !!firstCall && firstCall.minPlayersToMove === 2 && firstCall.maxPlayersToMove === 2,
         `scrambleType EloDiff drives the search's own escalating budget (min=max=2 at the first step), not the 40/55 forced-churn hack (got ${JSON.stringify(firstCall)}).`
+      );
+      // Every budget step returned an empty plan, so executeScramble takes the empty-plan
+      // failure branch. It must use microScrambleFailedMessage, not the generic
+      // scrambleFailedMessage — reusing the generic text would broadcast "Scramble failed!"
+      // for what is actually just "no small correction was needed."
+      assert(
+        capturedBroadcasts.some((m) => m.includes('Micro Elo-diff scramble found no change needed')),
+        `an EloDiff scramble with no budget-sized plan broadcasts microScrambleFailedMessage, not the generic one (got ${JSON.stringify(capturedBroadcasts)}).`
+      );
+      assert(
+        !capturedBroadcasts.some((m) => m === '[TB] Scramble failed.'),
+        'an EloDiff scramble with no budget-sized plan must not broadcast the generic scrambleFailedMessage.'
       );
     }
   );

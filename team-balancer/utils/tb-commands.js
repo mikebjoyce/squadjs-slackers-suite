@@ -125,6 +125,7 @@ const CommandHandlers = {
       microScrambleAnnouncement:
         'Team imbalance detected ({margin}-ticket margin) | Micro scramble in {delay}s...',
       microScrambleCompleteMessage: 'Balance has been restored. (Micro scramble)',
+      microScrambleFailedMessage: 'No balance change needed. (Micro scramble)',
 
       system: {
         trackingEnabled: 'Team Balancer has been enabled.',

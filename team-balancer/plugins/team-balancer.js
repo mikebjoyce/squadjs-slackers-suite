@@ -1902,6 +1902,14 @@ export default class TeamBalancer extends S3PluginBase {
       // will already hold _scramblePending/_scrambleInProgress by the time this one resolves.
       // isSeedMode() is checked explicitly here, independent of enableSeedAutoScramble — this
       // trigger must never fire on a Seed round regardless of that option.
+      //
+      // eloDiffPromise is captured (not fire-and-forget) so the non-dominant branch below can
+      // await it before deciding whether to broadcast its own win-margin narrative message —
+      // otherwise both that narrative and the micro-scramble announcement land back to back for
+      // the same round. It stays unawaited here, on the dominant path, deliberately: the
+      // win-streak-threshold scramble check further down is synchronous and must keep winning
+      // that race, which the fire-and-forget timing already guaranteed before this change.
+      let eloDiffPromise = null;
       if (this.options.enableEloDiffScramble && !this._s3?.gameState?.isSeedMode?.()) {
         const eloTrackerPlugin = this.server.plugins?.find(p => p.constructor.name === 'EloTracker');
         if (eloTrackerPlugin?.awaitRatingsCommitted) {
@@ -1909,11 +1917,12 @@ export default class TeamBalancer extends S3PluginBase {
           const team1EosIDs = currentPlayers.filter(p => String(p.teamID) === '1').map(p => p.eosID);
           const team2EosIDs = currentPlayers.filter(p => String(p.teamID) === '2').map(p => p.eosID);
           const ticketMargin = margin;
-          eloTrackerPlugin.awaitRatingsCommitted().then(({ snapshot }) =>
+          eloDiffPromise = eloTrackerPlugin.awaitRatingsCommitted().then(({ snapshot }) =>
             this._evaluateEloDiffTrigger({ team1EosIDs, team2EosIDs, ticketMargin, snapshot })
-          ).catch(err =>
-            Logger.verbose('TeamBalancer', 1, `[EloDiff] Unhandled error: ${err.message}`)
-          );
+          ).catch(err => {
+            Logger.verbose('TeamBalancer', 1, `[EloDiff] Unhandled error: ${err.message}`);
+            return false;
+          });
         }
       }
 
@@ -1943,7 +1952,15 @@ export default class TeamBalancer extends S3PluginBase {
 
       if (!isDominant) {
         Logger.verbose('TeamBalancer', 4, 'Handling non-dominant win branch.');
-        if (this.options.showWinStreakMessages) {
+        // Non-dominant wins are exactly the rounds the Elo-diff micro scramble targets, and
+        // nothing else in this branch can have claimed _scramblePending ahead of it (the
+        // consecutive-wins/single-round-margin checks above already returned if they fired) —
+        // so awaiting here is safe and doesn't cost the win-streak-threshold trigger its
+        // precedence the way awaiting on the dominant path would. If the micro scramble armed,
+        // its own announcement already told players a scramble is coming; skip this narrative
+        // broadcast so only one message shows up.
+        const eloDiffArmed = eloDiffPromise ? await eloDiffPromise : false;
+        if (this.options.showWinStreakMessages && !eloDiffArmed) {
           let template;
 
           if (this.winStreakTeam && this.winStreakTeam !== winnerID) {
@@ -2256,7 +2273,7 @@ export default class TeamBalancer extends S3PluginBase {
 
     Logger.verbose('TeamBalancer', 4, `[EloDiff] avgTeam1Mu=${avgTeam1Mu.toFixed(2)}, avgTeam2Mu=${avgTeam2Mu.toFixed(2)}, diff=${diff.toFixed(2)}, threshold=${this.options.eloDiffScrambleThreshold}`);
 
-    if (diff < this.options.eloDiffScrambleThreshold) return;
+    if (diff < this.options.eloDiffScrambleThreshold) return false;
 
     Logger.verbose('TeamBalancer', 2, `[EloDiff] Triggered! diff=${diff.toFixed(2)} >= threshold=${this.options.eloDiffScrambleThreshold}`);
 
@@ -2265,7 +2282,7 @@ export default class TeamBalancer extends S3PluginBase {
     const armed = await this.initiateScramble(false, false, null, null, null, 'EloDiff');
     if (!armed) {
       Logger.verbose('TeamBalancer', 2, '[EloDiff] Scramble not armed — lost to a same-round competitor (e.g. win-streak).');
-      return;
+      return false;
     }
 
     const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.microScrambleAnnouncement, {
@@ -2278,6 +2295,7 @@ export default class TeamBalancer extends S3PluginBase {
       Logger.verbose('TeamBalancer', 1, `Failed to broadcast micro scramble announcement: ${err.message}`);
     }
     this.mirrorRconToDiscord(msg, 'warning');
+    return true;
   }
 
   // ╔═══════════════════════════════════════╗
@@ -2820,25 +2838,34 @@ export default class TeamBalancer extends S3PluginBase {
         Logger.verbose('TeamBalancer', 2, 'Scrambler returned no player moves or an empty plan.');
         
         if (!isSimulated) {
-          const msg = `${this.RconMessages.prefix} ${this.RconMessages.scrambleFailedMessage.trim()}`;
+          // An EloDiff micro scramble finding no budget-sized plan isn't a failure in the
+          // sense a full scramble finding nothing is — it just means the round-end gap was
+          // too small to correct within the move-budget ceiling. Reusing scrambleFailedMessage
+          // here would broadcast the same alarming text for a routine "no action needed" outcome.
+          const isMicro = scrambleType === 'EloDiff';
+          const failedMessage = isMicro ? this.RconMessages.microScrambleFailedMessage : this.RconMessages.scrambleFailedMessage;
+          const msg = `${this.RconMessages.prefix} ${failedMessage.trim()}`;
           Logger.verbose('TeamBalancer', 4, `Broadcasting: "${msg}"`);
           try {
             await this.server.rcon.broadcast(msg);
           } catch (broadcastErr) {
             Logger.verbose('TeamBalancer', 1, `Failed to broadcast scramble failed message: ${broadcastErr.message}`);
           }
-          this.mirrorRconToDiscord(msg, 'warning');
+          this.mirrorRconToDiscord(msg, isMicro ? 'info' : 'warning');
           const targetReportChannel = this.discordReportChannel || this.discordChannel;
           // Same routing as the success path: dry run failures go to the admin command channel
           // (this.discordChannel), live scramble failures go to the report channel (targetReportChannel).
           const failChannel = isSimulated ? this.discordChannel : targetReportChannel;
           if (failChannel) {
-            const embed = DiscordHelpers.buildScrambleFailedEmbed('No valid swap solution found.', swapPlan?.calculationTime || 0, this);
+            const embedReason = isMicro ? 'No budget-sized swap reached the parity target.' : 'No valid swap solution found.';
+            const embed = DiscordHelpers.buildScrambleFailedEmbed(embedReason, swapPlan?.calculationTime || 0, this);
             DiscordHelpers.sendDiscordMessage(failChannel, { embeds: [embed] });
           }
           // Note: We do NOT reset the streak here, as the imbalance likely persists.
         } else {
-          Logger.verbose('TeamBalancer', 2, `${this.RconMessages.prefix} ${this.RconMessages.scrambleFailedMessage.trim()}`);
+          const isMicro = scrambleType === 'EloDiff';
+          const failedMessage = isMicro ? this.RconMessages.microScrambleFailedMessage : this.RconMessages.scrambleFailedMessage;
+          Logger.verbose('TeamBalancer', 2, `${this.RconMessages.prefix} ${failedMessage.trim()}`);
         }
       }
 
