@@ -561,5 +561,81 @@
                 "discordServerBroadcastDescription": "📢 **Server Broadcast**\n{message}"
             }
         }
+    },
+    "elo-tracker": {
+        "system": {
+            "logs": {
+                "s3VersionPassed": "[S3] Version check passed: S³ v{actual} >= required v{required}",
+                "pluginMounting": "Mounting plugin.",
+                "s3DbMigrationSkipped": "S³ DB or migrationEngine not available — skipping migration registration.",
+                "prunedStaleEntries": "[mount] Pruned stale entries — Tier 1 (provisional): {tier1}, Tier 2 (calibrated): {tier2}",
+                "restartDetectedResuming": "Restart detected. Resuming round from S³ roundStartTime: {time}",
+                "startingFreshRound": "No restart recovery from S³. Starting fresh.",
+                "fetchedDiscordChannel": "Fetched {type} Discord channel: {name} (ID: {id})",
+                "pluginMountedReady": "Plugin mounted and ready.",
+                "pluginUnmounting": "Unmounting plugin.",
+                "pluginUnmounted": "Plugin unmounted.",
+                "newGameReceived": "NEW_GAME event received. Starting new session.",
+                "dbBackoffActive": "[UPDATED_PLAYER_INFO] DB backoff active — skipping cache population this tick.",
+                "roundStartEmbedAbandoned": "Round start embed abandoned: player count never recovered within retry window.",
+                "roundStartEmbedPosted": "Round start embed posted.",
+                "scrambleEventReceived": "[onTeamBalancerScramble] Event received. Waiting 5s to capture post-scramble state...",
+                "scrambleDataNotReady": "[onTeamBalancerScramble] Data not ready, skipping embed.",
+                "postScrambleEmbedPosted": "[onTeamBalancerScramble] Post-scramble embed posted.",
+                "roundEndedNotReady": "[onRoundEnded] Fired but plugin not ready. Skipping.",
+                "skipEloPlayerCount": "[onRoundEnded] Skipping ELO update: player count {playerCount} below threshold {threshold}.",
+                "gameModeUnknownSkipping": "[onRoundEnded] Game mode unknown — skipping (safe default)",
+                "ignoredMatchType": "[onRoundEnded] Ignored match type: {reason}",
+                "noEligiblePlayers": "[onRoundEnded] No eligible players meeting participation ratio threshold.",
+                "playerCountBelowThreshold": "[onRoundEnded] Skipping ELO update: player count {playerCount} below threshold {minPlayers}.",
+                "ignoredMatch": "[onRoundEnded] {label}",
+                "noEligibleParticipants": "[onRoundEnded] No eligible participants. Skipping ELO update.",
+                "oneOrBothTeamsIneligible": "[onRoundEnded] Skipping ELO update: One or both teams have no eligible participants (Team 1: {t1Count}, Team 2: {t2Count}).",
+                "startingBulkIncrement": "[onRoundEnded] Starting bulkIncrementPlayerStats for {count} players...",
+                "bulkIncrementComplete": "[onRoundEnded] bulkIncrementPlayerStats complete. Starting insertRoundHistory...",
+                "insertRoundHistoryComplete": "[onRoundEnded] insertRoundHistory complete (id={id}).",
+                "dbWriteFailed": "[onRoundEnded] DB write failed: {error}",
+                "failedAppendMatchLog": "Failed to append match log: {error}",
+                "databasePlayerInsertFailed": "[onRoundEnded] Database player insert failed: {error}",
+                "discordTargetChannel": "[onRoundEnded] Discord target: #{channelName} ({channelId}), reportChannel={reportId}, adminChannel={adminId}",
+                "buildingRoundSummary": "[onRoundEnded] Building round summary embed...",
+                "sendingRoundSummary": "[onRoundEnded] Sending round summary to Discord...",
+                "roundSummarySent": "[onRoundEnded] Round summary sent successfully.",
+                "discordPostFailed": "[onRoundEnded] Discord post failed: {error}",
+                "eloUpdateComplete": "[onRoundEnded] ELO update complete. {count} players updated.",
+                "matchLogAppended": "[onRoundEnded] Match log appended to {path}",
+                "errorAppendingMatchLog": "[onRoundEnded] Error appending to match log: {error}"
+            },
+            "skippedReasons": {
+                "pluginNotReady": "Plugin not ready at round end",
+                "playerCountBelowThreshold": "Player count below threshold (Gamemode: {gameMode})",
+                "ignoredMatchType": "Ignored match type: {reason}",
+                "noEligiblePlayers": "No eligible players meeting participation threshold"
+            },
+            "embeds": {
+                "postScrambleTitle": "🔀 Post-Scramble Team Balance - {layerName}",
+                "roundSkipped": {
+                    "pluginNotReady": "Plugin not ready at round end",
+                    "playerCountBelow": "Player count below threshold (Gamemode: {gameMode})",
+                    "ignoredMatchType": "Ignored match type: {reason}",
+                    "gameModeUnknown": "Game mode unknown — skipping (safe default)",
+                    "noEligible": "No eligible participants (0 players met minParticipationRatio of {ratio})",
+                    "oneOrBothIneligible": "One or both teams had no eligible participants (Gamemode: {gameMode})"
+                }
+            },
+            "errors": {
+                "incompatibleS3Version": "[EloTracker] Incompatible S³ version: got {actual}, need >={required}. Please update SlackersSquadServices.",
+                "fetchDiscordChannelFailed": "Could not fetch {type} Discord channel (ID: {id}): {error}",
+                "backgroundFetchFailed": "Background fetch failed: {error}",
+                "postStartEmbedFailed": "Failed to post start embed: {error}",
+                "postScrambleEmbedFailed": "[onTeamBalancerScramble] Failed to post scramble embed: {error}",
+                "writeMatchLogFailed": "Failed to write match log: {error}",
+                "postRoundEndEmbedFailed": "Failed to post round-end embed: {error}",
+                "onRoundEndedFailed": "Error during onRoundEnded execution: {error}",
+                "onEloCommandFailed": "Error executing onEloCommand: {error}",
+                "onEloAdminCommandFailed": "Error executing onEloAdminCommand: {error}",
+                "onDiscordMessageFailed": "Error processing Discord message: {error}"
+            }
+        }
     }
 }

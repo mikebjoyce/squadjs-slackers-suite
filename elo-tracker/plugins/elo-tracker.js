@@ -245,7 +245,7 @@ export default class EloTracker extends S3PluginBase {
     this.listeners.onEloAdminCommand = this.onEloAdminCommand.bind(this);
   }
 
-  /// S3PluginBase lifecycle hooks
+/// S3PluginBase lifecycle hooks
 
   _checkS3Version() {
     // 1.2.2 — searchPlayer() calls _s3db.caseInsensitiveLikeLiteral(), added in
@@ -262,11 +262,17 @@ export default class EloTracker extends S3PluginBase {
     const actual = this._s3?.version;
     if (!this._s3VersionAtLeast(required)) {
       throw new Error(
-        `[EloTracker] Incompatible S³ version: got ${actual || 'unknown'}, need >=${required}. ` +
-        'Please update SlackersSquadServices.'
+        this.formatMessage(this.messages['elo-tracker'].system.errors.incompatibleS3Version, {
+          actual: actual || 'unknown',
+          required
+        })
       );
     }
-    Logger.verbose('EloTracker', 2, `[S3] Version check passed: S³ v${actual} >= required v${required}`);
+    Logger.verbose(
+      'EloTracker',
+      2,
+      this.formatMessage(this.messages['elo-tracker'].system.logs.s3VersionPassed, { actual, required })
+    );
   }
 
   async _onS3Ready() {
@@ -274,7 +280,7 @@ export default class EloTracker extends S3PluginBase {
     if (this._isMounted) {
       return;
     }
-    Logger.verbose('EloTracker', 1, 'Mounting plugin.');
+    Logger.verbose('EloTracker', 1, this.messages['elo-tracker'].system.logs.pluginMounting);
     this.ready = false;
 
     // ── Elo models (Sequelize) ──────────────────────────────────────────
@@ -463,7 +469,7 @@ export default class EloTracker extends S3PluginBase {
       // Apply pending migrations
       await this.verifyAndRunMigrations('elo-tracker');
     } else {
-      Logger.verbose('EloTracker', 1, 'S³ DB or migrationEngine not available — skipping migration registration.');
+      Logger.verbose('EloTracker', 1, this.messages['elo-tracker'].system.logs.s3DbMigrationSkipped);
     }
 
     // Initialize DB models (tables created by MigrationEngine above; initDB will find them)
@@ -471,47 +477,64 @@ export default class EloTracker extends S3PluginBase {
 
     // --- Prune stale player entries ---
     const { tier1, tier2 } = await this.db.pruneStaleEntries(this.options.minRoundsForLeaderboard);
-    Logger.verbose('EloTracker', 1, `[mount] Pruned stale entries — Tier 1 (provisional): ${tier1}, Tier 2 (calibrated): ${tier2}`);
+    Logger.verbose(
+      'EloTracker',
+      1,
+      this.formatMessage(this.messages['elo-tracker'].system.logs.prunedStaleEntries, { tier1, tier2 })
+    );
 
     // Restart Recovery — delegated to S³ GameStateService
     const gs = this._s3?.gameState;
     const recoveredStart = gs?.getRoundStartTime?.();
     if (recoveredStart) {
       this.session.startRound(recoveredStart);
-      Logger.verbose('EloTracker', 1, `Restart detected. Resuming round from S³ roundStartTime: ${new Date(recoveredStart).toISOString()}`);
+      Logger.verbose(
+        'EloTracker',
+        1,
+        this.formatMessage(this.messages['elo-tracker'].system.logs.restartDetectedResuming, {
+          time: new Date(recoveredStart).toISOString()
+        })
+      );
       // Immediately populate sessions for currently connected players
       this.session.updatePlayers(this.server.players, recoveredStart);
     } else {
       // Fresh round — S³ will set roundStartTime on NEW_GAME; for now use Date.now() as fallback
       // so the session manager has a timestamp to work with during early-join players
-      Logger.verbose('EloTracker', 1, 'No restart recovery from S³. Starting fresh.');
-      this.session.startRound(Date.now());
+      Logger.verbose('EloTracker', 1, this.messages['elo-tracker'].system.logs.startingFreshRound);
     }
 
     // Fetch Discord channels
     if (this.options.discordClient) {
-      if (this.options.discordAdminChannelID) {
-        try {
-          this.discordAdminChannel = await this.options.discordClient.channels.fetch(this.options.discordAdminChannelID);
-          Logger.verbose('EloTracker', 1, `Fetched admin Discord channel: ${this.discordAdminChannel.name} (ID: ${this.options.discordAdminChannelID})`);
-        } catch (err) {
-          Logger.verbose('EloTracker', 1, `Could not fetch admin Discord channel (ID: ${this.options.discordAdminChannelID}): ${err.message}`);
-        }
-      }
-      if (this.options.discordPublicChannelID) {
-        try {
-          this.discordPublicChannel = await this.options.discordClient.channels.fetch(this.options.discordPublicChannelID);
-          Logger.verbose('EloTracker', 1, `Fetched public Discord channel: ${this.discordPublicChannel.name} (ID: ${this.options.discordPublicChannelID})`);
-        } catch (err) {
-          Logger.verbose('EloTracker', 1, `Could not fetch public Discord channel (ID: ${this.options.discordPublicChannelID}): ${err.message}`);
-        }
-      }
-      if (this.options.discordReportChannelID) {
-        try {
-          this.discordReportChannel = await this.options.discordClient.channels.fetch(this.options.discordReportChannelID);
-          Logger.verbose('EloTracker', 1, `Fetched report Discord channel: ${this.discordReportChannel.name} (ID: ${this.options.discordReportChannelID})`);
-        } catch (err) {
-          Logger.verbose('EloTracker', 1, `Could not fetch report Discord channel (ID: ${this.options.discordReportChannelID}): ${err.message}`);
+      const channelConfigs = [
+        { type: 'admin', id: this.options.discordAdminChannelID, prop: 'discordAdminChannel' },
+        { type: 'public', id: this.options.discordPublicChannelID, prop: 'discordPublicChannel' },
+        { type: 'report', id: this.options.discordReportChannelID, prop: 'discordReportChannel' }
+      ];
+
+      for (const config of channelConfigs) {
+        if (config.id) {
+          try {
+            this[config.prop] = await this.options.discordClient.channels.fetch(config.id);
+            Logger.verbose(
+              'EloTracker',
+              1,
+              this.formatMessage(this.messages['elo-tracker'].system.logs.fetchedDiscordChannel, {
+                type: config.type,
+                name: this[config.prop].name,
+                id: config.id
+              })
+            );
+          } catch (err) {
+            Logger.verbose(
+              'EloTracker',
+              1,
+              this.formatMessage(this.messages['elo-tracker'].system.errors.fetchDiscordChannelFailed, {
+                type: config.type,
+                id: config.id,
+                error: err.message
+              })
+            );
+          }
         }
       }
     }
@@ -540,7 +563,7 @@ export default class EloTracker extends S3PluginBase {
 
     this._isMounted = true;
     this.ready = true;
-    Logger.verbose('EloTracker', 1, 'Plugin mounted and ready.');
+    Logger.verbose('EloTracker', 1, this.messages['elo-tracker'].system.logs.pluginMountedReady);
   }
 
   /**
@@ -553,7 +576,7 @@ export default class EloTracker extends S3PluginBase {
     if (!this._isMounted) {
       return;
     }
-    Logger.verbose('EloTracker', 1, 'Unmounting plugin.');
+    Logger.verbose('EloTracker', 1, this.messages['elo-tracker'].system.logs.pluginUnmounting);
 
     this.server.removeListener('NEW_GAME', this.listeners.onNewGame);
     this.server.removeListener('UPDATED_PLAYER_INFORMATION', this.listeners.onUpdatedPlayerInfo);
@@ -573,7 +596,7 @@ export default class EloTracker extends S3PluginBase {
 
     this.ready = false;
     this._isMounted = false;
-    Logger.verbose('EloTracker', 1, 'Plugin unmounted.');
+    Logger.verbose('EloTracker', 1, this.messages['elo-tracker'].system.logs.pluginUnmounted);
   }
 
   /**
@@ -583,7 +606,7 @@ export default class EloTracker extends S3PluginBase {
    async onNewGame(data) {
      if (!this.ready) return;
 
-      Logger.verbose('EloTracker', 1, 'NEW_GAME event received. Starting new session.');
+      Logger.verbose('EloTracker', 1, this.messages['elo-tracker'].system.logs.newGameReceived);
 
       // Layer info and round start time are owned by S³ gameState — it resolves on NEW_GAME
       // via its own handlers. Read roundStartTime from S³ for cross-plugin consistency.
@@ -630,7 +653,7 @@ export default class EloTracker extends S3PluginBase {
       this.db.getPlayerStatsBatch(uncachedIDs)
         .then((dbResults) => {
           if (!dbResults) {
-            Logger.verbose('EloTracker', 2, '[UPDATED_PLAYER_INFO] DB backoff active — skipping cache population this tick.');
+            Logger.verbose('EloTracker', 2, this.messages['elo-tracker'].system.logs.dbBackoffActive);
             return;
           }
 
@@ -649,7 +672,11 @@ export default class EloTracker extends S3PluginBase {
             }
           }
         })
-        .catch((err) => Logger.verbose('EloTracker', 1, `Background fetch failed: ${err.message}`));
+        .catch((err) => Logger.verbose(
+          'EloTracker',
+          1,
+          this.formatMessage(this.messages['elo-tracker'].system.errors.backgroundFetchFailed, { error: err.message })
+        ));
     }
 
     // Delayed Round Start Embed logic — retry on each tick until threshold met or timeout expires
@@ -663,7 +690,7 @@ export default class EloTracker extends S3PluginBase {
           this.sendDelayedStartEmbed();
         } else if (elapsed >= maxRetryMs) {
           this._roundStartEmbedPending = null; // expired — give up silently
-          Logger.verbose('EloTracker', 1, 'Round start embed abandoned: player count never recovered within retry window.');
+          Logger.verbose('EloTracker', 1, this.messages['elo-tracker'].system.logs.roundStartEmbedAbandoned);
         }
         // else: still within retry window but below threshold — leave pending and retry next tick
       }
@@ -680,54 +707,47 @@ export default class EloTracker extends S3PluginBase {
       const embedData = this.buildRoundStartData();
       const embed = EloDiscord.buildRoundStartEmbed(embedData);
       await EloDiscord.sendDiscordMessage(targetChannel, { embeds: [embed] });
-      Logger.verbose('EloTracker', 1, 'Round start embed posted.');
+      Logger.verbose('EloTracker', 1, this.messages['elo-tracker'].system.logs.roundStartEmbedPosted);
     } catch (err) {
-      Logger.verbose('EloTracker', 1, `Failed to post start embed: ${err.message}`);
+      Logger.verbose(
+        'EloTracker',
+        1,
+        this.formatMessage(this.messages['elo-tracker'].system.errors.postStartEmbedFailed, { error: err.message })
+      );
     }
   }
 
   async onTeamBalancerScramble(data) {
     if (!this.ready) return;
     
-    Logger.verbose('EloTracker', 1, '[onTeamBalancerScramble] Event received. Waiting 5s to capture post-scramble state...');
+    Logger.verbose('EloTracker', 1, this.messages['elo-tracker'].system.logs.scrambleEventReceived);
     
     this._scrambleEmbedTimer = setTimeout(async () => {
       try {
         const embedData = this.buildRoundStartData();
         if (embedData.status === 'warming' || embedData.status === 'empty') {
-          Logger.verbose('EloTracker', 1, '[onTeamBalancerScramble] Data not ready, skipping embed.');
+          Logger.verbose('EloTracker', 1, this.messages['elo-tracker'].system.logs.scrambleDataNotReady);
           return;
         }
         
         const embed = EloDiscord.buildRoundStartEmbed(embedData, 'manual');
-        embed.title = `🔀 Post-Scramble Team Balance - ${embedData.layerName || 'Unknown'}`;
+        embed.title = this.formatMessage(this.messages['elo-tracker'].system.embeds.postScrambleTitle, {
+          layerName: embedData.layerName || 'Unknown'
+        });
         
         const targetChannel = this.discordReportChannel || this.discordPublicChannel || this.discordAdminChannel;
         if (targetChannel) {
           await EloDiscord.sendDiscordMessage(targetChannel, { embeds: [embed] });
         }
-        Logger.verbose('EloTracker', 1, '[onTeamBalancerScramble] Post-scramble embed posted.');
+        Logger.verbose('EloTracker', 1, this.messages['elo-tracker'].system.logs.postScrambleEmbedPosted);
       } catch (err) {
-        Logger.verbose('EloTracker', 1, `[onTeamBalancerScramble] Failed to post scramble embed: ${err.message}`);
+        Logger.verbose(
+          'EloTracker',
+          1,
+          this.formatMessage(this.messages['elo-tracker'].system.errors.postScrambleEmbedFailed, { error: err.message })
+        );
       }
     }, 5000);
-  }
-
-  _isIgnoredMatch() {
-    const gs = this._s3?.gameState;
-    if (!gs) return null; // No S³ → can't determine, not ignored
-    const matched = gs.isIgnoredMode?.();
-    if (matched) return true; // true → the mode was matched
-    if (gs.getGamemode?.() === 'Unknown' && gs.getLayerName?.() === 'Unknown') return 'Unknown';
-    return null;
-  }
-
-  _getLayerName() {
-    return this._s3?.gameState?.getLayerName?.();
-  }
-
-  _getGamemode() {
-    return this._s3?.gameState?.getGamemode?.();
   }
 
   async onRoundEnded(data) {
@@ -735,342 +755,416 @@ export default class EloTracker extends S3PluginBase {
     // so a concurrent onNewGame() for the next round can't redirect this round's resolve.
     const resolveRatingsCommitted = this._ratingsCommittedResolve;
     try {
-    const gameMode = this._getGamemode();
-    const layerName = this._getLayerName();
+      const gameMode = this._getGamemode();
+      const layerName = this._getLayerName();
 
-    if (!this.ready) {
-      Logger.verbose('EloTracker', 1, '[onRoundEnded] Fired but plugin not ready. Skipping.');
-      const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
-      if (targetReportChannel) {
-        const embed = EloDiscord.buildRoundSkippedEmbed('Plugin not ready at round end', 0, layerName);
-        await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+      if (!this.ready) {
+        Logger.verbose('EloTracker', 1, this.messages['elo-tracker'].system.logs.roundEndedNotReady);
+        const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
+        if (targetReportChannel) {
+          const embed = EloDiscord.buildRoundSkippedEmbed(
+            this.messages['elo-tracker'].system.embeds.roundSkipped.pluginNotReady,
+            0,
+            layerName
+          );
+          await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+        }
+        return;
       }
-      return;
-    }
 
-    const roundEndTime = Date.now();
+      const roundEndTime = Date.now();
 
-    // --- Eligibility checks ---
-    const playerCount = this.server.players.length;
+      // --- Eligibility checks ---
+      const playerCount = this.server.players.length;
 
-    if (playerCount < this.options.minPlayersForElo) {
-      Logger.verbose('EloTracker', 1, `[onRoundEnded] Skipping ELO update: player count ${playerCount} below threshold ${this.options.minPlayersForElo}.`);
-      const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
-      if (targetReportChannel) {
-        const embed = EloDiscord.buildRoundSkippedEmbed(`Player count below threshold (Gamemode: ${gameMode ?? 'Unknown'})`, playerCount, layerName);
-        await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
-      }
-      return;
-    }
-
-    const ignoredReason = this._isIgnoredMatch();
-    if (ignoredReason) {
-      const label = ignoredReason === 'Unknown' ? 'Game mode unknown — skipping (safe default)' : `Ignored match type: ${ignoredReason}`;
-      Logger.verbose('EloTracker', 1, `[onRoundEnded] ${label}`);
-      const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
-      if (targetReportChannel) {
-        const embed = EloDiscord.buildRoundSkippedEmbed(`Ignored match type: ${ignoredReason}`, playerCount, layerName);
-        await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
-      }
-      return;
-    }
-
-    // --- Session flush ---
-    const participants = this.session.endRound(roundEndTime);
-
-    // --- Determine outcome ---
-    // SquadJS ROUND_ENDED data.winner is an object like { team: '1', tickets: 150 }
-    const winningTeamID = data?.winner ? parseInt(data.winner.team, 10) : null;
-    const ticketDiff = Math.abs((data?.winner?.tickets ?? 0) - (data?.loser?.tickets ?? 0));
-    const outcome = winningTeamID === 1 ? 'team1win'
-                  : winningTeamID === 2 ? 'team2win'
-                  : 'draw';
-
-    // --- Filter by minParticipationRatio ---
-    const eligible = participants.filter(
-      p => p.participationRatio >= this.options.minParticipationRatio
-    );
-
-    if (eligible.length === 0) {
-      Logger.verbose('EloTracker', 1, '[onRoundEnded] No eligible participants. Skipping ELO update.');
-      const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
-      if (targetReportChannel) {
-        const embed = EloDiscord.buildRoundSkippedEmbed(
-          `No eligible participants (0 players met minParticipationRatio of ${this.options.minParticipationRatio})`,
-          participants.length,
-          layerName
+      if (playerCount < this.options.minPlayersForElo) {
+        Logger.verbose(
+          'EloTracker',
+          1,
+          this.formatMessage(this.messages['elo-tracker'].system.logs.playerCountBelowThreshold, {
+            playerCount,
+            minPlayers: this.options.minPlayersForElo
+          })
         );
-        await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+        const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
+        if (targetReportChannel) {
+          const embed = EloDiscord.buildRoundSkippedEmbed(
+            this.formatMessage(this.messages['elo-tracker'].system.embeds.roundSkipped.playerCountBelow, {
+              gameMode: gameMode ?? 'Unknown'
+            }),
+            playerCount,
+            layerName
+          );
+          await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+        }
+        return;
       }
-      return;
-    }
 
-    const calculationStartTime = Date.now();
+      const ignoredReason = this._isIgnoredMatch();
+      if (ignoredReason) {
+        const label = ignoredReason === 'Unknown'
+          ? this.messages['elo-tracker'].system.embeds.roundSkipped.gameModeUnknown
+          : this.formatMessage(this.messages['elo-tracker'].system.embeds.roundSkipped.ignoredMatchType, { reason: ignoredReason });
 
-    // --- Build team arrays with mu/sigma from cache ---
-    const getRating = (eosID) =>
-      this.eloCache.get(eosID) ?? { mu: EloCalculator.MU_DEFAULT, sigma: EloCalculator.SIGMA_DEFAULT };
+        Logger.verbose('EloTracker', 1, this.formatMessage(this.messages['elo-tracker'].system.logs.ignoredMatch, { label }));
+        const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
+        if (targetReportChannel) {
+          const embed = EloDiscord.buildRoundSkippedEmbed(
+            this.formatMessage(this.messages['elo-tracker'].system.embeds.roundSkipped.ignoredMatchType, { reason: ignoredReason }),
+            playerCount,
+            layerName
+          );
+          await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+        }
+        return;
+      }
 
-    const team1Eligible = eligible.filter(p => p.assignedTeamID === 1);
-    const team2Eligible = eligible.filter(p => p.assignedTeamID === 2);
+      // --- Session flush ---
+      const participants = this.session.endRound(roundEndTime);
 
-    if (team1Eligible.length === 0 || team2Eligible.length === 0) {
-      Logger.verbose('EloTracker', 1, `[onRoundEnded] Skipping ELO update: One or both teams have no eligible participants (Team 1: ${team1Eligible.length}, Team 2: ${team2Eligible.length}).`);
-      const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
-      if (targetReportChannel) {
-        const embed = EloDiscord.buildRoundSkippedEmbed(
-          `One or both teams had no eligible participants (Gamemode: ${gameMode ?? 'Unknown'})`,
-          playerCount,
-          layerName
+      // --- Determine outcome ---
+      // SquadJS ROUND_ENDED data.winner is an object like { team: '1', tickets: 150 }
+      const winningTeamID = data?.winner ? parseInt(data.winner.team, 10) : null;
+      const ticketDiff = Math.abs((data?.winner?.tickets ?? 0) - (data?.loser?.tickets ?? 0));
+      const outcome = winningTeamID === 1 ? 'team1win'
+                    : winningTeamID === 2 ? 'team2win'
+                    : 'draw';
+
+      // --- Filter by minParticipationRatio ---
+      const eligible = participants.filter(
+        p => p.participationRatio >= this.options.minParticipationRatio
+      );
+
+      if (eligible.length === 0) {
+        Logger.verbose('EloTracker', 1, this.messages['elo-tracker'].system.logs.noEligibleParticipants);
+        const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
+        if (targetReportChannel) {
+          const embed = EloDiscord.buildRoundSkippedEmbed(
+            this.formatMessage(this.messages['elo-tracker'].system.embeds.roundSkipped.noEligible, {
+              ratio: this.options.minParticipationRatio
+            }),
+            participants.length,
+            layerName
+          );
+          await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+        }
+        return;
+      }
+
+      const calculationStartTime = Date.now();
+
+      // --- Build team arrays with mu/sigma from cache ---
+      const getRating = (eosID) =>
+        this.eloCache.get(eosID) ?? { mu: EloCalculator.MU_DEFAULT, sigma: EloCalculator.SIGMA_DEFAULT };
+
+      const team1Eligible = eligible.filter(p => p.assignedTeamID === 1);
+      const team2Eligible = eligible.filter(p => p.assignedTeamID === 2);
+
+      if (team1Eligible.length === 0 || team2Eligible.length === 0) {
+        Logger.verbose(
+          'EloTracker',
+          1,
+          this.formatMessage(this.messages['elo-tracker'].system.logs.oneOrBothTeamsIneligible, {
+            t1Count: team1Eligible.length,
+            t2Count: team2Eligible.length
+          })
         );
-        await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+        const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
+        if (targetReportChannel) {
+          const embed = EloDiscord.buildRoundSkippedEmbed(
+            this.formatMessage(this.messages['elo-tracker'].system.embeds.roundSkipped.oneOrBothIneligible, {
+              gameMode: gameMode ?? 'Unknown'
+            }),
+            playerCount,
+            layerName
+          );
+          await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+        }
+        return;
       }
-      return;
-    }
 
-    // --- Run TrueSkill ---
-    const { team1Updates, team2Updates } = EloCalculator.computeTeamUpdate(
-      team1Eligible.map(p => ({ ...getRating(p.eosID), participationRatio: p.participationRatio })),
-      team2Eligible.map(p => ({ ...getRating(p.eosID), participationRatio: p.participationRatio })),
-      outcome
-    );
+      // --- Run TrueSkill ---
+      const { team1Updates, team2Updates } = EloCalculator.computeTeamUpdate(
+        team1Eligible.map(p => ({ ...getRating(p.eosID), participationRatio: p.participationRatio })),
+        team2Eligible.map(p => ({ ...getRating(p.eosID), participationRatio: p.participationRatio })),
+        outcome
+      );
 
-    const team1RatingsBefore = team1Eligible.map(p => getRating(p.eosID));
-    const team2RatingsBefore = team2Eligible.map(p => getRating(p.eosID));
+      const team1RatingsBefore = team1Eligible.map(p => getRating(p.eosID));
+      const team2RatingsBefore = team2Eligible.map(p => getRating(p.eosID));
 
-    // --- Apply participation scaling, build DB updates, track topMovers ---
-    const dbUpdates = [];
-    const now = Date.now();
+      // --- Apply participation scaling, build DB updates, track topMovers ---
+      const dbUpdates = [];
+      const now = Date.now();
 
-    const processTeam = (players, updates, isWinner, isLoser) => {
-      const metrics = this._getMatchMetrics(players);
-      let totalDeltaMu = 0;
-      let totalDeltaSigma = 0;
-      const teamRegulars = [];
+      const processTeam = (players, updates, isWinner, isLoser) => {
+        const metrics = this._getMatchMetrics(players);
+        let totalDeltaMu = 0;
+        let totalDeltaSigma = 0;
+        const teamRegulars = [];
 
-      players.forEach((player, i) => {
-        const { deltaMu, deltaSigma } = updates[i];
-        const rating = getRating(player.eosID);
-        const scaledDeltaMu = deltaMu * player.participationRatio;
-        const scaledDeltaSigma = deltaSigma * player.participationRatio;
+        players.forEach((player, i) => {
+          const { deltaMu, deltaSigma } = updates[i];
+          const rating = getRating(player.eosID);
+          const scaledDeltaMu = deltaMu * player.participationRatio;
+          const scaledDeltaSigma = deltaSigma * player.participationRatio;
 
-        totalDeltaMu += scaledDeltaMu;
-        totalDeltaSigma += Math.abs(scaledDeltaSigma); // Sum absolute change in uncertainty
+          totalDeltaMu += scaledDeltaMu;
+          totalDeltaSigma += Math.abs(scaledDeltaSigma); // Sum absolute change in uncertainty
 
-        const newMu = rating.mu + scaledDeltaMu;
-        const newSigma = Math.max(rating.sigma - scaledDeltaSigma, 0.5);
-        const wins = (rating.wins ?? 0) + (isWinner ? 1 : 0);
-        const losses = (rating.losses ?? 0) + (isLoser ? 1 : 0);
+          const newMu = rating.mu + scaledDeltaMu;
+          const newSigma = Math.max(rating.sigma - scaledDeltaSigma, 0.5);
+          const wins = (rating.wins ?? 0) + (isWinner ? 1 : 0);
+          const losses = (rating.losses ?? 0) + (isLoser ? 1 : 0);
 
-        dbUpdates.push({
-          eosID: player.eosID,
-          steamID: player.steamID ?? null,
-          name: player.name,
-          mu: newMu,
-          sigma: newSigma,
-          wins: isWinner ? 1 : 0,    // NOTE: bulkIncrementPlayerStats must INCREMENT not overwrite
-          losses: isLoser ? 1 : 0,
-          roundsPlayed: 1,
-          lastSeen: now
+          dbUpdates.push({
+            eosID: player.eosID,
+            steamID: player.steamID ?? null,
+            name: player.name,
+            mu: newMu,
+            sigma: newSigma,
+            wins: isWinner ? 1 : 0,    // NOTE: bulkIncrementPlayerStats must INCREMENT not overwrite
+            losses: isLoser ? 1 : 0,
+            roundsPlayed: 1,
+            lastSeen: now
+          });
+
+          // Track Regulars for Spread Snapshot
+          const rounds = rating.roundsPlayed ?? 0;
+          if (rounds >= this.thresholds.regularMinGames) {
+            teamRegulars.push({
+              name: player.name,
+              muBefore: rating.mu,
+              muAfter: newMu,
+              deltaMu: scaledDeltaMu
+            });
+          }
+
+          // Update cache immediately
+          this.eloCache.set(player.eosID, { mu: newMu, sigma: newSigma, roundsPlayed: rounds + 1, wins, losses });
         });
 
-        // Track Regulars for Spread Snapshot
-        const rounds = rating.roundsPlayed ?? 0;
-        if (rounds >= this.thresholds.regularMinGames) {
-          teamRegulars.push({
-            name: player.name,
-            muBefore: rating.mu,
-            muAfter: newMu,
-            deltaMu: scaledDeltaMu
-          });
+        // Calculate Spread Snapshot
+        teamRegulars.sort((a, b) => b.muBefore - a.muBefore);
+        let spreadSnapshot = [];
+        if (teamRegulars.length <= 5) {
+          spreadSnapshot = teamRegulars.map((r, i) => ({ ...r, label: `${i + 1}.` }));
+        } else {
+          const midIndex = Math.floor(teamRegulars.length / 2);
+          spreadSnapshot = [
+            { ...teamRegulars[0], label: 'Top:' },
+            { ...teamRegulars[1], label: 'Top:' },
+            { ...teamRegulars[midIndex], label: 'Mid:' },
+            { ...teamRegulars[teamRegulars.length - 2], label: 'Bot:' },
+            { ...teamRegulars[teamRegulars.length - 1], label: 'Bot:' }
+          ];
         }
 
-        // Update cache immediately
-        this.eloCache.set(player.eosID, { mu: newMu, sigma: newSigma, roundsPlayed: rounds + 1, wins, losses });
-      });
-
-      // Calculate Spread Snapshot
-      teamRegulars.sort((a, b) => b.muBefore - a.muBefore);
-      let spreadSnapshot = [];
-      if (teamRegulars.length <= 5) {
-        spreadSnapshot = teamRegulars.map((r, i) => ({ ...r, label: `${i + 1}.` }));
-      } else {
-        const midIndex = Math.floor(teamRegulars.length / 2);
-        spreadSnapshot = [
-          { ...teamRegulars[0], label: 'Top:' },
-          { ...teamRegulars[1], label: 'Top:' },
-          { ...teamRegulars[midIndex], label: 'Mid:' },
-          { ...teamRegulars[teamRegulars.length - 2], label: 'Bot:' },
-          { ...teamRegulars[teamRegulars.length - 1], label: 'Bot:' }
-        ];
-      }
-
-      // Averages calculated outside of forEach loop after summation is complete
-      return {
-        ...metrics,
-        avgDeltaMu: players.length > 0 ? totalDeltaMu / players.length : 0,
-        avgDeltaSigma: players.length > 0 ? totalDeltaSigma / players.length : 0,
-        spreadSnapshot
+        // Averages calculated outside of forEach loop after summation is complete
+        return {
+          ...metrics,
+          avgDeltaMu: players.length > 0 ? totalDeltaMu / players.length : 0,
+          avgDeltaSigma: players.length > 0 ? totalDeltaSigma / players.length : 0,
+          spreadSnapshot
+        };
       };
-    };
 
-    const team1IsWinner = outcome === 'team1win';
-    const team2IsWinner = outcome === 'team2win';
-    const team1Summary = processTeam(team1Eligible, team1Updates, team1IsWinner, team2IsWinner);
-    const team2Summary = processTeam(team2Eligible, team2Updates, team2IsWinner, team1IsWinner);
+      const team1IsWinner = outcome === 'team1win';
+      const team2IsWinner = outcome === 'team2win';
+      const team1Summary = processTeam(team1Eligible, team1Updates, team1IsWinner, team2IsWinner);
+      const team2Summary = processTeam(team2Eligible, team2Updates, team2IsWinner, team1IsWinner);
 
-    // --- Ratings committed for this round — snapshot and resolve before any DB/Discord awaits ---
-    this.lastRoundSnapshot = new Map(this.eloCache);
-    resolveRatingsCommitted({ snapshot: this.lastRoundSnapshot });
+      // --- Ratings committed for this round — snapshot and resolve before any DB/Discord awaits ---
+      this.lastRoundSnapshot = new Map(this.eloCache);
+      resolveRatingsCommitted({ snapshot: this.lastRoundSnapshot });
 
-    // --- DB writes ---
-    let roundRecord = null;
-    try {
-      Logger.verbose('EloTracker', 2, `[onRoundEnded] Starting bulkIncrementPlayerStats for ${dbUpdates.length} players...`);
-      await this.db.bulkIncrementPlayerStats(dbUpdates);
-      Logger.verbose('EloTracker', 2, '[onRoundEnded] bulkIncrementPlayerStats complete. Starting insertRoundHistory...');
-
-      const gs = this._s3?.gameState;
-
-      roundRecord = await this.db.insertRoundHistory({
-        layerName: layerName,
-        matchId: gs?.getMatchId?.() ?? null,
-        winningTeamID,
-        ticketDiff: ticketDiff,
-        roundDuration: roundEndTime - this.session.roundStartTime,
-        endedAt: roundEndTime,
-        playerCount: eligible.length
-      });
-      Logger.verbose('EloTracker', 2, `[onRoundEnded] insertRoundHistory complete (id=${roundRecord?.id}).`);
-    } catch (err) {
-      Logger.verbose('EloTracker', 1, `[onRoundEnded] DB write failed: ${err.message}`);
-    }
-
-    const gs = this._s3?.gameState;
-    const matchRecord = {
-      ts: roundEndTime,
-      matchId: gs?.getMatchId?.() ?? roundEndTime.toString(),
-      endedAt: roundEndTime,
-      layerName: layerName,
-      gameMode: gameMode ?? 'Unknown',
-      outcome,
-      roundDuration: roundEndTime - this.session.roundStartTime,
-      params: {
-        BETA: EloCalculator.BETA,
-        TAU: EloCalculator.TAU,
-        DRAW_PROBABILITY: EloCalculator.DRAW_PROBABILITY
-      },
-      players: [
-        ...team1Eligible.map((player, i) => {
-          const rating = team1RatingsBefore[i];
-          const { deltaMu, deltaSigma } = team1Updates[i];
-          const scaledDeltaMu = deltaMu * player.participationRatio;
-          const scaledDeltaSigma = deltaSigma * player.participationRatio;
-          return {
-            eosID: player.eosID,
-            name: player.name,
-            teamID: 1,
-            participationRatio: player.participationRatio,
-            muBefore: rating.mu,
-            sigmaBefore: rating.sigma,
-            rawDeltaMu: deltaMu,
-            rawDeltaSigma: deltaSigma,
-            scaledDeltaMu,
-            scaledDeltaSigma,
-            muAfter: rating.mu + scaledDeltaMu,
-            sigmaAfter: Math.max(rating.sigma - scaledDeltaSigma, 0.5)
-          };
-        }),
-        ...team2Eligible.map((player, i) => {
-          const rating = team2RatingsBefore[i];
-          const { deltaMu, deltaSigma } = team2Updates[i];
-          const scaledDeltaMu = deltaMu * player.participationRatio;
-          const scaledDeltaSigma = deltaSigma * player.participationRatio;
-          return {
-            eosID: player.eosID,
-            name: player.name,
-            teamID: 2,
-            participationRatio: player.participationRatio,
-            muBefore: rating.mu,
-            sigmaBefore: rating.sigma,
-            rawDeltaMu: deltaMu,
-            rawDeltaSigma: deltaSigma,
-            scaledDeltaMu,
-            scaledDeltaSigma,
-            muAfter: rating.mu + scaledDeltaMu,
-            sigmaAfter: Math.max(rating.sigma - scaledDeltaSigma, 0.5)
-          };
-        })
-      ]
-    };
-    this._appendMatchLog(matchRecord).catch(err => Logger.verbose('EloTracker', 1, `Failed to append match log: ${err.message}`));
-
-    // Fire-and-forget database insert if enabled and roundRecord was created
-    if (this.options.enableDatabaseLogging && roundRecord && roundRecord.id) {
-      // Read matchId and roundStartTime from S³ GameStateService for cross-plugin consistency
-      const gs2 = this._s3?.gameState;
-      const roundStartTime = gs2?.getRoundStartTime?.() ?? this.session.roundStartTime;
-      const matchId = gs2?.getMatchId?.();
-
-      const playerRows = matchRecord.players.map(p => ({
-        matchId: matchId,
-        roundStartTime: roundStartTime,
-        roundHistoryId: roundRecord.id,
-        eosID: p.eosID,
-        steamID: p.steamID || null,
-        name: p.name,
-        teamID: p.teamID,
-        participationRatio: p.participationRatio,
-        muBefore: p.muBefore,
-        sigmaBefore: p.sigmaBefore,
-        rawDeltaMu: p.rawDeltaMu,
-        rawDeltaSigma: p.rawDeltaSigma,
-        scaledDeltaMu: p.scaledDeltaMu,
-        scaledDeltaSigma: p.scaledDeltaSigma,
-        muAfter: p.muAfter,
-        sigmaAfter: p.sigmaAfter
-      }));
-      this.db.insertRoundPlayers(roundRecord.id, roundEndTime, playerRows).catch(err =>
-        Logger.verbose('EloTracker', 1, `[onRoundEnded] Database player insert failed: ${err.message}`)
-      );
-    }
-
-    const calculationDuration = Date.now() - calculationStartTime;
-
-    // --- Discord post ---
-    const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
-    Logger.verbose('EloTracker', 2, `[onRoundEnded] Discord target: #${targetReportChannel?.name || 'none'} (${targetReportChannel?.id || 'none'}), reportChannel=${this.discordReportChannel?.id || 'null'}, adminChannel=${this.discordAdminChannel?.id || 'null'}`);
-    if (targetReportChannel) {
+      // --- DB writes ---
+      let roundRecord = null;
       try {
-        Logger.verbose('EloTracker', 2, '[onRoundEnded] Building round summary embed...');
-        const liveT1 = this._getMatchMetrics(this.server.players.filter(p => p.teamID === 1));
-        const liveT2 = this._getMatchMetrics(this.server.players.filter(p => p.teamID === 2));
+        Logger.verbose(
+          'EloTracker',
+          2,
+          this.formatMessage(this.messages['elo-tracker'].system.logs.startingBulkIncrement, { count: dbUpdates.length })
+        );
+        await this.db.bulkIncrementPlayerStats(dbUpdates);
+        Logger.verbose('EloTracker', 2, this.messages['elo-tracker'].system.logs.bulkIncrementComplete);
 
-        const embed = EloDiscord.buildRoundSummaryEmbed({
+        const gs = this._s3?.gameState;
+
+        roundRecord = await this.db.insertRoundHistory({
           layerName: layerName,
-          gameMode,
+          matchId: gs?.getMatchId?.() ?? null,
           winningTeamID,
           ticketDiff: ticketDiff,
           roundDuration: roundEndTime - this.session.roundStartTime,
-          totalPlayerCount: this.server.players.length,
-          playersUpdatedCount: eligible.length,
-          team1Summary,
-          team2Summary,
-          liveT1,
-          liveT2,
-          calculationDuration
+          endedAt: roundEndTime,
+          playerCount: eligible.length
         });
-        Logger.verbose('EloTracker', 2, '[onRoundEnded] Sending round summary to Discord...');
-        await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
-        Logger.verbose('EloTracker', 2, '[onRoundEnded] Round summary sent successfully.');
+        Logger.verbose(
+          'EloTracker',
+          2,
+          this.formatMessage(this.messages['elo-tracker'].system.logs.insertRoundHistoryComplete, { id: roundRecord?.id })
+        );
       } catch (err) {
-        Logger.verbose('EloTracker', 1, `[onRoundEnded] Discord post failed: ${err.message}`);
+        Logger.verbose(
+          'EloTracker',
+          1,
+          this.formatMessage(this.messages['elo-tracker'].system.logs.dbWriteFailed, { error: err.message })
+        );
       }
-    }
 
-    // --- Flush cache ---
-    this.eloCache.clear();
-    Logger.verbose('EloTracker', 1, `[onRoundEnded] ELO update complete. ${eligible.length} players updated.`);
+      const gs = this._s3?.gameState;
+      const matchRecord = {
+        ts: roundEndTime,
+        matchId: gs?.getMatchId?.() ?? roundEndTime.toString(),
+        endedAt: roundEndTime,
+        layerName: layerName,
+        gameMode: gameMode ?? 'Unknown',
+        outcome,
+        roundDuration: roundEndTime - this.session.roundStartTime,
+        params: {
+          BETA: EloCalculator.BETA,
+          TAU: EloCalculator.TAU,
+          DRAW_PROBABILITY: EloCalculator.DRAW_PROBABILITY
+        },
+        players: [
+          ...team1Eligible.map((player, i) => {
+            const rating = team1RatingsBefore[i];
+            const { deltaMu, deltaSigma } = team1Updates[i];
+            const scaledDeltaMu = deltaMu * player.participationRatio;
+            const scaledDeltaSigma = deltaSigma * player.participationRatio;
+            return {
+              eosID: player.eosID,
+              name: player.name,
+              teamID: 1,
+              participationRatio: player.participationRatio,
+              muBefore: rating.mu,
+              sigmaBefore: rating.sigma,
+              rawDeltaMu: deltaMu,
+              rawDeltaSigma: deltaSigma,
+              scaledDeltaMu,
+              scaledDeltaSigma,
+              muAfter: rating.mu + scaledDeltaMu,
+              sigmaAfter: Math.max(rating.sigma - scaledDeltaSigma, 0.5)
+            };
+          }),
+          ...team2Eligible.map((player, i) => {
+            const rating = team2RatingsBefore[i];
+            const { deltaMu, deltaSigma } = team2Updates[i];
+            const scaledDeltaMu = deltaMu * player.participationRatio;
+            const scaledDeltaSigma = deltaSigma * player.participationRatio;
+            return {
+              eosID: player.eosID,
+              name: player.name,
+              teamID: 2,
+              participationRatio: player.participationRatio,
+              muBefore: rating.mu,
+              sigmaBefore: rating.sigma,
+              rawDeltaMu: deltaMu,
+              rawDeltaSigma: deltaSigma,
+              scaledDeltaMu,
+              scaledDeltaSigma,
+              muAfter: rating.mu + scaledDeltaMu,
+              sigmaAfter: Math.max(rating.sigma - scaledDeltaSigma, 0.5)
+            };
+          })
+        ]
+      };
+      this._appendMatchLog(matchRecord).catch(err =>
+        Logger.verbose(
+          'EloTracker',
+          1,
+          this.formatMessage(this.messages['elo-tracker'].system.logs.failedAppendMatchLog, { error: err.message })
+        )
+      );
+
+      // Fire-and-forget database insert if enabled and roundRecord was created
+      if (this.options.enableDatabaseLogging && roundRecord && roundRecord.id) {
+        // Read matchId and roundStartTime from S³ GameStateService for cross-plugin consistency
+        const gs2 = this._s3?.gameState;
+        const roundStartTime = gs2?.getRoundStartTime?.() ?? this.session.roundStartTime;
+        const matchId = gs2?.getMatchId?.();
+
+        const playerRows = matchRecord.players.map(p => ({
+          matchId: matchId,
+          roundStartTime: roundStartTime,
+          roundHistoryId: roundRecord.id,
+          eosID: p.eosID,
+          steamID: p.steamID || null,
+          name: p.name,
+          teamID: p.teamID,
+          participationRatio: p.participationRatio,
+          muBefore: p.muBefore,
+          sigmaBefore: p.sigmaBefore,
+          rawDeltaMu: p.rawDeltaMu,
+          rawDeltaSigma: p.rawDeltaSigma,
+          scaledDeltaMu: p.scaledDeltaMu,
+          scaledDeltaSigma: p.scaledDeltaSigma,
+          muAfter: p.muAfter,
+          sigmaAfter: p.sigmaAfter
+        }));
+        this.db.insertRoundPlayers(roundRecord.id, roundEndTime, playerRows).catch(err =>
+          Logger.verbose(
+            'EloTracker',
+            1,
+            this.formatMessage(this.messages['elo-tracker'].system.logs.databasePlayerInsertFailed, { error: err.message })
+          )
+        );
+      }
+
+      const calculationDuration = Date.now() - calculationStartTime;
+
+      // --- Discord post ---
+      const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
+      Logger.verbose(
+        'EloTracker',
+        2,
+        this.formatMessage(this.messages['elo-tracker'].system.logs.discordTargetChannel, {
+          channelName: targetReportChannel?.name || 'none',
+          channelId: targetReportChannel?.id || 'none',
+          reportId: this.discordReportChannel?.id || 'null',
+          adminId: this.discordAdminChannel?.id || 'null'
+        })
+      );
+      if (targetReportChannel) {
+        try {
+          Logger.verbose('EloTracker', 2, this.messages['elo-tracker'].system.logs.buildingRoundSummary);
+          const liveT1 = this._getMatchMetrics(this.server.players.filter(p => p.teamID === 1));
+          const liveT2 = this._getMatchMetrics(this.server.players.filter(p => p.teamID === 2));
+
+          const embed = EloDiscord.buildRoundSummaryEmbed({
+            layerName: layerName,
+            gameMode,
+            winningTeamID,
+            ticketDiff: ticketDiff,
+            roundDuration: roundEndTime - this.session.roundStartTime,
+            totalPlayerCount: this.server.players.length,
+            playersUpdatedCount: eligible.length,
+            team1Summary,
+            team2Summary,
+            liveT1,
+            liveT2,
+            calculationDuration
+          });
+          Logger.verbose('EloTracker', 2, this.messages['elo-tracker'].system.logs.sendingRoundSummary);
+          await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
+          Logger.verbose('EloTracker', 2, this.messages['elo-tracker'].system.logs.roundSummarySent);
+        } catch (err) {
+          Logger.verbose(
+            'EloTracker',
+            1,
+            this.formatMessage(this.messages['elo-tracker'].system.logs.discordPostFailed, { error: err.message })
+          );
+        }
+      }
+
+      // --- Flush cache ---
+      this.eloCache.clear();
+      Logger.verbose(
+        'EloTracker',
+        1,
+        this.formatMessage(this.messages['elo-tracker'].system.logs.eloUpdateComplete, { count: eligible.length })
+      );
     } finally {
       // No-op on the normal path (already resolved above, right after processTeam()) —
       // this only matters for early-return paths, resolving with whatever
@@ -1182,9 +1276,17 @@ export default class EloTracker extends S3PluginBase {
   async _appendMatchLog(record) {
     try {
       appendFileSync(this.options.eloLogPath, JSON.stringify(record) + '\n', 'utf8');
-      Logger.verbose('EloTracker', 4, `[onRoundEnded] Match log appended to ${this.options.eloLogPath}`);
+      Logger.verbose(
+        'EloTracker',
+        4,
+        this.formatMessage(this.messages['elo-tracker'].system.logs.matchLogAppended, { path: this.options.eloLogPath })
+      );
     } catch (err) {
-      Logger.verbose('EloTracker', 1, `[onRoundEnded] Error appending to match log: ${err.message}`);
+      Logger.verbose(
+        'EloTracker',
+        1,
+        this.formatMessage(this.messages['elo-tracker'].system.logs.errorAppendingMatchLog, { error: err.message })
+      );
     }
   }
 
