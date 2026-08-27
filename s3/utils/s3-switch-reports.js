@@ -40,6 +40,21 @@
  * player generated any event that round), so getGamesPlayedMap() reads
  * roster membership from there instead.
  *
+ * ─── SEED/JENSEN ROUNDS ARE EXCLUDED BY DEFAULT ──────────────────
+ *
+ * Every function below that counts switches or games takes an optional
+ * trailing `ignoredGameModes` array (default ['Seed', 'Jensen'], same
+ * default as S³'s own `ignoredGameModes` option) and drops any row whose
+ * matchId belongs to a round whose TB_RoundReport.gameMode/layerName matches
+ * one of those substrings. Seed/Jensen rounds get used to test the switch
+ * plugins themselves — an admin repeatedly self-switching to verify a fix —
+ * which would otherwise inflate that player's real switch/karma numbers with
+ * activity nobody would call "playing." Callers pass the S³ plugin's own
+ * `ignoredGameModes` config through so a server that customises it gets
+ * consistent behaviour everywhere; omitting the argument falls back to the
+ * Seed/Jensen default. The filter silently no-ops (nothing excluded) when
+ * TB_RoundReport doesn't exist, since there's no round data to check against.
+ *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * parseRange(argString)                        — "30d" / "2w" / "YYYY-MM-DD..YYYY-MM-DD" -> {fromTs,toTs}|{error}
@@ -47,12 +62,12 @@
  * checkLoggingAvailability(s3db, fromTs, toTs) — detects a logging-disabled gap vs. a genuine zero
  * resolvePlayers(s3db, identifier)             — tiered ID/name lookup against S3_PlayerEvents
  * isUnambiguous(candidates)                    — true when the best match tier is unique
- * getGamesPlayedMap(s3db, fromTs, toTs)        — Map<eosID, {name, matchIds:Set}> from snapshot rosters
- * getSwitchesMap(s3db, fromTs, toTs)           — Map<eosID, {name, total, bySource}> from TEAM_CHANGE rows
- * getPlayerSwitches(s3db, eosID, fromTs, toTs) — same shape, single player, indexed by eosID directly
- * getKarmaReport(s3db, eosID, fromTs, toTs)    — win-rate of self/balancer switches vs. round outcome
+ * getGamesPlayedMap(s3db, fromTs, toTs, ignoredGameModes?)        — Map<eosID, {name, matchIds:Set}> from snapshot rosters
+ * getSwitchesMap(s3db, fromTs, toTs, ignoredGameModes?)           — Map<eosID, {name, total, bySource}> from TEAM_CHANGE rows
+ * getPlayerSwitches(s3db, eosID, fromTs, toTs, ignoredGameModes?) — same shape, single player, indexed by eosID directly
+ * getKarmaReport(s3db, eosID, fromTs, toTs, ignoredGameModes?)    — win-rate of self/balancer switches vs. round outcome
  * isPeriodToken(token)                         — true for "daily"/"weekly"/"monthly"
- * getSwitchesByPeriod(s3db, fromTs, toTs, key) — all-players switch/round counts bucketed by period
+ * getSwitchesByPeriod(s3db, fromTs, toTs, key, ignoredGameModes?) — all-players switch/round counts bucketed by period
  *
  * ═══════════════════════════════════════════════════════════════
  */
@@ -103,6 +118,56 @@ const KNOWN_SOURCES = [
 ];
 
 const SOURCE_ALIASES = { 'Team-Balancer': 'TeamBalancer' };
+
+// Same default as S³'s own `ignoredGameModes` option (slackers-squad-services.js)
+// — Seed/Jensen rounds get used to test the switch plugins themselves (players
+// switching repeatedly to verify a fix works), which would otherwise inflate a
+// player's real switch/karma numbers with rounds nobody would call "played."
+const DEFAULT_IGNORED_GAME_MODES = ['Seed', 'Jensen'];
+
+/**
+ * @param {{gameMode?:string, layerName?:string}} row - A plain TB_RoundReport row.
+ * @param {string[]} needles - Already-lowercased mode/map substrings.
+ * @returns {boolean} True if this round's stored gameMode or layerName matches
+ *   any needle — same substring-match semantics as
+ *   GameStateService.isIgnoredMode(), applied to the round's persisted values
+ *   rather than the live game-state cache.
+ */
+function isIgnoredRound(row, needles) {
+  if (needles.length === 0) return false;
+  const gameMode = String(row.gameMode || '').toLowerCase();
+  const layerName = String(row.layerName || '').toLowerCase();
+  return needles.some((n) => gameMode.includes(n) || layerName.includes(n));
+}
+
+/**
+ * Builds the set of matchIds whose TB_RoundReport row matches an ignored game
+ * mode, for callers that don't otherwise fetch TB_RoundReport rows themselves.
+ * Returns an empty set (no filtering) when TB_RoundReport doesn't exist —
+ * reports fall back to their pre-filter behaviour rather than silently
+ * excluding everything just because TeamBalancer isn't installed.
+ *
+ * @returns {Promise<Set<string>>}
+ */
+async function getIgnoredMatchIds(s3db, fromTs, toTs, ignoredGameModes) {
+  const roundModel = s3db?.isReady?.() ? s3db.getModel('TB_RoundReport') : null;
+  if (!roundModel) return new Set();
+
+  const needles = (ignoredGameModes || []).map((m) => String(m).toLowerCase()).filter(Boolean);
+  if (needles.length === 0) return new Set();
+
+  const rounds = await roundModel.findAll({
+    where: { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
+    attributes: ['matchId', 'gameMode', 'layerName']
+  });
+
+  const ignored = new Set();
+  for (const r of rounds) {
+    const row = toPlainRow(r);
+    if (row.matchId && isIgnoredRound(row, needles)) ignored.add(row.matchId);
+  }
+  return ignored;
+}
 
 function bucketSource(source) {
   const normalized = SOURCE_ALIASES[source] || source;
@@ -286,17 +351,23 @@ const SNAPSHOT_TRIGGER_RANK = { ENDGAME: 0, MID_ROUND: 1, LIVE: 2 };
  *
  * @returns {Promise<{perPlayer: Map<string,{name:string, matchIds:Set<string>}>, roundsInRange:number}>}
  */
-export async function getGamesPlayedMap(s3db, fromTs, toTs) {
+export async function getGamesPlayedMap(s3db, fromTs, toTs, ignoredGameModes = DEFAULT_IGNORED_GAME_MODES) {
   const perPlayer = new Map();
   const roundModel = s3db?.isReady?.() ? s3db.getModel('TB_RoundReport') : null;
   const snapshotModel = s3db?.isReady?.() ? s3db.getModel('S3PlayerSnapshots') : null;
   if (!roundModel || !snapshotModel) return { perPlayer, roundsInRange: 0 };
 
+  const needles = (ignoredGameModes || []).map((m) => String(m).toLowerCase()).filter(Boolean);
   const rounds = await roundModel.findAll({
     where: { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
-    attributes: ['matchId']
+    attributes: ['matchId', 'gameMode', 'layerName']
   });
-  const matchIds = [...new Set(rounds.map((r) => toPlainRow(r).matchId).filter(Boolean))];
+  const matchIds = [...new Set(
+    rounds
+      .map((r) => toPlainRow(r))
+      .filter((row) => row.matchId && !isIgnoredRound(row, needles))
+      .map((row) => row.matchId)
+  )];
   if (matchIds.length === 0) return { perPlayer, roundsInRange: 0 };
 
   const snapshots = await snapshotModel.findAll({
@@ -341,19 +412,22 @@ export async function getGamesPlayedMap(s3db, fromTs, toTs) {
 /**
  * @returns {Promise<Map<string,{name:string,total:number,bySource:Object<string,number>}>>}
  */
-export async function getSwitchesMap(s3db, fromTs, toTs) {
+export async function getSwitchesMap(s3db, fromTs, toTs, ignoredGameModes = DEFAULT_IGNORED_GAME_MODES) {
   const perPlayer = new Map();
   const model = s3db?.isReady?.() ? s3db.getModel('S3PlayerEvents') : null;
   if (!model) return perPlayer;
 
+  const ignoredMatchIds = await getIgnoredMatchIds(s3db, fromTs, toTs, ignoredGameModes);
+
   const rows = await model.findAll({
     where: { eventType: 'TEAM_CHANGE', ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
-    attributes: ['eosID', 'name', 'source']
+    attributes: ['eosID', 'name', 'source', 'matchId']
   });
 
   for (const r of rows) {
     const row = toPlainRow(r);
     if (!row.eosID) continue;
+    if (row.matchId && ignoredMatchIds.has(row.matchId)) continue;
     let entry = perPlayer.get(row.eosID);
     if (!entry) {
       entry = { name: row.name, total: 0, bySource: {} };
@@ -371,20 +445,21 @@ export async function getSwitchesMap(s3db, fromTs, toTs) {
  * Single-player equivalent of getSwitchesMap(), filtered at the DB via the
  * indexed eosID column rather than pulling the whole range and filtering in JS.
  */
-export async function getPlayerSwitches(s3db, eosID, fromTs, toTs) {
+export async function getPlayerSwitches(s3db, eosID, fromTs, toTs, ignoredGameModes = DEFAULT_IGNORED_GAME_MODES) {
   const model = s3db?.isReady?.() ? s3db.getModel('S3PlayerEvents') : null;
   const empty = { name: null, total: 0, bySource: {} };
   if (!model || !eosID) return empty;
 
-  const rows = await model.findAll({
+  const ignoredMatchIds = await getIgnoredMatchIds(s3db, fromTs, toTs, ignoredGameModes);
+
+  const rows = (await model.findAll({
     where: { eventType: 'TEAM_CHANGE', eosID, ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
-    attributes: ['name', 'source']
-  });
+    attributes: ['name', 'source', 'matchId']
+  })).map(toPlainRow).filter((row) => !(row.matchId && ignoredMatchIds.has(row.matchId)));
   if (rows.length === 0) return empty;
 
-  const result = { name: toPlainRow(rows[0]).name, total: 0, bySource: {} };
-  for (const r of rows) {
-    const row = toPlainRow(r);
+  const result = { name: rows[0].name, total: 0, bySource: {} };
+  for (const row of rows) {
     result.total++;
     const bucket = bucketSource(row.source);
     result.bySource[bucket] = (result.bySource[bucket] || 0) + 1;
@@ -422,14 +497,16 @@ const KARMA_EXCLUDED_SOURCES = [
  *   decided?:number, wins?:number, winRate?:number|null, bySource?:Object}>}
  *   reason (when !available) is 'dbUnavailable' or 'noRoundOutcomeData'.
  */
-export async function getKarmaReport(s3db, eosID, fromTs, toTs) {
+export async function getKarmaReport(s3db, eosID, fromTs, toTs, ignoredGameModes = DEFAULT_IGNORED_GAME_MODES) {
   const eventsModel = s3db?.isReady?.() ? s3db.getModel('S3PlayerEvents') : null;
   if (!eventsModel) return { available: false, reason: 'dbUnavailable' };
 
   const roundModel = s3db.getModel('TB_RoundReport');
   if (!roundModel) return { available: false, reason: 'noRoundOutcomeData' };
 
-  const switchRows = await eventsModel.findAll({
+  const ignoredMatchIds = await getIgnoredMatchIds(s3db, fromTs, toTs, ignoredGameModes);
+
+  const switchRows = (await eventsModel.findAll({
     where: {
       eventType: 'TEAM_CHANGE',
       eosID,
@@ -437,13 +514,13 @@ export async function getKarmaReport(s3db, eosID, fromTs, toTs) {
       source: { [Op.notIn]: KARMA_EXCLUDED_SOURCES }
     },
     attributes: ['matchId', 'newTeamID', 'source']
-  });
+  })).map(toPlainRow).filter((row) => !(row.matchId && ignoredMatchIds.has(row.matchId)));
 
   if (switchRows.length === 0) {
     return { available: true, totalSwitches: 0, decided: 0, wins: 0, winRate: null, bySource: {} };
   }
 
-  const matchIds = [...new Set(switchRows.map((r) => toPlainRow(r).matchId).filter(Boolean))];
+  const matchIds = [...new Set(switchRows.map((row) => row.matchId).filter(Boolean))];
   const rounds = await roundModel.findAll({
     where: { matchId: { [Op.in]: matchIds } },
     attributes: ['matchId', 'winningTeamID']
@@ -457,8 +534,7 @@ export async function getKarmaReport(s3db, eosID, fromTs, toTs) {
   let wins = 0;
   const bySource = {};
 
-  for (const r of switchRows) {
-    const row = toPlainRow(r);
+  for (const row of switchRows) {
     const bucket = bucketSource(row.source);
     if (!bySource[bucket]) bySource[bucket] = { total: 0, wins: 0, decided: 0 };
     bySource[bucket].total++;
@@ -528,7 +604,7 @@ function bucketRanges(fromTs, toTs, periodKey) {
  * @returns {Promise<{ok:boolean, reason?:string, periods?:Array<{periodStart:number,
  *   periodEnd:number, rounds:number, total:number, bySource:Object}>}>}
  */
-export async function getSwitchesByPeriod(s3db, fromTs, toTs, periodKey = 'weekly') {
+export async function getSwitchesByPeriod(s3db, fromTs, toTs, periodKey = 'weekly', ignoredGameModes = DEFAULT_IGNORED_GAME_MODES) {
   const eventsModel = s3db?.isReady?.() ? s3db.getModel('S3PlayerEvents') : null;
   if (!eventsModel) return { ok: false, reason: 'dbUnavailable' };
 
@@ -538,30 +614,39 @@ export async function getSwitchesByPeriod(s3db, fromTs, toTs, periodKey = 'weekl
 
   const indexFor = (ts) => Math.min(Math.floor((ts - fromTs) / stepMs), periods.length - 1);
 
+  // Round query doubles as the ignored-mode source, so this stays one query
+  // instead of two — getIgnoredMatchIds() isn't reused here for that reason.
+  const needles = (ignoredGameModes || []).map((m) => String(m).toLowerCase()).filter(Boolean);
+  const roundModel = s3db.getModel('TB_RoundReport');
+  const ignoredMatchIds = new Set();
+  if (roundModel) {
+    const roundRows = await roundModel.findAll({
+      where: { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
+      attributes: ['matchId', 'ts', 'gameMode', 'layerName']
+    });
+    for (const r of roundRows) {
+      const row = toPlainRow(r);
+      if (row.matchId && isIgnoredRound(row, needles)) {
+        ignoredMatchIds.add(row.matchId);
+        continue;
+      }
+      const period = periods[indexFor(row.ts)];
+      if (period) period.rounds++;
+    }
+  }
+
   const switchRows = await eventsModel.findAll({
     where: { eventType: 'TEAM_CHANGE', ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
-    attributes: ['ts', 'source']
+    attributes: ['ts', 'source', 'matchId']
   });
   for (const r of switchRows) {
     const row = toPlainRow(r);
+    if (row.matchId && ignoredMatchIds.has(row.matchId)) continue;
     const period = periods[indexFor(row.ts)];
     if (!period) continue;
     period.total++;
     const bucket = bucketSource(row.source);
     period.bySource[bucket] = (period.bySource[bucket] || 0) + 1;
-  }
-
-  const roundModel = s3db.getModel('TB_RoundReport');
-  if (roundModel) {
-    const roundRows = await roundModel.findAll({
-      where: { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
-      attributes: ['ts']
-    });
-    for (const r of roundRows) {
-      const row = toPlainRow(r);
-      const period = periods[indexFor(row.ts)];
-      if (period) period.rounds++;
-    }
   }
 
   return { ok: true, periods };

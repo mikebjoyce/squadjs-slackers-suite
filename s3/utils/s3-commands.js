@@ -20,10 +20,9 @@
  *           checkmark (kept for legacy compat), truncate
  * Embeds:   buildStatusEmbed, buildServicesEmbed, buildGameStateEmbed,
  *           buildFactionsEmbed, buildLocksEmbed, buildConfigEmbed,
- *           buildSwitchesEmbed, buildKarmaEmbed, buildSwitchesExport,
- *           buildHelpEmbed
+ *           buildKarmaEmbed, buildSwitchesExport, buildHelpEmbed
  * Embed sets (return an array — one Discord message, several embeds):
- *           buildPlayersEmbeds, buildClansEmbeds
+ *           buildPlayersEmbeds, buildClansEmbeds, buildSwitchesEmbed
  * Tests:    runDiagnostic  (inject sendDiscordMessage)
  *
  * ─── DEPRECATED ─────────────────────────────────────────────────
@@ -1237,6 +1236,30 @@ function formatReportRange(range) {
   return `${from} → ${to}${range.capped ? ' *(capped at 180 days)*' : ''}`;
 }
 
+function formatIgnoredModesNote(ignoredGameModes) {
+  const modes = (ignoredGameModes || []).filter(Boolean);
+  return modes.length ? `*Excludes ${modes.join('/')} rounds.*` : '';
+}
+
+// Generic to any embed's 4096-char description limit — distinct from
+// pushLineField()'s 1024-char per-field chunking used elsewhere in this file.
+function chunkLines(lines, maxLen) {
+  const chunks = [];
+  let current = [];
+  let currentLen = 0;
+  for (const line of lines) {
+    if (currentLen + line.length + 1 > maxLen && current.length > 0) {
+      chunks.push(current);
+      current = [];
+      currentLen = 0;
+    }
+    current.push(line);
+    currentLen += line.length + 1;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks.length ? chunks : [[]];
+}
+
 function buildAvailabilityWarningEmbed(availability) {
   if (availability.reason === 'dbUnavailable') {
     return {
@@ -1281,27 +1304,34 @@ function buildPlayerNotFoundEmbed(identifier) {
  * Build the `!s3 switches` embed — a top-N leaderboard when no identifier is
  * given, or a single-player drill-down when one is.
  *
+ * Returns an embed set (array) rather than a single embed — the leaderboard's
+ * line list is paginated across embeds by description length (4096 chars
+ * each) instead of Discord's smaller 1024-char field limit, so a "(cont.)"
+ * field almost never happens in practice, but the contract stays an array
+ * for the rare case it does. Detail/error paths return a one-element array.
+ *
  * @param {object} plugin - S³ plugin instance.
  * @param {?string} identifier - Player ident, or null for leaderboard mode.
  * @param {?string} rangeArg - Raw range token ("30d", date range, or null for default).
- * @returns {Promise<object>} Discord embed object.
+ * @returns {Promise<object[]>} Discord embed objects — send all of them in one message.
  */
 export async function buildSwitchesEmbed(plugin, identifier, rangeArg) {
   const db = plugin.services?.db;
   const range = parseRange(rangeArg);
   if (range.error) {
-    return { color: 0xe74c3c, title: '❌ Invalid Range', description: range.error, timestamp: new Date().toISOString() };
+    return [{ color: 0xe74c3c, title: '❌ Invalid Range', description: range.error, timestamp: new Date().toISOString() }];
   }
 
   const availability = await checkLoggingAvailability(db, range.fromTs, range.toTs);
   if (!availability.ok) {
-    return buildAvailabilityWarningEmbed(availability);
+    return [buildAvailabilityWarningEmbed(availability)];
   }
 
-  const { perPlayer: gamesPlayedMap } = await getGamesPlayedMap(db, range.fromTs, range.toTs);
+  const ignoredGameModes = plugin.options?.ignoredGameModes;
+  const { perPlayer: gamesPlayedMap } = await getGamesPlayedMap(db, range.fromTs, range.toTs, ignoredGameModes);
 
   if (!identifier) {
-    const switchesMap = await getSwitchesMap(db, range.fromTs, range.toTs);
+    const switchesMap = await getSwitchesMap(db, range.fromTs, range.toTs, ignoredGameModes);
     const rows = [...switchesMap.entries()].map(([eosID, entry]) => ({
       eosID,
       name: entry.name,
@@ -1315,37 +1345,72 @@ export async function buildSwitchesEmbed(plugin, identifier, rangeArg) {
     const lines = top.map((r, i) => {
       const full = r.bySource['TeamBalancer:Full'] || 0;
       const micro = r.bySource['TeamBalancer:Micro'] || 0;
-      // Pre-Full/Micro-split historical balancer moves — still balancer-driven,
-      // just not typed. bucketSource() already merges the 'Team-Balancer'
-      // dead-code alias into this key.
+      // Pre-Full/Micro-split historical balancer moves — definitionally
+      // non-micro (the split didn't exist yet), so folded into the Full
+      // count below rather than shown as its own category — three columns
+      // where two are perpetually 0 and one silently carries every scramble
+      // reads as more categories than actually exist. bucketSource() already
+      // merges the 'Team-Balancer' dead-code alias into this key.
       const legacy = r.bySource.TeamBalancer || 0;
       // All player-initiated switch flavours (self-serve, queued pairing, join handshake, double-swap).
       const self = (r.bySource['Player-Self'] || 0) + (r.bySource['Player-Queue'] || 0) +
         (r.bySource['Switch-Double-Swap'] || 0) + (r.bySource['Handshake-Swap'] || 0);
       const other = r.total - full - micro - legacy - self;
-      const legacyStr = legacy > 0 ? ` · Legacy: ${legacy}` : '';
+      const fullStr = legacy > 0 ? `Full: ${full + legacy} (${legacy} legacy)` : `Full: ${full}`;
       const otherStr = other > 0 ? ` · Other: ${other}` : '';
-      return `**${i + 1}.** ${escapeMarkdown(truncate(r.name ?? r.eosID, 24))} — ${r.total} switches (${r.games} games) · Full: ${full} · Micro: ${micro}${legacyStr} · Self: ${self}${otherStr}`;
+      return `**${i + 1}.** ${escapeMarkdown(truncate(r.name ?? r.eosID, 24))} — ${r.total} switches (${r.games} games) · ${fullStr} · Micro: ${micro} · Self: ${self}${otherStr}`;
     });
 
-    const fields = [];
-    pushLineField(fields, `Top ${top.length} by Total Switches`, lines, { maxFields: 4 });
+    if (lines.length === 0) {
+      return [{
+        color: 0x3498db,
+        title: '🔀 Team-Switch Leaderboard',
+        description: formatReportRange(range),
+        fields: [{ name: 'No Switches', value: 'No TEAM_CHANGE events in this range.', inline: false }],
+        timestamp: new Date().toISOString()
+      }];
+    }
 
-    return {
+    // "Other" isn't self-explanatory in a bare number list, and Full's "(N
+    // legacy)" parenthetical needs a one-line explanation of what "legacy"
+    // means — spelled out once here rather than repeated per line.
+    const legend = 'Full = Full Scramble (legacy = pre-split Balancer moves, before Full/Micro were tracked separately — still full scrambles) · Micro = Elo-Diff Scramble · Self = player-initiated switch (self-serve, queued, handshake, or double-swap) · Other = SmartAssign, admin-forced, or untracked in-game switches';
+    const header = [formatReportRange(range), formatIgnoredModesNote(ignoredGameModes), legend]
+      .filter(Boolean).join('\n');
+
+    // Fits one embed in the overwhelming majority of cases — a description's
+    // 4096-char budget is 4x a field's, unlike the old field-based chunking
+    // this replaced, which produced a "Top N (cont.)" field per overflow.
+    const fullDescription = `${header}\n\n${lines.join('\n')}`;
+    if (fullDescription.length <= 4096) {
+      return [{
+        color: 0x3498db,
+        title: '🔀 Team-Switch Leaderboard',
+        description: fullDescription,
+        timestamp: new Date().toISOString()
+      }];
+    }
+
+    // Long clan-tagged names pushed this past one embed — split the list only,
+    // keeping header/legend on the first page. Each chunk is its own embed
+    // (Discord renders up to 10 per message as separate bordered cards), not
+    // a repeated field, so there is no "(cont.)" label to read past.
+    const budget = Math.max(4096 - header.length - 4, 500);
+    const chunks = chunkLines(lines, budget);
+    return chunks.map((chunk, i) => ({
       color: 0x3498db,
-      title: '🔀 Team-Switch Leaderboard',
-      description: formatReportRange(range),
-      fields: fields.length ? fields : [{ name: 'No Switches', value: 'No TEAM_CHANGE events in this range.', inline: false }],
+      title: chunks.length > 1 ? `🔀 Team-Switch Leaderboard (${i + 1}/${chunks.length})` : '🔀 Team-Switch Leaderboard',
+      description: i === 0 ? `${header}\n\n${chunk.join('\n')}` : chunk.join('\n'),
       timestamp: new Date().toISOString()
-    };
+    }));
   }
 
   const candidates = await resolvePlayers(db, identifier);
-  if (candidates.length === 0) return buildPlayerNotFoundEmbed(identifier);
-  if (!isUnambiguous(candidates)) return buildAmbiguousPlayerEmbed(identifier, candidates);
+  if (candidates.length === 0) return [buildPlayerNotFoundEmbed(identifier)];
+  if (!isUnambiguous(candidates)) return [buildAmbiguousPlayerEmbed(identifier, candidates)];
 
   const best = candidates[0];
-  const detail = await getPlayerSwitches(db, best.eosID, range.fromTs, range.toTs);
+  const detail = await getPlayerSwitches(db, best.eosID, range.fromTs, range.toTs, ignoredGameModes);
   const games = gamesPlayedMap.get(best.eosID)?.matchIds.size ?? 0;
 
   const scrambleLines = groupSwitchCounts(detail.bySource, SCRAMBLE_SOURCE_GROUPS)
@@ -1353,17 +1418,17 @@ export async function buildSwitchesEmbed(plugin, identifier, rangeArg) {
   const manualLines = groupSwitchCounts(detail.bySource, MANUAL_SOURCE_GROUPS)
     .map((g) => `${g.label}: **${g.count}**`);
 
-  return {
+  return [{
     color: 0x3498db,
     title: `🔀 Team Switches — ${escapeMarkdown(detail.name ?? best.name ?? best.eosID)}`,
-    description: formatReportRange(range),
+    description: [formatReportRange(range), formatIgnoredModesNote(ignoredGameModes)].filter(Boolean).join('\n'),
     fields: [
       { name: 'Summary', value: `Total Switches: **${detail.total}** | Games Played: **${games}**`, inline: false },
       { name: '⚖️ Balancer / Scrambles', value: scrambleLines.length ? scrambleLines.join('\n') : '*(none)*', inline: false },
       { name: '🔀 Manual / Switch', value: manualLines.length ? manualLines.join('\n') : '*(none)*', inline: false }
     ],
     timestamp: new Date().toISOString()
-  };
+  }];
 }
 
 /**
@@ -1407,14 +1472,27 @@ export async function buildKarmaEmbed(plugin, identifier, rangeArg) {
   if (!isUnambiguous(candidates)) return buildAmbiguousPlayerEmbed(identifier, candidates);
 
   const best = candidates[0];
-  const report = await getKarmaReport(db, best.eosID, range.fromTs, range.toTs);
+  const ignoredGameModes = plugin.options?.ignoredGameModes;
+  const report = await getKarmaReport(db, best.eosID, range.fromTs, range.toTs, ignoredGameModes);
+  const description = [formatReportRange(range), formatIgnoredModesNote(ignoredGameModes)].filter(Boolean).join('\n');
+
+  // Win-rate alone can't distinguish "switched 3 times in 150 games" from
+  // "switched 30 times in 40 games" — one is noise, the other is a pattern.
+  // Games played gives the verdict a sample-size anchor the way the
+  // `switches` leaderboard already does.
+  const { perPlayer: gamesPlayedMap } = await getGamesPlayedMap(db, range.fromTs, range.toTs, ignoredGameModes);
+  const games = gamesPlayedMap.get(best.eosID)?.matchIds.size ?? 0;
+  const switchRatePct = games > 0 ? ((report.totalSwitches / games) * 100).toFixed(1) : null;
+  const gamesSummary = switchRatePct != null
+    ? `in **${games}** games — **${switchRatePct}%** of rounds`
+    : `Games Played: **${games}**`;
 
   if (report.totalSwitches === 0) {
     return {
       color: 0x3498db,
       title: `🍀 Karma — ${escapeMarkdown(best.name ?? best.eosID)}`,
-      description: formatReportRange(range),
-      fields: [{ name: 'No Qualifying Switches', value: 'No self/untracked team switches in this range (admin-forced and balancer/SmartAssign-driven switches are excluded — karma is about the player\'s own choices).', inline: false }],
+      description,
+      fields: [{ name: 'No Qualifying Switches', value: `No self/untracked team switches in this range (${games} games played) — admin-forced and balancer/SmartAssign-driven switches are excluded, karma is about the player's own choices.`, inline: false }],
       timestamp: new Date().toISOString()
     };
   }
@@ -1430,9 +1508,9 @@ export async function buildKarmaEmbed(plugin, identifier, rangeArg) {
   return {
     color: 0x3498db,
     title: `🍀 Karma — ${escapeMarkdown(best.name ?? best.eosID)}`,
-    description: formatReportRange(range),
+    description,
     fields: [
-      { name: 'Summary', value: `Switches: **${report.totalSwitches}** | Known Outcome: **${report.decided}**`, inline: false },
+      { name: 'Summary', value: `Switches: **${report.totalSwitches}** (${gamesSummary}) | Known Outcome: **${report.decided}**`, inline: false },
       { name: '🎯 Switch Karma', value: verdict, inline: false },
       { name: 'By Source', value: sourceLines.length ? sourceLines.join('\n') : '*(none)*', inline: false }
     ],
@@ -1490,7 +1568,8 @@ export async function buildSwitchesExport(plugin, rangeArg, periodArg, asJson) {
     };
   }
 
-  const result = await getSwitchesByPeriod(db, range.fromTs, range.toTs, period);
+  const ignoredGameModes = plugin.options?.ignoredGameModes;
+  const result = await getSwitchesByPeriod(db, range.fromTs, range.toTs, period, ignoredGameModes);
   if (!result.ok) return { error: 'The S³ database service is not mounted.' };
 
   const rows = result.periods.map((p) => ({
@@ -1513,7 +1592,7 @@ export async function buildSwitchesExport(plugin, rangeArg, periodArg, asJson) {
     embed: {
       color: 0x2ecc71,
       title: `📊 Switch Report Export (${period})`,
-      description: formatReportRange(range),
+      description: [formatReportRange(range), formatIgnoredModesNote(ignoredGameModes)].filter(Boolean).join('\n'),
       fields: [
         { name: 'Periods', value: `${rows.length}`, inline: true },
         { name: 'Format', value: ext.toUpperCase(), inline: true }
@@ -1841,8 +1920,8 @@ export function createCommandHandlers(context) {
       identParts = rest.slice(0, -1);
     }
     const identifier = identParts.join(' ').trim() || null;
-    const embed = await buildSwitchesEmbed(plugin, identifier, rangeArg);
-    await sendDiscordMessage(message.channel, { embeds: [embed] }, 'S3', (...a) => plugin.verbose(...a));
+    const embeds = await buildSwitchesEmbed(plugin, identifier, rangeArg);
+    await sendDiscordMessage(message.channel, { embeds }, 'S3', (...a) => plugin.verbose(...a));
   });
 
   handlers.set('karma', async (plugin, message, args) => {

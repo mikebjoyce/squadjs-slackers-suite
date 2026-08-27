@@ -197,7 +197,9 @@ async function withDialect(name, fn) {
       ts: { type: DataTypes.BIGINT, allowNull: false },
       winningTeamID: { type: DataTypes.INTEGER, allowNull: true },
       scrambled: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
-      scrambleType: { type: DataTypes.STRING(100), allowNull: true }
+      scrambleType: { type: DataTypes.STRING(100), allowNull: true },
+      gameMode: { type: DataTypes.STRING(100), allowNull: true },
+      layerName: { type: DataTypes.STRING(150), allowNull: true }
     },
     { tableName: `T_RR${suffix}`, timestamps: false, exportTier: 'historical' }
   );
@@ -471,6 +473,81 @@ for (const { name } of DIALECTS) {
       const result = await getSwitchesByPeriod(db, fromTs, NOW, 'weekly');
       assert.equal(result.ok, true);
       assert.equal(result.periods.length, 2);
+    }));
+
+  // ─── Seed/Jensen exclusion (default ignoredGameModes) ────────────────────
+
+  test(`[${name}] getGamesPlayedMap: excludes rounds matching gameMode or layerName against the ignore list`, async () =>
+    withDialect(name, async (db, { snapshotsModel, roundReportModel }) => {
+      await roundReportModel.create({ matchId: 'r1', ts: NOW - DAY / 2, winningTeamID: 1, gameMode: 'RAAS' });
+      await roundReportModel.create({ matchId: 'r2', ts: NOW - DAY / 3, winningTeamID: 2, gameMode: 'Seed' });
+      await roundReportModel.create({ matchId: 'r3', ts: NOW - DAY / 4, winningTeamID: 1, gameMode: 'Invasion', layerName: 'Jensens Range AAS' });
+
+      await snapshotsModel.bulkCreate([
+        { matchId: 'r1', ts: NOW - DAY / 2, trigger: 'ENDGAME', playersJson: JSON.stringify([{ eosID: 'p1', name: 'One', teamID: 1 }]) },
+        { matchId: 'r2', ts: NOW - DAY / 3, trigger: 'ENDGAME', playersJson: JSON.stringify([{ eosID: 'p1', name: 'One', teamID: 1 }]) },
+        { matchId: 'r3', ts: NOW - DAY / 4, trigger: 'ENDGAME', playersJson: JSON.stringify([{ eosID: 'p1', name: 'One', teamID: 1 }]) }
+      ]);
+
+      const { perPlayer, roundsInRange } = await getGamesPlayedMap(db, NOW - DAY, NOW);
+      assert.equal(roundsInRange, 1, 'Seed (by gameMode) and Jensen (by layerName) rounds must both be excluded');
+      assert.deepEqual([...perPlayer.get('p1').matchIds], ['r1']);
+    }));
+
+  test(`[${name}] getSwitchesMap / getPlayerSwitches: excludes switches made during Seed rounds; empty ignoredGameModes opts out`, async () =>
+    withDialect(name, async (db, { eventsModel, roundReportModel }) => {
+      await roundReportModel.bulkCreate([
+        { matchId: 'r1', ts: NOW, gameMode: 'RAAS' },
+        { matchId: 'r2', ts: NOW, gameMode: 'Seed' }
+      ]);
+      await eventsModel.bulkCreate([
+        { ts: NOW, eventType: 'TEAM_CHANGE', eosID: 'p1', name: 'One', matchId: 'r1', source: 'Player-Self' },
+        { ts: NOW, eventType: 'TEAM_CHANGE', eosID: 'p1', name: 'One', matchId: 'r2', source: 'Player-Self' }
+      ]);
+
+      const map = await getSwitchesMap(db, NOW - DAY, NOW);
+      assert.equal(map.get('p1').total, 1, 'the Seed-round switch must be excluded by default');
+
+      const single = await getPlayerSwitches(db, 'p1', NOW - DAY, NOW);
+      assert.equal(single.total, 1);
+
+      const unfiltered = await getPlayerSwitches(db, 'p1', NOW - DAY, NOW, []);
+      assert.equal(unfiltered.total, 2, 'passing an empty ignoredGameModes array must opt out of exclusion');
+    }));
+
+  test(`[${name}] getKarmaReport: switches made during Seed rounds do not count toward totals or wins`, async () =>
+    withDialect(name, async (db, { eventsModel, roundReportModel }) => {
+      await roundReportModel.bulkCreate([
+        { matchId: 'r1', ts: NOW, winningTeamID: 1, gameMode: 'RAAS' },
+        { matchId: 'r2', ts: NOW, winningTeamID: 1, gameMode: 'Seed' }
+      ]);
+      await eventsModel.bulkCreate([
+        { ts: NOW, eventType: 'TEAM_CHANGE', eosID: 'p1', name: 'One', matchId: 'r1', newTeamID: 1, source: 'Player-Self' },
+        { ts: NOW, eventType: 'TEAM_CHANGE', eosID: 'p1', name: 'One', matchId: 'r2', newTeamID: 1, source: 'Player-Self' }
+      ]);
+
+      const report = await getKarmaReport(db, 'p1', NOW - DAY, NOW);
+      assert.equal(report.totalSwitches, 1, 'the Seed-round switch must not count toward karma at all');
+      assert.equal(report.wins, 1);
+    }));
+
+  test(`[${name}] getSwitchesByPeriod: excludes Seed rounds and their switches from bucket counts`, async () =>
+    withDialect(name, async (db, { eventsModel, roundReportModel }) => {
+      const fromTs = NOW - 3 * DAY;
+      const toTs = NOW;
+
+      await roundReportModel.bulkCreate([
+        { matchId: 'r1', ts: fromTs + DAY / 2, gameMode: 'RAAS' },
+        { matchId: 'r2', ts: fromTs + DAY / 2, gameMode: 'Seed' }
+      ]);
+      await eventsModel.bulkCreate([
+        { ts: fromTs + DAY / 2, eventType: 'TEAM_CHANGE', eosID: 'p1', name: 'One', matchId: 'r1', source: 'Player-Self' },
+        { ts: fromTs + DAY / 2, eventType: 'TEAM_CHANGE', eosID: 'p1', name: 'One', matchId: 'r2', source: 'Player-Self' }
+      ]);
+
+      const result = await getSwitchesByPeriod(db, fromTs, toTs, 'daily');
+      assert.equal(result.periods[0].rounds, 1, 'the Seed round must not count in rounds');
+      assert.equal(result.periods[0].total, 1, 'the Seed-round switch must not count in total');
     }));
 }
 
