@@ -83,7 +83,11 @@ const CATEGORY_TESTS = {
     // Parses S3_DEVELOPER_GUIDE.md and checks its command table, option
     // defaults and test catalog against source. No engine, no I/O beyond
     // reading three files.
-    'test-developer-guide-accuracy.js'
+    'test-developer-guide-accuracy.js',
+    // !s3 switches / !s3 karma query layer. Pure-JS section always runs;
+    // DB-integration section is SQLite-always, MySQL self-skips like the
+    // other dialect-portability tests above.
+    'test-s3-switch-reports.js'
   ],
   2: [
     'test-join-pipeline.js',

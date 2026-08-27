@@ -20,6 +20,7 @@
  *           checkmark (kept for legacy compat), truncate
  * Embeds:   buildStatusEmbed, buildServicesEmbed, buildGameStateEmbed,
  *           buildFactionsEmbed, buildLocksEmbed, buildConfigEmbed,
+ *           buildSwitchesEmbed, buildKarmaEmbed, buildSwitchesExport,
  *           buildHelpEmbed
  * Embed sets (return an array — one Discord message, several embeds):
  *           buildPlayersEmbeds, buildClansEmbeds
@@ -47,6 +48,12 @@
  *  ⚪  White circle  — Unknown / N/A / Indeterminate
  *  🟣  Purple circle — Optional / Auxiliary feature active
  *
+ * buildKarmaVerdict() reuses these circles for an unrelated scale — win-rate
+ * direction, not system status. There, 🟢/🟢🟢 = good karma (switches skew
+ * toward the losing team), 🟡/🟠 = bad karma (skew toward the winning team),
+ * ⚪ = neutral or insufficient sample. The general legend above does not apply
+ * to that one function.
+ *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
  * s3-migration-discord.js — buildMigrationEmbed
@@ -66,6 +73,19 @@ import {
   exportToFile
 } from './s3-export-import.js';
 import { formatSize } from './s3-common.js';
+import {
+  parseRange,
+  looksLikeRangeToken,
+  checkLoggingAvailability,
+  resolvePlayers,
+  isUnambiguous,
+  getGamesPlayedMap,
+  getSwitchesMap,
+  getPlayerSwitches,
+  getKarmaReport,
+  isPeriodToken,
+  getSwitchesByPeriod
+} from './s3-switch-reports.js';
 
 // ============================================================================
 // Emoji Utilities
@@ -1137,6 +1157,374 @@ export function buildConfigEmbed(plugin) {
   };
 }
 
+// ============================================================================
+// Switch / Karma Reports (!s3 switches, !s3 karma)
+// ============================================================================
+
+// Display-only grouping for Discord embeds: nobody asks "how exactly did
+// switch.js move this player" — self-serve, queued-pairing, join-handshake and
+// double-swap all read as one "the switch plugin did it" line. Full/Micro/
+// Legacy scrambles stay split out on purpose — that distinction is the whole
+// point of the original Fiercer ask. Kept as two separate group lists (rather
+// than one flat list sorted by count) so the embed can render scrambles and
+// manual/self switches as visually separate sections instead of interleaving
+// them by count, which read as noise during review.
+const SCRAMBLE_SOURCE_GROUPS = [
+  { label: 'Full Scramble', sources: ['TeamBalancer:Full'] },
+  { label: 'Micro (Elo-Diff)', sources: ['TeamBalancer:Micro'] },
+  { label: 'Team-Balancer (Legacy)', sources: ['TeamBalancer'] },
+  { label: 'SmartAssign', sources: ['SmartAssign'] }
+];
+
+const MANUAL_SOURCE_GROUPS = [
+  { label: 'Switch (Self)', sources: ['Player-Self', 'Player-Queue', 'Handshake-Swap', 'Switch-Double-Swap'] },
+  { label: 'Admin-Forced', sources: ['Admin-Force'] },
+  { label: 'In-Game / Untracked', sources: ['Manual/Game'] },
+  { label: 'Other', sources: ['Other'] }
+];
+
+// bySource values are plain counts (switches) here.
+function groupSwitchCounts(bySource, groups) {
+  return groups
+    .map((g) => ({ label: g.label, count: g.sources.reduce((sum, s) => sum + (bySource[s] || 0), 0) }))
+    .filter((g) => g.count > 0);
+}
+
+// Minimum decided self/untracked switches before the karma verdict commits to
+// a directional read — below this, a 100%/0% rate is sample noise, not signal.
+const KARMA_MIN_SAMPLE = 5;
+
+/**
+ * The actual "karma" question: does this player's own switching behaviour
+ * (not a balancer/SmartAssign move they had no say in) tend to land them on
+ * the winning side. Scrambles are informative about the balancer, not the
+ * player, so they're excluded here even though the overall win-rate stat
+ * above includes them.
+ */
+function buildKarmaVerdict(winRate, decided) {
+  if (decided < KARMA_MIN_SAMPLE) {
+    return `⚪ Not enough decided self/untracked switches yet to judge (${decided} so far, need ${KARMA_MIN_SAMPLE}+).`;
+  }
+  const pct = (winRate * 100).toFixed(1);
+  if (winRate >= 0.60) return `🟠 Strongly favors the winning team — landed on the winner **${pct}%** of the time after a self/untracked switch.`;
+  if (winRate >= 0.55) return `🟡 Leans toward the winning team (**${pct}%**).`;
+  if (winRate > 0.45) return `⚪ Neutral — no clear pattern (**${pct}%**).`;
+  if (winRate > 0.40) return `🟢 Leans toward the losing team (**${pct}%**).`;
+  return `🟢🟢 Strongly favors the losing team (**${pct}%**).`;
+}
+
+// bySource values are {wins, decided, total} here.
+function groupKarmaBuckets(bySource, groups) {
+  return groups
+    .map((g) => {
+      const merged = g.sources.reduce((acc, s) => {
+        const v = bySource[s];
+        if (v) {
+          acc.wins += v.wins;
+          acc.decided += v.decided;
+          acc.total += v.total;
+        }
+        return acc;
+      }, { wins: 0, decided: 0, total: 0 });
+      return { label: g.label, ...merged };
+    })
+    .filter((g) => g.total > 0);
+}
+
+function formatReportRange(range) {
+  const from = new Date(range.fromTs).toISOString().slice(0, 10);
+  const to = new Date(range.toTs).toISOString().slice(0, 10);
+  return `${from} → ${to}${range.capped ? ' *(capped at 180 days)*' : ''}`;
+}
+
+function buildAvailabilityWarningEmbed(availability) {
+  if (availability.reason === 'dbUnavailable') {
+    return {
+      color: 0xe74c3c,
+      title: '🔴 Database Not Ready',
+      description: 'The S³ database service is not mounted, or the `S3_PlayerEvents` table does not exist yet.',
+      timestamp: new Date().toISOString()
+    };
+  }
+  return {
+    color: 0xf39c12,
+    title: '🟠 No Event Data Logged In This Range',
+    description: [
+      'No `S3_PlayerEvents` rows exist anywhere in the requested date range.',
+      'This almost always means `enableDatabaseLogging` was off for the whole window, not that nothing happened — check the S³ config before trusting a "0" result.'
+    ].join('\n'),
+    timestamp: new Date().toISOString()
+  };
+}
+
+function buildAmbiguousPlayerEmbed(identifier, candidates) {
+  const lines = candidates.slice(0, 10).map((c) => `\`${c.eosID}\` — ${escapeMarkdown(c.name ?? '?')}`);
+  return {
+    color: 0xf39c12,
+    title: '🟠 Ambiguous Player',
+    description: `Multiple players match \`${escapeMarkdown(identifier)}\`. Retry with a full eosID/steamID:`,
+    fields: [{ name: 'Candidates', value: lines.join('\n'), inline: false }],
+    timestamp: new Date().toISOString()
+  };
+}
+
+function buildPlayerNotFoundEmbed(identifier) {
+  return {
+    color: 0xe74c3c,
+    title: '❌ Player Not Found',
+    description: `No player matching \`${escapeMarkdown(identifier)}\` was found in the switch-event log.`,
+    timestamp: new Date().toISOString()
+  };
+}
+
+/**
+ * Build the `!s3 switches` embed — a top-N leaderboard when no identifier is
+ * given, or a single-player drill-down when one is.
+ *
+ * @param {object} plugin - S³ plugin instance.
+ * @param {?string} identifier - Player ident, or null for leaderboard mode.
+ * @param {?string} rangeArg - Raw range token ("30d", date range, or null for default).
+ * @returns {Promise<object>} Discord embed object.
+ */
+export async function buildSwitchesEmbed(plugin, identifier, rangeArg) {
+  const db = plugin.services?.db;
+  const range = parseRange(rangeArg);
+  if (range.error) {
+    return { color: 0xe74c3c, title: '❌ Invalid Range', description: range.error, timestamp: new Date().toISOString() };
+  }
+
+  const availability = await checkLoggingAvailability(db, range.fromTs, range.toTs);
+  if (!availability.ok) {
+    return buildAvailabilityWarningEmbed(availability);
+  }
+
+  const { perPlayer: gamesPlayedMap } = await getGamesPlayedMap(db, range.fromTs, range.toTs);
+
+  if (!identifier) {
+    const switchesMap = await getSwitchesMap(db, range.fromTs, range.toTs);
+    const rows = [...switchesMap.entries()].map(([eosID, entry]) => ({
+      eosID,
+      name: entry.name,
+      total: entry.total,
+      bySource: entry.bySource,
+      games: gamesPlayedMap.get(eosID)?.matchIds.size ?? 0
+    }));
+    rows.sort((a, b) => b.total - a.total);
+
+    const top = rows.slice(0, 20);
+    const lines = top.map((r, i) => {
+      const full = r.bySource['TeamBalancer:Full'] || 0;
+      const micro = r.bySource['TeamBalancer:Micro'] || 0;
+      // Pre-Full/Micro-split historical balancer moves — still balancer-driven,
+      // just not typed. bucketSource() already merges the 'Team-Balancer'
+      // dead-code alias into this key.
+      const legacy = r.bySource.TeamBalancer || 0;
+      // All player-initiated switch flavours (self-serve, queued pairing, join handshake, double-swap).
+      const self = (r.bySource['Player-Self'] || 0) + (r.bySource['Player-Queue'] || 0) +
+        (r.bySource['Switch-Double-Swap'] || 0) + (r.bySource['Handshake-Swap'] || 0);
+      const other = r.total - full - micro - legacy - self;
+      const legacyStr = legacy > 0 ? ` · Legacy: ${legacy}` : '';
+      const otherStr = other > 0 ? ` · Other: ${other}` : '';
+      return `**${i + 1}.** ${escapeMarkdown(truncate(r.name ?? r.eosID, 24))} — ${r.total} switches (${r.games} games) · Full: ${full} · Micro: ${micro}${legacyStr} · Self: ${self}${otherStr}`;
+    });
+
+    const fields = [];
+    pushLineField(fields, `Top ${top.length} by Total Switches`, lines, { maxFields: 4 });
+
+    return {
+      color: 0x3498db,
+      title: '🔀 Team-Switch Leaderboard',
+      description: formatReportRange(range),
+      fields: fields.length ? fields : [{ name: 'No Switches', value: 'No TEAM_CHANGE events in this range.', inline: false }],
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  const candidates = await resolvePlayers(db, identifier);
+  if (candidates.length === 0) return buildPlayerNotFoundEmbed(identifier);
+  if (!isUnambiguous(candidates)) return buildAmbiguousPlayerEmbed(identifier, candidates);
+
+  const best = candidates[0];
+  const detail = await getPlayerSwitches(db, best.eosID, range.fromTs, range.toTs);
+  const games = gamesPlayedMap.get(best.eosID)?.matchIds.size ?? 0;
+
+  const scrambleLines = groupSwitchCounts(detail.bySource, SCRAMBLE_SOURCE_GROUPS)
+    .map((g) => `${g.label}: **${g.count}**`);
+  const manualLines = groupSwitchCounts(detail.bySource, MANUAL_SOURCE_GROUPS)
+    .map((g) => `${g.label}: **${g.count}**`);
+
+  return {
+    color: 0x3498db,
+    title: `🔀 Team Switches — ${escapeMarkdown(detail.name ?? best.name ?? best.eosID)}`,
+    description: formatReportRange(range),
+    fields: [
+      { name: 'Summary', value: `Total Switches: **${detail.total}** | Games Played: **${games}**`, inline: false },
+      { name: '⚖️ Balancer / Scrambles', value: scrambleLines.length ? scrambleLines.join('\n') : '*(none)*', inline: false },
+      { name: '🔀 Manual / Switch', value: manualLines.length ? manualLines.join('\n') : '*(none)*', inline: false }
+    ],
+    timestamp: new Date().toISOString()
+  };
+}
+
+/**
+ * Build the `!s3 karma <ident>` embed — win-rate of a player's own switch
+ * decisions (self-serve, queued, join handshake, or untracked in-game)
+ * against the eventual round winner. Balancer/SmartAssign moves are excluded
+ * entirely (see KARMA_EXCLUDED_SOURCES in s3-switch-reports.js) — those
+ * aren't the player's choice. Requires TeamBalancer's
+ * `TB_RoundReport` table for outcome data.
+ *
+ * @param {object} plugin - S³ plugin instance.
+ * @param {?string} identifier - Player ident (required).
+ * @param {?string} rangeArg - Raw range token, or null for default.
+ * @returns {Promise<object>} Discord embed object.
+ */
+export async function buildKarmaEmbed(plugin, identifier, rangeArg) {
+  const db = plugin.services?.db;
+  const range = parseRange(rangeArg);
+  if (range.error) {
+    return { color: 0xe74c3c, title: '❌ Invalid Range', description: range.error, timestamp: new Date().toISOString() };
+  }
+  if (!identifier) {
+    return { color: 0xe74c3c, title: '❌ Missing Player', description: 'Usage: `!s3 karma <ident> [range]`', timestamp: new Date().toISOString() };
+  }
+
+  const availability = await checkLoggingAvailability(db, range.fromTs, range.toTs);
+  if (!availability.ok) {
+    return buildAvailabilityWarningEmbed(availability);
+  }
+  if (!availability.hasRoundOutcomeData) {
+    return {
+      color: 0xf39c12,
+      title: '🟠 Round Outcome Data Unavailable',
+      description: 'The `TB_RoundReport` table does not exist — TeamBalancer must be installed and mounted to compute karma (round winners are its data).',
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  const candidates = await resolvePlayers(db, identifier);
+  if (candidates.length === 0) return buildPlayerNotFoundEmbed(identifier);
+  if (!isUnambiguous(candidates)) return buildAmbiguousPlayerEmbed(identifier, candidates);
+
+  const best = candidates[0];
+  const report = await getKarmaReport(db, best.eosID, range.fromTs, range.toTs);
+
+  if (report.totalSwitches === 0) {
+    return {
+      color: 0x3498db,
+      title: `🍀 Karma — ${escapeMarkdown(best.name ?? best.eosID)}`,
+      description: formatReportRange(range),
+      fields: [{ name: 'No Qualifying Switches', value: 'No self/untracked team switches in this range (admin-forced and balancer/SmartAssign-driven switches are excluded — karma is about the player\'s own choices).', inline: false }],
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  // getKarmaReport() already excludes Admin-Force and every balancer/
+  // SmartAssign source at the query level (KARMA_EXCLUDED_SOURCES in
+  // s3-switch-reports.js) — report.bySource only ever contains switches the
+  // player chose themselves, so no re-filtering is needed here.
+  const verdict = buildKarmaVerdict(report.winRate ?? 0, report.decided);
+  const sourceLines = groupKarmaBuckets(report.bySource, MANUAL_SOURCE_GROUPS)
+    .map((g) => `${g.label}: ${g.wins}/${g.decided} decided (${g.total} total)`);
+
+  return {
+    color: 0x3498db,
+    title: `🍀 Karma — ${escapeMarkdown(best.name ?? best.eosID)}`,
+    description: formatReportRange(range),
+    fields: [
+      { name: 'Summary', value: `Switches: **${report.totalSwitches}** | Known Outcome: **${report.decided}**`, inline: false },
+      { name: '🎯 Switch Karma', value: verdict, inline: false },
+      { name: 'By Source', value: sourceLines.length ? sourceLines.join('\n') : '*(none)*', inline: false }
+    ],
+    timestamp: new Date().toISOString()
+  };
+}
+
+// Same grouping as the Discord embeds above, but as export columns nothing is
+// filtered out for being zero — a data doc needs a stable column set across
+// every row so it can be pivoted/charted, unlike a compact embed line.
+const EXPORT_GROUPS = [...SCRAMBLE_SOURCE_GROUPS, ...MANUAL_SOURCE_GROUPS];
+
+function sumGroup(bySource, group) {
+  return group.sources.reduce((sum, s) => sum + (bySource[s] || 0), 0);
+}
+
+function toCsv(rows) {
+  if (rows.length === 0) return '';
+  const headers = Object.keys(rows[0]);
+  const lines = [headers.join(',')];
+  for (const row of rows) {
+    lines.push(headers.map((h) => row[h]).join(','));
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Build the `!s3 switches export` file attachment — all-players switch/round
+ * counts bucketed by period, as CSV by default or JSON with `--json`. This is
+ * the periodic "data doc" — a trend over weeks/months, not a live leaderboard
+ * snapshot like the bare `!s3 switches` embed.
+ *
+ * @param {object} plugin
+ * @param {?string} rangeArg
+ * @param {?string} periodArg
+ * @param {boolean} asJson
+ * @returns {Promise<{error:string}|{embed:object, buffer:Buffer, filename:string}>}
+ */
+export async function buildSwitchesExport(plugin, rangeArg, periodArg, asJson) {
+  const db = plugin.services?.db;
+  const range = parseRange(rangeArg);
+  if (range.error) return { error: range.error };
+
+  if (periodArg && !isPeriodToken(periodArg)) {
+    return { error: `Unknown period "${periodArg}". Use "daily", "weekly", or "monthly".` };
+  }
+  const period = periodArg ? periodArg.toLowerCase() : 'weekly';
+
+  const availability = await checkLoggingAvailability(db, range.fromTs, range.toTs);
+  if (!availability.ok) {
+    return {
+      error: availability.reason === 'dbUnavailable'
+        ? 'The S³ database service is not mounted, or the `S3_PlayerEvents` table does not exist yet.'
+        : 'No `S3_PlayerEvents` rows exist anywhere in the requested date range — check `enableDatabaseLogging` before trusting this export.'
+    };
+  }
+
+  const result = await getSwitchesByPeriod(db, range.fromTs, range.toTs, period);
+  if (!result.ok) return { error: 'The S³ database service is not mounted.' };
+
+  const rows = result.periods.map((p) => ({
+    'Period Start': new Date(p.periodStart).toISOString(),
+    'Period End': new Date(p.periodEnd).toISOString(),
+    'Rounds Played': p.rounds,
+    'Total Switches': p.total,
+    ...Object.fromEntries(EXPORT_GROUPS.map((g) => [g.label, sumGroup(p.bySource, g)]))
+  }));
+
+  const ext = asJson ? 'json' : 'csv';
+  const fromStr = new Date(range.fromTs).toISOString().slice(0, 10);
+  const toStr = new Date(range.toTs).toISOString().slice(0, 10);
+  const filename = `s3-switches-${period}-${fromStr}_to_${toStr}.${ext}`;
+  const buffer = asJson
+    ? Buffer.from(JSON.stringify(rows, null, 2), 'utf-8')
+    : Buffer.from(toCsv(rows), 'utf-8');
+
+  return {
+    embed: {
+      color: 0x2ecc71,
+      title: `📊 Switch Report Export (${period})`,
+      description: formatReportRange(range),
+      fields: [
+        { name: 'Periods', value: `${rows.length}`, inline: true },
+        { name: 'Format', value: ext.toUpperCase(), inline: true }
+      ],
+      timestamp: new Date().toISOString()
+    },
+    buffer,
+    filename
+  };
+}
+
 export function buildHelpEmbed() {
   return {
     color: 0x3498db,
@@ -1153,6 +1541,18 @@ export function buildHelpEmbed() {
           '`!s3 clans` — Clan groups, plus why tags were excluded or merged',
           '`!s3 locks` — Global and per-player locks',
           '`!s3 config` — Server configuration values'
+        ].join('\n'),
+        inline: false
+      },
+      {
+        name: '📊 Reports',
+        value: [
+          '`!s3 switches [range]` — Team-switch leaderboard, all players',
+          '`!s3 switches <ident> [range]` — One player\'s switch breakdown by source',
+          '`!s3 switches export [range] [period] [--json]` — All-players switch/round counts per period, as a file attachment',
+          '`!s3 karma <ident> [range]` — Win-rate of a player\'s own switch decisions (self/untracked, not balancer/SmartAssign) vs. round outcome',
+          '`range`: `7d`, `30d` (default), `2w`, or `YYYY-MM-DD..YYYY-MM-DD` (max 180 days)',
+          '`period`: `daily`, `weekly` (default), or `monthly` — `--json` switches the attachment from CSV to JSON'
         ].join('\n'),
         inline: false
       },
@@ -1406,6 +1806,55 @@ export function createCommandHandlers(context) {
 
   handlers.set('config', async (plugin, message, args) => {
     const embed = buildConfigEmbed(plugin);
+    await sendDiscordMessage(message.channel, { embeds: [embed] }, 'S3', (...a) => plugin.verbose(...a));
+  });
+
+  // ── Reports ───────────────────────────────────────────────────
+
+  handlers.set('switches', async (plugin, message, args) => {
+    if (args[1]?.toLowerCase() === 'export') {
+      const rest = args.slice(2);
+      const asJson = rest.includes('--json');
+      const tokens = rest.filter((t) => t !== '--json');
+      let periodArg = null;
+      let rangeArg = null;
+      for (const t of tokens) {
+        if (isPeriodToken(t)) periodArg = t;
+        else if (looksLikeRangeToken(t)) rangeArg = t;
+      }
+      const result = await buildSwitchesExport(plugin, rangeArg, periodArg, asJson);
+      if (result.error) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xe74c3c, title: '❌ Export Failed', description: result.error, timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+      await message.channel.send({ embeds: [result.embed], files: [{ attachment: result.buffer, name: result.filename }] });
+      return;
+    }
+
+    const rest = args.slice(1);
+    let rangeArg = null;
+    let identParts = rest;
+    if (rest.length > 0 && looksLikeRangeToken(rest[rest.length - 1])) {
+      rangeArg = rest[rest.length - 1];
+      identParts = rest.slice(0, -1);
+    }
+    const identifier = identParts.join(' ').trim() || null;
+    const embed = await buildSwitchesEmbed(plugin, identifier, rangeArg);
+    await sendDiscordMessage(message.channel, { embeds: [embed] }, 'S3', (...a) => plugin.verbose(...a));
+  });
+
+  handlers.set('karma', async (plugin, message, args) => {
+    const rest = args.slice(1);
+    let rangeArg = null;
+    let identParts = rest;
+    if (rest.length > 0 && looksLikeRangeToken(rest[rest.length - 1])) {
+      rangeArg = rest[rest.length - 1];
+      identParts = rest.slice(0, -1);
+    }
+    const identifier = identParts.join(' ').trim() || null;
+    const embed = await buildKarmaEmbed(plugin, identifier, rangeArg);
     await sendDiscordMessage(message.channel, { embeds: [embed] }, 'S3', (...a) => plugin.verbose(...a));
   });
 

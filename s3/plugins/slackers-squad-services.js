@@ -126,6 +126,9 @@
  *   !s3 clans                → Detected clan groups.
  *   !s3 locks                → Global lock + per-player locks + priority table.
  *   !s3 config               → Server config values.
+ *   !s3 switches [ident] [range]  → Team-switch leaderboard, or one player's breakdown by source.
+ *   !s3 switches export [range] [period] [--json]  → All-players switch/round counts per period, as a file attachment.
+ *   !s3 karma <ident> [range]     → Win-rate of a player's own switches (excludes balancer/SmartAssign) vs. round outcome.
  *   !s3 db status            → Connector type, schema version status per plugin.
  *   !s3 db export [--logs|--all] [--to-file]  → Export tables as JSON.
  *   !s3 db import [--confirm] [--dry-run]       → Import from backup.

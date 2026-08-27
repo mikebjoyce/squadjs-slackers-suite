@@ -1587,6 +1587,10 @@ All commands in the configured `channelID` Discord channel:
 | `!s3 clans` | Active clan groups, plus a second embed explaining every exclusion (size bounds, `ignoreList`, unnormalizable tag) and every Damerau-Levenshtein merge and recruit-suffix strip |
 | `!s3 locks` | Global lock + per-player locks |
 | `!s3 config` | Server config values |
+| `!s3 switches [range]` | Team-switch leaderboard across all players |
+| `!s3 switches <ident> [range]` | One player's switch breakdown, grouped into Balancer/Scrambles vs. Manual/Switch |
+| `!s3 switches export [range] [period] [--json]` | All-players switch/round counts per period (`daily`/`weekly`/`monthly`), as a CSV (default) or JSON file attachment |
+| `!s3 karma <ident> [range]` | Win-rate of a player's self/untracked switches vs. the eventual round winner, with a directional verdict (excludes balancer/SmartAssign moves — those aren't the player's choice) |
 | `!s3 watch <service>` | Relay verbose logs for a service to Discord |
 | `!s3 unwatch` | Stop all active watches |
 | `!s3 diag` | Consolidated diagnostic — mounts, phase, factions, players, locks in one pass |
@@ -1769,6 +1773,7 @@ node s3/testing/test-game-state-service.js
 | `test-team-change-retry.js` | Team-change retry loop and give-up conditions |
 | `test-request-team-change-eosid.js` | `_requestTeamChange()` sends RCON `switchTeam(eosID)` — a single unambiguous arg, never playerName or a second targetTeamID arg |
 | `test-developer-guide-accuracy.js` | This guide's command table, option defaults and test catalog still match the source — see 11.8 |
+| `test-s3-switch-reports.js` | `!s3 switches`/`!s3 karma`/`!s3 switches export` query layer: range/period parsing, player resolution, source bucketing, games-played, karma, and periodic aggregation, on **SQLite and MySQL** |
 
 The harness's own suite lives outside `s3/`: `dev-harness/testing/test-dev-rcon-harness.js`
 (16 tests, fully mocked). See 11.7.
