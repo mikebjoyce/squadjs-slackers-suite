@@ -739,7 +739,7 @@ export default class S3PluginBase extends BasePlugin {
       // Force-refresh S³ player registry after the RCON command so the
       // next iteration (or the final check) sees up-to-date team data.
       if (this.players?.refreshNow) {
-        await this.players.refreshNow(source).catch(() => {});
+        await this.players.refreshNow(source).catch(() => { });
       }
     }
 
@@ -765,5 +765,39 @@ export default class S3PluginBase extends BasePlugin {
 
     this.verbose(2, t('s3PluginBase.teamChange.verbose.allAttemptsExhausted', { playerName, maxAttempts }, this.lang));
     return makeResult(false, null, attempts);
+  }
+
+  /**
+   * Loads localized JSON messages into this.messages automatically.
+   * @param {string} pluginNamespace - e.g. 'elo-tracker', 'smart-assign', 'switch'
+   * @param {string} [langCode='en'] - e.g. 'en', 'pt'
+   */
+  async loadMessages(pluginNamespace, langCode = 'en') {
+    const safeLang = String(langCode).toLowerCase().replace(/[^a-z0-9_-]/g, '');
+
+    // Path points from s3/plugins/ to top-level locales/ folder
+    const rootLocalesDir = path.resolve(__dirname, '../../locales');
+    const targetPath = path.join(rootLocalesDir, `${safeLang}.json`);
+    const fallbackPath = path.join(rootLocalesDir, 'en.json');
+
+    const fileToLoad = existsSync(targetPath) ? targetPath : fallbackPath;
+
+    try {
+      const module = await import(fileToLoad, { assert: { type: 'json' } });
+      // Assigns only the sub-namespace for this specific plugin (e.g. this.messages['elo-tracker'])
+      this.messages = module.default;
+      this.pluginNamespace = pluginNamespace;
+    } catch (err) {
+      const fallbackModule = await import(fallbackPath, { assert: { type: 'json' } });
+      this.messages = fallbackModule.default;
+    }
+  }
+
+  /**
+   * Global message formatter helper for variables like {playerCount}
+   */
+  formatMessage(template, vars = {}) {
+    if (!template) return '';
+    return template.replace(/\{(\w+)\}/g, (_, key) => vars[key] ?? `{${key}}`);
   }
 }
