@@ -116,6 +116,20 @@ export default class SwapExecutor {
       const now = Date.now();
       const playersToRemove = [];
 
+      // This is the string that actually reaches S3_PlayerEvents.source for every TeamBalancer
+      // move: _requestTeamChange() below re-records attribution via players.recordMove() right
+      // before each RCON attempt (s3-plugin-base.js), which always happens-before the tick-diff
+      // that detects and persists the real team change. Any recordMove() call made earlier in
+      // the scramble flow (e.g. team-balancer.js's executeScramble loop) is overwritten before
+      // it can ever be consumed — see the comment there.
+      //
+      // Read once per batch rather than per player — _pendingScrambleType is fixed for the
+      // whole scramble and only changes between initiateScramble() calls, which can't
+      // interleave with this loop (the global lock excludes a second scramble).
+      const moveSource = this.teamBalancer?._pendingScrambleType === 'EloDiff'
+        ? 'TeamBalancer:Micro'
+        : 'TeamBalancer:Full';
+
       for (const [eosID] of this.pendingPlayerMoves.entries()) {
         try {
           // Delegate to the base class method which handles retry/verify/warn
@@ -126,7 +140,7 @@ export default class SwapExecutor {
               timeoutMs: this.options.maxScrambleCompletionTime || 15000,
               warnPlayer: !!this.options.warnOnSwap,
               warnMessage: this.RconMessages?.playerScrambledWarning || 'You have been scrambled',
-              source: 'TeamBalancer'
+              source: moveSource
             });
 
             if (result && result.success) {

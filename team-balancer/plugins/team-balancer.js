@@ -2759,9 +2759,16 @@ export default class TeamBalancer extends S3PluginBase {
               continue;
             }
             
-            Logger.verbose('TeamBalancer', 1, `[Attribution] TEAM_BALANCER recording move via S³: player=${player.name} (${player.steamID}), sourceTeam=${player.teamID}, targetTeam=${move.targetTeamID}`);
-            this._s3?.players?.recordMove(move.eosID, move.targetTeamID, 'Team-Balancer');
-            
+            // No recordMove() here — reliablePlayerMove() -> swapExecutor.queueMove() ->
+            // processRetries() -> _requestTeamChange() re-records attribution itself right
+            // before every RCON attempt (s3-plugin-base.js), and that call always runs
+            // before this move can be detected as a real team change. A recordMove() call
+            // placed here would only ever be overwritten (Map.set, last-write-wins) before
+            // anything consumes it, or never consumed at all if the player disconnects or is
+            // already on the target team. It previously wrote the stale, differently-spelled
+            // 'Team-Balancer' string for exactly that reason — dead on arrival every time.
+            Logger.verbose('TeamBalancer', 1, `[Attribution] TEAM_BALANCER queuing move: player=${player.name} (${player.steamID}), sourceTeam=${player.teamID}, targetTeam=${move.targetTeamID}`);
+
             await this.reliablePlayerMove(move.eosID, move.targetTeamID, isSimulated);
           }
           await this.waitForScrambleToFinish(this.options.maxScrambleCompletionTime);
