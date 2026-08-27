@@ -83,7 +83,7 @@ import {
   getPlayerSwitches,
   getKarmaReport,
   isPeriodToken,
-  getSwitchesByPeriod
+  getSwitchesByPeriodAndPlayer
 } from './s3-switch-reports.js';
 
 // ============================================================================
@@ -1527,20 +1527,30 @@ function sumGroup(bySource, group) {
   return group.sources.reduce((sum, s) => sum + (bySource[s] || 0), 0);
 }
 
+// Every column used to be a number or ISO date, so a naive join never needed
+// escaping. The per-player export adds a free-text Player name column — real
+// Squad names routinely contain commas and quotes — so quoting is load-bearing
+// now, not defensive.
+function csvField(value) {
+  const s = String(value);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
 function toCsv(rows) {
   if (rows.length === 0) return '';
   const headers = Object.keys(rows[0]);
-  const lines = [headers.join(',')];
+  const lines = [headers.map(csvField).join(',')];
   for (const row of rows) {
-    lines.push(headers.map((h) => row[h]).join(','));
+    lines.push(headers.map((h) => csvField(row[h])).join(','));
   }
   return lines.join('\n');
 }
 
 /**
- * Build the `!s3 switches export` file attachment — all-players switch/round
- * counts bucketed by period, as CSV by default or JSON with `--json`. This is
- * the periodic "data doc" — a trend over weeks/months, not a live leaderboard
+ * Build the `!s3 switches export` file attachment — one row per (period,
+ * player) for every player who switched or played a round that period, as
+ * CSV by default or JSON with `--json`. This is the periodic "data doc" — an
+ * exhaustive per-player trend over weeks/months, not a live leaderboard
  * snapshot like the bare `!s3 switches` embed.
  *
  * @param {object} plugin
@@ -1569,16 +1579,19 @@ export async function buildSwitchesExport(plugin, rangeArg, periodArg, asJson) {
   }
 
   const ignoredGameModes = plugin.options?.ignoredGameModes;
-  const result = await getSwitchesByPeriod(db, range.fromTs, range.toTs, period, ignoredGameModes);
+  const result = await getSwitchesByPeriodAndPlayer(db, range.fromTs, range.toTs, period, ignoredGameModes);
   if (!result.ok) return { error: 'The S³ database service is not mounted.' };
 
-  const rows = result.periods.map((p) => ({
+  const rows = result.periods.flatMap((p) => p.players.map((player) => ({
     'Period Start': new Date(p.periodStart).toISOString(),
     'Period End': new Date(p.periodEnd).toISOString(),
     'Rounds Played': p.rounds,
-    'Total Switches': p.total,
-    ...Object.fromEntries(EXPORT_GROUPS.map((g) => [g.label, sumGroup(p.bySource, g)]))
-  }));
+    'Player': player.name ?? player.eosID,
+    'eosID': player.eosID,
+    'Games Played': player.games,
+    'Total Switches': player.total,
+    ...Object.fromEntries(EXPORT_GROUPS.map((g) => [g.label, sumGroup(player.bySource, g)]))
+  })));
 
   const ext = asJson ? 'json' : 'csv';
   const fromStr = new Date(range.fromTs).toISOString().slice(0, 10);
@@ -1586,7 +1599,7 @@ export async function buildSwitchesExport(plugin, rangeArg, periodArg, asJson) {
   const filename = `s3-switches-${period}-${fromStr}_to_${toStr}.${ext}`;
   const buffer = asJson
     ? Buffer.from(JSON.stringify(rows, null, 2), 'utf-8')
-    : Buffer.from(toCsv(rows), 'utf-8');
+    : Buffer.from('\uFEFF' + toCsv(rows), 'utf-8');
 
   return {
     embed: {
@@ -1594,7 +1607,8 @@ export async function buildSwitchesExport(plugin, rangeArg, periodArg, asJson) {
       title: `📊 Switch Report Export (${period})`,
       description: [formatReportRange(range), formatIgnoredModesNote(ignoredGameModes)].filter(Boolean).join('\n'),
       fields: [
-        { name: 'Periods', value: `${rows.length}`, inline: true },
+        { name: 'Periods', value: `${result.periods.length}`, inline: true },
+        { name: 'Rows', value: `${rows.length}`, inline: true },
         { name: 'Format', value: ext.toUpperCase(), inline: true }
       ],
       timestamp: new Date().toISOString()
@@ -1626,10 +1640,10 @@ export function buildHelpEmbed() {
       {
         name: '📊 Reports',
         value: [
-          '`!s3 switches [range]` — Team-switch leaderboard, all players',
+          '`!s3 switches [range]` — Team-switch leaderboard, all players (Legacy pre-split Balancer moves fold into Full)',
           '`!s3 switches <ident> [range]` — One player\'s switch breakdown by source',
-          '`!s3 switches export [range] [period] [--json]` — All-players switch/round counts per period, as a file attachment',
-          '`!s3 karma <ident> [range]` — Win-rate of a player\'s own switch decisions (self/untracked, not balancer/SmartAssign) vs. round outcome',
+          '`!s3 switches export [range] [period] [--json]` — One row per period per active player — games played, total switches, and source breakdown — as a file attachment',
+          '`!s3 karma <ident> [range]` — Win-rate of a player\'s own switch decisions (self/untracked, not balancer/SmartAssign) vs. round outcome, with switch frequency (N switches in G games)',
           '`range`: `7d`, `30d` (default), `2w`, or `YYYY-MM-DD..YYYY-MM-DD` (max 180 days)',
           '`period`: `daily`, `weekly` (default), or `monthly` — `--json` switches the attachment from CSV to JSON'
         ].join('\n'),

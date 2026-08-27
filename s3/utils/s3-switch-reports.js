@@ -67,7 +67,7 @@
  * getPlayerSwitches(s3db, eosID, fromTs, toTs, ignoredGameModes?) — same shape, single player, indexed by eosID directly
  * getKarmaReport(s3db, eosID, fromTs, toTs, ignoredGameModes?)    — win-rate of self/balancer switches vs. round outcome
  * isPeriodToken(token)                         — true for "daily"/"weekly"/"monthly"
- * getSwitchesByPeriod(s3db, fromTs, toTs, key, ignoredGameModes?) — all-players switch/round counts bucketed by period
+ * getSwitchesByPeriodAndPlayer(s3db, fromTs, toTs, key, ignoredGameModes?) — per-player switch/games-played, bucketed by period
  *
  * ═══════════════════════════════════════════════════════════════
  */
@@ -589,36 +589,49 @@ function bucketRanges(fromTs, toTs, periodKey) {
 }
 
 /**
- * All-players aggregate switch counts, bucketed into fixed-width time periods
- * — the "data doc" export behind `!s3 switches export`. Unlike
- * getSwitchesMap()/getPlayerSwitches(), this has no per-player dimension: it
- * answers "how much balancer/switch activity happened, and when", which is
- * what a trend export over weeks/months actually needs. Rounds-played per
- * period comes from TB_RoundReport directly (one row per round) rather than
- * S3_PlayerSnapshots — there's no per-player membership question here.
+ * Per-player switch/games-played breakdown, bucketed into fixed-width time
+ * periods — the "data doc" export behind `!s3 switches export`. One row per
+ * (period, player) for every player who either switched or appeared in a
+ * round's canonical snapshot that period; a player silent all period simply
+ * has no row, rather than padding the export with an all-zero line for every
+ * eosID ever seen. Games-played comes from S3_PlayerSnapshots the same way
+ * getGamesPlayedMap() reads it — a JOIN/LEFT event fires once per connection,
+ * not once per round, so it can't answer "how many rounds this period."
  *
  * @param {object} s3db
  * @param {number} fromTs
  * @param {number} toTs
  * @param {string} [periodKey='weekly'] - 'daily' | 'weekly' | 'monthly'
  * @returns {Promise<{ok:boolean, reason?:string, periods?:Array<{periodStart:number,
- *   periodEnd:number, rounds:number, total:number, bySource:Object}>}>}
+ *   periodEnd:number, rounds:number, players:Array<{eosID:string, name:?string,
+ *   games:number, total:number, bySource:Object}>}>}>}
  */
-export async function getSwitchesByPeriod(s3db, fromTs, toTs, periodKey = 'weekly', ignoredGameModes = DEFAULT_IGNORED_GAME_MODES) {
+export async function getSwitchesByPeriodAndPlayer(s3db, fromTs, toTs, periodKey = 'weekly', ignoredGameModes = DEFAULT_IGNORED_GAME_MODES) {
   const eventsModel = s3db?.isReady?.() ? s3db.getModel('S3PlayerEvents') : null;
   if (!eventsModel) return { ok: false, reason: 'dbUnavailable' };
 
   const buckets = bucketRanges(fromTs, toTs, periodKey);
   const stepMs = buckets[0].periodEnd - buckets[0].periodStart || 1;
-  const periods = buckets.map((b) => ({ ...b, rounds: 0, total: 0, bySource: {} }));
-
+  const periods = buckets.map((b) => ({ ...b, rounds: 0, players: new Map() }));
   const indexFor = (ts) => Math.min(Math.floor((ts - fromTs) / stepMs), periods.length - 1);
+
+  function playerEntry(period, eosID, name) {
+    let entry = period.players.get(eosID);
+    if (!entry) {
+      entry = { eosID, name: name ?? null, games: 0, total: 0, bySource: {} };
+      period.players.set(eosID, entry);
+    } else if (name) {
+      entry.name = name;
+    }
+    return entry;
+  }
 
   // Round query doubles as the ignored-mode source, so this stays one query
   // instead of two — getIgnoredMatchIds() isn't reused here for that reason.
   const needles = (ignoredGameModes || []).map((m) => String(m).toLowerCase()).filter(Boolean);
   const roundModel = s3db.getModel('TB_RoundReport');
   const ignoredMatchIds = new Set();
+  const periodIndexByMatch = new Map();
   if (roundModel) {
     const roundRows = await roundModel.findAll({
       where: { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
@@ -630,24 +643,67 @@ export async function getSwitchesByPeriod(s3db, fromTs, toTs, periodKey = 'weekl
         ignoredMatchIds.add(row.matchId);
         continue;
       }
-      const period = periods[indexFor(row.ts)];
-      if (period) period.rounds++;
+      const idx = indexFor(row.ts);
+      if (periods[idx]) periods[idx].rounds++;
+      if (row.matchId) periodIndexByMatch.set(row.matchId, idx);
+    }
+  }
+
+  const snapshotModel = roundModel ? s3db.getModel('S3PlayerSnapshots') : null;
+  if (snapshotModel && periodIndexByMatch.size > 0) {
+    const snapshots = await snapshotModel.findAll({
+      where: { matchId: { [Op.in]: [...periodIndexByMatch.keys()] } },
+      attributes: ['matchId', 'trigger', 'playersJson']
+    });
+    const canonicalByMatch = new Map();
+    for (const s of snapshots) {
+      const row = toPlainRow(s);
+      const rank = SNAPSHOT_TRIGGER_RANK[row.trigger] ?? 3;
+      const existing = canonicalByMatch.get(row.matchId);
+      if (!existing || rank < existing.rank) {
+        canonicalByMatch.set(row.matchId, { rank, playersJson: row.playersJson });
+      }
+    }
+    for (const [matchId, snap] of canonicalByMatch) {
+      const period = periods[periodIndexByMatch.get(matchId)];
+      if (!period) continue;
+      let roster;
+      try {
+        roster = JSON.parse(snap.playersJson);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(roster)) continue;
+      for (const p of roster) {
+        if (!p?.eosID) continue;
+        playerEntry(period, p.eosID, p.name).games++;
+      }
     }
   }
 
   const switchRows = await eventsModel.findAll({
     where: { eventType: 'TEAM_CHANGE', ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
-    attributes: ['ts', 'source', 'matchId']
+    attributes: ['ts', 'eosID', 'name', 'source', 'matchId']
   });
   for (const r of switchRows) {
     const row = toPlainRow(r);
+    if (!row.eosID) continue;
     if (row.matchId && ignoredMatchIds.has(row.matchId)) continue;
     const period = periods[indexFor(row.ts)];
     if (!period) continue;
-    period.total++;
+    const entry = playerEntry(period, row.eosID, row.name);
+    entry.total++;
     const bucket = bucketSource(row.source);
-    period.bySource[bucket] = (period.bySource[bucket] || 0) + 1;
+    entry.bySource[bucket] = (entry.bySource[bucket] || 0) + 1;
   }
 
-  return { ok: true, periods };
+  return {
+    ok: true,
+    periods: periods.map((p) => ({
+      periodStart: p.periodStart,
+      periodEnd: p.periodEnd,
+      rounds: p.rounds,
+      players: [...p.players.values()].sort((a, b) => b.total - a.total || b.games - a.games)
+    }))
+  };
 }

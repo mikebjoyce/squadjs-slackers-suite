@@ -36,7 +36,7 @@ import {
   getPlayerSwitches,
   getKarmaReport,
   isPeriodToken,
-  getSwitchesByPeriod
+  getSwitchesByPeriodAndPlayer
 } from '../utils/s3-switch-reports.js';
 
 // ---------------------------------------------------------------------------
@@ -434,43 +434,55 @@ for (const { name } of DIALECTS) {
       assert.equal(report.winRate, null);
     }));
 
-  test(`[${name}] getSwitchesByPeriod: buckets switches and rounds into the right period, across two players`, async () =>
-    withDialect(name, async (db, { eventsModel, roundReportModel }) => {
+  test(`[${name}] getSwitchesByPeriodAndPlayer: buckets switches, rounds, and games-played per player into the right period`, async () =>
+    withDialect(name, async (db, { eventsModel, roundReportModel, snapshotsModel }) => {
       // 10-day range split into 'daily' buckets -> bucket index = floor(offset / 1 day).
       const fromTs = NOW - 10 * DAY;
       const toTs = NOW;
 
-      // Day 0 bucket: two switches (one balancer, one self), one round.
-      await eventsModel.bulkCreate([
-        { ts: fromTs + DAY / 2, eventType: 'TEAM_CHANGE', eosID: 'p1', name: 'One', source: 'TeamBalancer:Full' },
-        { ts: fromTs + DAY / 2, eventType: 'TEAM_CHANGE', eosID: 'p2', name: 'Two', source: 'Player-Self' }
-      ]);
+      // Day 0 bucket: one round with both players in the roster, one balancer switch (p1), one self switch (p2).
       await roundReportModel.create({ matchId: 'm1', ts: fromTs + DAY / 2, winningTeamID: 1 });
+      await snapshotsModel.create({
+        matchId: 'm1', ts: fromTs + DAY / 2, trigger: 'ENDGAME',
+        playersJson: JSON.stringify([{ eosID: 'p1', name: 'One', teamID: 1 }, { eosID: 'p2', name: 'Two', teamID: 2 }])
+      });
+      await eventsModel.bulkCreate([
+        { ts: fromTs + DAY / 2, eventType: 'TEAM_CHANGE', eosID: 'p1', name: 'One', matchId: 'm1', source: 'TeamBalancer:Full' },
+        { ts: fromTs + DAY / 2, eventType: 'TEAM_CHANGE', eosID: 'p2', name: 'Two', matchId: 'm1', source: 'Player-Self' }
+      ]);
 
-      // Day 5 bucket: one switch, no round.
+      // Day 5 bucket: p1 switches with no round on record — games stays 0 for that bucket.
       await eventsModel.create({ ts: fromTs + 5 * DAY + 100, eventType: 'TEAM_CHANGE', eosID: 'p1', name: 'One', source: 'Player-Queue' });
 
-      const result = await getSwitchesByPeriod(db, fromTs, toTs, 'daily');
+      const result = await getSwitchesByPeriodAndPlayer(db, fromTs, toTs, 'daily');
       assert.equal(result.ok, true);
       assert.equal(result.periods.length, 10);
 
-      assert.equal(result.periods[0].total, 2);
-      assert.equal(result.periods[0].rounds, 1);
-      assert.equal(result.periods[0].bySource['TeamBalancer:Full'], 1);
-      assert.equal(result.periods[0].bySource['Player-Self'], 1);
+      const day0 = result.periods[0];
+      assert.equal(day0.rounds, 1);
+      const p1Day0 = day0.players.find((p) => p.eosID === 'p1');
+      const p2Day0 = day0.players.find((p) => p.eosID === 'p2');
+      assert.equal(p1Day0.games, 1);
+      assert.equal(p1Day0.total, 1);
+      assert.equal(p1Day0.bySource['TeamBalancer:Full'], 1);
+      assert.equal(p2Day0.games, 1);
+      assert.equal(p2Day0.total, 1);
+      assert.equal(p2Day0.bySource['Player-Self'], 1);
 
-      assert.equal(result.periods[5].total, 1);
-      assert.equal(result.periods[5].rounds, 0);
-      assert.equal(result.periods[5].bySource['Player-Queue'], 1);
+      const day5 = result.periods[5];
+      assert.equal(day5.rounds, 0);
+      const p1Day5 = day5.players.find((p) => p.eosID === 'p1');
+      assert.equal(p1Day5.games, 0, 'no round on record this bucket -> games stays 0');
+      assert.equal(p1Day5.total, 1);
+      assert.equal(p1Day5.bySource['Player-Queue'], 1);
 
-      assert.equal(result.periods[9].total, 0);
-      assert.equal(result.periods[9].rounds, 0);
+      assert.equal(result.periods[9].players.length, 0, 'a silent period has no player rows at all');
     }));
 
-  test(`[${name}] getSwitchesByPeriod: 'weekly' over a 14-day range produces 2 buckets`, async () =>
+  test(`[${name}] getSwitchesByPeriodAndPlayer: 'weekly' over a 14-day range produces 2 buckets`, async () =>
     withDialect(name, async (db) => {
       const fromTs = NOW - 14 * DAY;
-      const result = await getSwitchesByPeriod(db, fromTs, NOW, 'weekly');
+      const result = await getSwitchesByPeriodAndPlayer(db, fromTs, NOW, 'weekly');
       assert.equal(result.ok, true);
       assert.equal(result.periods.length, 2);
     }));
@@ -531,8 +543,8 @@ for (const { name } of DIALECTS) {
       assert.equal(report.wins, 1);
     }));
 
-  test(`[${name}] getSwitchesByPeriod: excludes Seed rounds and their switches from bucket counts`, async () =>
-    withDialect(name, async (db, { eventsModel, roundReportModel }) => {
+  test(`[${name}] getSwitchesByPeriodAndPlayer: excludes Seed rounds and their switches from per-player bucket counts`, async () =>
+    withDialect(name, async (db, { eventsModel, roundReportModel, snapshotsModel }) => {
       const fromTs = NOW - 3 * DAY;
       const toTs = NOW;
 
@@ -540,14 +552,22 @@ for (const { name } of DIALECTS) {
         { matchId: 'r1', ts: fromTs + DAY / 2, gameMode: 'RAAS' },
         { matchId: 'r2', ts: fromTs + DAY / 2, gameMode: 'Seed' }
       ]);
+      await snapshotsModel.bulkCreate([
+        { matchId: 'r1', ts: fromTs + DAY / 2, trigger: 'ENDGAME', playersJson: JSON.stringify([{ eosID: 'p1', name: 'One', teamID: 1 }]) },
+        { matchId: 'r2', ts: fromTs + DAY / 2, trigger: 'ENDGAME', playersJson: JSON.stringify([{ eosID: 'p2', name: 'Two', teamID: 1 }]) }
+      ]);
       await eventsModel.bulkCreate([
         { ts: fromTs + DAY / 2, eventType: 'TEAM_CHANGE', eosID: 'p1', name: 'One', matchId: 'r1', source: 'Player-Self' },
-        { ts: fromTs + DAY / 2, eventType: 'TEAM_CHANGE', eosID: 'p1', name: 'One', matchId: 'r2', source: 'Player-Self' }
+        { ts: fromTs + DAY / 2, eventType: 'TEAM_CHANGE', eosID: 'p2', name: 'Two', matchId: 'r2', source: 'Player-Self' }
       ]);
 
-      const result = await getSwitchesByPeriod(db, fromTs, toTs, 'daily');
-      assert.equal(result.periods[0].rounds, 1, 'the Seed round must not count in rounds');
-      assert.equal(result.periods[0].total, 1, 'the Seed-round switch must not count in total');
+      const result = await getSwitchesByPeriodAndPlayer(db, fromTs, toTs, 'daily');
+      const day0 = result.periods[0];
+      assert.equal(day0.rounds, 1, 'the Seed round must not count in rounds');
+      assert.equal(day0.players.length, 1, 'p2 only appears via the Seed round/switch and must be excluded entirely, not shown at zero');
+      assert.equal(day0.players[0].eosID, 'p1');
+      assert.equal(day0.players[0].games, 1);
+      assert.equal(day0.players[0].total, 1);
     }));
 }
 

@@ -1,4 +1,4 @@
-# SlackersSquadServices (S³) Plugin v1.5.0
+# SlackersSquadServices (S³) Plugin v1.5.1
 
 **Centralised service container for shared state across SquadJS plugins**
 
@@ -148,9 +148,9 @@ The `!s3` admin command surface is organised across:
 |---------|---------|-------------|
 | `!s3 players` | `s3-commands.js` | Population overview + one embed per team, broken down by squad. Marks squad leaders (👑), locked squads, and per-player locks. "Unassigned" means not in a squad. |
 | `!s3 clans` | `s3-commands.js` | Active clan groups, plus a second embed explaining why every other tag was excluded (below `minSize`, above `maxSize`, on `ignoreList`, unnormalizable) and every Damerau-Levenshtein merge and recruit-suffix strip |
-| `!s3 switches [ident] [range]` | `s3-commands.js` | Team-switch leaderboard (no ident), or one player's breakdown grouped into Balancer/Scrambles vs. Manual/Switch |
-| `!s3 switches export [range] [period] [--json]` | `s3-commands.js` | All-players switch/round counts per `daily`/`weekly`/`monthly` period, as a CSV (default) or JSON file attachment — the periodic "data doc" |
-| `!s3 karma <ident> [range]` | `s3-commands.js` | Win-rate of a player's own switch decisions (self/untracked only — excludes balancer and SmartAssign moves) vs. the eventual round winner, with a directional verdict |
+| `!s3 switches [ident] [range]` | `s3-commands.js` | Team-switch leaderboard (no ident — Legacy pre-split Balancer moves fold into Full, since they're definitionally non-micro), or one player's breakdown grouped into Balancer/Scrambles vs. Manual/Switch |
+| `!s3 switches export [range] [period] [--json]` | `s3-commands.js` | One row per `daily`/`weekly`/`monthly` period per active player — games played, total switches, and the full source breakdown — as a CSV (default) or JSON file attachment. Players silent all period get no row |
+| `!s3 karma <ident> [range]` | `s3-commands.js` | Win-rate of a player's own switch decisions (self/untracked only — excludes balancer and SmartAssign moves) vs. the eventual round winner, with switch frequency context (N switches in G games — P% of rounds) and a directional verdict |
 | `!s3 db status` | `s3-commands.js` | Connector, pending migrations, per-plugin schema versions |
 | `!s3 db export` | `s3-export-import.js` | JSON export. Models declare an `exportTier` — `historical` and `logging` are included by default, `ephemeral` is not |
 | `!s3 db export --all` | `s3-export-import.js` | Also includes the `ephemeral` tier |
