@@ -453,31 +453,35 @@ export default class TeamBalancer extends S3PluginBase {
     }
 
     if (this.options.scrambleAnnouncementDelay < 10) {
-      Logger.verbose('TeamBalancer', 1, `scrambleAnnouncementDelay (${this.options.scrambleAnnouncementDelay}s) too low. Enforcing minimum 10 seconds.`);
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.verbose.scrambleDelayTooLow, { delay: this.options.scrambleAnnouncementDelay }));
       this.options.scrambleAnnouncementDelay = 10;
     }
     // Its own floor, well below the global 10s: the whole point of the option is that a Seed
     // round's post-round window is shorter than that minimum. 3s still leaves the announcement
     // time to reach players before the swaps start.
     if (this.options.seedScrambleAnnouncementDelay < 3) {
-      Logger.verbose('TeamBalancer', 1, `seedScrambleAnnouncementDelay (${this.options.seedScrambleAnnouncementDelay}s) too low. Enforcing minimum 3 seconds.`);
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.verbose.seedScrambleDelayTooLow, { delay: this.options.seedScrambleAnnouncementDelay }));
       this.options.seedScrambleAnnouncementDelay = 3;
     }
     if (this.options.changeTeamRetryInterval < 50) {
-      Logger.verbose('TeamBalancer', 1, `changeTeamRetryInterval (${this.options.changeTeamRetryInterval}ms) too low. Enforcing minimum 50ms.`);
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.verbose.changeTeamRetryTooLow, { interval: this.options.changeTeamRetryInterval }));
       this.options.changeTeamRetryInterval = 50;
     }
     if (this.options.maxScrambleCompletionTime < 5000) {
-      Logger.verbose('TeamBalancer', 1, `maxScrambleCompletionTime (${this.options.maxScrambleCompletionTime}ms) too low. Enforcing minimum 5000ms.`);
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.verbose.maxScrambleTimeTooLow, { time: this.options.maxScrambleCompletionTime }));
       this.options.maxScrambleCompletionTime = 5000;
     }
     if (this.options.scramblePercentage < 0.0 || this.options.scramblePercentage > 1.0) {
-      Logger.verbose('TeamBalancer', 1, `scramblePercentage (${this.options.scramblePercentage}) is outside the valid range (0.0 to 1.0). Enforcing 0.5.`);
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.verbose.scramblePercentageInvalid, { percentage: this.options.scramblePercentage }));
       this.options.scramblePercentage = 0.5;
     }
     if (this.options.singleRoundScrambleThreshold <= this.options.minTicketsToCountAsDominantWin) {
       const newThreshold = this.options.minTicketsToCountAsDominantWin + 50;
-      Logger.verbose('TeamBalancer', 1, `singleRoundScrambleThreshold (${this.options.singleRoundScrambleThreshold}) must be greater than minTicketsToCountAsDominantWin (${this.options.minTicketsToCountAsDominantWin}). Enforcing ${newThreshold}.`);
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.verbose.singleRoundThresholdTooLow, { 
+        threshold: this.options.singleRoundScrambleThreshold, 
+        minTickets: this.options.minTicketsToCountAsDominantWin, 
+        newThreshold 
+      }));
       this.options.singleRoundScrambleThreshold = newThreshold;
     }
   }
@@ -552,7 +556,7 @@ export default class TeamBalancer extends S3PluginBase {
       try {
         await this.db.saveScrambleArm(armedBy);
       } catch (err) {
-        Logger.verbose('TeamBalancer', 1, `[DB] Failed to persist scramble arm: ${err.message}`);
+        Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.dbArmPersistFailed, { error: err.message }));
       }
     }
   }
@@ -562,14 +566,19 @@ export default class TeamBalancer extends S3PluginBase {
   async _notifyScrambleDiscarded(armedBy, reason) {
     if (armedBy?.name) {
       try {
-        await this.server.rcon.warn(armedBy.name, `${this.RconMessages.prefix} Your scheduled end-of-round scramble was discarded because ${reason}. Re-issue "!scramble matchend" during the round if still needed.`);
+        const warnMsg = this.formatMessage(this.messages.system.broadcasts.warnAdminMatchEndDiscarded, { reason });
+        await this.server.rcon.warn(armedBy.name, `${this.RconMessages.prefix} ${warnMsg}`);
       } catch (err) {
-        Logger.verbose('TeamBalancer', 1, `Failed to warn admin about discarded match-end scramble: ${err.message}`);
+        Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.warnAdminArmFailed, { error: err.message }));
       }
     }
     if (this.discordChannel) {
+      const discordMsg = this.formatMessage(this.messages.system.broadcasts.discordMatchEndDiscarded, { 
+        admin: armedBy?.name || 'unknown', 
+        reason 
+      });
       DiscordHelpers.sendDiscordMessage(this.discordChannel, {
-        content: `⚠️ Scheduled end-of-round scramble (armed by **${armedBy?.name || 'unknown'}**) was discarded — ${reason}.`
+        content: discordMsg
       });
     }
   }
@@ -578,7 +587,7 @@ export default class TeamBalancer extends S3PluginBase {
   // Used by call sites throughout team-balancer.js and tb-commands.js.
   _buildS3DbWrapper(s3db) {
     if (!s3db || !s3db.isReady()) {
-      Logger.verbose('TeamBalancer', 2, '[7.4m] S³ DB not ready — DB operations will be no-ops.');
+      Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.dbNotReady);
       return null;
     }
 
@@ -587,7 +596,7 @@ export default class TeamBalancer extends S3PluginBase {
     const TBRoundReportModel = s3db.models?.['TB_RoundReport'];
 
     if (!TeamBalancerStateModel) {
-      Logger.verbose('TeamBalancer', 1, '[7.4m] TeamBalancerState model not found on S³ DB — cannot build wrapper.');
+      Logger.verbose('TeamBalancer', 1, this.messages.system.errors.dbModelNotFound);
       return null;
     }
 
@@ -628,14 +637,20 @@ export default class TeamBalancer extends S3PluginBase {
             Logger.verbose(
               'TeamBalancer',
               2,
-              `[7.4m] initDB read state inside transaction: winStreakTeam=${record.winStreakTeam} ` +
-              `winStreakCount=${record.winStreakCount} isStale=${isStale}`
+              this.formatMessage(this.messages.system.verbose.dbStateRead, {
+                winStreakTeam: record.winStreakTeam,
+                winStreakCount: record.winStreakCount,
+                isStale
+              })
             );
 
             if (!isStale) {
-              Logger.verbose('TeamBalancer', 4, `[7.4m] Restored state: team=${record.winStreakTeam}, count=${record.winStreakCount}`);
+              Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.dbStateRestored, {
+                winStreakTeam: record.winStreakTeam,
+                winStreakCount: record.winStreakCount
+              }));
             } else {
-              Logger.verbose('TeamBalancer', 4, '[7.4m] State stale; resetting.');
+              Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.dbStateStale);
               record.winStreakTeam = null;
               record.winStreakCount = 0;
               record.lastSyncTimestamp = Date.now();
@@ -657,7 +672,7 @@ export default class TeamBalancer extends S3PluginBase {
             };
           });
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `[7.4m] initDB failed: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.dbInitFailed, { error: err.message }));
           return {
             winStreakTeam: null, winStreakCount: 0, lastSyncTimestamp: null,
             lastScrambleTime: null, isStale: true,
@@ -688,7 +703,7 @@ export default class TeamBalancer extends S3PluginBase {
             };
           });
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `[7.4m] saveState failed: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.dbSaveStateFailed, { error: err.message }));
           return null;
         }
       },
@@ -717,7 +732,7 @@ export default class TeamBalancer extends S3PluginBase {
             };
           });
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `[7.4m] incrementStreak failed: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.dbIncrementStreakFailed, { error: err.message }));
           return null;
         }
       },
@@ -732,7 +747,7 @@ export default class TeamBalancer extends S3PluginBase {
             return { lastScrambleTime: record.lastScrambleTime };
           });
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `[7.4m] saveScrambleTime failed: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.dbSaveScrambleTimeFailed, { error: err.message }));
           return null;
         }
       },
@@ -747,7 +762,7 @@ export default class TeamBalancer extends S3PluginBase {
             return { manuallyDisabled: record.manuallyDisabled };
           });
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `[7.4m] saveManuallyDisabledState failed: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.dbSaveManuallyDisabledStateFailed, { error: err.message }));
           return null;
         }
       },
@@ -762,7 +777,7 @@ export default class TeamBalancer extends S3PluginBase {
             return { scrambleOnRoundEndBy: record.scrambleOnRoundEndBy };
           });
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `[7.4m] saveScrambleArm failed: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.dbSaveScrambleArmFailed, { error: err.message }));
           return null;
         }
       },
@@ -796,7 +811,7 @@ export default class TeamBalancer extends S3PluginBase {
             return record.toJSON();
           });
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `[7.4m] insertRoundReport failed: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.dbInsertRoundReportFailed, { error: err.message }));
           return null;
         }
       },
@@ -804,13 +819,13 @@ export default class TeamBalancer extends S3PluginBase {
       runConcurrencyTest: async () => {
         // TBDatabase.runConcurrencyTest() was a diagnostic for the old custom mutex.
         // S³'s withTransactionWithRetry handles serialization natively.
-        Logger.verbose('TeamBalancer', 1, '[7.4m] runConcurrencyTest not available — S³ transactions handle this natively.');
+        Logger.verbose('TeamBalancer', 1, this.messages.system.verbose.dbConcurrencyTestSkipped);
         return { success: true, message: 'SKIP (S³ handles concurrency)' };
       }
     };
   }
 
-  // isSeedMatch() removed in Stage 6.4b — seed detection delegated to S³ GameStateService.isSeedMode()
+ // isSeedMatch() removed in Stage 6.4b — seed detection delegated to S³ GameStateService.isSeedMode()
   // Training/Jensen detection also available via S³ GameStateService.isTrainingMode()
 
   /**
@@ -828,11 +843,11 @@ export default class TeamBalancer extends S3PluginBase {
     // stopped would send them away from the one thing that would have. Not seed-specific on
     // purpose — the countdown could equally be a streak scramble, and the advice is the same.
     if (this._scramblePending || this._scrambleInProgress) {
-      return ' | A scramble countdown is already running — use !scramble cancel to stop it';
+      return this.messages.system.broadcasts.seedScrambleOffPendingScramble;
     }
     // The seed auto-scramble trigger fires on any Seed round end (isSeedMode()) regardless of
     // ignored game mode settings. "off while disabled" is true for any configuration.
-    return this.options.enableSeedAutoScramble ? ' | Seed auto-scramble is off too while disabled' : '';
+    return this.options.enableSeedAutoScramble ? this.messages.system.broadcasts.seedScrambleOffDisabled : '';
   }
 
   /**
@@ -844,9 +859,9 @@ export default class TeamBalancer extends S3PluginBase {
    */
   enableConfirmationText() {
     const base = this.options.enableWinStreakTracking
-      ? 'Win streak tracking enabled.'
-      : 'Plugin enabled — win streak tracking stays off in config.';
-    return `${base}${this.options.enableSeedAutoScramble ? ' | Seed auto-scramble re-armed' : ''}`;
+      ? this.messages.system.broadcasts.enableConfirmationStreakOn
+      : this.messages.system.broadcasts.enableConfirmationStreakOff;
+    return `${base}${this.options.enableSeedAutoScramble ? this.messages.system.broadcasts.enableConfirmationSeedRearmed : ''}`;
   }
 
   /**
@@ -856,9 +871,9 @@ export default class TeamBalancer extends S3PluginBase {
    * a trigger that will still not fire afterwards.
    */
   seedAutoScrambleStatus() {
-    if (!this.options.enableSeedAutoScramble) return 'OFF (config)';
-    if (this.manuallyDisabled) return 'OFF (plugin disabled)';
-    return 'ON (at Seed round end)';
+    if (!this.options.enableSeedAutoScramble) return this.messages.system.broadcasts.seedStatusConfigOff;
+    if (this.manuallyDisabled) return this.messages.system.broadcasts.seedStatusPluginDisabled;
+    return this.messages.system.broadcasts.seedStatusActive;
   }
 
   /**
@@ -900,7 +915,10 @@ export default class TeamBalancer extends S3PluginBase {
    */
   _applyLayerFallback(roundReport) {
     if (this.gameModeCached !== null || this.layerNameCached !== null || this.lastKnownGoodLayer === null) return;
-    Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Warning: Layer info missing at round end. Using fallback lastKnownGoodLayer (${this.lastKnownGoodLayer.gamemode} / ${this.lastKnownGoodLayer.name})`);
+    Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.layerInfoMissingFallback, {
+      gamemode: this.lastKnownGoodLayer.gamemode,
+      name: this.lastKnownGoodLayer.name
+    }));
     this.gameModeCached = this.lastKnownGoodLayer.gamemode;
     this.layerNameCached = this.lastKnownGoodLayer.name;
     roundReport.gameMode = this.gameModeCached;
@@ -917,25 +935,27 @@ export default class TeamBalancer extends S3PluginBase {
     const actual = this._s3?.version;
     if (!this._s3VersionAtLeast(required)) {
       throw new Error(
-        `[TeamBalancer] Incompatible S³ version: got ${actual || 'unknown'}, need >=${required}. ` +
-        'Please update SlackersSquadServices.'
+        this.formatMessage(this.messages.system.errors.s3VersionIncompatible, {
+          actual: actual || 'unknown',
+          required
+        })
       );
     }
-    Logger.verbose('TeamBalancer', 2, `[S3] Version check passed: S³ v${actual} >= required v${required}`);
+    Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.s3VersionPassed, { actual, required }));
   }
 
   async _onS3Ready() {
     this._checkS3Version();
     if (this._isMounted) {
-      Logger.verbose('TeamBalancer', 1, 'Plugin already mounted, skipping duplicate mount attempt.');
+      Logger.verbose('TeamBalancer', 1, this.messages.system.verbose.alreadyMounted);
       return;
     }
     this.ready = false;
-    Logger.verbose('TeamBalancer', 4, 'Mounting plugin and adding listeners.');
+    Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.mountingPlugin);
     this.validateOptions();
     
     if (this.options.devMode) {
-      Logger.verbose('TeamBalancer', 1, '⚠️ CRITICAL SECURITY WARNING: devMode is enabled in configuration! This allows ANY player to execute admin commands. This should never be enabled in a production environment.');
+      Logger.verbose('TeamBalancer', 1, this.messages.system.verbose.devModeWarning);
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -1102,59 +1122,77 @@ export default class TeamBalancer extends S3PluginBase {
             if (currentMatchId && dbState.scrambleOnRoundEndBy.matchId === currentMatchId) {
               this._scrambleOnRoundEnd = true;
               this._scrambleOnRoundEndBy = dbState.scrambleOnRoundEndBy;
-              Logger.verbose('TeamBalancer', 2, `[7.4m] Restored match-end scramble arm (armed by ${dbState.scrambleOnRoundEndBy.name || 'unknown'}, matchId=${currentMatchId}).`);
+              Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.restoredMatchEndArm, {
+                name: dbState.scrambleOnRoundEndBy.name || 'unknown',
+                currentMatchId
+              }));
             } else {
-              Logger.verbose('TeamBalancer', 2, `[7.4m] Discarding stale match-end scramble arm — stored matchId=${dbState.scrambleOnRoundEndBy.matchId}, current=${currentMatchId}.`);
+              Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.discardedStaleMatchEndArm, {
+                storedMatchId: dbState.scrambleOnRoundEndBy.matchId,
+                currentMatchId
+              }));
               await this._setScrambleArm(null);
-              await this._notifyScrambleDiscarded(dbState.scrambleOnRoundEndBy, 'a server restart carried it past the round it was armed for');
+              await this._notifyScrambleDiscarded(dbState.scrambleOnRoundEndBy, this.messages.system.broadcasts.armDiscardedRestartReason);
             }
           }
 
-          Logger.verbose('TeamBalancer', 4, `[7.4m] Restored state: team=${this.winStreakTeam}, count=${this.winStreakCount}, manuallyDisabled=${this.manuallyDisabled}`);
+          Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.restoredState, {
+            winStreakTeam: this.winStreakTeam,
+            winStreakCount: this.winStreakCount,
+            manuallyDisabled: this.manuallyDisabled
+          }));
         } else if (dbState) {
-          Logger.verbose('TeamBalancer', 4, '[7.4m] State stale; resetting.');
+          Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.stateStaleReset);
           this.lastScrambleTime = dbState.lastScrambleTime;
           this.manuallyDisabled = dbState.manuallyDisabled || false;
           await this.db.saveState(null, 0);
         }
       } catch (err) {
-        Logger.verbose('TeamBalancer', 1, `[7.4m] DB init failed: ${err.message}`);
+        Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.dbInitFailed, { error: err.message }));
       }
     } else {
-      Logger.verbose('TeamBalancer', 2, '[7.4m] S³ DB or migrationEngine not available — TB mounts without DB persistence.');
+      Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.dbNotAvailable);
       this.db = null;
     }
 
     if (this.options.discordClient) {
-      Logger.verbose('TeamBalancer', 2, '[Discord] discordClient available, registering message listener (before channel fetch).');
+      Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.discordClientAvailable);
 
       // Register listener BEFORE channel fetch (fix: if fetch fails, listener is still active)
       this.options.discordClient.on('message', this.listeners.onDiscordMessage);
-      Logger.verbose('TeamBalancer', 4, '[Discord] Discord message listener registered.');
+      Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.discordListenerRegistered);
 
       if (this.options.discordAdminChannelID) {
         try {
           this.discordChannel = await this.options.discordClient.channels.fetch(this.options.discordAdminChannelID);
-          Logger.verbose('TeamBalancer', 2, `[Discord] Admin channel fetched: ${this.discordChannel?.name ?? 'unknown'} (${this.options.discordAdminChannelID})`);
+          Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.discordAdminChannelFetched, {
+            channelName: this.discordChannel?.name ?? 'unknown',
+            channelId: this.options.discordAdminChannelID
+          }));
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `[Discord] Failed to fetch admin channel (${this.options.discordAdminChannelID}): ${err.message}. Listener IS registered — messages received but replies may fail.`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.verbose.discordAdminChannelFetchFailed, {
+            channelId: this.options.discordAdminChannelID,
+            error: err.message
+          }));
         }
       } else {
-        Logger.verbose('TeamBalancer', 2, `[Discord] discordAdminChannelID not set — listener registered but all messages filtered. Use "discordChannelID" in config to populate this.`);
+        Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.discordAdminChannelNotSet);
       }
 
       if (this.options.discordReportChannelID) {
         try {
           this.discordReportChannel = await this.options.discordClient.channels.fetch(this.options.discordReportChannelID);
-          Logger.verbose('TeamBalancer', 2, `[Discord] Report channel fetched: ${this.discordReportChannel?.name ?? 'unknown'}`);
+          Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.discordReportChannelFetched, {
+            channelName: this.discordReportChannel?.name ?? 'unknown'
+          }));
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `[Discord] Failed to fetch report channel: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.verbose.discordReportChannelFetchFailed, { error: err.message }));
         }
       } else {
-        Logger.verbose('TeamBalancer', 2, '[Discord] No discordReportChannelID set — reports will use admin channel.');
+        Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.discordReportChannelNotSet);
       }
     } else {
-      Logger.verbose('TeamBalancer', 2, '[Discord] No discordClient configured — Discord commands disabled.');
+      Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.discordNotSet);
     }
 
     const listenerCounts = {
@@ -1166,7 +1204,9 @@ export default class TeamBalancer extends S3PluginBase {
       'CHAT_COMMAND:scramble': this.server.listenerCount('CHAT_COMMAND:scramble'),
       CHAT_MESSAGE: this.server.listenerCount('CHAT_MESSAGE')
     };
-    Logger.verbose('TeamBalancer', 4, `Listener counts before registration: ${JSON.stringify(listenerCounts)}`);
+    Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.listenerCountsBefore, {
+      counts: JSON.stringify(listenerCounts)
+    }));
 
     this.server.on('ROUND_ENDED', this.listeners.onRoundEnded);
     this.server.on('NEW_GAME', this.listeners.onNewGame);
@@ -1177,7 +1217,10 @@ export default class TeamBalancer extends S3PluginBase {
     // S³ gameState and service availability is already checked in the 7.4m block above.
     // Layer info always served from S³ gameState
     if (this._s3?.gameState?.isReady()) {
-      Logger.verbose('TeamBalancer', 4, `[mount] S³ gameState available: ${this._s3.gameState.getGamemode()} / ${this._s3.gameState.getLayerName()}`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.s3GameStateAvailable, {
+        gamemode: this._s3.gameState.getGamemode(),
+        layerName: this._s3.gameState.getLayerName()
+      }));
     }
 
     // Subscribe to S³ layer change callbacks to keep gameModeCached/layerNameCached in sync.
@@ -1187,19 +1230,19 @@ export default class TeamBalancer extends S3PluginBase {
       this.gameModeCached = gameMode;
       this.layerNameCached = layerName;
       this.lastKnownGoodLayer = { gamemode: gameMode, name: layerName };
-      Logger.verbose('TeamBalancer', 4, `[S³ callback] Layer updated: ${gameMode} / ${layerName}`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.s3LayerUpdated, { gameMode, layerName }));
     }) || null;
 
     this._isMounted = true;
     this.ready = true;
 
     if (this.options.useEloForBalance) {
-      Logger.verbose('TeamBalancer', 2, '[TeamBalancer] EloTracker integration enabled. ELO data will be fetched on scramble.');
+      Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.eloTrackerEnabled);
     } else {
-      Logger.verbose('TeamBalancer', 2, '[TeamBalancer] Use EloTracker disabled. Scrambling without ELO data.');
+      Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.eloTrackerDisabled);
     }
     
-    Logger.verbose('TeamBalancer', 2, '[TeamBalancer] Plugin is now fully ready.');
+    Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.pluginFullyReady);
   }
 
   /**
@@ -1211,10 +1254,10 @@ export default class TeamBalancer extends S3PluginBase {
    */
   async _onUnmount() {
     if (!this._isMounted) {
-      Logger.verbose('TeamBalancer', 1, 'Plugin not mounted, skipping unmount.');
+      Logger.verbose('TeamBalancer', 1, this.messages.system.verbose.notMountedSkippingUnmount);
       return;
     }
-    Logger.verbose('TeamBalancer', 4, 'Unmounting plugin and removing listeners.');
+    Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.unmountingPlugin);
     this.server.removeListener('ROUND_ENDED', this.listeners.onRoundEnded);
     this.server.removeListener('NEW_GAME', this.listeners.onNewGame);
     this.server.removeListener('CHAT_COMMAND:teambalancer', this.listeners.onChatCommand);
@@ -1282,7 +1325,7 @@ export default class TeamBalancer extends S3PluginBase {
 
   async onDiscordMessage(message) {
     if (!this.ready) {
-      Logger.verbose('TeamBalancer', 2, `[Discord] Received message but plugin not ready yet. Dropping.`);
+      Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.discordNotReadyDropped);
       return;
     }
     if (message.author.bot) {
@@ -1290,7 +1333,10 @@ export default class TeamBalancer extends S3PluginBase {
       return;
     }
     if (message.channel.id !== this.options.discordAdminChannelID) {
-      Logger.verbose('TeamBalancer', 4, `[Discord] Message from wrong channel (got ${message.channel.id}, expected ${this.options.discordAdminChannelID}). Dropping.`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.discordWrongChannelDropped, {
+        gotId: message.channel.id,
+        expectedId: this.options.discordAdminChannelID
+      }));
       return;
     }
 
@@ -1300,10 +1346,14 @@ export default class TeamBalancer extends S3PluginBase {
       return;
     }
 
-    Logger.verbose('TeamBalancer', 2, `[Discord] Received valid command: "${content.substring(0, 80)}" from ${message.author.tag} (${message.author.id}).`);
+    Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.discordCommandReceived, {
+      content: content.substring(0, 80),
+      authorTag: message.author.tag,
+      authorId: message.author.id
+    }));
 
     if (!this.checkDiscordAdminPermission(message.member)) {
-      await message.reply('❌ You do not have permission to use this command.');
+      await message.reply(this.messages.system.errors.discordPermissionDenied);
       return;
     }
 
@@ -1328,7 +1378,7 @@ export default class TeamBalancer extends S3PluginBase {
         DiscordHelpers.sendDiscordMessage(message.channel, { embeds: [DiscordHelpers.buildStatusEmbed(this)] });
         break;
       case 'diag': {
-        await message.channel.send('🔄 Running diagnostics... please wait.');
+        await message.channel.send(this.messages.discord.commands.diagRunning);
         const diagnostics = new TBDiagnostics(this);
         const results = await diagnostics.runAll();
 
@@ -1352,27 +1402,24 @@ export default class TeamBalancer extends S3PluginBase {
       case 'help': {
         const helpEmbed = {
           color: 0x3498db,
-          title: '📚 TeamBalancer Command Reference',
-          description: 'Available commands for Discord admins:',
+          title: this.messages.discord.help.title,
+          description: this.messages.discord.help.description,
           fields: [
-            { name: 'Plugin Commands', value: '`!teambalancer status` - Show current state & win streak\n' +
-              '`!teambalancer diag` - Run diagnostics & dry run\n' +
-              '`!teambalancer on` - Enable win streak tracking\n' +
-              '`!teambalancer off` - Disable win streak tracking\n' +
-              '`!teambalancer export` - Export the round reports JSONL file\n' +
-              '`!teambalancer clear` - Clear the round reports log file' },
-            { name: 'Scramble Commands', value: '`!scramble` - Trigger scramble (with countdown)\n' +
-              '`!scramble now` - Trigger immediate scramble\n' +
-              '`!scramble dry` - Run simulation (dry run)\n' +
-              '`!scramble matchend` - Schedule scramble at end of round\n' +
-              '`!scramble cancel` - Cancel pending countdown' }
+            { 
+              name: this.messages.discord.help.fields.pluginCommands.name, 
+              value: this.messages.discord.help.fields.pluginCommands.value 
+            },
+            { 
+              name: this.messages.discord.help.fields.scrambleCommands.name, 
+              value: this.messages.discord.help.fields.scrambleCommands.value 
+            }
           ]
         };
         DiscordHelpers.sendDiscordMessage(message.channel, { embeds: [helpEmbed] });
         break;
       }
       default:
-        await message.reply('Invalid command. Use: `status`, `diag`, `on`, `off`, `export`, `clear`, `help` or `!scramble <now|dry|cancel>`.');
+        await message.reply(this.messages.discord.commands.invalidCommand);
     }
   }
 
@@ -1381,11 +1428,11 @@ export default class TeamBalancer extends S3PluginBase {
       const logPath = path.resolve(process.cwd(), this.options.reportLogPath || 'team-balancer-reports.jsonl');
       await fs.promises.access(logPath);
       await message.reply({
-        content: '📄 Here is the TeamBalancer round reports export:',
+        content: this.messages.discord.export.successContent,
         files: [{ attachment: logPath, name: 'team-balancer-reports.jsonl' }]
       });
     } catch (err) {
-      await message.reply('❌ The round reports log file does not exist yet or cannot be accessed.');
+      await message.reply(this.messages.discord.export.fileNotFound);
     }
   }
 
@@ -1393,9 +1440,9 @@ export default class TeamBalancer extends S3PluginBase {
     try {
       const logPath = path.resolve(process.cwd(), this.options.reportLogPath || 'team-balancer-reports.jsonl');
       await fs.promises.writeFile(logPath, '');
-      await message.reply('✅ The round reports log file has been cleared.');
+      await message.reply(this.messages.discord.clear.success);
     } catch (err) {
-      await message.reply(`❌ Failed to clear the round reports log file: ${err.message}`);
+      await message.reply(this.formatMessage(this.messages.discord.clear.failed, { error: err.message }));
     }
   }
 
@@ -1410,7 +1457,7 @@ export default class TeamBalancer extends S3PluginBase {
     const VALID_SCRAMBLE_ARGS = ['now', 'dry', 'matchend', 'cancel', 'confirm', 'elo'];
     const badArg = args.find(a => !VALID_SCRAMBLE_ARGS.includes(a));
     if (badArg) {
-      await message.reply(`❌ Unknown argument "${badArg}". Usage: \`!scramble [now|dry|matchend|cancel|confirm|elo]\``);
+      await message.reply(this.formatMessage(this.messages.discord.scramble.unknownArg, { badArg }));
       return;
     }
 
@@ -1418,13 +1465,13 @@ export default class TeamBalancer extends S3PluginBase {
 
     if (isConfirm) {
       if (!this.scrambleConfirmation) {
-        await message.reply('⚠️ No pending scramble confirmation found.');
+        await message.reply(this.messages.discord.scramble.noPendingConfirmation);
         return;
       }
       const timeoutMs = (this.options.scrambleConfirmationTimeout || 60) * 1000;
       if (Date.now() - this.scrambleConfirmation.timestamp > timeoutMs) {
         this.scrambleConfirmation = null;
-        await message.reply('⚠️ Scramble confirmation expired.');
+        await message.reply(this.messages.discord.scramble.confirmationExpired);
         return;
       }
       args = this.scrambleConfirmation.args;
@@ -1440,32 +1487,35 @@ export default class TeamBalancer extends S3PluginBase {
 
     if (isMatchEnd) {
       if (hasNow || hasDry) {
-        await message.reply('❌ "!scramble matchend" cannot be combined with "now" or "dry".');
+        await message.reply(this.messages.discord.scramble.matchEndIncompatible);
         return;
       }
       if (this._scrambleOnRoundEnd) {
-        await message.reply('⚠️ A match-end scramble is already scheduled. It will fire when this round ends. Use `!scramble cancel` to cancel it.');
+        await message.reply(this.messages.discord.scramble.matchEndAlreadyScheduled);
         return;
       }
       const adminName = message.author?.username || 'unknown';
       await this._setScrambleArm({ name: adminName, eosID: null, scrambleType });
-      Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Match-end ${hasElo ? 'micro ' : ''}scramble armed by ${adminName} (Discord)`);
+      Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.matchEndArmedDiscord, {
+        scrambleKind: hasElo ? 'micro ' : '',
+        adminName
+      }));
       await message.reply(hasElo
-        ? '✅ Micro scramble scheduled for the end of this round. It will fire automatically when the round ends. Use `!scramble cancel` to cancel it.'
-        : '✅ Scramble scheduled for the end of this round. It will fire automatically when the round ends. Use `!scramble cancel` to cancel it.');
+        ? this.messages.discord.scramble.matchEndScheduledMicro
+        : this.messages.discord.scramble.matchEndScheduled);
       return;
     }
 
     if (isCancel) {
       this.scrambleConfirmation = null;
       const cancelled = await this.cancelPendingScramble(null, null, false);
-      if (cancelled) await message.reply('✅ Pending scramble cancelled.');
-      else if (this._scrambleInProgress) await message.reply('⚠️ Cannot cancel scramble - it is already executing.');
-      else await message.reply('⚠️ No pending scramble to cancel.');
+      if (cancelled) await message.reply(this.messages.discord.scramble.cancelSuccess);
+      else if (this._scrambleInProgress) await message.reply(this.messages.discord.scramble.cannotCancelExecuting);
+      else await message.reply(this.messages.discord.scramble.noPendingToCancel);
     } else {
       if (this._scramblePending || this._scrambleInProgress) {
         const status = this._scrambleInProgress ? 'executing' : 'pending';
-        await message.reply(`⚠️ Scramble already ${status}. Use \`!scramble cancel\` to cancel.`);
+        await message.reply(this.formatMessage(this.messages.discord.scramble.alreadyActive, { status }));
         return;
       }
 
@@ -1473,10 +1523,14 @@ export default class TeamBalancer extends S3PluginBase {
         this.scrambleConfirmation = { timestamp: Date.now(), args: args };
         const scrambleKind = hasElo ? 'micro' : 'full';
         const timing = hasNow
-          ? 'immediately, with no countdown'
-          : `in ${this.options.scrambleAnnouncementDelay}s, after a countdown broadcast`;
+          ? this.messages.discord.scramble.timingImmediate
+          : this.formatMessage(this.messages.discord.scramble.timingCountdown, { delay: this.options.scrambleAnnouncementDelay });
         const timeoutSec = this.options.scrambleConfirmationTimeout || 60;
-        await message.reply(`⚠️ Confirming will execute a ${scrambleKind} scramble ${timing}. Type \`!scramble confirm\` within ${timeoutSec}s to proceed.`);
+        await message.reply(this.formatMessage(this.messages.discord.scramble.confirmPrompt, {
+          scrambleKind,
+          timing,
+          timeoutSec
+        }));
         return;
       }
 
@@ -1492,48 +1546,57 @@ export default class TeamBalancer extends S3PluginBase {
         try {
           await this.server.rcon.broadcast(broadcastMsg);
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `[TeamBalancer] Error broadcasting Discord scramble message: ${err?.message || err}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastError, {
+            error: err?.message || err
+          }));
         }
       }
 
       const microLabel = hasElo ? 'micro ' : '';
-      const actionDesc = hasDry ? `dry run ${microLabel}scramble (immediate)` : hasNow ? `immediate ${microLabel}scramble` : `${microLabel}scramble with countdown`;
-      let replyMsg = `🔄 Initiating ${actionDesc}...`;
+      const actionDesc = hasDry 
+        ? this.formatMessage(this.messages.discord.scramble.actionDryRun, { microLabel })
+        : hasNow 
+          ? this.formatMessage(this.messages.discord.scramble.actionImmediate, { microLabel })
+          : this.formatMessage(this.messages.discord.scramble.actionCountdown, { microLabel });
+      
+      let replyMsg = this.formatMessage(this.messages.discord.scramble.initiating, { actionDesc });
       if (!hasDry && !hasNow) {
-        replyMsg += `\n⏳ Countdown: ${this.options.scrambleAnnouncementDelay}s\n📢 Broadcast sent to server.`;
+        replyMsg += `\n${this.formatMessage(this.messages.discord.scramble.initiatingCountdownSuffix, {
+          delay: this.options.scrambleAnnouncementDelay
+        })}`;
       }
       await message.reply(replyMsg);
       const success = await this.initiateScramble(hasDry, hasDry || hasNow, null, null, null, scrambleType);
-      if (!success) await message.reply('❌ Failed to initiate scramble.');
+      if (!success) await message.reply(this.messages.discord.scramble.initiateFailed);
     }
   }
 
   async discordCommandToggle(message, state) {
     if (state === 'on') {
-      if (!this.manuallyDisabled) return message.reply('✅ Win streak tracking is already enabled.');
+      if (!this.manuallyDisabled) return message.reply(this.messages.discord.toggle.alreadyEnabled);
       this.manuallyDisabled = false;
       if (this.db) {
         try {
           await this.db.saveManuallyDisabledState(false);
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `[DB] Failed to persist enabled state: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.dbPersistEnabledFailed, { error: err.message }));
         }
       }
       await message.reply(`✅ ${this.enableConfirmationText()}`);
       await this.server.rcon.broadcast(`${this.RconMessages.prefix} ${this.RconMessages.system.trackingEnabled}`);
       this.mirrorRconToDiscord(this.RconMessages.system.trackingEnabled, 'info');
     } else {
-      if (this.manuallyDisabled) return message.reply('✅ Win streak tracking is already disabled.');
+      if (this.manuallyDisabled) return message.reply(this.messages.discord.toggle.alreadyDisabled);
       this.manuallyDisabled = true;
       if (this.db) {
         try {
           await this.db.saveManuallyDisabledState(true);
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `[DB] Failed to persist disabled state: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.dbPersistDisabledFailed, { error: err.message }));
         }
       }
-      await message.reply(`✅ Win streak tracking disabled.${this.seedScrambleOffNote()}`);
-      await this.resetStreak('Manual disable via Discord');
+      await message.reply(`${this.messages.discord.toggle.disabledSuccess}${this.seedScrambleOffNote()}`);
+      await this.resetStreak(this.messages.system.reasons.manualDisableDiscord);
       await this.server.rcon.broadcast(`${this.RconMessages.prefix} ${this.RconMessages.system.trackingDisabled}`);
       this.mirrorRconToDiscord(this.RconMessages.system.trackingDisabled, 'info');
     }
@@ -1552,7 +1615,9 @@ export default class TeamBalancer extends S3PluginBase {
   async onNewGame(data) {
     if (!this.ready) return;
     try {
-      Logger.verbose('TeamBalancer', 4, `[onNewGame] Event triggered with data: ${JSON.stringify(data)}`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.onNewGameTriggered, {
+        data: JSON.stringify(data)
+      }));
       
       // Layer info always served from S³ gameState; standalone polling removed in Stage 4.
       // Reset cached mode/layer so a stale value doesn't bleed into the next round's isInvasion check.
@@ -1566,15 +1631,17 @@ export default class TeamBalancer extends S3PluginBase {
       // is the one signal an operator has to tune the announcement delays against, so it belongs in
       // the default log output — a too-long delay does not postpone the scramble, it cancels it.
       if (this._clearPendingScrambleCountdown()) {
-        Logger.verbose('TeamBalancer', 1, '[TeamBalancer] Discarding pending scramble countdown (new game started before it could execute). The announcement delay outlasted the round — lower it if this repeats.');
+        Logger.verbose('TeamBalancer', 1, this.messages.system.verbose.discardedPendingScrambleNewGame);
       }
 
       // Discard any armed "!scramble matchend" — a new round has started without consuming it.
       if (this._scrambleOnRoundEnd) {
         const armedBy = this._scrambleOnRoundEndBy;
-        Logger.verbose('TeamBalancer', 2, `[onNewGame] Discarding match-end scramble arm (armed by ${armedBy?.name || 'unknown'}) — new round started.`);
+        Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.discardedMatchEndArmNewGame, {
+          name: armedBy?.name || 'unknown'
+        }));
         await this._setScrambleArm(null);
-        await this._notifyScrambleDiscarded(armedBy, 'a new round started before the scheduled scramble could fire');
+        await this._notifyScrambleDiscarded(armedBy, this.messages.system.broadcasts.armDiscardedNewGameReason);
       }
 
       try {
@@ -1589,10 +1656,10 @@ export default class TeamBalancer extends S3PluginBase {
           this.lastSyncTimestamp = dbRes.lastSyncTimestamp;
         }
       } catch (err) {
-        Logger.verbose('TeamBalancer', 1, `[DB] onNewGame saveState failed: ${err.message}`);
+        Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.onNewGameSaveStateFailed, { error: err.message }));
       }
     } catch (err) {
-      Logger.verbose('TeamBalancer', 1, `[TeamBalancer] Error in onNewGame: ${err.message}`);
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.onNewGameError, { error: err.message }));
       this.winStreakTeam = null;
       this.winStreakCount = 0;
       try {
@@ -1603,7 +1670,7 @@ export default class TeamBalancer extends S3PluginBase {
         this.consecutiveWinsCount = 0;
         if (dbRes) this.lastSyncTimestamp = dbRes.lastSyncTimestamp;
       } catch (err) {
-        Logger.verbose('TeamBalancer', 1, `[DB] onNewGame fallback saveState failed: ${err.message}`);
+        Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.onNewGameFallbackSaveStateFailed, { error: err.message }));
       }
       this._scrambleInProgress = false;
       this._clearPendingScrambleCountdown();
@@ -1624,7 +1691,7 @@ export default class TeamBalancer extends S3PluginBase {
     // match-end path was still parked on its broadcast. Claiming synchronously here closes all of
     // those at once, which is why the individual blocks can keep the natural announce-then-arm order.
     if (this._roundEndInFlight) {
-      Logger.verbose('TeamBalancer', 2, '[TeamBalancer] Duplicate ROUND_ENDED ignored: the previous one is still being processed.');
+      Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.duplicateRoundEndedIgnored);
       return;
     }
 
@@ -1636,12 +1703,12 @@ export default class TeamBalancer extends S3PluginBase {
     const gs = this._s3?.gameState;
     let roundReport = {
       ts: Date.now(),
-      gameMode: gs?.getGamemode?.() || 'Unknown',
-      layerName: gs?.getLayerName?.() || 'Unknown',
+      gameMode: gs?.getGamemode?.() || this.messages.system.labels.unknown,
+      layerName: gs?.getLayerName?.() || this.messages.system.labels.unknown,
       playerCount: s3PlayersCount,
-      winner: data && data.winner ? `Team ${data.winner.team}` : 'Draw',
+      winner: data && data.winner ? `Team ${data.winner.team}` : this.messages.system.labels.draw,
       scrambled: false,
-      scrambleCondition: 'None'
+      scrambleCondition: this.messages.system.labels.none
     };
 
     let winnerID = null;
@@ -1654,7 +1721,9 @@ export default class TeamBalancer extends S3PluginBase {
     this._roundEndInFlight = true;
 
     try {
-      Logger.verbose('TeamBalancer', 4, `Round ended event received: ${JSON.stringify(data)}`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.roundEndedEventReceived, {
+        data: JSON.stringify(data)
+      }));
 
       // Parse the outcome once, before any early-returning path below, so the finally block logs
       // the winner and tickets for EVERY round — an armed match-end scramble and a seed
@@ -1675,9 +1744,12 @@ export default class TeamBalancer extends S3PluginBase {
         if (currentMatchId && armedMatchId && armedMatchId !== currentMatchId) {
           // Restart crossed a round boundary — the arm is stale. Discard it and fall
           // through so THIS round is evaluated normally by the win-streak path below.
-          Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Discarding stale match-end scramble arm: armed for matchId=${armedMatchId} but current round is matchId=${currentMatchId}.`);
+          Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.discardedStaleMatchEndArmRoundEnded, {
+            armedMatchId,
+            currentMatchId
+          }));
           await this._setScrambleArm(null);
-          await this._notifyScrambleDiscarded(armedBy, 'a server restart carried it past the round it was armed for');
+          await this._notifyScrambleDiscarded(armedBy, this.messages.system.broadcasts.armDiscardedRestartReason);
         } else {
           // Same round — fire the deferred scramble.
           await this._setScrambleArm(null);
@@ -1690,7 +1762,10 @@ export default class TeamBalancer extends S3PluginBase {
           roundReport.scrambleCondition = isMicro ? 'Match End (Manual Micro)' : 'Match End (Manual)';
           if (isMicro) roundReport.scrambleType = 'EloDiff';
 
-          Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Firing match-end ${isMicro ? 'micro ' : ''}scramble (armed by ${armedBy?.name || 'unknown'}).`);
+          Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.firingMatchEndScramble, {
+            microLabel: isMicro ? 'micro ' : '',
+            name: armedBy?.name || 'unknown'
+          }));
           const msg = isMicro
             ? `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.manualMicroScrambleAnnouncement, {
                 delay: this.options.scrambleAnnouncementDelay
@@ -1704,11 +1779,15 @@ export default class TeamBalancer extends S3PluginBase {
           try {
             await this.server.rcon.broadcast(msg);
           } catch (err) {
-            Logger.verbose('TeamBalancer', 1, `Failed to broadcast match-end scramble announcement: ${err.message}`);
+            Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastMatchEndAnnouncementFailed, {
+              error: err.message
+            }));
           }
           this.mirrorRconToDiscord(msg, 'warning');
           this.initiateScramble(false, false, null, null, null, isMicro ? 'EloDiff' : null).catch(err =>
-            Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
+            Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.initiateScrambleUnhandledError, {
+              error: err.message
+            }))
           );
           return; // Early return — the finally block still logs this round.
         }
@@ -1725,13 +1804,15 @@ export default class TeamBalancer extends S3PluginBase {
         // Don't announce or claim attribution for a scramble initiateScramble would refuse — but a
         // Seed round still never feeds the streak, so clear it on the way out.
         if (this._scramblePending || this._scrambleInProgress) {
-          Logger.verbose('TeamBalancer', 2, '[TeamBalancer] Seed auto-scramble skipped: another scramble is already pending or in progress.');
-          await this.resetStreak('Seed round ended (scramble already pending)');
+          Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.seedAutoScrambleSkipped);
+          await this.resetStreak(this.messages.system.reasons.seedEndedPendingScramble);
           return;
         }
         roundReport.scrambled = true;
         roundReport.scrambleCondition = 'Seed Auto Scramble';
-        Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Seed match ended with ${this.server.players.length} players. Triggering auto-scramble.`);
+        Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.seedMatchEndedScrambling, {
+          count: this.server.players.length
+        }));
         // Bound once and used for the announcement AND the countdown — the text must never quote a
         // delay the timer does not actually run on.
         const seedDelay = this.options.seedScrambleAnnouncementDelay;
@@ -1739,20 +1820,24 @@ export default class TeamBalancer extends S3PluginBase {
         try {
           await this.server.rcon.broadcast(msg);
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `Failed to broadcast seed scramble announcement: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastSeedScrambleFailed, {
+            error: err.message
+          }));
         }
         this.mirrorRconToDiscord(msg, 'warning');
         this.initiateScramble(false, false, null, null, seedDelay).catch(err =>
-          Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.initiateScrambleUnhandledError, {
+            error: err.message
+          }))
         );
         // Seed rounds never feed the streak, so clear it here rather than leaving it to
         // executeScramble — that reset is skipped when the scrambler returns an empty plan.
-        await this.resetStreak('Seed round ended');
+        await this.resetStreak(this.messages.system.reasons.seedEnded);
         return;
       }
 
       if (!this.options.enableWinStreakTracking || this.manuallyDisabled) {
-        Logger.verbose('TeamBalancer', 4, 'Win streak tracking disabled, skipping round evaluation.');
+        Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.winStreakTrackingDisabledSkipping);
         return;
       }
 
@@ -1763,30 +1848,40 @@ export default class TeamBalancer extends S3PluginBase {
 
       // Check for Draw (Winner is null)
       if (!data || !data.winner) {
-        Logger.verbose('TeamBalancer', 2, 'Round ended in a Draw.');
+        Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.roundEndedDraw);
         const msg = `${this.RconMessages.prefix} ${this.RconMessages.draw}`;
         try {
           await this.server.rcon.broadcast(msg);
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `Failed to broadcast draw message: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastDrawFailed, {
+            error: err.message
+          }));
         }
         this.mirrorRconToDiscord(msg, 'info');
-        return await this.resetStreak('Draw');
+        return await this.resetStreak(this.messages.system.reasons.draw);
       }
 
       // Already parsed into the report above; the win-streak evaluation needs it complete.
       const { winnerTickets, loserTickets, margin, winnerName, loserName } = outcome;
       if (isNaN(outcome.winnerID) || isNaN(winnerTickets) || isNaN(loserTickets)) {
-        Logger.verbose('TeamBalancer', 1, 'Could not parse round end data, skipping evaluation.');
+        Logger.verbose('TeamBalancer', 1, this.messages.system.errors.parseRoundEndDataFailed);
         return;
       }
 
-      Logger.verbose('TeamBalancer', 4, `Parsed winnerID=${winnerID}, winnerTickets=${winnerTickets}, loserTickets=${loserTickets}, margin=${margin}`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.parsedRoundOutcome, {
+        winnerID,
+        winnerTickets,
+        loserTickets,
+        margin
+      }));
 
       const gameMode = this._s3?.gameState?.getGamemode?.()?.toLowerCase() || '';
 
       if (this.isIgnoredMatch()) {
-        Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Ignored match ended (${this.gameModeCached} / ${this.layerNameCached}). Resetting streak metrics.`);
+        Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.ignoredMatchEnded, {
+          gamemode: this.gameModeCached,
+          layerName: this.layerNameCached
+        }));
 
         // Reached only when no seed auto-scramble fired — that path returned above.
         let broadcastWinnerName = winnerName;
@@ -1799,11 +1894,13 @@ export default class TeamBalancer extends S3PluginBase {
         try {
           await this.server.rcon.broadcast(msg);
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `Failed to broadcast standard seed win message: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastStandardSeedWinFailed, {
+            error: err.message
+          }));
         }
         this.mirrorRconToDiscord(msg, 'info');
 
-        await this.resetStreak('Ignored match ended');
+        await this.resetStreak(this.messages.system.reasons.ignoredMatchEnded);
         return;
       }
 
@@ -1815,7 +1912,10 @@ export default class TeamBalancer extends S3PluginBase {
         this.consecutiveWinsTeam = winnerID;
         this.consecutiveWinsCount = 1;
       }
-      Logger.verbose('TeamBalancer', 4, `Consecutive wins: Team ${this.consecutiveWinsTeam} has ${this.consecutiveWinsCount} wins.`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.consecutiveWinsUpdated, {
+        team: this.consecutiveWinsTeam,
+        count: this.consecutiveWinsCount
+      }));
 
       // Persist consecutive state immediately so it survives a crash before the
       // dominant path commits.
@@ -1826,7 +1926,9 @@ export default class TeamBalancer extends S3PluginBase {
           this.consecutiveWinsCount = dbRes.consecutiveWinsCount;
         }
       } catch (err) {
-        Logger.verbose('TeamBalancer', 1, `[DB] consecutive saveState failed: ${err.message}`);
+        Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.consecutiveSaveStateFailed, {
+          error: err.message
+        }));
       }
 
       // ── Consecutive Wins Scramble Check ────────────────────────
@@ -1834,7 +1936,10 @@ export default class TeamBalancer extends S3PluginBase {
         if (this.options.maxConsecutiveWinsWithoutThreshold > 0 && this.consecutiveWinsCount >= this.options.maxConsecutiveWinsWithoutThreshold) {
           roundReport.scrambled = true;
           roundReport.scrambleCondition = 'Consecutive Wins';
-          Logger.verbose('TeamBalancer', 2, `[ConsecutiveWins] Triggered! Count: ${this.consecutiveWinsCount} >= Threshold: ${this.options.maxConsecutiveWinsWithoutThreshold}`);
+          Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.consecutiveWinsTriggered, {
+            count: this.consecutiveWinsCount,
+            threshold: this.options.maxConsecutiveWinsWithoutThreshold
+          }));
           const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.consecutiveWinsScramble, {
             team: this.getTeamName(winnerID),
             count: this.consecutiveWinsCount,
@@ -1843,11 +1948,15 @@ export default class TeamBalancer extends S3PluginBase {
           try {
             await this.server.rcon.broadcast(msg);
           } catch (broadcastErr) {
-            Logger.verbose('TeamBalancer', 1, `Failed to broadcast consecutive wins scramble: ${broadcastErr.message}`);
+            Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastConsecutiveWinsFailed, {
+              error: broadcastErr.message
+            }));
           }
           this.mirrorRconToDiscord(msg, 'warning');
           this.initiateScramble(false, false).catch(err =>
-            Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
+            Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.initiateScrambleUnhandledError, {
+              error: err.message
+            }))
           );
           return; // Scramble triggered — skip dominant/non-dominant evaluation
         }
@@ -1872,7 +1981,10 @@ export default class TeamBalancer extends S3PluginBase {
         if (this.options.enableSingleRoundScramble && !isInvasion && margin >= this.options.singleRoundScrambleThreshold) {
           roundReport.scrambled = true;
           roundReport.scrambleCondition = 'Single Round Margin';
-          Logger.verbose('TeamBalancer', 2, `[SingleRoundScramble] Triggered! Margin: ${margin} >= Threshold: ${this.options.singleRoundScrambleThreshold}`);
+          Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.singleRoundScrambleTriggered, {
+            margin,
+            threshold: this.options.singleRoundScrambleThreshold
+          }));
           const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.singleRoundScramble, {
             margin,
             delay: this.options.scrambleAnnouncementDelay
@@ -1880,11 +1992,15 @@ export default class TeamBalancer extends S3PluginBase {
           try {
             await this.server.rcon.broadcast(msg);
           } catch (broadcastErr) {
-            Logger.verbose('TeamBalancer', 1, `Failed to broadcast single-round scramble: ${broadcastErr.message}`);
+            Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastSingleRoundFailed, {
+              error: broadcastErr.message
+            }));
           }
           this.mirrorRconToDiscord(msg, 'warning');
           this.initiateScramble(false, false).catch(err =>
-            Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
+            Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.initiateScrambleUnhandledError, {
+              error: err.message
+            }))
           );
           return; // Scramble triggered — skip dominant/non-dominant evaluation
         }
@@ -1912,7 +2028,9 @@ export default class TeamBalancer extends S3PluginBase {
           eloTrackerPlugin.awaitRatingsCommitted().then(({ snapshot }) =>
             this._evaluateEloDiffTrigger({ team1EosIDs, team2EosIDs, ticketMargin, snapshot })
           ).catch(err =>
-            Logger.verbose('TeamBalancer', 1, `[EloDiff] Unhandled error: ${err.message}`)
+            Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.eloDiffUnhandledError, {
+              error: err.message
+            }))
           );
         }
       }
@@ -1936,13 +2054,19 @@ export default class TeamBalancer extends S3PluginBase {
         isDominant = margin >= dominantThreshold;
         isStomp = margin >= stompThreshold;
       }
-      Logger.verbose('TeamBalancer', 4, `Dominance state: isDominant=${isDominant}, isStomp=${isStomp}`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.dominanceState, {
+        isDominant,
+        isStomp
+      }));
 
       const teamNames = { winnerName: broadcastWinnerName, loserName: broadcastLoserName };
-      Logger.verbose('TeamBalancer', 4, `Final team names for broadcast: winnerName=${teamNames.winnerName}, loserName=${teamNames.loserName}`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.finalTeamNamesBroadcast, {
+        winnerName: teamNames.winnerName,
+        loserName: teamNames.loserName
+      }));
 
       if (!isDominant) {
-        Logger.verbose('TeamBalancer', 4, 'Handling non-dominant win branch.');
+        Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.handlingNonDominantBranch);
         if (this.options.showWinStreakMessages) {
           let template;
 
@@ -1970,31 +2094,38 @@ export default class TeamBalancer extends S3PluginBase {
               template = this.RconMessages.nonDominant.operationalSuperiority;
             }
           }
-            Logger.verbose('TeamBalancer', 4, `Using template for non-dominant win: ${template}`);
+          Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.usingTemplateNonDominant, { template }));
 
           const message = `${this.RconMessages.prefix} ${this.formatMessage(template, {
             team: teamNames.winnerName,
             loser: teamNames.loserName,
             margin
           })}`;
-          Logger.verbose('TeamBalancer', 4, `Broadcasting non-dominant message: ${message}`);
+          Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.broadcastingNonDominantMessage, { message }));
           try {
             await this.server.rcon.broadcast(message);
           } catch (broadcastErr) {
-            Logger.verbose('TeamBalancer', 1, `Failed to broadcast non-dominant message: ${broadcastErr.message}`);
+            Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastNonDominantFailed, {
+              error: broadcastErr.message
+            }));
           }
           this.mirrorRconToDiscord(message, 'info');
         }
-        return await this.resetStreak(`Non-dominant win by team ${winnerID}`, false);
+        return await this.resetStreak(this.formatMessage(this.messages.system.reasons.nonDominantWin, { winnerID }), false);
       }
 
-      Logger.verbose('TeamBalancer', 4, 'Dominant win detected under standard mode.');
-      Logger.verbose('TeamBalancer', 4, `Current streak: winStreakTeam=${this.winStreakTeam}, winStreakCount=${this.winStreakCount}`);
+      Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.dominantWinDetectedStandard);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.currentStreakState, {
+        winStreakTeam: this.winStreakTeam,
+        winStreakCount: this.winStreakCount
+      }));
 
       const streakBroken = this.winStreakTeam && this.winStreakTeam !== winnerID;
       if (streakBroken) {
-        Logger.verbose('TeamBalancer', 4, `Streak broken. Previous streak team: ${this.winStreakTeam}`);
-        await this.resetStreak('Streak broken by opposing team', false);
+        Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.streakBrokenPreviousTeam, {
+          team: this.winStreakTeam
+        }));
+        await this.resetStreak(this.messages.system.reasons.streakBrokenOpposing, false);
       }
 
       try {
@@ -2010,9 +2141,14 @@ export default class TeamBalancer extends S3PluginBase {
           this.winStreakTeam = winnerID;
           this.winStreakCount++;
         }
-        Logger.verbose('TeamBalancer', 4, `New win streak started: team ${this.winStreakTeam}, count ${this.winStreakCount}`);
+        Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.newWinStreakStarted, {
+          team: this.winStreakTeam,
+          count: this.winStreakCount
+        }));
       } catch (err) {
-        Logger.verbose('TeamBalancer', 1, `[DB] incrementStreak failed: ${err.message}`);
+        Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.incrementStreakFailed, {
+          error: err.message
+        }));
       }
 
       const targetReportChannel = this.discordReportChannel || this.discordChannel;
@@ -2030,7 +2166,11 @@ export default class TeamBalancer extends S3PluginBase {
       }
 
       const scrambleComing = this.winStreakCount >= this.options.maxWinStreak;
-      Logger.verbose('TeamBalancer', 4, `Scramble check: winStreakCount=${this.winStreakCount}, maxWinStreak=${this.options.maxWinStreak}, scrambleComing=${scrambleComing}`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.scrambleCheckStreak, {
+        count: this.winStreakCount,
+        max: this.options.maxWinStreak,
+        scrambleComing
+      }));
 
       if (this.options.showWinStreakMessages && !scrambleComing) {
         let template;
@@ -2045,54 +2185,76 @@ export default class TeamBalancer extends S3PluginBase {
         } else {
           template = this.RconMessages.dominant.steamrolled;
         }
-        Logger.verbose('TeamBalancer', 4, `Using template for dominant win: ${template}`);
+        Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.usingTemplateDominant, { template }));
 
         const message = `${this.RconMessages.prefix} ${this.formatMessage(template, {
           team: teamNames.winnerName,
           loser: teamNames.loserName,
           margin
         })}`;
-        Logger.verbose('TeamBalancer', 4, `Broadcasting dominant win message: ${message}`);
+        Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.broadcastingDominantMessage, { message }));
         try {
           await this.server.rcon.broadcast(message);
         } catch (broadcastErr) {
-          Logger.verbose('TeamBalancer', 1, `Failed to broadcast dominant win message: ${broadcastErr.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastDominantFailed, {
+            error: broadcastErr.message
+          }));
         }
         this.mirrorRconToDiscord(message, 'info');
       }
 
-      Logger.verbose('TeamBalancer', 4, `Evaluating scramble trigger: streakCount=${this.winStreakCount}, streakTeam=${this.winStreakTeam}, margin=${margin}`);
-      Logger.verbose('TeamBalancer', 4, `_scramblePending=${this._scramblePending}, _scrambleInProgress=${this._scrambleInProgress}`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.evaluatingScrambleTrigger, {
+        count: this.winStreakCount,
+        team: this.winStreakTeam,
+        margin
+      }));
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.scramblePendingState, {
+        pending: this._scramblePending,
+        inProgress: this._scrambleInProgress
+      }));
 
       if (this._scramblePending || this._scrambleInProgress) return;
 
       if (this.winStreakCount >= this.options.maxWinStreak) {
         roundReport.scrambled = true;
         roundReport.scrambleCondition = 'Win Streak Threshold';
-        Logger.verbose('TeamBalancer', 4, `Scramble condition met. Preparing to broadcast announcement.`);
+        Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.scrambleConditionMetPreparingAnnouncement);
         const message = this.formatMessage(this.RconMessages.scrambleAnnouncement, {
           team: teamNames.winnerName,
           count: this.winStreakCount,
           margin,
           delay: this.options.scrambleAnnouncementDelay
         });
-        Logger.verbose('TeamBalancer', 4, `Scramble announcement message: ${message}`);
+        Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.scrambleAnnouncementMessage, { message }));
         try {
           await this.server.rcon.broadcast(`${this.RconMessages.prefix} ${message}`);
         } catch (broadcastErr) {
-          Logger.verbose('TeamBalancer', 1, `Failed to broadcast scramble announcement: ${broadcastErr.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastScrambleAnnouncementFailed, {
+            error: broadcastErr.message
+          }));
         }
         this.mirrorRconToDiscord(`${this.RconMessages.prefix} ${message}`, 'warning');
         const targetReportChannel = this.discordReportChannel || this.discordChannel;
         if (targetReportChannel) {
-          DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds: [DiscordHelpers.buildScrambleTriggeredEmbed('Win streak threshold reached', teamNames.winnerName, this.winStreakCount, this.options.scrambleAnnouncementDelay)] });
+          DiscordHelpers.sendDiscordMessage(targetReportChannel, { 
+            embeds: [DiscordHelpers.buildScrambleTriggeredEmbed(
+              this.messages.discord.embeds.winStreakThresholdReached, 
+              teamNames.winnerName, 
+              this.winStreakCount, 
+              this.options.scrambleAnnouncementDelay
+            )] 
+          });
         }
         this.initiateScramble(false, false).catch(err =>
-          Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.initiateScrambleUnhandledError, {
+            error: err.message
+          }))
         );
       }
     } catch (err) {
-      Logger.verbose('TeamBalancer', 1, `[TeamBalancer] Error in onRoundEnded: ${err.message}`);      
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.onRoundEndedError, {
+        error: err.message
+      }));      
       
       const targetReportChannel = this.discordReportChannel || this.discordChannel;
       if (targetReportChannel) {
@@ -2105,11 +2267,11 @@ export default class TeamBalancer extends S3PluginBase {
       this._scrambleInProgress = false;
       this._clearPendingScrambleCountdown();
       this.cleanupScrambleTracking();
-     } finally {
-       this._roundEndInFlight = false;
-       roundReport.isDominantWin = isDominant ?? null;
-       roundReport.winStreak = this.winStreakCount;
-       roundReport.consecutiveWins = this.consecutiveWinsCount;
+    } finally {
+      this._roundEndInFlight = false;
+      roundReport.isDominantWin = isDominant ?? null;
+      roundReport.winStreak = this.winStreakCount;
+      roundReport.consecutiveWins = this.consecutiveWinsCount;
 
       let eloLogString = '';
       try {
@@ -2155,22 +2317,41 @@ export default class TeamBalancer extends S3PluginBase {
             roundReport.muDelta = Math.abs(roundReport.team1AvgMu - roundReport.team2AvgMu);
             roundReport.regDelta = Math.abs(t1Regs - t2Regs);
             
-            eloLogString = ` | ELO Δ: ${roundReport.muDelta.toFixed(2)}μ | Reg Δ: ${roundReport.regDelta}`;
+            eloLogString = this.formatMessage(this.messages.system.verbose.eloLogString, {
+              muDelta: roundReport.muDelta.toFixed(2),
+              regDelta: roundReport.regDelta
+            });
           }
         }
       } catch (err) {
-        Logger.verbose('TeamBalancer', 1, `[TeamBalancer] Failed to append ELO data to round report: ${err.message}`);
+        Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.appendEloDataFailed, {
+          error: err.message
+        }));
       }
 
       // Log to console
-      Logger.verbose('TeamBalancer', 1, `[Round Report] Match: ${roundReport.layerName} | Mode: ${roundReport.gameMode} | Players: ${roundReport.playerCount} | Winner: ${roundReport.winnerName || roundReport.winner} | Tickets: ${roundReport.winnerTickets} to ${roundReport.loserTickets} (Margin: ${roundReport.ticketMargin}) | Scrambled: ${roundReport.scrambled} | Condition: ${roundReport.scrambleCondition} | Win Streak: ${roundReport.winStreak}${eloLogString}`);
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.verbose.roundReportConsole, {
+        layerName: roundReport.layerName,
+        gameMode: roundReport.gameMode,
+        playerCount: roundReport.playerCount,
+        winner: roundReport.winnerName || roundReport.winner,
+        winnerTickets: roundReport.winnerTickets,
+        loserTickets: roundReport.loserTickets,
+        ticketMargin: roundReport.ticketMargin,
+        scrambled: roundReport.scrambled,
+        scrambleCondition: roundReport.scrambleCondition,
+        winStreak: roundReport.winStreak,
+        eloLogString
+      }));
 
       // Log to JSONL
       try {
         const logPath = path.resolve(process.cwd(), this.options.reportLogPath || 'team-balancer-reports.jsonl');
         await fs.promises.appendFile(logPath, JSON.stringify(roundReport) + '\n');
       } catch (logErr) {
-        Logger.verbose('TeamBalancer', 1, `[TeamBalancer] Failed to write round report to JSONL: ${logErr.message}`);
+        Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.writeJsonlReportFailed, {
+          error: logErr.message
+        }));
       }
 
       // Log to database
@@ -2202,7 +2383,9 @@ export default class TeamBalancer extends S3PluginBase {
           scrambleCondition: roundReport.scrambleCondition ?? null,
           scrambleType: roundReport.scrambleType ?? null
         }).catch(err =>
-          Logger.verbose('TeamBalancer', 1, `[DB] Round report insert failed: ${err.message}`)
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.dbInsertRoundReportFailed, {
+            error: err.message
+          }))
         );
       }
     }
@@ -2254,17 +2437,25 @@ export default class TeamBalancer extends S3PluginBase {
     const avgTeam2Mu = avgMu(team2EosIDs);
     const diff = Math.abs(avgTeam1Mu - avgTeam2Mu);
 
-    Logger.verbose('TeamBalancer', 4, `[EloDiff] avgTeam1Mu=${avgTeam1Mu.toFixed(2)}, avgTeam2Mu=${avgTeam2Mu.toFixed(2)}, diff=${diff.toFixed(2)}, threshold=${this.options.eloDiffScrambleThreshold}`);
+    Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.eloDiffEvaluated, {
+      avgTeam1Mu: avgTeam1Mu.toFixed(2),
+      avgTeam2Mu: avgTeam2Mu.toFixed(2),
+      diff: diff.toFixed(2),
+      threshold: this.options.eloDiffScrambleThreshold
+    }));
 
     if (diff < this.options.eloDiffScrambleThreshold) return;
 
-    Logger.verbose('TeamBalancer', 2, `[EloDiff] Triggered! diff=${diff.toFixed(2)} >= threshold=${this.options.eloDiffScrambleThreshold}`);
+    Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.eloDiffTriggered, {
+      diff: diff.toFixed(2),
+      threshold: this.options.eloDiffScrambleThreshold
+    }));
 
     // No separate _scramblePending/_scrambleInProgress pre-check — initiateScramble() already
     // re-checks that guard at the moment it matters, and its return value IS the check.
     const armed = await this.initiateScramble(false, false, null, null, null, 'EloDiff');
     if (!armed) {
-      Logger.verbose('TeamBalancer', 2, '[EloDiff] Scramble not armed — lost to a same-round competitor (e.g. win-streak).');
+      Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.eloDiffScrambleNotArmedCompetitor);
       return;
     }
 
@@ -2275,7 +2466,9 @@ export default class TeamBalancer extends S3PluginBase {
     try {
       await this.server.rcon.broadcast(msg);
     } catch (err) {
-      Logger.verbose('TeamBalancer', 1, `Failed to broadcast micro scramble announcement: ${err.message}`);
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastMicroScrambleFailed, {
+        error: err.message
+      }));
     }
     this.mirrorRconToDiscord(msg, 'warning');
   }
@@ -2286,13 +2479,13 @@ export default class TeamBalancer extends S3PluginBase {
 
   async initiateScramble(isSimulated = false, immediate = false, steamID = null, player = null, delaySeconds = null, scrambleType = null) {
     if (this._scramblePending || this._scrambleInProgress) {
-      Logger.verbose('TeamBalancer', 4, 'Scramble initiation blocked: scramble already pending or in progress.');
+      Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.scrambleInitiationBlocked);
       return false;
     }
-    const adminName = player?.name || (steamID ? `admin ${steamID}` : 'system');
+    const adminName = player?.name || (steamID ? this.formatMessage(this.messages.system.labels.adminSteamID, { steamID }) : this.messages.system.labels.system);
 
     if (isSimulated) {
-      Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Simulating immediate scramble initiated by ${adminName}`);
+      Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.simulatingScrambleInitiated, { adminName }));
       this._pendingScrambleType = scrambleType;
       await this.executeScramble(true, steamID, player);
       return true;
@@ -2310,12 +2503,12 @@ export default class TeamBalancer extends S3PluginBase {
         // Drop the handle first: a non-null handle must mean "a countdown is still armed", which is
         // what NEW_GAME/unmount/cancel check before tearing it down.
         this._scrambleCountdownTimeout = null;
-        Logger.verbose('TeamBalancer', 4, 'Scramble countdown finished, executing scramble.');
+        Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.scrambleCountdownFinished);
         await this.executeScramble(false, steamID, player);
       }, delay * 1000);
       return true;
     } else {
-      Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Immediate live scramble initiated by ${adminName}`);
+      Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.immediateLiveScrambleInitiated, { adminName }));
       this._pendingScrambleType = scrambleType;
       await this.executeScramble(false, steamID, player);
       return true;
@@ -2323,7 +2516,7 @@ export default class TeamBalancer extends S3PluginBase {
   }
 
   transformSquadJSData(squads, players) {
-    Logger.verbose('TeamBalancer', 4, 'Transforming SquadJS data for scrambler...');
+    Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.transformingSquadJSData);
     
     const normalizedSquads = (squads || []).filter(
       (squad) =>
@@ -2352,14 +2545,18 @@ export default class TeamBalancer extends S3PluginBase {
     const droppedNullTeamPlayers = allValidPlayers.filter((player) => player.teamID === null);
 
     if (droppedNullTeamPlayers.length > 0) {
-      Logger.verbose('TeamBalancer', 1, 
-        `⚠️ [Scramble] Dropped ${droppedNullTeamPlayers.length} players with null teamID during transformSquadJSData. ` +
-        `This is normal at NEW_GAME (players loading into round). ` +
-        `Consider delaying manual scrambles ~30-60s after map load to allow RCON team resolution.`
-      );
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.verbose.droppedNullTeamPlayersWarning, {
+        count: droppedNullTeamPlayers.length
+      }));
     }
 
-    Logger.verbose('TeamBalancer', 4, `Input validation: ${normalizedSquads.length} valid squads, ${normalizedPlayers.length} valid players${droppedNullTeamPlayers.length > 0 ? ` (dropped ${droppedNullTeamPlayers.length} null-teamID)` : ''}`);
+    Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.transformInputValidation, {
+      validSquads: normalizedSquads.length,
+      validPlayers: normalizedPlayers.length,
+      droppedClause: droppedNullTeamPlayers.length > 0 
+        ? this.formatMessage(this.messages.system.verbose.droppedNullClause, { count: droppedNullTeamPlayers.length })
+        : ''
+    }));
     
     const squadPlayerMap = new Map();
 
@@ -2373,7 +2570,9 @@ export default class TeamBalancer extends S3PluginBase {
       }
     }
 
-    Logger.verbose('TeamBalancer', 4, `Squad-player mapping created for ${squadPlayerMap.size} squads`);
+    Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.squadPlayerMappingCreated, {
+      count: squadPlayerMap.size
+    }));
     
     const transformedSquads = normalizedSquads.map((squad) => {
       const squadKey = `T${squad.teamID}-S${squad.squadID}`;
@@ -2386,7 +2585,12 @@ export default class TeamBalancer extends S3PluginBase {
         locked: squad.locked === 'True' || squad.locked === true // Handle both string and boolean
       };
 
-      Logger.verbose('TeamBalancer', 4, `Transformed squad ${squadKey}: ${playersInSquad.length} players, team ${transformed.teamID}, locked: ${transformed.locked}`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.transformedSquadDetail, {
+        squadKey,
+        count: playersInSquad.length,
+        teamID: transformed.teamID,
+        locked: transformed.locked
+      }));
 
       return transformed;
     });
@@ -2397,13 +2601,16 @@ export default class TeamBalancer extends S3PluginBase {
       squadID: player.squadID ? `T${player.teamID}-S${player.squadID}` : null
     }));
 
-    Logger.verbose('TeamBalancer', 4, `Transformation complete: ${transformedSquads.length} squads, ${transformedPlayers.length} players`);
+    Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.transformationComplete, {
+      squadsCount: transformedSquads.length,
+      playersCount: transformedPlayers.length
+    }));
     
     if (transformedSquads.length > 0) {
-      Logger.verbose('TeamBalancer', 4, `Sample transformed squad:`, JSON.stringify(transformedSquads[0], null, 2));
+      Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.sampleTransformedSquad, JSON.stringify(transformedSquads[0], null, 2));
     }
     if (transformedPlayers.length > 0) {
-      Logger.verbose('TeamBalancer', 4, `Sample transformed player:`, JSON.stringify(transformedPlayers[0], null, 2));
+      Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.sampleTransformedPlayer, JSON.stringify(transformedPlayers[0], null, 2));
     }
 
     return {
@@ -2448,7 +2655,7 @@ export default class TeamBalancer extends S3PluginBase {
     // scramblePercentage budget (a near-full scramble), which is exactly what this feature
     // exists to avoid. See "Second high-risk finding".
     if (!eloMap || eloMap.size === 0) {
-      Logger.verbose('TeamBalancer', 1, '[EloDiff] No ELO ratings available at execution time — skipping micro scramble.');
+      Logger.verbose('TeamBalancer', 1, this.messages.system.verbose.eloDiffNoRatingsSkipping);
       return [];
     }
 
@@ -2479,12 +2686,20 @@ export default class TeamBalancer extends S3PluginBase {
       // ACTUAL number of players moved, so an oversized plan is rejected outright rather than
       // accepted just because it happened to also reach parity.
       if (plan && plan.length > maxBudget) {
-        Logger.verbose('TeamBalancer', 2, `[EloDiff] Budget ${budget}: scrambler returned a ${plan.length}-player plan, exceeding the ${maxBudget}-player safety ceiling (squad atomicity) — discarding.`);
+        Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.eloDiffBudgetExceededCeiling, {
+          budget,
+          planLength: plan.length,
+          maxBudget
+        }));
         continue;
       }
 
       const diff = this._computePostSwapMuDiff(transformedPlayers, plan, eloMap);
-      Logger.verbose('TeamBalancer', 4, `[EloDiff] Budget ${budget}: post-swap diff ${diff.toFixed(3)}μ (plan size ${plan?.length ?? 0}).`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.eloDiffBudgetPostSwapDiff, {
+        budget,
+        diff: diff.toFixed(3),
+        planSize: plan?.length ?? 0
+      }));
 
       if (plan && plan.length > 0 && diff < bestDiff) {
         bestDiff = diff;
@@ -2506,7 +2721,7 @@ export default class TeamBalancer extends S3PluginBase {
     this._pendingScrambleType = null;
 
     if (this._scrambleInProgress) {
-      Logger.verbose('TeamBalancer', 1, 'Scramble already in progress.');
+      Logger.verbose('TeamBalancer', 1, this.messages.system.verbose.scrambleAlreadyInProgress);
       return false;
     }
 
@@ -2529,16 +2744,16 @@ export default class TeamBalancer extends S3PluginBase {
     if (this._s3?.players?.isReady() && !isSimulated) {
       const locked = this._s3.players.lockGlobal('TeamBalancer', this.options.maxScrambleCompletionTime + 5000);
       if (!locked) {
-        Logger.verbose('TeamBalancer', 1, '[S3] Global lock denied — held by equal/higher priority (likely another TB scramble).');
+        Logger.verbose('TeamBalancer', 1, this.messages.system.verbose.globalLockDeniedEqualOrHigher);
         return false;
       }
       globalLockAcquired = true;
-      Logger.verbose('TeamBalancer', 4, '[S3] Global lock acquired for scramble.');
+      Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.globalLockAcquired);
     }
 
     this._scrambleInProgress = true;    
-    const adminName = player?.name || (steamID ? `admin ${steamID}` : 'system');
-    Logger.verbose('TeamBalancer', 4, `Scramble started by ${adminName}`);
+    const adminName = player?.name || (steamID ? this.formatMessage(this.messages.system.labels.adminSteamID, { steamID }) : this.messages.system.labels.system);
+    Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.scrambleStartedBy, { adminName }));
 
     let swapPlan = null;
     let preScrambleState = null;
@@ -2546,18 +2761,18 @@ export default class TeamBalancer extends S3PluginBase {
       let broadcastMessage;
       if (isSimulated) {
         broadcastMessage = `${this.RconMessages.prefix} ${this.RconMessages.executeDryRunMessage.trim()}`;
-        Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Simulating scramble initiated by ${adminName}`);
+        Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.simulatingScrambleInitiated, { adminName }));
       } else {
         broadcastMessage = `${this.RconMessages.prefix} ${this.RconMessages.executeScrambleMessage.trim()}`;
-        Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Executing scramble initiated by ${adminName}`);
+        Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.executingScrambleInitiated, { adminName }));
       }
 
-      Logger.verbose('TeamBalancer', 4, `Broadcasting: "${broadcastMessage}"`);      
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.broadcastingMessage, { message: broadcastMessage }));      
       if (!isSimulated) {
         try {
           await this.server.rcon.broadcast(broadcastMessage);
         } catch (broadcastErr) {          
-          Logger.verbose('TeamBalancer', 1, `Failed to broadcast scramble execution message: ${broadcastErr.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastExecutionFailed, { error: broadcastErr.message }));
         }
         this.mirrorRconToDiscord(broadcastMessage, 'scramble');
       }
@@ -2580,7 +2795,7 @@ export default class TeamBalancer extends S3PluginBase {
         const p = this.server.players.find(pl => pl.eosID === eosID);
         return {
           eosID,
-          name: p?.name ?? 'Unknown',
+          name: p?.name ?? this.messages.system.labels.unknownPlayer,
           steamID: p?.steamID ?? null
         };
       };
@@ -2628,11 +2843,11 @@ export default class TeamBalancer extends S3PluginBase {
             const snapshot = eloTrackerPlugin.lastRoundSnapshot;
             if (snapshot && snapshot.size > 0) {
               eloMap = snapshot;
-              Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Using ELO round snapshot (${eloMap.size} players).`);
+              Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.eloUsingRoundSnapshot, { count: eloMap.size }));
             } else {
               const eosIDs = transformedPlayers.map(p => p.eosID);
               eloMap = await eloTrackerPlugin.getRatingsByEosIDs(eosIDs);
-              Logger.verbose('TeamBalancer', 2, `[TeamBalancer] ELO snapshot empty, fell back to DB read (${eloMap.size} players).`);
+              Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.eloFallbackToDB, { count: eloMap.size }));
             }
 
             // --- Enforce 40-55 Person Scramble for Edge Cases ---
@@ -2658,18 +2873,18 @@ export default class TeamBalancer extends S3PluginBase {
               const muDelta = Math.abs(avgT1 - avgT2);
 
               if (muDelta < 0.4) {
-                Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Pre-scramble ELO diff is extremely small (${muDelta.toFixed(2)}μ). Enforcing 40-55 person scramble bound.`);
+                Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.eloSmallDiffEnforcingChurn, { muDelta: muDelta.toFixed(2) }));
                 minPlayersToMove = 40;
                 maxPlayersToMove = 55;
               }
             }
 
           } catch (err) {
-            Logger.verbose('TeamBalancer', 1, `[TeamBalancer] ELO fetch failed, scrambling without ratings: ${err.message}`);
+            Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.eloFetchFailed, { error: err.message }));
             eloMap = null;
           }
         } else {
-          Logger.verbose('TeamBalancer', 2, '[TeamBalancer] EloTracker plugin not found! Scrambling without ELO data.');
+          Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.eloTrackerNotFound);
         }
       }
 
@@ -2683,17 +2898,20 @@ export default class TeamBalancer extends S3PluginBase {
           // extractClanGroups uses getGroupingOptions() internally — no overrides needed
           const tagCount = Object.keys(clanGroups).length;
           if (tagCount > 0) {
-            Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Clan tag grouping: extracted ${tagCount} qualifying clan(s).`);
+            Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.clanGroupingExtracted, { count: tagCount }));
           } else {
-            Logger.verbose('TeamBalancer', 2, '[TeamBalancer] Clan tag grouping enabled but no qualifying clans found.');
+            Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.clanGroupingNoQualifying);
           }
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `[TeamBalancer] Clan tag extraction failed, scrambling without clan grouping: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.clanExtractionFailed, { error: err.message }));
           clanGroups = null;
         }
       }
 
-      Logger.verbose('TeamBalancer', 4, `Calling scrambler with ${transformedSquads.length} squads and ${transformedPlayers.length} players`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.callingScramblerWithData, {
+        squadsCount: transformedSquads.length,
+        playersCount: transformedPlayers.length
+      }));
 
       if (scrambleType === 'EloDiff') {
         // Micro scramble: an escalating search for the smallest move-count budget that reaches
@@ -2731,17 +2949,25 @@ export default class TeamBalancer extends S3PluginBase {
       }
 
       if (swapPlan && swapPlan.length > 0) {
-        Logger.verbose('TeamBalancer', 2, `Dry run: Scrambler returned ${swapPlan.length} player moves (Calculation: ${swapPlan.calculationTime}ms).`);
+        Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.dryRunMovesReturned, {
+          count: swapPlan.length,
+          calculationTime: swapPlan.calculationTime
+        }));
 
         if (!isSimulated) {
           for (const move of swapPlan) {
             const player = this.server.players.find(p => p.eosID === move.eosID);
             if (!player) {
-              Logger.verbose('TeamBalancer', 1, `[executeScramble] Player with eosID ${move.eosID} not found in server.players during move execution`);
+              Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.verbose.executePlayerNotFound, { eosID: move.eosID }));
               continue;
             }
             
-            Logger.verbose('TeamBalancer', 1, `[Attribution] TEAM_BALANCER recording move via S³: player=${player.name} (${player.steamID}), sourceTeam=${player.teamID}, targetTeam=${move.targetTeamID}`);
+            Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.verbose.attributionRecordMove, {
+              name: player.name,
+              steamID: player.steamID,
+              sourceTeam: player.teamID,
+              targetTeam: move.targetTeamID
+            }));
             this._s3?.players?.recordMove(move.eosID, move.targetTeamID, 'Team-Balancer');
             
             await this.reliablePlayerMove(move.eosID, move.targetTeamID, isSimulated);
@@ -2786,11 +3012,11 @@ export default class TeamBalancer extends S3PluginBase {
             ? this.RconMessages.microScrambleCompleteMessage
             : this.RconMessages.scrambleCompleteMessage;
           const msg = `${this.RconMessages.prefix} ${completeMessage.trim()}`;
-          Logger.verbose('TeamBalancer', 4, `Broadcasting: "${msg}"`);
+          Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.broadcastingMessage, { message: msg }));
           try {
             await this.server.rcon.broadcast(msg);
           } catch (broadcastErr) {
-            Logger.verbose('TeamBalancer', 1, `Failed to broadcast scramble complete message: ${broadcastErr.message}`);
+            Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastCompleteFailed, { error: broadcastErr.message }));
           }
           this.mirrorRconToDiscord(msg, 'success');
           const scrambleTimestamp = Date.now();
@@ -2799,33 +3025,36 @@ export default class TeamBalancer extends S3PluginBase {
             const res = await this.db.saveScrambleTime(scrambleTimestamp);
             if (res && res.lastScrambleTime) this.lastScrambleTime = res.lastScrambleTime;
           } catch (err) {
-            Logger.verbose('TeamBalancer', 1, `[DB] saveScrambleTime failed: ${err.message}`);
+            Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.dbSaveScrambleTimeFailed, { error: err.message }));
           }
           // Do NOT reset win-streak state for the Elo-diff micro scramble — it moves a
           // deliberately small number of players and isn't trying to guarantee full parity, so a
           // persistent streak across rounds is still real signal for the existing triggers to
           // escalate on.
           if (scrambleType !== 'EloDiff') {
-            await this.resetStreak('Post-scramble cleanup');
+            await this.resetStreak(this.messages.system.reasons.postScrambleCleanup);
           }
         } else {
-          Logger.verbose('TeamBalancer', 2, `Dry run: Would have queued ${swapPlan.length} player moves.`);
+          Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.dryRunWouldHaveQueued, { count: swapPlan.length }));
           for (const move of swapPlan) {
-            Logger.verbose('TeamBalancer', 4, `  [Dry Run] Player ${move.eosID} to Team ${move.targetTeamID}`);
+            Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.dryRunMoveDetail, {
+              eosID: move.eosID,
+              targetTeamID: move.targetTeamID
+            }));
           }
-          Logger.verbose('TeamBalancer', 2, `[Diagnostics] Dry run successful. No players were harmed.`);
+          Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.dryRunSuccessfulNoPlayersHarmed);
           Logger.verbose('TeamBalancer', 2, `${this.RconMessages.prefix} ${this.RconMessages.scrambleCompleteMessage.trim()}`);
         }
       } else {
-        Logger.verbose('TeamBalancer', 2, 'Scrambler returned no player moves or an empty plan.');
+        Logger.verbose('TeamBalancer', 2, this.messages.system.verbose.scramblerReturnedNoMoves);
         
         if (!isSimulated) {
           const msg = `${this.RconMessages.prefix} ${this.RconMessages.scrambleFailedMessage.trim()}`;
-          Logger.verbose('TeamBalancer', 4, `Broadcasting: "${msg}"`);
+          Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.broadcastingMessage, { message: msg }));
           try {
             await this.server.rcon.broadcast(msg);
           } catch (broadcastErr) {
-            Logger.verbose('TeamBalancer', 1, `Failed to broadcast scramble failed message: ${broadcastErr.message}`);
+            Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastFailedMessageError, { error: broadcastErr.message }));
           }
           this.mirrorRconToDiscord(msg, 'warning');
           const targetReportChannel = this.discordReportChannel || this.discordChannel;
@@ -2833,7 +3062,11 @@ export default class TeamBalancer extends S3PluginBase {
           // (this.discordChannel), live scramble failures go to the report channel (targetReportChannel).
           const failChannel = isSimulated ? this.discordChannel : targetReportChannel;
           if (failChannel) {
-            const embed = DiscordHelpers.buildScrambleFailedEmbed('No valid swap solution found.', swapPlan?.calculationTime || 0, this);
+            const embed = DiscordHelpers.buildScrambleFailedEmbed(
+              this.messages.system.embeds.noValidSwapSolutionFound,
+              swapPlan?.calculationTime || 0,
+              this
+            );
             DiscordHelpers.sendDiscordMessage(failChannel, { embeds: [embed] });
           }
           // Note: We do NOT reset the streak here, as the imbalance likely persists.
@@ -2844,26 +3077,26 @@ export default class TeamBalancer extends S3PluginBase {
 
       return true;
     } catch (error) {
-    Logger.verbose('TeamBalancer', 1, `[TeamBalancer] Critical error during scramble execution: ${error?.message || error}`);      
-      Logger.verbose('TeamBalancer', 4, `Squad data at error:`, JSON.stringify(this.server.squads, null, 2));
-      Logger.verbose('TeamBalancer', 4, `Player data at error:`, JSON.stringify(this.server.players, null, 2));      
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.criticalErrorDuringScrambleExecution, { error: error?.message || error }));      
+      Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.squadDataAtError, JSON.stringify(this.server.squads, null, 2));
+      Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.playerDataAtError, JSON.stringify(this.server.players, null, 2));      
       
       const targetReportChannel = this.discordReportChannel || this.discordChannel;
       if (targetReportChannel) {
-        const embed = DiscordHelpers.buildFatalErrorEmbed(error, 'Scramble Execution', this);
+        const embed = DiscordHelpers.buildFatalErrorEmbed(error, this.messages.system.labels.scrambleExecution, this);
         DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
       }
 
       this.cleanupScrambleTracking();
-      await this.resetStreak('Scramble execution failed');
+      await this.resetStreak(this.messages.system.reasons.scrambleExecutionFailed);
       return false;
     } finally {
       if (globalLockAcquired) {
         try {
           this._s3?.players.unlockGlobal('TeamBalancer');
-          Logger.verbose('TeamBalancer', 4, '[S3] Global lock released after scramble.');
+          Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.globalLockReleased);
         } catch (err) {
-          Logger.verbose('TeamBalancer', 1, `[S3] Failed to release global lock: ${err.message}`);
+          Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.failedToReleaseGlobalLock, { error: err.message }));
         }
       }
       // Write scramble report JSON (includes swap plan and execution results)
@@ -2875,7 +3108,7 @@ export default class TeamBalancer extends S3PluginBase {
       // helper the other teardown paths use, so "no countdown outstanding" has one meaning.
       this._clearPendingScrambleCountdown();
       this._scrambleInProgress = false;
-      Logger.verbose('TeamBalancer', 4, 'Scramble finished');
+      Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.scrambleFinished);
     }
   }
 
@@ -2887,7 +3120,7 @@ export default class TeamBalancer extends S3PluginBase {
     if (this._scrambleInProgress) {
       if (!isAutomatic) {
         const adminName = player?.name || steamID;
-        Logger.verbose('TeamBalancer', 2, `[TeamBalancer] ${adminName} attempted to cancel scramble, but it's already executing`);
+        Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.adminAttemptedCancelAlreadyExecuting, { adminName }));
       }
       return false;
     }
@@ -2895,17 +3128,19 @@ export default class TeamBalancer extends S3PluginBase {
     this._clearPendingScrambleCountdown();
 
     const adminName = player?.name || steamID; // Prioritize player name
-    const cancelReason = isAutomatic ? 'automatically' : `by admin ${adminName}`;
+    const cancelReason = isAutomatic 
+      ? this.messages.system.labels.cancelReasonAutomatic 
+      : this.formatMessage(this.messages.system.labels.cancelReasonAdmin, { adminName });
 
-    Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Scramble countdown cancelled ${cancelReason}`);
+    Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.scrambleCountdownCancelled, { cancelReason }));
 
-      if (!isAutomatic) {
-      const msg = `${this.RconMessages.prefix} Scramble cancelled by admin.`;
-      Logger.verbose('TeamBalancer', 4, `Broadcasting: "${msg}"`);
+    if (!isAutomatic) {
+      const msg = `${this.RconMessages.prefix} ${this.messages.system.rcon.scrambleCancelledByAdmin}`;
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.broadcastingMessage, { message: msg }));
       try {
         await this.server.rcon.broadcast(msg);
       } catch (err) {
-        Logger.verbose('TeamBalancer', 1, `Failed to broadcast scramble cancellation message: ${err.message}`);
+        Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.broadcastCancellationFailed, { error: err.message }));
       }
       this.mirrorRconToDiscord(msg, 'info');
     }
@@ -2917,14 +3152,14 @@ export default class TeamBalancer extends S3PluginBase {
     if (this.swapExecutor) {
       await this.swapExecutor.waitForCompletion(timeoutMs, intervalMs);
     } else {
-      Logger.verbose('TeamBalancer', 4, 'No swapExecutor present; nothing to wait for.');
+      Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.noSwapExecutorPresent);
     }
-    Logger.verbose('TeamBalancer', 4, 'All player moves processed or timeout reached.');
+    Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.allMovesProcessedOrTimeout);
   }
   
   async reliablePlayerMove(eosID, targetTeamID, isSimulated = false) {
     if (isSimulated) {
-      Logger.verbose('TeamBalancer', 4, `[Dry Run] Would queue player move for ${eosID} to team ${targetTeamID}`);
+      Logger.verbose('TeamBalancer', 4, this.formatMessage(this.messages.system.verbose.dryRunWouldQueueMove, { eosID, targetTeamID }));
       return;
     }
 
@@ -2963,7 +3198,7 @@ export default class TeamBalancer extends S3PluginBase {
     try {
       const reportDirOpt = this.options.scrambleReportPath;
       if (!reportDirOpt) {
-        Logger.verbose('TeamBalancer', 4, '[ScrambleReport] Disabled (scrambleReportPath empty)');
+        Logger.verbose('TeamBalancer', 4, this.messages.system.verbose.scrambleReportDisabledPathEmpty);
         return;
       }
       const logDir = path.resolve(process.cwd(), reportDirOpt);
@@ -2979,8 +3214,8 @@ export default class TeamBalancer extends S3PluginBase {
         timestamp: Date.now(),
         isoTimestamp: new Date().toISOString(),
         matchId: gs?.isReady() ? (gs.getMatchId?.() ?? null) : null,
-        layerName: gs?.isReady() ? (gs.getLayerName?.() ?? 'Unknown') : 'Unknown',
-        gamemode: gs?.isReady() ? (gs.getGamemode?.() ?? 'Unknown') : 'Unknown',
+        layerName: gs?.isReady() ? (gs.getLayerName?.() ?? this.messages.system.labels.unknownLayer) : this.messages.system.labels.unknownLayer,
+        gamemode: gs?.isReady() ? (gs.getGamemode?.() ?? this.messages.system.labels.unknownGamemode) : this.messages.system.labels.unknownGamemode,
         calculationTime,
         totalMovesInPlan: swapPlan?.length || 0,
         plan: (swapPlan || []).map(m => ({
@@ -3004,9 +3239,9 @@ export default class TeamBalancer extends S3PluginBase {
       };
 
       await fs.promises.writeFile(reportPath, JSON.stringify(report, null, 2));
-      Logger.verbose('TeamBalancer', 2, `[ScrambleReport] Written to ${reportPath}`);
+      Logger.verbose('TeamBalancer', 2, this.formatMessage(this.messages.system.verbose.scrambleReportWritten, { reportPath }));
     } catch (err) {
-      Logger.verbose('TeamBalancer', 1, `[ScrambleReport] Failed to write: ${err.message}`);
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.scrambleReportWriteFailed, { error: err.message }));
     }
   }
 
@@ -3015,7 +3250,7 @@ export default class TeamBalancer extends S3PluginBase {
     if (!targetReportChannel || !this.options.mirrorRconBroadcasts) return;
 
     if (!message || typeof message !== 'string' || message.trim() === '') {
-      Logger.verbose('TeamBalancer', 1, `[Discord] Attempted to mirror empty/invalid message: ${message}`);
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.verbose.discordMirrorEmptyMessage, { message }));
       return;
     }
 
@@ -3030,12 +3265,12 @@ export default class TeamBalancer extends S3PluginBase {
     try {
       const embed = {
         color: parseInt((colors[type] || colors.info).replace('#', ''), 16),
-        description: `📢 **Server Broadcast**\n${message}`,
+        description: this.formatMessage(this.messages.system.embeds.discordServerBroadcastDescription, { message }),
         timestamp: new Date().toISOString()
       };
       DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
     } catch (err) {
-      Logger.verbose('TeamBalancer', 1, `[Discord] Mirror failed: ${err.message}`);
+      Logger.verbose('TeamBalancer', 1, this.formatMessage(this.messages.system.errors.discordMirrorFailed, { error: err.message }));
     }
   }
 }
