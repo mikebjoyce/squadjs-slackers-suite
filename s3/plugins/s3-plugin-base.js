@@ -91,6 +91,18 @@ export default class S3PluginBase extends BasePlugin {
     return this.options?.language || 'en';
   }
 
+  /**
+   * Translates a message key using the plugin's configured language.
+   * Delegates to i18n.js and automatically injects this.lang.
+   * 
+   * @param {string} key - Translation key (e.g., 'switch.discord.scrambleEmbedTitle')
+   * @param {object} [vars={}] - Variable substitutions (e.g., { count: 12, minutes: 20 })
+   * @returns {string} Formatted localized string
+   */
+  t(key, vars = {}) {
+    return t(key, vars, this.lang);
+  }
+
   // ═══════════════════════════════════════════════════════════════
   //  S³ DISCOVERY
   // ═══════════════════════════════════════════════════════════════
@@ -769,8 +781,8 @@ export default class S3PluginBase extends BasePlugin {
 
   /**
    * Loads localized JSON messages into this.messages automatically.
-   * @param {string} pluginNamespace - e.g. 'elo-tracker', 'smart-assign', 'switch'
-   * @param {string} [langCode='en'] - e.g. 'en', 'pt'
+   * @param {string} pluginNamespace 
+   * @param {string} [langCode='en']
    */
   async loadMessages(pluginNamespace, langCode = 'en') {
     const safeLang = String(langCode).toLowerCase().replace(/[^a-z0-9_-]/g, '');
