@@ -644,6 +644,11 @@ export default class S3PluginBase extends BasePlugin {
       return null;
     }
 
+    // Strict === is safe here: teamID is documented as number|null (see
+    // docs/.agents/skills/creating-squadjs-plugins/references/event-reliability.md),
+    // never a string. Below, current/final-team comparisons go through
+    // String() instead because they compare against targetTeamID, a value
+    // this file computed itself and could just as easily have left numeric.
     const targetTeamID = playerState.teamID === 1 ? 2 : 1;
     const playerName = playerState.name;
 

@@ -541,7 +541,11 @@ const SwitchCommands = {
 
           const eligibility = await plugin._checkSwitchEligibility(info.player);
           if (!eligibility.eligible) {
-            if (eligibility.reason === 'scramble_lock') {
+            if (eligibility.reason === 'recent_switch') {
+              plugin.warn(eosID, `[Switch] You just switched — wait ${eligibility.remaining}s before switching again.`);
+              plugin.verbose(1, `[Switch] Denied ${playerName}: Post-switch lockout active.`);
+              plugin._trackDenial(eosID, playerName, 'recent_switch');
+            } else if (eligibility.reason === 'scramble_lock') {
               plugin.warn(eosID, `[Switch] Scramble lock active — expires in ${eligibility.remaining}m.\nYour switch window may close before this expires.\nUse !switch check to see your full status.`);
               plugin.verbose(1, `[Switch] Denied ${playerName}: Scramble lockdown active.`);
               plugin._trackDenial(eosID, playerName, 'scramble_lock');

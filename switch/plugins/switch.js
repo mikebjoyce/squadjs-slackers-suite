@@ -9,6 +9,10 @@ import SwitchQueue from '../utils/switch-queue.js';
 import SwitchCommands from '../utils/switch-commands.js';
 import SwitchExplain from '../utils/switch-explain.js';
 
+// Post-switch lockout duration — see _checkSwitchEligibility()'s recent_switch
+// gate. Not configurable: it exists purely to close a race between S³'s
+// registry and the player's client, not a tunable gameplay knob.
+const POST_SWITCH_LOCKOUT_MS = 10_000;
 
 /**
  * ╔═══════════════════════════════════════════════════════════════╗
@@ -440,7 +444,7 @@ export default class Switch extends S3DiscordPluginBase {
         // Time limit toggle — loaded from DB in _onS3Ready(), defaults to true.
         this.timeLimitEnabled = true;
 
-        this.recentSwitches = [];
+        this.recentSwitches = [];          // { eosID, datetime } — post-switch lockout, see _recordRecentSwitch()
         this.recentDoubleSwitches = [];
         this._reconnectLockoutClearTimeouts = new Map();
 
@@ -901,9 +905,41 @@ export default class Switch extends S3DiscordPluginBase {
         return row;
     }
 
+    /**
+     * Records that `eosID` was just switched successfully, for the
+     * post-switch lockout enforced by _checkSwitchEligibility(). One entry
+     * per player, updated in place — mirrors the recentDoubleSwitches
+     * pattern used by doubleSwitchPlayer().
+     *
+     * @param {string} eosID
+     */
+    _recordRecentSwitch(eosID) {
+        const existing = this.recentSwitches.find(e => e.eosID === eosID);
+        if (existing) existing.datetime = new Date();
+        else this.recentSwitches.push({ eosID, datetime: new Date() });
+    }
+
     async _checkSwitchEligibility(player) {
         const eosID = player?.eosID;
         if (!eosID) return { eligible: false, reason: 'missing_eos' };
+
+        // Post-switch lockout — independent of liberal/seed mode and checked
+        // before any DB lookup. Closes the gap between S³'s registry confirming
+        // a team change (recordMove, fired before the RCON round-trip even
+        // finishes — see _requestTeamChange in s3-plugin-base.js) and the
+        // player's client visually rendering the move. Without this, a player
+        // who assumes their first !switch didn't register (because of that
+        // render lag) can fire a second one while the registry already shows
+        // them on the new team — _requestTeamChange then computes the ORIGINAL
+        // team as the new target and switches them straight back, burning two
+        // tokens for a net no-op and leaving them stranded on their starting side.
+        const recentSwitch = this.recentSwitches.find(e => e.eosID === eosID);
+        if (recentSwitch) {
+            const elapsedMs = Date.now() - recentSwitch.datetime.getTime();
+            if (elapsedMs < POST_SWITCH_LOCKOUT_MS) {
+                return { eligible: false, reason: 'recent_switch', remaining: Math.ceil((POST_SWITCH_LOCKOUT_MS - elapsedMs) / 1000) };
+            }
+        }
 
         const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
         const cooldownData = PlayerCooldowns ? await PlayerCooldowns.findByPk(eosID) : null;
@@ -1177,6 +1213,7 @@ export default class Switch extends S3DiscordPluginBase {
         }
         this.verbose(2, `Player disconnected ${playerName}`);
         this.recentDoubleSwitches = this.recentDoubleSwitches.filter(p => p.eosID != eosID);
+        this.recentSwitches = this.recentSwitches.filter(p => p.eosID != eosID);
     }
 
       async doubleSwitchPlayer(eosID, forced = false, senderSteamID) {
@@ -1329,6 +1366,7 @@ export default class Switch extends S3DiscordPluginBase {
 
         if (result && result.success) {
             this.verbose(3, `[Switch] RCON SUCCESS: ${result.name} switched to T${result.teamID} (source=${source})`);
+            this._recordRecentSwitch(eosID);
             return result;
         }
 

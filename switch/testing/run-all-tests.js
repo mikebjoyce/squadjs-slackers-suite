@@ -32,6 +32,11 @@ const testFiles = [
   // be constructed — slower than the mock-harness suites, and the only one
   // that runs an event handler end to end into a real database.
   'test-scramble-lockdown.js',
+  // Same approach, no DB: exercises the real _taggedSwitchPlayer/
+  // _checkSwitchEligibility/handlePlayerLeave post-switch lockout gate,
+  // whose mock-harness copy in mock-harness.js is hand-maintained and can
+  // drift from the production code it mirrors.
+  'test-post-switch-lockout.js',
   // Same approach, run against SQLite AND MySQL. These two are where the
   // v2.5.6 admin/seed behaviour is actually pinned; the mock-harness suites
   // above cannot see permission errors or three-valued logic. MySQL cases
