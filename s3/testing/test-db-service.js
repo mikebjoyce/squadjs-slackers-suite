@@ -238,6 +238,71 @@ await runTest('runMigrations applies a registered migration exactly once', async
   await db.unmount();
 });
 
+await runTest('ensureIndexes creates missing indexes and is idempotent on re-run', async () => {
+  // Real in-memory SQLite, same reasoning as the migration case above: a mock
+  // cannot answer "did the index actually land," which is the whole point.
+  const sequelize = new Sequelize.Sequelize({
+    dialect: 'sqlite',
+    storage: ':memory:',
+    logging: false
+  });
+  const db = new DBService({ sequelize, verboseLogger: () => {} });
+  await db.mount();
+
+  const qi = sequelize.getQueryInterface();
+  await qi.createTable('EnsureIndexesProbe', {
+    id: { type: Sequelize.DataTypes.INTEGER, primaryKey: true },
+    matchId: { type: Sequelize.DataTypes.STRING },
+    ts: { type: Sequelize.DataTypes.BIGINT }
+  });
+
+  const indexes = [
+    { name: 'idx_eip_matchId', fields: ['matchId'] },
+    { name: 'idx_eip_ts', fields: ['ts'] }
+  ];
+
+  await db.ensureIndexes('EnsureIndexesProbe', indexes);
+  let names = (await qi.showIndex('EnsureIndexesProbe')).map((i) => i.name);
+  assert.ok(names.includes('idx_eip_matchId'), 'idx_eip_matchId was not created');
+  assert.ok(names.includes('idx_eip_ts'), 'idx_eip_ts was not created');
+
+  // Re-run: showIndex() already reports both, so this must be a no-op, not an
+  // error from re-declaring an index that already exists.
+  await db.ensureIndexes('EnsureIndexesProbe', indexes);
+  names = (await qi.showIndex('EnsureIndexesProbe')).map((i) => i.name);
+  assert.equal(names.filter((n) => n === 'idx_eip_matchId').length, 1, 'index was duplicated on re-run');
+  assert.equal(names.filter((n) => n === 'idx_eip_ts').length, 1, 'index was duplicated on re-run');
+
+  await db.unmount();
+});
+
+await runTest('ensureIndexes logs and continues past a failed CREATE INDEX rather than throwing', async () => {
+  // No such table exists, so the CREATE INDEX itself fails (whether or not
+  // showIndex() throws first depends on dialect — SQLite tolerates PRAGMA
+  // index_list on a missing table). Either way this must never propagate:
+  // a missing index is a query-performance concern, not a correctness one.
+  const sequelize = new Sequelize.Sequelize({
+    dialect: 'sqlite',
+    storage: ':memory:',
+    logging: false
+  });
+  const warnings = [];
+  const db = new DBService({
+    sequelize,
+    verboseLogger: (level, msg) => warnings.push(msg)
+  });
+  await db.mount();
+
+  await db.ensureIndexes('NoSuchTable', [{ name: 'idx_nst_x', fields: ['x'] }]);
+
+  assert.ok(
+    warnings.some((m) => m.includes('Failed to create index')),
+    'expected a logged failure, got: ' + JSON.stringify(warnings)
+  );
+
+  await db.unmount();
+});
+
 if (!process.exitCode) {
   console.log('\nAll db-service tests passed.');
 }

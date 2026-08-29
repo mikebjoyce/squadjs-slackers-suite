@@ -235,7 +235,7 @@ current number.
 | `clanTagIgnoreList` | no | array | `[]` | Clan tags excluded from grouping |
 | `clanRecruitSuffixes` | no | array | `["r", "-r"]` | Suffixes to strip from clan tags when the base tag (without suffix) exists on other players. Enabled by default for common recruit tags (case-insensitive, so "R" and "-R" are also matched). Set to `[]` to disable. Stripping only occurs when the base tag is present on at least one other player in the data set. |
 | `clanGroupingPullEntireSquads` | no | boolean | `true` | Pull non-clan teammates with clan members |
-| `enableDatabaseLogging` | no | boolean | `false` | Enable shared S³ logging tables (S3_PlayerEvents, S3_GameStateEvents, S3_PlayerSnapshots). When false, LoggingService runs in no-op mode. |
+| `enableDatabaseLogging` | no | boolean | `true` | Enable shared S³ logging tables (S3_PlayerEvents, S3_GameStateEvents, S3_PlayerSnapshots). When false, LoggingService runs in no-op mode. |
 | `enableFileLogging` | no | boolean | `false` | Enable JSONL file mirror for S³ logging events. Each DB write is also appended as a self-contained JSONL line to the logPath file. |
 | `logPath` | no | string | `"./s3-log.jsonl"` | Path to JSONL file for S³ event mirror. Only used when enableFileLogging is true. |
 | `autoMigrate` | no | boolean | `false` | If `true`, skips Discord confirmation prompt for migrations |

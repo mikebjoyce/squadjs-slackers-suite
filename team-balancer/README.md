@@ -167,7 +167,7 @@ Add to your `config.json`:
   "useEloForBalance": true,
   "devMode": false,
   "reportLogPath": "team-balancer-reports.jsonl",
-  "enableDatabaseLogging": false
+  "enableDatabaseLogging": true
 }
 ```
 
@@ -263,11 +263,11 @@ Admin Commands:
 | `enableEloDiffScramble` | no | boolean | `false` | Trigger a small "micro scramble" when the average Elo (mu) gap between teams from the round that just ended meets `eloDiffScrambleThreshold`, independent of the three reactive triggers. Opt-in — requires EloTracker to be active. Can also be triggered manually via `!scramble elo` regardless of this setting. |
 | `eloDiffScrambleThreshold` | no | number | `1.2` | Average mu gap between teams (abs value) that arms the Elo-diff micro scramble |
 | `microScrambleParityTarget` | no | number | `0.05` | Post-swap average mu gap the Elo-diff micro scramble's escalating search stops at once reached |
-| `microScrambleMaxMovePercent` | no | number | `0.10` | Safety ceiling for the Elo-diff micro scramble: max fraction of the current round's population (both teams combined) that may be moved |
+| `microScrambleMaxMovePercent` | no | number | `0.20` | Safety ceiling for the Elo-diff micro scramble: max fraction of the current round's population (both teams combined) that may be moved |
 | `devMode` | no | boolean | `false` | Allow commands from any player regardless of admin status |
 | `reportLogPath` | no | string | `"team-balancer-reports.jsonl"` | Path to the JSONL log file for round reports |
 | `scrambleReportPath` | no | string | `"TeamBalancerScrambleReports/"` | Directory for per-scramble report files |
-| `enableDatabaseLogging` | no | boolean | `false` | If true, round reports are also written to database tables |
+| `enableDatabaseLogging` | no | boolean | `true` | If true, round reports are also written to database tables |
 
 > **S³-Managed Options**: The following settings are no longer configured on the TeamBalancer plugin. They are now managed by S³:
 >

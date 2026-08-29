@@ -313,6 +313,7 @@ for (const { name } of DIALECTS) {
       assert.equal(r.ok, false);
       assert.equal(r.reason, 'noEventsLogged');
       assert.equal(r.hasRoundOutcomeData, true); // TB_RoundReport model is registered, just empty
+      assert.equal(r.roundOutcomeDataLogged, false); // ...but has no rows in range
     }));
 
   test(`[${name}] checkLoggingAvailability: any event in range -> ok`, async () =>
@@ -321,6 +322,27 @@ for (const { name } of DIALECTS) {
       const r = await checkLoggingAvailability(db, NOW - DAY, NOW);
       assert.equal(r.ok, true);
       assert.equal(r.reason, null);
+    }));
+
+  test(`[${name}] checkLoggingAvailability: round rows in range -> roundOutcomeDataLogged true`, async () =>
+    withDialect(name, async (db, { roundReportModel }) => {
+      await roundReportModel.create({ matchId: 'm1', ts: NOW - DAY / 2, winningTeamID: 1 });
+      const r = await checkLoggingAvailability(db, NOW - DAY, NOW);
+      assert.equal(r.hasRoundOutcomeData, true);
+      assert.equal(r.roundOutcomeDataLogged, true);
+    }));
+
+  test(`[${name}] checkLoggingAvailability: S3 events on, TeamBalancer's own DB logging off -> flags the gap`, async () =>
+    withDialect(name, async (db, { eventsModel }) => {
+      // Regression for 2026-08-28: S³'s own enableDatabaseLogging being on
+      // (events flowing) says nothing about TeamBalancer's own toggle — the
+      // two are independent, so TB_RoundReport can still be empty even
+      // though checkLoggingAvailability().ok is true.
+      await eventsModel.create({ ts: NOW - DAY / 2, eventType: 'TEAM_CHANGE', eosID: 'p1', name: 'One', source: 'Player-Self' });
+      const r = await checkLoggingAvailability(db, NOW - DAY, NOW);
+      assert.equal(r.ok, true);
+      assert.equal(r.hasRoundOutcomeData, true);
+      assert.equal(r.roundOutcomeDataLogged, false);
     }));
 
   test(`[${name}] resolvePlayers: exact eosID match is tier 0`, async () =>

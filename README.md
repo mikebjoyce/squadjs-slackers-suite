@@ -38,7 +38,6 @@ S³ **must** be mounted before any consumer plugin. In your SquadJS `config.json
       "enableSmartAssign": true,
       "enableEventLogging": false,
       "logPath": "./smart-assign-log.jsonl",
-      "enableDatabaseLogging": false,
       "handshakeWithSwitch": true,
       "handshakeScoreThreshold": 0.5,
       "handshakeMode": "queueDrain"
@@ -201,6 +200,24 @@ squad-server/
    - [Switch](switch/README.md#configuration-options) — [Behaviour Reference](switch/SWITCH_BEHAVIOUR.md)
    - [EloTracker](elo-tracker/README.md#configuration-options)
    - [TeamBalancer](team-balancer/README.md#configuration-options)
+
+### Logging
+
+S³, SmartAssign, TeamBalancer, and EloTracker each ship an `enableDatabaseLogging`
+option, and it's **on by default** on all of them. S³ writes its shared event/snapshot
+tables (`S3_PlayerEvents`, `S3_GameStateEvents`, `S3_PlayerSnapshots`); each consumer
+plugin writes its own history table alongside that (SmartAssign's `SA_AssignmentLog`,
+TeamBalancer's `TB_RoundReport`, EloTracker's round history).
+
+This isn't just bookkeeping — S³'s `!s3 switches` and `!s3 karma` Discord commands read
+directly from S³'s tables, and TeamBalancer's own games-played/round-outcome accounting
+reads from `TB_RoundReport`. Turning either toggle off independently is handled
+gracefully — both commands detect the gap and say so instead of showing a false zero.
+
+If you don't want the DB writes on a given plugin — smaller database, or you only want
+the JSONL/file output — set `enableDatabaseLogging: false` on that plugin's config
+block. JSONL/file logging is a separate set of options per plugin (e.g. SmartAssign's
+`enableEventLogging` + `logPath`, S³'s `enableFileLogging`) and is unaffected either way.
 
 ## For Plugin Developers
 

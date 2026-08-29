@@ -52,7 +52,9 @@ const REPO_ROOT = path.resolve(HERE, '..', '..');
 const SUITES = [
   { file: 'test-smart-assign-plugin.js', desc: 'plugin lifecycle, S³ gate, refresh interest' },
   { file: 'test-sa-team-evaluator.js', desc: 'assignment scoring and verdicts' },
-  { file: 'test-handshake-integration.js', desc: 'join handshake integration' }
+  { file: 'test-handshake-integration.js', desc: 'join handshake integration' },
+  { file: 'test-sa-assignment-log-indexes.js', desc: 'SA_AssignmentLog indexes actually get created' },
+  { file: 'test-readme-accuracy.js', desc: 'README option tables match optionsSpecification' }
 ];
 
 const results = [];

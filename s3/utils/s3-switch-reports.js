@@ -226,17 +226,29 @@ export function parseRange(argString) {
 
 /**
  * Distinguishes "nobody switched" from "logging wasn't on for this window" —
- * S3_PlayerEvents sits entirely behind the enableDatabaseLogging config toggle
- * (independent of TB_RoundReport, which TeamBalancer always writes), so an
- * operator who never enabled it would otherwise see a clean-looking zero.
+ * S3_PlayerEvents sits entirely behind S³'s own enableDatabaseLogging config
+ * toggle, so an operator who never enabled it would otherwise see a
+ * clean-looking zero.
  *
- * @returns {Promise<{ok:boolean, reason:?string, hasRoundOutcomeData:boolean}>}
+ * `hasRoundOutcomeData` reflects whether the TB_RoundReport model is
+ * registered at all (i.e. TeamBalancer is installed) — independent of S³'s
+ * toggle, since TeamBalancer's row-level writes to that table are gated by
+ * TeamBalancer's OWN enableDatabaseLogging option. `roundOutcomeDataLogged`
+ * is the row-level check for that toggle, the same way `ok`/`reason` is the
+ * row-level check for S³'s: true only when TB_RoundReport actually has rows
+ * in the requested window. A caller that only checked `hasRoundOutcomeData`
+ * would treat "TeamBalancer installed but its own logging is off" the same
+ * as "TeamBalancer has real data" — games-played and karma numbers derived
+ * from TB_RoundReport would then look like a genuine zero instead of a
+ * flagged gap.
+ *
+ * @returns {Promise<{ok:boolean, reason:?string, hasRoundOutcomeData:boolean, roundOutcomeDataLogged:boolean}>}
  *   reason is null when ok, else one of 'dbUnavailable' | 'noEventsLogged'.
  */
 export async function checkLoggingAvailability(s3db, fromTs, toTs) {
   const eventsModel = s3db?.isReady?.() ? s3db.getModel('S3PlayerEvents') : null;
   if (!eventsModel) {
-    return { ok: false, reason: 'dbUnavailable', hasRoundOutcomeData: false };
+    return { ok: false, reason: 'dbUnavailable', hasRoundOutcomeData: false, roundOutcomeDataLogged: false };
   }
 
   const anyEventCount = await eventsModel.count({
@@ -244,11 +256,16 @@ export async function checkLoggingAvailability(s3db, fromTs, toTs) {
   });
 
   const roundReportModel = s3db.getModel('TB_RoundReport');
+  const hasRoundOutcomeData = !!roundReportModel;
+  const anyRoundCount = hasRoundOutcomeData
+    ? await roundReportModel.count({ where: { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } } })
+    : 0;
 
   return {
     ok: anyEventCount > 0,
     reason: anyEventCount > 0 ? null : 'noEventsLogged',
-    hasRoundOutcomeData: !!roundReportModel
+    hasRoundOutcomeData,
+    roundOutcomeDataLogged: hasRoundOutcomeData && anyRoundCount > 0
   };
 }
 

@@ -51,6 +51,7 @@ const FAST = process.argv.includes('--fast');
 
 const SUITES = [
   { file: 'test-team-balancer-plugin.js', desc: 'plugin lifecycle + layer mirror' },
+  { file: 'test-readme-accuracy.js', desc: 'README option table matches optionsSpecification' },
   { file: 'plugin-logic-test-runner.js', desc: 'streak tracking, scramble triggers, mode detection' },
   { file: 'test-tb-elo-scramble.js', desc: 'ELO-weighted scramble, squad atomicity' },
   { file: 'test-elo-diff-scramble.js', desc: 'Elo-diff micro scramble trigger, budget search, scrambleType plumbing' },

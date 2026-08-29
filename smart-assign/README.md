@@ -158,7 +158,7 @@ The Switch Handshake feature allows SmartAssign to optionally include Switch-que
 | `enableSmartAssign` | no | boolean | `true` | If true, runs the assignment algorithm and moves players. If false, only logs real server events (passive mode). |
 | `enableEventLogging` | no | boolean | `false` | Toggle the JSONL lifecycle event logging output entirely |
 | `logPath` | no | string | `"./smart-assign-log.jsonl"` | File path for JSONL player lifecycle events |
-| `enableDatabaseLogging` | no | boolean | `false` | If true, mirrors JSONL event data into database tables for querying |
+| `enableDatabaseLogging` | no | boolean | `true` | If true, mirrors JSONL event data into database tables for querying |
 
 ---
 

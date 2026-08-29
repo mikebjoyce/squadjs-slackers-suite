@@ -1378,7 +1378,7 @@ The `qi` (QueryInterface) object passed to each migration function provides thes
 | `addColumn(table, col, def)` | `(string, string, string\|object) => Promise` | Add column |
 | `removeColumn(table, col)` | `(string, string) => Promise` | Remove column |
 | `changeColumn(table, col, def)` | `(string, string, object) => Promise` | Modify column |
-| `addIndex(table, cols, opts?)` | `(string, string[], object?) => Promise` | Create index |
+| `addIndex(table, cols, opts?)` | `(string, string[], object?) => Promise` | Create index — **ALTER-based**; rejected under a CREATE-but-not-ALTER grant, even on a table created in the same migration. See §11.5. |
 | `removeIndex(table, name, opts?)` | `(string, string, object?) => Promise` | Drop index |
 | `createTable(name, attrs, opts?)` | `(string, object, object?) => Promise` | Create table |
 | `dropTable(name, opts?)` | `(string, object?) => Promise` | Drop table |
@@ -1760,12 +1760,13 @@ node s3/testing/test-game-state-service.js
 | `test-dialect-portability.js` | Raw SQL against **real** SQLite/MySQL/Postgres engines — see 11.4 |
 | `test-migration-bulk-types.js` | `qi.bulkInsert`/`bulkUpdate` value typing and NULL backfills, real engines — see 11.4 |
 | `test-stderr-diagnostics.js` | Migration failures and drift reach fd 2, not stdout — see 9.9 |
-| `test-migration-permissions.js` | Migration DDL at three permission tiers, per dialect (Docker-gated) |
+| `test-migration-permissions.js` | Migration DDL at four permission tiers, per dialect (Docker-gated) — see 11.4 |
 | `test-export-model-registration.js` | Real services register every model; each declares an `exportTier` matching the fixture; a third-party model reaches the default export without editing S³ — see 11.5 |
 | `test-resolving-cleared-logging.js` | `RESOLVING_CLEARED` rows and `S3_GameStateEvents` shape, on **SQLite and MySQL** |
 | `test-install-layout.js` | `install.cjs` output layout: flattening, per-plugin runners, no collisions |
 | `test-migration-pipeline.js` | End-to-end migration run: ordering, backup, version bump |
 | `test-migration-conformance.js` | Migration definitions match the expected shape/contract |
+| `test-migration-partial-retry.js` | A migration whose `up()` commits real DDL/DML but fails post-commit `touches` verification is safely retryable — `addColumn`/`bulkInsert` don't crash on a raw duplicate-column/duplicate-key error, real engines |
 | `test-migration-data-assertions.js` | Migrations' data effects are asserted, not assumed — see `TASK_MIGRATION_DATA_ASSERTIONS.md` |
 | `test-command-routing.js` | `!s3` subcommand dispatch and argument parsing |
 | `test-inspection-embeds.js` | Inspection/embed builders render without throwing on sparse data |
@@ -1774,6 +1775,7 @@ node s3/testing/test-game-state-service.js
 | `test-request-team-change-eosid.js` | `_requestTeamChange()` sends RCON `switchTeam(eosID)` — a single unambiguous arg, never playerName or a second targetTeamID arg |
 | `test-developer-guide-accuracy.js` | This guide's command table, option defaults and test catalog still match the source — see 11.8 |
 | `test-s3-switch-reports.js` | `!s3 switches`/`!s3 karma`/`!s3 switches export` query layer: range/period parsing, player resolution, source bucketing, games-played, karma, and periodic aggregation, on **SQLite and MySQL** |
+| `test-s3-commands-embeds.js` | `buildSwitchesEmbed`/`buildKarmaEmbed` Discord formatting layer: the TeamBalancer-own-logging-off gap warning (hard-block in karma, soft note in switches), on **SQLite** |
 
 The harness's own suite lives outside `s3/`: `dev-harness/testing/test-dev-rcon-harness.js`
 (16 tests, fully mocked). See 11.7.
@@ -1848,6 +1850,23 @@ Two conventions worth copying from that file:
 
 > `sqlite3` will not install in the stock `node:*-slim` images (the prebuilt binding needs a newer glibc than they ship). Run the tests on the host, or build `sqlite3` from source in the container.
 
+#### Permission-tier testing: a real engine still isn't enough
+
+Running a real engine proves the SQL is valid. It does not prove the suite's chosen DB user can actually execute it — and `CREATE TABLE`/`ALTER TABLE`/`DROP` are gated by *different* MySQL privileges, so `CREATE`-but-not-`ALTER` is a normal least-privilege grant a DBA or shared host can hand an application, not a hypothetical. Code proven only under a fully-privileged (root/admin) connection is unproven for every operator running the tighter profile.
+
+`test-migration-permissions.js` is the canonical home for this and owns four grant tiers, created idempotently on first use:
+
+| Tier | Grant | Dialects | Expected outcome |
+|---|---|---|---|
+| `admin` | Full/root | SQLite, MySQL, Postgres | Everything succeeds |
+| `readonly` | `SELECT` only | SQLite (Unix only — Windows can't express file-level read-only to SQLite), MySQL, Postgres | `CREATE TABLE` rejected |
+| `no-ddl` | `SELECT/INSERT/UPDATE/DELETE` | MySQL, Postgres | `CREATE TABLE` rejected |
+| `create-only` | `SELECT/INSERT/UPDATE/DELETE/CREATE/INDEX`, no `ALTER`/`DROP` | **MySQL only** | `CREATE TABLE` resolves; a bare `CREATE INDEX` resolves; `qi.addIndex()` (ALTER-based) is rejected |
+
+`create-only` is the tier that matters most: `admin` has everything, `no-ddl` has no `CREATE` at all, and `readonly` has neither — none of the other three reproduces a restricted, CREATE-but-not-ALTER grant, which is a normal MySQL deployment shape. There is no Postgres `create-only` tier — confirmed empirically that a Postgres role granted only `CREATE` on a schema can still freely `ALTER`/`CREATE INDEX` on a table it just created, because ownership grants full DDL on owned objects independent of schema-level grants. That asymmetry is a property of MySQL's global per-user privilege model, not a general SQL one.
+
+The practical fallout of the `create-only` tier is the §11.5 `Model.sync()`/`qi.addIndex()` trap below — a migration or model-sync path that only ever ran against `admin` or SQLite will pass every existing test and still fail to mount, every restart, on a server whose DB user is provisioned this way.
+
 ### 11.5 — Model Definition Traps
 
 These are failure modes with no symptom at runtime — the code logs success and the data quietly goes missing.
@@ -1856,6 +1875,7 @@ These are failure modes with no symptom at runtime — the code logs success and
 - **`defineModel()` injects `freezeTableName: true`.** The **model** name becomes the table name unless you pass an explicit `tableName`. Model `S3GameStateEvents` reaching table `S3_GameStateEvents` only works because `tableName` says so.
 - **Declare `exportTier` on every model you define.** Classification lives at the definition site, not in `s3-export-import.js` — see 10.2. A model that declares nothing is exported at the default tier and warns by name at mount; an invalid tier throws immediately. The tier sets that remain in `s3-export-import.js` are the *expected classification fixture*, not the allowlist: `s3/testing/test-export-model-registration.js` asserts each model's declared tier equals its entry there, so adding a model means editing both, which is intended. Those sets hold **model names**, not table names — a table name written there matches nothing.
 - **`Model.sync()` emits no DDL for an existing table without `alter`.** A newly added column then exists in the model and nowhere in the database. On a live server with no DDL grants the operator applies schema by hand, so a migration's *data* step must not be nested inside an `addColumn` guard — otherwise the data step is skipped on exactly the servers where the column already exists.
+- **`Model.sync()` and `qi.addIndex()` both index a table via `ALTER TABLE ... ADD INDEX` — even a table they just created.** A MySQL grant with `CREATE`/`INDEX` but no `ALTER` (the `create-only` tier — see 11.4) accepts the `CREATE TABLE` and then throws on the first index, aborting model initialization before later tables are even attempted. This is not the same trap as the bullet above: that one is about existing tables missing a *column*; this one breaks on the very first mount of a brand-new table. Confirmed empirically 2026-08-28 against LoggingService (`s3/utils/logging-service.js`): create tables with `qi.createTable()`, then create each index with a bare `CREATE INDEX ... ON ...` statement (never `ALTER TABLE`/`addIndex()`) — `_ensureIndexes()` in that file is the reference pattern. Regression cover: `s3/testing/test-migration-permissions.js`'s `create-only` tier.
 - **There is no CLS transaction context.** `withTransactionWithRetry(async (t) => …)` does not propagate `t` implicitly; every model call inside must receive `{ transaction: t }`. Miss one and SQLite's single-connection pool throws "cannot start a transaction within a transaction", usually into a catch that logs and continues.
 
 ### 11.6 — Pre-Push Checklist for Database Changes
@@ -1975,7 +1995,7 @@ S³ must appear **before** consumer plugins:
 | `clanTagIgnoreList` | array | `[]` | Tags excluded from grouping |
 | `clanRecruitSuffixes` | array | `["r", "-r"]` | Suffixes to strip from clan tags when the base tag (without suffix) exists on other players. Enabled by default for common recruit tags (case-insensitive, so "R" and "-R" are also matched). Set to `[]` to disable. Stripping only occurs when the base tag is present on at least one other player in the data set. |
 | `clanGroupingPullEntireSquads` | boolean | `true` | Pull full squads when preserving clan groups |
-| `enableDatabaseLogging` | boolean | `false` | Enable `S3_PlayerEvents`/`S3_GameStateEvents`/`S3_PlayerSnapshots` tables. `false` → LoggingService runs no-op. |
+| `enableDatabaseLogging` | boolean | `true` | Enable `S3_PlayerEvents`/`S3_GameStateEvents`/`S3_PlayerSnapshots` tables. `false` → LoggingService runs no-op. |
 | `enableFileLogging` | boolean | `false` | Mirror each DB log write as a JSONL line at `logPath` |
 | `logPath` | string | `'./s3-log.jsonl'` | JSONL mirror path, used only when `enableFileLogging` is true |
 | `autoMigrate` | boolean | `false` | Auto-apply migrations without Discord confirmation |

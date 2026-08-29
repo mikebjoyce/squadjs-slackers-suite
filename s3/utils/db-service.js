@@ -956,6 +956,58 @@ export default class DBService {
     return model;
   }
 
+  /**
+   * Create declared indexes on an already-existing table, one at a time, via
+   * a bare `CREATE INDEX` — never `ALTER TABLE` / Sequelize's `addIndex()`,
+   * which emit `ALTER TABLE ... ADD INDEX` on MySQL/Postgres and require the
+   * ALTER grant a CREATE-only live user doesn't have. Each index is skipped
+   * if it already exists (via `showIndex()`), so this is safe to call on
+   * every mount as a self-healing step — see LoggingService._initModels()
+   * for the pattern this generalises.
+   *
+   * Deliberately untransacted: intended to be called after the caller's own
+   * table-creation step (migration or otherwise) has already committed, not
+   * from inside one. `defineModel()`'s `indexes` option is Sequelize
+   * metadata only — sync() would read it, but nothing here calls sync() —
+   * so index creation always has to be driven explicitly, via this method.
+   *
+   * None of these indexes are expected to be UNIQUE; a missing one is a
+   * query-performance concern, not a correctness one, so a failure is
+   * logged (verboseLogger + stderrWarn) and non-fatal — it never blocks the
+   * table itself from being written to or read.
+   *
+   * @param {string} tableName
+   * @param {{name: string, fields: string[]}[]} indexes
+   */
+  async ensureIndexes(tableName, indexes) {
+    const connector = this.getConnector();
+    const qi = connector.getQueryInterface();
+
+    let existing = new Set();
+    try {
+      const rows = await qi.showIndex(tableName);
+      existing = new Set(rows.map((r) => r.name));
+    } catch (err) {
+      this.verboseLogger(1, `[DB] Could not read existing indexes on ${tableName}: ${err.message}`);
+    }
+
+    const q = (id) => this.quoteIdentifier(id);
+    for (const { name, fields } of indexes) {
+      if (existing.has(name)) continue;
+      try {
+        const cols = fields.map(q).join(', ');
+        await connector.query(`CREATE INDEX ${q(name)} ON ${q(tableName)} (${cols})`);
+      } catch (err) {
+        this.verboseLogger(1, `[DB] Failed to create index ${name} on ${tableName}: ${err.message}`);
+        stderrWarn(
+          'DBService',
+          `Could not create index "${name}" on ${tableName} — queries against it will be unindexed.`,
+          err.message
+        );
+      }
+    }
+  }
+
   /* ────────────────────────────────────── EXPORT TIER REGISTRY ────────────────────────────────────── */
 
   /**

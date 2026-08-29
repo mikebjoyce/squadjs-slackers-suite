@@ -185,12 +185,12 @@
  *   microScrambleParityTarget          - Post-swap mu gap the micro scramble's search stops
  *                                        at once reached (default: 0.05).
  *   microScrambleMaxMovePercent        - Safety ceiling: max fraction of the round's population
- *                                        the micro scramble may move (default: 0.10).
+ *                                        the micro scramble may move (default: 0.20).
  *
  * Dev:
  *   devMode                            - Allow commands from any player regardless of admin status.
  *   reportLogPath                      - Path to the JSONL log file for round reports.
- *   enableDatabaseLogging              - If true, round reports are also written to the database in addition to the JSONL log (default: false).
+ *   enableDatabaseLogging              - If true, round reports are also written to the database in addition to the JSONL log (default: true).
  *   scrambleReportPath                 - Directory for per-scramble JSON reports (default: "TeamBalancerScrambleReports/").
  *
  * IMPORTANT: The "database" option specifies which Sequelize connector to use for persistence.
@@ -239,10 +239,10 @@
  *   "enableEloDiffScramble": false,
  *   "eloDiffScrambleThreshold": 1.2,
  *   "microScrambleParityTarget": 0.05,
- *   "microScrambleMaxMovePercent": 0.10,
+ *   "microScrambleMaxMovePercent": 0.20,
  *   "devMode": false,
  *   "reportLogPath": "team-balancer-reports.jsonl",
- *   "enableDatabaseLogging": false
+ *   "enableDatabaseLogging": true
  * }
  *
  * ─── AUTHOR ──────────────────────────────────────────────────────
@@ -427,7 +427,7 @@ export default class TeamBalancer extends S3PluginBase {
        },
        enableDatabaseLogging: {
          required: false,
-         default: false,
+         default: true,
          type: 'boolean',
          description: 'If true, round reports are also written to the database in addition to the JSONL log.'
        },

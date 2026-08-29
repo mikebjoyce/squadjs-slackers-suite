@@ -257,7 +257,7 @@ export default class SlackersSquadServices extends BasePlugin {
         required: false,
         type: 'boolean',
         description: 'Enable shared S³ logging tables (S3_PlayerEvents, S3_GameStateEvents, S3_PlayerSnapshots). When false, LoggingService runs in no-op mode.',
-        default: false
+        default: true
       },
       enableFileLogging: {
         required: false,

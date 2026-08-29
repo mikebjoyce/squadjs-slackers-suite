@@ -127,9 +127,9 @@
  * DB connector: Inherited from S³ DBService (no standalone database option).
  * logPath: Path for JSONL event logging (default: './smart-assign-log.jsonl').
  * enableSmartAssign: Toggle auto-assignment logic (default: true).
- * enableEventLogging: Toggle JSONL event logging (default: true).
+ * enableEventLogging: Toggle JSONL event logging (default: false).
  * enableDatabaseLogging: If true, mirrors JSONL event data into database tables
- *   for querying (default: false).
+ *   for querying (default: true).
  * handshakeWithSwitch: Enable SA-Switch handshake for queued swaps (default: true).
  * handshakeScoreThreshold: Scoring threshold for eloGated handshake (default: 0.5).
  * handshakeMode: Handshake mode — "eloGated" or "queueDrain" (default: 'queueDrain').
@@ -182,8 +182,8 @@ export default class SmartAssign extends S3PluginBase {
       },
       enableDatabaseLogging: {
         required: false,
-        description: 'If true, mirrors JSONL event data into database tables for querying (default: false).',
-        default: false,
+        description: 'If true, mirrors JSONL event data into database tables for querying (default: true).',
+        default: true,
         type: 'boolean'
       },
       handshakeWithSwitch: {
@@ -221,7 +221,7 @@ export default class SmartAssign extends S3PluginBase {
     const dbDelegate = {
       logAssignmentEvent: (event) => this._saLogAssignmentEvent(event)
     };
-    this.eventLogger = new SAEventLogger(options, dbDelegate);
+    this.eventLogger = new SAEventLogger(this.options, dbDelegate);
 
      this._joiningPlayers = new Set();
      this._sessionJoinTimes = new Map();
@@ -332,6 +332,15 @@ export default class SmartAssign extends S3PluginBase {
     // ═══════════════════════════════════════════════════════════════
     // Define SA model on S³ connector + inject s3db into SADatabase
     // ═══════════════════════════════════════════════════════════════
+    // DDL only, reused below by ensureIndexes() after the migration creates the
+    // table — defineModel()'s own `indexes` option is Sequelize metadata that
+    // only sync() would act on, and nothing here calls sync().
+    const saAssignmentLogIndexes = [
+      { name: 'idx_sa_al_matchId', fields: ['matchId'] },
+      { name: 'idx_sa_al_eventType', fields: ['eventType'] },
+      { name: 'idx_sa_al_ts', fields: ['ts'] }
+    ];
+
     if (this._s3db?.isReady()) {
       this.defineModel('SA_AssignmentLog', {
         id: { type: this._s3db.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
@@ -357,11 +366,7 @@ export default class SmartAssign extends S3PluginBase {
         tableName: 'SA_AssignmentLog',
         timestamps: false,
         exportTier: 'historical',
-        indexes: [
-          { name: 'idx_sa_al_matchId', fields: ['matchId'] },
-          { name: 'idx_sa_al_eventType', fields: ['eventType'] },
-          { name: 'idx_sa_al_ts', fields: ['ts'] }
-        ]
+        indexes: saAssignmentLogIndexes
       });
 
       Logger.verbose('SmartAssign', 2, 'SA_AssignmentLog model defined on S³ connector.');
@@ -433,6 +438,14 @@ export default class SmartAssign extends S3PluginBase {
           }
         ]);
         await this.verifyAndRunMigrations('smart-assign');
+
+        // Self-healing: the migration's up() only creates the table, not its
+        // indexes (a plain CREATE INDEX is safe under a CREATE-only grant; the
+        // migration engine's own addIndex() would emit ALTER TABLE, which
+        // isn't). Runs on every mount, after the migration transaction has
+        // committed, so an already-deployed DB gets its indexes without a
+        // version bump. See DBService.ensureIndexes() for the mechanism.
+        await this._s3db.ensureIndexes('SA_AssignmentLog', saAssignmentLogIndexes);
       } else {
         Logger.verbose('SmartAssign', 1, 'S³ DB or migrationEngine not available — skipping migration registration.');
       }

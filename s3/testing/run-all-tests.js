@@ -71,6 +71,11 @@ const CATEGORY_TESTS = {
     // Replays every plugin's real migrations across DB states, so it is slower
     // than the rest.
     'test-migration-conformance.js',
+    // A migration whose up() commits real DDL/DML but fails post-commit
+    // touches verification must be safely retryable, not crash forever on a
+    // raw duplicate-column/duplicate-key driver error. SQLite always runs,
+    // MySQL self-skips when unreachable, same shape as the dialect suites above.
+    'test-migration-partial-retry.js',
     // Runs the real install.cjs into throwaway directories and asserts the
     // target layout — including that dev-harness/ can never be deployed.
     'test-install-layout.js',
@@ -87,7 +92,10 @@ const CATEGORY_TESTS = {
     // !s3 switches / !s3 karma query layer. Pure-JS section always runs;
     // DB-integration section is SQLite-always, MySQL self-skips like the
     // other dialect-portability tests above.
-    'test-s3-switch-reports.js'
+    'test-s3-switch-reports.js',
+    // The Discord-facing embed builders on top of the above — SQLite only,
+    // since the logic they format is already dual-dialect-proven there.
+    'test-s3-commands-embeds.js'
   ],
   2: [
     'test-join-pipeline.js',

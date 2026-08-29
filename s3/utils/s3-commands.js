@@ -1241,6 +1241,19 @@ function formatIgnoredModesNote(ignoredGameModes) {
   return modes.length ? `*Excludes ${modes.join('/')} rounds.*` : '';
 }
 
+// Games-played counts come from TB_RoundReport (see getGamesPlayedMap in
+// s3-switch-reports.js), which is gated by TeamBalancer's OWN
+// enableDatabaseLogging — independently of S³'s. checkLoggingAvailability()
+// already blocks the whole command when S³'s own logging is off; this covers
+// the narrower case where S³'s is fine but TeamBalancer's isn't, so a
+// silent "0 games" doesn't get mistaken for real data.
+function formatRoundDataNote(availability) {
+  if (availability.hasRoundOutcomeData && !availability.roundOutcomeDataLogged) {
+    return '⚠️ *No TeamBalancer round data logged in this range — games-played counts below may read 0 even for active players. Check TeamBalancer\'s `enableDatabaseLogging`.*';
+  }
+  return '';
+}
+
 // Generic to any embed's 4096-char description limit — distinct from
 // pushLineField()'s 1024-char per-field chunking used elsewhere in this file.
 function chunkLines(lines, maxLen) {
@@ -1375,7 +1388,7 @@ export async function buildSwitchesEmbed(plugin, identifier, rangeArg) {
     // legacy)" parenthetical needs a one-line explanation of what "legacy"
     // means — spelled out once here rather than repeated per line.
     const legend = 'Full = Full Scramble (legacy = pre-split Balancer moves, before Full/Micro were tracked separately — still full scrambles) · Micro = Elo-Diff Scramble · Self = player-initiated switch (self-serve, queued, handshake, or double-swap) · Other = SmartAssign, admin-forced, or untracked in-game switches';
-    const header = [formatReportRange(range), formatIgnoredModesNote(ignoredGameModes), legend]
+    const header = [formatReportRange(range), formatIgnoredModesNote(ignoredGameModes), formatRoundDataNote(availability), legend]
       .filter(Boolean).join('\n');
 
     // Fits one embed in the overwhelming majority of cases — a description's
@@ -1421,7 +1434,7 @@ export async function buildSwitchesEmbed(plugin, identifier, rangeArg) {
   return [{
     color: 0x3498db,
     title: `🔀 Team Switches — ${escapeMarkdown(detail.name ?? best.name ?? best.eosID)}`,
-    description: [formatReportRange(range), formatIgnoredModesNote(ignoredGameModes)].filter(Boolean).join('\n'),
+    description: [formatReportRange(range), formatIgnoredModesNote(ignoredGameModes), formatRoundDataNote(availability)].filter(Boolean).join('\n'),
     fields: [
       { name: 'Summary', value: `Total Switches: **${detail.total}** | Games Played: **${games}**`, inline: false },
       { name: '⚖️ Balancer / Scrambles', value: scrambleLines.length ? scrambleLines.join('\n') : '*(none)*', inline: false },
@@ -1463,6 +1476,17 @@ export async function buildKarmaEmbed(plugin, identifier, rangeArg) {
       color: 0xf39c12,
       title: '🟠 Round Outcome Data Unavailable',
       description: 'The `TB_RoundReport` table does not exist — TeamBalancer must be installed and mounted to compute karma (round winners are its data).',
+      timestamp: new Date().toISOString()
+    };
+  }
+  if (!availability.roundOutcomeDataLogged) {
+    return {
+      color: 0xf39c12,
+      title: '🟠 No Round Outcome Data Logged In This Range',
+      description: [
+        'No `TB_RoundReport` rows exist anywhere in the requested date range, even though TeamBalancer is installed.',
+        'This almost always means TeamBalancer\'s own `enableDatabaseLogging` was off for the whole window, not that no rounds were played — check the TeamBalancer config before trusting karma numbers from this range.'
+      ].join('\n'),
       timestamp: new Date().toISOString()
     };
   }

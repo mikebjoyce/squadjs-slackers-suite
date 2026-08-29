@@ -33,9 +33,14 @@
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
- * - enableEventLogging toggles JSONL output (default: true).
- * - enableDatabaseLogging toggles DB writes; passed through to
- *   SADatabase so writes are only gated once.
+ * - enableEventLogging / enableDatabaseLogging toggle JSONL / DB writes.
+ *   Their defaults live in smart-assign.js's optionsSpecification, not here
+ *   — the caller must pass `this.options` (post-default), never the plugin
+ *   constructor's raw `options` argument, or an operator who omits both keys
+ *   silently gets this file's own fallback instead of the documented default.
+ *   Confirmed empirically 2026-08-28: passing raw options left JSONL logging
+ *   on and DB logging off for anyone not setting both keys explicitly — the
+ *   opposite of what the README documented.
  * - The logPath file accumulates per-event JSONL lines over time.
  *   Each line is a self-contained object with round context.
  * - Assignment events (MOVE_SUCCESS, MOVE_FAILED, MOVE_RETRY) are

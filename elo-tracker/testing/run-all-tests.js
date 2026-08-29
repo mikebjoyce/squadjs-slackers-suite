@@ -15,8 +15,12 @@
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
- * - No live SquadJS server is required. test-elo-database.js runs against
- *   real SQLite; the MySQL cases inside it self-skip when unreachable.
+ * - No live SquadJS server is required. test-elo-database.js runs its full
+ *   battery against real SQLite (always) and real MySQL (opportunistically,
+ *   127.0.0.1:3307 — see s3/S3_DEVELOPER_GUIDE.md §11.4). This runner passes
+ *   suites a `runSkip` helper alongside `runTest` so MySQL cases can report
+ *   as skipped, not passed, when the container is down — see the Skipped
+ *   line in the summary below, and never call a run "green" without reading it.
  *
  * ─── A SUITE THAT FAILS TO LOAD IS A FAILURE ─────────────────────
  *
@@ -67,6 +71,17 @@ export async function runTest(name, fn) {
 }
 
 /**
+ * Companion to runTest for a case that cannot run at all (e.g. an engine
+ * that isn't reachable) rather than one that ran and failed. Must never be
+ * folded into the passed count — a suite that does that reports a green
+ * run having never actually exercised the unreachable engine.
+ */
+export async function runSkip(name, reason) {
+  console.log(`  ⊘ ${name}... ${COLORS.YELLOW}[SKIP]${COLORS.RESET} (${reason})`);
+  return { skipped: true, reason };
+}
+
+/**
  * Main runner that executes all defined test suites.
  */
 export async function runAll() {
@@ -85,6 +100,7 @@ export async function runAll() {
   const results = {};
   let totalPassed = 0;
   let totalFailed = 0;
+  let totalSkipped = 0;
   const brokenSuites = [];
 
   for (const suite of suites) {
@@ -109,13 +125,20 @@ export async function runAll() {
         return result.passed;
       };
 
+      const capturingRunSkip = async (name, reason) => {
+        await runSkip(name, reason);
+        suiteRunData.tests.push({ name, passed: null, skipped: true, error: null, reason });
+        totalSkipped++;
+        return true;
+      };
+
       try {
         const modulePath = new URL(suite.file, import.meta.url).href;
         const module = await import(modulePath);
 
-        // Expecting default export to be a function accepting runTest
+        // Expecting default export to be a function accepting (runTest, runSkip)
         if (module.default && typeof module.default === 'function') {
-          await module.default(capturingRunTest);
+          await module.default(capturingRunTest, capturingRunSkip);
         } else {
           throw new Error(`no default export function in ${suite.file}`);
         }
@@ -136,8 +159,9 @@ export async function runAll() {
   }
 
   console.log(`${COLORS.CYAN}=== EloTracker Summary ===${COLORS.RESET}`);
-  console.log(`  Passed: ${totalPassed}`);
-  console.log(`  Failed: ${totalFailed}`);
+  console.log(`  Passed:  ${totalPassed}`);
+  console.log(`  Failed:  ${totalFailed}`);
+  console.log(`  Skipped: ${totalSkipped}`);
   if (brokenSuites.length > 0) {
     console.log(`${COLORS.RED}  Suites that failed to load: ${brokenSuites.join(', ')}${COLORS.RESET}`);
   }
@@ -157,7 +181,7 @@ export async function runAll() {
   }
 
   if (totalFailed > 0) process.exitCode = 1;
-  return { passed: totalPassed, failed: totalFailed };
+  return { passed: totalPassed, failed: totalFailed, skipped: totalSkipped };
 }
 
 // Execute if run directly

@@ -69,6 +69,7 @@
  */
 
 import { promises as fsPromises } from 'fs';
+import { stderrWarn } from './s3-stderr.js';
 
 const MID_ROUND_SNAPSHOT_DELAY_MS = 25 * 60 * 1000; // 25 minutes
 
@@ -414,103 +415,157 @@ export default class LoggingService {
     // The explicit `tableName` on each is load-bearing: defineModel() injects
     // freezeTableName: true, which makes the MODEL name the table name unless
     // tableName overrides it. Drop it and Sequelize targets 'S3PlayerEvents'
-    // instead of 'S3_PlayerEvents' — a brand new table. On the live MySQL server
-    // the DB user has no DDL grants, so that failure surfaces at runtime on a
-    // path that logs and continues, not at review time.
+    // instead of 'S3_PlayerEvents' — a brand new table.
+    //
+    // Tables are created via queryInterface.createTable() + a manual CREATE
+    // INDEX per declared index below — NOT Model.sync(). sync() issues CREATE
+    // TABLE and then, for every declared index, a SEPARATE
+    // `ALTER TABLE ... ADD INDEX`, even on a table it just created. A MySQL
+    // grant with CREATE but not ALTER — a real, deliberately hardened live
+    // profile, see the live-mysql-db-user-lacks-ddl-grants memory — accepts
+    // the CREATE TABLE and then throws on the first index, aborting
+    // _initModels() before the other two tables are even attempted. Confirmed
+    // empirically against that exact grant: Model.sync() fails on every
+    // mount; createTable() + a bare CREATE INDEX (never ALTER TABLE)
+    // succeeds. createTable()'s own `indexes` option is silently a no-op on
+    // MySQL — also confirmed empirically, not documented — so indexes are
+    // created explicitly by _ensureIndexes() instead of being passed there.
+
+    const playerEventsSchema = {
+      id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+      matchId: { type: DataTypes.STRING, allowNull: true },
+      roundStartTime: { type: DataTypes.BIGINT, allowNull: true },
+      ts: { type: DataTypes.BIGINT, allowNull: false },
+      eventType: { type: DataTypes.STRING, allowNull: false },
+      eosID: { type: DataTypes.STRING, allowNull: true },
+      steamID: { type: DataTypes.STRING, allowNull: true },
+      name: { type: DataTypes.STRING, allowNull: true },
+      teamID: { type: DataTypes.INTEGER, allowNull: true },
+      squadID: { type: DataTypes.INTEGER, allowNull: true },
+      oldTeamID: { type: DataTypes.INTEGER, allowNull: true },
+      newTeamID: { type: DataTypes.INTEGER, allowNull: true },
+      source: { type: DataTypes.STRING, allowNull: true },
+      betweenRounds: { type: DataTypes.INTEGER, allowNull: true, defaultValue: 0 },
+      t1: { type: DataTypes.INTEGER, allowNull: true },
+      t2: { type: DataTypes.INTEGER, allowNull: true }
+    };
+    const playerEventsIndexes = [
+      { name: 'idx_s3_pe_matchId', fields: ['matchId'] },
+      { name: 'idx_s3_pe_eosID', fields: ['eosID'] },
+      { name: 'idx_s3_pe_eventType_matchId', fields: ['eventType', 'matchId'] },
+      { name: 'idx_s3_pe_ts', fields: ['ts'] }
+    ];
 
     // ── S3_PlayerEvents ──────────────────────────────────────────
     this.PlayerEventsModel = this.dbService.defineModel(
       'S3PlayerEvents',
-      {
-        id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-        matchId: { type: DataTypes.STRING, allowNull: true },
-        roundStartTime: { type: DataTypes.BIGINT, allowNull: true },
-        ts: { type: DataTypes.BIGINT, allowNull: false },
-        eventType: { type: DataTypes.STRING, allowNull: false },
-        eosID: { type: DataTypes.STRING, allowNull: true },
-        steamID: { type: DataTypes.STRING, allowNull: true },
-        name: { type: DataTypes.STRING, allowNull: true },
-        teamID: { type: DataTypes.INTEGER, allowNull: true },
-        squadID: { type: DataTypes.INTEGER, allowNull: true },
-        oldTeamID: { type: DataTypes.INTEGER, allowNull: true },
-        newTeamID: { type: DataTypes.INTEGER, allowNull: true },
-        source: { type: DataTypes.STRING, allowNull: true },
-        betweenRounds: { type: DataTypes.INTEGER, allowNull: true, defaultValue: 0 },
-        t1: { type: DataTypes.INTEGER, allowNull: true },
-        t2: { type: DataTypes.INTEGER, allowNull: true }
-      },
-      {
-        tableName: 'S3_PlayerEvents',
-        timestamps: false,
-        exportTier: 'logging',
-        indexes: [
-          { name: 'idx_s3_pe_matchId', fields: ['matchId'] },
-          { name: 'idx_s3_pe_eosID', fields: ['eosID'] },
-          { name: 'idx_s3_pe_eventType_matchId', fields: ['eventType', 'matchId'] },
-          { name: 'idx_s3_pe_ts', fields: ['ts'] }
-        ]
-      }
+      playerEventsSchema,
+      { tableName: 'S3_PlayerEvents', timestamps: false, exportTier: 'logging', indexes: playerEventsIndexes }
     );
+
+    const gameStateEventsSchema = {
+      id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+      matchId: { type: DataTypes.STRING, allowNull: true },
+      ts: { type: DataTypes.BIGINT, allowNull: false },
+      eventType: { type: DataTypes.STRING, allowNull: false },
+      oldPhase: { type: DataTypes.STRING, allowNull: true },
+      newPhase: { type: DataTypes.STRING, allowNull: true },
+      resolving: { type: DataTypes.INTEGER, allowNull: true, defaultValue: 0 },
+      layerName: { type: DataTypes.STRING, allowNull: true },
+      gamemode: { type: DataTypes.STRING, allowNull: true }
+    };
+    const gameStateEventsIndexes = [
+      { name: 'idx_s3_gse_matchId', fields: ['matchId'] },
+      { name: 'idx_s3_gse_eventType', fields: ['eventType'] },
+      { name: 'idx_s3_gse_ts', fields: ['ts'] }
+    ];
 
     // ── S3_GameStateEvents ───────────────────────────────────────
     this.GameStateEventsModel = this.dbService.defineModel(
       'S3GameStateEvents',
-      {
-        id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-        matchId: { type: DataTypes.STRING, allowNull: true },
-        ts: { type: DataTypes.BIGINT, allowNull: false },
-        eventType: { type: DataTypes.STRING, allowNull: false },
-        oldPhase: { type: DataTypes.STRING, allowNull: true },
-        newPhase: { type: DataTypes.STRING, allowNull: true },
-        resolving: { type: DataTypes.INTEGER, allowNull: true, defaultValue: 0 },
-        layerName: { type: DataTypes.STRING, allowNull: true },
-        gamemode: { type: DataTypes.STRING, allowNull: true }
-      },
-      {
-        tableName: 'S3_GameStateEvents',
-        timestamps: false,
-        exportTier: 'logging',
-        indexes: [
-          { name: 'idx_s3_gse_matchId', fields: ['matchId'] },
-          { name: 'idx_s3_gse_eventType', fields: ['eventType'] },
-          { name: 'idx_s3_gse_ts', fields: ['ts'] }
-        ]
-      }
+      gameStateEventsSchema,
+      { tableName: 'S3_GameStateEvents', timestamps: false, exportTier: 'logging', indexes: gameStateEventsIndexes }
     );
+
+    const playerSnapshotsSchema = {
+      id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+      matchId: { type: DataTypes.STRING, allowNull: false },
+      ts: { type: DataTypes.BIGINT, allowNull: false },
+      trigger: { type: DataTypes.STRING, allowNull: false },
+      playersJson: { type: DataTypes.TEXT, allowNull: false },
+      t1: { type: DataTypes.INTEGER, allowNull: true },
+      t2: { type: DataTypes.INTEGER, allowNull: true }
+    };
+    const playerSnapshotsIndexes = [
+      { name: 'idx_s3_ps_matchId_ts', fields: ['matchId', 'ts'] }
+    ];
 
     // ── S3_PlayerSnapshots ───────────────────────────────────────
     this.PlayerSnapshotsModel = this.dbService.defineModel(
       'S3PlayerSnapshots',
-      {
-        id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-        matchId: { type: DataTypes.STRING, allowNull: false },
-        ts: { type: DataTypes.BIGINT, allowNull: false },
-        trigger: { type: DataTypes.STRING, allowNull: false },
-        playersJson: { type: DataTypes.TEXT, allowNull: false },
-        t1: { type: DataTypes.INTEGER, allowNull: true },
-        t2: { type: DataTypes.INTEGER, allowNull: true }
-      },
-      {
-        tableName: 'S3_PlayerSnapshots',
-        timestamps: false,
-        exportTier: 'logging',
-        indexes: [
-          { name: 'idx_s3_ps_matchId_ts', fields: ['matchId', 'ts'] }
-        ]
-      }
+      playerSnapshotsSchema,
+      { tableName: 'S3_PlayerSnapshots', timestamps: false, exportTier: 'logging', indexes: playerSnapshotsIndexes }
     );
 
-    // Sync all models (create tables if they don't exist)
+    // Create tables (CREATE TABLE IF NOT EXISTS — needs only the CREATE grant).
+    const qi = this.dbService.getConnector().getQueryInterface();
     await this.dbService.executeWithRetry(async () => {
-      await this.PlayerEventsModel.sync();
-      await this.GameStateEventsModel.sync();
-      await this.PlayerSnapshotsModel.sync();
+      await qi.createTable('S3_PlayerEvents', playerEventsSchema);
+      await qi.createTable('S3_GameStateEvents', gameStateEventsSchema);
+      await qi.createTable('S3_PlayerSnapshots', playerSnapshotsSchema);
     });
+
+    await this._ensureIndexes('S3_PlayerEvents', playerEventsIndexes);
+    await this._ensureIndexes('S3_GameStateEvents', gameStateEventsIndexes);
+    await this._ensureIndexes('S3_PlayerSnapshots', playerSnapshotsIndexes);
 
     if (this.enableFileLogging) {
       this.verboseLogger(3, `[Logging] File logging enabled — mirroring to ${this.logPath}`);
     }
     this.verboseLogger(3, '[Logging] Initialised S3_PlayerEvents, S3_GameStateEvents, S3_PlayerSnapshots tables.');
+  }
+
+  /**
+   * Creates one declared index if it doesn't already exist yet, via a bare
+   * CREATE INDEX statement — never ALTER TABLE / Sequelize's addIndex(),
+   * which emit ALTER TABLE ... ADD INDEX on MySQL/Postgres and require the
+   * ALTER grant a CREATE-only live user doesn't have. None of these indexes
+   * are UNIQUE, so a missing one is a query-performance concern, not a
+   * correctness one: failure is logged and non-fatal, and never blocks the
+   * table itself from being written to or read.
+   */
+  async _ensureIndexes(tableName, indexes) {
+    const connector = this.dbService.getConnector();
+    const qi = connector.getQueryInterface();
+
+    let existing = new Set();
+    try {
+      const rows = await qi.showIndex(tableName);
+      existing = new Set(rows.map((r) => r.name));
+    } catch (err) {
+      this.verboseLogger(1, `[Logging] Could not read existing indexes on ${tableName}: ${err.message}`);
+    }
+
+    const q = (id) => this.dbService.quoteIdentifier(id);
+    for (const { name, fields } of indexes) {
+      if (existing.has(name)) continue;
+      try {
+        const cols = fields.map(q).join(', ');
+        await connector.query(`CREATE INDEX ${q(name)} ON ${q(tableName)} (${cols})`);
+      } catch (err) {
+        this.verboseLogger(1, `[Logging] Failed to create index ${name} on ${tableName}: ${err.message}`);
+        // Non-fatal to correctness (see the docblock above), but an operator
+        // running with a grant that lacks even INDEX would otherwise never
+        // learn their queries are unindexed — this runs unconditionally on
+        // every mount, outside the migration engine's confirm/Discord flow,
+        // so stderrWarn is the only operator-visible channel available to it.
+        stderrWarn(
+          'LoggingService',
+          `Could not create index "${name}" on ${tableName} — queries against it will be unindexed.`,
+          err.message
+        );
+      }
+    }
   }
 
   /* ────────────────────────────────────── JSONL MIRROR ────────────────────────────────────── */

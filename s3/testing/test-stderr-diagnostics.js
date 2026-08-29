@@ -36,6 +36,10 @@
  *   7. Flood control: identical events collapse to one block plus a
  *      suppressed count, distinct events never merge, and a closed
  *      window emits its tally.
+ *   8. LoggingService's _ensureIndexes() writes a WARN block naming the
+ *      table and index on a failed CREATE INDEX — the only operator-visible
+ *      channel it has, since it runs on every mount outside the migration
+ *      engine's Discord-facing confirm/report flow.
  *
  * ─── USAGE ───────────────────────────────────────────────────────
  *
@@ -241,6 +245,20 @@ async function runChildCase(caseName) {
     return;
   }
 
+  if (caseName === 'logging-index-failure') {
+    // Regression for 2026-08-28: _ensureIndexes() runs unconditionally on every
+    // mount, outside the migration/Discord pipeline entirely, so stderrWarn is
+    // the only operator-visible channel it has. A nonexistent table reproduces
+    // the same CREATE-INDEX failure a create-but-not-ALTER MySQL grant would.
+    configureStderrDiagnostics({ mode: 'mirror' });
+    const { db } = await fixtureDb();
+    const { default: LoggingService } = await import('../utils/logging-service.js');
+    const logging = new LoggingService({ dbService: db, verboseLogger: () => {} });
+    await logging._ensureIndexes('T_NoSuchTable_Stderr', [{ name: 'idx_bogus_stderr', fields: ['id'] }]);
+    console.log('child-stdout-marker');
+    return;
+  }
+
   // ── Process-level unhandled rejections ─────────────────────────────
   // DBService.mount() installs a process 'unhandledRejection' listener to keep
   // Sequelize pool noise out of the log. Installing ANY such listener replaces
@@ -380,6 +398,17 @@ test('schema drift writes a WARN block naming the missing column', async () => {
   assert.match(stderr, /\[S3\] \[WARN\] \[SchemaDrift\]/, 'no greppable S3 WARN prefix on stderr');
   assert.match(stderr, /lastActiveTimestamp/, 'missing column not named in the stderr block');
   assert.match(stderr, /!s3 migrate force/, 'stderr block does not say how to recover');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3a. LoggingService's unindexed-table warning reaches stderr, outside migrations
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('a failed index creation in LoggingService writes a WARN block naming the table and index', async () => {
+  const { stderr } = capture('logging-index-failure');
+  assert.match(stderr, /\[S3\] \[WARN\] \[LoggingService\]/, 'no greppable S3 WARN prefix on stderr');
+  assert.match(stderr, /idx_bogus_stderr/, 'index name not named in the stderr block');
+  assert.match(stderr, /T_NoSuchTable_Stderr/, 'table name not named in the stderr block');
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

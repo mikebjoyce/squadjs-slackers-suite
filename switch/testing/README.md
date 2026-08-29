@@ -26,10 +26,13 @@ switch/testing/
 ├── test-admin-clear.js        # Admin clear refill semantics (§3.4)
 ├── test-seed-bonus.js         # Stage 2 seed bonus grants (§4.1–4.4)
 ├── test-token-queue-integration.js  # Token spend at queue resolution (§3.3)
-└── test-dialect-literals.js   # Mock/production agreement on SQL literals
+├── test-dialect-literals.js   # Mock/production agreement on SQL literals
+├── test-scramble-lockdown.js  # onScrambleExecuted's real write path (real DB)
+├── test-admin-mutations.js    # Admin wipe/clear/regen write paths (real DB)
+└── test-seed-token-lifecycle.js  # Four historical seed-bonus failures (real DB)
 ```
 
-All tests are **pure-logic unit tests**. No Docker, no live SquadJS server, no RCON, no Discord connection required. They run with plain `node` and use Node's built-in `assert` module.
+Most of these are **pure-logic unit tests**: no Docker, no live SquadJS server, no RCON, no Discord connection required, run with plain `node` and Node's built-in `assert` module. Three files are the exception — `test-scramble-lockdown.js`, `test-admin-mutations.js`, and `test-seed-token-lifecycle.js` build a throwaway flattened assembly (mirroring what `install.cjs` produces) and construct a real `Switch` instance against a real SQLite DB, with `test-admin-mutations.js` and `test-seed-token-lifecycle.js` also running their MySQL cases when the shared Docker test-MySQL container (`s3-test-mysql`, 127.0.0.1:3307) is reachable. Those exist because the mock harness models the database in JavaScript, which cannot reject a write for want of a DROP/ALTER grant and does not implement SQL three-valued logic — see [S3_DEVELOPER_GUIDE.md §11.4](../../s3/S3_DEVELOPER_GUIDE.md#114--testing-raw-sql-mocks-are-not-enough) for why that gap matters and how the skip-vs-pass counters are kept honest. When MySQL is unreachable those cases report as SKIPPED, not passed — read the skip count.
 
 > **The mock cannot model a database.** These tests validate WHERE clauses and
 > field updates against a hand-written mock, which by construction knows nothing
@@ -112,8 +115,11 @@ For seed bonus tests (which test the atomic UPDATE WHERE patterns), the test hel
 | Re-entrancy guard | 1 | Boolean guard prevents concurrent periodic+transition processing |
 | Queue integration | 3 | Solo switch spend, pair trade double spend, regen-while-queued anchor correctness |
 | Dialect-safe literals | 12 | Increment-literal parsing (bare / backtick / double-quote / negative), mock applies a real `DBService` literal per dialect, full seed-grant field set, `caseInsensitiveLikeOp()` selection |
+| Scramble lockdown (real DB) | 11 | `onScrambleExecuted` write path: `lastActiveTimestamp` on new/existing rows, queued-player exemption, EloDiff scrambles write no rows and still clear the queue / arm remediation |
+| Admin mutations (real DB, SQLite+MySQL) | 45 | `adminWipeAll`/`clearall` as real DML including a MySQL user with no DROP grant, admin failures propagating instead of being swallowed by `_withDb()`, seed-token confiscation, NULL-vs-`< cap` three-valued logic, regen write-back |
+| Seed token lifecycle (real DB, SQLite+MySQL) | 24 | The four historical seed-bonus failure modes: no grant at threshold, per-round counter not resetting (vs. the wallet-ceiling case it must not be confused with), duplicate warning spam, and players never draining from the DB after leaving |
 
-**Total: 98 tests. Requires `sequelize` on the module path (for `test-dialect-literals.js`); everything else is Node.js stdlib.**
+**Total: 178 tests** (`node switch/testing/run-all-tests.js`'s own aggregate — rerun it rather than trusting this number as time passes). Requires `sequelize` on the module path (for `test-dialect-literals.js` and the three real-DB suites); the real-DB suites also need `s3-test-mysql` (127.0.0.1:3307) reachable for their MySQL cases, which otherwise report as skipped rather than passed. Everything else is Node.js stdlib.
 
 ## Running Tests
 
@@ -129,13 +135,15 @@ node switch/testing/test-admin-clear.js
 node switch/testing/test-seed-bonus.js
 node switch/testing/test-token-queue-integration.js
 node switch/testing/test-dialect-literals.js
+node switch/testing/test-scramble-lockdown.js
+node switch/testing/test-admin-mutations.js
+node switch/testing/test-seed-token-lifecycle.js
 ```
 
 ## What's NOT Tested (Remains Manual QA)
 
 - **Full integration** requiring a live SquadJS server, RCON, or Discord — these are manual QA
 - **Queue stability gate / pair trading logic** — unchanged by the token system
-- **Scramble lockdown logic** — unchanged, tested only for the "overrides tokens" eligibility check
 - **Stats scraper regex parsing** — unchanged
 - **Round summary embed format** — unchanged
 - **Broadcast timers and join-warn scheduling** — unchanged
