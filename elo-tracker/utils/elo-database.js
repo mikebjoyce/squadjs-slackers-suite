@@ -78,6 +78,11 @@ import EloCalculator from './elo-calculator.js';
 
 const { Op } = Sequelize;
 
+// Bounds bulkIncrementPlayerStats/insertRoundHistory — both sit on the round-end
+// critical path (their caller's calculationDuration feeds the Discord "Processing
+// Time" field). See the totalTimeoutMs note on db-service.js's executeWithRetry.
+const ROUND_END_DB_TIMEOUT_MS = 15000;
+
 function isLockError(err) {
   const message = String(err?.message || '');
   return (
@@ -607,7 +612,7 @@ export default class EloDatabase {
         });
 
         await Promise.all(ops);
-      });
+      }, { totalTimeoutMs: ROUND_END_DB_TIMEOUT_MS });
     } catch (error) {
       this.verbose(1, `[DB] Error bulk upserting stats: ${error.message}`);
       return null;
@@ -624,7 +629,7 @@ export default class EloDatabase {
       return await this._s3db.withTransactionWithRetry(async (t) => {
         const record = await this._s3db.getModel('Elo_RoundHistory').create(data, { transaction: t });
         return record.toJSON();
-      });
+      }, { totalTimeoutMs: ROUND_END_DB_TIMEOUT_MS });
     } catch (error) {
       this.verbose(1, `[DB] Error inserting round history: ${error.message}`);
       return null;

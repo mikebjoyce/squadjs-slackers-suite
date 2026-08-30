@@ -48,8 +48,12 @@
  *                                  registered expected versions against DB.
  *   get migrationEngine()       — Returns the MigrationEngine instance.
  *   executeWithRetry(fn, opts)  — Wraps logicFn with retry+jitter, SQLite-mutexed.
+ *                                  opts.totalTimeoutMs (opt-in) caps the WHOLE
+ *                                  retry loop's wall-clock time, not just each
+ *                                  attempt — see inline comment at its call site.
  *   withTransaction(fn, opts)   — Executes logicFn inside a Sequelize transaction.
- *   withTransactionWithRetry(fn, opts) — Transaction with retry+jitter.
+ *   withTransactionWithRetry(fn, opts) — Transaction with retry+jitter. opts may
+ *                                  include totalTimeoutMs (see executeWithRetry).
  *   ensureSqlitePragmas()       — Enforces WAL + synchronous=NORMAL on SQLite.
  *   Static: resolveConnector(), isLockError(), isSqlite(),
  *           withConnectorMutex(), withSqliteMutex(),
@@ -229,7 +233,8 @@ export default class DBService {
     'SequelizeConnectionRefusedError',
     'SequelizeHostNotFoundError',
     'SequelizeHostNotReachableError',
-    'SequelizeConnectionAcquireTimeoutError'
+    'SequelizeConnectionAcquireTimeoutError',
+    'S3RetryBudgetExceededError'
   ]);
 
   static isNetworkError(err) {
@@ -292,6 +297,8 @@ export default class DBService {
     const attempts = Number.isFinite(retryOptions.attempts) ? retryOptions.attempts : 5;
     const baseDelayMs = Number.isFinite(retryOptions.baseDelayMs) ? retryOptions.baseDelayMs : 200;
     const jitterMs = Number.isFinite(retryOptions.jitterMs) ? retryOptions.jitterMs : 500;
+    // Opt-in only — omitted for every existing caller, so nothing changes for them.
+    const totalTimeoutMs = Number.isFinite(retryOptions.totalTimeoutMs) ? retryOptions.totalTimeoutMs : null;
 
     const runAttempt = async () => {
       for (let i = 1; i <= attempts; i += 1) {
@@ -311,7 +318,36 @@ export default class DBService {
     };
 
     // Only serialize for SQLite connectors; other dialects handle concurrency internally.
-    return DBService.withSqliteMutex(connector, runAttempt);
+    const attemptPromise = DBService.withSqliteMutex(connector, runAttempt);
+    if (totalTimeoutMs === null) {
+      return attemptPromise;
+    }
+
+    // Bounds the WHOLE retry loop, not a single attempt. A single attempt's own
+    // timeout (e.g. Sequelize's connection-pool `acquire` timeout — commonly 60s,
+    // configured outside this repo by core SquadJS) can itself run long under pool
+    // exhaustion; five retries at that cost compound to minutes (observed: a real
+    // 301s EloTracker round-end write during a live outage, which sat directly
+    // upstream of a TeamBalancer scramble-trigger check on the same connection
+    // pool). Racing the whole loop against a budget — instead of only bounding each
+    // attempt — is what actually caps how long a caller can be blocked. The
+    // underlying attempt keeps running in the background after losing the race;
+    // it just can no longer hold this specific caller hostage.
+    attemptPromise.catch(() => {});
+    let timer;
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const err = new Error(`DB retry budget of ${totalTimeoutMs}ms exceeded`);
+        err.name = 'S3RetryBudgetExceededError';
+        reject(err);
+      }, totalTimeoutMs);
+    });
+
+    try {
+      return await Promise.race([attemptPromise, timeoutPromise]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   static async withTransaction(connector, logicFn, { transactionOptions = null } = {}) {
@@ -858,9 +894,16 @@ export default class DBService {
     if (this.shouldSkipDb()) {
       return null;
     }
+    // totalTimeoutMs is a retry-budget knob for executeWithRetry, not a Sequelize
+    // transaction option — split it out before forwarding the rest to withTransaction().
+    // Note: the remaining `passthroughOptions` is NOT the nested Sequelize transaction
+    // options itself — withTransaction() expects that nested one level down, under its
+    // own `transactionOptions` key (e.g. { transactionOptions: { isolationLevel } }).
+    const { totalTimeoutMs, ...passthroughOptions } = options;
     try {
-      const result = await this.executeWithRetry(() =>
-        DBService.withTransaction(this.sequelize, logicFn, options)
+      const result = await this.executeWithRetry(
+        () => DBService.withTransaction(this.sequelize, logicFn, passthroughOptions),
+        { totalTimeoutMs }
       );
       // Success — clear any active backoff
       if (this._networkErrorBackoff !== null) {

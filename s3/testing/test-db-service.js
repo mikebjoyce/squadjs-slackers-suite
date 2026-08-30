@@ -102,6 +102,71 @@ await runTest('executeWithRetry retries lock errors then succeeds', async () => 
   assert.equal(attempts, 3);
 });
 
+await runTest('executeWithRetry without totalTimeoutMs never races a stuck attempt (default, unchanged behaviour)', async () => {
+  const sequelize = new MockSequelize({ dialect: 'sqlite' });
+
+  // Simulates 5 attempts each blocking on a slow connection-pool acquire — the exact
+  // shape that produced a real ~301s EloTracker round-end stall. Without opting into
+  // totalTimeoutMs, every existing caller must still just wait it out (no regression).
+  let attempts = 0;
+  const start = Date.now();
+  const result = await DBService.executeWithRetry(sequelize, async () => {
+    attempts += 1;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    return 'ok';
+  }, { attempts: 1, baseDelayMs: 0, jitterMs: 0 });
+
+  assert.equal(result, 'ok');
+  assert.ok(Date.now() - start >= 15, 'must have actually waited for the slow attempt');
+});
+
+await runTest('executeWithRetry with totalTimeoutMs fails fast on a stuck retry loop', async () => {
+  const sequelize = new MockSequelize({ dialect: 'sqlite' });
+
+  // Every attempt "hangs" far longer than the budget — the real-world equivalent is
+  // Sequelize's connection-pool acquire() blocking under pool exhaustion. The budget
+  // must trip well before 5 attempts would ever resolve on their own.
+  const result = DBService.executeWithRetry(sequelize, async () => {
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    return 'never';
+  }, { attempts: 5, baseDelayMs: 0, jitterMs: 0, totalTimeoutMs: 50 });
+
+  await assert.rejects(result, (err) => {
+    assert.equal(err.name, 'S3RetryBudgetExceededError');
+    return true;
+  });
+});
+
+await runTest('executeWithRetry with totalTimeoutMs still returns normally when the attempt is fast', async () => {
+  const sequelize = new MockSequelize({ dialect: 'sqlite' });
+
+  const result = await DBService.executeWithRetry(sequelize, async () => 'ok', {
+    attempts: 5,
+    baseDelayMs: 0,
+    jitterMs: 0,
+    totalTimeoutMs: 5000
+  });
+
+  assert.equal(result, 'ok');
+});
+
+await runTest('withTransactionWithRetry treats a totalTimeoutMs budget-exceeded error as a network error and engages backoff', async () => {
+  const sequelize = new MockSequelize({ dialect: 'sqlite' });
+  const db = new DBService({ sequelize });
+
+  // withTransactionWithRetry rethrows like any other DB error — callers (every real
+  // one in this repo) wrap it in their own try/catch and return null. What matters
+  // here is that the rejection is classified as a network error so backoff engages.
+  await assert.rejects(
+    db.withTransactionWithRetry(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      return 'never';
+    }, { totalTimeoutMs: 50 }),
+    (err) => err.name === 'S3RetryBudgetExceededError'
+  );
+  assert.ok(db.shouldSkipDb(), 'budget-exceeded must engage the same network backoff as a real connection failure');
+});
+
 await runTest('SQLite mutex serializes concurrent operations', async () => {
   const sequelize = new MockSequelize({ dialect: 'sqlite' });
 

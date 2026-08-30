@@ -132,9 +132,9 @@ Centralises Sequelize connector management, schema version tracking, and migrati
 | `getPendingMigrations()` | `() => Array<{pluginName, currentVersion, expectedVersion}>` | Pending list | Used by startup prompt |
 | `waitForMigrations()` | `() => Promise<void>` | void | Resolves after migrations complete or skipped |
 | `migrationEngine` | getter | `MigrationEngine` instance | Direct access to the engine |
-| `executeWithRetry(fn)` | `(Function) => Promise<*>` | Function result | With retry + jitter (all connectors) |
+| `executeWithRetry(fn, opts?)` | `(Function, object?) => Promise<*>` | Function result | With retry + jitter (all connectors). `opts.totalTimeoutMs` — see note below |
 | `withTransaction(fn)` | `(Function) => Promise<*>` | Function result | Within a Sequelize transaction |
-| `withTransactionWithRetry(fn)` | `(Function) => Promise<*>` | Function result | Transaction + retry combined |
+| `withTransactionWithRetry(fn, opts?)` | `(Function, object?) => Promise<*>` | Function result | Transaction + retry combined. `opts.totalTimeoutMs` — see note below |
 | `getDatabasePath()` | `() => string\|null` | File path or null | SQLite only |
 | `models` | property | `object` | All defined models, keyed by name. Direct property, not a getter method. |
 
@@ -162,6 +162,20 @@ Centralises Sequelize connector management, schema version tracking, and migrati
 
 > **`getConnectorName()` vs `getDialect()`:** `getConnectorName()` returns the connector **label** — the key in the `connectors` map from `config.json`. That's conventionally the dialect name, but a deployment may key its connector `main` or `s3`, in which case the label matches no dialect branch at all. Any code deciding *what SQL to emit* must use `getDialect()`.
 
+> **`totalTimeoutMs` (opt-in, default: no cap):** bounds the whole retry loop's wall-clock
+> time, not each attempt — a single attempt's own timeout (e.g. Sequelize's connection-pool
+> `acquire` timeout, commonly 60s and configured outside this repo) can itself run long
+> under pool exhaustion, and 5 retries at that cost compound to minutes. Pass it on any
+> call sitting on a hot path where a caller must not be blocked for that long (e.g. a
+> round-end handler another plugin's scramble/trigger decision depends on). The abandoned
+> attempt keeps running in the background after the budget trips — it isn't cancelled,
+> so a slow-but-eventually-successful write can still land after the caller has already
+> moved on with `null`. A budget-exceeded rejection is classified as a network error, so
+> it engages the same `_networkErrorBackoffMs` (30s default) as a real connection failure
+> — since that backoff lives on the shared `DBService` instance, tripping the budget once
+> pauses *every* plugin's DB calls on that connector for the cooldown window, not just the
+> caller that opted in. Pick a value comfortably above normal-load latency for that call.
+>
 > **Note:** `canBackup(connector)` is **not** a `DBService` method — it's a standalone export from `s3-backup.js` that always returns `true` (all Sequelize dialects get JSON-export fallback; the SQLite-only gate was removed). If you need this on a `DBService` instance, import it separately: `import { canBackup } from './s3-backup.js'`.
 
 **Static methods (for advanced use):**

@@ -265,6 +265,11 @@ import { TBDiagnostics } from '../utils/tb-diagnostics.js';
 import fs from 'fs';
 import path from 'path';
 
+// Bounds the saveState/incrementStreak writes inside onRoundEnded() — both sit
+// directly upstream of a scramble-trigger check in that same handler. See the
+// totalTimeoutMs note on db-service.js's executeWithRetry.
+const ROUND_END_DB_TIMEOUT_MS = 15000;
+
 export default class TeamBalancer extends S3PluginBase {
   static version = '4.0.6';
 
@@ -669,6 +674,8 @@ export default class TeamBalancer extends S3PluginBase {
 
       saveState: async (team, count, conTeam, conCount) => {
         try {
+          // Upstream of the "Extreme ticket difference" scramble-trigger check further
+          // down onRoundEnded() — see ROUND_END_DB_TIMEOUT_MS above.
           return await s3db.withTransactionWithRetry(async (t) => {
             const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
             if (!record) return null;
@@ -686,7 +693,7 @@ export default class TeamBalancer extends S3PluginBase {
               consecutiveWinsTeam: record.consecutiveWinsTeam,
               consecutiveWinsCount: record.consecutiveWinsCount
             };
-          });
+          }, { totalTimeoutMs: ROUND_END_DB_TIMEOUT_MS });
         } catch (err) {
           Logger.verbose('TeamBalancer', 1, `[7.4m] saveState failed: ${err.message}`);
           return null;
@@ -695,6 +702,8 @@ export default class TeamBalancer extends S3PluginBase {
 
       incrementStreak: async (winnerID, conTeam, conCount) => {
         try {
+          // Upstream of the dominant-win-streak scramble check instead — see
+          // ROUND_END_DB_TIMEOUT_MS above.
           return await s3db.withTransactionWithRetry(async (t) => {
             const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
             if (!record) return null;
@@ -715,7 +724,7 @@ export default class TeamBalancer extends S3PluginBase {
               consecutiveWinsTeam: record.consecutiveWinsTeam,
               consecutiveWinsCount: record.consecutiveWinsCount
             };
-          });
+          }, { totalTimeoutMs: ROUND_END_DB_TIMEOUT_MS });
         } catch (err) {
           Logger.verbose('TeamBalancer', 1, `[7.4m] incrementStreak failed: ${err.message}`);
           return null;
