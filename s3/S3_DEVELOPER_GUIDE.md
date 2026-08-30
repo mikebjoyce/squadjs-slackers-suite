@@ -1310,6 +1310,29 @@ Every migration **must** declare which tables, columns, seed rows, and data post
   down: async (qi) => { /* no DDL changes */ } }
 ```
 
+#### `touches` also decides what gets backed up
+
+Before running pending migrations, the engine takes a JSON backup scoped to
+what those migrations declare. Only `columns` and `rows` pull a table into it.
+
+`creates` deliberately does not. A table a migration creates is the one category
+that provably cannot lose data: either it does not exist yet, or it already
+exists and the idempotent existence guard means the migration leaves it alone.
+Backing it up buys nothing and costs its full size in memory.
+
+That distinction is a regression guard, not a micro-optimisation. db-log's
+migration is a pure idempotent `createTable` and it declared `creates` for its
+eight `dblog_*` tables. When `creates` counted towards the backup scope, mounting
+on a server holding ~900MB of stats exported all of it into memory and the
+process was OOM-killed (exit 137) before any SQL ran. `test-migration-backup.js`
+asserts each category's behaviour.
+
+A migration whose declaration resolves to no data-bearing table — `creates` only,
+or `touches: {}` — takes no JSON backup at all. Setting `backup: false` states
+the same intent explicitly and is worth adding when a reader would otherwise
+wonder; it is what db-log does. On SQLite the whole-file binary copy still runs
+either way, since it is disk-bound rather than memory-bound.
+
 **Backward compatibility:** Existing migrations that predate the `touches` requirement (pre-v1.2.0) should have `touches` added retroactively when their plugin's migration file is next touched. The Switch plugin's migrations demonstrate this pattern — see `switch-db.js` v1 for a real-world example of retroactive `touches` on old migrations.
 
 #### 9.1.2 — Seed Row Drift Detection (`touches.rows`)
@@ -1407,6 +1430,7 @@ The `qi` (QueryInterface) object passed to each migration function provides thes
 | `db` | property | DBService instance |
 | `transaction` | property | Active Sequelize transaction |
 | `DataTypes` | property | Sequelize DataTypes for column defs |
+| `isReapply` | property (`boolean`) | `true` when this `up()` is being **re-applied to repair drift** rather than applied for the first time. Guard any one-time destructive step on it — see the warning below |
 
 Each `qi` method above is already bound to the migration's transaction, so pass options only for the operation itself. `qi.transaction` is exposed for model calls, which do need it explicitly.
 
@@ -1414,6 +1438,17 @@ Each `qi` method above is already bound to the migration's transaction, so pass 
 >
 > For **set-wide** work — backfilling a column across every row — use `qi.bulkUpdate()`. It resolves the registered model's attribute types automatically, which matters more than it looks: Sequelize's low-level bulk API escapes values by their JS shape when it has no types, and on SQLite a `Date` then lands in the column as an **integer epoch** rather than the TEXT that `DataTypes.DATE` reads back. Every subsequent read of that row dies with `date.includes is not a function`. MySQL and Postgres escape a `Date` to a datetime literal either way, so this reaches production on SQLite deployments only. If you bypass the wrapper and call `qi.sequelize.getQueryInterface().bulkUpdate()` directly, you must pass `model.rawAttributes` as the fifth argument yourself.
 
+> **Guard one-time destructive steps on `qi.isReapply`.** Drift recovery deliberately re-runs a migration that has *already been applied* (see §9.8). That is safe for `addColumn`, `createTable` and null-matched backfills, which are idempotent. It is **not** safe for a step that resets state — truncating a table, zeroing balances, seeding over rows players have since edited. On the repair pass, such a step destroys exactly the live data the operator ran `!s3 migrate force` to preserve.
+>
+> ```js
+> // Truncate on first install only — never while repairing drift.
+> if (!qi.isReapply) {
+>   await qi.bulkDelete('SwitchPlugin_PlayerCooldowns', {});
+> }
+> ```
+>
+> Version tracking alone does not protect you here: it stops an *ordinary* re-run, but recovery rolls the recorded version backwards on purpose, so the migration genuinely is pending again. Switch v3 is the reference case — it adds five token columns and then truncates the cooldown table. The columns re-add harmlessly; the truncate would have wiped every player's token balance, seed-bonus progress and scramble lockdown. The flag is `false` for a first-time apply and cleared after the repair run, so a later ordinary migration still gets its one-time step. `s3/testing/test-migration-data-assertions.js` asserts the `[false, true, false]` sequence across all three engines.
+>
 > **Write backfills so they survive a re-run.** Do not nest a backfill inside the `if (!columns.x)` guard that adds the column — the column existing does not prove the data step ran. A DB whose user lacks `ALTER` privileges gets its DDL applied by hand, and an attempt that failed after the `ALTER` leaves the same state: column present, every row NULL. Match on `{ col: { [Op.is]: null } }` instead, outside the guard, so `!s3 migrate force` repairs those rows and leaves rows stamped by live gameplay untouched. `Op.is` generates a real `IS NULL`; a bare `col: null` in a raw where-clause can become the `= NULL` that matches nothing. Switch migration v5 is the reference implementation, and `s3/testing/test-migration-bulk-types.js` locks both behaviours down against real engines.
 
 ### 9.3 — Version Numbering
@@ -1523,6 +1558,35 @@ A consolidated read‑only diagnostic command that surfaces:
 
 Both commands require S³'s Discord admin channel to be configured (`channelID` in config).
 
+#### What recovery actually does
+
+Detecting drift is only half of it. When the check confirms that schema a migration already applied has gone missing, S³ rolls the plugin's recorded version **back below the migration that owns the missing schema**, which makes that migration pending again so `!s3 migrate force` re-applies it.
+
+Ownership comes from `touches`: the engine finds the lowest-versioned migration whose `creates`/`columns`/`rows` declares the missing item, and rolls back to one below it. Rolling back a fixed single version is not enough — a table that has lost columns owned by v3 *and* v5 would re-apply only v5, drift again on v3's, and roll back again on the next mount, forever. Matching is case-insensitive, because MySQL with `lower_case_table_names=1` reports identifiers folded while `touches` declares them as written.
+
+Because recovery re-applies an already-applied migration, `up()` must be idempotent — see the `qi.isReapply` warning in §9.2.
+
+#### Drift alongside pending migrations
+
+The check runs even when a plugin has migrations waiting, so a server that is **both behind and drifted** is repaired in a single confirmation rather than needing one run to reveal the drift and a second to fix it.
+
+This is only safe because the two cases are told apart before anything is rolled back. A plugin that is legitimately behind is *also* missing the columns its unapplied migrations add, and treating that as drift would fire a false alarm on every routine upgrade and roll versions backwards. So each missing item is attributed to its owning migration and discarded when that migration has not run yet; plugins with no recorded version at all — a brand-new install, where nothing exists — are dropped wholesale.
+
+An item no migration declares (a column created inline by `createTable`, covered by `touches.creates` rather than `touches.columns`) cannot be attributed, and is treated as drift. That fails safe: a real loss is reported rather than silently ignored.
+
+The verbose log shows both views, and they are expected to differ:
+
+```
+[DB] DRIFT: ... missing columns: tokenBalance, seedBonusTokensEarned, lastActiveTimestamp   ← raw
+[DB] CONFIRMED DRIFT: ... missing columns: tokenBalance, seedBonusTokensEarned              ← after attribution
+```
+
+`lastActiveTimestamp` is absent from the confirmed set because the migration that adds it simply has not run yet. Only the confirmed set drives rollback and reaches the stderr `SchemaDrift` warning.
+
+**Extra** columns are informational only — they never trigger rollback, and are excluded from stderr so they don't append to the error file on every mount.
+
+`s3/testing/test-drift-recovery-matrix.js` covers all of this across SQLite, MySQL and Postgres: brand-new, behind, drifted, behind *and* drifted, undeclared-column loss, multi-plugin, and repeated cycles converging.
+
 ### 9.9 — Failure Diagnostics on stderr
 
 SquadJS's `Logger` writes everything to stdout. Operators who split the streams —
@@ -1609,8 +1673,8 @@ All commands in the configured `channelID` Discord channel:
 | `!s3 unwatch` | Stop all active watches |
 | `!s3 diag` | Consolidated diagnostic — mounts, phase, factions, players, locks in one pass |
 | `!s3 help` | Command reference |
-| `!s3 db export [--logs\|--all]` | Export DB as JSON attachment |
-| `!s3 db export --to-file [--all]` | Export to server filesystem backup dir |
+| `!s3 db export [--logs\|--all]` | Stream the export to `backups/`, then attach it to the reply if the gzipped file fits the guild's own upload limit (10 MB unboosted, 50 MB at boost tier 2, 100 MB at tier 3 — read from `guild.premiumTier`, falling back to the 10 MB floor when the tier is unknown). If it doesn't fit, or the upload fails anyway, the file stays on disk. Either way the summary embed names it |
+| `!s3 db export --to-file [--all]` | Same export, no attachment attempt |
 | `!s3 db import [--confirm] [--dry-run]` | Import from attached JSON (two-step) |
 | `!s3 db status` | Connector name, pending-migration state, and schema version per registered plugin |
 | `!s3 backup list` | List backups in the backup directory |
@@ -1648,8 +1712,9 @@ Two rules make forgetting survivable:
 
 - **An undeclared model is exported at the default (`historical`) tier**, and
   `defineModel()` warns by name at mount. Over-exporting fails visibly and
-  recoverably (the exporter errors on Discord's 25 MB limit); under-exporting
-  fails silently and permanently. The fallback picks the recoverable direction.
+  recoverably (the export lands on disk and the reply says it was too big to
+  attach); under-exporting fails silently and permanently. The fallback picks
+  the recoverable direction.
 - **An invalid tier string throws at definition time**, on the author's own
   server at startup — not at restore time months later.
 
@@ -1682,12 +1747,16 @@ of the tier logic rather than a path around it.
 ```json
 {
   "s3ExportVersion": 1,
+  "s3StreamFormat": 1,
   "exportedAt": 1719547200000,
   "connector": "sqlite",
   "tier": "historical",
   "tiers": { "ModelName": "historical" },
   "tables": {
-    "ModelName": [ { ... row ... } ]
+    "ModelName": [
+{ "...": "row" },
+{ "...": "row" }
+    ]
   },
   "rowCounts": { "ModelName": 42 },
   "results": { "ModelName": { "status": "ok", "rows": 42 } }
@@ -1699,6 +1768,47 @@ of the tier logic rather than a path around it.
 than leaving them to infer it from absence. Both are **additive**, so the format
 stays version 1 and every backup written before they existed still imports; the
 importer must keep tolerating their absence.
+
+`s3StreamFormat` marks a file written by the streaming exporter. Its one visible
+consequence is the layout above: **one row per line**, unindented, inside each
+table array. That is not cosmetic — it is what lets `restoreFromFile()` import a
+file larger than the heap by reading it a line at a time. The document is
+ordinary JSON either way, so anything that could read an older export still can.
+Files without the marker are legacy pretty-printed exports and take the
+in-memory path; above 256MB they are refused rather than allowed to OOM.
+
+### 10.2.1 — Memory: Which Functions Stream and Which Do Not
+
+`s3-export-import.js` is split down the middle and the halves are not
+interchangeable:
+
+| Function | Memory | Use for |
+|----------|--------|---------|
+| `exportToFile()` | One row batch + a ~256KB buffer | Any database, any size |
+| `importFromStreamFile()` | One chunk of rows | Any file the exporter wrote |
+| `gzipFileForAttachment()` | Stream buffers, then the result only if it fits | Turning an export into an attachment |
+| `exportToJSON()` | The whole database | Tests, validation, datasets known to be small |
+| `importFromJSON()` | The whole file | Same |
+| `serializeForAttachment()` | The whole database, twice | Same |
+
+This is a live-outage boundary, not a style preference. A production db-log
+dataset is roughly 900MB. V8 caps a single string at about 512MB on Node 18 —
+the version SquadJS ships on — so `JSON.stringify()` of that data cannot produce
+a string at all, and the attempt OOM-killed the SquadJS process (exit 137)
+during pre-migration backup, before any SQL ran. If you add a code path that
+touches every row, it belongs in the top half of that table.
+
+Two implementation details are load-bearing and easy to undo by accident:
+
+- **Backpressure.** The writer awaits `'drain'` whenever `stream.write()`
+  returns false. Ignoring that return value turns "streaming" back into
+  "buffer the whole database in memory", with no visible difference until the
+  data is big enough to kill the process.
+- **Keyset pagination.** Row batches are fetched with `WHERE pk > :last ORDER BY
+  pk LIMIT :n`, not `LIMIT ... OFFSET`. MySQL re-walks and discards every
+  skipped row for an OFFSET, so paging a multi-million-row table that way is
+  quadratic — slower than the naive full load it replaced. Models with a
+  composite or absent primary key fall back to OFFSET.
 
 **Import workflow:** Two-step — `!s3 db import` (with attachment) → review embed → `!s3 db import --confirm` → execute.
 
@@ -1782,6 +1892,7 @@ node s3/testing/test-game-state-service.js
 | `test-migration-conformance.js` | Migration definitions match the expected shape/contract |
 | `test-migration-partial-retry.js` | A migration whose `up()` commits real DDL/DML but fails post-commit `touches` verification is safely retryable — `addColumn`/`bulkInsert` don't crash on a raw duplicate-column/duplicate-key error, real engines |
 | `test-migration-data-assertions.js` | Migrations' data effects are asserted, not assumed — see `TASK_MIGRATION_DATA_ASSERTIONS.md` |
+| `test-drift-recovery-matrix.js` | Drift recovery across every DB state a server can be in — brand new, behind, drifted, behind *and* drifted, multi-plugin — on SQLite, MySQL and Postgres |
 | `test-command-routing.js` | `!s3` subcommand dispatch and argument parsing |
 | `test-inspection-embeds.js` | Inspection/embed builders render without throwing on sparse data |
 | `test-sa-per-player-lock.js` | Per-player lock acquisition/release under contention |

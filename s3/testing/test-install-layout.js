@@ -131,20 +131,59 @@ function install(args) {
 }
 
 /**
+ * Read CORE_PLUGIN_NAMES out of install.cjs for the same reason ALL_PLUGINS is
+ * read rather than restated.
+ *
+ * Core-plugin upgrades (drop-in replacements for a plugin SquadJS ships) do not
+ * get a directory of their own. They are single files in `core-plugins/`, named
+ * to match the core file they overwrite — `core-plugins/db-log.js` deploys to
+ * `plugins/db-log.js`. Anything else would double-post: SquadJS would load both
+ * its own copy and ours.
+ */
+function readCorePluginNames() {
+  const source = fs.readFileSync(INSTALL_SCRIPT, 'utf8');
+  const match = source.match(/const CORE_PLUGIN_NAMES = new Set\(\[([^\]]*)\]\)/);
+  assert.ok(match, 'install.cjs must declare CORE_PLUGIN_NAMES as a Set of an array literal');
+  return new Set(
+    match[1]
+      .split(',')
+      .map(s => s.trim().replace(/^['"]|['"]$/g, ''))
+      .filter(Boolean)
+  );
+}
+
+/**
  * Every copyable file in the monorepo, keyed by its path relative to its plugin.
  * Returns Map<'testing/run-all-tests.js', string[] /* owning plugins *\/>.
  */
-function sourceIndex(plugins, dirs) {
+function sourceIndex(plugins, dirs, corePlugins = new Set()) {
   const index = new Map();
+  const add = (rel, plugin) => {
+    const base = path.basename(rel).toLowerCase();
+    if (base === 'readme.md' || base === 'readme.mdx') return;
+    if (!['.js', '.mjs', '.cjs', '.json'].includes(path.extname(rel).toLowerCase())) return;
+    if (!index.has(rel)) index.set(rel, []);
+    index.get(rel).push(plugin);
+  };
+
   for (const plugin of plugins) {
+    // Core-plugin upgrades are flat single files, not a plugin directory.
+    if (corePlugins.has(plugin)) {
+      for (const dirName of dirs) {
+        let sourceFile = null;
+        if (dirName === 'plugins') sourceFile = path.join(MONOREPO_ROOT, 'core-plugins', `${plugin}.js`);
+        else if (dirName === 'testing') sourceFile = path.join(MONOREPO_ROOT, 'core-plugins', `${plugin}-test.js`);
+        else continue; // no utils/ or tools/ for a core-plugin upgrade
+        if (!fs.existsSync(sourceFile)) continue;
+        add(`${dirName}/${path.basename(sourceFile)}`, plugin);
+      }
+      continue;
+    }
+
     for (const dirName of dirs) {
       const dirPath = path.join(MONOREPO_ROOT, plugin, dirName);
       for (const rel of listRelative(dirPath, path.join(MONOREPO_ROOT, plugin))) {
-        const base = path.basename(rel).toLowerCase();
-        if (base === 'readme.md' || base === 'readme.mdx') continue;
-        if (!['.js', '.mjs', '.cjs', '.json'].includes(path.extname(rel).toLowerCase())) continue;
-        if (!index.has(rel)) index.set(rel, []);
-        index.get(rel).push(plugin);
+        add(rel, plugin);
       }
     }
   }
@@ -153,9 +192,11 @@ function sourceIndex(plugins, dirs) {
 
 describe('install.cjs target layout', { skip: AVAILABLE ? false : 'no monorepo to install from' }, () => {
   let allPlugins;
+  let corePlugins;
 
   before(() => {
     allPlugins = readAllPlugins();
+    corePlugins = readCorePluginNames();
   });
 
   after(() => {
@@ -166,7 +207,7 @@ describe('install.cjs target layout', { skip: AVAILABLE ? false : 'no monorepo t
 
   test('a production deploy emits only verbatim source paths', () => {
     const { files } = install(['--plugin=all']);
-    const sources = sourceIndex(allPlugins, ['plugins', 'utils']);
+    const sources = sourceIndex(allPlugins, ['plugins', 'utils'], corePlugins);
 
     assert.ok(files.length > 0, 'a full install must copy something');
 
@@ -188,7 +229,7 @@ describe('install.cjs target layout', { skip: AVAILABLE ? false : 'no monorepo t
   test('--with-testing emits every plugin\'s runner, distinctly', () => {
     const { outputDir, files } = install(['--plugin=all', '--with-testing', '--with-tools']);
 
-    const owners = sourceIndex(allPlugins, OPT_IN_DIRS).get('testing/run-all-tests.js') ?? [];
+    const owners = sourceIndex(allPlugins, OPT_IN_DIRS, corePlugins).get('testing/run-all-tests.js') ?? [];
     assert.ok(owners.length > 1, 'fixture assumption: more than one plugin owns testing/run-all-tests.js');
 
     for (const plugin of owners) {
@@ -208,7 +249,7 @@ describe('install.cjs target layout', { skip: AVAILABLE ? false : 'no monorepo t
 
   test('directory depth is preserved for every copied file', () => {
     const { files } = install(['--plugin=all', '--with-testing', '--with-tools']);
-    const sources = sourceIndex(allPlugins, ['plugins', 'utils', ...OPT_IN_DIRS]);
+    const sources = sourceIndex(allPlugins, ['plugins', 'utils', ...OPT_IN_DIRS], corePlugins);
 
     const sourceDirs = new Set([...sources.keys()].map(rel => path.posix.dirname(rel)));
 
@@ -223,7 +264,7 @@ describe('install.cjs target layout', { skip: AVAILABLE ? false : 'no monorepo t
 
   test('a uniquely-named file keeps its name exactly', () => {
     const { files } = install(['--plugin=all', '--with-testing', '--with-tools']);
-    const sources = sourceIndex(allPlugins, ['plugins', 'utils', ...OPT_IN_DIRS]);
+    const sources = sourceIndex(allPlugins, ['plugins', 'utils', ...OPT_IN_DIRS], corePlugins);
 
     const emitted = new Set(files);
     let checked = 0;

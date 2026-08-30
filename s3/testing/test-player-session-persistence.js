@@ -334,9 +334,21 @@ test('Multiple players have independent sessions', async () => {
     joinTimes.push(result.sessionStart.getTime());
   }
 
-  // Each should have independent start times
-  const uniqueTimes = new Set(joinTimes);
-  assert.equal(uniqueTimes.size, players.length, 'each player should have a unique joinTime');
+  // Independence means one row per player with its own state — NOT distinct
+  // timestamps. sessionStart is a plain `new Date()` at millisecond resolution,
+  // so players joining in the same millisecond legitimately share one; a squad
+  // joining together does exactly that. Asserting uniqueness here made this test
+  // fail intermittently under suite load while passing standalone.
+  assert.equal(await sm.model.count(), players.length, 'one row per player');
+  for (const eosID of players) {
+    const row = await sm.model.findByPk(eosID);
+    assert.ok(row, `${eosID} should have its own row`);
+    assert.equal(row.disconnectTime, null, `${eosID} should start connected`);
+  }
+  assert.ok(
+    joinTimes.every((t, i) => i === 0 || t >= joinTimes[i - 1]),
+    'joinTimes should be non-decreasing in join order'
+  );
 
   // Disconnect one player independently
   await sm.onPlayerDisconnected('EOS:p101');

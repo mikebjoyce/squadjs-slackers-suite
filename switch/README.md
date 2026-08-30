@@ -210,6 +210,7 @@ The Switch plugin exposes a public API for external consumers (such as SmartAssi
 
 ### Version Compatibility
 
+- `static version = '2.5.7'` — Migration v3's cooldown-table reset no longer runs when the migration is being re-applied to repair schema drift, so restoring lost columns preserves token balances, seed-bonus progress and scramble lockdowns instead of wiping them. Requires S³ >= 1.6.0, which is what supplies the flag it checks.
 - `static version = '2.5.6'` — Admin commands split into `clear`/`clearall` (lift restrictions, never confiscate seed tokens) and `wipe confirm` (delete rows, and it will not run without the confirm word); `clearall` no longer uses TRUNCATE, which the live MySQL account has no privilege for and which was failing silently. Per-round seed state is retired at NEW_GAME rather than only for players who happen to be connected at round end, the presence clock stops on disconnect, and fully-regenerated balances are written back so the 30-minute row prune can see them. `!switch status` reports who is actually blocked instead of listing players at full tokens.
 - `static version = '2.5.5'` — Verify migration data effects; stop swallowing unhandled rejections
 - `static version = '2.5.4'` — Correct misleading 'schema already up to date' log when migrations are pending

@@ -57,19 +57,18 @@
  *
  * s3-migration-discord.js — buildMigrationEmbed
  * s3-backup.js           — canBackup, listBackups, restoreBackup
- * s3-export-import.js    — exportToJSON, importFromJSON, etc.
+ * s3-export-import.js    — exportToFile, gzipFileForAttachment, importFromJSON, etc.
  * s3-common.js           — formatSize
  *
  */
 import { buildMigrationEmbed } from './s3-migration-discord.js';
 import { canBackup, listBackups, restoreBackup } from './s3-backup.js';
 import {
-  exportToJSON,
   importFromJSON,
   validateImportStructure,
-  serializeForAttachment,
   restoreFromFile,
-  exportToFile
+  exportToFile,
+  gzipFileForAttachment
 } from './s3-export-import.js';
 import { formatSize } from './s3-common.js';
 import {
@@ -207,6 +206,29 @@ export function checkmark(val) {
 export function truncate(str, maxLen = 1024) {
   if (!str) return '';
   return str.length > maxLen ? str.substring(0, maxLen - 3) + '...' : str;
+}
+
+/**
+ * Bytes this guild will accept in a single attachment.
+ *
+ * The ceiling is a function of the guild's boost tier, and assuming the boosted
+ * 25MB everywhere is how a 200MB export got as far as an upload before Discord
+ * answered "Request entity too large" — a 413 raised after the file had already
+ * been compressed and buffered, surfaced to the operator as a failed export even
+ * though the export itself had succeeded.
+ *
+ * discord.js 14.26 exposes `maximumBitrate` but no equivalent for uploads, so
+ * the tiers are mapped here. An unknown or missing guild falls back to the
+ * smallest limit: over-estimating costs a failed send, under-estimating costs
+ * only a link to a file that is on the server anyway.
+ */
+export function guildAttachmentLimit(guild) {
+  const MiB = 1024 * 1024;
+  switch (guild?.premiumTier) {
+    case 2: return 50 * MiB;
+    case 3: return 100 * MiB;
+    default: return 10 * MiB;
+  }
 }
 
 export function formatTimestamp(unixMs) {
@@ -1690,7 +1712,7 @@ export function buildHelpEmbed() {
           '`!s3 db export` — Export essential tables as JSON',
           '`!s3 db export --logs` — Include event log tables',
           '`!s3 db export --all` — Include all tables (incl. ephemeral)',
-          '`!s3 db export --to-file` — Write export to server filesystem (backups/)',
+          '`!s3 db export --to-file` — Skip the attachment; leave it in backups/ only',
           '`!s3 db import` — Import from attached .s3backup.json',
           '`!s3 db import --confirm [--dry-run]` — Execute or validate import'
         ].join('\n'),
@@ -2790,6 +2812,11 @@ export function createCommandHandlers(context) {
             '`!s3 db export` — Export essential (historical) tables as JSON',
             '`!s3 db export --logs` — Include event log tables (player/game-state events)',
             '`!s3 db export --all` — Include all tables (incl. auto-recoverable state)',
+            '`!s3 db export --to-file` — Skip the attachment; leave it in backups/ only',
+            '',
+            'Every export is written to `backups/` first and attached here only if the',
+            'compressed file fits under Discord\'s 25MB limit — the summary always names it.',
+            '',
             '`!s3 db import` — Import from attached .s3backup.json',
             '`!s3 db import --confirm [--dry-run]` — Execute or validate staged import',
             '',
@@ -2872,101 +2899,131 @@ export function createCommandHandlers(context) {
       const hasToFile = args.includes('--to-file');
       const tier = hasAll ? 'all' : hasLogs ? 'logs' : 'historical';
 
-      // ── --to-file: write to server filesystem ───────────────
-      if (hasToFile) {
-        // Same acknowledgement as `!s3 backup create` — this is the same export,
-        // and the 'all' tier is the slow one.
-        await sendDiscordMessage(message.channel, {
-          embeds: [{
-            color: 0xf39c12,
-            title: `⏳ Exporting to File (${tier})…`,
-            description: 'Writing tables to JSON. This can take a while on a large database — the result will be posted here when it finishes.',
-            timestamp: new Date().toISOString()
-          }]
-        }, 'S3', (...a) => plugin.verbose(...a));
-
-        try {
-          const result = await exportToFile(db, null, { tier, retention: 5 });
-          if (!result) {
-            await sendDiscordMessage(message.channel, {
-              embeds: [{ color: 0xe74c3c, title: '❌ File Export Failed', description: 'Could not write export file. Check disk space and permissions.', timestamp: new Date().toISOString() }]
-            }, 'S3', (...a) => plugin.verbose(...a));
-            return;
-          }
-          await sendDiscordMessage(message.channel, {
-            embeds: [{
-              color: 0x2ecc71,
-              title: `✅ Exported to File (${tier})`,
-              description: `Saved \`${result.filename}\` (${formatSize(result.sizeBytes)}) to \`backups/\` directory.`,
-              timestamp: new Date().toISOString()
-            }]
-          }, 'S3', (...a) => plugin.verbose(...a));
-        } catch (err) {
-          await sendDiscordMessage(message.channel, {
-            embeds: [{ color: 0xe74c3c, title: '❌ File Export Failed', description: `**${err.message}**`, timestamp: new Date().toISOString() }]
-          }, 'S3', (...a) => plugin.verbose(...a));
-        }
-        return;
-      }
-
-      // Show "running" embed
+      // The export always goes to a file first, whatever flags were given.
+      // Building it in memory to decide whether it fits in Discord is what
+      // OOM-killed the process: a production db-log dataset is ~900MB, and on
+      // Node 18 that cannot even be turned into a string. Streaming to disk has
+      // a fixed memory cost, and the attachment decision is then made against a
+      // known file size rather than a gamble. `--to-file` now means only "don't
+      // bother trying to attach it".
       await sendDiscordMessage(message.channel, {
         embeds: [{
-          color: 0x3498db,
-          title: '⏳ Exporting...',
-          description: `Exporting ${tier} tables. This may take a moment.`,
+          color: 0xf39c12,
+          title: `⏳ Exporting (${tier})…`,
+          description: 'Streaming tables to a backup file. This can take a while on a large database — the summary will be posted here when it finishes.',
           timestamp: new Date().toISOString()
         }]
       }, 'S3', (...a) => plugin.verbose(...a));
 
       try {
-        const exportObj = await exportToJSON(db, { tier });
+        const result = await exportToFile(db, null, {
+          tier,
+          retention: 5,
+          verboseLogger: (...a) => plugin.verbose(...a)
+        });
 
-        // Build per-table status lines for embed
-        const statusLines = Object.entries(exportObj.results).map(([name, r]) =>
-          r.status === 'ok'
-            ? `✅ **${name}**: ${r.rows} rows`
-            : `❌ **${name}**: ${r.error}`
-        );
-
-        // A model that declared no exportTier was included here by the default-tier
-        // fallback. Say so on the backup itself — the mount-time warning is only
-        // seen by whoever was reading the log at the time.
-        for (const w of exportObj.warnings || []) statusLines.push(`⚠️ ${w}`);
-
-        // Serialize for Discord attachment
-        let attachment;
-        try {
-          attachment = await serializeForAttachment(exportObj);
-        } catch (sizeErr) {
+        if (!result) {
           await sendDiscordMessage(message.channel, {
             embeds: [{
-              color: 0xf39c12,
-              title: '⚠️ Export Too Large',
-              description: sizeErr.message,
+              color: 0xe74c3c,
+              title: '❌ Export Failed',
+              description: 'Could not write the export file. Check disk space and permissions on the `backups/` directory.',
               timestamp: new Date().toISOString()
             }]
           }, 'S3', (...a) => plugin.verbose(...a));
           return;
         }
 
-        await message.channel.send({
+        // Per-table summary. Row counts come from what was actually streamed,
+        // so a table that failed part-way still reports the rows it wrote.
+        const statusLines = Object.entries(result.results).map(([name, r]) =>
+          r.status === 'ok'
+            ? `✅ **${name}**: ${(r.rows ?? 0).toLocaleString()} rows`
+            : `❌ **${name}**: ${r.error}`
+        );
+
+        // A model that declared no exportTier was included here by the default-tier
+        // fallback. Say so on the backup itself — the mount-time warning is only
+        // seen by whoever was reading the log at the time.
+        for (const w of result.warnings || []) statusLines.push(`⚠️ ${w}`);
+
+        const totalRows = Object.values(result.rowCounts || {}).reduce((a, b) => a + b, 0);
+        const fields = [
+          {
+            name: '📄 File',
+            value: `\`backups/${result.filename}\` (${formatSize(result.sizeBytes)}, ${totalRows.toLocaleString()} rows)`,
+            inline: false
+          },
+          {
+            name: 'ℹ️',
+            value: `Connector: \`${result.connector}\``,
+            inline: false
+          }
+        ];
+
+        // Only try to compress and attach when the operator did not ask for a
+        // file-only export. gzipFileForAttachment streams the compression and
+        // checks the size *before* allocating a Buffer for it.
+        let attachment = null;
+        if (!hasToFile) {
+          const gz = await gzipFileForAttachment(result.path, {
+            limitBytes: guildAttachmentLimit(message.guild)
+          });
+          if (gz.attachable) {
+            attachment = gz;
+          } else {
+            fields.push({
+              name: '📎 No attachment',
+              value: `${gz.reason}. The full export is on the server at \`backups/${result.filename}\`.`,
+              inline: false
+            });
+          }
+        }
+
+        // Discord caps an embed description at 4096 characters — a wide model
+        // registry can exceed that, and the send would fail outright.
+        let description = statusLines.join('\n');
+        if (description.length > 3900) {
+          const okCount = statusLines.filter((l) => l.startsWith('✅')).length;
+          description = statusLines.filter((l) => !l.startsWith('✅')).join('\n');
+          description = `${okCount} table(s) exported successfully.\n${description}`.slice(0, 3900);
+        }
+
+        const payload = {
           embeds: [{
             color: 0x2ecc71,
             title: `✅ Export Complete (${tier})`,
-            description: statusLines.join('\n'),
-            fields: [{
-              name: 'ℹ️',
-              value: `Connector: \`${exportObj.connector}\` | Exported at: <t:${Math.floor(exportObj.exportedAt / 1000)}:T>`,
-              inline: false
-            }],
+            description,
+            fields,
             timestamp: new Date().toISOString()
-          }],
-          files: [{
-            attachment: attachment.buffer,
-            name: attachment.filename
           }]
-        });
+        };
+        if (attachment) {
+          // sendDiscordMessage does not carry attachments — send directly.
+          try {
+            await message.channel.send({
+              ...payload,
+              files: [{ attachment: attachment.buffer, name: attachment.filename }]
+            });
+          } catch (sendErr) {
+            // The export is already on disk and is the thing the operator asked
+            // for. A rejected upload — a 413 from a limit we guessed too high, a
+            // channel that forbids attachments — must not be reported as a failed
+            // export, so fall back to the summary alone.
+            plugin.verbose(1, `[S3] Export attachment rejected (${sendErr.message}) — posting summary only.`);
+            payload.embeds[0].fields = [
+              ...fields,
+              {
+                name: '📎 No attachment',
+                value: `Discord rejected the upload (${sendErr.message}). The full export is on the server at \`backups/${result.filename}\`.`,
+                inline: false
+              }
+            ];
+            await sendDiscordMessage(message.channel, payload, 'S3', (...a) => plugin.verbose(...a));
+          }
+        } else {
+          await sendDiscordMessage(message.channel, payload, 'S3', (...a) => plugin.verbose(...a));
+        }
       } catch (err) {
         await sendDiscordMessage(message.channel, {
           embeds: [{

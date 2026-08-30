@@ -117,7 +117,11 @@ await runTest('executeWithRetry without totalTimeoutMs never races a stuck attem
   }, { attempts: 1, baseDelayMs: 0, jitterMs: 0 });
 
   assert.equal(result, 'ok');
-  assert.ok(Date.now() - start >= 15, 'must have actually waited for the slow attempt');
+  // Tolerance of 2ms: Windows' timer granularity is ~15.6ms, and setTimeout(15)
+  // can fire a fraction under its nominal delay, so a bare `>= 15` failed
+  // intermittently. What this asserts is that the slow attempt was actually
+  // awaited rather than skipped — 13ms is nowhere near the ~0ms a skip costs.
+  assert.ok(Date.now() - start >= 13, 'must have actually waited for the slow attempt');
 });
 
 await runTest('executeWithRetry with totalTimeoutMs fails fast on a stuck retry loop', async () => {

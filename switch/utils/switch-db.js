@@ -299,10 +299,18 @@ const SwitchDB = {
             // Truncate existing data — players start fresh with max tokens.
             // Uses bulkDelete with empty where clause for dialect-agnostic
             // truncation (works on SQLite, PostgreSQL, MySQL).
-            // NOTE: This is destructive and unconditional. The migration engine's
-            // version tracking prevents re-execution, but if this migration is
-            // ever manually re-run, all cooldown state will be lost again.
-            await qi.sequelize.getQueryInterface().bulkDelete('SwitchPlugin_PlayerCooldowns', {}, { transaction: qi.transaction });
+            //
+            // Skipped when this is a drift repair. Version tracking stops an
+            // ordinary re-run, but drift recovery deliberately re-applies an
+            // already-applied migration, and this reset would then destroy the
+            // live cooldown state — token balances, seed-bonus progress and
+            // scramble lockdowns — that the repair exists to preserve. The
+            // columns re-added above carry their own defaults, so every row is
+            // already consistent without wiping it. The reset is a one-time
+            // launch step for the token system, not part of the repair.
+            if (!qi.isReapply) {
+              await qi.sequelize.getQueryInterface().bulkDelete('SwitchPlugin_PlayerCooldowns', {}, { transaction: qi.transaction });
+            }
           }
         },
         down: async (qi) => {

@@ -25,7 +25,7 @@ import assert from 'node:assert/strict';
 import { Sequelize, DataTypes } from 'sequelize';
 
 import DBService from '../utils/db-service.js';
-import { buildSwitchesEmbed, buildKarmaEmbed } from '../utils/s3-commands.js';
+import { buildSwitchesEmbed, buildKarmaEmbed, guildAttachmentLimit } from '../utils/s3-commands.js';
 
 let passed = 0;
 let failed = 0;
@@ -193,5 +193,20 @@ test('buildSwitchesEmbed single-player: TB_RoundReport empty -> formatRoundDataN
     const [embed] = await buildSwitchesEmbed(plugin(db), 'Alice', null);
     assert.match(embed.description, /No TeamBalancer round data logged in this range/);
   }));
+
+// A live `!s3 db export --all` reported "❌ Export Failed — Request entity too
+// large" on a 200MB export that had in fact succeeded: the attachment ceiling
+// was hardcoded to the boosted 25MB, so an unboosted guild's 10MB limit was
+// exceeded and Discord's 413 was surfaced as a failed export. An unknown guild
+// must resolve to the smallest limit, never the largest.
+test('guildAttachmentLimit never over-estimates an unboosted or unknown guild', () => {
+  const MiB = 1024 * 1024;
+  assert.equal(guildAttachmentLimit({ premiumTier: 0 }), 10 * MiB);
+  assert.equal(guildAttachmentLimit({ premiumTier: 1 }), 10 * MiB);
+  assert.equal(guildAttachmentLimit({ premiumTier: 2 }), 50 * MiB);
+  assert.equal(guildAttachmentLimit({ premiumTier: 3 }), 100 * MiB);
+  assert.equal(guildAttachmentLimit(undefined), 10 * MiB, 'a DM or uncached guild must fall back to the floor');
+  assert.equal(guildAttachmentLimit({}), 10 * MiB, 'a guild with no tier must fall back to the floor');
+});
 
 await run();

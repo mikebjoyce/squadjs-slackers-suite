@@ -1,12 +1,21 @@
 # SquadJS Slackers Suite
 
-**Monorepo for S³ (SlackersSquadServices) and its consumer plugins — SmartAssign, Switch, EloTracker, and TeamBalancer.**
+**Monorepo for S³ (SlackersSquadServices), its consumer plugins — SmartAssign, Switch, EloTracker, and TeamBalancer — and S³-backed upgrades of stock SquadJS core plugins (`core-plugins/`).**
 
 ## Overview
 
 This repository contains a suite of SquadJS plugins built around **S³ (SlackersSquadServices)**, a centralized service container that owns the ground truth for server configuration, game-state lifecycle, player state, faction metadata, clan grouping, database access, logging, and cross-plugin event routing.
 
 The four consumer plugins — **SmartAssign**, **Switch**, **EloTracker**, and **TeamBalancer** — all depend on S³ and coordinate through its shared services rather than duplicating state or communicating directly.
+
+`core-plugins/` holds a second category: S³-backed drop-in replacements for
+*stock SquadJS core* plugins — same class/file name as the original, safety
+and robustness fixes only, no new features or config surface. Installing one
+overwrites the original file in place rather than adding a second,
+differently-named plugin alongside it. Files sit flat in `core-plugins/` as
+`<name>.js` (no per-plugin subfolder) since these are single-file drop-ins
+with no `utils/` of their own; each plugin's full writeup lives in its own
+top-of-file docblock rather than a separate README.
 
 For the design rationale and architectural decisions behind S³, see **[WHY_S3.md](WHY_S3.md)**.
 
@@ -17,6 +26,7 @@ For the design rationale and architectural decisions behind S³, see **[WHY_S3.m
 | **Switch** | [`switch/`](switch/) | Team-change management with cooldowns, queues, and scramble lockout — [behaviour reference](switch/SWITCH_BEHAVIOUR.md) |
 | **EloTracker** | [`elo-tracker/`](elo-tracker/) | Player rating tracking with round history |
 | **TeamBalancer** | [`team-balancer/`](team-balancer/) | Scramble-based team balancing with clan grouping |
+| **DBLog** *(core upgrade)* | [`core-plugins/db-log.js`](core-plugins/db-log.js) | Drop-in, DB-outage-safe replacement for core's `db-log.js` stats logger |
 
 ## Mount Order
 
@@ -100,6 +110,7 @@ not all the same, so pinning S³ to the lowest one will stop the others mounting
 |---|---|---|
 | SmartAssign | 1.0.0 | Baseline service container |
 | TeamBalancer | 1.0.0 | Baseline service container |
+| DBLog *(core upgrade)* | 1.0.0 | Baseline service container |
 | EloTracker | 1.2.4 | |
 | Switch | 1.4.0 | Seed-bonus grants need accessors added in 1.4.0; on an older S³ they are `undefined` and the UPDATE throws mid-grant |
 
@@ -132,7 +143,7 @@ This produces an `out/` folder with the correct `plugins/` and `utils/` layout. 
 
 | Flag | Description |
 |---|---|
-| `--plugin=<name>` | Plugin(s) to install: `s3`, `team-balancer`, `elo-tracker`, `smart-assign`, `switch`, or `all` (comma-separated). S3 is always auto-included. |
+| `--plugin=<name>` | Plugin(s) to install: `s3`, `team-balancer`, `elo-tracker`, `smart-assign`, `switch`, `db-log`, or `all` (comma-separated). S3 is always auto-included. |
 | `--output=<path>` | Output directory (default: `./out`) |
 | `--with-tools` | Also copy `tools/` directories |
 | `--with-testing` | Also copy `testing/` directories |
@@ -144,6 +155,7 @@ Examples:
 ```bash
 node install.cjs --plugin=team-balancer                      # TeamBalancer + S3
 node install.cjs --plugin=switch,smart-assign                # Switch + SmartAssign + S3
+node install.cjs --plugin=db-log                             # DBLog (core-plugins/db-log.js) + S3
 node install.cjs --plugin=all --with-tools                   # Everything including tools
 node install.cjs --plugin=all --output=../squadjs/squad-server  # Write directly to SquadJS
 ```
@@ -163,7 +175,8 @@ squad-server/
 │   ├── smart-assign.js               (from smart-assign/plugins/)
 │   ├── switch.js                     (from switch/plugins/)
 │   ├── elo-tracker.js                (from elo-tracker/plugins/)
-│   └── team-balancer.js              (from team-balancer/plugins/)
+│   ├── team-balancer.js              (from team-balancer/plugins/)
+│   └── db-log.js                     (from core-plugins/ — overwrites core's file of the same name)
 └── utils/
     ├── game-state-service.js         (from s3/utils/)
     ├── db-service.js                 (from s3/utils/)
@@ -200,6 +213,7 @@ squad-server/
    - [Switch](switch/README.md#configuration-options) — [Behaviour Reference](switch/SWITCH_BEHAVIOUR.md)
    - [EloTracker](elo-tracker/README.md#configuration-options)
    - [TeamBalancer](team-balancer/README.md#configuration-options)
+   - [DBLog (core upgrade)](core-plugins/db-log.js) — see its top-of-file docblock; no config changes needed if you already run core's `db-log.js`
 
 ### Logging
 

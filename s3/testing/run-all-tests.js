@@ -66,6 +66,9 @@ const CATEGORY_TESTS = {
     'test-migration-bulk-types.js',
     // touches.data post-conditions: same shape again, all three engines.
     'test-migration-data-assertions.js',
+    // Drift recovery across the DB states a real server can be in — brand new,
+    // behind, drifted, both at once, several plugins — on all three engines.
+    'test-drift-recovery-matrix.js',
     // Spawns child processes to assert stdout/stderr separation.
     'test-stderr-diagnostics.js',
     // Replays every plugin's real migrations across DB states, so it is slower

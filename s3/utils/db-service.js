@@ -1333,20 +1333,197 @@ export default class DBService {
    *
    * @param {Array<{pluginName: string, table: string, model?: string, missing?: string[], missingRows?: Array<{key: string, value: string}>, dataViolations?: Array<{column: string, offenders: number}>, extra?: string[], error?: string}>} drift
    */
+  /**
+   * How far back to roll a plugin's recorded version so that re-running its
+   * migrations actually restores what drifted.
+   *
+   * Rolling back one version is only correct when the missing schema belongs to
+   * the newest migration. Observed on a live server: SwitchPlugin_PlayerCooldowns
+   * had lost five columns added by switch v3 plus one added by v5. Rolling back
+   * to v4 made only v5 pending, so `!s3 migrate force` re-added v5's column,
+   * drift re-fired on v3's five, the version was rolled back to v4 again — a
+   * repair loop that ran on every mount and could never converge.
+   *
+   * Each migration's mandatory `touches` says which tables and columns it owns,
+   * so the correct target is one below the LOWEST-versioned migration owning
+   * anything currently missing. Falls back to the old expected-1 behaviour when
+   * no migration claims the drifting schema, which is the best guess available.
+   *
+   * @param {string} pluginName
+   * @param {Array<Object>} drift - entries from _detectSchemaDrift()
+   * @returns {number} version to record, never below 0
+   */
+  /**
+   * Recorded schema version per plugin, straight from S3_SchemaVersions.
+   *
+   * @returns {Promise<Map<string, number>>} pluginName -> applied version
+   */
+  async getRecordedVersions() {
+    const versions = new Map();
+    if (!this.SchemaVersionsModel) return versions;
+    const rows = await this.SchemaVersionsModel.findAll({ raw: true });
+    for (const row of rows) versions.set(row.pluginName, row.version);
+    return versions;
+  }
+
+  /**
+   * Lowest migration version that declares ownership of a thing, or null.
+   *
+   * `kind` selects which `touches` category to search: 'columns' matches a
+   * table+column pair, 'creates' and 'rows' match a table alone.
+   */
+  _owningVersion(migrations, kind, table, column = null) {
+    const wanted = String(table).toLowerCase();
+    let lowest = null;
+    for (const migration of migrations) {
+      const touches = migration.touches;
+      if (!touches) continue;
+      let owns = false;
+      if (kind === 'creates') {
+        owns = (touches.creates || []).some((t) => String(t).toLowerCase() === wanted);
+      } else if (kind === 'rows') {
+        owns = Object.keys(touches.rows || {}).some((t) => t.toLowerCase() === wanted);
+      } else {
+        const target = String(column).toLowerCase();
+        for (const [t, columns] of Object.entries(touches.columns || {})) {
+          if (t.toLowerCase() !== wanted) continue;
+          if ((columns || []).some((c) => String(c).toLowerCase() === target)) { owns = true; break; }
+        }
+      }
+      if (owns && (lowest === null || migration.version < lowest)) lowest = migration.version;
+    }
+    return lowest;
+  }
+
+  /**
+   * Narrow raw drift to what is genuinely drift for this database's state.
+   *
+   * verifyLiveSchema() compares registered models against the live schema and
+   * cannot tell "this column was applied and then lost" from "this column
+   * belongs to a migration that has not run yet". Both read as missing. That
+   * distinction does not matter while drift is only ever checked on a server
+   * with nothing pending — which is exactly why the check was gated that way,
+   * and exactly why a server that was both behind AND drifted needed two
+   * passes to repair: the drift was invisible until the pending run finished.
+   *
+   * Checking drift on a server with pending migrations means separating the two
+   * here, or every routine version upgrade would raise a false drift alarm and
+   * roll versions backwards. `touches` already records which migration owns
+   * each table and column, so anything owned by a migration ABOVE the recorded
+   * version is simply not applied yet and is dropped. Plugins with no recorded
+   * version at all are dropped wholesale — nothing has ever been applied, so
+   * nothing can have drifted, which is the brand-new-install case.
+   *
+   * @param {Array<Object>} drift - entries from verifyLiveSchema()
+   * @returns {Promise<Array<Object>>} entries trimmed to genuine drift
+   */
+  async filterDriftToApplied(drift) {
+    const recorded = await this.getRecordedVersions();
+    const kept = [];
+
+    for (const entry of drift) {
+      const applied = recorded.get(entry.pluginName) || 0;
+      if (applied <= 0) continue; // never installed here — cannot have drifted
+
+      const migrations = this._migrationEngine?.getMigrations?.(entry.pluginName) || [];
+
+      // A table whose creating migration has not run yet is legitimately absent,
+      // and so is everything in it.
+      const createdBy = this._owningVersion(migrations, 'creates', entry.table);
+      if (createdBy !== null && createdBy > applied) continue;
+
+      const trimmed = { ...entry };
+
+      if (entry.missing) {
+        trimmed.missing = entry.missing.filter((column) => {
+          const owner = this._owningVersion(migrations, 'columns', entry.table, column);
+          // An undeclared column cannot be attributed to a pending migration,
+          // so treat it as drift rather than silently ignoring a real loss.
+          return owner === null || owner <= applied;
+        });
+        if (trimmed.missing.length === 0) delete trimmed.missing;
+      }
+
+      if (entry.missingRows) {
+        const owner = this._owningVersion(migrations, 'rows', entry.table);
+        if (owner !== null && owner > applied) delete trimmed.missingRows;
+      }
+
+      if (entry.dataViolations) {
+        trimmed.dataViolations = entry.dataViolations.filter((violation) => {
+          const owner = this._owningVersion(migrations, 'columns', entry.table, violation.column);
+          return owner === null || owner <= applied;
+        });
+        if (trimmed.dataViolations.length === 0) delete trimmed.dataViolations;
+      }
+
+      if (trimmed.missing || trimmed.missingRows || trimmed.dataViolations || trimmed.error) {
+        kept.push(trimmed);
+      }
+    }
+
+    return kept;
+  }
+
+  _rollbackTargetForDrift(pluginName, drift) {
+    const expected = this._expectedVersions.get(pluginName) || 1;
+    const fallback = Math.max(0, expected - 1);
+
+    const migrations = this._migrationEngine?.getMigrations?.(pluginName) || [];
+    if (migrations.length === 0) return fallback;
+
+    // Identifier case is not portable — MySQL with lower_case_table_names=1
+    // reports tables folded to lowercase while `touches` declares them as
+    // written — so match case-insensitively throughout.
+    const key = (table, column) => `${String(table).toLowerCase()}.${String(column).toLowerCase()}`;
+    const missingColumns = new Set();
+    const missingTables = new Set();
+    for (const entry of drift) {
+      if (entry.pluginName !== pluginName) continue;
+      for (const column of entry.missing || []) missingColumns.add(key(entry.table, column));
+      for (const violation of entry.dataViolations || []) missingColumns.add(key(entry.table, violation.column));
+      if (entry.missingRows || entry.dataViolations) missingTables.add(String(entry.table).toLowerCase());
+    }
+    if (missingColumns.size === 0 && missingTables.size === 0) return fallback;
+
+    let lowest = null;
+    for (const migration of migrations) {
+      const touches = migration.touches;
+      if (!touches) continue;
+      let owns = false;
+      for (const [table, columns] of Object.entries(touches.columns || {})) {
+        if ((columns || []).some((column) => missingColumns.has(key(table, column)))) { owns = true; break; }
+      }
+      if (!owns) {
+        owns = Object.keys(touches.rows || {}).some((table) => missingTables.has(table.toLowerCase()));
+      }
+      if (owns && (lowest === null || migration.version < lowest)) lowest = migration.version;
+    }
+
+    return lowest === null ? fallback : Math.max(0, lowest - 1);
+  }
+
   async _handleDetectedDrift(drift) {
     const stderrLines = [];
+    // Labelled "CONFIRMED" rather than "POST-MIGRATION": this runs both after a
+    // migration pass and, since one-pass repair, before one — on a server that
+    // is behind AND drifted. What the label marks is that these entries have
+    // already been through filterDriftToApplied(), so every one names schema
+    // that a migration recorded as applied should have left behind. The raw
+    // "[DB] DRIFT:" lines above it are the unfiltered view and will legitimately
+    // list more, including columns merely waiting on a pending migration.
     for (const entry of drift) {
       if (entry.missing) {
-        this.verboseLogger(1, `[DB] POST-MIGRATION DRIFT: ${entry.table} missing columns: ${entry.missing.join(', ')}`);
+        this.verboseLogger(1, `[DB] CONFIRMED DRIFT: ${entry.table} missing columns: ${entry.missing.join(', ')}`);
         stderrLines.push(`${entry.pluginName}: ${entry.table} missing column(s): ${entry.missing.join(', ')}`);
       }
       if (entry.missingRows) {
-        this.verboseLogger(1, `[DB] POST-MIGRATION ROW DRIFT: ${entry.table} missing row(s): ${entry.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
+        this.verboseLogger(1, `[DB] CONFIRMED ROW DRIFT: ${entry.table} missing row(s): ${entry.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
         stderrLines.push(`${entry.pluginName}: ${entry.table} missing row(s): ${entry.missingRows.map(r => `${r.key}=${r.value}`).join(', ')}`);
       }
       if (entry.dataViolations) {
         const summary = entry.dataViolations.map(v => `${v.offenders} row(s) with NULL "${v.column}"`).join('; ');
-        this.verboseLogger(1, `[DB] POST-MIGRATION DATA DRIFT: ${entry.table}: ${summary}`);
+        this.verboseLogger(1, `[DB] CONFIRMED DATA DRIFT: ${entry.table}: ${summary}`);
         stderrLines.push(`${entry.pluginName}: ${entry.table}: ${summary}`);
       }
     }
@@ -1372,18 +1549,30 @@ export default class DBService {
     // prompt renders "v2 → v3" rather than "v-1 → v3". The S3_SchemaVersions
     // DB row is also rolled back below, so runMigrations() will detect the
     // gap and re-apply the idempotent migration.
-    this._pendingMigrations = pluginNames.map(pn => ({
-      pluginName: pn,
-      currentVersion: (this._expectedVersions.get(pn) || 1) - 1,
-      expectedVersion: this._expectedVersions.get(pn) || -1,
-      behind: 1
-    }));
+    const driftPending = pluginNames.map(pn => {
+      const currentVersion = this._rollbackTargetForDrift(pn, drift);
+      const expectedVersion = this._expectedVersions.get(pn) || -1;
+      return {
+        pluginName: pn,
+        currentVersion,
+        expectedVersion,
+        behind: Math.max(1, expectedVersion - currentVersion)
+      };
+    });
+    // Merge rather than replace. Drift can now be detected while other plugins
+    // have ordinary migrations pending; overwriting the list would drop those
+    // plugins from the prompt and leave them un-migrated with no further prompt.
+    const untouched = (this._pendingMigrations || []).filter(p => !pluginNames.includes(p.pluginName));
+    this._pendingMigrations = [...untouched, ...driftPending];
     // Roll back S3_SchemaVersions records so runMigrations() sees a pending
     // migration and re-applies the idempotent up(). Without this, !s3 migrate
     // force would skip the migration because the DB still says e.g. v3 is
     // applied, even though columns are missing.
+    // Tell the engine these runs are repairs, so a migration with a one-time
+    // destructive step can skip it (see qi.isReapply in migration-engine.js).
+    this._migrationEngine?.markDriftReapply?.(pluginNames);
     for (const pn of pluginNames) {
-      const prevVersion = Math.max(0, (this._expectedVersions.get(pn) || 1) - 1);
+      const prevVersion = this._rollbackTargetForDrift(pn, drift);
       if (this.SchemaVersionsModel) {
         try {
           const existing = await this.SchemaVersionsModel.findOne({ where: { pluginName: pn } });
@@ -1743,7 +1932,7 @@ export default class DBService {
 
     const sqlitePaths = new Set();
 
-    for (const [key, value] of Object.entries(this.connectors)) {
+    for (const value of Object.values(this.connectors)) {
       if (!value || typeof value !== 'object') continue;
 
       // A SQLite-like connector has either a dialect of 'sqlite' or a 'storage' property

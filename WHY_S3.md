@@ -133,7 +133,8 @@ Existing features (double-switch, admin match-end switching) are now S³-aware �
 | **End-of-match switches** | Admin-only DB-backed command (`matchend`/`matchendsquad`), local `ROUND_ENDED` handling | Same admin command, now reading round/phase state from S³'s GameState service instead of local tracking |
 | **Reconnect memory** | Per-plugin | Shared via S³ PlayersService |
 | **DB migrations** | Manual per-plugin | Unified MigrationEngine with versioning & rollback |
-| **Schema drift protection** | None | `_checkS3Version()` enforces compatibility at mount |
+| **Schema drift protection** | None | Every mount re-checks the live database against what migrations declared, and repairs schema that has gone missing |
+| **Plugin/container compatibility** | None | `_checkS3Version()` fails a plugin that needs a newer S³ than is installed, instead of half-working |
 | **Plugin mount order** | Ad-hoc | S³-first guarantee with readiness gating |
 | **Testing** | Per-plugin | Per-plugin + S³ integration test suite |
 
@@ -154,7 +155,7 @@ Existing features (double-switch, admin match-end switching) are now S³-aware �
 Every feature from the legacy standalone plugins has been ported forward:
 
 - All configuration options are preserved (with additions — nothing removed). For example, if your legacy TeamBalancer config had `"maxWinStreak": 2` and `"scramblePercentage": 0.5`, those same keys work identically in the S³ version.
-- Database schemas are compatible; the MigrationEngine handles upgrades automatically on first mount.
+- Database schemas are compatible; the MigrationEngine works out which upgrades your database needs on first mount and applies them once you confirm in Discord (or immediately, if you set `autoMigrate: true`).
 - All Discord commands, RCON broadcasts, and admin workflows continue to work identically.
 - The scramble algorithm, TrueSkill engine, and assignment logic are the same battle-tested implementations.
 - Plugin-to-plugin integration (TB ↔ Switch, TB ↔ EloTracker, SA ↔ EloTracker) is preserved and strengthened.
@@ -169,7 +170,7 @@ For contributors and server admins who maintain forks or custom configs:
 
 - **One repo instead of four.** All plugins live in a single monorepo. Instead of cloning four separate repos and manually copying `plugins/` and `utils/` directories into your SquadJS installation, a single `node install.cjs --plugin=all` assembles everything with collision detection.
 - **Shared services = one fix, four wins.** A bug fix in clan tag detection benefits EloTracker, TeamBalancer, SmartAssign, and Switch simultaneously.
-- **Unified migration pipeline.** Schema changes are versioned, reversible, and applied automatically — no more manual SQL scripts per plugin.
+- **Unified migration pipeline.** Schema changes are versioned and reversible, applied in order behind a Discord confirmation, with a backup taken first — no more manual SQL scripts per plugin.
 - **Runtime compatibility enforcement.** Every consumer plugin checks its S³ version at mount time and refuses to start if incompatible. No silent degradation, no mystery bugs from version mismatch.
 - **Coherent test suite.** S³ integration tests validate cross-plugin locking, event delivery, and mount-order behavior — scenarios that couldn't be tested in the standalone architecture.
 
@@ -215,7 +216,7 @@ Most config options map 1:1 from the legacy plugins. Check each plugin's README 
 
 ### Database
 
-On first mount, the MigrationEngine automatically detects your existing schema and applies any needed upgrades. No manual migration steps are required. Backups are handled through S³'s built-in backup/restore system (`!s3 backup`, `!s3 restore`).
+On first mount, the MigrationEngine detects your existing schema and works out which upgrades it needs. It posts what it intends to do to your admin channel and waits for `!s3 confirm <token>`; set `autoMigrate: true` in the S³ config if you would rather it just run. Either way it takes a backup before touching anything, and re-checks afterwards that the schema it expected is really there. No hand-written SQL is required. Backups are managed through `!s3 backup list` / `create` / `restore`.
 
 ---
 

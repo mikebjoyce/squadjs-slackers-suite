@@ -167,7 +167,7 @@ export default class SlackersSquadServices extends BasePlugin {
     return false;
   }
 
-  static get version() { return '1.5.1'; }
+  static get version() { return '1.6.0'; }
 
   static get optionsSpecification() {
     return {
@@ -724,7 +724,7 @@ export default class SlackersSquadServices extends BasePlugin {
     // Use fresh verifySchemaVersions() instead of cached getPendingMigrations()
     // so the check reflects all plugins that have registered since mount.
     const status = await db.verifySchemaVersions();
-    const pending = status.pending;
+    let pending = status.pending;
 
     // Refresh the cached pending list and create the migration gate so that
     // getPendingMigrations() and waitForMigrations() return correct data
@@ -734,6 +734,27 @@ export default class SlackersSquadServices extends BasePlugin {
       db._migrationGate = new Promise((resolve) => {
         db._resolveMigrationGateFn = resolve;
       });
+    }
+
+    // Drift on a server that ALSO has migrations pending used to be invisible
+    // here — the check below only ran when nothing was pending — so it could
+    // only surface in post-migration verification, i.e. after a run. Repairing
+    // it then took a second run: one to reveal the drift, one to fix it.
+    // Checking now folds both into the single prompt the operator already gets.
+    // filterDriftToApplied() is what makes this safe: it drops schema belonging
+    // to migrations that simply have not run yet, so a routine upgrade — and a
+    // brand-new install, where nothing exists at all — raises no false alarm.
+    if (pending && pending.length > 0) {
+      const raw = await db.verifyLiveSchema();
+      db._lastDriftResult = raw;
+      const drift = await db.filterDriftToApplied(raw);
+      if (drift.some(e => e.missing || e.missingRows || e.dataViolations)) {
+        this.verbose(1, `[S3 Migration] Schema drift detected alongside ${pending.length} pending migration(s) — ${drift.length} issue(s).`);
+        await db._handleDetectedDrift(drift);
+        // _handleDetectedDrift() widens the pending list to the rollback targets
+        // it just wrote, so the prompt renders the full range to be re-applied.
+        pending = db._pendingMigrations;
+      }
     }
 
     if (!pending || pending.length === 0) {

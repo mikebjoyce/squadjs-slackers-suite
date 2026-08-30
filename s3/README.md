@@ -152,8 +152,9 @@ The `!s3` admin command surface is organised across:
 | `!s3 switches export [range] [period] [--json]` | `s3-commands.js` | One row per `daily`/`weekly`/`monthly` period per active player — games played, total switches, and the full source breakdown — as a CSV (default) or JSON file attachment. Players silent all period get no row |
 | `!s3 karma <ident> [range]` | `s3-commands.js` | Win-rate of a player's own switch decisions (self/untracked only — excludes balancer and SmartAssign moves) vs. the eventual round winner, with switch frequency context (N switches in G games — P% of rounds) and a directional verdict |
 | `!s3 db status` | `s3-commands.js` | Connector, pending migrations, per-plugin schema versions |
-| `!s3 db export` | `s3-export-import.js` | JSON export. Models declare an `exportTier` — `historical` and `logging` are included by default, `ephemeral` is not |
+| `!s3 db export` | `s3-export-import.js` | JSON export, streamed to `backups/` a row batch at a time and attached to the reply only if the gzipped file fits the Discord server's own upload limit (10 MB unboosted, 50 MB at boost tier 2, 100 MB at tier 3). Over that — or if the upload fails anyway — the file stays on disk and the summary embed names it. Models declare an `exportTier` — `historical` and `logging` are included by default, `ephemeral` is not |
 | `!s3 db export --all` | `s3-export-import.js` | Also includes the `ephemeral` tier |
+| `!s3 db export --to-file` | `s3-export-import.js` | Same export, no attachment attempt |
 | `!s3 db import` | `s3-export-import.js` | Validates `.s3backup.json`, posts confirmation embed. **Writes nothing** |
 | `!s3 db import --confirm` | `s3-export-import.js` | Executes upsert import, reports per-table counts |
 | `!s3 db import --confirm --dry-run` | `s3-export-import.js` | Validate only, no writes |

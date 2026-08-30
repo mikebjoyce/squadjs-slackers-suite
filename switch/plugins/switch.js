@@ -200,7 +200,7 @@ const POST_SWITCH_LOCKOUT_MS = 10_000;
  *
  */
 export default class Switch extends S3DiscordPluginBase {
-    static version = '2.5.6';
+    static version = '2.5.7';
 
     static get description() {
         return "Switch plugin with persistent join timers";
@@ -524,6 +524,14 @@ export default class Switch extends S3DiscordPluginBase {
      * and ChangeTeam detection.
      */
     _checkS3Version() {
+        // 1.6.0 — migration v3 guards its cooldown-table truncate on `qi.isReapply`,
+        // which only S³ 1.6.0 and later set. On an older engine the property is
+        // undefined, so `!qi.isReapply` is true and the truncate runs during a
+        // drift repair — destroying every player's token balance, seed-bonus
+        // progress and scramble lockdown, which is the exact state the repair was
+        // run to preserve. It fails open, silently, and only on the recovery path,
+        // so nothing short of a version gate catches it.
+        //
         // 1.4.0 — migration v5 declares touches.data, which only S³ 1.4.0 and
         // later validate or verify. An older engine ignores the key silently:
         // registration succeeds, the migration applies, and the operator is left
@@ -534,7 +542,7 @@ export default class Switch extends S3DiscordPluginBase {
         // calls _s3db.caseInsensitiveLikeOp(), both added in S³ 1.2.2. Against an
         // older S³ these are undefined, so the seed-bonus UPDATE would throw
         // mid-grant rather than failing at mount where it is diagnosable.
-        const required = '1.4.0';
+        const required = '1.6.0';
         const actual = this._s3?.version;
         if (!this._s3VersionAtLeast(required)) {
             throw new Error(

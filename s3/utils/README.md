@@ -70,5 +70,5 @@ await db.unmount();
   the whole retry loop's wall-clock time (not each attempt) — opt-in, not part of the
   constructor's `defaultRetry`. See S3_DEVELOPER_GUIDE.md's DBService API table for when to
   use it and its backoff side effect.
-- Migration tracking is provided via `S3_Migrations` + `registerMigration()` / `runMigrations()`.
-- Version numbering is shared with the S³ plugin (currently v1.2.1).
+- Migration tracking is provided via the `S3_SchemaVersions` table (one row per plugin) + `registerMigrations()` / `runMigrations()`. The flat `S3_Migrations` table this replaced is gone — nothing reads it.
+- Version numbering is shared with the S³ plugin; `SlackersSquadServices.version` is the source of truth.
