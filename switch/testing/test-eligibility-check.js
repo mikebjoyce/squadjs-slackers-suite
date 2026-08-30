@@ -241,6 +241,49 @@ async function testSuite() {
     const result = await plugin._checkSwitchEligibility({ eosID: 'player2' });
     assert.strictEqual(result.eligible, true, 'A different player should be unaffected by player1\'s lockout');
   });
+
+  // ── DB outage fallback (fail-open) ───────────────────────────
+  // A player on cooldown/scramble-lock, whose eligibility check hits an
+  // unreachable DB, must be let through rather than silently dropped
+  // (the pre-fix behavior: an uncaught rejection reached the caller's
+  // catch-all, which never messages the player).
+
+  await runTest('Eligible: DB in active network backoff — fails open even on a cooldown-holding player', async () => {
+    const clock = new MockClock(BASE_TIME);
+    const { plugin } = createMockHarness({ maxSwitchTokens: 2, switchCooldownHours: 1 }, clock);
+    const db = createMockDb();
+    await db.upsert({ eosID: 'player1', tokenBalance: 0, tokenRegenAnchor: new Date(BASE_TIME) });
+    plugin._testDb = db;
+    plugin._s3db._skip = true;
+    const result = await plugin._checkSwitchEligibility({ eosID: 'player1' });
+    assert.strictEqual(result.eligible, true, 'Backoff-skipped DB must fail open, not deny');
+  });
+
+  await runTest('Eligible: DB lookup throws — fails open even on a scramble-locked player', async () => {
+    const clock = new MockClock(BASE_TIME);
+    const { plugin } = createMockHarness({ maxSwitchTokens: 2, switchCooldownHours: 1 }, clock);
+    const db = createMockDb();
+    await db.upsert({
+      eosID: 'player1',
+      tokenBalance: 5,
+      tokenRegenAnchor: new Date(BASE_TIME),
+      scrambleLockdownExpiry: new Date(BASE_TIME + 30 * 60 * 1000)
+    });
+    db.findByPk = async () => { throw new Error('SequelizeConnectionAcquireTimeoutError: Operation timeout'); };
+    plugin._testDb = db;
+    const result = await plugin._checkSwitchEligibility({ eosID: 'player1' });
+    assert.strictEqual(result.eligible, true, 'A thrown DB error must fail open, not deny or propagate');
+  });
+
+  await runTest('Denied: post-switch lockout still applies even when the DB is unreachable', async () => {
+    const clock = new MockClock(BASE_TIME);
+    const { plugin } = createMockHarness({ maxSwitchTokens: 2, switchCooldownHours: 1 }, clock);
+    plugin._s3db._skip = true;
+    plugin._recordRecentSwitch('player1');
+    const result = await plugin._checkSwitchEligibility({ eosID: 'player1' });
+    assert.strictEqual(result.eligible, false, 'In-memory post-switch lockout is DB-independent and must still deny');
+    assert.strictEqual(result.reason, 'recent_switch');
+  });
 }
 
 // ── Run ──────────────────────────────────────────────────────

@@ -446,6 +446,13 @@ export default class Switch extends S3DiscordPluginBase {
 
         this.recentSwitches = [];          // { eosID, datetime } — post-switch lockout, see _recordRecentSwitch()
         this.recentDoubleSwitches = [];
+
+        // In-memory mirror of SwitchPlugin_Endmatches, kept in sync with every DB
+        // write. { id: number|null, name, eosID, steamID } — id is null for an
+        // entry that was queued while the DB was unreachable and never got a row.
+        // doSwitchMatchend() reads from this (not the DB) so a DB outage at round
+        // end doesn't silently drop players who requested a match-end switch.
+        this._matchendQueue = [];
         this._reconnectLockoutClearTimeouts = new Map();
 
          // v2.3.0 Stage 2: Seed presence tracking
@@ -658,18 +665,43 @@ export default class Switch extends S3DiscordPluginBase {
     async doSwitchMatchend() {
         try {
             const Endmatches = this._getModel('SwitchPlugin_Endmatches');
-            if (!Endmatches) return;
-            const requests = await Endmatches.findAll();
-            if (requests.length === 0) return;
+
+            // The in-memory queue is authoritative for "who asked to be switched
+            // this round" — it's populated by every enqueue regardless of whether
+            // the DB write behind it succeeded. DB rows are read too and merged
+            // in, so a request persisted before a restart (and therefore missing
+            // from the freshly-reset in-memory queue) still gets processed.
+            let dbRequests = [];
+            if (Endmatches) {
+                try {
+                    dbRequests = await Endmatches.findAll();
+                } catch (err) {
+                    this.verbose(1, `[Switch] doSwitchMatchend: DB unreachable, processing in-memory queue only: ${err.message}`);
+                }
+            }
+
+            const seen = new Set();
+            const merged = [];
+            for (const source of [...dbRequests, ...this._matchendQueue]) {
+                const key = source.eosID || source.steamID;
+                if (!key || seen.has(key)) continue;
+                seen.add(key);
+                merged.push(source);
+            }
+
+            if (merged.length === 0) {
+                this._matchendQueue = [];
+                return;
+            }
 
             // Resolve each request to an eosID up front — the roster is still
             // populated at round end, and this is the last moment it is.
-            const resolved = requests.map((pl) => {
+            const resolved = merged.map((pl) => {
                 let eosID = pl.eosID || null;
                 if (!eosID && pl.steamID && Array.isArray(this.server?.players)) {
                     eosID = this.getPlayerBySteamID(pl.steamID)?.eosID || null;
                 }
-                return { id: pl.id, name: pl.name, eosID, steamID: pl.steamID };
+                return { id: pl.id ?? null, name: pl.name, eosID, steamID: pl.steamID };
             });
 
             for (const r of resolved) {
@@ -697,12 +729,24 @@ export default class Switch extends S3DiscordPluginBase {
                 }
             });
 
-            // Consume the batch unconditionally — see (1) above.
-            const ids = resolved.map(r => r.id);
-            const cleared = await Endmatches.destroy({ where: { id: { [Op.in]: ids } } });
-            this.verbose(1, `[Switch] Matchend: processed ${resolved.length} requests (${failed} failed), cleared ${cleared} rows.`);
+            // Consume the batch unconditionally — see (1) above. The in-memory
+            // queue is cleared regardless of DB reachability; the DB rows (if
+            // any) are cleared best-effort.
+            this._matchendQueue = [];
+            const ids = resolved.map(r => r.id).filter((id) => id != null);
+            if (Endmatches && ids.length > 0) {
+                try {
+                    const cleared = await Endmatches.destroy({ where: { id: { [Op.in]: ids } } });
+                    this.verbose(1, `[Switch] Matchend: processed ${resolved.length} requests (${failed} failed), cleared ${cleared} rows.`);
+                } catch (err) {
+                    this.verbose(1, `[Switch] Matchend: processed ${resolved.length} requests (${failed} failed), but failed to clear DB rows: ${err.message}`);
+                }
+            } else {
+                this.verbose(1, `[Switch] Matchend: processed ${resolved.length} requests (${failed} failed).`);
+            }
         } catch (err) {
             this.verbose(1, `[Switch] doSwitchMatchend failed: ${err.message || err}`);
+            this._matchendQueue = [];
         }
     }
 
@@ -941,8 +985,31 @@ export default class Switch extends S3DiscordPluginBase {
             }
         }
 
+        // DB-outage fallback: this read bypasses _withDb (it's a hot path, not a
+        // write worth retrying), so it must handle unreachability itself. Policy
+        // is fail-open — during an outage a player can't be told their real
+        // cooldown/lock state, and blocking switches entirely (as the pre-fix
+        // behavior did, silently, via the unhandled rejection in the caller's
+        // catch-all) is worse than temporarily skipping enforcement.
         const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
-        const cooldownData = PlayerCooldowns ? await PlayerCooldowns.findByPk(eosID) : null;
+        let cooldownData = null;
+        let dbUnavailable = false;
+        if (PlayerCooldowns) {
+            if (this._s3db?.shouldSkipDb?.()) {
+                dbUnavailable = true;
+            } else {
+                try {
+                    cooldownData = await PlayerCooldowns.findByPk(eosID);
+                } catch (err) {
+                    dbUnavailable = true;
+                    this.reportError('DB', `Error checking cooldown for ${eosID}: ${err.message}`, err);
+                }
+            }
+        }
+        if (dbUnavailable) {
+            this.verbose(1, `[Switch] DB unavailable — failing open for ${eosID} (cooldown/lock checks skipped).`);
+            return { eligible: true };
+        }
         const now = Date.now();
 
         // Liberal/seed mode bypasses all cooldown and lock restrictions.
@@ -1317,27 +1384,42 @@ export default class Switch extends S3DiscordPluginBase {
      *   player was already queued or the model is unavailable.
      */
     async _enqueueMatchendSwitch(player) {
-        const Endmatches = this._getModel('SwitchPlugin_Endmatches');
-        if (!Endmatches || !player) return false;
+        if (!player) return false;
 
         // Match on whichever identifier we actually hold. eosID is the one
         // doSwitchMatchend switches on, so it is the one that matters.
-        const match = [];
-        if (player.eosID) match.push({ eosID: player.eosID });
-        if (player.steamID) match.push({ steamID: player.steamID });
-        if (match.length === 0) return false;
+        if (!player.eosID && !player.steamID) return false;
 
-        const existing = await Endmatches.findOne({ where: { [Op.or]: match } });
-        if (existing) {
+        // In-memory dedup is the primary gate — it works identically whether or
+        // not the DB is reachable, and covers the case where an earlier enqueue
+        // never made it to a row (DB was down at the time).
+        const alreadyQueued = this._matchendQueue.some(
+            (r) => (player.eosID && r.eosID === player.eosID) || (player.steamID && r.steamID === player.steamID)
+        );
+        if (alreadyQueued) {
             this.verbose(2, `[Switch] Matchend: ${player.name || player.eosID} is already queued — not queueing again.`);
             return false;
         }
 
-        await Endmatches.create({
-            name: player.name,
-            steamID: player.steamID,
-            eosID: player.eosID,
-        });
+        const entry = { id: null, name: player.name, steamID: player.steamID, eosID: player.eosID };
+        this._matchendQueue.push(entry);
+
+        // DB write is best-effort persistence (survives a restart before round
+        // end). Failure here must not undo the in-memory enqueue — that's the
+        // whole point of keeping this list.
+        const Endmatches = this._getModel('SwitchPlugin_Endmatches');
+        if (Endmatches) {
+            try {
+                const row = await Endmatches.create({
+                    name: player.name,
+                    steamID: player.steamID,
+                    eosID: player.eosID,
+                });
+                entry.id = row.id;
+            } catch (err) {
+                this.verbose(1, `[Switch] Matchend: DB persist failed for ${player.name || player.eosID}, keeping in-memory only: ${err.message}`);
+            }
+        }
         return true;
     }
 

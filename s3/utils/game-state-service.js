@@ -1779,10 +1779,20 @@ export default class GameStateService {
         matchId: this.matchId
       });
     };
-    if (dbService?.executeWithRetry) {
-      await dbService.executeWithRetry(write);
-    } else {
-      await write();
+    // Best-effort: every caller awaits this immediately before firing a phase-change
+    // notification (onGamePhaseChange subscribers include Switch's seed-token grant
+    // and SmartAssign's roster snapshot). This row is only for restart recovery — an
+    // uncaught throw here must never suppress the notification that keeps consumer
+    // plugins' own in-memory state in sync with a phase change S3 already committed
+    // to memory.
+    try {
+      if (dbService?.executeWithRetry) {
+        await dbService.executeWithRetry(write);
+      } else {
+        await write();
+      }
+    } catch (err) {
+      this.verboseLogger(1, `[GameState] _persistState failed (state kept in memory, restart recovery may be stale): ${err.message}`);
     }
   }
 

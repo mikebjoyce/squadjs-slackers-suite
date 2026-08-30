@@ -983,27 +983,31 @@ export const EloDiscord = {
       }
 
       if (!sub || sub === 'me') {
-        const player = await this.db.getModel('Elo_PlayerStats')?.findOne({ where: { discordID: message.author.id } });
-        if (!player) {
-          await message.reply('No linked ELO record found. Please use `!elo link <Your17DigitSteamID>` to link your account first!');
-          return;
+        try {
+          const player = await this.db.getModel('Elo_PlayerStats')?.findOne({ where: { discordID: message.author.id } });
+          if (!player) {
+            await message.reply('No linked ELO record found. Please use `!elo link <Your17DigitSteamID>` to link your account first!');
+            return;
+          }
+
+          const minRounds = this.options.minRoundsForLeaderboard;
+          const provisional = player.roundsPlayed < minRounds;
+          const rank = provisional ? null : await this.db.getPlayerRank(player.eosID, minRounds);
+          const totalRanked = await this.db.getTotalRankedPlayers(minRounds);
+          const totalPlayers = await this.db.getTotalPlayers();
+
+          let localLeaderboard = null;
+          if (!provisional && rank !== null) {
+            const limit = 9;
+            const offset = Math.max(0, rank - 5);
+            const neighborhood = await this.db.getLeaderboard(limit, minRounds, offset);
+            localLeaderboard = neighborhood.map((p, i) => ({ ...p, actualRank: offset + 1 + i }));
+          }
+
+          await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildPlayerStatsEmbed(player, rank, totalRanked, totalPlayers, provisional, localLeaderboard, minRounds)] });
+        } catch (err) {
+          await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildErrorEmbed('ELO Lookup', err)] });
         }
-
-        const minRounds = this.options.minRoundsForLeaderboard;
-        const provisional = player.roundsPlayed < minRounds;
-        const rank = provisional ? null : await this.db.getPlayerRank(player.eosID, minRounds);
-        const totalRanked = await this.db.getTotalRankedPlayers(minRounds);
-        const totalPlayers = await this.db.getTotalPlayers();
-
-        let localLeaderboard = null;
-        if (!provisional && rank !== null) {
-          const limit = 9;
-          const offset = Math.max(0, rank - 5);
-          const neighborhood = await this.db.getLeaderboard(limit, minRounds, offset);
-          localLeaderboard = neighborhood.map((p, i) => ({ ...p, actualRank: offset + 1 + i }));
-        }
-
-        await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildPlayerStatsEmbed(player, rank, totalRanked, totalPlayers, provisional, localLeaderboard, minRounds)] });
         return;
       }
 

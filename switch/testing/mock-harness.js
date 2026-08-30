@@ -508,6 +508,10 @@ export function createMockHarness(opts = {}, clock = null) {
       return null;
     },
 
+    // Tests toggle this via plugin._s3db._skip = true to simulate an active
+    // network backoff, mirroring S3's DBService.shouldSkipDb().
+    _s3db: { _skip: false, shouldSkipDb() { return this._skip; } },
+
     warn: (eosID, msg) => {
       // Capture for assertion
       plugin._lastWarnMsg = msg;
@@ -582,8 +586,24 @@ export function createMockHarness(opts = {}, clock = null) {
       }
     }
 
-    // Simulate DB lookup via the injected db
-    const cooldownData = plugin._testDb ? await plugin._testDb.findByPk(eosID) : null;
+    // Simulate DB lookup via the injected db — mirrors the real plugin's
+    // fail-open handling of backoff/thrown errors (see switch.js).
+    let cooldownData = null;
+    let dbUnavailable = false;
+    if (plugin._testDb) {
+      if (plugin._s3db?.shouldSkipDb?.()) {
+        dbUnavailable = true;
+      } else {
+        try {
+          cooldownData = await plugin._testDb.findByPk(eosID);
+        } catch (err) {
+          dbUnavailable = true;
+        }
+      }
+    }
+    if (dbUnavailable) {
+      return { eligible: true };
+    }
     const now = resolvedClock.now();
 
     // Scramble lock is an independent override

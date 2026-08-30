@@ -1587,6 +1587,13 @@ export default class TeamBalancer extends S3PluginBase {
           this.consecutiveWinsTeam = dbRes.consecutiveWinsTeam;
           this.consecutiveWinsCount = dbRes.consecutiveWinsCount;
           this.lastSyncTimestamp = dbRes.lastSyncTimestamp;
+        } else {
+          // Fallback if DB fails: apply the flip in memory anyway. Team IDs swap
+          // every new round, so skipping this (unlike a plain missed-update) would
+          // leave winStreakTeam/consecutiveWinsTeam pointing at the WRONG team for
+          // the rest of the round — worse than the counters just being stale.
+          this.winStreakTeam = flippedTeam;
+          this.consecutiveWinsTeam = flippedConTeam;
         }
       } catch (err) {
         Logger.verbose('TeamBalancer', 1, `[DB] onNewGame saveState failed: ${err.message}`);

@@ -188,7 +188,18 @@ export default class SwapExecutor {
     */
    async verifyMoves() {
       try {
-        await this.teamBalancer?._s3?.players?.refreshNow('TeamBalancer');
+        // refreshNow() ultimately awaits server.updatePlayerList() (RCON), which
+        // has no internal timeout of its own. Under RCON/event-loop congestion
+        // (e.g. a concurrent DB outage flooding the process with retries) this
+        // can hang far past maxScrambleCompletionTime, silently blocking
+        // completeSession() — and everything downstream that waits on it —
+        // for minutes. Bound it so a stuck refresh degrades to the same
+        // fallback path as an outright failure instead of hanging forever.
+        const refreshTimeoutMs = this.options.maxScrambleCompletionTime || 15000;
+        await Promise.race([
+          this.teamBalancer?._s3?.players?.refreshNow('TeamBalancer'),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('refreshNow timed out')), refreshTimeoutMs))
+        ]);
       } catch (err) {
         Logger.verbose('TeamBalancer', 1, `[SwapExecutor] Failed to refresh player list for verification: ${err?.message || err}`);
         // Fall back to current counts if update fails
@@ -311,8 +322,17 @@ export default class SwapExecutor {
   }
 
   async waitForCompletion(timeoutMs = 10000, intervalMs = 100) {
+    // Poll for the session actually finishing (activeSession is nulled at the
+    // very end of completeSession(), after verifyMoves() resolves) rather than
+    // pendingPlayerMoves.size — that map is drained by processRetries() before
+    // it fires the (unawaited) completeSession() call, so polling it let this
+    // return while completeSession()/verifyMoves() was still running in the
+    // background. Callers then read getLastSessionReport() before it was set
+    // for the current session, silently reusing the previous scramble's report.
     const start = Date.now();
-    while (this.pendingPlayerMoves.size > 0) {
+    // Grace period: queueMove() may not have started monitoring yet on the very
+    // first call in a batch, so don't treat a still-null activeSession as "done".
+    while (!this.activeSession || this.pendingPlayerMoves.size > 0 || this._completing) {
       if (Date.now() - start > timeoutMs) {
         Logger.verbose('TeamBalancer', 1, `[SwapExecutor] waitForCompletion timed out after ${timeoutMs}ms`);
         break;

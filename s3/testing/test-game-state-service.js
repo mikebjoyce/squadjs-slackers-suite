@@ -535,6 +535,50 @@ await runTest('persists and recovers phase/resolving/layer state via sequelize c
   await service2.unmount();
 });
 
+await runTest('phase-change notification still fires when _persistState throws (DB outage)', async () => {
+  // Regression test: an uncaught throw from _persistState() used to propagate
+  // out of the phase-transition handler (e.g. handleRoundEnded), which meant
+  // the awaited call never reached its onGamePhaseChange() notification.
+  // Downstream consumers (Switch's seed-token grant on ENDGAME, SmartAssign's
+  // roster snapshot on S3_ROUND_LIVE) depend on that notification firing
+  // regardless of whether the persistence write itself succeeded.
+  const sequelize = new MockSequelize();
+  // The outage must hit only the runtime _persistState() write path, not
+  // mount()'s one-time GameStateModel.sync() — so let the first call through
+  // (table creation) and start throwing from the second call onward (the
+  // persist that follows handleRoundEnded()'s in-memory phase transition).
+  let callCount = 0;
+  const dbService = {
+    getConnector: () => sequelize,
+    getDataTypes: () => sequelize.constructor.DataTypes,
+    executeWithRetry: (fn) => {
+      callCount++;
+      if (callCount > 1) throw new Error('SequelizeConnectionAcquireTimeoutError: Operation timeout');
+      return fn();
+    },
+    quoteIdentifier: (name) => `"${String(name).replace(/"/g, '""')}"`,
+    registerExpectedVersion: () => {}
+  };
+
+  const server = new MockServer();
+  const parent = { services: { db: dbService } };
+  parent.db = parent.services.db;
+  const service = new GameStateService({ parent, server, stagingDurationMs: 600000 });
+  parent.services.gameState = service;
+
+  await service.mount();
+
+  const seenPhases = [];
+  service.onGamePhaseChange((prevPhase) => seenPhases.push(service.getPhase()));
+
+  await service.handleRoundEnded();
+
+  assert.equal(service.getPhase(), 'ENDGAME', 'in-memory phase must still transition despite the DB throw');
+  assert.deepEqual(seenPhases, ['ENDGAME'], 'notification must fire even though _persistState() failed');
+
+  await service.unmount();
+});
+
 await runTest('invalidates recovered state when recovered round age is impossible', async () => {
   const sequelize = new MockSequelize();
 
