@@ -505,6 +505,16 @@ export default class TeamBalancer extends S3PluginBase {
     this.scrambleConfirmation = null;
     this.ready = false;
 
+    // Layer mirror of S³ — written only by the gameState.onLayerGameModeChange()
+    // subscription in mount(). Initialised to null here because _applyLayerFallback()
+    // null-checks all three: left undefined, its original `=== null` guard missed and
+    // the fallback dereferenced undefined on the first round end after a restart where
+    // the layer never resolved (onNewGame nulls the two caches but not
+    // lastKnownGoodLayer, so only a never-resolved layer reaches that state).
+    this.gameModeCached = null;
+    this.layerNameCached = null;
+    this.lastKnownGoodLayer = null;
+
     this._isMounted = false;
     this._scramblePending = false;
     // Set only on the paths in initiateScramble() that actually arm a scramble, and captured
@@ -908,7 +918,24 @@ export default class TeamBalancer extends S3PluginBase {
    * team shuffle. Hence it runs only on the paths that need it, never before the seed decision.
    */
   _applyLayerFallback(roundReport) {
-    if (this.gameModeCached !== null || this.layerNameCached !== null || this.lastKnownGoodLayer === null) return;
+    // This round resolved its own layer — nothing to substitute.
+    // Nullish, not strict-null: these are undefined before the first S³ layer callback,
+    // and a `=== null` guard let an undefined lastKnownGoodLayer through into the
+    // dereference below. Belt-and-braces with the constructor initialisation.
+    if (this.gameModeCached != null || this.layerNameCached != null) return;
+
+    if (this.lastKnownGoodLayer == null) {
+      // No layer has resolved through S³ at all since this process started, so there is
+      // nothing to fall back on and this round cannot be classified. Level 1, not 2: it is
+      // the operator's only signal that the round was processed blind, and it points at the
+      // real defect — S³ never resolving a layer — rather than at this plugin. Before the
+      // constructor initialisation above, this branch was unreachable: an undefined
+      // lastKnownGoodLayer slipped past the guard and crashed on the dereference below.
+      Logger.verbose('TeamBalancer', 1, '[TeamBalancer] Layer info missing at round end and no previous layer to fall back on — S³ has not resolved a layer since startup. This round cannot be classified.');
+      roundReport.layerUnresolved = true;
+      return;
+    }
+
     Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Warning: Layer info missing at round end. Using fallback lastKnownGoodLayer (${this.lastKnownGoodLayer.gamemode} / ${this.lastKnownGoodLayer.name})`);
     this.gameModeCached = this.lastKnownGoodLayer.gamemode;
     this.layerNameCached = this.lastKnownGoodLayer.name;
@@ -1776,6 +1803,19 @@ export default class TeamBalancer extends S3PluginBase {
       // Only now: everything below reads the layer for thresholds, ignored-mode matching and the
       // report, all of which tolerate the previous round's layer as a guess.
       this._applyLayerFallback(roundReport);
+
+      // An unclassifiable round must not feed the streak. Both gates that would have
+      // excluded it — the seed check above and isIgnoredMatch() below — read S³ directly,
+      // and S³ having no layer is exactly the state we are in, so both answer "no" and a
+      // seed round would be counted as an ordinary competitive one. Left unguarded that
+      // accumulates a streak out of seed rounds and eventually scrambles off it.
+      // The streak is left untouched rather than reset: we cannot tell whether this round
+      // was a seed round that should never have counted or a real one whose layer simply
+      // never arrived, and discarding a legitimate streak is the worse of the two errors.
+      if (this.gameModeCached == null && this.layerNameCached == null) {
+        Logger.verbose('TeamBalancer', 1, '[TeamBalancer] Skipping round evaluation: no layer could be resolved, so this round cannot be classified as seed or ignored. Streak left unchanged.');
+        return;
+      }
 
       // Check for Draw (Winner is null)
       if (!data || !data.winner) {

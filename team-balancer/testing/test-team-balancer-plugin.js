@@ -164,7 +164,143 @@ try {
     });
   }
 
-  // ── 4. mount is idempotent ─────────────────────────────────────────────────
+  // ── 4. the layer fallback ──────────────────────────────────────────────────
+  //
+  // _applyLayerFallback() substitutes the last resolved layer when this round's own
+  // never resolved. Its guard tests lastKnownGoodLayer against null, so the field has
+  // to actually BE null before the first S³ callback — left undefined, the guard
+  // misses and the fallback dereferences it. That is the crash reported against
+  // v4.0.6 on a live server:
+  //
+  //   TypeError: Cannot read properties of undefined (reading 'gamemode')
+  //     at TeamBalancer._applyLayerFallback
+  //     at TeamBalancer.onRoundEnded
+  //
+  // It needs a restart where the layer never resolved, so it survived every round
+  // that had one — hence the explicit fresh-construct assertion below.
+  {
+    const server = makeMockServer();
+    const plugin = await mount(server);
+
+    await test('the layer mirror initialises to null, not undefined', async () => {
+      const fresh = new TeamBalancer(makeMockServer(), OPTIONS, {});
+      for (const field of ['gameModeCached', 'layerNameCached', 'lastKnownGoodLayer']) {
+        assert.strictEqual(fresh[field], null, `${field} is not initialised in the constructor`);
+      }
+    });
+
+    await test('the fallback is a no-op when no layer has ever resolved', async () => {
+      // A mid-round SquadJS restart: NEW_GAME nulls the two caches, and the S³ layer
+      // callback has never fired, so there is nothing to fall back to.
+      await plugin.onNewGame({});
+
+      // The call itself is the assertion: in v4.0.6 an undefined lastKnownGoodLayer
+      // sailed past the guard and was dereferenced right here, taking round-end
+      // processing down with it.
+      const roundReport = {};
+      plugin._applyLayerFallback(roundReport);
+
+      assert.equal(plugin.lastKnownGoodLayer, null);
+      assert.equal(roundReport.gameMode, undefined);
+      assert.equal(roundReport.layerName, undefined);
+      assert.notEqual(roundReport.layerFallback, true, 'claimed a fallback it never had');
+      // The branch is silent otherwise, so this flag and its log line are the only
+      // evidence an operator gets that a round was processed with no layer at all.
+      assert.equal(roundReport.layerUnresolved, true, 'no provenance for a blind round');
+    });
+
+    await test("the fallback substitutes the previous round's layer when it has one", async () => {
+      server.s3.emitLayerGameModeChange('Yehorivka_RAAS_v1', 'RAAS');
+      await plugin.onNewGame({});   // clears the two caches, keeps lastKnownGoodLayer
+
+      const roundReport = {};
+      plugin._applyLayerFallback(roundReport);
+
+      assert.equal(roundReport.gameMode, 'RAAS');
+      assert.equal(roundReport.layerName, 'Yehorivka_RAAS_v1');
+      assert.equal(roundReport.layerFallback, true);
+    });
+
+    await plugin.unmount();
+  }
+
+  // ── 5. an unclassifiable round does not feed the streak ────────────────────
+  //
+  // Once the v4.0.6 crash stopped aborting onRoundEnded, a round whose layer never
+  // resolved began falling through to the win-streak evaluation. Both gates that
+  // would have excluded it — the seed check and isIgnoredMatch() — read S³, which is
+  // the very service with no layer, so both answer "no" and a seed round gets counted
+  // as an ordinary competitive one. Left unguarded that builds a streak out of seed
+  // rounds and eventually scrambles off it.
+  {
+    const logPath = path.join(HERE, '.tmp-round-reports.jsonl');
+    const ROUND_OPTS = {
+      enableWinStreakTracking: true,
+      enableSeedAutoScramble: false,
+      enableDatabaseLogging: false,       // the mock S³ carries db: null
+      // Both scramble triggers return before the streak bookkeeping, which would mask
+      // whether the round was evaluated at all. This block is about the layer guard,
+      // not about threshold tuning.
+      enableSingleRoundScramble: false,
+      maxConsecutiveWinsWithoutThreshold: 0,
+      reportLogPath: logPath
+    };
+    // An ordinary Team 1 win: a 100-ticket margin stays under every scramble threshold.
+    const WIN = { winner: { team: '1', tickets: '250' }, loser: { team: '2', tickets: '150' } };
+
+    function roundEndServer() {
+      const server = makeMockServer();
+      server._sent = [];
+      server.rcon.broadcast = async (msg) => { server._sent.push(msg); };
+      server.rcon.warn = async () => {};
+      return server;
+    }
+
+    await test('a round with no resolvable layer is skipped and the streak is left alone', async () => {
+      const server = roundEndServer();
+      const plugin = await mount(server, ROUND_OPTS);
+
+      // No layer has ever resolved; NEW_GAME nulls the caches and there is no fallback.
+      await plugin.onNewGame({});
+      plugin.winStreakTeam = 1;
+      plugin.winStreakCount = 2;
+
+      await plugin.onRoundEnded(WIN);
+
+      // consecutiveWinsCount is the tell: it advances on every non-ignored win
+      // regardless of margin, so it is the cleanest evidence of whether the round
+      // was evaluated at all, without coupling the test to threshold tuning.
+      assert.equal(plugin.consecutiveWinsCount, 0, 'an unclassifiable round was evaluated');
+      assert.equal(plugin.winStreakCount, 2, 'an unclassifiable round fed the win streak');
+      assert.equal(plugin.winStreakTeam, 1, 'streak team changed on an unclassifiable round');
+      assert.equal(server._sent.length, 0, 'broadcast a result for a round it could not classify');
+
+      await plugin.unmount();
+    });
+
+    await test('a round that HAS a layer still feeds the streak', async () => {
+      // The guard must not swallow ordinary rounds — without this the test above
+      // passes just as well against a plugin that stopped evaluating anything.
+      const server = roundEndServer();
+      const plugin = await mount(server, ROUND_OPTS);
+
+      server.s3.emitLayerGameModeChange('Yehorivka_RAAS_v1', 'RAAS');
+      plugin.winStreakTeam = 1;
+      plugin.winStreakCount = 2;
+
+      await plugin.onRoundEnded(WIN);
+
+      assert.equal(plugin.consecutiveWinsCount, 1, 'the guard is swallowing classifiable rounds');
+      assert.equal(plugin.consecutiveWinsTeam, 1);
+      assert.ok(server._sent.length > 0, 'a classifiable round announced nothing');
+
+      await plugin.unmount();
+    });
+
+    fs.rmSync(logPath, { force: true });
+  }
+
+  // ── 6. mount is idempotent ─────────────────────────────────────────────────
   {
     const server = makeMockServer();
     const plugin = await mount(server);
@@ -179,7 +315,7 @@ try {
     await plugin.unmount();
   }
 
-  // ── 5. the S³ contract ─────────────────────────────────────────────────────
+  // ── 7. the S³ contract ─────────────────────────────────────────────────────
   await test('refuses to mount against an S³ older than required', async () => {
     const server = makeMockServer();
     server.plugins = [makeMockS3({ version: '0.9.0' })];
@@ -202,7 +338,7 @@ try {
     await assert.rejects(() => mount(server), /SlackersSquadServices is required/);
   });
 
-  // ── 6. the deleted layer stack stays deleted ───────────────────────────────
+  // ── 8. the deleted layer stack stays deleted ───────────────────────────────
   await test('the removed layer-resolution methods are gone and uncalled', async () => {
     const source = fs.readFileSync(PLUGIN_SRC, 'utf8');
     // Comments legitimately name these while explaining the removal, so strip
