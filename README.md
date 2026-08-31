@@ -88,10 +88,16 @@ S³ **must** be mounted before any consumer plugin. In your SquadJS `config.json
       "scramblePercentage": 0.5,
       "useEloForBalance": true,
       "discordAdminChannelID": ""
+    },
+    {
+      "plugin": "DBLog",
+      "enabled": true
     }
   ]
 }
 ```
+
+`DBLog` is optional — include it only if you want the S³ build of SquadJS's core `db-log.js` (see [Installation](#installation)). It takes no options beyond core's `overrideServerID`, and unlike core it needs no `database` key, because it logs through S³'s connection. If you are switching over from core's version, you can leave your existing entry exactly as it is: SquadJS ignores config keys a plugin doesn't declare, and S³ already opens the `database` connector your old entry was naming.
 
 Internally, S³ services mount in this order to satisfy dependency chains:
 
@@ -213,7 +219,7 @@ squad-server/
    - [Switch](switch/README.md#configuration-options) — [Behaviour Reference](switch/SWITCH_BEHAVIOUR.md)
    - [EloTracker](elo-tracker/README.md#configuration-options)
    - [TeamBalancer](team-balancer/README.md#configuration-options)
-   - [DBLog (core upgrade)](core-plugins/db-log.js) — see its top-of-file docblock; no config changes needed if you already run core's `db-log.js`
+   - **DBLog (core upgrade)** — one option, `overrideServerID`, same as core's. No config changes needed if you already run core's `db-log.js`; see the [top-of-file docblock](core-plugins/db-log.js) for what differs behind the same config
 
 ### Logging
 
