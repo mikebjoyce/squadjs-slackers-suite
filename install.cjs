@@ -9,8 +9,11 @@
  *   node install.cjs --plugin=<name> [--output=<path>] [--with-tools] [--with-testing]
  *                    [--clean] [--force]
  *
- *   --plugin     s3 | team-balancer | elo-tracker | smart-assign | switch | all
+ *   --plugin     s3 | team-balancer | elo-tracker | smart-assign | switch | db-log | all
  *                (S3 is always auto-included — every consumer plugin depends on it)
+ *                `db-log` and other core-plugin upgrades live flat in `core-plugins/`
+ *                (as `<name>.js`) but are selected by their bare name, same as any
+ *                other plugin.
  *   --output     Output directory (default: ./out)
  *   --with-tools      Also copy tools/ directories
  *   --with-testing    Also copy testing/ directories
@@ -33,7 +36,48 @@ const path = require('path');
 
 const MONOREPO_ROOT = __dirname;
 
-const ALL_PLUGINS = ['s3', 'team-balancer', 'elo-tracker', 'smart-assign', 'switch'];
+const ALL_PLUGINS = ['s3', 'team-balancer', 'elo-tracker', 'smart-assign', 'switch', 'db-log'];
+
+// core-plugins/ holds S3-backed drop-in replacements for stock SquadJS core
+// plugins (same class/file name as the original, so installing one
+// overwrites rather than running alongside it — see the docblock in
+// core-plugins/db-log.js). Unlike the other plugins, which keep <name>/plugins/
+// and <name>/utils/ subfolders, these are single-file drop-ins with no utils
+// of their own, so every core-plugin's files sit flat in core-plugins/,
+// namespaced by filename prefix: <name>.js (+ <name>-test.js once tests
+// exist). Selected by the same bare name as any other plugin
+// (`--plugin=db-log`); only the source layout differs.
+const CORE_PLUGINS_DIR = path.join(MONOREPO_ROOT, 'core-plugins');
+const CORE_PLUGIN_NAMES = new Set(['db-log']);
+
+function pluginSourceExists(pluginName) {
+  if (CORE_PLUGIN_NAMES.has(pluginName)) return fs.existsSync(CORE_PLUGINS_DIR);
+  return fs.existsSync(path.join(MONOREPO_ROOT, pluginName));
+}
+
+/**
+ * Every file a plugin contributes to a given target subdirectory (`plugins`,
+ * `utils`, `testing`, or `tools`), as { abs, sourceRel } pairs. `sourceRel`
+ * mirrors what the flattened target path will be (e.g. "plugins/db-log.js")
+ * and is what clash-detection and namespacing key off of below.
+ */
+function pluginFilesInDir(pluginName, dirName) {
+  if (CORE_PLUGIN_NAMES.has(pluginName)) {
+    let abs;
+    if (dirName === 'plugins') abs = path.join(CORE_PLUGINS_DIR, `${pluginName}.js`);
+    else if (dirName === 'testing') abs = path.join(CORE_PLUGINS_DIR, `${pluginName}-test.js`);
+    else return []; // no utils/ or tools/ for core-plugin upgrades
+
+    if (!fs.existsSync(abs)) return [];
+    return [{ abs, sourceRel: path.join(dirName, path.basename(abs)) }];
+  }
+
+  const dirPath = path.join(MONOREPO_ROOT, pluginName, dirName);
+  return listFilesRecursive(dirPath).map(abs => ({
+    abs,
+    sourceRel: path.join(dirName, path.relative(dirPath, abs))
+  }));
+}
 
 // Directories to copy per plugin (testing and tools are opt-in).
 const ALWAYS_DIRS = ['plugins', 'utils'];
@@ -91,7 +135,7 @@ Usage:
 
 Options:
   --plugin=<name>   Plugin(s) to install: s3, team-balancer, elo-tracker,
-                    smart-assign, switch, or all (comma-separated).
+                    smart-assign, switch, db-log, or all (comma-separated).
                     S3 is always auto-included.
   --output=<path>   Output directory (default: ./out)
   --with-tools      Also copy tools/ directories
@@ -168,15 +212,6 @@ function listFilesRecursive(dir) {
 }
 
 /**
- * Get the relative path from a plugin subfolder to a file within it.
- * e.g., "s3/plugins/foo.js" → "plugins/foo.js"
- */
-function relativeToPlugin(pluginName, filePath) {
-  const pluginDir = path.join(MONOREPO_ROOT, pluginName);
-  return path.relative(pluginDir, filePath);
-}
-
-/**
  * Is this a file the installer copies at all?
  */
 function isCopyable(filePath) {
@@ -198,11 +233,10 @@ function findOptInClashes() {
 
   for (const pluginName of ALL_PLUGINS) {
     for (const dirName of OPT_IN_DIRS) {
-      for (const filePath of listFilesRecursive(path.join(MONOREPO_ROOT, pluginName, dirName))) {
-        if (!isCopyable(filePath)) continue;
-        const rel = relativeToPlugin(pluginName, filePath);
-        if (!owners.has(rel)) owners.set(rel, new Set());
-        owners.get(rel).add(pluginName);
+      for (const { abs, sourceRel } of pluginFilesInDir(pluginName, dirName)) {
+        if (!isCopyable(abs)) continue;
+        if (!owners.has(sourceRel)) owners.set(sourceRel, new Set());
+        owners.get(sourceRel).add(pluginName);
       }
     }
   }
@@ -230,7 +264,7 @@ function allSuiteFiles() {
   const results = [];
   for (const pluginName of ALL_PLUGINS) {
     for (const dirName of [...ALWAYS_DIRS, ...OPT_IN_DIRS]) {
-      results.push(...listFilesRecursive(path.join(MONOREPO_ROOT, pluginName, dirName)));
+      results.push(...pluginFilesInDir(pluginName, dirName).map(e => e.abs));
     }
   }
   return results.filter(isCopyable);
@@ -302,23 +336,15 @@ function collectFiles(plugins, opts) {
   assertClashingFilesAreEntryPoints(optInClashes);
 
   for (const pluginName of plugins) {
-    const pluginDir = path.join(MONOREPO_ROOT, pluginName);
-
-    if (!fs.existsSync(pluginDir)) {
-      console.error(`Error: Plugin directory not found: ${pluginDir}`);
+    if (!pluginSourceExists(pluginName)) {
+      console.error(`Error: Plugin source not found for "${pluginName}"`);
       process.exit(1);
     }
 
     for (const dirName of dirsToCopy) {
-      const dirPath = path.join(pluginDir, dirName);
-      if (!fs.existsSync(dirPath)) continue;
+      for (const { abs, sourceRel } of pluginFilesInDir(pluginName, dirName)) {
+        if (!isCopyable(abs)) continue;
 
-      const allFiles = listFilesRecursive(dirPath);
-
-      for (const filePath of allFiles) {
-        if (!isCopyable(filePath)) continue;
-
-        const sourceRel = relativeToPlugin(pluginName, filePath);
         const rel = optInClashes.has(sourceRel)
           ? namespaceRel(sourceRel, pluginName)
           : sourceRel;
@@ -334,7 +360,7 @@ function collectFiles(plugins, opts) {
           process.exit(1);
         }
 
-        files.set(rel, { source: filePath, plugin: pluginName });
+        files.set(rel, { source: abs, plugin: pluginName });
       }
     }
   }

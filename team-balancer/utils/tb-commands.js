@@ -125,6 +125,7 @@ const CommandHandlers = {
       microScrambleAnnouncement:
         'Team imbalance detected ({margin}-ticket margin) | Micro scramble in {delay}s...',
       microScrambleCompleteMessage: 'Balance has been restored. (Micro scramble)',
+      microScrambleFailedMessage: 'No balance change needed. (Micro scramble)',
 
       system: {
         trackingEnabled: 'Team Balancer has been enabled.',
@@ -417,7 +418,10 @@ const CommandHandlers = {
               `Scramble: ${(this.options?.scramblePercentage || 0.5) * 100}% | ${this.options?.scrambleAnnouncementDelay}s (Seed: ${this.options?.seedScrambleAnnouncementDelay}s) | ${this.options?.maxScrambleCompletionTime}ms`,
               `Teams: ${team1Name} | ${team2Name}`,
               `1-Round: ${this.options?.enableSingleRoundScramble ? `ON (> ${this.options?.singleRoundScrambleThreshold} tix)` : 'OFF'}`,
-              `Invasion: Atk ${this.options?.invasionAttackTeamThreshold} | Def ${this.options?.invasionDefenceTeamThreshold}`
+              `Invasion: Atk ${this.options?.invasionAttackTeamThreshold} | Def ${this.options?.invasionDefenceTeamThreshold}`,
+              // Kept on its own short line: 'std' rather than the resolved
+              // number so an admin can see at a glance that TC is untuned.
+              `TC: Dom ${this.options?.tcDominantThreshold ?? 'std'} | Mercy ${this.options?.tcSingleRoundScrambleThreshold ?? 'std'}`
             ].join('\n'));
 
             const targetReportChannel = this.discordReportChannel || this.discordChannel;

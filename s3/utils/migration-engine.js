@@ -102,10 +102,63 @@ export async function countNullColumn(model, column, transaction = null) {
 }
 
 /**
+ * Recognize a database permission-denied error and produce operator-facing
+ * guidance, or return null for anything else. This is what tells an admin
+ * "grant the DB user ALTER and retry" instead of leaving them to parse a raw
+ * driver error inside a wall of stack trace — the same failure that broke
+ * LoggingService's Model.sync() on a create-only MySQL grant
+ * (2026-08-28, see s3/S3_DEVELOPER_GUIDE.md §11.4) surfaces identically
+ * from any migration author's up(), and is otherwise indistinguishable from
+ * a genuine bug in the migration itself.
+ *
+ * Confirmed empirically (Docker MySQL + Postgres, 2026-08-29):
+ *   - MySQL: err.parent.code is one of the ER_*ACCESS_DENIED_ERROR family
+ *     (ER_TABLEACCESS_DENIED_ERROR, ER_DBACCESS_DENIED_ERROR,
+ *     ER_COLUMNACCESS_DENIED_ERROR, ER_SPECIFIC_ACCESS_DENIED_ERROR), and the
+ *     message always leads with the specific missing privilege — "ALTER
+ *     command denied to user 'x'@'y' for table 'z'" — extracted below so the
+ *     guidance can name it rather than making the admin re-derive it.
+ *   - Postgres: err.parent.code is SQLSTATE 42501 (insufficient_privilege);
+ *     message is already plain English ("permission denied for schema
+ *     public", "must be owner of table X").
+ *   - SQLite: err.parent.code is SQLITE_READONLY or SQLITE_PERM when the
+ *     file (or its directory, for WAL/journal files) isn't writable.
+ * None of these overlap with the "already applied" duplicate-name/key
+ * errors addColumn/bulkInsert/addIndex/removeIndex guard against — those
+ * are a structurally different error family on every dialect tested, so
+ * there is no risk of this classifier misfiring on a healthy retry.
+ *
+ * @param {Error} err
+ * @returns {string|null}
+ */
+function describePermissionError(err) {
+  const code = err?.parent?.code || err?.original?.code;
+  const message = err?.message || '';
+
+  if (typeof code === 'string' && /ACCESS_DENIED/.test(code)) {
+    const m = message.match(/^(\w+) command denied/i);
+    const priv = m ? m[1].toUpperCase() : null;
+    return priv
+      ? `the database user is missing the ${priv} privilege (GRANT ${priv} ON <database>.* TO '<user>'@'%'). Fix the grant, then retry with !s3 migrate force.`
+      : 'the database user lacks a privilege required for this migration. Check its GRANTs, then retry with !s3 migrate force.';
+  }
+
+  if (code === '42501') {
+    return `the database role lacks a required privilege (${message}). Fix the grant/ownership, then retry with !s3 migrate force.`;
+  }
+
+  if (code === 'SQLITE_READONLY' || code === 'SQLITE_PERM') {
+    return 'the SQLite database file (or its containing directory) is not writable by this process. Fix the file permissions, then retry with !s3 migrate force.';
+  }
+
+  return null;
+}
+
+/**
  * Create a QueryInterface object bound to a specific DBService + transaction.
  * Passed as the sole argument to migration up()/down() handlers.
  */
-function createQueryInterface(sequelize, db, transaction) {
+function createQueryInterface(sequelize, db, transaction, { isReapply = false } = {}) {
   const DataTypes = db.getDataTypes();
 
   /**
@@ -150,8 +203,33 @@ function createQueryInterface(sequelize, db, transaction) {
     // from its table (e.g. model 'Elo_PluginState' → table 'Elo_PluginStates').
     modelForTable,
 
+    /**
+     * True when this up() is being re-applied to repair detected drift rather
+     * than being applied for the first time.
+     *
+     * Drift recovery re-runs an already-applied migration on a live database,
+     * which is only safe if up() is idempotent. A migration that performs a
+     * one-time destructive step — resetting balances, truncating a table,
+     * seeding over user edits — must guard that step on this flag, or drift
+     * recovery silently destroys the very data the operator is trying to
+     * repair. Adding a missing column is idempotent; wiping the rows that
+     * column lives on is not.
+     */
+    isReapply,
+
     async addColumn(tableName, columnName, columnDef) {
       const qi = sequelize.getQueryInterface();
+      // Check existence first — no-op if a prior attempt already added it.
+      // DDL commits are not undone by rolling back the transaction wrapping
+      // up() (confirmed on both SQLite and MySQL): a migration that adds
+      // this column and then fails for any later reason — a mismatched
+      // touches declaration, a backfill bug, a dropped connection — leaves
+      // the column in place with the version never recorded, so the exact
+      // same addColumn call runs again on the next retry. Without this
+      // guard that throws a raw "duplicate column" error from the driver,
+      // on every retry, forever, with no automatic recovery.
+      const info = await qi.describeTable(tableName, { transaction });
+      if (info[columnName]) return;
       await qi.addColumn(tableName, columnName, columnDef, { transaction });
     },
 
@@ -170,6 +248,10 @@ function createQueryInterface(sequelize, db, transaction) {
       await qi.renameColumn(tableName, columnName, deprecatedName, { transaction });
     },
 
+    // No retry guard needed: confirmed empirically on both SQLite (full
+    // table-rebuild path) and MySQL (in-place MODIFY COLUMN) that re-running
+    // changeColumn with the same target definition is already a safe no-op —
+    // unlike addColumn there is no "already exists" failure mode to guard.
     async changeColumn(tableName, columnName, columnDef) {
       const qi = sequelize.getQueryInterface();
       await qi.changeColumn(tableName, columnName, columnDef, { transaction });
@@ -177,11 +259,41 @@ function createQueryInterface(sequelize, db, transaction) {
 
     async addIndex(tableName, columns, options = {}) {
       const qi = sequelize.getQueryInterface();
-      await qi.addIndex(tableName, columns, { ...options, transaction });
+      try {
+        await qi.addIndex(tableName, columns, { ...options, transaction });
+      } catch (err) {
+        // Both dialects throw a plain DatabaseError (not a distinguished
+        // class like UniqueConstraintError) for "index name already exists" —
+        // confirmed empirically, for an explicit `options.name` and for
+        // Sequelize's own deterministic auto-generated name alike. A retry
+        // after a prior attempt's addIndex committed but a later step failed
+        // hits this every time. Caught errors here don't poison the
+        // transaction (confirmed on both dialects), so it's safe to keep
+        // using it below. Verify the index actually landed before
+        // swallowing, so an unrelated DDL error still surfaces.
+        if (!/already exists|Duplicate key name/i.test(err.message)) throw err;
+        const indexes = await qi.showIndex(tableName, { transaction });
+        const columnList = Array.isArray(columns) ? columns : [columns];
+        const alreadyThere = options.name
+          ? indexes.some((i) => i.name === options.name)
+          : indexes.some((i) => (i.fields || []).map((f) => f.attribute || f).join(',') === columnList.join(','));
+        if (!alreadyThere) throw err;
+        db.verboseLogger(2, `[MigrationEngine] addIndex on "${tableName}" hit a duplicate index name — treating as already applied from a prior attempt: ${err.message}`);
+      }
     },
 
     async removeIndex(tableName, indexName, options = {}) {
       const qi = sequelize.getQueryInterface();
+      // Check existence first — no-op if a prior attempt already removed it.
+      // Confirmed empirically: SQLite's DROP INDEX is naturally idempotent
+      // on a retry, but MySQL throws "Can't DROP '<name>'; check that
+      // column/key exists" — the same "already applied" shape as every
+      // other gap this hardening pass found, just on the removal side.
+      const indexes = await qi.showIndex(tableName, { transaction });
+      const stillThere = typeof indexName === 'string'
+        ? indexes.some((i) => i.name === indexName)
+        : indexes.some((i) => (i.fields || []).map((f) => f.attribute || f).join(',') === indexName.join(','));
+      if (!stillThere) return;
       await qi.removeIndex(tableName, indexName, { ...options, transaction });
     },
 
@@ -209,12 +321,27 @@ function createQueryInterface(sequelize, db, transaction) {
      * Attribute types are resolved from the registered model for the same
      * SQLite serialization reason described on bulkUpdate; `options.attributes`
      * overrides the lookup.
+     *
+     * Unlike addColumn/createTable, there is no cheap existence check for
+     * "were these particular rows already inserted" — so a retry after a
+     * prior attempt's insert committed but a later step failed re-runs the
+     * same INSERT and collides on the primary/unique key. That collision
+     * (Sequelize normalizes it to UniqueConstraintError on every dialect
+     * tested — SQLite and MySQL both confirmed) is swallowed here rather
+     * than left to crash the migration a second time: touches.rows already
+     * verifies the intended rows exist after commit, so a duplicate-key
+     * failure on retry means they do, just from the earlier attempt.
      */
     async bulkInsert(tableName, records, options = {}) {
       const qi = sequelize.getQueryInterface();
       const { attributes: override, ...rest } = options;
       const attributes = override || modelForTable(tableName)?.rawAttributes || null;
-      await qi.bulkInsert(tableName, records, { ...rest, transaction }, attributes);
+      try {
+        await qi.bulkInsert(tableName, records, { ...rest, transaction }, attributes);
+      } catch (err) {
+        if (!(err instanceof SequelizeLib.UniqueConstraintError)) throw err;
+        db.verboseLogger(2, `[MigrationEngine] bulkInsert into "${tableName}" hit a duplicate key — treating as already applied from a prior attempt: ${err.message}`);
+      }
     },
 
     /**
@@ -304,6 +431,74 @@ function createQueryInterface(sequelize, db, transaction) {
   };
 }
 
+/**
+ * Resolve the set of registered model names that back the tables a migration
+ * declares it touches.
+ *
+ * Scans every pending migration's `touches` for the categories that can
+ * actually lose data: `columns` keys (table names whose columns are altered)
+ * and `rows` keys (table names whose rows are backfilled). For each table
+ * name, finds the registered Sequelize model whose `.tableName` matches,
+ * using the same `modelForTable` resolution the query interface relies on.
+ *
+ * `touches.creates` is deliberately NOT backed up. A table a migration creates
+ * is the one category that provably cannot lose data: either it does not exist
+ * yet (nothing to export), or it already exists and the migration's idempotent
+ * existence guard means the migration will not touch it. Including `creates`
+ * here is what made the "scoped" backup export the entire table anyway — on a
+ * live server, db-log's pure-create migration named eight dblog_* tables
+ * holding ~900MB of stats, and the pre-migration backup loaded every row of
+ * them into memory and OOM-killed the SquadJS process (exit 137) on mount.
+ *
+ * Returns null if no pending migration declares any backup-worthy `touches`
+ * metadata, so callers fall back to a full-db backup (original behaviour).
+ * Returns an empty array if such touches exist but no table maps to a
+ * registered model.
+ *
+ * @param {object} dbService - DBService instance
+ * @param {Array<object>} pending - Pending migration objects (with `touches`)
+ * @returns {string[]|null} Deduplicated model names, or null if no touches
+ */
+function _resolveBackupModels(dbService, pending) {
+  /** @type {Set<string>} */
+  const tableNames = new Set();
+  // True if any pending migration declared `touches` at all — including a
+  // creates-only declaration. Without this, a pure-create migration would
+  // resolve to zero tables and fall through to the `tier: 'all'` full-database
+  // backup, which is the very OOM this scoping exists to avoid.
+  let sawTouches = false;
+
+  for (const m of pending) {
+    if (!m.touches) continue;
+    sawTouches = true;
+    // NOTE: touches.creates is intentionally skipped — see the docblock above.
+    // Tables whose columns are altered (keys of touches.columns)
+    if (m.touches.columns && typeof m.touches.columns === 'object') {
+      for (const t of Object.keys(m.touches.columns)) tableNames.add(t);
+    }
+    // Tables whose rows are backfilled (keys of touches.rows)
+    if (m.touches.rows && typeof m.touches.rows === 'object') {
+      for (const t of Object.keys(m.touches.rows)) tableNames.add(t);
+    }
+  }
+
+  if (!sawTouches) return null;
+  if (tableNames.size === 0) return [];
+
+  // Resolve table names → registered model names via the same lookup the
+  // query interface uses for bulk operations.
+  const modelNames = [];
+  const allModelNames = dbService.getModelNames?.() || [];
+  for (const name of allModelNames) {
+    const model = dbService.getModel(name);
+    if (model && tableNames.has(model.tableName || model.name)) {
+      modelNames.push(name);
+    }
+  }
+
+  return modelNames;
+}
+
 export default class MigrationEngine {
   /**
    * @param {Object} opts
@@ -326,6 +521,10 @@ export default class MigrationEngine {
 
     /** @type {Map<string, Array<{version: number, up: Function, down?: Function}>>} */
     this._migrations = new Map();
+    // Plugins whose next runMigrations() is a drift-repair re-application
+    // rather than a first-time apply. Populated by DBService when it rolls a
+    // version back to recover from drift.
+    this._driftReapply = new Set();
 
     /** Token expected from Discord confirmation prompt. Set by _checkAndPromptMigrations(). */
     this._confirmToken = null;
@@ -343,7 +542,7 @@ export default class MigrationEngine {
    * Register a sequence of migrations for a plugin.
    * @param {string} pluginName  - Unique plugin identifier (e.g. 'smart-assign', 's3-core')
    * @param {Array}  migrations  - Array of migration objects:
-   *   [{ version: number, description: string, up: async (qi) => void, down?: async (qi) => void, touches?: { creates?: string[], columns?: Record<string, string[]> } }]
+   *   [{ version: number, description: string, up: async (qi) => void, down?: async (qi) => void, backup?: boolean, touches?: { creates?: string[], columns?: Record<string, string[]>, rows?: Record<string, string[]> } }]
    *
    * Validates:
    *   - No duplicate version numbers
@@ -517,6 +716,20 @@ export default class MigrationEngine {
     // Sort ascending by version
 
     const sorted = [...migrations].sort((a, b) => a.version - b.version);
+    const prev = this._migrations.get(pluginName) || [];
+
+    // Guard against duplicate registration — if all versions in sorted
+    // are already present in prev, this is a re-registration (e.g. from
+    // PlayersService calling registerMigrations from two init methods, or a
+    // plugin remounting without a process restart). Must run BEFORE the gap
+    // check below: re-registering the exact same set is not a gap, it's a
+    // no-op, but the gap check can't tell the difference on its own.
+    const prevVersions = new Set(prev.map((m) => m.version));
+    const allExist = sorted.every((m) => prevVersions.has(m.version));
+    if (allExist && prev.length > 0) {
+      this.verboseLogger(4, `[MigrationEngine] Skipping re-registration: "${pluginName}" already has ${prev.length} migration(s).`);
+      return;
+    }
 
     // Check for gaps only if there are existing registrations
     if (this._migrations.has(pluginName)) {
@@ -529,18 +742,6 @@ export default class MigrationEngine {
           `Versions must be strictly increasing.`
         );
       }
-    }
-
-    const prev = this._migrations.get(pluginName) || [];
-
-    // Guard against duplicate registration — if all versions in sorted
-    // are already present in prev, this is a re-registration (e.g. from
-    // PlayersService calling registerMigrations from two init methods).
-    const prevVersions = new Set(prev.map((m) => m.version));
-    const allExist = sorted.every((m) => prevVersions.has(m.version));
-    if (allExist && prev.length > 0) {
-      this.verboseLogger(4, `[MigrationEngine] Skipping re-registration: "${pluginName}" already has ${prev.length} migration(s).`);
-      return;
     }
 
     this._migrations.set(pluginName, [...prev, ...sorted]);
@@ -665,10 +866,24 @@ export default class MigrationEngine {
       // Tier 2: Connector-agnostic JSON export (works on all dialects, ensures
       // cross-connector portability for future Postgres/MySQL migration).
       // At least one must succeed; if both fail, the migration is aborted.
+      //
+      // Backup scope: only tables a pending migration can actually lose data
+      // in — `touches.columns` and `touches.rows` — are backed up, rather than
+      // the entire database. `touches.creates` is excluded on purpose: a table
+      // a migration creates either does not exist yet, or already exists and
+      // the idempotent existence guard means the migration leaves it alone.
+      // A `tier: 'all'` export loads every row of every model into memory — on
+      // a live server with years of stats in large logging tables, that can OOM
+      // a Node.js process (exit code 137). If every pending migration
+      // explicitly sets `backup: false`, the JSON backup is skipped entirely.
       let fileCopyResult = null;
       let jsonExportResult = null;
 
-      // Tier 1: SQLite file copy (fast, binary-identical)
+      // Determine backup scope from pending migrations' touches declarations
+      const backupModels = _resolveBackupModels(this.dbService, pending);
+      const allBackupFalse = pending.length > 0 && pending.every((m) => m.backup === false);
+
+      // Tier 1: SQLite file copy (fast, binary-identical) — always full-db
       if (this.dbPath) {
         try {
           fileCopyResult = createBackup(this.dbPath, this.backupDir, this.backupRetention);
@@ -681,18 +896,56 @@ export default class MigrationEngine {
         }
       }
 
-      // Tier 2: JSON export (always run — ensures cross-connector portability)
-      try {
-        jsonExportResult = await jsonExportToFile(this.dbService, this.backupDir, {
-          tier: 'all',
-          retention: this.backupRetention
-        });
-        if (jsonExportResult) {
-          this.verboseLogger(2, `[MigrationEngine] JSON backup created: ${jsonExportResult.filename} (${jsonExportResult.sizeBytes} bytes).`);
+      // Tier 2: JSON export
+      if (allBackupFalse) {
+        // Every pending migration explicitly opted out of backup — skip the
+        // JSON export entirely. This is safe when every migration is a pure
+        // createTable with an idempotent existence guard (no data migration,
+        // no column changes, no backfills — nothing that can lose data).
+        this.verboseLogger(2, `[MigrationEngine] JSON backup skipped — all ${pending.length} pending migration(s) for "${pluginName}" opted out (backup: false).`);
+        jsonExportResult = { filename: 'skipped', sizeBytes: 0 };
+      } else if (backupModels && backupModels.length === 0) {
+        // Pending migrations declared `touches`, but none of it is data-bearing
+        // — the only declarations were `creates` (a table a migration creates
+        // cannot lose data: either it does not exist, or the idempotent guard
+        // means the migration skips it), or the named tables map to no
+        // registered model (which a full backup could not export either).
+        // Skipping here is what keeps a pure-create migration from falling
+        // through to the `tier: 'all'` full-database export.
+        this.verboseLogger(2, `[MigrationEngine] JSON backup skipped — pending migration(s) for "${pluginName}" touch no data-bearing tables (creates only).`);
+        jsonExportResult = { filename: 'skipped', sizeBytes: 0 };
+      } else if (backupModels && backupModels.length > 0) {
+        // Scoped backup — only the models backing tables this migration
+        // actually touches. Prevents OOM on large datasets (e.g. years of
+        // wound/death stats in a logging table that a createTable migration
+        // will never modify).
+        try {
+          jsonExportResult = await jsonExportToFile(this.dbService, this.backupDir, {
+            models: backupModels,
+            retention: this.backupRetention
+          });
+          if (jsonExportResult) {
+            this.verboseLogger(2, `[MigrationEngine] JSON backup created (scoped to ${backupModels.length} model(s)): ${jsonExportResult.filename} (${jsonExportResult.sizeBytes} bytes).`);
+          }
+        } catch (err) {
+          this.verboseLogger(1, `[MigrationEngine] JSON backup failed: ${err.message}`);
+          jsonExportResult = null;
         }
-      } catch (err) {
-        this.verboseLogger(1, `[MigrationEngine] JSON backup failed: ${err.message}`);
-        jsonExportResult = null;
+      } else {
+        // No touches metadata on any pending migration — fall back to the
+        // full-db backup (original behaviour, unchanged).
+        try {
+          jsonExportResult = await jsonExportToFile(this.dbService, this.backupDir, {
+            tier: 'all',
+            retention: this.backupRetention
+          });
+          if (jsonExportResult) {
+            this.verboseLogger(2, `[MigrationEngine] JSON backup created (full — no touches metadata): ${jsonExportResult.filename} (${jsonExportResult.sizeBytes} bytes).`);
+          }
+        } catch (err) {
+          this.verboseLogger(1, `[MigrationEngine] JSON backup failed: ${err.message}`);
+          jsonExportResult = null;
+        }
       }
 
       if (!fileCopyResult && !jsonExportResult) {
@@ -706,11 +959,15 @@ export default class MigrationEngine {
       this.verboseLogger(2, `[MigrationEngine] Running ${pending.length} migration(s) for "${pluginName}"...`);
 
       let applied = 0;
+      // Drift recovery re-runs migrations that were already applied once. Tell
+      // up() which situation it is in so a destructive one-time step can be
+      // skipped on the repair pass — see the isReapply docs on the qi object.
+      const isReapply = this._driftReapply.has(pluginName);
       for (const migration of pending) {
         try {
           // Step 1: Run up() inside a transaction
           await this.dbService.withTransactionWithRetry(async (transaction) => {
-            const qi = createQueryInterface(this.dbService.sequelize, this.dbService, transaction);
+            const qi = createQueryInterface(this.dbService.sequelize, this.dbService, transaction, { isReapply });
             await migration.up(qi);
           });
 
@@ -733,7 +990,15 @@ export default class MigrationEngine {
           // verifyAndRunMigrations) funnels through this loop, and the Discord
           // embed only carries err.message — the stack dies here otherwise.
           // Mirrored to stderr so `2>` redirection captures it, then re-thrown
-          // unchanged so existing handling is untouched.
+          // unchanged so existing handling is untouched, except for a
+          // permission-error guidance line appended to err.message itself —
+          // that's the one field every caller actually reads (Discord's
+          // failEmbed included), so enriching it here is what makes the
+          // guidance visible everywhere the raw error already was.
+          const permissionHint = describePermissionError(err);
+          if (permissionHint) {
+            err.message += `\n\nThis looks like a database-permissions problem: ${permissionHint}`;
+          }
           stderrError(
             'MigrationEngine',
             `"${pluginName}" v${appliedVersion} -> v${migration.version} failed: ${err.message}`,
@@ -744,12 +1009,41 @@ export default class MigrationEngine {
         }
       }
 
+      // The repair pass is over. Clearing here — not on the drift path — means
+      // a later ordinary migration for this plugin is treated as a first-time
+      // apply again and still gets its one-time destructive step.
+      this._driftReapply.delete(pluginName);
+
       return { applied, skipped: pending.length - applied };
     } finally {
       if (locked) {
         await this.dbService.releaseAdvisoryLock(lockKey);
       }
     }
+  }
+
+  /**
+   * Migrations registered for a plugin, lowest version first.
+   *
+   * Exposed so DBService's drift recovery can ask which migration owns a
+   * column that has gone missing, instead of assuming it was the most recent
+   * one. Returns a copy — callers must not mutate the registry.
+   *
+   * @param {string} pluginName
+   * @returns {Array<Object>} registered migrations, or [] if none
+   */
+  getMigrations(pluginName) {
+    return [...(this._migrations.get(pluginName) || [])];
+  }
+
+  /**
+   * Mark plugins whose next migration run repairs drift rather than applying
+   * for the first time. Consumed once, by the next runMigrations() for each.
+   *
+   * @param {string[]} pluginNames
+   */
+  markDriftReapply(pluginNames) {
+    for (const name of pluginNames) this._driftReapply.add(name);
   }
 
   /**

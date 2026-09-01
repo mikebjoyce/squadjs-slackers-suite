@@ -545,6 +545,46 @@ await runTest('extractClanGroups groups a bracketless-looking clan once its deco
   assert.equal(groups.WANCS?.length, 3);
 });
 
+await runTest('extractClanGroups groups a hash-prefixed clan without needing outside corroboration', async () => {
+  // Real prod example: both BOZO members used '#BOZO Name' formatting.
+  // '#' wasn't in the bracket/separator char lists, so extraction fell to
+  // low-confidence 'bare' and, with no bracket/separator BOZO member to
+  // corroborate it, the whole 2-member clan was dropped as uncorroborated.
+  // '#TAG' is now a first-class high-confidence extraction ('prefixSymbol').
+  const service = new ClansService();
+  const players = [
+    { eosID: 'e1', name: '#BOZO Rulerofcode' },
+    { eosID: 'e2', name: '#BOZO Shadowcat' }
+  ];
+
+  const { groups, trace } = service.explainClanGroups(players);
+
+  assert.equal(groups.BOZO?.length, 2);
+  assert.equal(trace.memberStrategies.get('e1'), 'prefixSymbol');
+  assert.equal(trace.memberStrategies.get('e2'), 'prefixSymbol');
+});
+
+await runTest('extractClanGroups treats a numeric hash-prefix as high-confidence too (accepted false-positive risk)', async () => {
+  // '#1'/'#69'-style self-styled "rank" monikers get merged as a
+  // false-positive "clan" here — a deliberate trade-off. The alternative
+  // (requiring a letter, falling back to bareRegex otherwise) would also
+  // block a genuine all-numeric clan tag (e.g. '#420') from ever
+  // corroborating on its own, which is a worse failure: a false negative
+  // that costs a real clan its grouping entirely, vs. two unrelated
+  // players coincidentally sharing a numeral getting merged.
+  const service = new ClansService();
+  const players = [
+    { eosID: 'e1', name: '#1 BestPlayer' },
+    { eosID: 'e2', name: '#1 TopFragger' }
+  ];
+
+  const { groups, trace } = service.explainClanGroups(players);
+
+  assert.equal(groups['1']?.length, 2);
+  assert.equal(trace.memberStrategies.get('e1'), 'prefixSymbol');
+  assert.equal(trace.memberStrategies.get('e2'), 'prefixSymbol');
+});
+
 await runTest('extractClanGroups does not treat a period as a separator (would re-admit rank abbreviations)', async () => {
   // Real prod finding: 'MR.'/'DR.'/'PVT.'/'SGT.'/'CPT.'/'CPL.'/'LT.'/'CAPT.'
   // account for 96 of the period-separated names in the historic export —
@@ -683,6 +723,84 @@ await runTest('removePlayerFromCache and clearPlayerTagCache clear pending low-c
   service.addPlayerToCache('e2', 'GN Bravo');
   service.recordConfirmedTag('e3', 'GN');
   assert.equal(service.getPlayerTag('e2'), 'GN');
+  assert.equal(service.getPlayerTag('e1'), null);
+});
+
+// ─── Reconnect Restoration (_lastConfirmedTags) ────────────────────
+
+await runTest('addPlayerToCache restores confirmed status for a rejoining player whose tag is unchanged', async () => {
+  // A reconnecting player whose tag is ALREADY visible on their first
+  // post-reconnect name never produces the tagless->tagged transition that
+  // normally (re-)confirms a tag — Squad only injects the tag live for a
+  // genuinely fresh, tagless join. Before this fix, a plain mid-session
+  // disconnect (the player's own game connection drops, not a SquadJS
+  // restart — that wipes _confirmedTags/_lastConfirmedTags together and is
+  // a separate, unaddressed gap) permanently downgraded a confirmed player
+  // back to whatever the regex pipeline alone could extract.
+  const service = new ClansService();
+
+  service.recordConfirmedTag('e1', 'GN');
+  service.removePlayerFromCache('e1');
+  assert.equal(service.getPlayerTag('e1'), null);
+
+  service.addPlayerToCache('e1', 'GN Alpha');
+  assert.equal(service.getPlayerTag('e1'), 'GN');
+  assert.equal(service._confirmedTags.get('e1'), 'GN');
+});
+
+await runTest('reconnect restoration re-anchors corroboration for the whole clan, not just the reconnecting player', async () => {
+  const service = new ClansService();
+
+  service.recordConfirmedTag('e1', 'GN');
+  service.addPlayerToCache('e2', 'GN Bravo'); // bare, corroborated by e1's confirmed tag
+
+  service.removePlayerFromCache('e1'); // e1 disconnects — the clan's sole anchor is gone
+  service.addPlayerToCache('e1', 'GN Alpha'); // e1 reconnects, tag already showing
+
+  const groups = service.extractClanGroups([
+    { eosID: 'e1', name: 'GN Alpha' },
+    { eosID: 'e2', name: 'GN Bravo' }
+  ]);
+  assert.equal(groups.GN?.length, 2);
+});
+
+await runTest('reconnecting with a DIFFERENT tag does not get silently restored', async () => {
+  const service = new ClansService();
+
+  service.recordConfirmedTag('e1', 'GN');
+  service.removePlayerFromCache('e1');
+
+  // e1 shows up under a different tag entirely — must go through the
+  // ordinary corroboration gate like any other unconfirmed bare extraction,
+  // not be waved through because they were once confirmed as something else.
+  service.addPlayerToCache('e1', 'ZZZ Alpha');
+  assert.equal(service.getPlayerTag('e1'), null);
+  assert.equal(service._confirmedTags.has('e1'), false);
+});
+
+await runTest('clearConfirmedTag (explicit in-session tag removal) also clears reconnect-restoration memory', async () => {
+  // Distinguishes a disconnect (network blip, tag memory kept) from the
+  // player deliberately taking their tag off mid-session (shrink
+  // transition) — the latter is real evidence the tag is gone and must not
+  // be silently reinstated on a later reconnect.
+  const service = new ClansService();
+
+  service.recordConfirmedTag('e1', 'GN');
+  service.clearConfirmedTag('e1');
+  assert.equal(service._lastConfirmedTags.has('e1'), false);
+
+  service.addPlayerToCache('e1', 'GN Alpha');
+  assert.equal(service.getPlayerTag('e1'), null);
+});
+
+await runTest('clearPlayerTagCache clears reconnect-restoration memory too', async () => {
+  const service = new ClansService();
+
+  service.recordConfirmedTag('e1', 'GN');
+  service.clearPlayerTagCache();
+  assert.equal(service._lastConfirmedTags.has('e1'), false);
+
+  service.addPlayerToCache('e1', 'GN Alpha');
   assert.equal(service.getPlayerTag('e1'), null);
 });
 

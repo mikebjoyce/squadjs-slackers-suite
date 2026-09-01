@@ -118,8 +118,8 @@ export default class ClansService {
     this._playerTagCache = new Map();
 
     /**
-     * @private Extraction strategy ('bracket'/'separator'/'doublespace'/
-     * 'shorttag'/'bare') behind each cached tag, tracked alongside
+     * @private Extraction strategy ('bracket'/'separator'/'prefixSymbol'/
+     * 'doublespace'/'shorttag'/'bare') behind each cached tag, tracked alongside
      * _playerTagCache so addPlayerToCache() can corroborate a new
      * low-confidence extraction against other already-cached players'
      * high-confidence ones.
@@ -134,6 +134,26 @@ export default class ClansService {
      * extractions of the same tag.
      */
     this._confirmedTags = new Map();
+
+    /**
+     * @private eosID -> most recently confirmed tag, survives disconnect
+     * (unlike _confirmedTags, which removePlayerFromCache() clears along
+     * with the rest of that player's session state). A reconnecting player
+     * whose EOS ID is stable across sessions goes through the plain "new
+     * player" join path, which never re-observes a tagless->tagged
+     * transition when the tag is already present on their very first
+     * post-reconnect name — Squad only re-injects it live for a genuinely
+     * fresh, tagless join. Without this map, a bracketless/hash-prefixed
+     * clan permanently loses its corroboration anchor the instant every
+     * member has disconnected once, with no path back short of a live
+     * mid-session tag change. addPlayerToCache() consults this to restore
+     * 'confirmed' status immediately when a rejoining player's tag hasn't
+     * changed, instead of waiting for a transition that will never come.
+     * Cleared only by an explicit clearConfirmedTag() (the player removed
+     * their own tag — a real signal, not a network blip) or a full
+     * clearPlayerTagCache() reset.
+     */
+    this._lastConfirmedTags = new Map();
 
     /**
      * @private eosID -> candidate tag rejected only for lack of corroboration
@@ -190,12 +210,13 @@ export default class ClansService {
 
   /**
    * Same detection as extractRawPrefix(), but also reports which strategy
-   * matched. 'bracket' and 'separator' require an explicit, deliberate tag
-   * delimiter and are treated as high-confidence; 'doublespace', 'shorttag',
-   * and 'bare' are heuristics over plain whitespace and routinely fire on
-   * ordinary words ('BIG', 'THE', 'MR') that aren't clan tags at all. The
-   * corroboration gate in _computeClanGroups() / buildPlayerTagCache() uses
-   * this distinction to decide which extractions can be trusted on their own.
+   * matched. 'bracket', 'separator', and 'prefixSymbol' require an explicit,
+   * deliberate tag delimiter and are treated as high-confidence;
+   * 'doublespace', 'shorttag', and 'bare' are heuristics over plain
+   * whitespace and routinely fire on ordinary words ('BIG', 'THE', 'MR')
+   * that aren't clan tags at all. The corroboration gate in
+   * _computeClanGroups() / buildPlayerTagCache() uses this distinction to
+   * decide which extractions can be trusted on their own.
    *
    * @private
    * @param {string} name
@@ -211,6 +232,26 @@ export default class ClansService {
     const sepRegex = /^\s*(.{1,10}?)\s*(?:\/\/|\||-|:|\:\(|\:\)|†|™|✯|~|\*|↯|♠)\s+/;
     match = name.match(sepRegex);
     if (match) return { raw: match[1].trim(), strategy: 'separator' };
+
+    // A leading '#' immediately before the tag ('#BOZO Name') is the same
+    // kind of deliberate, unambiguous formatting as a bracket pair or a
+    // trailing separator — nobody's name accidentally starts with '#TAG '.
+    // Without this, '#'-prefixed tags fall through to bareRegex below,
+    // which is a low-confidence heuristic requiring corroboration from a
+    // bracket/separator/confirmed source elsewhere in the population. A
+    // clan whose members ALL use '#TAG' formatting then has no such source
+    // and can never form a group, no matter how many members share the tag.
+    //
+    // No letter requirement: a numeric-only capture like '#1 BestPlayer'
+    // is treated the same as any other tag. This does mean two unrelated
+    // players who both self-style '#1' get merged as a false-positive
+    // "clan" — an accepted trade-off, since the alternative (falling back
+    // to bareRegex) requires corroboration a real all-numeric-tag clan
+    // (e.g. '#420') could never produce on its own, a false negative that
+    // costs a real clan its grouping entirely.
+    const prefixSymbolRegex = /^\s*#(.{1,10}?)\s+/;
+    match = name.match(prefixSymbolRegex);
+    if (match) return { raw: match[1].trim(), strategy: 'prefixSymbol' };
 
     const spaceRegex = /^\s*(.{1,10}?)\s{2,}/;
     match = name.match(spaceRegex);
@@ -229,7 +270,7 @@ export default class ClansService {
 
   /** @private True for strategies that require an explicit, deliberate tag delimiter. */
   _isHighConfidenceStrategy(strategy) {
-    return strategy === 'bracket' || strategy === 'separator' || strategy === 'confirmed';
+    return strategy === 'bracket' || strategy === 'separator' || strategy === 'prefixSymbol' || strategy === 'confirmed';
   }
 
   normalizeTag(raw) {
@@ -362,13 +403,14 @@ export default class ClansService {
    * at least minMergeLength long, so short tags (e.g. 2-3 chars) never
    * fuzzy-merge.
    *
-   * Corroboration gate: 'bracket' and 'separator' extraction (an explicit
-   * `[TAG]` or `TAG //`) is high-confidence — deliberate formatting. The
-   * whitespace-only heuristics ('doublespace', 'shorttag', 'bare') routinely
-   * fire on ordinary words ('BIG', 'THE', 'MR', 'RAT') that aren't clan tags
-   * at all. A low-confidence extraction only survives if the SAME final key
-   * is also established by a high-confidence extraction from some other
-   * player — one real bracketed/separated member vouches for the rest.
+   * Corroboration gate: 'bracket', 'separator', and 'prefixSymbol' extraction
+   * (an explicit `[TAG]`, `TAG //`, or `#TAG`) is high-confidence — deliberate
+   * formatting. The whitespace-only heuristics ('doublespace', 'shorttag',
+   * 'bare') routinely fire on ordinary words ('BIG', 'THE', 'MR', 'RAT') that
+   * aren't clan tags at all. A low-confidence extraction only survives if the
+   * SAME final key is also established by a high-confidence extraction from
+   * some other player — one real bracketed/separated/hash-prefixed member
+   * vouches for the rest.
    *
    * @private
    * @param {Array<{eosID: string, name: string}>} rawPlayers
@@ -728,6 +770,23 @@ export default class ClansService {
       if (normalizedIgnores.has(candidateTag)) candidateTag = null;
     }
 
+    // Reconnect restoration: this eosID was confirmed before (via a live
+    // transition or a high-confidence extraction) and their current name
+    // still resolves to that exact tag. Trust it immediately rather than
+    // demanding a fresh corroborator — a rejoining player whose tag is
+    // already visible on their very first post-reconnect name will never
+    // produce the tagless->tagged transition addPlayerToCache's caller
+    // relies on to (re-)confirm normally, since Squad only re-injects the
+    // tag live for a genuinely fresh, tagless join. Without this, a clan
+    // whose format never earns a bracket/separator (or a hash-prefix) is
+    // one disconnect away from permanently losing its sole corroboration
+    // anchor. Only an exact tag match restores it — a changed or absent
+    // tag falls through to the ordinary corroboration gate below.
+    if (candidateTag && this._lastConfirmedTags.get(eosID) === candidateTag) {
+      this.recordConfirmedTag(eosID, raw);
+      return;
+    }
+
     let tag = candidateTag;
     let rejectedForCorroboration = false;
 
@@ -787,6 +846,7 @@ export default class ClansService {
       if (normalizedIgnores.has(tag)) return;
     }
     this._confirmedTags.set(eosID, tag);
+    this._lastConfirmedTags.set(eosID, tag);
     this._playerTagCache.set(eosID, tag);
     this._playerTagStrategy.set(eosID, 'confirmed');
     this._healPendingLowConfidenceTag(tag);
@@ -795,6 +855,11 @@ export default class ClansService {
   clearConfirmedTag(eosID) {
     if (!eosID || !this._confirmedTags.has(eosID)) return;
     this._confirmedTags.delete(eosID);
+    // A deliberate in-session removal (shrink transition — the player took
+    // their own tag off) is a real signal, unlike a disconnect. Clear the
+    // reconnect-restoration memory too, or a later reconnect would silently
+    // re-confirm a tag the player just chose to drop.
+    this._lastConfirmedTags.delete(eosID);
     this._playerTagCache.delete(eosID);
     this._playerTagStrategy.delete(eosID);
   }
@@ -821,12 +886,16 @@ export default class ClansService {
     this._playerTagStrategy.delete(eosID);
     this._confirmedTags.delete(eosID);
     this._pendingLowConfidenceTags.delete(eosID);
+    // _lastConfirmedTags is deliberately NOT cleared here — see its
+    // constructor doc comment. A disconnect is not a signal the tag is
+    // gone; addPlayerToCache() uses it to restore 'confirmed' on rejoin.
   }
 
   clearPlayerTagCache() {
     this._playerTagCache.clear();
     this._playerTagStrategy.clear();
     this._confirmedTags.clear();
+    this._lastConfirmedTags.clear();
     this._pendingLowConfidenceTags.clear();
   }
 

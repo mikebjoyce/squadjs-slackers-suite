@@ -49,11 +49,15 @@
  *
  *   node s3/testing/test-resolving-cleared-logging.js
  *
- * Runs against a real file-backed SQLite database and reads every assertion
- * back out of the engine. A mock would accept any write and prove nothing —
- * which is precisely how this regression survived a green suite.
+ * Runs against a real file-backed SQLite database, and against MySQL too when
+ * s3-test-mysql (127.0.0.1:3307) is reachable — reading every assertion back
+ * out of the engine. A mock would accept any write and prove nothing, which
+ * is precisely how this regression survived a green suite, and MySQL is not
+ * optional window-dressing here: the whole point of case 6 is a claim about
+ * the engine with no DDL grants. MySQL cases report as skipped, not passed,
+ * when the container is down — read the skip count.
  *
- * Category: 1 (no server required)
+ * Category: 1 (no server required; Docker-optional, see above)
  */
 
 'use strict';

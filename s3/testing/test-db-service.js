@@ -102,6 +102,75 @@ await runTest('executeWithRetry retries lock errors then succeeds', async () => 
   assert.equal(attempts, 3);
 });
 
+await runTest('executeWithRetry without totalTimeoutMs never races a stuck attempt (default, unchanged behaviour)', async () => {
+  const sequelize = new MockSequelize({ dialect: 'sqlite' });
+
+  // Simulates 5 attempts each blocking on a slow connection-pool acquire — the exact
+  // shape that produced a real ~301s EloTracker round-end stall. Without opting into
+  // totalTimeoutMs, every existing caller must still just wait it out (no regression).
+  let attempts = 0;
+  const start = Date.now();
+  const result = await DBService.executeWithRetry(sequelize, async () => {
+    attempts += 1;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    return 'ok';
+  }, { attempts: 1, baseDelayMs: 0, jitterMs: 0 });
+
+  assert.equal(result, 'ok');
+  // Tolerance of 2ms: Windows' timer granularity is ~15.6ms, and setTimeout(15)
+  // can fire a fraction under its nominal delay, so a bare `>= 15` failed
+  // intermittently. What this asserts is that the slow attempt was actually
+  // awaited rather than skipped — 13ms is nowhere near the ~0ms a skip costs.
+  assert.ok(Date.now() - start >= 13, 'must have actually waited for the slow attempt');
+});
+
+await runTest('executeWithRetry with totalTimeoutMs fails fast on a stuck retry loop', async () => {
+  const sequelize = new MockSequelize({ dialect: 'sqlite' });
+
+  // Every attempt "hangs" far longer than the budget — the real-world equivalent is
+  // Sequelize's connection-pool acquire() blocking under pool exhaustion. The budget
+  // must trip well before 5 attempts would ever resolve on their own.
+  const result = DBService.executeWithRetry(sequelize, async () => {
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    return 'never';
+  }, { attempts: 5, baseDelayMs: 0, jitterMs: 0, totalTimeoutMs: 50 });
+
+  await assert.rejects(result, (err) => {
+    assert.equal(err.name, 'S3RetryBudgetExceededError');
+    return true;
+  });
+});
+
+await runTest('executeWithRetry with totalTimeoutMs still returns normally when the attempt is fast', async () => {
+  const sequelize = new MockSequelize({ dialect: 'sqlite' });
+
+  const result = await DBService.executeWithRetry(sequelize, async () => 'ok', {
+    attempts: 5,
+    baseDelayMs: 0,
+    jitterMs: 0,
+    totalTimeoutMs: 5000
+  });
+
+  assert.equal(result, 'ok');
+});
+
+await runTest('withTransactionWithRetry treats a totalTimeoutMs budget-exceeded error as a network error and engages backoff', async () => {
+  const sequelize = new MockSequelize({ dialect: 'sqlite' });
+  const db = new DBService({ sequelize });
+
+  // withTransactionWithRetry rethrows like any other DB error — callers (every real
+  // one in this repo) wrap it in their own try/catch and return null. What matters
+  // here is that the rejection is classified as a network error so backoff engages.
+  await assert.rejects(
+    db.withTransactionWithRetry(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      return 'never';
+    }, { totalTimeoutMs: 50 }),
+    (err) => err.name === 'S3RetryBudgetExceededError'
+  );
+  assert.ok(db.shouldSkipDb(), 'budget-exceeded must engage the same network backoff as a real connection failure');
+});
+
 await runTest('SQLite mutex serializes concurrent operations', async () => {
   const sequelize = new MockSequelize({ dialect: 'sqlite' });
 
@@ -234,6 +303,71 @@ await runTest('runMigrations applies a registered migration exactly once', async
   const second = await db.migrationEngine.runMigrations('test-db-service');
   assert.equal(second.applied, 0);
   assert.equal(upCalls, 1);
+
+  await db.unmount();
+});
+
+await runTest('ensureIndexes creates missing indexes and is idempotent on re-run', async () => {
+  // Real in-memory SQLite, same reasoning as the migration case above: a mock
+  // cannot answer "did the index actually land," which is the whole point.
+  const sequelize = new Sequelize.Sequelize({
+    dialect: 'sqlite',
+    storage: ':memory:',
+    logging: false
+  });
+  const db = new DBService({ sequelize, verboseLogger: () => {} });
+  await db.mount();
+
+  const qi = sequelize.getQueryInterface();
+  await qi.createTable('EnsureIndexesProbe', {
+    id: { type: Sequelize.DataTypes.INTEGER, primaryKey: true },
+    matchId: { type: Sequelize.DataTypes.STRING },
+    ts: { type: Sequelize.DataTypes.BIGINT }
+  });
+
+  const indexes = [
+    { name: 'idx_eip_matchId', fields: ['matchId'] },
+    { name: 'idx_eip_ts', fields: ['ts'] }
+  ];
+
+  await db.ensureIndexes('EnsureIndexesProbe', indexes);
+  let names = (await qi.showIndex('EnsureIndexesProbe')).map((i) => i.name);
+  assert.ok(names.includes('idx_eip_matchId'), 'idx_eip_matchId was not created');
+  assert.ok(names.includes('idx_eip_ts'), 'idx_eip_ts was not created');
+
+  // Re-run: showIndex() already reports both, so this must be a no-op, not an
+  // error from re-declaring an index that already exists.
+  await db.ensureIndexes('EnsureIndexesProbe', indexes);
+  names = (await qi.showIndex('EnsureIndexesProbe')).map((i) => i.name);
+  assert.equal(names.filter((n) => n === 'idx_eip_matchId').length, 1, 'index was duplicated on re-run');
+  assert.equal(names.filter((n) => n === 'idx_eip_ts').length, 1, 'index was duplicated on re-run');
+
+  await db.unmount();
+});
+
+await runTest('ensureIndexes logs and continues past a failed CREATE INDEX rather than throwing', async () => {
+  // No such table exists, so the CREATE INDEX itself fails (whether or not
+  // showIndex() throws first depends on dialect — SQLite tolerates PRAGMA
+  // index_list on a missing table). Either way this must never propagate:
+  // a missing index is a query-performance concern, not a correctness one.
+  const sequelize = new Sequelize.Sequelize({
+    dialect: 'sqlite',
+    storage: ':memory:',
+    logging: false
+  });
+  const warnings = [];
+  const db = new DBService({
+    sequelize,
+    verboseLogger: (level, msg) => warnings.push(msg)
+  });
+  await db.mount();
+
+  await db.ensureIndexes('NoSuchTable', [{ name: 'idx_nst_x', fields: ['x'] }]);
+
+  assert.ok(
+    warnings.some((m) => m.includes('Failed to create index')),
+    'expected a logged failure, got: ' + JSON.stringify(warnings)
+  );
 
   await db.unmount();
 });

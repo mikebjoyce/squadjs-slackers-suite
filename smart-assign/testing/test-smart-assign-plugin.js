@@ -213,6 +213,38 @@ try {
 
     await plugin.unmount();
   });
+
+  // ── 5. eventLogger sees the resolved defaults, not the raw config ─────────
+  await test('eventLogger honors optionsSpecification defaults when the operator sets neither flag', async () => {
+    // Regression for 2026-08-28: the plugin used to construct SAEventLogger
+    // with the raw pre-default `options` argument instead of `this.options`,
+    // so SAEventLogger's own (stale) inline fallback won out over the
+    // documented default for any operator who didn't set both keys
+    // explicitly — silently inverting enableEventLogging/enableDatabaseLogging.
+    const server = makeMockServer({ players: somePlayers });
+    const plugin = await mount(server);
+
+    assert.equal(
+      plugin.eventLogger.enableEventLogging, false,
+      'enableEventLogging should follow optionsSpecification\'s documented default (false) when unset'
+    );
+    assert.equal(
+      plugin.eventLogger.enableDatabaseLogging, true,
+      'enableDatabaseLogging should follow optionsSpecification\'s documented default (true) when unset'
+    );
+
+    await plugin.unmount();
+  });
+
+  await test('eventLogger honors an operator override of both flags', async () => {
+    const server = makeMockServer({ players: somePlayers });
+    const plugin = await mount(server, { enableEventLogging: true, enableDatabaseLogging: false });
+
+    assert.equal(plugin.eventLogger.enableEventLogging, true, 'explicit enableEventLogging: true was not honored');
+    assert.equal(plugin.eventLogger.enableDatabaseLogging, false, 'explicit enableDatabaseLogging: false was not honored');
+
+    await plugin.unmount();
+  });
 } finally {
   cleanAssembly(assembly);
 }

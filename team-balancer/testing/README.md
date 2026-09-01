@@ -2,7 +2,12 @@
 
 Standalone scripts for testing and validating TeamBalancer behaviour.
 
-These are **not part of the plugin** and are **not maintained** alongside it. They were written during development and vary in their current state — some work standalone, some require a live SquadJS server environment, and some are deprecated. They are provided as-is with no support.
+Some of these are wired into `node testing/run-all-tests.js [--fast]` (the
+plugin's entry point, also reachable via `node testing/run-all-tests.js
+--plugin=team-balancer` at the repo root); others are excluded from that
+runner for documented reasons (historical replays need a CLI data-file
+argument; `mock-data-generator.js` is a fixture module, not a test). See
+`run-all-tests.js`'s own header for the exact included/excluded list.
 
 ---
 
@@ -34,16 +39,34 @@ Replays historical match data from an EloTracker DB backup and JSONL match log t
 node historical-scramble-test.js <elodb.json> [merged.jsonl]
 ```
 
-**`plugin-logic-test-runner.js`** — ⚠️ **currently does not run**
-Tests win streak logic, dominant win detection, and scramble triggering using a mock SquadJS environment. Carried over from the standalone TeamBalancer repo and never updated for S³: its mock server has no `SlackersSquadServices` plugin, so the mount path fails the S³ discovery and version checks. It also cannot resolve `s3-plugin-base.js` from the source tree, since `install.cjs` only flattens that next to `team-balancer.js` in the assembled output. Fixing it needs an assembled tree plus a mock S³ exposing `version` and the service getters.
+**`plugin-logic-test-runner.js`**
+Streak tracking, dominant-win detection, scramble triggering, and config validation, against the real plugin loaded through a throwaway flattened assembly (mirroring what `install.cjs` produces) so `./s3-plugin-base.js` resolves. Wired into `run-all-tests.js`. The note that used to say this "does not run" was itself wrong by the time it was written — nothing here ever touched a live server; it failed on a plain `ERR_MODULE_NOT_FOUND` import, now fixed by the sandboxed assembly.
 ```
 node plugin-logic-test-runner.js
 ```
 
-**`elo-integration-test.js`**
-Tests ELO-weighted scramble behaviour against a constructed scenario (pro stack vs average team). Requires a live SquadJS environment for Logger — will error if run standalone without mocking Logger first.
+**`test-team-balancer-plugin.js`**
+Regression for the layer-mirror deletion: `gameModeCached`/`layerNameCached` must be fed only by `gameState.onLayerGameModeChange()`, never `server.currentLayer` (which reads `null` after a mid-round SquadJS restart). Loads the real plugin via the same sandboxed assembly. Wired into `run-all-tests.js`.
 ```
-node elo-integration-test.js
+node test-team-balancer-plugin.js
+```
+
+**`test-tb-elo-scramble.js`**
+Pins both directions of one rule: squad atomicity outranks ELO parity. A skill stack spread across several squads must be broken up; the same stack inside one squad must be left alone rather than decomposed. Runs the randomized scrambler across many trials since it has no seed parameter. **Replaces** the now-deleted `elo-integration-test.js`, which turned out (once its dead import was fixed) to assert something impossible by construction — see the file's own header for the full history. Wired into `run-all-tests.js`.
+```
+node test-tb-elo-scramble.js
+```
+
+**`test-elo-diff-scramble.js`**
+Covers the fourth scramble trigger — the small, budget-capped mu-gap correction fired at round end — distinct from the three ticket-margin-driven triggers `plugin-logic-test-runner.js` covers: threshold logic, budget search, `scrambleType` plumbing through `initiateScramble`/`executeScramble`/`onRoundEnded`. Stubs the randomized scrambler for determinism. Wired into `run-all-tests.js`.
+```
+node test-elo-diff-scramble.js
+```
+
+**`historical-elo-backbone-test.js`**
+Replays recorded match data through the TrueSkill rating pipeline: convergence, round-over-round stability, and top-15 backbone-ELO correctness. Requires an EloTracker DB export as a CLI argument, so it's excluded from `run-all-tests.js`.
+```
+node historical-elo-backbone-test.js <elodb.json>
 ```
 
 ---

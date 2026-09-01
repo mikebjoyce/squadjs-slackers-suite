@@ -58,7 +58,7 @@ import Sequelize from 'sequelize';
 import ClansService from '../utils/clans-service.js';
 import DBService from '../utils/db-service.js';
 import FactionsService from '../utils/factions-service.js';
-import GameStateService from '../utils/game-state-service.js';
+import GameStateService, { gamemodeKeyOf } from '../utils/game-state-service.js';
 import PlayersService from '../utils/players-service.js';
 import ServerConfigService from '../utils/server-config-service.js';
 
@@ -222,6 +222,12 @@ export function makeMockS3(overrides = {}) {
       // this separate; the mock has only one name, so both return it.
       getLayerDisplayName: () => state.layerDisplayName || state.layerName,
       getGamemode: () => state.gamemode,
+      // Borrowed from the real service rather than reimplemented: a mock with
+      // its own copy of the alias table would keep passing after the real one
+      // gained an entry, which is the same reasoning as scraping the version
+      // string above. Set state.gamemode to whatever SquadJS really reports
+      // ("Territory Control") and consumers see the same 'TC' production does.
+      getGamemodeKey: () => gamemodeKeyOf(state.gamemode),
       getPhase: () => 'LIVE',
       isResolving: () => false,
       isLayerResolved: () => true,

@@ -97,8 +97,8 @@
  *   2. the staging phase itself — 4 minutes, the same in every mode.
  *
  * Only the countdown differs by mode. RAAS and AAS run 10s (→ 250000);
- * Invasion runs a full minute, presumably for defender setup (→ 300000).
- * Owner-observed in-game, 2026-08-19.
+ * Invasion and TC run a full minute (→ 300000). Owner-observed in-game,
+ * 2026-08-19 (RAAS/AAS/Invasion) and 2026-09-01 (TC).
  *
  * Corroborated independently on the test server: rolling Fallujah_Invasion_v1,
  * `server.matchStartTime` — which SquadJS derives from the A2S PLAYTIME rule,
@@ -107,6 +107,14 @@
  * takes. The dev harness records it on every lifecycle event, which is how to
  * measure any mode added here later.
  *
+ * TC was measured the same way, and rolling TWO different maps is what
+ * separates the countdown from map-load time: Logar_TC_v1 settled ~87s after
+ * NEW_GAME and Narva_TC_v1 ~89s. Two maps agreeing within 2s rules out load
+ * time as the driver, and both sit in Invasion's band rather than anywhere
+ * near a 10s countdown. Before this entry existed TC fell to the default and
+ * S³ called LIVE at NEW_GAME+250s against a real +300s — 50s early, exactly
+ * the shortfall between the two numbers.
+ *
  * The previous single 180000 was a wiki figure of unknown provenance. It ran a
  * minute short on RAAS and TWO minutes short on Invasion, taking those rounds
  * LIVE while players were still locked in main.
@@ -114,15 +122,27 @@
  * Seed and Training are absent deliberately: they have no meaningful staging
  * phase at all and are short-circuited to 5s in _startStagingLiveTimer().
  *
+ * ── KEYED BY THE CANONICAL MODE KEY, NOT THE RAW MODE NAME ───────────
+ * Lookups go through gamemodeKeyOf(), not the raw gamemode string. SquadJS
+ * supplies TC's mode as "Territory Control" (see GAMEMODE_KEY_ALIASES), so a
+ * bare `TC` key read against that spelling would never match and this entry
+ * would be dead code.
+ *
+ * Note gamemodeKeyOf(), NOT the getGamemodeKey() accessor: the staging paths
+ * key off gameModeCached directly, because getGamemodeKey() inherits
+ * getGamemode()'s fall back to lastKnownGoodLayer and a stale mode must not
+ * reach this table. See _stagingDurationForRound().
+ *
  * ── UNMEASURED MODES ─────────────────────────────────────────────────
- * Only measured modes are listed. Anything else — TC, Skirmish, Insurgency,
+ * Only measured modes are listed. Anything else — Skirmish, Insurgency,
  * Destruction — falls back to DEFAULT_STAGING_DURATION_MS rather than being
  * guessed at here, so the table never implies knowledge it does not have.
  */
 const STAGING_DURATION_MS_BY_GAMEMODE = Object.freeze({
   RAAS: 250000,      // 10s match-start countdown + 4min staging
   AAS: 250000,       // same as RAAS
-  Invasion: 300000   // 1min match-start countdown + 4min staging
+  Invasion: 300000,  // 1min match-start countdown + 4min staging
+  TC: 300000         // same as Invasion — 1min countdown + 4min staging
 });
 
 /**
@@ -133,6 +153,71 @@ const STAGING_DURATION_MS_BY_GAMEMODE = Object.freeze({
  * delays them.
  */
 const DEFAULT_STAGING_DURATION_MS = 250000;
+
+/**
+ * Wiki gamemode spellings that differ from S³'s own short mode key.
+ *
+ * ── WHY THIS EXISTS ──────────────────────────────────────────────────
+ * A mode name reaches S³ by one of two routes, and they do not agree:
+ *
+ *   1. SquadJS's Layer object — `layer.gamemode`, sourced from the Squad Wiki
+ *      pipeline JSON. This is the normal path and it wins in resolveLayerInfo().
+ *   2. inferGameMode(), the fallback for a layer the wiki lookup did not
+ *      resolve (JensensRange is the standing example — it has no wiki entry).
+ *
+ * For most modes the two agree: both say "RAAS", "AAS", "Invasion", "Seed",
+ * "Skirmish". Territory Control is the observed exception — route 1 says
+ * "Territory Control" and route 2 says "TC" — so anything keying off the mode
+ * has to be told they are the same thing.
+ *
+ * ── ONLY VERIFIED DIVERGENCES GO IN HERE ─────────────────────────────
+ * Same policy as STAGING_DURATION_MS_BY_GAMEMODE: this maps what has actually
+ * been observed on a real server, not what a mode is guessed to be called.
+ * Add an entry when a divergence is seen, not in anticipation of one — a wrong
+ * alias silently reroutes a mode's staging duration and threshold branch.
+ * Confirmed for TC on 2026-09-01 across Logar_TC_v1 and Narva_TC_v1.
+ */
+const GAMEMODE_KEY_ALIASES = Object.freeze({
+  'territory control': 'TC'
+});
+
+/**
+ * Canonical key for a gamemode string. Unmapped modes — and null/undefined —
+ * pass through untouched, so this is safe to call on anything.
+ *
+ * Own-property guarded, like the period lookup in s3-switch-reports.js: a bare
+ * index reads Object.prototype too, so a mode spelled "constructor" would
+ * resolve to the Object constructor and be returned as if it were a mode key.
+ * The gamemode reaching here comes from the wiki pipeline, so that is not a
+ * realistic input — but the guard costs nothing and the failure would be
+ * baffling, since the returned value is truthy and only misbehaves downstream.
+ */
+export function gamemodeKeyOf(mode) {
+  if (!mode) return mode;
+  const key = String(mode).toLowerCase();
+  return Object.prototype.hasOwnProperty.call(GAMEMODE_KEY_ALIASES, key)
+    ? GAMEMODE_KEY_ALIASES[key]
+    : mode;
+}
+
+/**
+ * The table's entry for a mode key, or undefined when it has none.
+ *
+ * Both readers go through here rather than indexing the table directly, for
+ * the same own-property reason as gamemodeKeyOf() and with a sharper failure:
+ * a raw STAGING_DURATION_MS_BY_GAMEMODE['toString'] resolves to a *function*.
+ * _stagingDurationForRound() would then return it, and setTimeout coerces a
+ * function to NaN and fires immediately — a round declared LIVE during
+ * staging, the exact defect the measured table exists to prevent. The
+ * diagnostic reader would separately report it as a table hit, so the log
+ * would agree with itself while both were wrong.
+ */
+function stagingDurationFromTable(modeKey) {
+  if (!modeKey) return undefined;
+  return Object.prototype.hasOwnProperty.call(STAGING_DURATION_MS_BY_GAMEMODE, modeKey)
+    ? STAGING_DURATION_MS_BY_GAMEMODE[modeKey]
+    : undefined;
+}
 
 export default class GameStateService {
   constructor({
@@ -462,6 +547,9 @@ export default class GameStateService {
       // Additive: existing subscribers read layerName and are unaffected.
       layerDisplayName: this.layerDisplayNameCached || this.layerNameCached,
       gameMode: this.gameModeCached,
+      // Also additive. gameMode stays the human/storage spelling; this is the
+      // one to branch on ("Territory Control" vs 'TC').
+      gameModeKey: gamemodeKeyOf(this.gameModeCached),
       prevLayer,
       prevGameMode
     };
@@ -495,6 +583,19 @@ export default class GameStateService {
 
   getGamemode() {
     return this.gameModeCached || this.lastKnownGoodLayer?.gamemode || 'Unknown';
+  }
+
+  /**
+   * The gamemode as code should branch on it ('TC', 'RAAS', 'Invasion').
+   *
+   * Same split as getLayerName()/getLayerDisplayName(): getGamemode() is what a
+   * human should read and what gets stored on round rows, this one is what a
+   * lookup table or an if-branch should key off. They differ only where
+   * GAMEMODE_KEY_ALIASES says they do; everything else passes straight through
+   * unchanged, including 'Unknown'.
+   */
+  getGamemodeKey() {
+    return gamemodeKeyOf(this.getGamemode());
   }
 
   getLayerName() {
@@ -1126,15 +1227,24 @@ export default class GameStateService {
     // once the round's own layer is trusted, so this line is also how a re-arm
     // (unresolved -> resolved) is seen switching from the fallback to the real
     // per-gamemode value without a second NEW_GAME.
+    //
+    // Keyed through gamemodeKeyOf() for the same reason _stagingDurationForRound()
+    // is: reading gameModeCached raw here would report "not in table" for a TC
+    // round that had just been served a table value, i.e. the diagnostic would
+    // contradict the duration printed beside it on the same line. The key is
+    // shown when it differs from the mode, so the alias is visible rather than
+    // silently swallowed.
+    const modeKey = gamemodeKeyOf(this.gameModeCached);
+    const modeLabel = modeKey === this.gameModeCached ? `${modeKey}` : `${this.gameModeCached} -> ${modeKey}`;
     const durationSource = shortStaging
       ? 'seed/training shortcut'
       : this.stagingDurationOverrideMs !== null
         ? 'explicit override'
         : !this._roundLayerTrusted
           ? 'fallback (layer not yet resolved)'
-          : STAGING_DURATION_MS_BY_GAMEMODE[this.gameModeCached] !== undefined
-            ? `gamemode table [${this.gameModeCached}]`
-            : `fallback (gamemode ${this.gameModeCached} not in table)`;
+          : stagingDurationFromTable(modeKey) !== undefined
+            ? `gamemode table [${modeLabel}]`
+            : `fallback (gamemode ${modeLabel} not in table)`;
     this.verboseLogger(
       4,
       `[GameState] Staging timer armed: duration=${effectiveDuration}ms source="${durationSource}" ` +
@@ -1657,11 +1767,18 @@ export default class GameStateService {
    * the training shortcut fired. An unresolved layer therefore gets the
    * fallback, and resolveLayerInfo() re-arms the timer the moment the real
    * layer lands.
+   *
+   * The cached mode goes through gamemodeKeyOf() rather than being read raw:
+   * SquadJS hands TC over as "Territory Control", so the raw string would miss
+   * the table's TC entry entirely and silently fall back to the default. It is
+   * deliberately not getGamemodeKey(), which falls back to lastKnownGoodLayer —
+   * a stale mode is exactly what the _roundLayerTrusted gate above exists to
+   * keep out of this calculation.
    */
   _stagingDurationForRound() {
     if (this.stagingDurationOverrideMs !== null) return this.stagingDurationOverrideMs;
     if (!this._roundLayerTrusted) return DEFAULT_STAGING_DURATION_MS;
-    return STAGING_DURATION_MS_BY_GAMEMODE[this.gameModeCached] ?? DEFAULT_STAGING_DURATION_MS;
+    return stagingDurationFromTable(gamemodeKeyOf(this.gameModeCached)) ?? DEFAULT_STAGING_DURATION_MS;
   }
 
   _isRecoveredStagingOverdue(now = Date.now()) {
@@ -1779,10 +1896,20 @@ export default class GameStateService {
         matchId: this.matchId
       });
     };
-    if (dbService?.executeWithRetry) {
-      await dbService.executeWithRetry(write);
-    } else {
-      await write();
+    // Best-effort: every caller awaits this immediately before firing a phase-change
+    // notification (onGamePhaseChange subscribers include Switch's seed-token grant
+    // and SmartAssign's roster snapshot). This row is only for restart recovery — an
+    // uncaught throw here must never suppress the notification that keeps consumer
+    // plugins' own in-memory state in sync with a phase change S3 already committed
+    // to memory.
+    try {
+      if (dbService?.executeWithRetry) {
+        await dbService.executeWithRetry(write);
+      } else {
+        await write();
+      }
+    } catch (err) {
+      this.verboseLogger(1, `[GameState] _persistState failed (state kept in memory, restart recovery may be stale): ${err.message}`);
     }
   }
 

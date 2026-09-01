@@ -47,6 +47,10 @@
  */
 import assert from 'node:assert/strict';
 
+// Mirrors the plugin's hardcoded POST_SWITCH_LOCKOUT_MS (switch.js) — not
+// configurable there, so not exposed as a mock option either.
+const POST_SWITCH_LOCKOUT_MS = 10_000;
+
 // ── MockClock ─────────────────────────────────────────────────
 
 export class MockClock {
@@ -444,6 +448,7 @@ export function createMockHarness(opts = {}, clock = null) {
   // ── Build plugin stub ───────────────────────────────────────
   const plugin = {
     options,
+    recentSwitches: [],    // { eosID, datetime } — post-switch lockout, tests control via _recordRecentSwitch()
     server: {
       players: []          // tests control this via _setPlayerCount()
     },
@@ -503,10 +508,21 @@ export function createMockHarness(opts = {}, clock = null) {
       return null;
     },
 
+    // Tests toggle this via plugin._s3db._skip = true to simulate an active
+    // network backoff, mirroring S3's DBService.shouldSkipDb().
+    _s3db: { _skip: false, shouldSkipDb() { return this._skip; } },
+
     warn: (eosID, msg) => {
       // Capture for assertion
       plugin._lastWarnMsg = msg;
       plugin._lastWarnEosID = eosID;
+    },
+
+    // ── _recordRecentSwitch (exact copy of the plugin logic) ────
+    _recordRecentSwitch: (eosID) => {
+      const existing = plugin.recentSwitches.find(e => e.eosID === eosID);
+      if (existing) existing.datetime = new Date(resolvedClock.now());
+      else plugin.recentSwitches.push({ eosID, datetime: new Date(resolvedClock.now()) });
     }
   };
 
@@ -560,8 +576,34 @@ export function createMockHarness(opts = {}, clock = null) {
     const eosID = player?.eosID;
     if (!eosID) return { eligible: false, reason: 'missing_eos' };
 
-    // Simulate DB lookup via the injected db
-    const cooldownData = plugin._testDb ? await plugin._testDb.findByPk(eosID) : null;
+    // Post-switch lockout — mirrors the real plugin's gate, checked before
+    // any DB lookup and independent of liberal mode.
+    const recentSwitch = plugin.recentSwitches.find(e => e.eosID === eosID);
+    if (recentSwitch) {
+      const elapsedMs = resolvedClock.now() - recentSwitch.datetime.getTime();
+      if (elapsedMs < POST_SWITCH_LOCKOUT_MS) {
+        return { eligible: false, reason: 'recent_switch', remaining: Math.ceil((POST_SWITCH_LOCKOUT_MS - elapsedMs) / 1000) };
+      }
+    }
+
+    // Simulate DB lookup via the injected db — mirrors the real plugin's
+    // fail-open handling of backoff/thrown errors (see switch.js).
+    let cooldownData = null;
+    let dbUnavailable = false;
+    if (plugin._testDb) {
+      if (plugin._s3db?.shouldSkipDb?.()) {
+        dbUnavailable = true;
+      } else {
+        try {
+          cooldownData = await plugin._testDb.findByPk(eosID);
+        } catch (err) {
+          dbUnavailable = true;
+        }
+      }
+    }
+    if (dbUnavailable) {
+      return { eligible: true };
+    }
     const now = resolvedClock.now();
 
     // Scramble lock is an independent override

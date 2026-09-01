@@ -205,6 +205,8 @@
             "endgameConsolationFailed": "[SeedPresence] ENDGAME consolation grant failed: {{message}}",
             "matchendFailed": "[Switch] Matchend switch failed for {{identifier}}: {{reason}}",
             "matchendProcessed": "[Switch] Matchend: processed {{count}} requests ({{failed}} failed), cleared {{cleared}} rows.",
+            "matchendProcessedClearFailed": "[Switch] Matchend: processed {{count}} requests ({{failed}} failed), but failed to clear DB rows: {{message}}",
+            "matchendProcessedNoRows": "[Switch] Matchend: processed {{count}} requests ({{failed}} failed).",
             "matchendFailedGeneric": "[Switch] doSwitchMatchend failed: {{message}}",
             "roundEndedQueuePreserved": "[Queue] Round ended — queue preserved ({{count}} entries remain).",
             "onRoundEndedFailed": "[Switch] onRoundEnded matchend processing failed: {{message}}",

@@ -245,6 +245,31 @@ test('MigrationEngine registers per-plugin migrations', async () => {
   }
 });
 
+test('Re-registering the exact same migration set is a no-op, not a gap-check error', async () => {
+  const harness = await createTestHarness();
+  try {
+    const { engine } = harness;
+
+    const migrations = [
+      { version: 1, description: 'v1', touches: {}, up: async () => {} }
+    ];
+
+    // First registration establishes the baseline.
+    engine.registerMigrations('re-register-plugin', migrations);
+    assert.equal(engine._migrations.get('re-register-plugin').length, 1);
+
+    // Registering the identical set again (e.g. a plugin remounting without a
+    // process restart) must be silently skipped, not rejected by the
+    // strictly-increasing gap check — the two guards previously ran in the
+    // wrong order, so this exact case threw instead of hitting the
+    // duplicate-registration no-op it was meant for.
+    engine.registerMigrations('re-register-plugin', migrations);
+    assert.equal(engine._migrations.get('re-register-plugin').length, 1, 'duplicate registration should not append a second copy');
+  } finally {
+    await destroyTestHarness(harness);
+  }
+});
+
 test('Invalid migrations (non-monotonic versions) are rejected', async () => {
   const harness = await createTestHarness();
   try {

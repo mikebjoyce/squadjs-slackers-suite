@@ -1,4 +1,4 @@
-# Team Balancer Plugin v4.0.6
+# Team Balancer Plugin v4.1.0
 
 **SquadJS Plugin for Fair Match Enforcement**
 
@@ -70,7 +70,7 @@ Prevents players from changing teams immediately after a scramble. When TeamBala
 
 S³ is the centralised service container for shared state across Slacker's Squad plugins. TeamBalancer uses it as the primary data source for player state, squad data, faction names, clan grouping, game-mode detection (including ignored modes), and game-state metadata.
 
-**Requires S³ ≥1.0.0.**
+**Requires S³ ≥1.7.0.** Territory Control support branches on `gameState.getGamemodeKey()`, which S³ 1.7.0 is the first release to expose. TeamBalancer fails to mount below that rather than starting up with `tcDominantThreshold` and `tcSingleRoundScrambleThreshold` configured but silently inert.
 
 **Why this matters**: Rather than maintaining its own duplicate caches, TeamBalancer reads ground-truth data from S³ — player/squad snapshots via `players.getAllPlayers()` / `players.getSquads()`, faction names via `factions.getTeamName()`, game-mode/layer detection via `gameState.getGamemode()` / `gameState.getLayerName()`, ignored-mode checks via `gameState.isIgnoredMode()`, and clan grouping via `clans.extractClanGroups()`. During scrambles, S³'s global-lock mechanism (`players.lockGlobal()` / `players.unlockGlobal()`) prevents concurrent scrambles from conflicting.
 
@@ -167,7 +167,7 @@ Add to your `config.json`:
   "useEloForBalance": true,
   "devMode": false,
   "reportLogPath": "team-balancer-reports.jsonl",
-  "enableDatabaseLogging": false
+  "enableDatabaseLogging": true
 }
 ```
 
@@ -243,6 +243,8 @@ Admin Commands:
 | `minTicketsToCountAsDominantWin` | no | number | `150` | Minimum ticket difference for a dominant win in Standard modes |
 | `invasionAttackTeamThreshold` | no | number | `300` | Ticket difference for Invasion attackers to count as dominant |
 | `invasionDefenceTeamThreshold` | no | number | `500` | Ticket difference for Invasion defenders to count as dominant |
+| `tcDominantThreshold` | no | number | `null` | Ticket difference for a dominant win on Territory Control. `null` uses `minTicketsToCountAsDominantWin` |
+| `tcSingleRoundScrambleThreshold` | no | number | `null` | Ticket margin for a single-round scramble on Territory Control. `null` uses `singleRoundScrambleThreshold` |
 | `scrambleAnnouncementDelay` | no | number | `25` | Seconds before scramble executes after announcement |
 | `seedScrambleAnnouncementDelay` | no | number | `5` | Countdown for the seed auto-scramble only, in seconds (minimum 3). Separate from `scrambleAnnouncementDelay` because the window before the map change is much shorter after a Seed round |
 | `scramblePercentage` | no | number | `0.5` | Fraction of players to move (0.0–1.0) |
@@ -263,11 +265,11 @@ Admin Commands:
 | `enableEloDiffScramble` | no | boolean | `false` | Trigger a small "micro scramble" when the average Elo (mu) gap between teams from the round that just ended meets `eloDiffScrambleThreshold`, independent of the three reactive triggers. Opt-in — requires EloTracker to be active. Can also be triggered manually via `!scramble elo` regardless of this setting. |
 | `eloDiffScrambleThreshold` | no | number | `1.2` | Average mu gap between teams (abs value) that arms the Elo-diff micro scramble |
 | `microScrambleParityTarget` | no | number | `0.05` | Post-swap average mu gap the Elo-diff micro scramble's escalating search stops at once reached |
-| `microScrambleMaxMovePercent` | no | number | `0.10` | Safety ceiling for the Elo-diff micro scramble: max fraction of the current round's population (both teams combined) that may be moved |
+| `microScrambleMaxMovePercent` | no | number | `0.20` | Safety ceiling for the Elo-diff micro scramble: max fraction of the current round's population (both teams combined) that may be moved |
 | `devMode` | no | boolean | `false` | Allow commands from any player regardless of admin status |
 | `reportLogPath` | no | string | `"team-balancer-reports.jsonl"` | Path to the JSONL log file for round reports |
 | `scrambleReportPath` | no | string | `"TeamBalancerScrambleReports/"` | Directory for per-scramble report files |
-| `enableDatabaseLogging` | no | boolean | `false` | If true, round reports are also written to database tables |
+| `enableDatabaseLogging` | no | boolean | `true` | If true, round reports are also written to database tables |
 
 > **S³-Managed Options**: The following settings are no longer configured on the TeamBalancer plugin. They are now managed by S³:
 >
@@ -280,6 +282,7 @@ Admin Commands:
 
 - **RAAS / AAS**: Uses `minTicketsToCountAsDominantWin` threshold.
 - **Invasion**: Uses separate thresholds for attackers (`invasionAttackTeamThreshold`) and defenders (`invasionDefenceTeamThreshold`).
+- **Territory Control**: Symmetric, so both teams are judged on one number — `tcDominantThreshold`, with the stomp cutoff derived from it at 1.5x, and `tcSingleRoundScrambleThreshold` for the mercy scramble. Both default to `null`, which falls back to the Standard-mode values; set them only once you have enough TC rounds on your server to know what a lopsided one looks like there.
 - **Seed**: Excluded from win streak tracking. Optional auto-scramble at round end via `enableSeedAutoScramble`. This trigger runs on its own countdown, `seedScrambleAnnouncementDelay` (default 5s), not the global `scrambleAnnouncementDelay` — the gap between a Seed round ending and the map change is much shorter.
 - Other modes and map names can be excluded via `ignoredGameModes` (configured on S³).
 
@@ -293,6 +296,7 @@ The plugin operates two independent win tracking systems that can each trigger s
 Tracks wins where the victor exceeded configured ticket margin thresholds:
 - **Standard modes (RAAS/AAS)**: `minTicketsToCountAsDominantWin` (default: 150)
 - **Invasion mode**: Separate thresholds for attackers (`invasionAttackTeamThreshold`: 300) and defenders (`invasionDefenceTeamThreshold`: 500)
+- **Territory Control**: `tcDominantThreshold` (default `null` → the Standard value)
 
 A scramble triggers when one team achieves `maxWinStreak` dominant victories in a row (default: 2).
 

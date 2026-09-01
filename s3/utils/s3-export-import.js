@@ -28,11 +28,21 @@
  * towards including too much.
  *
  * Additions:
- *   exportToFile() — Writes export to a timestamped .s3backup.json file
- *     in the backup directory. Used by MigrationEngine as the fallback
- *     pre-migration backup for non-SQLite connectors.
+ *   exportToFile() — Streams the export to a timestamped .s3backup.json file
+ *     in the backup directory. Used by MigrationEngine as the pre-migration
+ *     backup, and by `!s3 db export`.
  *   restoreFromFile() — Reads a backup file, detects format (.sqlite vs
  *     .json), and restores via file copy or JSON import.
+ *
+ * ─── MEMORY ──────────────────────────────────────────────────────
+ *
+ * The file-backed half of this module streams; the object-returning half does
+ * not. exportToFile() / importFromStreamFile() hold one batch of rows at a
+ * time and are safe on a database of any size. exportToJSON() /
+ * importFromJSON() / serializeForAttachment() materialise everything and are
+ * only for datasets known to be small — a production db-log dataset is ~900MB,
+ * and materialising it OOM-killed the SquadJS process during pre-migration
+ * backup.
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
@@ -54,13 +64,22 @@
  *     JSON.stringify + optional gzip if > 1 MB. Pre-checks size against
  *     Discord's 25 MB boosted limit. Returns { filename, buffer, sizeBytes }.
  *
- *   exportToFile(dbService, backupDir, { tier, retention })
- *     Writes JSON export to backupDir as a timestamped file.
- *     Returns { filename, sizeBytes } or null on failure.
+ *   exportToFile(dbService, backupDir, { tier, retention, models, batchSize })
+ *     Streams a JSON export to backupDir as a timestamped file, one row batch
+ *     at a time. Bounded memory on any database size.
+ *     Returns { filename, path, sizeBytes, rowCounts, results, ... } or null.
+ *
+ *   gzipFileForAttachment(filePath, { limitBytes })
+ *     Compresses an export file via a streaming pipeline and returns it as a
+ *     Discord attachment buffer, or { attachable: false } with a reason.
+ *
+ *   importFromStreamFile(dbService, backupPath, { dryRun, chunkSize })
+ *     Restores a file written by exportToFile() line by line, upserting in
+ *     bounded per-transaction chunks. Never parses the whole document.
  *
  *   restoreFromFile(filename, dbService, backupDir)
- *     Detects backup format (.sqlite → file copy, .json → JSON import)
- *     and restores accordingly. Returns restore result or throws.
+ *     Detects backup format (.sqlite → file copy, .json → streamed or
+ *     in-memory JSON import) and restores accordingly. Returns result or throws.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
@@ -74,6 +93,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import readline from 'node:readline';
+import { pipeline } from 'node:stream/promises';
+import SequelizeLib from 'sequelize';
 import { restoreBackup, listBackups } from './s3-backup.js';
 import { formatSize, timestampString, parseTimestamp } from './s3-common.js';
 
@@ -190,8 +212,12 @@ const TIERS_FOR_FLAG = Object.freeze({
  * @param {string} [options.tier] - 'historical' (default), 'logs', or 'all'
  * @returns {string[]} Filtered model names in declaration order
  */
-function filterByTier(dbService, { tier = 'historical' } = {}) {
+export function filterByTier(dbService, { tier = 'historical', models = null } = {}) {
   const modelNames = dbService.getModelNames();
+  if (models && Array.isArray(models) && models.length > 0) {
+    const modelSet = new Set(modelNames);
+    return models.filter((name) => modelSet.has(name));
+  }
 
   // `--all` still short-circuits, but now it is a superset of the tier logic
   // rather than a path that bypasses it: every model has an effective tier, and
@@ -323,12 +349,12 @@ function enforceJsonRetention(dir, maxCount) {
  * @param {string} [options.tier='historical'] - 'historical', 'logs', or 'all'
  * @returns {Promise<object>} { tables, rowCounts, results, s3ExportVersion, exportedAt, connector }
  */
-export async function exportToJSON(dbService, { tier = 'historical' } = {}) {
+export async function exportToJSON(dbService, { tier = 'historical', models = null } = {}) {
   if (!dbService || !dbService.isReady()) {
     throw new Error('DBService is not ready.');
   }
 
-  const selected = filterByTier(dbService, { tier });
+  const selected = filterByTier(dbService, { tier, models });
   const connector = dbService.getConnector();
   const connectorName = connector && typeof connector.getDialect === 'function'
     ? connector.getDialect()
@@ -583,28 +609,191 @@ export async function serializeForAttachment(exportObj) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// FILE-BACKED EXPORT/RESTORE
+// FILE-BACKED EXPORT/RESTORE  (streaming)
 // ══════════════════════════════════════════════════════════════════════
 
-/**
- * Export database tables to a timestamped JSON file in the backup directory.
+/*
+ * Why this half of the file streams and the exportToJSON() half does not.
  *
- * This is the connector-agnostic fallback for MigrationEngine pre-migration
- * backup. For SQLite, the faster file copy in s3-backup.js is used instead;
- * exportToFile() is only called when the SQLite file path is unavailable.
+ * exportToJSON() materialises every row of every selected table into one
+ * object, and the old exportToFile() then ran JSON.stringify() over it. Both
+ * steps scale with the size of the database, and neither has an upper bound:
+ *
+ *   - A production db-log dataset is ~900MB of rows. Holding that as JS objects
+ *     costs several times its serialised size in heap.
+ *   - JSON.stringify() then adds another full copy as a single string, on top of
+ *     the objects it is reading.
+ *
+ * What actually killed the live server was the resident-set cost of that, not
+ * any single hard limit: the container's memory ceiling was hit and the kernel
+ * sent SIGKILL (exit 137) during the pre-migration backup, taking the whole
+ * SquadJS instance down on mount. A big enough dataset would additionally run
+ * into V8's max string length (~512MB on Node 18, ~1GB on Node 24), but the
+ * process is normally OOM-killed well before it gets there.
+ *
+ * The streaming writer below never holds more than one batch of rows and one
+ * ~256KB output buffer, regardless of table size, and honours write
+ * backpressure so the gzip/file sink cannot be outrun. exportToJSON() is
+ * retained for callers that genuinely want an in-memory object (imports,
+ * validation, tests) on datasets known to be small.
+ */
+
+/**
+ * Marker written into streamed exports. Its presence tells restoreFromFile()
+ * that the file is laid out one row per line and can be imported without
+ * parsing the whole document into memory. Files without it are legacy
+ * pretty-printed exports and take the in-memory path.
+ */
+export const STREAM_FORMAT_VERSION = 1;
+
+/** Discord's boosted per-attachment limit. */
+const DISCORD_ATTACHMENT_LIMIT = 25 * 1024 * 1024;
+
+/** Rows fetched per query while streaming. Bounds peak heap, not the output. */
+const DEFAULT_BATCH_SIZE = 2000;
+
+/** Bytes buffered before handing a chunk to the write stream. */
+const WRITE_FLUSH_BYTES = 256 * 1024;
+
+/**
+ * Largest legacy (non-streamed) JSON backup we will attempt to read into
+ * memory. Node 18's max string is ~512MB and JSON.parse peaks well above the
+ * input size, so anything approaching that would OOM rather than error.
+ */
+const LEGACY_PARSE_LIMIT = 256 * 1024 * 1024;
+
+/**
+ * Resolve a write-stream 'drain' as a promise, without leaking the listener or
+ * hanging if the stream errors while we are waiting. A plain
+ * `once(stream, 'drain')` never settles when the sink is destroyed — which is
+ * exactly how the first attempt at this fix hung instead of failing.
+ *
+ * @param {import('node:stream').Writable} stream
+ * @returns {Promise<void>}
+ */
+function _onceDrain(stream) {
+  return new Promise((resolve, reject) => {
+    const onDrain = () => { stream.removeListener('error', onError); resolve(); };
+    const onError = (err) => { stream.removeListener('drain', onDrain); reject(err); };
+    stream.once('drain', onDrain);
+    stream.once('error', onError);
+  });
+}
+
+/**
+ * Small buffered writer over a Writable.
+ *
+ * Coalesces many small writes into ~256KB chunks (one fs write per row would
+ * be needlessly chatty) and — the part that matters — awaits 'drain' whenever
+ * the stream says its buffer is full. Ignoring `write()`'s return value is what
+ * turns "streaming" back into "buffer the entire database in memory".
+ */
+class _BufferedWriter {
+  constructor(stream) {
+    this.stream = stream;
+    this.parts = [];
+    this.pending = 0;
+  }
+
+  async write(str) {
+    this.parts.push(str);
+    this.pending += str.length;
+    if (this.pending >= WRITE_FLUSH_BYTES) await this.flush();
+  }
+
+  async flush() {
+    if (this.parts.length === 0) return;
+    const chunk = this.parts.join('');
+    this.parts = [];
+    this.pending = 0;
+    if (!this.stream.write(chunk, 'utf8')) await _onceDrain(this.stream);
+  }
+}
+
+/**
+ * Yield a model's rows in batches without ever holding the whole table.
+ *
+ * Uses keyset pagination (`WHERE pk > :last ORDER BY pk LIMIT :n`) when the
+ * model has a single-column primary key. `LIMIT ... OFFSET n` is O(n) per page
+ * on MySQL — the server re-walks and discards every skipped row — so paging a
+ * multi-million-row table with OFFSET is quadratic and takes longer than the
+ * naive full load it was meant to replace. Keyset paging stays O(1) per page
+ * because the index seeks straight to the cursor.
+ *
+ * Composite or absent primary keys fall back to OFFSET: correct, just slower.
+ *
+ * @param {object} model - Sequelize model
+ * @param {number} batchSize
+ * @yields {object[]} A batch of raw rows
+ */
+async function* _iterateRowBatches(model, batchSize) {
+  const pkAttrs = Array.isArray(model.primaryKeyAttributes) ? model.primaryKeyAttributes : [];
+  const Op = model.sequelize?.constructor?.Op || model.sequelize?.Sequelize?.Op || SequelizeLib.Op;
+  const pk = pkAttrs.length === 1 && Op ? pkAttrs[0] : null;
+
+  if (pk) {
+    let last = null;
+    for (;;) {
+      const query = { raw: true, order: [[pk, 'ASC']], limit: batchSize };
+      if (last !== null) query.where = { [pk]: { [Op.gt]: last } };
+      const rows = await model.findAll(query);
+      if (rows.length === 0) return;
+      yield rows;
+      last = rows[rows.length - 1][pk];
+      if (rows.length < batchSize) return;
+      // A null cursor cannot be advanced past — bail rather than loop forever.
+      if (last === null || last === undefined) return;
+    }
+  } else {
+    let offset = 0;
+    for (;;) {
+      const rows = await model.findAll({ raw: true, limit: batchSize, offset });
+      if (rows.length === 0) return;
+      yield rows;
+      offset += rows.length;
+      if (rows.length < batchSize) return;
+    }
+  }
+}
+
+/**
+ * Export database tables to a timestamped JSON file in the backup directory,
+ * streaming row batches straight to disk.
+ *
+ * This is the connector-agnostic pre-migration backup used by MigrationEngine,
+ * and the backing store for `!s3 db export`. For SQLite, the faster file copy
+ * in s3-backup.js runs alongside it.
  *
  * Files are named s3backup-{YYYY-MM-DD-HHmmss}.json and placed alongside
- * SQLite file backups in the backups/ directory. Retention is enforced
- * on JSON backup files independently of SQLite backups.
+ * SQLite file backups in the backups/ directory. Retention is enforced on JSON
+ * backup files independently of SQLite backups.
+ *
+ * The file is written to a `.partial` sibling and renamed on success, so a
+ * crash mid-export cannot leave a truncated file that looks like a usable
+ * backup (and `.partial` does not match the retention pattern, so it is never
+ * mistaken for one).
+ *
+ * Output layout is ordinary JSON, with one row per line inside each table
+ * array. That is what makes the file importable without parsing it whole —
+ * see importFromStreamFile().
  *
  * @param {object} dbService - DBService instance
  * @param {string} [backupDir] - Backup directory (default: './backups')
  * @param {object} [options]
  * @param {string} [options.tier='all'] - Export tier ('historical', 'logs', or 'all')
  * @param {number} [options.retention=5] - Max JSON backup files to keep
- * @returns {Promise<{ filename: string, sizeBytes: number }|null>}
+ * @param {string[]|null} [options.models=null] - Explicit model allowlist
+ * @param {number} [options.batchSize] - Rows per query
+ * @param {(level:number,msg:string)=>void} [options.verboseLogger]
+ * @returns {Promise<{ filename: string, path: string, sizeBytes: number, rowCounts: object, results: object, warnings: string[], connector: string, tier: string }|null>}
  */
-export async function exportToFile(dbService, backupDir = null, { tier = 'all', retention = 5 } = {}) {
+export async function exportToFile(dbService, backupDir = null, {
+  tier = 'all',
+  retention = 5,
+  models = null,
+  batchSize = DEFAULT_BATCH_SIZE,
+  verboseLogger = () => {}
+} = {}) {
   if (!dbService || !dbService.isReady()) {
     return null;
   }
@@ -618,49 +807,360 @@ export async function exportToFile(dbService, backupDir = null, { tier = 'all', 
     return null;
   }
 
-  // Export to JSON
-  let exportObj;
+  let selected;
   try {
-    exportObj = await exportToJSON(dbService, { tier });
-  } catch {
+    selected = filterByTier(dbService, { tier, models });
+  } catch (err) {
+    verboseLogger(1, `[ExportImport] Export aborted — could not resolve models: ${err.message}`);
     return null;
   }
 
-  // Serialize
-  const jsonStr = JSON.stringify(exportObj, null, 2);
-  const ts = timestampString(Date.now());
-  const backupFilename = `s3backup-${ts}.json`;
+  const connector = dbService.getConnector();
+  const connectorName = connector && typeof connector.getDialect === 'function'
+    ? connector.getDialect()
+    : dbService.getConnectorName() || 'unknown';
+
+  const rowCounts = {};
+  const results = {};
+  const warnings = [];
+
+  const undeclared = typeof dbService.getUndeclaredModelNames === 'function'
+    ? dbService.getUndeclaredModelNames().filter((name) => selected.includes(name))
+    : [];
+  if (undeclared.length > 0) {
+    warnings.push(
+      `These models declare no exportTier and were exported at the default tier: ` +
+      `${undeclared.join(', ')}. Declare one at each defineModel() call site.`
+    );
+  }
+
+  for (const name of selected.filter((n) => !dbService.getModel(n))) {
+    results[name] = { status: 'error', error: 'Model not found in dbService' };
+  }
+  const present = selected.filter((name) => dbService.getModel(name));
+
+  const backupFilename = `s3backup-${timestampString(Date.now())}.json`;
   const backupPath = path.join(resolvedDir, backupFilename);
+  const partialPath = `${backupPath}.partial`;
 
-  // Write to file
+  const ws = fs.createWriteStream(partialPath, { encoding: 'utf8' });
+  const w = new _BufferedWriter(ws);
+
   try {
-    fs.writeFileSync(backupPath, jsonStr, 'utf8');
-  } catch {
+    await w.write('{\n');
+    await w.write('  "s3ExportVersion": 1,\n');
+    await w.write(`  "s3StreamFormat": ${STREAM_FORMAT_VERSION},\n`);
+    await w.write(`  "exportedAt": ${Date.now()},\n`);
+    await w.write(`  "connector": ${JSON.stringify(connectorName)},\n`);
+    await w.write(`  "tier": ${JSON.stringify(tier)},\n`);
+    await w.write(`  "tiers": ${JSON.stringify(Object.fromEntries(selected.map((n) => [n, dbService.getEffectiveModelTier(n)])))},\n`);
+    if (warnings.length > 0) await w.write(`  "warnings": ${JSON.stringify(warnings)},\n`);
+    await w.write('  "tables": {\n');
+
+    let firstTable = true;
+    for (const name of present) {
+      if (!firstTable) await w.write(',\n');
+      firstTable = false;
+      await w.write(`    ${JSON.stringify(name)}: [\n`);
+
+      const model = dbService.getModel(name);
+      let count = 0;
+      try {
+        for await (const batch of _iterateRowBatches(model, batchSize)) {
+          let chunk = '';
+          for (const row of batch) {
+            chunk += (count === 0 ? '' : ',\n') + JSON.stringify(row);
+            count += 1;
+          }
+          await w.write(chunk);
+        }
+        results[name] = { status: 'ok', rows: count };
+      } catch (err) {
+        // Per-table isolation, as before: one unreadable table does not abort
+        // the export. Rows already streamed stay in the file and stay valid.
+        results[name] = { status: 'error', error: err.message, rows: count };
+      }
+      rowCounts[name] = count;
+      await w.write('\n    ]');
+    }
+
+    await w.write('\n  },\n');
+    await w.write(`  "rowCounts": ${JSON.stringify(rowCounts)},\n`);
+    await w.write(`  "results": ${JSON.stringify(results)}\n`);
+    await w.write('}\n');
+    await w.flush();
+
+    await new Promise((resolve, reject) => {
+      ws.once('error', reject);
+      ws.end(resolve);
+    });
+  } catch (err) {
+    try { ws.destroy(); } catch { /* ignore */ }
+    try { fs.unlinkSync(partialPath); } catch { /* ignore */ }
+    verboseLogger(1, `[ExportImport] Streaming export failed: ${err.message}`);
     return null;
   }
 
-  // Validate: verify the file was written
+  try {
+    fs.renameSync(partialPath, backupPath);
+  } catch (err) {
+    try { fs.unlinkSync(partialPath); } catch { /* ignore */ }
+    verboseLogger(1, `[ExportImport] Could not finalise export file: ${err.message}`);
+    return null;
+  }
+
   let writtenStat;
   try {
     writtenStat = fs.statSync(backupPath);
   } catch {
-    try { fs.unlinkSync(backupPath); } catch { /* ignore */ }
     return null;
   }
 
-  const bufferSize = Buffer.byteLength(jsonStr, 'utf8');
-  if (writtenStat.size !== bufferSize) {
-    try { fs.unlinkSync(backupPath); } catch { /* ignore */ }
-    return null;
-  }
-
-  // Enforce retention on JSON backup files
   enforceJsonRetention(resolvedDir, retention);
 
   return {
     filename: backupFilename,
-    sizeBytes: writtenStat.size
+    path: backupPath,
+    sizeBytes: writtenStat.size,
+    rowCounts,
+    results,
+    warnings,
+    connector: connectorName,
+    tier
   };
+}
+
+/**
+ * Compress an already-written export file and return it as a Discord
+ * attachment, if it fits.
+ *
+ * Compression runs as a file→gzip→file pipeline, so a 900MB export costs a
+ * fixed handful of stream buffers rather than its own size in heap. Only once
+ * the compressed result is known to be under the limit is it read into a
+ * Buffer — the size check happens before the allocation, not after it. The
+ * temporary .gz is removed either way; nothing is left behind in backups/.
+ *
+ * @param {string} filePath - Path to a JSON export written by exportToFile()
+ * @param {object} [options]
+ * @param {number} [options.limitBytes] - Attachment ceiling (default 25MB)
+ * @returns {Promise<{ attachable: boolean, filename?: string, buffer?: Buffer, sizeBytes: number, reason?: string }>}
+ */
+export async function gzipFileForAttachment(filePath, { limitBytes = DISCORD_ATTACHMENT_LIMIT } = {}) {
+  const gzPath = `${filePath}.gz`;
+
+  try {
+    await pipeline(
+      fs.createReadStream(filePath),
+      zlib.createGzip({ level: 6 }),
+      fs.createWriteStream(gzPath)
+    );
+  } catch (err) {
+    try { fs.unlinkSync(gzPath); } catch { /* ignore */ }
+    return { attachable: false, sizeBytes: 0, reason: `compression failed: ${err.message}` };
+  }
+
+  let stat;
+  try {
+    stat = fs.statSync(gzPath);
+  } catch {
+    return { attachable: false, sizeBytes: 0, reason: 'compressed file could not be read back' };
+  }
+
+  if (stat.size > limitBytes) {
+    try { fs.unlinkSync(gzPath); } catch { /* ignore */ }
+    return {
+      attachable: false,
+      sizeBytes: stat.size,
+      reason: `compressed export is ${formatSize(stat.size)}, over Discord's ${formatSize(limitBytes)} attachment limit`
+    };
+  }
+
+  let buffer;
+  try {
+    buffer = fs.readFileSync(gzPath);
+  } catch (err) {
+    try { fs.unlinkSync(gzPath); } catch { /* ignore */ }
+    return { attachable: false, sizeBytes: stat.size, reason: `could not read compressed file: ${err.message}` };
+  }
+  try { fs.unlinkSync(gzPath); } catch { /* ignore */ }
+
+  return {
+    attachable: true,
+    filename: `${path.basename(filePath)}.gz`,
+    buffer,
+    sizeBytes: stat.size
+  };
+}
+
+/**
+ * Detect whether a JSON backup was written by the streaming exporter.
+ *
+ * Reads only the first 8KB — `s3StreamFormat` is the second key written, so it
+ * is always well inside that window, and a 900MB file costs one small read.
+ *
+ * @param {string} backupPath
+ * @returns {boolean}
+ */
+function _isStreamFormat(backupPath) {
+  let fd;
+  try {
+    fd = fs.openSync(backupPath, 'r');
+    const buf = Buffer.alloc(8192);
+    const read = fs.readSync(fd, buf, 0, 8192, 0);
+    return /"s3StreamFormat"\s*:\s*1/.test(buf.subarray(0, read).toString('utf8'));
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+}
+
+/**
+ * Import a streamed export file line by line, without parsing it whole.
+ *
+ * A backup that cannot be restored is not a backup. The in-memory importer
+ * needs the entire document as a JS object, so a 900MB export written by
+ * exportToFile() would be unrestorable on the very server that produced it —
+ * `fs.readFileSync(..., 'utf8')` alone exceeds V8's max string on Node 18.
+ *
+ * This reads the file as lines instead. It works because exportToFile() writes
+ * exactly one row per line and JSON.stringify escapes newlines inside strings,
+ * so "one line" and "one row" cannot drift apart. Only the fixed structural
+ * lines are pattern-matched; every row is parsed by JSON.parse as normal.
+ *
+ * Rows are upserted in bounded chunks, each in its own transaction, rather than
+ * one transaction spanning millions of rows. A chunk that fails is reported
+ * against its table and the rest of the import continues — matching
+ * importFromJSON()'s per-table isolation.
+ *
+ * @param {object} dbService - DBService instance
+ * @param {string} backupPath - Path to a file written by exportToFile()
+ * @param {object} [options]
+ * @param {boolean} [options.dryRun=false] - Count rows without writing
+ * @param {number} [options.chunkSize=500] - Rows per transaction
+ * @param {(level:number,msg:string)=>void} [options.verboseLogger]
+ * @returns {Promise<{ imported: object, errors: string[] }>}
+ */
+export async function importFromStreamFile(dbService, backupPath, {
+  dryRun = false,
+  chunkSize = 500,
+  verboseLogger = () => {}
+} = {}) {
+  if (!dbService || !dbService.isReady()) {
+    throw new Error('DBService is not ready.');
+  }
+
+  const known = new Set(dbService.getModelNames());
+  const result = { imported: {}, errors: [] };
+  const connector = dbService.getConnector();
+  const fkLogger = typeof dbService.verboseLogger === 'function' ? dbService.verboseLogger : () => {};
+
+  const upsertChunk = async (model, rows) => {
+    if (dryRun || rows.length === 0) return;
+    if (connector && typeof connector.transaction === 'function') {
+      // No CLS in this codebase — the transaction handle has to be passed
+      // explicitly to every call inside it.
+      await connector.transaction(async (transaction) => {
+        for (const row of rows) await model.upsert(row, { transaction });
+      });
+    } else {
+      for (const row of rows) await model.upsert(row);
+    }
+  };
+
+  const input = fs.createReadStream(backupPath, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input, crlfDelay: Infinity });
+
+  let inTables = false;
+  /** @type {{name:string, model:object|null, buffer:object[], count:number, failed:boolean}|null} */
+  let current = null;
+
+  const finishTable = async () => {
+    if (!current) return;
+    if (current.model && !current.failed) {
+      try {
+        await upsertChunk(current.model, current.buffer);
+        result.imported[current.name] = { status: 'ok', rows: current.count, ...(dryRun ? { dryRun: true } : {}) };
+      } catch (err) {
+        result.imported[current.name] = { status: 'error', error: err.message, rows: current.count };
+      }
+    } else if (!current.model) {
+      result.imported[current.name] = { status: 'error', error: 'Model not found' };
+    }
+    current = null;
+  };
+
+  if (!dryRun) await disableForeignKeyChecks(connector, fkLogger);
+  try {
+    for await (const rawLine of rl) {
+      const line = rawLine.replace(/\r$/, '');
+
+      if (!inTables) {
+        if (line === '  "tables": {') inTables = true;
+        continue;
+      }
+
+      if (current === null) {
+        const opened = line.match(/^ {4}("(?:[^"\\]|\\.)*"): \[$/);
+        if (opened) {
+          const name = JSON.parse(opened[1]);
+          const model = known.has(name) ? dbService.getModel(name) : null;
+          if (!model) {
+            result.errors.push(`Table "${name}" is not a known model — skipped.`);
+          }
+          current = { name, model, buffer: [], count: 0, failed: false };
+          continue;
+        }
+        // `  },` closes the tables object; everything after it is trailer
+        // metadata (rowCounts / results) that we do not need.
+        if (line === '  },' || line === '  }') break;
+        continue;
+      }
+
+      if (line === '    ]' || line === '    ],') {
+        await finishTable();
+        continue;
+      }
+
+      const trimmed = line.trim();
+      if (trimmed === '') continue;
+      const rowJson = trimmed.endsWith(',') ? trimmed.slice(0, -1) : trimmed;
+
+      if (current.failed || !current.model) continue;
+
+      let row;
+      try {
+        row = JSON.parse(rowJson);
+      } catch (err) {
+        current.failed = true;
+        result.imported[current.name] = { status: 'error', error: `malformed row at row ${current.count + 1}: ${err.message}`, rows: current.count };
+        continue;
+      }
+
+      current.buffer.push(row);
+      current.count += 1;
+      if (current.buffer.length >= chunkSize) {
+        const batch = current.buffer;
+        current.buffer = [];
+        try {
+          await upsertChunk(current.model, batch);
+        } catch (err) {
+          current.failed = true;
+          result.imported[current.name] = { status: 'error', error: err.message, rows: current.count };
+        }
+      }
+    }
+    await finishTable();
+  } finally {
+    rl.close();
+    input.destroy();
+    if (!dryRun) await enableForeignKeyChecks(connector, fkLogger);
+  }
+
+  verboseLogger(2, `[ExportImport] Streamed import of ${path.basename(backupPath)}: ${Object.keys(result.imported).length} table(s).`);
+  return result;
 }
 
 /**
@@ -668,7 +1168,8 @@ export async function exportToFile(dbService, backupDir = null, { tier = 'all', 
  *
  * Supports two formats:
  * - .sqlite files → delegate to restoreBackup() (file copy, s3-backup.js)
- * - .json files → parse JSON, call importFromJSON()
+ * - .json files → streamed row-by-row if written by exportToFile(), otherwise
+ *   parsed in memory and passed to importFromJSON()
  *
  * @param {string} filename - Backup filename (e.g. 'squad-server-2026-06-28-143000.sqlite'
  *                            or 's3backup-2026-06-28-143000.json')
@@ -707,6 +1208,28 @@ export async function restoreFromFile(filename, dbService, backupDir = null, dbP
   if (isJsonBackup) {
     if (!dbService || !dbService.isReady()) {
       throw new Error('DBService is required and must be ready for JSON backup restore.');
+    }
+
+    // Written by the streaming exporter — restore it the same way, one row at
+    // a time. This is the only path that can restore a multi-hundred-MB backup.
+    if (_isStreamFormat(backupPath)) {
+      return importFromStreamFile(dbService, backupPath, { dryRun: false });
+    }
+
+    // Legacy pretty-printed export: has to be parsed whole. Refuse rather than
+    // OOM — reading it alone would exceed V8's max string length on Node 18.
+    let legacyStat;
+    try {
+      legacyStat = fs.statSync(backupPath);
+    } catch {
+      throw new Error(`Backup file not found: ${filename}`);
+    }
+    if (legacyStat.size > LEGACY_PARSE_LIMIT) {
+      throw new Error(
+        `${filename} is ${formatSize(legacyStat.size)} and predates the streaming backup format, ` +
+        `so it can only be restored by loading it entirely into memory — which would exhaust the ` +
+        `Node heap. Restore it with an external tool, or take a fresh export first.`
+      );
     }
 
     // Read and parse the JSON file

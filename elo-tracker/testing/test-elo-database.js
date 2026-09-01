@@ -21,10 +21,17 @@
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
- * - Uses an in-memory SQLite database; no file I/O required.
+ * - Runs the full battery against an in-memory SQLite instance (always) and
+ *   again against real MySQL (127.0.0.1:3307, overridable via
+ *   S3_TEST_MYSQL_HOST/PORT/ROOT_USER/ROOT_PASSWORD/DATABASE) when that
+ *   container is reachable. MySQL cases are suffixed " [mysql]" and, when the
+ *   container is down, are reported as individually SKIPPED via `runSkip` —
+ *   never folded into the pass count. See s3/S3_DEVELOPER_GUIDE.md §11.4.
  * - Requires the `sequelize` npm package to be installed.
  * - The s3dbShim adapter allows EloDatabase to work without a live
- *   S³ plugin instance.
+ *   S³ plugin instance; it delegates every SQL-building helper to the real
+ *   DBService, which is what makes the MySQL pass meaningful rather than
+ *   redundant with SQLite.
  *
  */
 
@@ -151,30 +158,35 @@ function defineEloModels(sequelize) {
   }, { timestamps: false, tableName: 'Elo_RoundPlayers', freezeTableName: true });
 }
 
-export default async function runDatabaseTests(runTest) {
-  // Setup: In-memory SQLite instance
-  const sequelize = new Sequelize({
-    dialect: 'sqlite',
-    storage: ':memory:',
-    logging: false
-  });
-
-  // Define models and sync
+/**
+ * Builds a fresh EloDatabase + S³ shim on top of a given Sequelize instance.
+ * `force` drops and recreates tables first — needed for the MySQL instance,
+ * which is a persistent throwaway database reused across runs, not a fresh
+ * in-memory one.
+ */
+async function buildDb(sequelize, { force = false } = {}) {
   defineEloModels(sequelize);
-  await sequelize.sync();
+  await sequelize.sync({ force });
 
-  // Create the S³ shim and wire it into EloDatabase
   const s3dbShim = createS3dbShim(sequelize);
-  const server = {};
-  const options = {};
-  const db = new EloDatabase(server, options, null);
+  const db = new EloDatabase({}, {}, null);
   db._s3db = s3dbShim;
   db.verbose = () => {}; // silence logs
+  return { db, s3dbShim };
+}
 
+/**
+ * The full assertion battery, parameterized over `step` so the same test
+ * bodies run against both dialects without duplication. `step` has the same
+ * `(name, fn) => Promise` shape as `runTest`; the skip path below passes a
+ * `step` that logs and never calls `fn`, so `db`/`s3dbShim` can safely be
+ * `null` in that case — nothing inside the closures ever dereferences them.
+ */
+async function runSuiteBody(step, db, s3dbShim) {
   // ────────────────────────────────────────────────────────────────
   // Test 1: Initialization
   // ────────────────────────────────────────────────────────────────
-  await runTest('Initialization: Create Tables', async () => {
+  await step('Initialization: Create Tables', async () => {
     await db.initDB();
 
     // Verify models are accessible via the shim
@@ -196,7 +208,7 @@ export default async function runDatabaseTests(runTest) {
   // ────────────────────────────────────────────────────────────────
   // Test 2: CRUD — Save and Search
   // ────────────────────────────────────────────────────────────────
-  await runTest('CRUD: Save and Search', async () => {
+  await step('CRUD: Save and Search', async () => {
     const player = {
       eosID: 'eos_123',
       steamID: 'steam_456',
@@ -224,7 +236,7 @@ export default async function runDatabaseTests(runTest) {
   // ────────────────────────────────────────────────────────────────
   // Test 3: Special Characters in Player Names (LIKE escaping)
   // ────────────────────────────────────────────────────────────────
-  await runTest('Search: Special Characters in Player Names', async () => {
+  await step('Search: Special Characters in Player Names', async () => {
     // Insert players with special characters
     const players = [
       { eosID: 'eos_raccoon', steamID: 'steam_raccoon', name: '/-gMg-\\ Raccoon', mu: 36.6, sigma: 6.3 },
@@ -270,7 +282,7 @@ export default async function runDatabaseTests(runTest) {
   // ────────────────────────────────────────────────────────────────
   // Test 4: Retry Logic — SQLITE_BUSY
   // ────────────────────────────────────────────────────────────────
-  await runTest('Retry Logic: SQLITE_BUSY', async () => {
+  await step('Retry Logic: SQLITE_BUSY', async () => {
     let attempts = 0;
 
     // A function that fails once with SQLITE_BUSY, then succeeds
@@ -297,7 +309,7 @@ export default async function runDatabaseTests(runTest) {
   // Rows are inserted with the low-round decoy FIRST, so a regression to
   // unordered findOne fails this test on SQLite rather than passing by luck.
   // ────────────────────────────────────────────────────────────────
-  await runTest('Search: Ranked disambiguation and case-insensitivity', async () => {
+  await step('Search: Ranked disambiguation and case-insensitivity', async () => {
     const roster = [
       { eosID: 'eos_cerveira', steamID: 'steam_cerveira', name: 'Cerveira', roundsPlayed: 2, wins: 1, losses: 1 },
       { eosID: 'eos_cerv', steamID: '76561198962436118', name: '[NL] Cerv', roundsPlayed: 267, wins: 134, losses: 133 },
@@ -390,7 +402,7 @@ export default async function runDatabaseTests(runTest) {
   // included, since the leading space on " Hunty" is what makes it a literal
   // exact match for the term "hunty" in the first place.
   // ────────────────────────────────────────────────────────────────
-  await runTest('Search: literal and tag-stripped exact names compete on rounds', async () => {
+  await step('Search: literal and tag-stripped exact names compete on rounds', async () => {
     await db.upsertPlayerStats('eos_hunty_bare', { steamID: 'steam_hunty_bare', name: ' Hunty', roundsPlayed: 12, wins: 5, losses: 7 });
     await db.upsertPlayerStats('eos_hunty_nl', { steamID: 'steam_hunty_nl', name: '[✦NL✦] Hunty', roundsPlayed: 384, wins: 201, losses: 183 });
 
@@ -441,7 +453,7 @@ export default async function runDatabaseTests(runTest) {
   // higher-round substring matches, so the fuzzy pass alone cannot save it —
   // only the trimmed exact query can.
   // ────────────────────────────────────────────────────────────────
-  await runTest('Search: whitespace-padded stored names still match exactly', async () => {
+  await step('Search: whitespace-padded stored names still match exactly', async () => {
     await db.upsertPlayerStats('eos_padded', { steamID: 'steam_padded', name: ' Ice', roundsPlayed: 3, wins: 1, losses: 2 });
     for (let i = 0; i < 40; i++) {
       await db.upsertPlayerStats(`eos_icefill${i}`, {
@@ -474,7 +486,7 @@ export default async function runDatabaseTests(runTest) {
   // unbracketed first words must survive, or ordinary two-word names would
   // exact-match a search for their surname.
   // ────────────────────────────────────────────────────────────────
-  await runTest('Search: stripClanTags is conservative', async () => {
+  await step('Search: stripClanTags is conservative', async () => {
     const cases = [
       ['[NL] Cerv', 'Cerv'],
       ['(NL) Cerv', 'Cerv'],
@@ -508,7 +520,7 @@ export default async function runDatabaseTests(runTest) {
   // correlated subquery, so both sides are the same expression evaluated by
   // the same engine — a row can never rank above itself, by construction.
   // ────────────────────────────────────────────────────────────────
-  await runTest('getPlayerRank: ordering matches getLeaderboard, no self-rank inflation', async () => {
+  await step('getPlayerRank: ordering matches getLeaderboard, no self-rank inflation', async () => {
     const roster = [
       { eosID: 'eos_rank_first', name: 'Slacker', mu: 46.8057, sigma: 5.84185, roundsPlayed: 418, wins: 262, losses: 156 },
       { eosID: 'eos_rank_second', name: 'TheGreatGrub', mu: 44.36, sigma: 5.485, roundsPlayed: 519, wins: 326, losses: 193 },
@@ -539,4 +551,84 @@ export default async function runDatabaseTests(runTest) {
     const model = s3dbShim.getModel('Elo_PlayerStats');
     await model.destroy({ where: { eosID: roster.map(p => p.eosID) } });
   });
+}
+
+/**
+ * Default `runSkip` used when a caller (e.g. running this file directly
+ * rather than through elo-tracker/testing/run-all-tests.js) doesn't supply
+ * one. Matches the ⊘ marker convention used across the other real-DB suites.
+ */
+async function defaultRunSkip(name, reason) {
+  console.log(`  ⊘ ${name} (skipped — ${reason})`);
+}
+
+const MYSQL = {
+  host: process.env.S3_TEST_MYSQL_HOST || '127.0.0.1',
+  port: parseInt(process.env.S3_TEST_MYSQL_PORT || '3307', 10),
+  username: process.env.S3_TEST_MYSQL_ROOT_USER || 'root',
+  password: process.env.S3_TEST_MYSQL_ROOT_PASSWORD || 'root',
+  database: process.env.S3_TEST_MYSQL_DATABASE || 'elo_tracker_test'
+};
+
+export default async function runDatabaseTests(runTest, runSkip = defaultRunSkip) {
+  // ---- SQLite: always runs, needs nothing running ----
+  const { db: sqliteDb, s3dbShim: sqliteShim } = await buildDb(
+    new Sequelize({ dialect: 'sqlite', storage: ':memory:', logging: false })
+  );
+  await runSuiteBody((name, fn) => runTest(name, fn), sqliteDb, sqliteShim);
+
+  // ---- MySQL: opportunistic, mirrors the other real-DB suites in this repo.
+  // EloDatabase delegates every SQL-building helper (quoteIdentifier,
+  // caseInsensitiveLikeOp/Literal, escapeValue) to the real DBService via the
+  // shim above, so this is the dialect where identifier folding and LIKE
+  // case-sensitivity differences would actually surface — SQLite alone
+  // cannot prove those helpers are wired correctly. ----
+  let mysqlReachable = false;
+  let probe;
+  try {
+    probe = new Sequelize({
+      dialect: 'mysql',
+      host: MYSQL.host,
+      port: MYSQL.port,
+      username: MYSQL.username,
+      password: MYSQL.password,
+      database: 'mysql',
+      logging: false,
+      dialectOptions: { connectTimeout: 4000 }
+    });
+    await probe.authenticate();
+    await probe.query(`CREATE DATABASE IF NOT EXISTS \`${MYSQL.database}\``);
+    mysqlReachable = true;
+    console.log(`  mysql reachable on ${MYSQL.host}:${MYSQL.port}`);
+  } catch {
+    mysqlReachable = false;
+    console.log(`  ⚠ mysql not reachable on ${MYSQL.host}:${MYSQL.port} — EloDatabase MySQL cases will skip`);
+  } finally {
+    try { await probe?.close(); } catch { /* best effort */ }
+  }
+
+  if (!mysqlReachable) {
+    // Skips are reported per-case with a distinct counter, never folded into
+    // the pass count — a suite that folds a skip in reports green having
+    // never actually exercised the unreachable engine.
+    const skipStep = (name) => runSkip(`${name} [mysql]`, `mysql unreachable on ${MYSQL.host}:${MYSQL.port}`);
+    await runSuiteBody((name) => skipStep(name), null, null);
+    return;
+  }
+
+  const mysqlSequelize = new Sequelize({
+    dialect: 'mysql',
+    host: MYSQL.host,
+    port: MYSQL.port,
+    username: MYSQL.username,
+    password: MYSQL.password,
+    database: MYSQL.database,
+    logging: false
+  });
+  // force: true — this is a persistent throwaway database in the Docker test
+  // container, connected as root, reused across runs; drop-and-recreate
+  // keeps each run's state clean the same way the fresh in-memory SQLite is.
+  const { db: mysqlDb, s3dbShim: mysqlShim } = await buildDb(mysqlSequelize, { force: true });
+  await runSuiteBody((name, fn) => runTest(`${name} [mysql]`, fn), mysqlDb, mysqlShim);
+  await mysqlSequelize.close();
 }

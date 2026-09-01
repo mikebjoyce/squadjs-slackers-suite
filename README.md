@@ -1,12 +1,21 @@
 # SquadJS Slackers Suite
 
-**Monorepo for S³ (SlackersSquadServices) and its consumer plugins — SmartAssign, Switch, EloTracker, and TeamBalancer.**
+**Monorepo for S³ (SlackersSquadServices), its consumer plugins — SmartAssign, Switch, EloTracker, and TeamBalancer — and S³-backed upgrades of stock SquadJS core plugins (`core-plugins/`).**
 
 ## Overview
 
 This repository contains a suite of SquadJS plugins built around **S³ (SlackersSquadServices)**, a centralized service container that owns the ground truth for server configuration, game-state lifecycle, player state, faction metadata, clan grouping, database access, logging, and cross-plugin event routing.
 
 The four consumer plugins — **SmartAssign**, **Switch**, **EloTracker**, and **TeamBalancer** — all depend on S³ and coordinate through its shared services rather than duplicating state or communicating directly.
+
+`core-plugins/` holds a second category: S³-backed drop-in replacements for
+*stock SquadJS core* plugins — same class/file name as the original, safety
+and robustness fixes only, no new features or config surface. Installing one
+overwrites the original file in place rather than adding a second,
+differently-named plugin alongside it. Files sit flat in `core-plugins/` as
+`<name>.js` (no per-plugin subfolder) since these are single-file drop-ins
+with no `utils/` of their own; each plugin's full writeup lives in its own
+top-of-file docblock rather than a separate README.
 
 For the design rationale and architectural decisions behind S³, see **[WHY_S3.md](WHY_S3.md)**.
 
@@ -17,6 +26,7 @@ For the design rationale and architectural decisions behind S³, see **[WHY_S3.m
 | **Switch** | [`switch/`](switch/) | Team-change management with cooldowns, queues, and scramble lockout — [behaviour reference](switch/SWITCH_BEHAVIOUR.md) |
 | **EloTracker** | [`elo-tracker/`](elo-tracker/) | Player rating tracking with round history |
 | **TeamBalancer** | [`team-balancer/`](team-balancer/) | Scramble-based team balancing with clan grouping |
+| **DBLog** *(core upgrade)* | [`core-plugins/db-log.js`](core-plugins/db-log.js) | Drop-in, DB-outage-safe replacement for core's `db-log.js` stats logger |
 
 ## Mount Order
 
@@ -38,7 +48,6 @@ S³ **must** be mounted before any consumer plugin. In your SquadJS `config.json
       "enableSmartAssign": true,
       "enableEventLogging": false,
       "logPath": "./smart-assign-log.jsonl",
-      "enableDatabaseLogging": false,
       "handshakeWithSwitch": true,
       "handshakeScoreThreshold": 0.5,
       "handshakeMode": "queueDrain"
@@ -79,10 +88,16 @@ S³ **must** be mounted before any consumer plugin. In your SquadJS `config.json
       "scramblePercentage": 0.5,
       "useEloForBalance": true,
       "discordAdminChannelID": ""
+    },
+    {
+      "plugin": "DBLog",
+      "enabled": true
     }
   ]
 }
 ```
+
+`DBLog` is optional — include it only if you want the S³ build of SquadJS's core `db-log.js` (see [Installation](#installation)). It takes no options beyond core's `overrideServerID`, and unlike core it needs no `database` key, because it logs through S³'s connection. If you are switching over from core's version, you can leave your existing entry exactly as it is: SquadJS ignores config keys a plugin doesn't declare, and S³ already opens the `database` connector your old entry was naming.
 
 Internally, S³ services mount in this order to satisfy dependency chains:
 
@@ -94,15 +109,16 @@ Consumer plugins discover S³ at runtime and access services through flat getter
 
 ## S³ Version Compatibility
 
-S³ is currently **v1.5.0**. Each consumer plugin declares its own floor — they are
+S³ is currently **v1.7.0**. Each consumer plugin declares its own floor — they are
 not all the same, so pinning S³ to the lowest one will stop the others mounting:
 
 | Consumer | Requires S³ ≥ | Why |
 |---|---|---|
 | SmartAssign | 1.0.0 | Baseline service container |
-| TeamBalancer | 1.0.0 | Baseline service container |
+| DBLog *(core upgrade)* | 1.0.0 | Baseline service container |
 | EloTracker | 1.2.4 | |
-| Switch | 1.4.0 | Seed-bonus grants need accessors added in 1.4.0; on an older S³ they are `undefined` and the UPDATE throws mid-grant |
+| Switch | 1.6.0 | Migration v3's cooldown-table truncate is guarded on `qi.isReapply`, which only 1.6.0 and later set; on an older engine a drift repair wipes token balances instead of preserving them |
+| TeamBalancer | 1.7.0 | Territory Control branches on `gameState.getGamemodeKey()`, added in 1.7.0; on an older S³ the TC thresholds would be configured but silently inert |
 
 Each plugin enforces its floor at runtime via `_checkS3Version()`, which throws on
 mismatch. There is no silent degradation — an incompatible S³ means the consumer
@@ -133,7 +149,7 @@ This produces an `out/` folder with the correct `plugins/` and `utils/` layout. 
 
 | Flag | Description |
 |---|---|
-| `--plugin=<name>` | Plugin(s) to install: `s3`, `team-balancer`, `elo-tracker`, `smart-assign`, `switch`, or `all` (comma-separated). S3 is always auto-included. |
+| `--plugin=<name>` | Plugin(s) to install: `s3`, `team-balancer`, `elo-tracker`, `smart-assign`, `switch`, `db-log`, or `all` (comma-separated). S3 is always auto-included. |
 | `--output=<path>` | Output directory (default: `./out`) |
 | `--with-tools` | Also copy `tools/` directories |
 | `--with-testing` | Also copy `testing/` directories |
@@ -145,6 +161,7 @@ Examples:
 ```bash
 node install.cjs --plugin=team-balancer                      # TeamBalancer + S3
 node install.cjs --plugin=switch,smart-assign                # Switch + SmartAssign + S3
+node install.cjs --plugin=db-log                             # DBLog (core-plugins/db-log.js) + S3
 node install.cjs --plugin=all --with-tools                   # Everything including tools
 node install.cjs --plugin=all --output=../squadjs/squad-server  # Write directly to SquadJS
 ```
@@ -164,7 +181,8 @@ squad-server/
 │   ├── smart-assign.js               (from smart-assign/plugins/)
 │   ├── switch.js                     (from switch/plugins/)
 │   ├── elo-tracker.js                (from elo-tracker/plugins/)
-│   └── team-balancer.js              (from team-balancer/plugins/)
+│   ├── team-balancer.js              (from team-balancer/plugins/)
+│   └── db-log.js                     (from core-plugins/ — overwrites core's file of the same name)
 └── utils/
     ├── game-state-service.js         (from s3/utils/)
     ├── db-service.js                 (from s3/utils/)
@@ -201,6 +219,25 @@ squad-server/
    - [Switch](switch/README.md#configuration-options) — [Behaviour Reference](switch/SWITCH_BEHAVIOUR.md)
    - [EloTracker](elo-tracker/README.md#configuration-options)
    - [TeamBalancer](team-balancer/README.md#configuration-options)
+   - **DBLog (core upgrade)** — one option, `overrideServerID`, same as core's. No config changes needed if you already run core's `db-log.js`; see the [top-of-file docblock](core-plugins/db-log.js) for what differs behind the same config
+
+### Logging
+
+S³, SmartAssign, TeamBalancer, and EloTracker each ship an `enableDatabaseLogging`
+option, and it's **on by default** on all of them. S³ writes its shared event/snapshot
+tables (`S3_PlayerEvents`, `S3_GameStateEvents`, `S3_PlayerSnapshots`); each consumer
+plugin writes its own history table alongside that (SmartAssign's `SA_AssignmentLog`,
+TeamBalancer's `TB_RoundReport`, EloTracker's round history).
+
+This isn't just bookkeeping — S³'s `!s3 switches` and `!s3 karma` Discord commands read
+directly from S³'s tables, and TeamBalancer's own games-played/round-outcome accounting
+reads from `TB_RoundReport`. Turning either toggle off independently is handled
+gracefully — both commands detect the gap and say so instead of showing a false zero.
+
+If you don't want the DB writes on a given plugin — smaller database, or you only want
+the JSONL/file output — set `enableDatabaseLogging: false` on that plugin's config
+block. JSONL/file logging is a separate set of options per plugin (e.g. SmartAssign's
+`enableEventLogging` + `logPath`, S³'s `enableFileLogging`) and is unaffected either way.
 
 ## For Plugin Developers
 

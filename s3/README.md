@@ -1,4 +1,4 @@
-# SlackersSquadServices (S³) Plugin v1.5.0
+# SlackersSquadServices (S³) Plugin v1.5.1
 
 **Centralised service container for shared state across SquadJS plugins**
 
@@ -50,7 +50,8 @@ s3/
 │   ├── players-service.js                 ← PlayersService (lock/unlock/canAct/registerPriority)
 │   ├── logging-service.js                 ← LoggingService
 │   ├── s3-discord.js                      ← Discord infra (command dispatch → s3-commands.js)
-│   ├── s3-commands.js                     ← Command handlers (players, clans, db, backup, migrate)
+│   ├── s3-commands.js                     ← Command handlers (players, clans, db, backup, migrate, switches, karma)
+│   ├── s3-switch-reports.js               ← Team-switch/karma query & aggregation layer (no Discord awareness)
 │   ├── s3-migration-discord.js            ← Migration prompts and embeds
 │   ├── s3-backup.js                       ← Backup/restore orchestration (canBackup, listBackups)
 │   ├── s3-export-import.js                ← JSON export/import (connector-agnostic)
@@ -58,7 +59,7 @@ s3/
 ├── tools/                                 ← schema-health.js, schema-version.mjs
 └── testing/
     ├── run-all-tests.js                   ← Unified test runner (--category 1|2|3|4)
-    └── test-*.js                          ← 34 suites; see S3_DEVELOPER_GUIDE.md §11.1
+    └── test-*.js                          ← see S3_DEVELOPER_GUIDE.md §11.1 for the current catalog
 ```
 
 ## Consumer Plugins
@@ -147,9 +148,13 @@ The `!s3` admin command surface is organised across:
 |---------|---------|-------------|
 | `!s3 players` | `s3-commands.js` | Population overview + one embed per team, broken down by squad. Marks squad leaders (👑), locked squads, and per-player locks. "Unassigned" means not in a squad. |
 | `!s3 clans` | `s3-commands.js` | Active clan groups, plus a second embed explaining why every other tag was excluded (below `minSize`, above `maxSize`, on `ignoreList`, unnormalizable) and every Damerau-Levenshtein merge and recruit-suffix strip |
+| `!s3 switches [ident] [range]` | `s3-commands.js` | Team-switch leaderboard (no ident — Legacy pre-split Balancer moves fold into Full, since they're definitionally non-micro), or one player's breakdown grouped into Balancer/Scrambles vs. Manual/Switch |
+| `!s3 switches export [range] [period] [--json]` | `s3-commands.js` | One row per `daily`/`weekly`/`monthly` period per active player — games played, total switches, and the full source breakdown — as a CSV (default) or JSON file attachment. Players silent all period get no row |
+| `!s3 karma <ident> [range]` | `s3-commands.js` | Win-rate of a player's own switch decisions (self/untracked only — excludes balancer and SmartAssign moves) vs. the eventual round winner, with switch frequency context (N switches in G games — P% of rounds) and a directional verdict |
 | `!s3 db status` | `s3-commands.js` | Connector, pending migrations, per-plugin schema versions |
-| `!s3 db export` | `s3-export-import.js` | JSON export. Models declare an `exportTier` — `historical` and `logging` are included by default, `ephemeral` is not |
+| `!s3 db export` | `s3-export-import.js` | JSON export, streamed to `backups/` a row batch at a time and attached to the reply only if the gzipped file fits the Discord server's own upload limit (10 MB unboosted, 50 MB at boost tier 2, 100 MB at tier 3). Over that — or if the upload fails anyway — the file stays on disk and the summary embed names it. Models declare an `exportTier` — `historical` and `logging` are included by default, `ephemeral` is not |
 | `!s3 db export --all` | `s3-export-import.js` | Also includes the `ephemeral` tier |
+| `!s3 db export --to-file` | `s3-export-import.js` | Same export, no attachment attempt |
 | `!s3 db import` | `s3-export-import.js` | Validates `.s3backup.json`, posts confirmation embed. **Writes nothing** |
 | `!s3 db import --confirm` | `s3-export-import.js` | Executes upsert import, reports per-table counts |
 | `!s3 db import --confirm --dry-run` | `s3-export-import.js` | Validate only, no writes |
@@ -231,7 +236,7 @@ current number.
 | `clanTagIgnoreList` | no | array | `[]` | Clan tags excluded from grouping |
 | `clanRecruitSuffixes` | no | array | `["r", "-r"]` | Suffixes to strip from clan tags when the base tag (without suffix) exists on other players. Enabled by default for common recruit tags (case-insensitive, so "R" and "-R" are also matched). Set to `[]` to disable. Stripping only occurs when the base tag is present on at least one other player in the data set. |
 | `clanGroupingPullEntireSquads` | no | boolean | `true` | Pull non-clan teammates with clan members |
-| `enableDatabaseLogging` | no | boolean | `false` | Enable shared S³ logging tables (S3_PlayerEvents, S3_GameStateEvents, S3_PlayerSnapshots). When false, LoggingService runs in no-op mode. |
+| `enableDatabaseLogging` | no | boolean | `true` | Enable shared S³ logging tables (S3_PlayerEvents, S3_GameStateEvents, S3_PlayerSnapshots). When false, LoggingService runs in no-op mode. |
 | `enableFileLogging` | no | boolean | `false` | Enable JSONL file mirror for S³ logging events. Each DB write is also appended as a self-contained JSONL line to the logPath file. |
 | `logPath` | no | string | `"./s3-log.jsonl"` | Path to JSONL file for S³ event mirror. Only used when enableFileLogging is true. |
 | `autoMigrate` | no | boolean | `false` | If `true`, skips Discord confirmation prompt for migrations |
@@ -247,4 +252,4 @@ GitHub: https://github.com/mikebjoyce
 
 ---
 
-*Built for SquadJS — current as of 2026-08-20*
+*Built for SquadJS — current as of 2026-08-27*

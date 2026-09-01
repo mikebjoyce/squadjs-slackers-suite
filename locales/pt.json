@@ -205,6 +205,8 @@
       "endgameConsolationFailed": "[SeedPresence] Falha ao conceder bônus de consolação no ENDGAME: {{message}}",
       "matchendFailed": "[Switch] Falha na troca de matchend para {{identifier}}: {{reason}}",
       "matchendProcessed": "[Switch] Matchend: processadas {{count}} solicitações ({{failed}} falharam), {{cleared}} registros limpos.",
+      "matchendProcessedClearFailed": "[Switch] Matchend: processadas {{count}} solicitações ({{failed}} falharam), mas não foi possível limpar os registros do banco de dados: {{message}}",
+      "matchendProcessedNoRows": "[Switch] Matchend: processadas {{count}} solicitações ({{failed}} falharam).",
       "matchendFailedGeneric": "[Switch] doSwitchMatchend falhou: {{message}}",
       "roundEndedQueuePreserved": "[Queue] Rodada encerrada — fila preservada ({{count}} entradas restantes).",
       "onRoundEndedFailed": "[Switch] Falha no processamento de matchend em onRoundEnded: {{message}}",

@@ -132,9 +132,9 @@ Centralises Sequelize connector management, schema version tracking, and migrati
 | `getPendingMigrations()` | `() => Array<{pluginName, currentVersion, expectedVersion}>` | Pending list | Used by startup prompt |
 | `waitForMigrations()` | `() => Promise<void>` | void | Resolves after migrations complete or skipped |
 | `migrationEngine` | getter | `MigrationEngine` instance | Direct access to the engine |
-| `executeWithRetry(fn)` | `(Function) => Promise<*>` | Function result | With retry + jitter (all connectors) |
+| `executeWithRetry(fn, opts?)` | `(Function, object?) => Promise<*>` | Function result | With retry + jitter (all connectors). `opts.totalTimeoutMs` — see note below |
 | `withTransaction(fn)` | `(Function) => Promise<*>` | Function result | Within a Sequelize transaction |
-| `withTransactionWithRetry(fn)` | `(Function) => Promise<*>` | Function result | Transaction + retry combined |
+| `withTransactionWithRetry(fn, opts?)` | `(Function, object?) => Promise<*>` | Function result | Transaction + retry combined. `opts.totalTimeoutMs` — see note below |
 | `getDatabasePath()` | `() => string\|null` | File path or null | SQLite only |
 | `models` | property | `object` | All defined models, keyed by name. Direct property, not a getter method. |
 
@@ -162,6 +162,20 @@ Centralises Sequelize connector management, schema version tracking, and migrati
 
 > **`getConnectorName()` vs `getDialect()`:** `getConnectorName()` returns the connector **label** — the key in the `connectors` map from `config.json`. That's conventionally the dialect name, but a deployment may key its connector `main` or `s3`, in which case the label matches no dialect branch at all. Any code deciding *what SQL to emit* must use `getDialect()`.
 
+> **`totalTimeoutMs` (opt-in, default: no cap):** bounds the whole retry loop's wall-clock
+> time, not each attempt — a single attempt's own timeout (e.g. Sequelize's connection-pool
+> `acquire` timeout, commonly 60s and configured outside this repo) can itself run long
+> under pool exhaustion, and 5 retries at that cost compound to minutes. Pass it on any
+> call sitting on a hot path where a caller must not be blocked for that long (e.g. a
+> round-end handler another plugin's scramble/trigger decision depends on). The abandoned
+> attempt keeps running in the background after the budget trips — it isn't cancelled,
+> so a slow-but-eventually-successful write can still land after the caller has already
+> moved on with `null`. A budget-exceeded rejection is classified as a network error, so
+> it engages the same `_networkErrorBackoffMs` (30s default) as a real connection failure
+> — since that backoff lives on the shared `DBService` instance, tripping the budget once
+> pauses *every* plugin's DB calls on that connector for the cooldown window, not just the
+> caller that opted in. Pick a value comfortably above normal-load latency for that call.
+>
 > **Note:** `canBackup(connector)` is **not** a `DBService` method — it's a standalone export from `s3-backup.js` that always returns `true` (all Sequelize dialects get JSON-export fallback; the SQLite-only gate was removed). If you need this on a `DBService` instance, import it separately: `import { canBackup } from './s3-backup.js'`.
 
 **Static methods (for advanced use):**
@@ -182,7 +196,7 @@ Tracks round phases (STAGING → LIVE → ENDGAME), infers gamemode/layer from s
 
 **Phase vs. resolving — two separate questions.** The *phase* is where the round is (STAGING mirrors the in-game staging period that keeps players in main). `resolving` is whether team data can be trusted yet, and it is **not** bounded by the phase: it is set at `NEW_GAME` and cleared by the first player-info tick that shows every tracked player on a real team, whatever phase that lands in. `resolvingTimeoutMs` (default 120s) is the escape hatch for a round where that never happens — floored at runtime to 4× PlayersService's effective refresh interval, since the flag can only ever clear on a tick and that interval is dynamic (clamped to [3s, 60s], set by the fastest registrant).
 
-**STAGING duration:** SquadJS gives no "match started" event, so STAGING → LIVE is a timer: `stagingDurationMs` (default 180s), or **5s on seed/training layers**, which have no real staging phase and would otherwise sit in STAGING forever (a seed round never fires another `NEW_GAME`). The shortcut applies **only when the layer was resolved for the current round** — `getLayerName()` falls back to the previous round's layer, and trusting that fallback here once made S³ declare LIVE 5s into a full RAAS staging phase because the round before it was Jensen's Range. When the real layer arrives mid-STAGING (`data.layer` was null, or S³ restarted), `resolveLayerInfo()` re-arms the timer against `lastNewGameAt`, so a late-identified seed round goes LIVE immediately rather than waiting out a second full duration.
+**STAGING duration:** SquadJS gives no "match started" event, so STAGING → LIVE is a timer, and its length is a **property of the gamemode, not a config option** — there is no config key for it. The value comes from a measured per-gamemode table (RAAS/AAS 250s, Invasion and Territory Control 300s; anything unmeasured falls back rather than being guessed at), keyed on the short mode key rather than the spelled-out mode name, so a mode SquadJS writes out in full still matches its table entry. Or **5s on seed/training layers**, which have no real staging phase and would otherwise sit in STAGING forever (a seed round never fires another `NEW_GAME`). The shortcut applies **only when the layer was resolved for the current round** — `getLayerName()` falls back to the previous round's layer, and trusting that fallback here once made S³ declare LIVE 5s into a full RAAS staging phase because the round before it was Jensen's Range. When the real layer arrives mid-STAGING (`data.layer` was null, or S³ restarted), `resolveLayerInfo()` re-arms the timer against `lastNewGameAt`, so a late-identified seed round goes LIVE immediately rather than waiting out a second full duration.
 
 **SquadJS events it subscribes to:** `NEW_GAME`, `ROUND_ENDED`, `UPDATED_LAYER_INFORMATION`, `UPDATED_SERVER_INFORMATION`, `UPDATED_PLAYER_INFORMATION`
 
@@ -196,7 +210,8 @@ Tracks round phases (STAGING → LIVE → ENDGAME), infers gamemode/layer from s
 | `isLive()` | `boolean` | Phase === `'LIVE'` |
 | `isEnding()` | `boolean` | Phase === `'ENDGAME'` |
 | `isResolving()` | `boolean` | Team data not yet trusted for this round — **any phase**, not just STAGING. Don't act on team IDs while true |
-| `getGamemode()` | `string\|null` | Inferred game mode (e.g. `'AAS'`, `'RAAS'`, `'Seed'`) |
+| `getGamemode()` | `string\|null` | The game mode as SquadJS spells it (e.g. `'AAS'`, `'RAAS'`, `'Seed'`, `'Territory Control'`). Use for display, storage and operator-configured needles |
+| `getGamemodeKey()` | `string\|null` | The same mode as a short, stable key (`'TC'` for Territory Control). **Branch and key lookup tables on this**, not on `getGamemode()` — same canonical/display split as the two layer getters below |
 | `getLayerName()` | `string\|null` | **Canonical** layer name — the SquadJS classname (e.g. `'Sumari_Seed_v1'`). Use for storage and comparisons; see §7.12 |
 | `getLayerDisplayName()` | `string\|null` | The same layer as a human reads it (e.g. `'Sumari Bala Seed v1'`). Falls back to the canonical name |
 | `isLayerResolved()` | `boolean` | `false` while the two getters above are returning the `'Unknown'` placeholder — use it before trusting a negative `isIgnoredMode()` / `isSeedMode()` |
@@ -216,7 +231,7 @@ Tracks round phases (STAGING → LIVE → ENDGAME), infers gamemode/layer from s
 | `isEndgameVotingComplete()` | `boolean` | All voting finished |
 | `setIgnoredGameModes(modes)` | `void` | Configures which modes to skip |
 | `onGamePhaseChange(callback)` | `Function` (unsubscribe) | Callback: `({ phase, prevPhase, subPhase, roundStartTime, matchId, layer }) => {}` |
-| `onLayerGameModeChange(callback)` | `Function` (unsubscribe) | Callback: `({ layerName, layerDisplayName, gameMode, prevLayer, prevGameMode }) => {}` — **one object argument**, not four positional ones |
+| `onLayerGameModeChange(callback)` | `Function` (unsubscribe) | Callback: `({ layerName, layerDisplayName, gameMode, gameModeKey, prevLayer, prevGameMode }) => {}` — **one object argument**, not several positional ones |
 | `onResolvingChange(callback)` | `Function` (unsubscribe) | Callback: `({ resolving, reason, durationMs, phase, matchId, layer }) => {}`. `reason` is one of `PLAYERS_RESOLVED` / `ROSTER_FALLBACK` / `BUDGET_EXPIRED` / `ROUND_ENDED` / `RECOVERY_STALE` / `RECOVERY_INVALIDATED`; `durationMs` measures from `lastNewGameAt` |
 
 ---
@@ -522,7 +537,7 @@ unsubscribe();
 | Method | Fires When | Payload |
 |--------|-----------|---------|
 | `onGamePhaseChange(cb)` | End of `handleNewGame()`, `handleRoundEnded()`, staging→live transition timer, each ENDGAME sub-state advance | `{ phase, prevPhase, subPhase, roundStartTime, matchId, layer }` |
-| `onLayerGameModeChange(cb)` | End of `resolveLayerInfo()` when layer/game mode changed | `{ layerName, layerDisplayName, gameMode, prevLayer, prevGameMode }` |
+| `onLayerGameModeChange(cb)` | End of `resolveLayerInfo()` when layer/game mode changed | `{ layerName, layerDisplayName, gameMode, gameModeKey, prevLayer, prevGameMode }` |
 | `onResolvingChange(cb)` | `resolving` is set at `NEW_GAME` or cleared by `_clearResolving()` | `{ resolving, reason, durationMs, phase, matchId, layer }` |
 
 **Notes:**
@@ -1296,6 +1311,29 @@ Every migration **must** declare which tables, columns, seed rows, and data post
   down: async (qi) => { /* no DDL changes */ } }
 ```
 
+#### `touches` also decides what gets backed up
+
+Before running pending migrations, the engine takes a JSON backup scoped to
+what those migrations declare. Only `columns` and `rows` pull a table into it.
+
+`creates` deliberately does not. A table a migration creates is the one category
+that provably cannot lose data: either it does not exist yet, or it already
+exists and the idempotent existence guard means the migration leaves it alone.
+Backing it up buys nothing and costs its full size in memory.
+
+That distinction is a regression guard, not a micro-optimisation. db-log's
+migration is a pure idempotent `createTable` and it declared `creates` for its
+eight `dblog_*` tables. When `creates` counted towards the backup scope, mounting
+on a server holding ~900MB of stats exported all of it into memory and the
+process was OOM-killed (exit 137) before any SQL ran. `test-migration-backup.js`
+asserts each category's behaviour.
+
+A migration whose declaration resolves to no data-bearing table — `creates` only,
+or `touches: {}` — takes no JSON backup at all. Setting `backup: false` states
+the same intent explicitly and is worth adding when a reader would otherwise
+wonder; it is what db-log does. On SQLite the whole-file binary copy still runs
+either way, since it is disk-bound rather than memory-bound.
+
 **Backward compatibility:** Existing migrations that predate the `touches` requirement (pre-v1.2.0) should have `touches` added retroactively when their plugin's migration file is next touched. The Switch plugin's migrations demonstrate this pattern — see `switch-db.js` v1 for a real-world example of retroactive `touches` on old migrations.
 
 #### 9.1.2 — Seed Row Drift Detection (`touches.rows`)
@@ -1378,7 +1416,7 @@ The `qi` (QueryInterface) object passed to each migration function provides thes
 | `addColumn(table, col, def)` | `(string, string, string\|object) => Promise` | Add column |
 | `removeColumn(table, col)` | `(string, string) => Promise` | Remove column |
 | `changeColumn(table, col, def)` | `(string, string, object) => Promise` | Modify column |
-| `addIndex(table, cols, opts?)` | `(string, string[], object?) => Promise` | Create index |
+| `addIndex(table, cols, opts?)` | `(string, string[], object?) => Promise` | Create index — **ALTER-based**; rejected under a CREATE-but-not-ALTER grant, even on a table created in the same migration. See §11.5. |
 | `removeIndex(table, name, opts?)` | `(string, string, object?) => Promise` | Drop index |
 | `createTable(name, attrs, opts?)` | `(string, object, object?) => Promise` | Create table |
 | `dropTable(name, opts?)` | `(string, object?) => Promise` | Drop table |
@@ -1393,6 +1431,7 @@ The `qi` (QueryInterface) object passed to each migration function provides thes
 | `db` | property | DBService instance |
 | `transaction` | property | Active Sequelize transaction |
 | `DataTypes` | property | Sequelize DataTypes for column defs |
+| `isReapply` | property (`boolean`) | `true` when this `up()` is being **re-applied to repair drift** rather than applied for the first time. Guard any one-time destructive step on it — see the warning below |
 
 Each `qi` method above is already bound to the migration's transaction, so pass options only for the operation itself. `qi.transaction` is exposed for model calls, which do need it explicitly.
 
@@ -1400,6 +1439,17 @@ Each `qi` method above is already bound to the migration's transaction, so pass 
 >
 > For **set-wide** work — backfilling a column across every row — use `qi.bulkUpdate()`. It resolves the registered model's attribute types automatically, which matters more than it looks: Sequelize's low-level bulk API escapes values by their JS shape when it has no types, and on SQLite a `Date` then lands in the column as an **integer epoch** rather than the TEXT that `DataTypes.DATE` reads back. Every subsequent read of that row dies with `date.includes is not a function`. MySQL and Postgres escape a `Date` to a datetime literal either way, so this reaches production on SQLite deployments only. If you bypass the wrapper and call `qi.sequelize.getQueryInterface().bulkUpdate()` directly, you must pass `model.rawAttributes` as the fifth argument yourself.
 
+> **Guard one-time destructive steps on `qi.isReapply`.** Drift recovery deliberately re-runs a migration that has *already been applied* (see §9.8). That is safe for `addColumn`, `createTable` and null-matched backfills, which are idempotent. It is **not** safe for a step that resets state — truncating a table, zeroing balances, seeding over rows players have since edited. On the repair pass, such a step destroys exactly the live data the operator ran `!s3 migrate force` to preserve.
+>
+> ```js
+> // Truncate on first install only — never while repairing drift.
+> if (!qi.isReapply) {
+>   await qi.bulkDelete('SwitchPlugin_PlayerCooldowns', {});
+> }
+> ```
+>
+> Version tracking alone does not protect you here: it stops an *ordinary* re-run, but recovery rolls the recorded version backwards on purpose, so the migration genuinely is pending again. Switch v3 is the reference case — it adds five token columns and then truncates the cooldown table. The columns re-add harmlessly; the truncate would have wiped every player's token balance, seed-bonus progress and scramble lockdown. The flag is `false` for a first-time apply and cleared after the repair run, so a later ordinary migration still gets its one-time step. `s3/testing/test-migration-data-assertions.js` asserts the `[false, true, false]` sequence across all three engines.
+>
 > **Write backfills so they survive a re-run.** Do not nest a backfill inside the `if (!columns.x)` guard that adds the column — the column existing does not prove the data step ran. A DB whose user lacks `ALTER` privileges gets its DDL applied by hand, and an attempt that failed after the `ALTER` leaves the same state: column present, every row NULL. Match on `{ col: { [Op.is]: null } }` instead, outside the guard, so `!s3 migrate force` repairs those rows and leaves rows stamped by live gameplay untouched. `Op.is` generates a real `IS NULL`; a bare `col: null` in a raw where-clause can become the `= NULL` that matches nothing. Switch migration v5 is the reference implementation, and `s3/testing/test-migration-bulk-types.js` locks both behaviours down against real engines.
 
 ### 9.3 — Version Numbering
@@ -1509,6 +1559,35 @@ A consolidated read‑only diagnostic command that surfaces:
 
 Both commands require S³'s Discord admin channel to be configured (`channelID` in config).
 
+#### What recovery actually does
+
+Detecting drift is only half of it. When the check confirms that schema a migration already applied has gone missing, S³ rolls the plugin's recorded version **back below the migration that owns the missing schema**, which makes that migration pending again so `!s3 migrate force` re-applies it.
+
+Ownership comes from `touches`: the engine finds the lowest-versioned migration whose `creates`/`columns`/`rows` declares the missing item, and rolls back to one below it. Rolling back a fixed single version is not enough — a table that has lost columns owned by v3 *and* v5 would re-apply only v5, drift again on v3's, and roll back again on the next mount, forever. Matching is case-insensitive, because MySQL with `lower_case_table_names=1` reports identifiers folded while `touches` declares them as written.
+
+Because recovery re-applies an already-applied migration, `up()` must be idempotent — see the `qi.isReapply` warning in §9.2.
+
+#### Drift alongside pending migrations
+
+The check runs even when a plugin has migrations waiting, so a server that is **both behind and drifted** is repaired in a single confirmation rather than needing one run to reveal the drift and a second to fix it.
+
+This is only safe because the two cases are told apart before anything is rolled back. A plugin that is legitimately behind is *also* missing the columns its unapplied migrations add, and treating that as drift would fire a false alarm on every routine upgrade and roll versions backwards. So each missing item is attributed to its owning migration and discarded when that migration has not run yet; plugins with no recorded version at all — a brand-new install, where nothing exists — are dropped wholesale.
+
+An item no migration declares (a column created inline by `createTable`, covered by `touches.creates` rather than `touches.columns`) cannot be attributed, and is treated as drift. That fails safe: a real loss is reported rather than silently ignored.
+
+The verbose log shows both views, and they are expected to differ:
+
+```
+[DB] DRIFT: ... missing columns: tokenBalance, seedBonusTokensEarned, lastActiveTimestamp   ← raw
+[DB] CONFIRMED DRIFT: ... missing columns: tokenBalance, seedBonusTokensEarned              ← after attribution
+```
+
+`lastActiveTimestamp` is absent from the confirmed set because the migration that adds it simply has not run yet. Only the confirmed set drives rollback and reaches the stderr `SchemaDrift` warning.
+
+**Extra** columns are informational only — they never trigger rollback, and are excluded from stderr so they don't append to the error file on every mount.
+
+`s3/testing/test-drift-recovery-matrix.js` covers all of this across SQLite, MySQL and Postgres: brand-new, behind, drifted, behind *and* drifted, undeclared-column loss, multi-plugin, and repeated cycles converging.
+
 ### 9.9 — Failure Diagnostics on stderr
 
 SquadJS's `Logger` writes everything to stdout. Operators who split the streams —
@@ -1587,12 +1666,16 @@ All commands in the configured `channelID` Discord channel:
 | `!s3 clans` | Active clan groups, plus a second embed explaining every exclusion (size bounds, `ignoreList`, unnormalizable tag) and every Damerau-Levenshtein merge and recruit-suffix strip |
 | `!s3 locks` | Global lock + per-player locks |
 | `!s3 config` | Server config values |
+| `!s3 switches [range]` | Team-switch leaderboard across all players (Legacy pre-split Balancer moves fold into Full — both are full scrambles, just from before Full/Micro were tracked separately) |
+| `!s3 switches <ident> [range]` | One player's switch breakdown, grouped into Balancer/Scrambles vs. Manual/Switch |
+| `!s3 switches export [range] [period] [--json]` | One row per period (`daily`/`weekly`/`monthly`) per player active that period — games played, total switches, and the full source breakdown — as a CSV (default) or JSON file attachment. Players silent all period get no row, not a padded zero |
+| `!s3 karma <ident> [range]` | Win-rate of a player's self/untracked switches vs. the eventual round winner, with switch frequency context (N switches in G games — P% of rounds) and a directional verdict (excludes balancer/SmartAssign moves — those aren't the player's choice) |
 | `!s3 watch <service>` | Relay verbose logs for a service to Discord |
 | `!s3 unwatch` | Stop all active watches |
 | `!s3 diag` | Consolidated diagnostic — mounts, phase, factions, players, locks in one pass |
 | `!s3 help` | Command reference |
-| `!s3 db export [--logs\|--all]` | Export DB as JSON attachment |
-| `!s3 db export --to-file [--all]` | Export to server filesystem backup dir |
+| `!s3 db export [--logs\|--all]` | Stream the export to `backups/`, then attach it to the reply if the gzipped file fits the guild's own upload limit (10 MB unboosted, 50 MB at boost tier 2, 100 MB at tier 3 — read from `guild.premiumTier`, falling back to the 10 MB floor when the tier is unknown). If it doesn't fit, or the upload fails anyway, the file stays on disk. Either way the summary embed names it |
+| `!s3 db export --to-file [--all]` | Same export, no attachment attempt |
 | `!s3 db import [--confirm] [--dry-run]` | Import from attached JSON (two-step) |
 | `!s3 db status` | Connector name, pending-migration state, and schema version per registered plugin |
 | `!s3 backup list` | List backups in the backup directory |
@@ -1630,8 +1713,9 @@ Two rules make forgetting survivable:
 
 - **An undeclared model is exported at the default (`historical`) tier**, and
   `defineModel()` warns by name at mount. Over-exporting fails visibly and
-  recoverably (the exporter errors on Discord's 25 MB limit); under-exporting
-  fails silently and permanently. The fallback picks the recoverable direction.
+  recoverably (the export lands on disk and the reply says it was too big to
+  attach); under-exporting fails silently and permanently. The fallback picks
+  the recoverable direction.
 - **An invalid tier string throws at definition time**, on the author's own
   server at startup — not at restore time months later.
 
@@ -1664,12 +1748,16 @@ of the tier logic rather than a path around it.
 ```json
 {
   "s3ExportVersion": 1,
+  "s3StreamFormat": 1,
   "exportedAt": 1719547200000,
   "connector": "sqlite",
   "tier": "historical",
   "tiers": { "ModelName": "historical" },
   "tables": {
-    "ModelName": [ { ... row ... } ]
+    "ModelName": [
+{ "...": "row" },
+{ "...": "row" }
+    ]
   },
   "rowCounts": { "ModelName": 42 },
   "results": { "ModelName": { "status": "ok", "rows": 42 } }
@@ -1681,6 +1769,47 @@ of the tier logic rather than a path around it.
 than leaving them to infer it from absence. Both are **additive**, so the format
 stays version 1 and every backup written before they existed still imports; the
 importer must keep tolerating their absence.
+
+`s3StreamFormat` marks a file written by the streaming exporter. Its one visible
+consequence is the layout above: **one row per line**, unindented, inside each
+table array. That is not cosmetic — it is what lets `restoreFromFile()` import a
+file larger than the heap by reading it a line at a time. The document is
+ordinary JSON either way, so anything that could read an older export still can.
+Files without the marker are legacy pretty-printed exports and take the
+in-memory path; above 256MB they are refused rather than allowed to OOM.
+
+### 10.2.1 — Memory: Which Functions Stream and Which Do Not
+
+`s3-export-import.js` is split down the middle and the halves are not
+interchangeable:
+
+| Function | Memory | Use for |
+|----------|--------|---------|
+| `exportToFile()` | One row batch + a ~256KB buffer | Any database, any size |
+| `importFromStreamFile()` | One chunk of rows | Any file the exporter wrote |
+| `gzipFileForAttachment()` | Stream buffers, then the result only if it fits | Turning an export into an attachment |
+| `exportToJSON()` | The whole database | Tests, validation, datasets known to be small |
+| `importFromJSON()` | The whole file | Same |
+| `serializeForAttachment()` | The whole database, twice | Same |
+
+This is a live-outage boundary, not a style preference. A production db-log
+dataset is roughly 900MB. V8 caps a single string at about 512MB on Node 18 —
+the version SquadJS ships on — so `JSON.stringify()` of that data cannot produce
+a string at all, and the attempt OOM-killed the SquadJS process (exit 137)
+during pre-migration backup, before any SQL ran. If you add a code path that
+touches every row, it belongs in the top half of that table.
+
+Two implementation details are load-bearing and easy to undo by accident:
+
+- **Backpressure.** The writer awaits `'drain'` whenever `stream.write()`
+  returns false. Ignoring that return value turns "streaming" back into
+  "buffer the whole database in memory", with no visible difference until the
+  data is big enough to kill the process.
+- **Keyset pagination.** Row batches are fetched with `WHERE pk > :last ORDER BY
+  pk LIMIT :n`, not `LIMIT ... OFFSET`. MySQL re-walks and discards every
+  skipped row for an OFFSET, so paging a multi-million-row table that way is
+  quadratic — slower than the naive full load it replaced. Models with a
+  composite or absent primary key fall back to OFFSET.
 
 **Import workflow:** Two-step — `!s3 db import` (with attachment) → review embed → `!s3 db import --confirm` → execute.
 
@@ -1756,19 +1885,23 @@ node s3/testing/test-game-state-service.js
 | `test-dialect-portability.js` | Raw SQL against **real** SQLite/MySQL/Postgres engines — see 11.4 |
 | `test-migration-bulk-types.js` | `qi.bulkInsert`/`bulkUpdate` value typing and NULL backfills, real engines — see 11.4 |
 | `test-stderr-diagnostics.js` | Migration failures and drift reach fd 2, not stdout — see 9.9 |
-| `test-migration-permissions.js` | Migration DDL at three permission tiers, per dialect (Docker-gated) |
+| `test-migration-permissions.js` | Migration DDL at four permission tiers, per dialect (Docker-gated) — see 11.4 |
 | `test-export-model-registration.js` | Real services register every model; each declares an `exportTier` matching the fixture; a third-party model reaches the default export without editing S³ — see 11.5 |
 | `test-resolving-cleared-logging.js` | `RESOLVING_CLEARED` rows and `S3_GameStateEvents` shape, on **SQLite and MySQL** |
 | `test-install-layout.js` | `install.cjs` output layout: flattening, per-plugin runners, no collisions |
 | `test-migration-pipeline.js` | End-to-end migration run: ordering, backup, version bump |
 | `test-migration-conformance.js` | Migration definitions match the expected shape/contract |
+| `test-migration-partial-retry.js` | A migration whose `up()` commits real DDL/DML but fails post-commit `touches` verification is safely retryable — `addColumn`/`bulkInsert` don't crash on a raw duplicate-column/duplicate-key error, real engines |
 | `test-migration-data-assertions.js` | Migrations' data effects are asserted, not assumed — see `TASK_MIGRATION_DATA_ASSERTIONS.md` |
+| `test-drift-recovery-matrix.js` | Drift recovery across every DB state a server can be in — brand new, behind, drifted, behind *and* drifted, multi-plugin — on SQLite, MySQL and Postgres |
 | `test-command-routing.js` | `!s3` subcommand dispatch and argument parsing |
 | `test-inspection-embeds.js` | Inspection/embed builders render without throwing on sparse data |
 | `test-sa-per-player-lock.js` | Per-player lock acquisition/release under contention |
 | `test-team-change-retry.js` | Team-change retry loop and give-up conditions |
 | `test-request-team-change-eosid.js` | `_requestTeamChange()` sends RCON `switchTeam(eosID)` — a single unambiguous arg, never playerName or a second targetTeamID arg |
 | `test-developer-guide-accuracy.js` | This guide's command table, option defaults and test catalog still match the source — see 11.8 |
+| `test-s3-switch-reports.js` | `!s3 switches`/`!s3 karma`/`!s3 switches export` query layer: range/period parsing, player resolution, source bucketing, games-played, karma, and periodic aggregation, on **SQLite and MySQL** |
+| `test-s3-commands-embeds.js` | `buildSwitchesEmbed`/`buildKarmaEmbed` Discord formatting layer: the TeamBalancer-own-logging-off gap warning (hard-block in karma, soft note in switches), on **SQLite** |
 
 The harness's own suite lives outside `s3/`: `dev-harness/testing/test-dev-rcon-harness.js`
 (16 tests, fully mocked). See 11.7.
@@ -1843,6 +1976,23 @@ Two conventions worth copying from that file:
 
 > `sqlite3` will not install in the stock `node:*-slim` images (the prebuilt binding needs a newer glibc than they ship). Run the tests on the host, or build `sqlite3` from source in the container.
 
+#### Permission-tier testing: a real engine still isn't enough
+
+Running a real engine proves the SQL is valid. It does not prove the suite's chosen DB user can actually execute it — and `CREATE TABLE`/`ALTER TABLE`/`DROP` are gated by *different* MySQL privileges, so `CREATE`-but-not-`ALTER` is a normal least-privilege grant a DBA or shared host can hand an application, not a hypothetical. Code proven only under a fully-privileged (root/admin) connection is unproven for every operator running the tighter profile.
+
+`test-migration-permissions.js` is the canonical home for this and owns four grant tiers, created idempotently on first use:
+
+| Tier | Grant | Dialects | Expected outcome |
+|---|---|---|---|
+| `admin` | Full/root | SQLite, MySQL, Postgres | Everything succeeds |
+| `readonly` | `SELECT` only | SQLite (Unix only — Windows can't express file-level read-only to SQLite), MySQL, Postgres | `CREATE TABLE` rejected |
+| `no-ddl` | `SELECT/INSERT/UPDATE/DELETE` | MySQL, Postgres | `CREATE TABLE` rejected |
+| `create-only` | `SELECT/INSERT/UPDATE/DELETE/CREATE/INDEX`, no `ALTER`/`DROP` | **MySQL only** | `CREATE TABLE` resolves; a bare `CREATE INDEX` resolves; `qi.addIndex()` (ALTER-based) is rejected |
+
+`create-only` is the tier that matters most: `admin` has everything, `no-ddl` has no `CREATE` at all, and `readonly` has neither — none of the other three reproduces a restricted, CREATE-but-not-ALTER grant, which is a normal MySQL deployment shape. There is no Postgres `create-only` tier — confirmed empirically that a Postgres role granted only `CREATE` on a schema can still freely `ALTER`/`CREATE INDEX` on a table it just created, because ownership grants full DDL on owned objects independent of schema-level grants. That asymmetry is a property of MySQL's global per-user privilege model, not a general SQL one.
+
+The practical fallout of the `create-only` tier is the §11.5 `Model.sync()`/`qi.addIndex()` trap below — a migration or model-sync path that only ever ran against `admin` or SQLite will pass every existing test and still fail to mount, every restart, on a server whose DB user is provisioned this way.
+
 ### 11.5 — Model Definition Traps
 
 These are failure modes with no symptom at runtime — the code logs success and the data quietly goes missing.
@@ -1851,6 +2001,7 @@ These are failure modes with no symptom at runtime — the code logs success and
 - **`defineModel()` injects `freezeTableName: true`.** The **model** name becomes the table name unless you pass an explicit `tableName`. Model `S3GameStateEvents` reaching table `S3_GameStateEvents` only works because `tableName` says so.
 - **Declare `exportTier` on every model you define.** Classification lives at the definition site, not in `s3-export-import.js` — see 10.2. A model that declares nothing is exported at the default tier and warns by name at mount; an invalid tier throws immediately. The tier sets that remain in `s3-export-import.js` are the *expected classification fixture*, not the allowlist: `s3/testing/test-export-model-registration.js` asserts each model's declared tier equals its entry there, so adding a model means editing both, which is intended. Those sets hold **model names**, not table names — a table name written there matches nothing.
 - **`Model.sync()` emits no DDL for an existing table without `alter`.** A newly added column then exists in the model and nowhere in the database. On a live server with no DDL grants the operator applies schema by hand, so a migration's *data* step must not be nested inside an `addColumn` guard — otherwise the data step is skipped on exactly the servers where the column already exists.
+- **`Model.sync()` and `qi.addIndex()` both index a table via `ALTER TABLE ... ADD INDEX` — even a table they just created.** A MySQL grant with `CREATE`/`INDEX` but no `ALTER` (the `create-only` tier — see 11.4) accepts the `CREATE TABLE` and then throws on the first index, aborting model initialization before later tables are even attempted. This is not the same trap as the bullet above: that one is about existing tables missing a *column*; this one breaks on the very first mount of a brand-new table. Confirmed empirically 2026-08-28 against LoggingService (`s3/utils/logging-service.js`): create tables with `qi.createTable()`, then create each index with a bare `CREATE INDEX ... ON ...` statement (never `ALTER TABLE`/`addIndex()`) — `_ensureIndexes()` in that file is the reference pattern. Regression cover: `s3/testing/test-migration-permissions.js`'s `create-only` tier.
 - **There is no CLS transaction context.** `withTransactionWithRetry(async (t) => …)` does not propagate `t` implicitly; every model call inside must receive `{ transaction: t }`. Miss one and SQLite's single-connection pool throws "cannot start a transaction within a transaction", usually into a catch that logs and continues.
 
 ### 11.6 — Pre-Push Checklist for Database Changes
@@ -1970,7 +2121,7 @@ S³ must appear **before** consumer plugins:
 | `clanTagIgnoreList` | array | `[]` | Tags excluded from grouping |
 | `clanRecruitSuffixes` | array | `["r", "-r"]` | Suffixes to strip from clan tags when the base tag (without suffix) exists on other players. Enabled by default for common recruit tags (case-insensitive, so "R" and "-R" are also matched). Set to `[]` to disable. Stripping only occurs when the base tag is present on at least one other player in the data set. |
 | `clanGroupingPullEntireSquads` | boolean | `true` | Pull full squads when preserving clan groups |
-| `enableDatabaseLogging` | boolean | `false` | Enable `S3_PlayerEvents`/`S3_GameStateEvents`/`S3_PlayerSnapshots` tables. `false` → LoggingService runs no-op. |
+| `enableDatabaseLogging` | boolean | `true` | Enable `S3_PlayerEvents`/`S3_GameStateEvents`/`S3_PlayerSnapshots` tables. `false` → LoggingService runs no-op. |
 | `enableFileLogging` | boolean | `false` | Mirror each DB log write as a JSONL line at `logPath` |
 | `logPath` | string | `'./s3-log.jsonl'` | JSONL mirror path, used only when `enableFileLogging` is true |
 | `autoMigrate` | boolean | `false` | Auto-apply migrations without Discord confirmation |

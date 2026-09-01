@@ -531,6 +531,85 @@ for (const dialect of ['sqlite', 'mysql', 'postgres']) {
       );
       assert.equal(await recordedVersion(db), 1);
     }));
+
+  // ---- how far back recovery has to roll ----
+  // Live incident: SwitchPlugin_PlayerCooldowns had lost five columns owned by
+  // switch v3 and one owned by v5. Recovery rolled back to v4, so only v5 was
+  // pending; re-running it restored v5's column, drift re-fired on v3's five,
+  // the version was rolled back to v4 again. `!s3 migrate force` could never
+  // converge and the loop ran on every mount. `touches` already says which
+  // migration owns which column, so recovery must roll back past the earliest
+  // one that owns anything missing — not one version.
+  test(`${dialect}: recovery rolls back past every migration owning a missing column`, () =>
+    onDialect(dialect, async (db) => {
+      await applyAll(db, [
+        createMigration(),
+        backfillMigration({}),
+        {
+          version: 3,
+          description: 'adds a later, unrelated column',
+          touches: { columns: { [TABLE]: ['extra'] } },
+          up: async (qi) => {
+            const existing = await qi.describeTable(TABLE);
+            if (!existing.extra) {
+              await qi.addColumn(TABLE, 'extra', { type: qi.DataTypes.STRING, allowNull: true });
+            }
+          },
+          down: async () => {}
+        }
+      ]);
+      assert.equal(await recordedVersion(db), 3);
+      // The fixture declares 2; this case owns a third migration, and the whole
+      // point is that expected-1 (2) and the correct target (1) differ.
+      db.registerExpectedVersion(PLUGIN, 3, { models: [TABLE] });
+
+      // Lose a column owned by v2 — not by the newest migration.
+      await db.sequelize.getQueryInterface().removeColumn(TABLE, 'stamped');
+
+      const drift = await db.verifyLiveSchema();
+      assert.ok(
+        drift.some((d) => (d.missing || []).includes('stamped')),
+        `expected "stamped" to read as missing, got ${JSON.stringify(drift)}`
+      );
+
+      await db._handleDetectedDrift(drift);
+      assert.equal(await recordedVersion(db), 1,
+        'rolling back one version leaves v2 applied, so nothing ever re-adds its column');
+    }));
+
+  // ---- a repair must not re-run one-time destructive steps ----
+  // Recovery re-applies an already-applied migration, which is safe only for
+  // idempotent work. switch v3 ends in an unconditional truncate of the
+  // cooldown table; re-running it would wipe the token balances, seed-bonus
+  // progress and scramble lockdowns the repair is meant to preserve. up() has
+  // to be able to tell the two situations apart.
+  test(`${dialect}: up() can tell a drift repair from a first-time apply`, () =>
+    onDialect(dialect, async (db) => {
+      const seen = [];
+      const probe = {
+        version: 2,
+        description: 'records how it was invoked',
+        touches: { columns: { [TABLE]: ['stamped'] } },
+        up: async (qi) => { seen.push(qi.isReapply); },
+        down: async () => {}
+      };
+
+      await applyAll(db, [createMigration(), probe]);
+      assert.deepEqual(seen, [false], 'a first-time apply must not look like a repair');
+
+      db.migrationEngine.markDriftReapply([PLUGIN]);
+      await db.SchemaVersionsModel.update({ version: 1 }, { where: { pluginName: PLUGIN } });
+      db.migrationEngine.confirmToken('__force__');
+      await db.migrationEngine.runMigrations(PLUGIN);
+      assert.deepEqual(seen, [false, true], 'the repair pass must be distinguishable from a first apply');
+
+      // The marker is consumed by the run it applies to. If it stuck, every
+      // later migration for this plugin would skip its one-time setup forever.
+      await db.SchemaVersionsModel.update({ version: 1 }, { where: { pluginName: PLUGIN } });
+      db.migrationEngine.confirmToken('__force__');
+      await db.migrationEngine.runMigrations(PLUGIN);
+      assert.deepEqual(seen, [false, true, false], 'the repair marker must not persist past its run');
+    }));
 }
 
 await run();

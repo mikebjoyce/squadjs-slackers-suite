@@ -116,6 +116,20 @@ export default class SwapExecutor {
       const now = Date.now();
       const playersToRemove = [];
 
+      // This is the string that actually reaches S3_PlayerEvents.source for every TeamBalancer
+      // move: _requestTeamChange() below re-records attribution via players.recordMove() right
+      // before each RCON attempt (s3-plugin-base.js), which always happens-before the tick-diff
+      // that detects and persists the real team change. Any recordMove() call made earlier in
+      // the scramble flow (e.g. team-balancer.js's executeScramble loop) is overwritten before
+      // it can ever be consumed — see the comment there.
+      //
+      // Read once per batch rather than per player — _pendingScrambleType is fixed for the
+      // whole scramble and only changes between initiateScramble() calls, which can't
+      // interleave with this loop (the global lock excludes a second scramble).
+      const moveSource = this.teamBalancer?._pendingScrambleType === 'EloDiff'
+        ? 'TeamBalancer:Micro'
+        : 'TeamBalancer:Full';
+
       for (const [eosID] of this.pendingPlayerMoves.entries()) {
         try {
           // Delegate to the base class method which handles retry/verify/warn
@@ -126,7 +140,7 @@ export default class SwapExecutor {
               timeoutMs: this.options.maxScrambleCompletionTime || 15000,
               warnPlayer: !!this.options.warnOnSwap,
               warnMessage: this.RconMessages?.playerScrambledWarning || 'You have been scrambled',
-              source: 'TeamBalancer'
+              source: moveSource
             });
 
             if (result && result.success) {
@@ -174,7 +188,18 @@ export default class SwapExecutor {
     */
    async verifyMoves() {
       try {
-        await this.teamBalancer?._s3?.players?.refreshNow('TeamBalancer');
+        // refreshNow() ultimately awaits server.updatePlayerList() (RCON), which
+        // has no internal timeout of its own. Under RCON/event-loop congestion
+        // (e.g. a concurrent DB outage flooding the process with retries) this
+        // can hang far past maxScrambleCompletionTime, silently blocking
+        // completeSession() — and everything downstream that waits on it —
+        // for minutes. Bound it so a stuck refresh degrades to the same
+        // fallback path as an outright failure instead of hanging forever.
+        const refreshTimeoutMs = this.options.maxScrambleCompletionTime || 15000;
+        await Promise.race([
+          this.teamBalancer?._s3?.players?.refreshNow('TeamBalancer'),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('refreshNow timed out')), refreshTimeoutMs))
+        ]);
       } catch (err) {
         Logger.verbose('TeamBalancer', 1, `[SwapExecutor] Failed to refresh player list for verification: ${err?.message || err}`);
         // Fall back to current counts if update fails
@@ -297,8 +322,17 @@ export default class SwapExecutor {
   }
 
   async waitForCompletion(timeoutMs = 10000, intervalMs = 100) {
+    // Poll for the session actually finishing (activeSession is nulled at the
+    // very end of completeSession(), after verifyMoves() resolves) rather than
+    // pendingPlayerMoves.size — that map is drained by processRetries() before
+    // it fires the (unawaited) completeSession() call, so polling it let this
+    // return while completeSession()/verifyMoves() was still running in the
+    // background. Callers then read getLastSessionReport() before it was set
+    // for the current session, silently reusing the previous scramble's report.
     const start = Date.now();
-    while (this.pendingPlayerMoves.size > 0) {
+    // Grace period: queueMove() may not have started monitoring yet on the very
+    // first call in a batch, so don't treat a still-null activeSession as "done".
+    while (!this.activeSession || this.pendingPlayerMoves.size > 0 || this._completing) {
       if (Date.now() - start > timeoutMs) {
         Logger.verbose('TeamBalancer', 1, `[SwapExecutor] waitForCompletion timed out after ${timeoutMs}ms`);
         break;

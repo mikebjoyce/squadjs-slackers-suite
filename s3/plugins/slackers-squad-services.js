@@ -126,6 +126,9 @@
  *   !s3 clans                → Detected clan groups.
  *   !s3 locks                → Global lock + per-player locks + priority table.
  *   !s3 config               → Server config values.
+ *   !s3 switches [ident] [range]  → Team-switch leaderboard, or one player's breakdown by source.
+ *   !s3 switches export [range] [period] [--json]  → All-players switch/round counts per period, as a file attachment.
+ *   !s3 karma <ident> [range]     → Win-rate of a player's own switches (excludes balancer/SmartAssign) vs. round outcome.
  *   !s3 db status            → Connector type, schema version status per plugin.
  *   !s3 db export [--logs|--all] [--to-file]  → Export tables as JSON.
  *   !s3 db import [--confirm] [--dry-run]       → Import from backup.
@@ -155,8 +158,6 @@ import crypto from 'node:crypto';
 import { registerS3DiscordCommands } from '../utils/s3-discord.js';
 import { configureStderrDiagnostics, flushStderrDiagnostics, stderrError } from '../utils/s3-stderr.js';
 import { buildMigrationEmbed } from '../utils/s3-migration-discord.js';
-import { t } from './i18n.js';
-
 export default class SlackersSquadServices extends BasePlugin {
   static get description() {
     return "Shared Slacker's Squad Services plugin wiring gameState, factions, clans, db, and players modules.";
@@ -166,7 +167,7 @@ export default class SlackersSquadServices extends BasePlugin {
     return false;
   }
 
-  static get version() { return '1.5.0'; }
+  static get version() { return '1.7.0'; }
 
   static get optionsSpecification() {
     return {
@@ -256,7 +257,7 @@ export default class SlackersSquadServices extends BasePlugin {
         required: false,
         type: 'boolean',
         description: 'Enable shared S³ logging tables (S3_PlayerEvents, S3_GameStateEvents, S3_PlayerSnapshots). When false, LoggingService runs in no-op mode.',
-        default: false
+        default: true
       },
       enableFileLogging: {
         required: false,
@@ -322,13 +323,6 @@ export default class SlackersSquadServices extends BasePlugin {
       handleUpdatedPlayerInfo: this.handleUpdatedPlayerInfo.bind(this),
       handlePlayerConnected: this.handlePlayerConnected.bind(this)
     };
-  }
-
-  /**
-   * Helper to retrieve configured language or default to English.
-   */
-  get lang() {
-    return this.options?.language || 'en';
   }
 
   // Flat accessors — consumers use this._s3?.gameState (not this._s3?.services?.gameState)
@@ -429,6 +423,56 @@ export default class SlackersSquadServices extends BasePlugin {
     });
   }
 
+  /**
+   * Apply the operator's stderr settings to the diagnostic channel.
+   *
+   * Called from prepareToMount() so it takes effect before any plugin can fail,
+   * and again from mount() so a host that mounts without preparing (tests, or a
+   * future SquadJS change) still gets configured. Idempotent.
+   */
+  _configureStderrDiagnostics() {
+    const stderrMode = ['auto', 'mirror', 'off'].includes(this.options.stderrDiagnostics)
+      ? this.options.stderrDiagnostics
+      : 'off';
+    configureStderrDiagnostics({
+      mode: stderrMode,
+      windowMs: Math.max(0, Number(this.options.stderrDedupeWindowSeconds ?? 60)) * 1000
+    });
+  }
+
+  /**
+   * Mount one service, naming it if it throws.
+   *
+   * SquadJS mounts plugins with `Promise.all(...)` from an un-caught `main()`,
+   * so a rejection here surfaces as an unhandled rejection rather than as
+   * anything a caller handles. Once DBService has mounted it has also installed
+   * a process-level listener for those, which means the server keeps running
+   * with a half-mounted S³ — so a service failing after `db` needs to announce
+   * itself or it announces nothing. Reporting the service by name is the
+   * difference between "S³ is broken" and "PlayersService could not create its
+   * table". Re-thrown unchanged: this adds a diagnostic, it does not decide
+   * that a failed mount is survivable.
+   *
+   * Reports through stderrError directly rather than reportError(): this class
+   * extends SquadJS's BasePlugin, not S3PluginBase, so it has no reportError.
+   *
+   * @param {string} name - Service key, used in the message
+   * @param {Function} fn - Async thunk performing the mount
+   */
+  async _mountService(name, fn) {
+    try {
+      await fn();
+    } catch (err) {
+      this.verbose(1, `[S3] ${name} service failed to mount: ${err.message}`);
+      stderrError(
+        'S3Mount',
+        `${name} service failed to mount — S³ is only partially available.`,
+        err
+      );
+      throw err;
+    }
+  }
+
   async mount() {
     // Belt and braces — prepareToMount() has normally already done this.
     this._configureStderrDiagnostics();
@@ -473,7 +517,7 @@ export default class SlackersSquadServices extends BasePlugin {
     // DBService fires this to post a warning embed in the admin Discord channel.
     if (this.services.db) {
       this.services.db._driftAlertCallback = (drift, pluginNames) => {
-        this.verbose(1, t('slackersSquadServices.drift.alertTriggered', { pluginNames: pluginNames.join(', ') }, this.lang));
+        this.verbose(1, `[S3] Schema drift alert triggered for: ${pluginNames.join(', ')}`);
         const discordClient = this.options.discordClient;
         const channelID = this.options.channelID;
         if (discordClient && channelID) {
@@ -488,20 +532,20 @@ export default class SlackersSquadServices extends BasePlugin {
           if (missingRows.length > 0) parts.push(missingRows.join('\n'));
           const dataViolations = drift
             .filter(e => e.dataViolations)
-            .map(e => `- **${e.table}**: ${e.dataViolations.map(v => t('slackersSquadServices.driftViolations.emptyRows', { offenders: v.offenders, column: v.column }, this.lang)).join(', ')}`);
+            .map(e => `- **${e.table}**: ${e.dataViolations.map(v => `${v.offenders} row(s) with empty \`${v.column}\``).join(', ')}`);
           if (dataViolations.length > 0) parts.push(dataViolations.join('\n'));
           const description = parts.length > 0
-            ? t('slackersSquadServices.drift.descriptionSummary', { parts: parts.join('\n') }, this.lang)
-            : t('slackersSquadServices.drift.descriptionFallback', {}, this.lang);
+            ? `Schema or data drift detected — expected state is missing from the live database.\nUse \`!s3 migrate force\` to re-apply.\n\n${parts.join('\n')}`
+            : `Schema drift detected — use \`!s3 migrate verify\` for details.`;
           discordClient.channels.fetch(channelID).then(channel => {
             if (channel) {
               channel.send({
                 embeds: [{
                   color: 0xe74c3c,
-                  title: t('slackersSquadServices.drift.embedTitle', {}, this.lang),
+                  title: '⚠️ Schema Drift Detected',
                   description,
                   timestamp: new Date().toISOString(),
-                  footer: { text: t('slackersSquadServices.drift.footer', {}, this.lang) }
+                  footer: { text: 'S³ Schema Verification' }
                 }]
               }).catch(() => {});
             }
@@ -513,7 +557,7 @@ export default class SlackersSquadServices extends BasePlugin {
     // Check for pending migrations and prompt via Discord if any
     this._scheduleMigrationPrompt();
 
-    this.verbose(1, t('slackersSquadServices.verbose.mounted', {}, this.lang));
+    this.verbose(1, 'Mounted SlackerSquadServices with gameState, factions, clans, db, players, serverConfig, and logging services.');
 
     // Resolve the ready promise — consumer plugins awaiting this._s3.ready() can now proceed
     this._resolveReady();
@@ -579,7 +623,7 @@ export default class SlackersSquadServices extends BasePlugin {
       await this.services.serverConfig.unmount();
     }
 
-    this.verbose(1, t('slackersSquadServices.verbose.unmounted', {}, this.lang));
+    this.verbose(1, 'Unmounted SlackerSquadServices and shared services.');
   }
 
   _bindServerEvents() {
@@ -638,7 +682,7 @@ export default class SlackersSquadServices extends BasePlugin {
 
   async handleUpdatedPlayerInfo(data) {
     const playerCount = this.server?.players?.length ?? 0;
-    this.verbose(3, t('slackersSquadServices.verbose.updatedPlayerInfoTick', { playerCount }, this.lang));
+    this.verbose(3, `[S3] UPDATED_PLAYER_INFORMATION tick: ${playerCount} players`);
 
     if (this.services.gameState?.handleUpdatedPlayerInfo) {
       await this.services.gameState.handleUpdatedPlayerInfo(data);
@@ -657,7 +701,7 @@ export default class SlackersSquadServices extends BasePlugin {
     const player = data?.player || {};
     const playerName = player?.name || data?.name || 'Unknown';
     const eosID = player?.eosID || data?.eosID || 'N/A';
-    this.verbose(2, t('slackersSquadServices.verbose.playerConnected', { playerName, eosID }, this.lang));
+    this.verbose(2, `[S3] PLAYER_CONNECTED: ${playerName} (eosID=${eosID})`);
 
     if (this.services.players?.handlePlayerConnected) {
       await this.services.players.handlePlayerConnected(data);
@@ -673,14 +717,14 @@ export default class SlackersSquadServices extends BasePlugin {
   async _checkAndPromptMigrations() {
     const db = this.services.db;
     if (!db || !db.isReady()) {
-      this.verbose(3, t('slackersSquadServices.verbose.migrationDbNotReady', {}, this.lang));
+      this.verbose(3, '[S3 Migration] DB not ready yet — skipping migration check.');
       return;
     }
 
     // Use fresh verifySchemaVersions() instead of cached getPendingMigrations()
     // so the check reflects all plugins that have registered since mount.
     const status = await db.verifySchemaVersions();
-    const pending = status.pending;
+    let pending = status.pending;
 
     // Refresh the cached pending list and create the migration gate so that
     // getPendingMigrations() and waitForMigrations() return correct data
@@ -692,78 +736,167 @@ export default class SlackersSquadServices extends BasePlugin {
       });
     }
 
+    // Drift on a server that ALSO has migrations pending used to be invisible
+    // here — the check below only ran when nothing was pending — so it could
+    // only surface in post-migration verification, i.e. after a run. Repairing
+    // it then took a second run: one to reveal the drift, one to fix it.
+    // Checking now folds both into the single prompt the operator already gets.
+    // filterDriftToApplied() is what makes this safe: it drops schema belonging
+    // to migrations that simply have not run yet, so a routine upgrade — and a
+    // brand-new install, where nothing exists at all — raises no false alarm.
+    if (pending && pending.length > 0) {
+      const raw = await db.verifyLiveSchema();
+      db._lastDriftResult = raw;
+      const drift = await db.filterDriftToApplied(raw);
+      if (drift.some(e => e.missing || e.missingRows || e.dataViolations)) {
+        this.verbose(1, `[S3 Migration] Schema drift detected alongside ${pending.length} pending migration(s) — ${drift.length} issue(s).`);
+        await db._handleDetectedDrift(drift);
+        // _handleDetectedDrift() widens the pending list to the rollback targets
+        // it just wrote, so the prompt renders the full range to be re-applied.
+        pending = db._pendingMigrations;
+      }
+    }
+
     if (!pending || pending.length === 0) {
-      this.verbose(3, t('slackersSquadServices.verbose.noPendingMigrations', {}, this.lang));
+      this.verbose(3, '[S3 Migration] No pending migrations.');
       // Run live schema verification now that all consumer plugins have registered
-      if (typeof db.verifyLiveSchema === 'function') {
-        try {
-          await db.verifyLiveSchema();
-        } catch (err) {
-          this.verbose(1, `[S3 Migration] Live schema verification failed: ${err.message}`);
+      // their models. The initial verifyLiveSchema() during db.mount() ran before
+      // any models were registered, so it could not detect drift. This second pass
+      // captures the actual schema state — on a server where S3_SchemaVersions
+      // already matches the expected version but the actual DB columns are missing
+      // (e.g. a prior migration's ADD COLUMN silently failed due to MySQL permissions),
+      // this will detect the drift and trigger recovery.
+      const drift = await db.verifyLiveSchema();
+      db._lastDriftResult = drift;
+      if (drift.length > 0) {
+        this.verbose(1, `[S3 Migration] Schema drift detected on up-to-date server — ${drift.length} issue(s).`);
+        await db._handleDetectedDrift(drift);
+        // Only re-schedule the migration prompt if the drift includes missing
+        // columns, missing rows, or violated data post-conditions — extra-only
+        // drift is informational and does not require admin intervention.
+        // _handleDetectedDrift() only re-opens the migration gate for those
+        // three; unconditionally re-scheduling here would create an infinite
+        // loop since extra-only drift never creates a pending migration.
+        if (drift.some(e => e.missing || e.missingRows || e.dataViolations)) {
+          this._scheduleMigrationPrompt();
         }
       }
       return;
     }
 
-    const uniquePlugins = [...new Set(pending.map((m) => m.pluginName))];
-    this.verbose(
-      1,
-      t('slackersSquadServices.verbose.pendingCount', {
-        count: pending.length,
-        plugins: uniquePlugins.length
-      }, this.lang)
-    );
-
-    // Auto-migrate path: apply immediately without Discord confirmation
-    if (this.options.autoMigrate) {
-      this.verbose(1, t('slackersSquadServices.verbose.autoMigrateEnabled', {}, this.lang));
-      try {
-        const engine = db.migrationEngine;
-        if (engine) {
-          engine.confirmMigrations();
-          for (const pluginName of uniquePlugins) {
-            const pluginPending = pending.filter((m) => m.pluginName === pluginName);
-            this.verbose(1, t('slackersSquadServices.verbose.applyingPlugin', { count: pluginPending.length, pluginName }, this.lang));
-            const result = await engine.runMigrations(pluginName);
-            this.verbose(1, t('slackersSquadServices.verbose.migrationApplied', { description: result.applied }, this.lang));
-          }
-          this.verbose(1, t('slackersSquadServices.verbose.allMigrationsApplied', {}, this.lang));
-        }
-      } catch (err) {
-        this.verbose(1, t('slackersSquadServices.verbose.autoMigrateFailed', { message: err.message }, this.lang));
-      }
-      return;
-    }
-
-    // Generate confirmation token and store on MigrationEngine
-    const confirmToken = crypto.randomBytes(3).toString('hex'); // 6-character hex
+    // Idempotency guard: if a valid unexpired token already exists, prompt was already posted
     const me = db.migrationEngine;
-    if (me) {
-      me.setConfirmToken(confirmToken, pending);
+    if (me && me._confirmToken && me._tokenExpiresAt && Date.now() < me._tokenExpiresAt) {
+      this.verbose(3, '[S3 Migration] Prompt already posted — skipping duplicate.');
+      return;
     }
-    this.verbose(1, t('slackersSquadServices.verbose.tokenGenerated', { confirmToken }, this.lang));
 
-    // Post to Discord channel if configured
+    // autoMigrate: skip Discord prompt, run directly
+    if (this.options.autoMigrate) {
+      this.verbose(1, `[S3 Migration] autoMigrate is enabled — running ${pending.length} pending migration(s) directly.`);
+      const me = db.migrationEngine;
+      if (me) {
+        me.confirmToken('__auto__');
+      }
+      for (const p of pending) {
+        try {
+          if (!me) {
+            this.verbose(1, `[S3 Migration] MigrationEngine not available — cannot migrate "${p.pluginName}".`);
+            continue;
+          }
+          const result = await me.runMigrations(p.pluginName);
+          this.verbose(2, `[S3 Migration] "${p.pluginName}": ${result.applied} applied, ${result.skipped} skipped.`);
+        } catch (err) {
+          this.verbose(1, `[S3 Migration] Auto-migration failed for "${p.pluginName}": ${err.message}`);
+        }
+      }
+      db._resolveMigrationGate(true);
+      return;
+    }
+
+    // Generate a confirmation token and post embed to Discord admin channel.
+    // The admin types `!s3 confirm <token>` to authorize migrations.
+    const token = crypto.randomBytes(4).toString('hex'); // e.g. "a3f9c2"
+
+    // Store token on the engine with 5-minute expiry
+    if (me) {
+      me._confirmToken = token;
+      me._tokenExpiresAt = Date.now() + 5 * 60 * 1000;
+    }
+
+    // Build token embed using the existing buildMigrationEmbed helper.
+    // The embed already includes generic instructions from buildMigrationEmbed().
+    // Append the token-specific line so the admin knows which token to use.
+    const embed = buildMigrationEmbed(pending, 'pending', null);
+    embed.description += `\nToken: \`${token}\``;
+
+    this.verbose(1, `[S3 Migration] ${pending.length} plugin(s) have pending schema migrations. Generated token: ${token}`);
+
+    // Post embed to the admin Discord channel
     const discordClient = this.options.discordClient;
     const channelID = this.options.channelID;
+    if (discordClient && channelID) {
+      try {
+        const channel = await discordClient.channels.fetch(channelID);
+        if (channel) {
+          await channel.send({ embeds: [embed] });
+          this.verbose(1, `[S3 Migration] Token embed posted to Discord — ${pending.length} plugin(s) pending.`);
+        }
+      } catch (err) {
+        this.verbose(1, `[S3 Migration] Failed to post token embed: ${err.message}`);
+        this.verbose(1, `[S3 Migration] Use !s3 migrate force or set autoMigrate: true in S³ config to run migrations.`);
+      }
+    } else {
+      this.verbose(1, `[S3 Migration] Cannot prompt — Discord not configured. ${pending.length} plugin(s) pending. Use !s3 migrate force or autoMigrate: true.`);
+    }
 
-    if (!discordClient || !channelID) {
-      this.verbose(1, t('slackersSquadServices.verbose.noChannel', {}, this.lang));
+    // Set 5-minute auto-expiry timeout
+    if (me) {
+      setTimeout(() => {
+        if (me._confirmToken === token && !me._confirmed) {
+          me._confirmToken = null;
+          me._tokenExpiresAt = null;
+          this.verbose(1, '[S3 Migration] Token expired — migrations not confirmed. Restart S³ or use !s3 migrate force to regenerate.');
+        }
+      }, 5 * 60 * 1000);
+    }
+  }
+
+  /**
+   * Debounced migration prompt scheduler. Called by consumer plugins via
+   * verifyAndRunMigrations() when they detect pending-but-unconfirmed
+   * migrations, AND by the drift-recovery path after _handleDetectedDrift()
+   * repopulates _pendingMigrations for affected plugins.
+   *
+   * Multiple callers may invoke this in rapid succession during
+   * initialisation — the 500ms debounce ensures only one Discord embed is
+   * posted after all plugins have registered their expected versions.
+   * Each call to verifyAndRunMigrations() from a consumer plugin resets
+   * the timer, so the prompt fires 500ms after the LAST consumer registers.
+   *
+   * Idempotency guard: if a valid unexpired token already exists on the
+   * MigrationEngine, the prompt was already posted and this is a no-op.
+   * The drift-recovery path may still bypass this if the token expired
+   * but the gate is still re-open — _handleDetectedDrift() creates a new
+   * gate and nullifies any stale token, so the next call will proceed.
+   */
+  _scheduleMigrationPrompt() {
+    // Idempotency: if a valid token already exists, prompt was already posted
+    const me = this.services.db?.migrationEngine;
+    if (me && me._confirmToken && me._tokenExpiresAt && Date.now() < me._tokenExpiresAt) {
+      this.verbose(3, '[S3 Migration] Prompt already active — skipping duplicate schedule.');
       return;
     }
 
-    try {
-      const channel = await discordClient.channels.fetch(channelID);
-      if (!channel) {
-        this.verbose(1, t('slackersSquadServices.verbose.noChannel', {}, this.lang));
-        return;
-      }
-
-      const embed = buildMigrationEmbed(pending, confirmToken);
-      await channel.send({ embeds: [embed] });
-      this.verbose(1, t('slackersSquadServices.verbose.promptSent', { channelID }, this.lang));
-    } catch (err) {
-      this.verbose(1, t('slackersSquadServices.verbose.promptFailed', { message: err.message }, this.lang));
+    // Clear any existing debounce timer
+    if (this._migrationPromptTimer) {
+      clearTimeout(this._migrationPromptTimer);
     }
+
+    // Debounce: wait 500ms for all consumer plugins to register, then fire
+    this._migrationPromptTimer = setTimeout(() => {
+      this._migrationPromptTimer = null;
+      this._checkAndPromptMigrations();
+    }, 500);
   }
 }

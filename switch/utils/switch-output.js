@@ -459,7 +459,7 @@ const SwitchOutput = {
       // reason strings (e.g. 'unexpected error' from the onChatMessage catch-all,
       // or any raw SQL/RCON error messages that bypassed sanitization) are
       // bucketed as "other" to prevent ugly text from leaking into the embed.
-      const KNOWN_DENIAL_REASONS = ['cooldown', 'time_window', 'scramble_lock'];
+      const KNOWN_DENIAL_REASONS = ['cooldown', 'time_window', 'scramble_lock', 'recent_switch'];
       const denialReasons = {};
       let otherDenialCount = 0;
       for (const d of s.deniedSwitches) {

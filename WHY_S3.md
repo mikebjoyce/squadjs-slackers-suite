@@ -8,7 +8,7 @@
 
 The legacy plugins started as independent projects, each solving one problem well. But as the plugin suite grew, so did the cracks:
 
-### Duplicated Systems Everywhere
+### Duplicated Systems
 
 Each plugin needed the same foundational logic — and each maintained its own copy:
 
@@ -22,19 +22,19 @@ The result: a fix in clan detection meant three separate PRs, three test suites 
 
 ### Ad-Hoc Cross-Plugin Communication
 
-Plugins that needed to coordinate did so via raw SquadJS event strings — `TEAM_BALANCER_SCRAMBLE_EXECUTED` — with no type safety, no delivery guarantees, and no concept of priority or locking. A Switch plugin listening for a scramble event had no way to know whether SmartAssign was mid-move on the same player. There was no mechanism to say "wait your turn."
+Plugins that needed to coordinate did so via raw SquadJS event strings — `TEAM_BALANCER_SCRAMBLE_EXECUTED` — with no type safety and no delivery guarantees. Legacy Switch did listen for this event and applied a time-based scramble lockdown to affected players, so scramble coordination existed in coarse form. But there was no per-player lock and no priority system: a Switch plugin had no way to know whether SmartAssign was mid-move on a *specific* player right now, only whether a scramble had recently happened.
 
-### No Shared Locking — Operation Windows Were Artificially Narrow
+### No Shared Locking
 
-The `teamID` null window at the start of every round (first ~30–90 seconds, where `teamID` is `null` for most players) meant SmartAssign couldn't safely assign players and Switch couldn't process `!switch` commands — neither plugin knew what team anyone was on. The legacy answer was to simply block all team changes during this window, forcing players to wait minutes while the server filled.
+The `teamID` null window at the start of every round (first ~30–90 seconds, where `teamID` is `null` for most players) meant SmartAssign couldn't safely assign players and Switch couldn't process `!switch` commands — neither plugin knew what team anyone was on. Legacy SmartAssign handled this with its own `resolving` phase that waited (up to ~30 seconds, by its own code comments) for 100% team resolution before resuming assignment decisions.
 
-S³'s PlayersService resolved the null window, but that created new risks: SmartAssign could now move players during end-game phases where TeamBalancer was scrambling, and both SmartAssign and Switch were independently debouncing `UPDATED_PLAYER_INFORMATION` with their own player-state tracking — two plugins competing on the same SquadJS event, each reinventing the same delta-diff pattern. The solution required a priority-based locking system that didn't exist in the standalone architecture.
+S³ improves on this with **null-teamID projection**: instead of just waiting out the window, `PlayersService` serves best-effort projected team data during it, so plugins don't have to block at all. That, in turn, surfaced a new risk: SmartAssign could now move players during end-game phases where TeamBalancer was scrambling, and both SmartAssign and Switch were independently debouncing `UPDATED_PLAYER_INFORMATION` with their own player-state tracking — two plugins competing on the same SquadJS event, each reinventing the same delta-diff pattern. The solution required a priority-based locking system that didn't exist in the standalone architecture.
 
-### The Server Config Change That Changed Everything
+### Switch-Only Servers
 
-Server admins who blocked the game's built-in team-switch UI (via server configuration) created a new reality: the `!switch` command was now the **only** way for players to change teams. Without a queue, players would spam `!switch` to out-compete each other — hardly fairer than the native team-change UI they'd just disabled. A **switch queue** that automatically paired players with partners and moved them when a slot opened was the only fair alternative. They also needed **liberal mode** for seed/training layers where normal restrictions didn't apply, and **dynamic balance tolerance** so the server wasn't locked down at low population.
+Server admins who blocked the game's built-in team-switch UI (via server configuration) created a new reality: the `!switch` command was now the **only** way for players to change teams. But legacy Switch had no self-service queue for the ordinary case: if `!switch` was denied because the balance slots were full, the player was just told "Teams would become too unbalanced" and had to retry manually. (Legacy did have an admin-only `matchend`/`matchendsquad` command that registered a player or squad in an `Endmatch` table for a one-time switch applied when the round ended — but that's an admin tool operators used to pre-schedule a switch, not a queue players fell into automatically.) Without an automatic queue, players would spam `!switch` to out-compete each other for the next open slot — hardly fairer than the native team-change UI they'd just disabled.
 
-Building a queue-based switch plugin requires fast, accurate player-state tracking — you need to know who just joined, who just left, and who just changed teams within seconds, not the ~30-second RCON poll cycle that the legacy plugins relied on. S³'s PlayersService provides this: per-tick player diffs, immediate join/leave/team-change events, and reconnect memory. The queue, liberal mode, and dynamic balance features simply couldn't function reliably without it.
+A queue that reacts mid-match — pairing waiting players and moving them the moment a slot opens, without an admin having to register them first — needs fast, accurate player-state tracking: who just joined, who just left, who just changed teams, within seconds, not the ~30-second RCON poll cycle the legacy plugin polled on its own. S³'s PlayersService provides this: per-tick player diffs, immediate join/leave/team-change events, and reconnect memory. That's what made a genuine self-service switch queue possible. Liberal mode and dynamic balance tolerance already existed standalone and needed no such upgrade — liberal mode now reads layer/gamemode from S³'s GameState service instead of local detection, but dynamic balance tolerance is essentially unchanged.
 
 ---
 
@@ -78,6 +78,15 @@ Every team-change action goes through S³'s `PlayersService` lock system:
 
 Race conditions between SmartAssign and Switch are now architecturally impossible. The priority system ensures TeamBalancer always wins, SmartAssign always wins over Switch, and no two plugins can simultaneously move the same player.
 
+### Capabilities Standalone Plugins Couldn't Have
+
+Most of what S³ does is deduplication — one implementation instead of three. But a few things weren't just duplicated pre-S³, they were **out of reach for a standalone plugin no matter how it was written**, because they require a shared source of truth that only a central service can hold:
+
+- **Team-change attribution.** SquadJS's `PLAYER_TEAM_CHANGE` event carries no source flag — there's no way to tell whether a change was a player's own `!switch`, a SmartAssign move, or a TeamBalancer scramble. A standalone plugin could only disambiguate this by having another specific plugin emit its own custom marker event for it to listen for — a pairwise, hand-wired arrangement that doesn't scale and can't include a plugin nobody has written yet. S³'s `players.recordMove()` is a single shared attribution point: every consumer calls the same method, every consumer (including third-party ones) can read the same answer.
+- **Third-party lock participation.** Legacy had no locking primitive at all — not even between the four official plugins, let alone for an outside plugin to hook into. S³'s `players.registerPriority('MyPlugin', 4)` lets any plugin join the same coordinated priority system SmartAssign, Switch, and TeamBalancer use. There was nothing standalone architecture could offer here; the primitive didn't exist to extend.
+- **Cross-plugin reconnect visibility.** Legacy SmartAssign's reconnect memory was already DB-backed and survived restarts — persistence wasn't the gap. The gap was that it was SmartAssign's alone; TeamBalancer, Switch, and EloTracker had no way to see a reconnect SmartAssign had already recorded. S³'s `players.rememberReconnect()` / `getReconnect()` is shared across every consumer, so one plugin's observation becomes every plugin's knowledge.
+- **One believed team during the null-teamID window.** SmartAssign's legacy `resolving` phase shows a single plugin could reason carefully about the post-`NEW_GAME` null-teamID window on its own. But with two plugins each guessing independently, nothing guaranteed they'd guess the *same* thing for the same player — there was no shared answer to check against, only two separate correct-in-isolation guesses that could still disagree. S³'s null-teamID projection gives every consumer the same canonical answer at the same moment, closing a disagreement window that persisted even when each plugin's own logic was sound.
+
 ### S³ Event Bus
 
 Typed, documented events replace ad-hoc strings:
@@ -95,40 +104,41 @@ Typed, documented events replace ad-hoc strings:
 
 Plus subscription callbacks on each service (e.g., `onGamePhaseChange`, `onPlayerDataChanged`) with proper unsubscribe lifecycle — no more guessing when to clean up listeners.
 
-### The Switch Plugin Leveled Up
+### Switch Plugin Changes
 
-Because the server config blocks the game's built-in team-switch UI, `!switch` is the only way for players to change teams. The legacy Switch provided basic cooldown-based switching and double-switch for bug fixes. The S³ version adds features that only became possible with shared player-state tracking:
+Because the server config blocks the game's built-in team-switch UI, `!switch` is the only way for players to change teams. The legacy Switch already had cooldown-based switching, double-switch, an admin-only match-end switch command, liberal mode, and dynamic balance tolerance. The S³ version upgrades these and adds a genuine self-service queue that legacy never had:
 
-- **Switch Queue**: When a balance slot isn't immediately available, players queue and are automatically switched when a partner or slot opens. This required S³'s fast per-tick player diffs — the ~30-second RCON poll cycle in the legacy architecture was too slow to drive a responsive queue.
-- **Liberal Mode**: Relaxed switching rules during Seed/Jensen rounds. Reads layer/gamemode from S³'s GameState service rather than maintaining its own detection.
-- **Dynamic Balance Tolerance**: Interpolated extra imbalance slots when the server is below full capacity. Driven by S³'s live player counts.
+- **Switch Queue**: Legacy had no automatic queue for a denied player — `!switch` was simply rejected ("Teams would become too unbalanced") and the player had to retry manually. (Legacy's separate `matchend`/`matchendsquad` commands let an admin register a player or squad for a one-time switch at round end — an admin scheduling tool, not a player-facing queue.) The S³ version is a real queue: players are automatically paired and switched (or given a solo slot) as soon as a slot opens *during* the match, driven by S³'s per-tick `S3_PLAYERS_UPDATED` events, with no admin action required.
+- **Liberal Mode**: Existed standalone, detecting Seed/Jensen layers via its own tracking. The S³ version reads layer/gamemode from S³'s GameState service instead of maintaining separate detection logic.
+- **Dynamic Balance Tolerance**: Existed standalone already, essentially unchanged — both versions read player count straight from `this.server.players`; nothing about the interpolation math needed S³. The only real delta is the upper-bound player cap, which now comes from S³'s serverConfig (`getMaxPlayers() - getNumReservedSlots()`) instead of a hardcoded 98.
 
-Existing features (double-switch, end-of-match switching) are now S³-aware — team-change attribution goes through `players.recordMove()`, cooldowns are tracked via the shared DB, and all actions check `canAct()` to defer during scrambles and SmartAssign moves. The ad-hoc `_saEvalLocks` / custom event wiring is replaced by a single priority-aware gate.
+Existing features (double-switch, admin match-end switching) are now S³-aware — team-change attribution goes through `players.recordMove()`, cooldowns are tracked via the shared DB, and all actions check `canAct()` to defer during scrambles and SmartAssign moves. The ad-hoc `_saEvalLocks` / custom event wiring is replaced by a single priority-aware gate.
 
 ---
 
-## What You Gain
+## Feature Comparison
 
-### Feature Comparison at a Glance
+### Legacy vs. S³
 
 | Capability | Legacy (Standalone) | S³ Suite |
 |------------|---------------------|----------|
 | **Clan tag detection** | 3 independent implementations | 1 shared implementation in S³ ClansService |
 | **Cross-plugin locking** | None — race conditions possible | Priority-based global + per-player locks |
-| **Scramble coordination** | Ad-hoc event string | Global lock blocks SA & Switch during scramble |
+| **Scramble coordination** | Ad-hoc event string + time-based lockdown | Global lock blocks SA & Switch during scramble |
 | **SmartAssign → Switch handshake** | Not possible | Switch reads SA locks via `canAct()` |
-| **Switch queue** | Not available | Queue driven by S³ player events (`S3_PLAYER_JOINED`/`LEFT`) |
-| **Dynamic balance tolerance** | Not available | Interpolated extra slots via S³ live player counts |
-| **Liberal/Seed mode** | Not available | Reads layer/gamemode from S³ GameState service |
+| **Switch queue** | None (denied instantly; admin-only match-end command exists separately) | Live self-service queue driven by S³ player events (`S3_PLAYER_JOINED`/`LEFT`) |
+| **Dynamic balance tolerance** | Standalone, identical math | Unchanged, except player cap now sourced from S³ serverConfig |
+| **Liberal/Seed mode** | Standalone, local layer detection | Reads layer/gamemode from S³ GameState service |
 | **Double-switch** | Standalone cooldown tracking | S³-aware with proper team-change attribution |
-| **End-of-match switches** | Basic slot count | Queue driven by S³ round-phase awareness |
+| **End-of-match switches** | Admin-only DB-backed command (`matchend`/`matchendsquad`), local `ROUND_ENDED` handling | Same admin command, now reading round/phase state from S³'s GameState service instead of local tracking |
 | **Reconnect memory** | Per-plugin | Shared via S³ PlayersService |
 | **DB migrations** | Manual per-plugin | Unified MigrationEngine with versioning & rollback |
-| **Schema drift protection** | None | `_checkS3Version()` enforces compatibility at mount |
+| **Schema drift protection** | None | Every mount re-checks the live database against what migrations declared, and repairs schema that has gone missing |
+| **Plugin/container compatibility** | None | `_checkS3Version()` fails a plugin that needs a newer S³ than is installed, instead of half-working |
 | **Plugin mount order** | Ad-hoc | S³-first guarantee with readiness gating |
 | **Testing** | Per-plugin | Per-plugin + S³ integration test suite |
 
-### Plugin-Specific Gains
+### Per-Plugin Changes
 
 **EloTracker** ([readme](elo-tracker/README.md)) — Same TrueSkill engine, now with shared clan detection, shared player reconnect memory, and S³'s migration pipeline for schema changes.
 
@@ -136,16 +146,16 @@ Existing features (double-switch, end-of-match switching) are now S³-aware — 
 
 **SmartAssign** ([readme](smart-assign/README.md)) — Same Elo-aware assignment and One-Hit & Verify RCON approach, now with per-player locking that prevents Switch from racing on the same player, S³-driven reconnect memory (no more standalone `sa-database.js`), and shared clan grouping (replacing the legacy `sa-clan-grouper.js`).
 
-**Switch** ([readme](switch/README.md)) — Expanded from the legacy version with switch queue, liberal mode, and dynamic balance tolerance — features that required S³'s fast per-tick player-state tracking. Double-switch is now S³-aware with proper team-change attribution. Lock-awareness via `canAct()` replaces ad-hoc SA eval events, so Switch automatically defers during TeamBalancer scrambles and SmartAssign moves.
+**Switch** ([readme](switch/README.md)) — Same cooldown-based switching, double-switch, liberal mode, and dynamic balance tolerance (dynamic balance tolerance is essentially untouched — same math, same local player count), plus a genuine self-service switch queue that legacy never had (legacy just denied `!switch` outright when slots were full; its `matchend` commands were an admin scheduling tool, not a queue). Liberal mode now reads layer/gamemode from S³'s GameState service instead of local detection. Double-switch is now S³-aware with proper team-change attribution. Lock-awareness via `canAct()` replaces the ad-hoc scramble-lockdown event, so Switch automatically defers during TeamBalancer scrambles and SmartAssign moves.
 
 ---
 
-## What You Don't Lose
+## Backward Compatibility
 
 Every feature from the legacy standalone plugins has been ported forward:
 
 - All configuration options are preserved (with additions — nothing removed). For example, if your legacy TeamBalancer config had `"maxWinStreak": 2` and `"scramblePercentage": 0.5`, those same keys work identically in the S³ version.
-- Database schemas are compatible; the MigrationEngine handles upgrades automatically on first mount.
+- Database schemas are compatible; the MigrationEngine works out which upgrades your database needs on first mount and applies them once you confirm in Discord (or immediately, if you set `autoMigrate: true`).
 - All Discord commands, RCON broadcasts, and admin workflows continue to work identically.
 - The scramble algorithm, TrueSkill engine, and assignment logic are the same battle-tested implementations.
 - Plugin-to-plugin integration (TB ↔ Switch, TB ↔ EloTracker, SA ↔ EloTracker) is preserved and strengthened.
@@ -154,13 +164,13 @@ There is no regression. The S³ versions are strict supersets of the legacy plug
 
 ---
 
-## The Maintenance Story
+## Maintenance Impact
 
 For contributors and server admins who maintain forks or custom configs:
 
 - **One repo instead of four.** All plugins live in a single monorepo. Instead of cloning four separate repos and manually copying `plugins/` and `utils/` directories into your SquadJS installation, a single `node install.cjs --plugin=all` assembles everything with collision detection.
 - **Shared services = one fix, four wins.** A bug fix in clan tag detection benefits EloTracker, TeamBalancer, SmartAssign, and Switch simultaneously.
-- **Unified migration pipeline.** Schema changes are versioned, reversible, and applied automatically — no more manual SQL scripts per plugin.
+- **Unified migration pipeline.** Schema changes are versioned and reversible, applied in order behind a Discord confirmation, with a backup taken first — no more manual SQL scripts per plugin.
 - **Runtime compatibility enforcement.** Every consumer plugin checks its S³ version at mount time and refuses to start if incompatible. No silent degradation, no mystery bugs from version mismatch.
 - **Coherent test suite.** S³ integration tests validate cross-plugin locking, event delivery, and mount-order behavior — scenarios that couldn't be tested in the standalone architecture.
 
@@ -206,7 +216,7 @@ Most config options map 1:1 from the legacy plugins. Check each plugin's README 
 
 ### Database
 
-On first mount, the MigrationEngine automatically detects your existing schema and applies any needed upgrades. No manual migration steps are required. Backups are handled through S³'s built-in backup/restore system (`!s3 backup`, `!s3 restore`).
+On first mount, the MigrationEngine detects your existing schema and works out which upgrades it needs. It posts what it intends to do to your admin channel and waits for `!s3 confirm <token>`; set `autoMigrate: true` in the S³ config if you would rather it just run. Either way it takes a backup before touching anything, and re-checks afterwards that the schema it expected is really there. No hand-written SQL is required. Backups are managed through `!s3 backup list` / `create` / `restore`.
 
 ---
 
@@ -226,8 +236,8 @@ Third-party plugins can register custom locking priorities via `players.register
 
 | Plugin | Legacy (Standalone) | S³ Suite |
 |--------|---------------------|----------|
-| **TeamBalancer** | [squadjs-team-balancer](https://github.com/mikebjoyce/squadjs-team-balancer) (v3.2.0) | [team-balancer/](team-balancer/) (v4.0.3) |
-| **Switch** | [squadjs-switch-teambalancer-aware](https://github.com/mikebjoyce/squadjs-switch-teambalancer-aware) | [switch/](switch/) (v2.1.3) |
+| **TeamBalancer** | [squadjs-team-balancer](https://github.com/mikebjoyce/squadjs-team-balancer) (v3.2.2) | [team-balancer/](team-balancer/) (v4.1.0) |
+| **Switch** | [squadjs-switch-teambalancer-aware](https://github.com/mikebjoyce/squadjs-switch-teambalancer-aware) | [switch/](switch/) (v2.5.6) |
 | **EloTracker** | [squadjs-elo-tracker](https://github.com/mikebjoyce/squadjs-elo-tracker) (v1.3.0) | [elo-tracker/](elo-tracker/) (v2.x) |
 | **SmartAssign** | [squadjs-smart-assign](https://github.com/mikebjoyce/squadjs-smart-assign) (v1.1.1) | [smart-assign/](smart-assign/) (v2.x) |
 | **S³** | — (no legacy equivalent) | [s3/](s3/) (v1.0+) |
