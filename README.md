@@ -109,16 +109,16 @@ Consumer plugins discover S³ at runtime and access services through flat getter
 
 ## S³ Version Compatibility
 
-S³ is currently **v1.5.0**. Each consumer plugin declares its own floor — they are
+S³ is currently **v1.7.0**. Each consumer plugin declares its own floor — they are
 not all the same, so pinning S³ to the lowest one will stop the others mounting:
 
 | Consumer | Requires S³ ≥ | Why |
 |---|---|---|
 | SmartAssign | 1.0.0 | Baseline service container |
-| TeamBalancer | 1.0.0 | Baseline service container |
 | DBLog *(core upgrade)* | 1.0.0 | Baseline service container |
 | EloTracker | 1.2.4 | |
-| Switch | 1.4.0 | Seed-bonus grants need accessors added in 1.4.0; on an older S³ they are `undefined` and the UPDATE throws mid-grant |
+| Switch | 1.6.0 | Migration v3's cooldown-table truncate is guarded on `qi.isReapply`, which only 1.6.0 and later set; on an older engine a drift repair wipes token balances instead of preserving them |
+| TeamBalancer | 1.7.0 | Territory Control branches on `gameState.getGamemodeKey()`, added in 1.7.0; on an older S³ the TC thresholds would be configured but silently inert |
 
 Each plugin enforces its floor at runtime via `_checkS3Version()`, which throws on
 mismatch. There is no silent degradation — an incompatible S³ means the consumer

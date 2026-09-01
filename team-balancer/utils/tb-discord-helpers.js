@@ -145,6 +145,9 @@ export const DiscordHelpers = {
         { name: 'Scramble Delay / Max', value: `${tb.options?.scrambleAnnouncementDelay}s (Seed: ${tb.options?.seedScrambleAnnouncementDelay}s) / ${tb.options?.maxScrambleCompletionTime}ms`, inline: false },
         { name: 'Single Round Scramble', value: tb.options?.enableSingleRoundScramble ? `ON (> ${tb.options?.singleRoundScrambleThreshold} tix)` : 'OFF', inline: true },
         { name: 'Invasion Thresholds', value: `Atk: ${tb.options?.invasionAttackTeamThreshold} | Def: ${tb.options?.invasionDefenceTeamThreshold}`, inline: true },
+        // Reads "standard" rather than repeating the number when unset, so the
+        // embed shows whether TC is tuned, not just what it currently resolves to.
+        { name: 'TC Thresholds', value: `Dom: ${tb.options?.tcDominantThreshold ?? 'standard'} | Mercy: ${tb.options?.tcSingleRoundScrambleThreshold ?? 'standard'}`, inline: true },
         { name: 'Discord Options', value: `Mirror: ${tb.options?.mirrorRconBroadcasts ? 'Yes' : 'No'} | Details: ${tb.options?.postScrambleDetails ? 'Yes' : 'No'}`, inline: false },
       ],
       timestamp: new Date().toISOString(),

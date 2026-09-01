@@ -148,6 +148,10 @@ const defaultTestOptions = {
   minTicketsToCountAsDominantWin: 300,
   invasionAttackTeamThreshold: 300,
   invasionDefenceTeamThreshold: 650,
+  // Both null, matching the shipped defaults: TC starts out untuned and on the
+  // standard scale, which is the state the first TC cases below assert.
+  tcDominantThreshold: null,
+  tcSingleRoundScrambleThreshold: null,
   scrambleAnnouncementDelay: 10,
   scramblePercentage: 0.5,
   showWinStreakMessages: true,
@@ -218,7 +222,16 @@ async function runPluginLogicTests() {
   // short of the 650 defender threshold. Emitting through the mock updates the
   // service AND the plugin's mirror, so both stay honest.
   const mockS3 = mockServer.plugins[0];
-  const LAYER_FOR_MODE = { RAAS: 'Fallujah_RAAS_v2', Invasion: 'Narva_Invasion_v1' };
+  // 'Territory Control', not 'TC': that is the exact string SquadJS's Layer
+  // object carries and therefore what getGamemode() returns in production
+  // (confirmed live on Logar_TC_v1 / Narva_TC_v1). Emitting the short name here
+  // would test a spelling the plugin never actually sees, and would hide the
+  // fact that the branch has to go through getGamemodeKey() to match.
+  const LAYER_FOR_MODE = {
+    RAAS: 'Fallujah_RAAS_v2',
+    Invasion: 'Narva_Invasion_v1',
+    'Territory Control': 'Logar_TC_v1'
+  };
   const setGameMode = (mode) => mockS3.emitLayerGameModeChange(LAYER_FOR_MODE[mode] || 'Unknown', mode);
 
   // --- Phase 3.1: Layer & Mode Detection ---
@@ -260,6 +273,77 @@ async function runPluginLogicTests() {
   setGameMode('Invasion');
   await tb.onRoundEnded({ winner: { team: 2, tickets: 700 }, loser: { tickets: 0 } });
   assert(tb.winStreakCount === 1, 'Invasion Defender Dominant Win (700 tickets) correctly increments streak.');
+
+  // --- Phase 3.2b: Territory Control ---
+  //
+  // TC used to be judged as RAAS/AAS because the only gamemode branch in
+  // onRoundEnded was `isInvasion`. It now has its own options — but they
+  // default to null, so the first pair below pins the deliberate no-op: an
+  // untuned TC server stays on the RAAS/AAS scale.
+  console.log('\n[Phase 3.2b: Territory Control]');
+
+  // Untuned TC falls back to the standard 300 threshold, on both sides.
+  await tb.resetStreak();
+  setGameMode('Territory Control');
+  assert(tb.gameModeCached === 'Territory Control', 'TC mirrors the full SquadJS spelling, not the short key.');
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 301 }, loser: { tickets: 0 } });
+  assert(tb.winStreakCount === 1, 'Untuned TC Dominant Win (301 tickets) uses the standard threshold.');
+
+  await tb.resetStreak();
+  setGameMode('Territory Control');
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 150 }, loser: { tickets: 0 } });
+  assert(tb.winStreakCount === 0, 'Untuned TC Non-Dominant Win (150 tickets) uses the standard threshold.');
+
+  // Tuned: 350 clears the standard 300 but not a TC-specific 500. If the mode
+  // branch is not reached — the failure mode this whole change exists to fix —
+  // this scores dominant and the streak increments.
+  await tb.resetStreak();
+  tb.options.tcDominantThreshold = 500;
+  setGameMode('Territory Control');
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 350 }, loser: { tickets: 0 } });
+  assert(tb.winStreakCount === 0, 'Tuned TC (500) rejects a 350-ticket win the standard scale would accept.');
+
+  await tb.resetStreak();
+  setGameMode('Territory Control');
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 550 }, loser: { tickets: 0 } });
+  assert(tb.winStreakCount === 1, 'Tuned TC (500) accepts a 550-ticket win.');
+
+  // TC is symmetric: unlike Invasion, team 2 is judged on the same number as
+  // team 1. A copy-paste of the Invasion arm would give team 2 its own scale.
+  await tb.resetStreak();
+  setGameMode('Territory Control');
+  await tb.onRoundEnded({ winner: { team: 2, tickets: 550 }, loser: { tickets: 0 } });
+  assert(tb.winStreakCount === 1, 'Tuned TC treats team 2 on the same scale as team 1 (symmetric mode).');
+
+  // The TC threshold must not leak into other modes.
+  await tb.resetStreak();
+  setGameMode('RAAS');
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 350 }, loser: { tickets: 0 } });
+  assert(tb.winStreakCount === 1, 'tcDominantThreshold does not affect RAAS.');
+  tb.options.tcDominantThreshold = null;
+
+  // Mercy scramble: TC gets its own margin, and again must not leak sideways.
+  await tb.resetStreak();
+  tb.options.enableSingleRoundScramble = true;
+  tb.options.singleRoundScrambleThreshold = 500;
+  tb.options.tcSingleRoundScrambleThreshold = 800;
+  setGameMode('Territory Control');
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 600 }, loser: { tickets: 0 } });
+  assert(tb._scramblePending === false, 'TC mercy threshold (800) holds a 600-margin round the standard 500 would scramble.');
+
+  await tb.resetStreak();
+  setGameMode('Territory Control');
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 850 }, loser: { tickets: 0 } });
+  assert(tb._scramblePending === true, 'TC mercy threshold (800) scrambles an 850-margin round.');
+  await tb.cancelPendingScramble(null, null, true);
+
+  await tb.resetStreak();
+  setGameMode('RAAS');
+  await tb.onRoundEnded({ winner: { team: 1, tickets: 600 }, loser: { tickets: 0 } });
+  assert(tb._scramblePending === true, 'tcSingleRoundScrambleThreshold does not affect RAAS.');
+  await tb.cancelPendingScramble(null, null, true);
+  tb.options.tcSingleRoundScrambleThreshold = null;
+  tb.options.enableSingleRoundScramble = false;
 
   // --- Phase 3.3: Streak & Scramble Triggering ---
   console.log('\n[Phase 3.3: Streak & Scramble Triggering]');

@@ -147,8 +147,12 @@
  *   minTicketsToCountAsDominantWin     - Ticket threshold for Standard modes (default: 150).
  *   invasionAttackTeamThreshold        - Ticket threshold for Invasion attackers (default: 300).
  *   invasionDefenceTeamThreshold       - Ticket threshold for Invasion defenders (default: 500).
+ *   tcDominantThreshold                - Ticket threshold for Territory Control, symmetric
+ *                                        (default: null = use minTicketsToCountAsDominantWin).
  *   enableSingleRoundScramble          - Scramble on a single massive margin round (default: true).
  *   singleRoundScrambleThreshold       - Ticket margin for single-round trigger (default: 200).
+ *   tcSingleRoundScrambleThreshold     - Single-round margin on Territory Control
+ *                                        (default: null = use singleRoundScrambleThreshold).
  *
  * Scramble Execution:
  *   scrambleAnnouncementDelay          - Seconds before scramble executes (default: 25).
@@ -271,7 +275,7 @@ import path from 'path';
 const ROUND_END_DB_TIMEOUT_MS = 15000;
 
 export default class TeamBalancer extends S3PluginBase {
-  static version = '4.0.6';
+  static version = '4.1.0';
 
   static get description() {
     return 'Tracks dominant wins by team ID and scrambles teams if one team wins too many rounds.';
@@ -320,6 +324,16 @@ export default class TeamBalancer extends S3PluginBase {
       invasionDefenceTeamThreshold: {
         default: 500,
         type: 'number'
+      },
+      tcDominantThreshold: {
+        default: null,
+        type: 'number',
+        description: 'Ticket margin that counts as a dominant win on Territory Control. null (the default) falls back to minTicketsToCountAsDominantWin, i.e. the RAAS/AAS scale. TC is symmetric — no attacker/defender split — so this one number also sets the stomp cutoff at 1.5x, the same as RAAS/AAS.'
+      },
+      tcSingleRoundScrambleThreshold: {
+        default: null,
+        type: 'number',
+        description: 'Single-round mercy-scramble margin on Territory Control. null (the default) falls back to singleRoundScrambleThreshold, i.e. the RAAS/AAS scale.'
       },
       scrambleAnnouncementDelay: {
         default: 25,
@@ -949,7 +963,13 @@ export default class TeamBalancer extends S3PluginBase {
   /// S3PluginBase lifecycle hooks
 
   _checkS3Version() {
-    const required = '1.0.0';
+    // 1.7.0 — the Territory Control branch in onRoundEnded() reads
+    // gameState.getGamemodeKey(), which only S³ 1.7.0 and later expose. On an
+    // older service the accessor is simply absent, so the branch never matches
+    // and a configured tcDominantThreshold / tcSingleRoundScrambleThreshold
+    // does nothing at all — TC rounds keep being judged on the RAAS/AAS scale
+    // with no complaint. Failing the mount is the loud version of that.
+    const required = '1.7.0';
     const actual = this._s3?.version;
     if (!this._s3VersionAtLeast(required)) {
       throw new Error(
@@ -1840,6 +1860,11 @@ export default class TeamBalancer extends S3PluginBase {
       Logger.verbose('TeamBalancer', 4, `Parsed winnerID=${winnerID}, winnerTickets=${winnerTickets}, loserTickets=${loserTickets}, margin=${margin}`);
 
       const gameMode = this._s3?.gameState?.getGamemode?.()?.toLowerCase() || '';
+      // Snapshotted here, next to gameMode, not re-read further down: the
+      // awaits between this point and the gamemode branch (a saveState, a
+      // broadcast) can in principle span a NEW_GAME, and the two flags must
+      // describe the round that just ended rather than one each.
+      const gameModeKey = this._s3?.gameState?.getGamemodeKey?.() || '';
 
       if (this.isIgnoredMatch()) {
         Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Ignored match ended (${this.gameModeCached} / ${this.layerNameCached}). Resetting streak metrics.`);
@@ -1920,15 +1945,31 @@ export default class TeamBalancer extends S3PluginBase {
         }
       }
 
+      // ── Gamemode branch ────────────────────────────────────────
+      // Invasion is asymmetric — attackers and defenders win on different
+      // ticket scales — so it gets its own arm everywhere below. Territory
+      // Control is symmetric like RAAS/AAS and therefore shares their shape;
+      // it differs only in the numbers, and only once an operator sets them,
+      // since both TC options default to null.
+      //
+      // TC is matched on the gamemode KEY rather than a substring of
+      // getGamemode(): SquadJS spells the mode "Territory Control", and that
+      // is what getGamemode() returns and what lands on the round row. The key
+      // accessor is the one that normalises it to 'TC'. It is guaranteed
+      // present — _checkS3Version() refuses to mount below S³ 1.7.0 precisely
+      // so this branch cannot silently never match.
       const isInvasion = gameMode.includes('invasion');
+      const isTC = gameModeKey === 'TC';
 
       // ── Single Round Scramble Check ────────────────────────────
       // Triggers on a single massive-margin round regardless of streak.
+      const singleRoundThreshold =
+        (isTC ? this.options.tcSingleRoundScrambleThreshold : null) ?? this.options.singleRoundScrambleThreshold;
       if (!this._scramblePending && !this._scrambleInProgress) {
-        if (this.options.enableSingleRoundScramble && !isInvasion && margin >= this.options.singleRoundScrambleThreshold) {
+        if (this.options.enableSingleRoundScramble && !isInvasion && margin >= singleRoundThreshold) {
           roundReport.scrambled = true;
           roundReport.scrambleCondition = 'Single Round Margin';
-          Logger.verbose('TeamBalancer', 2, `[SingleRoundScramble] Triggered! Margin: ${margin} >= Threshold: ${this.options.singleRoundScrambleThreshold}`);
+          Logger.verbose('TeamBalancer', 2, `[SingleRoundScramble] Triggered! Margin: ${margin} >= Threshold: ${singleRoundThreshold}`);
           const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.singleRoundScramble, {
             margin,
             delay: this.options.scrambleAnnouncementDelay
@@ -1984,12 +2025,18 @@ export default class TeamBalancer extends S3PluginBase {
 
       // ── Dominant Win Detection ─────────────────────────────────
       // Determine whether the ticket margin crosses the dominant threshold.
-      const dominantThreshold = this.options.minTicketsToCountAsDominantWin ?? 175;
+      // TC's threshold, when configured, replaces the standard one wholesale —
+      // stompThreshold then follows from it at the same 1.5x, so a single TC
+      // number tunes both cutoffs. The trailing fallbacks mirror the real
+      // optionsSpecification defaults; they are unreachable in practice, since
+      // SquadJS fills unset options in from that spec before the plugin runs.
+      const dominantThreshold =
+        (isTC ? this.options.tcDominantThreshold : null) ?? this.options.minTicketsToCountAsDominantWin ?? 150;
       const stompThreshold = Math.floor(dominantThreshold * 1.5);
 
       if (isInvasion) {
         const invasionAttackThreshold = this.options.invasionAttackTeamThreshold ?? 300;
-        const invasionDefenceThreshold = this.options.invasionDefenceTeamThreshold ?? 650;
+        const invasionDefenceThreshold = this.options.invasionDefenceTeamThreshold ?? 500;
         if (
           (winnerID === 1 && margin >= invasionAttackThreshold) ||
           (winnerID === 2 && margin >= invasionDefenceThreshold)
@@ -2027,11 +2074,14 @@ export default class TeamBalancer extends S3PluginBase {
                 ? this.RconMessages.nonDominant.invasionAttackWin
                 : this.RconMessages.nonDominant.invasionDefendWin;
           } else {
-            const threshold = this.options.minTicketsToCountAsDominantWin ?? 175;
-
-            const veryCloseCutoff = Math.floor(threshold * 0.11);
-            const closeCutoff = Math.floor(threshold * 0.45);
-            const tacticalCutoff = Math.floor(threshold * 0.68);
+            // Off dominantThreshold, not the raw option: these cutoffs describe
+            // how far short of dominance the win fell, so they have to be on
+            // the same scale the dominance test just used. Reading the raw
+            // option here would classify a TC round on one scale and narrate it
+            // on another the moment tcDominantThreshold is set.
+            const veryCloseCutoff = Math.floor(dominantThreshold * 0.11);
+            const closeCutoff = Math.floor(dominantThreshold * 0.45);
+            const tacticalCutoff = Math.floor(dominantThreshold * 0.68);
 
             if (margin < veryCloseCutoff) {
               template = this.RconMessages.nonDominant.narrowVictory;
@@ -2108,6 +2158,10 @@ export default class TeamBalancer extends S3PluginBase {
       if (this.options.showWinStreakMessages && !scrambleComing) {
         let template;
 
+        // No TC arm here or in the non-dominant ladder above, deliberately: the
+        // Invasion templates exist because they name a side ("attackers broke
+        // through"), which a symmetric mode has no equivalent for. TC takes the
+        // side-neutral stomped/steamrolled wording, same as RAAS/AAS.
         if (isInvasion) {
           template =
             winnerID === 1

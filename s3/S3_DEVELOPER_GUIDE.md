@@ -196,7 +196,7 @@ Tracks round phases (STAGING → LIVE → ENDGAME), infers gamemode/layer from s
 
 **Phase vs. resolving — two separate questions.** The *phase* is where the round is (STAGING mirrors the in-game staging period that keeps players in main). `resolving` is whether team data can be trusted yet, and it is **not** bounded by the phase: it is set at `NEW_GAME` and cleared by the first player-info tick that shows every tracked player on a real team, whatever phase that lands in. `resolvingTimeoutMs` (default 120s) is the escape hatch for a round where that never happens — floored at runtime to 4× PlayersService's effective refresh interval, since the flag can only ever clear on a tick and that interval is dynamic (clamped to [3s, 60s], set by the fastest registrant).
 
-**STAGING duration:** SquadJS gives no "match started" event, so STAGING → LIVE is a timer: `stagingDurationMs` (default 180s), or **5s on seed/training layers**, which have no real staging phase and would otherwise sit in STAGING forever (a seed round never fires another `NEW_GAME`). The shortcut applies **only when the layer was resolved for the current round** — `getLayerName()` falls back to the previous round's layer, and trusting that fallback here once made S³ declare LIVE 5s into a full RAAS staging phase because the round before it was Jensen's Range. When the real layer arrives mid-STAGING (`data.layer` was null, or S³ restarted), `resolveLayerInfo()` re-arms the timer against `lastNewGameAt`, so a late-identified seed round goes LIVE immediately rather than waiting out a second full duration.
+**STAGING duration:** SquadJS gives no "match started" event, so STAGING → LIVE is a timer, and its length is a **property of the gamemode, not a config option** — there is no config key for it. The value comes from a measured per-gamemode table (RAAS/AAS 250s, Invasion and Territory Control 300s; anything unmeasured falls back rather than being guessed at), keyed on the short mode key rather than the spelled-out mode name, so a mode SquadJS writes out in full still matches its table entry. Or **5s on seed/training layers**, which have no real staging phase and would otherwise sit in STAGING forever (a seed round never fires another `NEW_GAME`). The shortcut applies **only when the layer was resolved for the current round** — `getLayerName()` falls back to the previous round's layer, and trusting that fallback here once made S³ declare LIVE 5s into a full RAAS staging phase because the round before it was Jensen's Range. When the real layer arrives mid-STAGING (`data.layer` was null, or S³ restarted), `resolveLayerInfo()` re-arms the timer against `lastNewGameAt`, so a late-identified seed round goes LIVE immediately rather than waiting out a second full duration.
 
 **SquadJS events it subscribes to:** `NEW_GAME`, `ROUND_ENDED`, `UPDATED_LAYER_INFORMATION`, `UPDATED_SERVER_INFORMATION`, `UPDATED_PLAYER_INFORMATION`
 
@@ -210,7 +210,8 @@ Tracks round phases (STAGING → LIVE → ENDGAME), infers gamemode/layer from s
 | `isLive()` | `boolean` | Phase === `'LIVE'` |
 | `isEnding()` | `boolean` | Phase === `'ENDGAME'` |
 | `isResolving()` | `boolean` | Team data not yet trusted for this round — **any phase**, not just STAGING. Don't act on team IDs while true |
-| `getGamemode()` | `string\|null` | Inferred game mode (e.g. `'AAS'`, `'RAAS'`, `'Seed'`) |
+| `getGamemode()` | `string\|null` | The game mode as SquadJS spells it (e.g. `'AAS'`, `'RAAS'`, `'Seed'`, `'Territory Control'`). Use for display, storage and operator-configured needles |
+| `getGamemodeKey()` | `string\|null` | The same mode as a short, stable key (`'TC'` for Territory Control). **Branch and key lookup tables on this**, not on `getGamemode()` — same canonical/display split as the two layer getters below |
 | `getLayerName()` | `string\|null` | **Canonical** layer name — the SquadJS classname (e.g. `'Sumari_Seed_v1'`). Use for storage and comparisons; see §7.12 |
 | `getLayerDisplayName()` | `string\|null` | The same layer as a human reads it (e.g. `'Sumari Bala Seed v1'`). Falls back to the canonical name |
 | `isLayerResolved()` | `boolean` | `false` while the two getters above are returning the `'Unknown'` placeholder — use it before trusting a negative `isIgnoredMode()` / `isSeedMode()` |
@@ -230,7 +231,7 @@ Tracks round phases (STAGING → LIVE → ENDGAME), infers gamemode/layer from s
 | `isEndgameVotingComplete()` | `boolean` | All voting finished |
 | `setIgnoredGameModes(modes)` | `void` | Configures which modes to skip |
 | `onGamePhaseChange(callback)` | `Function` (unsubscribe) | Callback: `({ phase, prevPhase, subPhase, roundStartTime, matchId, layer }) => {}` |
-| `onLayerGameModeChange(callback)` | `Function` (unsubscribe) | Callback: `({ layerName, layerDisplayName, gameMode, prevLayer, prevGameMode }) => {}` — **one object argument**, not four positional ones |
+| `onLayerGameModeChange(callback)` | `Function` (unsubscribe) | Callback: `({ layerName, layerDisplayName, gameMode, gameModeKey, prevLayer, prevGameMode }) => {}` — **one object argument**, not several positional ones |
 | `onResolvingChange(callback)` | `Function` (unsubscribe) | Callback: `({ resolving, reason, durationMs, phase, matchId, layer }) => {}`. `reason` is one of `PLAYERS_RESOLVED` / `ROSTER_FALLBACK` / `BUDGET_EXPIRED` / `ROUND_ENDED` / `RECOVERY_STALE` / `RECOVERY_INVALIDATED`; `durationMs` measures from `lastNewGameAt` |
 
 ---
@@ -536,7 +537,7 @@ unsubscribe();
 | Method | Fires When | Payload |
 |--------|-----------|---------|
 | `onGamePhaseChange(cb)` | End of `handleNewGame()`, `handleRoundEnded()`, staging→live transition timer, each ENDGAME sub-state advance | `{ phase, prevPhase, subPhase, roundStartTime, matchId, layer }` |
-| `onLayerGameModeChange(cb)` | End of `resolveLayerInfo()` when layer/game mode changed | `{ layerName, layerDisplayName, gameMode, prevLayer, prevGameMode }` |
+| `onLayerGameModeChange(cb)` | End of `resolveLayerInfo()` when layer/game mode changed | `{ layerName, layerDisplayName, gameMode, gameModeKey, prevLayer, prevGameMode }` |
 | `onResolvingChange(cb)` | `resolving` is set at `NEW_GAME` or cleared by `_clearResolving()` | `{ resolving, reason, durationMs, phase, matchId, layer }` |
 
 **Notes:**

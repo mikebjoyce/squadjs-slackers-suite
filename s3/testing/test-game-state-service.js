@@ -21,7 +21,7 @@
 
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import GameStateService from '../utils/game-state-service.js';
+import GameStateService, { gamemodeKeyOf } from '../utils/game-state-service.js';
 import PlayersService from '../utils/players-service.js';
 
 class MockServer extends EventEmitter {
@@ -276,6 +276,135 @@ await runTest('staging duration comes from the gamemode, not from a config optio
   // An unresolved layer never reads the table: that is the stale-layer bug.
   service._roundLayerTrusted = false;
   assert.equal(service._stagingDurationForRound(), 250000);
+});
+
+await runTest('Territory Control staging is 300s on the production object path', async () => {
+  const server = new MockServer();
+  const service = new GameStateService({ server });
+
+  // THE PRODUCTION PATH. SquadJS hands resolveLayerInfo a Layer OBJECT whose
+  // gamemode field comes from the Squad Wiki pipeline, and resolveLayerInfo
+  // prefers that field over inferGameMode() — so the '_tc_' needle never runs
+  // and the mode arrives spelled "Territory Control", not 'TC'. Observed live
+  // on Logar_TC_v1 and Narva_TC_v1, 2026-09-01.
+  //
+  // This is the case that has to fail if the TC table entry or the key lookup
+  // in _stagingDurationForRound() is reverted. The string-form test below
+  // passes either way, which is exactly why it cannot stand alone.
+  await service.resolveLayerInfo(
+    { name: 'Logar TC v1', classname: 'Logar_TC_v1', gamemode: 'Territory Control' },
+    'test'
+  );
+  service._roundLayerTrusted = true;
+
+  assert.equal(service.getGamemode(), 'Territory Control', 'display/storage spelling is left alone');
+  assert.equal(service.getGamemodeKey(), 'TC', 'the key accessor is what normalises it');
+  assert.equal(
+    service._stagingDurationForRound(),
+    300000,
+    'TC is 1min pre-match + 4min staging; the old default called LIVE at +250s, 50s early'
+  );
+});
+
+await runTest('Territory Control staging is 300s on the inferGameMode fallback path', async () => {
+  const server = new MockServer();
+  const service = new GameStateService({ server });
+
+  // The fallback path: a bare string, no wiki entry, so inferGameMode()'s
+  // '_tc_' needle runs and yields the short name directly. Both spellings have
+  // to land on the same duration or a layer missing from the wiki pipeline
+  // would stage differently from the same layer present in it.
+  await service.resolveLayerInfo('Narva_TC_v1', 'test');
+  service._roundLayerTrusted = true;
+
+  assert.equal(service.getGamemode(), 'TC');
+  assert.equal(service.getGamemodeKey(), 'TC');
+  assert.equal(service._stagingDurationForRound(), 300000);
+});
+
+await runTest('the staging diagnostic names the table, not a fallback, for an aliased mode', async () => {
+  // This log line is what an operator reads to confirm which of the four
+  // sources supplied the staging duration, so it has to agree with the
+  // duration printed beside it. Keyed on the raw mode it reported
+  // "Territory Control not in table" for a TC round that had just been served
+  // 300000 from the table — the diagnostic contradicting its own line.
+  const lines = [];
+  const server = new MockServer();
+  const service = new GameStateService({
+    server,
+    verboseLogger: (_level, msg) => lines.push(String(msg))
+  });
+
+  await service.handleNewGame({
+    layer: { name: 'Logar TC v1', classname: 'Logar_TC_v1', gamemode: 'Territory Control' }
+  });
+
+  const armed = lines.filter((l) => l.includes('Staging timer armed')).pop();
+  assert.ok(armed, 'no staging-timer diagnostic was emitted');
+  assert.ok(armed.includes('duration=300000ms'), `wrong duration in: ${armed}`);
+  assert.ok(armed.includes('gamemode table'), `diagnostic claims a fallback: ${armed}`);
+  assert.ok(!armed.includes('not in table'), `diagnostic contradicts the duration: ${armed}`);
+  // Both spellings surface, so the alias is visible rather than swallowed.
+  assert.ok(armed.includes('Territory Control -> TC'), `alias not shown: ${armed}`);
+
+  service._clearStagingLiveTimer();
+});
+
+await runTest('getGamemodeKey normalises only known divergences', async () => {
+  const server = new MockServer();
+  const service = new GameStateService({ server });
+
+  // Both spellings of the one mode that actually diverges.
+  await service.resolveLayerInfo(
+    { name: 'Logar TC v1', classname: 'Logar_TC_v1', gamemode: 'Territory Control' },
+    'test'
+  );
+  assert.equal(service.getGamemodeKey(), 'TC');
+  await service.resolveLayerInfo('Narva_TC_v1', 'test');
+  assert.equal(service.getGamemodeKey(), 'TC');
+
+  // Everything else passes through untouched — the alias table maps observed
+  // divergences only, so a mode absent from it must not be rewritten.
+  await service.resolveLayerInfo('Gorodok_RAAS_v2', 'test');
+  assert.equal(service.getGamemodeKey(), 'RAAS');
+  await service.resolveLayerInfo('Fallujah_Invasion_v1', 'test');
+  assert.equal(service.getGamemodeKey(), 'Invasion');
+
+  // An unmapped mode from the wiki route keeps its exact spelling rather than
+  // being guessed at, and the placeholder survives too.
+  await service.resolveLayerInfo(
+    { name: 'Sumari Insurgency v1', classname: 'Sumari_Insurgency_v1', gamemode: 'Insurgency' },
+    'test'
+  );
+  assert.equal(service.getGamemodeKey(), 'Insurgency');
+
+  const fresh = new GameStateService({ server: new MockServer() });
+  assert.equal(fresh.getGamemodeKey(), 'Unknown', 'no layer yet must not become undefined');
+});
+
+await runTest('a gamemode named after an Object.prototype member is not read off the prototype', async () => {
+  // Both lookup tables are plain object literals, so a bare index also reads
+  // Object.prototype. No such gamemode exists — the wiki pipeline and
+  // inferGameMode() between them cannot produce one — but the failure would be
+  // silent and severe rather than a clean miss, so both readers are own-property
+  // guarded and this pins the guards.
+  //
+  // 'toString' is the sharp case: the raw table index yields a FUNCTION, which
+  // survives the `!== undefined` test and reaches setTimeout as a delay, where
+  // it coerces to NaN and fires the staging timer immediately. 'constructor'
+  // and '__proto__' are the alias-table cases — lowercased, so they match
+  // Object.prototype's real spelling and index truthy.
+  for (const hostile of ['toString', 'valueOf', 'constructor', '__proto__', 'hasOwnProperty']) {
+    assert.equal(gamemodeKeyOf(hostile), hostile, `${hostile} must pass through, not resolve off the prototype`);
+
+    const service = new GameStateService({ server: new MockServer() });
+    await service.resolveLayerInfo({ name: hostile, classname: hostile, gamemode: hostile }, 'test');
+    service._roundLayerTrusted = true;
+
+    const duration = service._stagingDurationForRound();
+    assert.equal(typeof duration, 'number', `${hostile} yielded a ${typeof duration} as a staging duration`);
+    assert.equal(duration, 250000, `${hostile} must fall back to the default, not hit an inherited key`);
+  }
 });
 
 await runTest('an explicit stagingDurationMs overrides the gamemode table', async () => {
