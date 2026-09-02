@@ -237,7 +237,7 @@ Third-party plugins can register custom locking priorities via `players.register
 | Plugin | Legacy (Standalone) | S³ Suite |
 |--------|---------------------|----------|
 | **TeamBalancer** | [squadjs-team-balancer](https://github.com/mikebjoyce/squadjs-team-balancer) (v3.2.2) | [team-balancer/](team-balancer/) (v4.1.0) |
-| **Switch** | [squadjs-switch-teambalancer-aware](https://github.com/mikebjoyce/squadjs-switch-teambalancer-aware) | [switch/](switch/) (v2.5.6) |
+| **Switch** | [squadjs-switch-teambalancer-aware](https://github.com/mikebjoyce/squadjs-switch-teambalancer-aware) | [switch/](switch/) (v2.5.7) |
 | **EloTracker** | [squadjs-elo-tracker](https://github.com/mikebjoyce/squadjs-elo-tracker) (v1.3.0) | [elo-tracker/](elo-tracker/) (v2.x) |
 | **SmartAssign** | [squadjs-smart-assign](https://github.com/mikebjoyce/squadjs-smart-assign) (v1.1.1) | [smart-assign/](smart-assign/) (v2.x) |
 | **S³** | — (no legacy equivalent) | [s3/](s3/) (v1.0+) |

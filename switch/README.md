@@ -1,4 +1,4 @@
-# Switch Plugin v2.5.6
+# Switch Plugin v2.5.7
 
 **Team-change management with database persistence, TeamBalancer integration, and S³-aware player tracking.**
 
