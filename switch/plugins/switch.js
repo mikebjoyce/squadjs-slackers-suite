@@ -485,19 +485,19 @@ export default class Switch extends S3DiscordPluginBase {
 
         // ── Option validation (clamp out-of-range values) ────────
         if (this.options.maxSwitchTokens <= 0) {
-            this.verbose(1, this.t('switch.verbose.configInvalidTokens', { count: this.options.maxSwitchTokens }));
+            this.verbose(1, `[Config] maxSwitchTokens=${this.options.maxSwitchTokens} is invalid — forcing to 1 (legacy flat-cooldown mode).`);
             this.options.maxSwitchTokens = 1;
         }
          if (this.options.seedTokenBonusAmount < 0) {
-             this.verbose(1, this.t('switch.verbose.configInvalidSeedBonusAmount', { count: this.options.seedTokenBonusAmount }));
+             this.verbose(1, `[Config] seedTokenBonusAmount=${this.options.seedTokenBonusAmount} is invalid — forcing to 0 (no seed bonus tokens).`);
              this.options.seedTokenBonusAmount = 0;
          }
          if (this.options.seedTokenBonusMinutes < 0) {
-             this.verbose(1, this.t('switch.verbose.configInvalidSeedBonusMinutes', { count: this.options.seedTokenBonusMinutes }));
+             this.verbose(1, `[Config] seedTokenBonusMinutes=${this.options.seedTokenBonusMinutes} is invalid — forcing to 0 (seed bonus disabled).`);
              this.options.seedTokenBonusMinutes = 0;
          }
          if (this.options.seedTokenBonusMinPlayers < 0) {
-             this.verbose(1, this.t('switch.verbose.configInvalidSeedBonusMinPlayers', { count: this.options.seedTokenBonusMinPlayers }));
+             this.verbose(1, `[Config] seedTokenBonusMinPlayers=${this.options.seedTokenBonusMinPlayers} is invalid — forcing to 0 (no minimum).`);
              this.options.seedTokenBonusMinPlayers = 0;
          }
 
@@ -546,16 +546,16 @@ export default class Switch extends S3DiscordPluginBase {
         const actual = this._s3?.version;
         if (!this._s3VersionAtLeast(required)) {
             throw new Error(
-                this.t('switch.errors.incompatibleS3Version', { actual: actual || 'unknown', required })
+                this.localize('switch.errors.incompatibleS3Version', { actual: actual || 'unknown', required })
             );
         }
-        this.verbose(2, this.t('switch.verbose.s3VersionCheckPassed', { actual, required }));
+        this.verbose(2, `[S3] Version check passed: S³ v${actual} >= required v${required}`);
     }
 
     async _onS3Ready() {
         this._checkS3Version();
         if (!this._s3db?.isReady?.() || !this._s3db.migrationEngine) {
-            this.verbose(1, this.t('switch.verbose.s3DbNotAvailable'));
+            this.verbose(1, '[S3] S³ DB or migrationEngine not available — cannot register Switch schema. Mounting without DB.');
             return;
         }
 
@@ -564,12 +564,12 @@ export default class Switch extends S3DiscordPluginBase {
             const sc = this._s3?.serverConfig;
             if (sc?.isReady?.() && typeof sc.getAllowTeamChanges === 'function') {
                 this._changeTeamDisabled = !sc.getAllowTeamChanges();
-                this.verbose(2, this.t('switch.verbose.changeTeamDetection', { status: this._changeTeamDisabled ? 'DISABLED' : 'enabled' }));
+                this.verbose(2, `[S3] ChangeTeam detection: ${this._changeTeamDisabled ? 'DISABLED' : 'enabled'}.`);
             } else {
-                this.verbose(2, this.t('switch.verbose.changeTeamNotAvailable'));
+                this.verbose(2, '[S3] serverConfig not available — assuming ChangeTeam is enabled.');
             }
         } catch (err) {
-            this.verbose(1, this.t('switch.verbose.changeTeamQueryFailed', { message: err.message }));
+            this.verbose(1, `[S3] Failed to query ChangeTeam setting: ${err.message}. Assuming enabled.`);
         }
 
         // ── Utility registration (extracted during refactor) ──────────
@@ -585,7 +585,7 @@ export default class Switch extends S3DiscordPluginBase {
         // ── Auto-update explain channel ──────────────────────────
         if (this.options.explainChannelID) {
             await this._initExplainAutoUpdate().catch(err => {
-                this.verbose(1, this.t('switch.verbose.explainInitFailed', { message: err.message }));
+                this.verbose(1, `[Explain] Auto-update init failed: ${err.message}`);
             });
         }
 
@@ -593,7 +593,7 @@ export default class Switch extends S3DiscordPluginBase {
         // non-empty (see _enqueuePlayer), and unregistered when the queue empties
         // (see _removePlayerFromQueue). If the queue is disabled, no interest is
         // registered at all. This avoids polling when no one is waiting.
-        this.verbose(2, this.t('switch.verbose.conditionalRefreshInterest'));
+        this.verbose(2, '[S3] Switch refresh interest is conditional (poll only when queue active).');
 
         // ── Mid-round restart: backfill _gameStartTs from S³ ──────────
         // onNewGame() sets _gameStartTs during normal NEW_GAME events, but when
@@ -604,7 +604,7 @@ export default class Switch extends S3DiscordPluginBase {
             const roundStartTime = this._s3?.gameState?.getRoundStartTime?.();
             if (roundStartTime) {
                 this._gameStartTs = roundStartTime;
-                this.verbose(2, this.t('switch.verbose.backfilledGameStartTs'));
+                this.verbose(2, `[S3] Backfilled _gameStartTs from S³ (mid-round recovery).`);
             }
         }
 
@@ -624,7 +624,7 @@ export default class Switch extends S3DiscordPluginBase {
             if (phase !== 'ENDGAME') return;
             if (!this._s3?.gameState?.isSeedMode?.()) return;
             this._grantSeedBonusAtEndgame().catch(err => {
-                this.verbose(1, this.t('switch.verbose.endgameConsolationFailed', { message: err.message }));
+                this.verbose(1, `[SeedPresence] ENDGAME consolation grant failed: ${err.message}`);
             });
         }) || null;
     }
@@ -712,7 +712,7 @@ export default class Switch extends S3DiscordPluginBase {
             });
 
             for (const r of resolved) {
-                if (r.eosID) this.warn(r.eosID, this.t('switch.warn.matchendWarning'));
+                if (r.eosID) this.warn(r.eosID, this.localize('switch.warn.matchendWarning'));
             }
 
             const warnMs = Number.isFinite(this._matchendWarnDelayMs)
@@ -722,7 +722,7 @@ export default class Switch extends S3DiscordPluginBase {
 
             const outcomes = await Promise.allSettled(resolved.map(async (r) => {
                 if (!r.eosID) {
-                    throw new Error(this.t('switch.errors.noEosIDResolved', { steamID: r.steamID || 'none' }));
+                    throw new Error(this.localize('switch.errors.noEosIDResolved', { steamID: r.steamID || 'none' }));
                 }
                 return this._taggedSwitchPlayer(r.eosID, 'Admin-Force');
             }));
@@ -732,7 +732,7 @@ export default class Switch extends S3DiscordPluginBase {
                 if (o.status === 'rejected') {
                     failed++;
                     const r = resolved[i];
-                    this.verbose(1, this.t('switch.verbose.matchendFailed', { identifier: r.name || r.eosID || r.steamID, reason: o.reason?.message || o.reason }));
+                    this.verbose(1, `[Switch] Matchend switch failed for ${r.name || r.eosID || r.steamID}: ${o.reason?.message || o.reason}`);
                 }
             });
 
@@ -744,15 +744,15 @@ export default class Switch extends S3DiscordPluginBase {
             if (Endmatches && ids.length > 0) {
                 try {
                     const cleared = await Endmatches.destroy({ where: { id: { [Op.in]: ids } } });
-                    this.verbose(1, this.t('switch.verbose.matchendProcessed', { count: resolved.length, failed, cleared }));
+                    this.verbose(1, `[Switch] Matchend: processed ${resolved.length} requests (${failed} failed), cleared ${cleared} rows.`);
                 } catch (err) {
-                    this.verbose(1, this.t('switch.verbose.matchendProcessedClearFailed', { count: resolved.length, failed, message: err.message }));
+                    this.verbose(1, `[Switch] Matchend: processed ${resolved.length} requests (${failed} failed), but failed to clear DB rows: ${err.message}`);
                 }
             } else {
-                this.verbose(1, this.t('switch.verbose.matchendProcessedNoRows', { count: resolved.length, failed }));
+                this.verbose(1, `[Switch] Matchend: processed ${resolved.length} requests (${failed} failed).`);
             }
         } catch (err) {
-            this.verbose(1, this.t('switch.verbose.matchendFailedGeneric', { message: err.message || err }));
+            this.verbose(1, `[Switch] doSwitchMatchend failed: ${err.message || err}`);
             this._matchendQueue = [];
         }
     }
@@ -767,14 +767,14 @@ export default class Switch extends S3DiscordPluginBase {
             this._roundStats.wasLiberalMode = this.isLiberalMode();
         }
 
-        this.verbose(2, this.t('switch.verbose.roundEndedQueuePreserved', { count: this._getQueueSize() }));
+        this.verbose(2, `[Queue] Round ended — queue preserved (${this._getQueueSize()} entries remain).`);
 
         // Run matchend switches only — summary now posts on NEW_GAME
         await this.cleanup();
         try {
             await this.doSwitchMatchend();
         } catch (err) {
-            this.verbose(1, this.t('switch.verbose.onRoundEndedFailed', { message: err.message || err }));
+            this.verbose(1, `[Switch] onRoundEnded matchend processing failed: ${err.message || err}`);
         }
     }
 
@@ -839,7 +839,7 @@ export default class Switch extends S3DiscordPluginBase {
          const dynamicExtra = this.getDynamicExtraSlots();
          if (dynamicExtra > 0) {
              cap += dynamicExtra;
-             this.verbose(2, this.t('switch.verbose.dynamicBalanceSlots', { extra: dynamicExtra, cap }));
+             this.verbose(2, `[Dynamic Balance] Extra slots: +${dynamicExtra} | Effective cap: ${cap}`);
          }
 
          const postSwitchDiff = teamID === 1
@@ -1132,19 +1132,15 @@ export default class Switch extends S3DiscordPluginBase {
         try {
             await this._s3?.players?.resetJoinTime?.(eosID);
         } catch (err) {
-            this.verbose(1, this.t('switch.verbose.reconnectResetJoinTimeFailed', { identifier: name || eosID, message: err.message }));
+            this.verbose(1, `[Reconnect] resetJoinTime failed for ${name || eosID}: ${err.message}`);
         }
 
         const reasons = [];
-        if (hadCooldown_obsolete) reasons.push(this.t('switch.reasons.legacyCooldown'));
-        if (hasTokenDebt) reasons.push(this.t('switch.reasons.tokenCooldown'));
-        if (hadScrambleLock) reasons.push(this.t('switch.reasons.scrambleLock'));
+        if (hadCooldown_obsolete) reasons.push('legacy cooldown');
+        if (hasTokenDebt) reasons.push('token cooldown');
+        if (hadScrambleLock) reasons.push('scramble lock');
         this.verbose(1,
-            this.t('switch.verbose.reconnectClearedLockouts', {
-                identifier: name || eosID,
-                reasons: reasons.join(this.t('switch.reasons.joiner')),
-                previousTeamID
-            })
+            `[Reconnect] ${name || eosID}: cleared ${reasons.join(' and ')} — stranded on current team, previous was T${previousTeamID}`
         );
     }
 
@@ -1177,7 +1173,7 @@ export default class Switch extends S3DiscordPluginBase {
             );
         });
 
-        this.verbose(1, this.t('switch.verbose.reconnectClearedScrambleLock', { identifier: name || eosID }));
+        this.verbose(1, `[Reconnect] ${name || eosID}: cleared stale scramble lock (reconnect).`);
     }
 
     /**
@@ -1212,7 +1208,7 @@ export default class Switch extends S3DiscordPluginBase {
 
         const row = await PlayerCooldowns.findByPk(eosID);
         if (!row) {
-            this.verbose(2, this.t('switch.verbose.resetLockoutsNoRow', { eosID }));
+            this.verbose(2, `[_resetPlayerLockouts] No PlayerCooldowns row for ${eosID} — nothing to reset.`);
             return false;
         }
 
@@ -1224,7 +1220,7 @@ export default class Switch extends S3DiscordPluginBase {
         const belowCap = balance < maxTokens;
 
         if (!hadScrambleLock && !belowCap) {
-            this.verbose(2, this.t('switch.verbose.resetLockoutsNothingToDo', { eosID }));
+            this.verbose(2, `[_resetPlayerLockouts] ${eosID}: no active scramble lock and at token cap — nothing to do.`);
             return false;
         }
 
@@ -1242,10 +1238,10 @@ export default class Switch extends S3DiscordPluginBase {
         try {
             await this._s3?.players?.resetJoinTime?.(eosID);
         } catch (err) {
-            this.verbose(1, this.t('switch.verbose.resetLockoutsJoinTimeFailed', { eosID, message: err.message }));
+            this.verbose(1, `[_resetPlayerLockouts] resetJoinTime failed for ${eosID}: ${err.message}`);
         }
 
-        this.verbose(1, this.t('switch.verbose.resetLockoutsCleared', { eosID, grantedToken: belowCap ? this.t('switch.reasons.grantedTokenSuffix') : '' }));
+        this.verbose(1, `[_resetPlayerLockouts] ${eosID}: cleared scramble lock${belowCap ? ' + granted +1 token' : ''}.`);
         return belowCap;
     }
 
@@ -1267,14 +1263,14 @@ export default class Switch extends S3DiscordPluginBase {
         // _removePlayerFromQueue it would already be null.
         const queueEntry = this._findQueueEntry(eosID)?.entry;
         if (this._removePlayerFromQueue(eosID)) {
-            this.verbose(2, this.t('switch.verbose.queueDisconnectedRemoved', { playerName }));
+            this.verbose(2, `[Queue] ${playerName} disconnected — removed from queue.`);
             // Deduplicate by eosID: a player can only DC from the queue once per round.
             // Without this guard, delayed async cascades (e.g. onChatMessage finishing
             // after the player already left) can record a second queueDisconnects entry
             // for the same disconnect, inflating the count in the round summary.
             if (this._roundStats && queueEntry) {
                 if (this._roundStats.queueDisconnects.some(d => d.eosID === eosID)) {
-                    this.verbose(2, this.t('switch.verbose.queueDisconnectDuplicateSkipped', { playerName }));
+                    this.verbose(2, `[Queue] ${playerName} disconnect already recorded — skipping duplicate.`);
                 } else {
                     const queueDurationSeconds = Math.round((Date.now() - queueEntry.queuedAt) / 1000);
                     const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
@@ -1289,7 +1285,7 @@ export default class Switch extends S3DiscordPluginBase {
                 }
             }
         }
-        this.verbose(2, this.t('switch.verbose.playerDisconnected', { playerName }));
+        this.verbose(2, `Player disconnected ${playerName}`);
         this.recentDoubleSwitches = this.recentDoubleSwitches.filter(p => p.eosID != eosID);
         this.recentSwitches = this.recentSwitches.filter(p => p.eosID != eosID);
     }
@@ -1304,12 +1300,12 @@ export default class Switch extends S3DiscordPluginBase {
         if (!forced) {
             const joinSeconds = await this.getSecondsFromJoin(playerEosID);
             if (joinSeconds / 60 > this.options.doubleSwitchEnabledMinutes && this.getSecondsFromMatchStart() / 60 > this.options.doubleSwitchEnabledMinutes) {
-                this.warn(playerEosID, this.t('switch.warn.doubleSwitchTimeLimit', { minutes: this.options.doubleSwitchEnabledMinutes }));
+                this.warn(playerEosID, this.localize('switch.warn.doubleSwitchTimeLimit', { minutes: this.options.doubleSwitchEnabledMinutes }));
                 return;
             }
 
             if (recentSwitch && cooldownHoursLeft < this.options.doubleSwitchCooldownHours) {
-                this.warn(playerEosID, this.t('switch.warn.doubleSwitchCooldown', { hours: this.options.doubleSwitchCooldownHours }));
+                this.warn(playerEosID, this.localize('switch.warn.doubleSwitchCooldown', { hours: this.options.doubleSwitchCooldownHours }));
                 return;
             }
 
@@ -1324,11 +1320,11 @@ export default class Switch extends S3DiscordPluginBase {
             await delay(this.options.doubleSwitchDelaySeconds * 1000);
             await this._taggedSwitchPlayer(playerEosID, 'Switch-Double-Swap');
 
-            if (forced && senderSteamID) this.warn(senderSteamID, this.t('switch.warn.playerDoubleSwitched'));
+            if (forced && senderSteamID) this.warn(senderSteamID, this.localize('switch.warn.playerDoubleSwitched'));
         } catch (err) {
-            this.verbose(1, this.t('switch.verbose.doubleSwitchFailed', { eosID: playerEosID, message: err.message }));
+            this.verbose(1, `Double switch failed for ${playerEosID}: ${err.message}`);
             if (forced && senderSteamID) {
-                this.warn(senderSteamID, this.t('switch.warn.doubleSwitchFailedSender', { message: err.message }));
+                this.warn(senderSteamID, this.localize('switch.warn.doubleSwitchFailedSender', { message: err.message }));
             }
         }
     }
@@ -1340,7 +1336,7 @@ export default class Switch extends S3DiscordPluginBase {
             try {
                 await this._taggedSwitchPlayer(p.eosID, 'Admin-Force');
             } catch (err) {
-                this.verbose(1, this.t('switch.verbose.switchSquadMemberFailed', { name: p.name, message: err.message }));
+                this.verbose(1, `Failed to switch squad member ${p.name}: ${err.message}`);
             }
         }
     }
@@ -1348,7 +1344,7 @@ export default class Switch extends S3DiscordPluginBase {
     getPlayersFromSquad(number, team) {
         const team_id = +team;
         if (!(team_id >= 0)) {
-            this.verbose(1, this.t('switch.verbose.invalidTeamIDSquad', { team }));
+            this.verbose(1, "Invalid team ID for getPlayersFromSquad:", team);
             return;
         }
         return this.server.players.filter((p) => p.teamID == team_id && p.squadID == number)
@@ -1362,7 +1358,7 @@ export default class Switch extends S3DiscordPluginBase {
             try {
                 await this._taggedSwitchPlayer(p.eosID, 'Switch-Double-Swap');
             } catch (err) {
-                this.verbose(1, this.t('switch.verbose.doubleSwitchSquadHop1Failed', { name: p.name, message: err.message }));
+                this.verbose(1, `First double-switch hop failed for ${p.name}: ${err.message}`);
             }
         }
         
@@ -1372,7 +1368,7 @@ export default class Switch extends S3DiscordPluginBase {
             try {
                 await this._taggedSwitchPlayer(p.eosID, 'Switch-Double-Swap');
             } catch (err) {
-                this.verbose(1, this.t('switch.verbose.doubleSwitchSquadHop2Failed', { name: p.name, message: err.message }));
+                this.verbose(1, `Second double-switch hop failed for ${p.name}: ${err.message}`);
             }
         }
     }
@@ -1408,7 +1404,7 @@ export default class Switch extends S3DiscordPluginBase {
             (r) => (player.eosID && r.eosID === player.eosID) || (player.steamID && r.steamID === player.steamID)
         );
         if (alreadyQueued) {
-            this.verbose(2, this.t('switch.verbose.matchendAlreadyQueued', { identifier: player.name || player.eosID }));
+            this.verbose(2, `[Switch] Matchend: ${player.name || player.eosID} is already queued — not queueing again.`);
             return false;
         }
 
@@ -1458,18 +1454,18 @@ export default class Switch extends S3DiscordPluginBase {
         });
 
         if (result && result.success) {
-            this.verbose(3, this.t('switch.verbose.rconSuccess', { name: result.name, teamID: result.teamID, source }));
+            this.verbose(3, `[Switch] RCON SUCCESS: ${result.name} switched to T${result.teamID} (source=${source})`);
             this._recordRecentSwitch(eosID);
             return result;
         }
 
         if (result === null) {
-            this.verbose(1, this.t('switch.verbose.rconPlayerNotFound', { eosID, source }));
+            this.verbose(1, `[Switch] WARNING: Player with eosID ${eosID} not found in server.players for source=${source}`);
             return null;
         }
 
-        this.verbose(1, this.t('switch.verbose.rconFailed', { identifier: result?.name || eosID, source }));
-        throw new Error(this.t('switch.errors.teamChangeFailed', { eosID, attempts: result?.attempts || 3, source }));
+        this.verbose(1, `[Switch] ERROR: AdminForceTeamChange failed for ${result?.name || eosID} (source=${source}): all attempts exhausted`);
+        throw new Error(this.localize('switch.errors.teamChangeFailed', { eosID, attempts: result?.attempts || 3, source }));
     }
 
     switchPlayer(eosID) {
@@ -1478,13 +1474,13 @@ export default class Switch extends S3DiscordPluginBase {
     }
 
     onNewGame = async () => {
-        this.verbose(1, this.t('switch.verbose.newGameStarted'));
+        this.verbose(1, '[NEW_GAME] Round started — null-teamID window handled by S³ players service.');
 
         // Clear the queue — round transition invalidates all stored teamIDs
-        this._clearAllQueueEntries(this.t('switch.reasons.newRound'));
+        this._clearAllQueueEntries('New round');
         // Schedule a delayed notification for former queued players
         this._scheduledClearNotification = setTimeout(() => {
-            this.verbose(1, this.t('switch.verbose.newGameQueueClearedNotified'));
+            this.verbose(1, '[NEW_GAME] Queue cleared — players notified.');
         }, 30_000);
 
         // Post summary for the round that just ended, BEFORE resetting stats
@@ -1574,7 +1570,7 @@ export default class Switch extends S3DiscordPluginBase {
 
         const currentMatchId = this._s3?.gameState?.getMatchId?.() || null;
         if (!currentMatchId) {
-            this.verbose(2, this.t('switch.verbose.seedPresenceSweepSkipped'));
+            this.verbose(2, '[SeedPresence] NEW_GAME sweep skipped — matchId not resolved yet; the reconciler will catch up.');
             return 0;
         }
 
@@ -1609,11 +1605,11 @@ export default class Switch extends S3DiscordPluginBase {
             });
 
             if (swept > 0) {
-                this.verbose(1, this.t('switch.verbose.seedPresenceSweepRetired', { count: swept, currentMatchId }));
+                this.verbose(1, `[SeedPresence] NEW_GAME sweep: retired stale seed state on ${swept} rows (round ${currentMatchId}).`);
             }
             return swept;
         } catch (err) {
-            this.verbose(1, this.t('switch.verbose.seedPresenceSweepFailed', { message: err.message }));
+            this.verbose(1, `[SeedPresence] NEW_GAME sweep failed: ${err.message}`);
             return 0;
         }
     }
@@ -1644,13 +1640,13 @@ export default class Switch extends S3DiscordPluginBase {
             // Tier 1: clear scramble lock for ALL reconnects (fire-and-forget).
             // Uses a lightweight DB update — only touches scrambleLockdownExpiry.
             this._clearReconnectScrambleLock(eosID, name).catch(err => {
-                this.verbose(1, this.t('switch.verbose.reconnectScrambleLockClearFailed', { identifier: name || eosID, message: err.message }));
+                this.verbose(1, `[Reconnect] Scramble lock clear failed for ${name || eosID}: ${err.message}`);
             });
         }
 
         if (isReconnectOnWrongTeam && !this._reconnectLockoutClearTimeouts.has(eosID)) {
             this._clearReconnectLockouts(eosID, name, previousTeamID).catch(err => {
-                this.verbose(1, this.t('switch.verbose.reconnectLockoutClearFailed', { identifier: name || eosID, message: err.message }));
+                this.verbose(1, `[Reconnect] Lockout clear failed for ${name || eosID}: ${err.message}`);
             });
 
             const msgTimeout = setTimeout(() => {
@@ -1658,7 +1654,7 @@ export default class Switch extends S3DiscordPluginBase {
                 const s3p = this._s3?.players?.isReady()
                     ? this._s3.players.getPlayer(eosID) : null;
                 if (s3p && s3p.teamID != null && s3p.teamID !== previousTeamID) {
-                    this.warn(eosID, this.t('switch.warn.reconnectWrongTeam'));
+                    this.warn(eosID, this.localize('switch.warn.reconnectWrongTeam'));
                 }
             }, 30_000);
             this._reconnectLockoutClearTimeouts.set(eosID, msgTimeout);
@@ -1676,7 +1672,7 @@ export default class Switch extends S3DiscordPluginBase {
                 );
             }
         }).catch(err => {
-            this.verbose(2, this.t('switch.verbose.lastActiveUpdateFailed', { identifier: name || eosID, message: err.message }));
+            this.verbose(2, `[LastActive] Failed to update lastActiveTimestamp for ${name || eosID}: ${err.message}`);
         });
 
         // v2.3.0 Stage 2: If server is in seed mode, set seedPresenceStart for this player
@@ -1724,7 +1720,7 @@ export default class Switch extends S3DiscordPluginBase {
                             firstSeenTimestamp: new Date(),
                             lastActiveTimestamp: new Date()
                         });
-                        this.verbose(2, this.t('switch.verbose.seedPresenceCreatedRow', { name }));
+                        this.verbose(2, `[SeedPresence] ${name}: joined during seed mode — created row with seedPresenceStart.`);
                     } else if (row.lastSeedBonusRoundID !== currentMatchId) {
                         // NEW ROUND for this row — reset the whole per-round block.
                         // JS !== treats NULL as different, so this also heals legacy
@@ -1742,7 +1738,7 @@ export default class Switch extends S3DiscordPluginBase {
                             },
                             { where: { eosID } }
                         );
-                        this.verbose(2, this.t('switch.verbose.seedPresenceResetPerRound', { name }));
+                        this.verbose(2, `[SeedPresence] ${name}: reconnected in new seed round — reset per-round state.`);
                     } else if (!row.seedPresenceStart) {
                         // SAME round, clock not running — the player disconnected
                         // earlier this round and has just come back.
@@ -1758,13 +1754,13 @@ export default class Switch extends S3DiscordPluginBase {
                             { seedPresenceStart: new Date() },
                             { where: { eosID } }
                         );
-                        this.verbose(2, this.t('switch.verbose.seedPresenceRestartedClock', { name, count: row.seedBonusTokensEarned }));
+                        this.verbose(2, `[SeedPresence] ${name}: rejoined mid seed round — restarted presence clock (bonus counter kept at ${row.seedBonusTokensEarned}).`);
                     }
                     // else: clock already running for this round — leave it alone
                 }
             }
         } catch (err) {
-            this.verbose(1, this.t('switch.verbose.seedPresenceStartFailed', { identifier: name || eosID, message: err.message }));
+            this.verbose(1, `[SeedPresence] Error setting seedPresenceStart for ${name || eosID}: ${err.message}`);
         }
 
         // v2.0.0: Schedule delayed join-warn if ChangeTeam is disabled
@@ -1825,7 +1821,7 @@ export default class Switch extends S3DiscordPluginBase {
                 );
             }
         }).catch(err => {
-            this.verbose(2, this.t('switch.verbose.lastActiveLeaveFailed', { identifier: name || eosID, message: err.message }));
+            this.verbose(2, `[LastActive] Failed to stamp lastActiveTimestamp on leave for ${name || eosID}: ${err.message}`);
         });
 
         // Delegate to handlePlayerLeave — clears join-warn, removes from queue,
@@ -1907,8 +1903,8 @@ export default class Switch extends S3DiscordPluginBase {
         this.server.removeListener('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
         this.server.removeListener('S3_PLAYERS_UPDATED', this._onSeedPresenceCheck);
         if (this.options.discordClient) this.options.discordClient.removeListener('message', this.onDiscordMessage);
-        this._clearAllQueueEntries(this.t('switch.reasons.pluginUnmount'));
-        this.verbose(1, this.t('switch.verbose.pluginUnmounted'));
+        this._clearAllQueueEntries('Plugin unmount');
+        this.verbose(1, 'Switch plugin was un-mounted.');
     }
 
     async unmount() {
@@ -1943,11 +1939,11 @@ export default class Switch extends S3DiscordPluginBase {
 
         ret = this.getPlayersByUsername(ident);
         if (ret.length == 0) {
-            this.warn(warnEosID, this.t('switch.warn.noPlayerFoundMatching', { ident }));
+            this.warn(warnEosID, this.localize('switch.warn.noPlayerFoundMatching', { ident }));
             return;
         }
         if (ret.length > 1) {
-            this.warn(warnEosID, this.t('switch.warn.multiplePlayersMatching', { ident }));
+            this.warn(warnEosID, this.localize('switch.warn.multiplePlayersMatching', { ident }));
             return;
         }
 
@@ -2054,7 +2050,7 @@ export default class Switch extends S3DiscordPluginBase {
         if (connectedEosIDs.length === 0) {
             // Not silent: an empty roster at ENDGAME means every seeder loses their
             // consolation token, and this path has no retry. Worth a log line.
-            this.verbose(1, this.t('switch.verbose.seedPresenceEndgameEmptyRoster'));
+            this.verbose(1, '[SeedPresence] ENDGAME reached in seed mode but the player roster is empty — no consolation grants issued.');
             return;
         }
 
@@ -2101,7 +2097,7 @@ export default class Switch extends S3DiscordPluginBase {
             );
 
             if (grantCount > 0) {
-                this.verbose(1, this.t('switch.verbose.seedPresenceEndgameGranted', { count: grantCount }));
+                this.verbose(1, `[SeedPresence] ENDGAME consolation: granted +1 seed bonus token to ${grantCount} players.`);
                 // NOTE: The pre-grant findAll runs outside the atomic UPDATE, so a
                 // concurrent periodic grant could modify rows between the SELECT and
                 // the UPDATE. The consequence is a spurious warn (a duplicate message),
@@ -2110,17 +2106,17 @@ export default class Switch extends S3DiscordPluginBase {
                   for (const row of qualifying) {
                     if (row.eosID) {
                       this.warn(row.eosID,
-                        this.t('switch.warn.seedBonusEndgame', { count: row.tokenBalance + 1 })
+                        this.localize('switch.warn.seedBonusEndgame', { count: row.tokenBalance + 1 })
                       );
                     }
                   }
                 } catch (notifyErr) {
-                  this.verbose(1, this.t('switch.verbose.seedPresenceNotifyFailed', { message: notifyErr.message }));
+                  this.verbose(1, `[SeedPresence] Error notifying players of seed bonus: ${notifyErr.message}`);
                 }
             } else if (qualifying.length > 0) {
                 // Shouldn't happen — the SELECT and UPDATE share a WHERE clause. If it
                 // does, something modified the rows in between and it's worth knowing.
-                this.verbose(1, this.t('switch.verbose.seedPresenceEndgameUpdateMismatch', { count: qualifying.length }));
+                this.verbose(1, `[SeedPresence] ENDGAME consolation: ${qualifying.length} rows qualified but the UPDATE matched none.`);
             }
 
             // Close the round for every connected player, not only grant recipients.
@@ -2138,10 +2134,10 @@ export default class Switch extends S3DiscordPluginBase {
                 }
             );
             if (closedCount > 0) {
-                this.verbose(2, this.t('switch.verbose.seedPresenceEndgameClearedConnected', { count: closedCount }));
+                this.verbose(2, `[SeedPresence] ENDGAME: cleared seedPresenceStart for ${closedCount} connected players.`);
             }
         } catch (err) {
-            this.verbose(1, this.t('switch.verbose.seedPresenceEndgameFailed', { message: err.message }));
+            this.verbose(1, `[SeedPresence] Error granting ENDGAME seed bonus: ${err.message}`);
         }
     };
 
@@ -2233,7 +2229,7 @@ export default class Switch extends S3DiscordPluginBase {
                 // would unwind to the outer catch and skip steps 2 and 3 entirely,
                 // costing every player a tick of accrual over one duplicate row.
                 await PlayerCooldowns.bulkCreate(toCreate, { ignoreDuplicates: true });
-                this.verbose(2, this.t('switch.verbose.seedPresenceCreatedRows', { count: missingEosIDs.length }));
+                this.verbose(2, `[SeedPresence] Created rows for ${missingEosIDs.length} connected players with no existing row.`);
             }
 
             // ═══════════════════════════════════════════════════════════
@@ -2299,11 +2295,7 @@ export default class Switch extends S3DiscordPluginBase {
 
             const resetCount = staleCount + bootstrapCount;
             if (resetCount > 0) {
-                this.verbose(2, this.t('switch.verbose.seedPresenceReconcilerReset', {
-                    currentMatchId,
-                    staleCount,
-                    bootstrapCount
-                }));
+                this.verbose(2, `[SeedPresence] Round ${currentMatchId}: reset ${staleCount} stale rows, started ${bootstrapCount} presence clocks.`);
             }
 
             // ═══════════════════════════════════════════════════════════
@@ -2360,7 +2352,7 @@ export default class Switch extends S3DiscordPluginBase {
             );
 
             if (grantCount > 0) {
-                this.verbose(1, this.t('switch.verbose.seedPresencePeriodicGranted', { count: grantCount }));
+                this.verbose(1, `[SeedPresence] Granted +1 seed bonus token to ${grantCount} players via periodic check.`);
                 // Notify only the players captured before the UPDATE — these are the
                 // exact players who just earned a token. Using the pre-grant snapshot
                 // avoids re-warning players who were granted on a previous tick.
@@ -2375,7 +2367,7 @@ export default class Switch extends S3DiscordPluginBase {
                   for (const row of qualifying) {
                     if (row.eosID) {
                       this.warn(row.eosID,
-                        this.t('switch.warn.seedBonusPeriodic', {
+                        this.localize('switch.warn.seedBonusPeriodic', {
                           count: row.tokenBalance + 1,
                           earned: row.seedBonusTokensEarned + 1,
                           cap: bonusCap
@@ -2384,11 +2376,11 @@ export default class Switch extends S3DiscordPluginBase {
                     }
                   }
                 } catch (notifyErr) {
-                  this.verbose(1, this.t('switch.verbose.seedPresenceNotifyFailed', { message: notifyErr.message }));
+                  this.verbose(1, `[SeedPresence] Error notifying players of seed bonus: ${notifyErr.message}`);
                 }
             }
         } catch (err) {
-            this.verbose(1, this.t('switch.verbose.seedPresenceCheckFailed', { message: err.message }));
+            this.verbose(1, `[SeedPresence] Error in seed bonus check: ${err.message}`);
         }
     };
 
@@ -2415,7 +2407,7 @@ export default class Switch extends S3DiscordPluginBase {
         try {
             await this._checkSeedBonusGrants();
         } catch (err) {
-            this.verbose(1, this.t('switch.verbose.seedPresencePeriodicCheckError', { message: err.message }));
+            this.verbose(1, `[SeedPresence] Periodic check error: ${err.message}`);
         } finally {
             this._seedPresenceProcessing = false;
         }
@@ -2435,7 +2427,7 @@ export default class Switch extends S3DiscordPluginBase {
 
         const discordClient = this.options.discordClient;
         if (!discordClient) {
-            this.verbose(1, this.t('switch.verbose.explainNoDiscordClient'));
+            this.verbose(1, '[Explain] No Discord client available — cannot auto-update explain channel.');
             return;
         }
 
@@ -2444,7 +2436,7 @@ export default class Switch extends S3DiscordPluginBase {
         try {
             channel = await discordClient.channels.fetch(explainChannelID);
         } catch (err) {
-            this.verbose(1, this.t('switch.verbose.explainFetchChannelFailed', { channelID: explainChannelID, message: err.message }));
+            this.verbose(1, `[Explain] Could not fetch explain channel ${explainChannelID}: ${err.message}`);
             return;
         }
         if (!channel) return;
@@ -2456,7 +2448,7 @@ export default class Switch extends S3DiscordPluginBase {
             try {
                 statsEmbed = await this._buildSevenDayStatsEmbed();
             } catch (err) {
-                this.verbose(1, this.t('switch.verbose.explainStatsEmbedFailed', { message: err.message }));
+                this.verbose(1, `[Explain] Stats embed generation failed (will be excluded): ${err.message}`);
             }
             const embeds = [...explainEmbeds];
             if (statsEmbed) embeds.push(statsEmbed);
@@ -2471,7 +2463,7 @@ export default class Switch extends S3DiscordPluginBase {
             for (const msgID of storedData.messageIDs) {
                 try {
                     await channel.messages.delete(msgID);
-                    this.verbose(2, this.t('switch.verbose.explainDeletedOldMessage', { msgID }));
+                    this.verbose(2, `[Explain] Deleted old explain message ${msgID}.`);
                 } catch (_) {
                     // 404 or missing permissions — harmless, continue
                 }
@@ -2500,9 +2492,9 @@ export default class Switch extends S3DiscordPluginBase {
                 await this._saveExplainMessageId(explainChannelID, messageIDs);
             }
 
-            this.verbose(1, this.t('switch.verbose.explainAutoUpdateInitialized', { count: embeds.length, channelID: explainChannelID }));
+            this.verbose(1, `[Explain] Auto-update initialized. Posted ${embeds.length} explain embed(s) in channel ${explainChannelID}.`);
         } catch (err) {
-            this.verbose(1, this.t('switch.verbose.explainPostFailed', { message: err.message }));
+            this.verbose(1, `[Explain] Failed to post/edit explain message: ${err.message}`);
         }
     };
 
@@ -2522,7 +2514,7 @@ export default class Switch extends S3DiscordPluginBase {
      */
     onScrambleExecuted = async (data) => {
         const { affectedPlayers, failedPlayers, scrambleType } = data;
-        this.verbose(2, this.t('switch.verbose.scrambleEventCalled', { data: JSON.stringify(data) }));
+        this.verbose(2, `[SCRAMBLE_EVENT] onScrambleExecuted called with data: ${JSON.stringify(data)}`);
 
         // Snapshot queued player eosIDs before clearing — these players
         // were already waiting to switch before the scramble and should
@@ -2531,17 +2523,17 @@ export default class Switch extends S3DiscordPluginBase {
             ...this._switchQueue.t1.map(e => e.eosID),
             ...this._switchQueue.t2.map(e => e.eosID)
         ]);
-        this.verbose(2, this.t('switch.verbose.scrambleQueuedPlayersCount', { count: queuedEosIDs.size }));
+        this.verbose(2, `[SCRAMBLE_EVENT] Queued players before scramble: ${queuedEosIDs.size}`);
         
         // Queue is always cleared on scramble regardless of affectedPlayers —
         // team state is invalidated either way, so stored teamIDs are stale.
-        this._clearAllQueueEntries(this.t('switch.reasons.scramble'));
+        this._clearAllQueueEntries('Scramble');
 
         // v2.0.0: During seed rounds, scramble clears the queue but does NOT
         // apply lockdown or flag _scrambleHappened — normal broadcasts play
         // when the next (non-seed) round starts.
         if (this._s3?.gameState?.isSeedMode?.()) {
-            this.verbose(1, this.t('switch.verbose.scrambleSeedRoundSkipped'));
+            this.verbose(1, `[SCRAMBLE_EVENT] Seed round — queue cleared, no lockdown applied.`);
             return;
         }
 
@@ -2551,7 +2543,7 @@ export default class Switch extends S3DiscordPluginBase {
         const totalPlayers = this.server.players.length;
         const minPlayers = this.options.scrambleLockdownMinPlayers ?? 60;
         if (totalPlayers < minPlayers) {
-            this.verbose(1, this.t('switch.verbose.scrambleLowPopSkipped', { totalPlayers, minPlayers }));
+            this.verbose(1, `[SCRAMBLE_EVENT] Server population (${totalPlayers}) below scrambleLockdownMinPlayers (${minPlayers}) — queue cleared, no lockdown applied.`);
             return;
         }
 
@@ -2566,11 +2558,11 @@ export default class Switch extends S3DiscordPluginBase {
             : this.server.players;
 
         if (!allPlayers || allPlayers.length === 0) {
-            this.verbose(1, this.t('switch.verbose.scrambleNoPlayersOnServer'));
+            this.verbose(1, `[SCRAMBLE_EVENT] No players on server — queue cleared, no lockdown records written.`);
             return;
         }
 
-        this.verbose(2, this.t('switch.verbose.scrambleEvaluatingPlayers', { movedCount: affectedPlayers?.length ?? 0, totalCount: allPlayers.length }));
+        this.verbose(2, `[SCRAMBLE_EVENT] Scramble moved ${affectedPlayers?.length ?? 0} players; applying lockdown evaluation to all ${allPlayers.length} server players.`);
 
         // Players within their switch-eligibility window haven't had time to
         // exploit pre-scramble imbalance, so they're exempt from lockdown.
@@ -2581,28 +2573,28 @@ export default class Switch extends S3DiscordPluginBase {
         const failedEosIDs = new Set(
             (failedPlayers || []).map(p => p.eosID)
         );
-        this.verbose(2, this.t('switch.verbose.scrambleFailedMovesCount', { count: failedEosIDs.size }));
+        this.verbose(2, `[SCRAMBLE_EVENT] Failed-to-move players (RCON failure, not disconnected): ${failedEosIDs.size}`);
 
         const lockoutPlayers = [];
         for (const p of allPlayers) {
             if (!p.eosID) {
-                this.verbose(1, this.t('switch.verbose.scrambleSkippingMissingEosID', { name: p.name }));
+                this.verbose(1, `[SCRAMBLE_EVENT] Skipping ${p.name} — missing eosID`);
                 continue;
             }
             // Failed-to-move players: skip lockdown, grant +1 token (when below cap)
             // so they can rejoin their group. Await the DB write so we only promise
             // a token that was actually granted.
             if (failedEosIDs.has(p.eosID)) {
-                this.verbose(2, this.t('switch.verbose.scrambleSkippingFailedMove', { name: p.name }));
+                this.verbose(2, `[SCRAMBLE_EVENT] Skipping lockdown for ${p.name} — RCON move failed, remediating.`);
                 let granted = false;
                 try {
                     granted = await this._resetPlayerLockouts(p.eosID);
                 } catch (err) {
-                    this.verbose(1, this.t('switch.verbose.scrambleResetLockoutsFailed', { identifier: p.name || p.eosID, message: err.message }));
+                    this.verbose(1, `[SCRAMBLE_EVENT] _resetPlayerLockouts failed for ${p.name || p.eosID}: ${err.message}`);
                 }
                 this.warn(p.eosID, granted
-                    ? this.t('switch.warn.scrambleMoveFailedTokenGranted')
-                    : this.t('switch.warn.scrambleMoveFailed')
+                    ? this.localize('switch.warn.scrambleMoveFailedTokenGranted')
+                    : this.localize('switch.warn.scrambleMoveFailed')
                 );
                 continue;
             }
@@ -2614,11 +2606,11 @@ export default class Switch extends S3DiscordPluginBase {
             // Convert joinSeconds/matchSeconds (s) to ms for comparison with switchWindowMs
             const withinWindow = (joinSeconds * 1000) < switchWindowMs || (matchSeconds * 1000) < switchWindowMs;
             if (withinWindow) {
-                this.verbose(2, this.t('switch.verbose.scrambleSkippingWithinWindow', { name: p.name, joinSeconds: joinSeconds.toFixed(1), matchSeconds: matchSeconds.toFixed(1) }));
+                this.verbose(2, `[SCRAMBLE_EVENT] Skipping lockdown for ${p.name} — within switch window (join: ${joinSeconds.toFixed(1)}s, match: ${matchSeconds.toFixed(1)}s)`);
                 continue;
             }
             if (queuedEosIDs.has(p.eosID)) {
-                this.verbose(2, this.t('switch.verbose.scrambleSkippingQueued', { name: p.name }));
+                this.verbose(2, `[SCRAMBLE_EVENT] Skipping lockdown for ${p.name} — was in switch queue before scramble.`);
                 continue;
             }
             lockoutPlayers.push(p);
@@ -2633,7 +2625,7 @@ export default class Switch extends S3DiscordPluginBase {
         // broadcast timer via _startPostScrambleBroadcastTimers(), which would be actively false
         // for a scramble that writes no lockdown rows.
         if (scrambleType === 'EloDiff') {
-            this.verbose(1, this.t('switch.verbose.scrambleEloDiffSkipped', { count: lockoutPlayers.length }));
+            this.verbose(1, `[SCRAMBLE_EVENT] Elo-diff micro scramble — queue cleared, no lockdown applied (${lockoutPlayers.length} would-be lockout players skipped).`);
             return;
         }
 
@@ -2642,10 +2634,10 @@ export default class Switch extends S3DiscordPluginBase {
 
         const lockdownDuration = this.options.scrambleLockdownDurationMinutes * 60 * 1000;
         const expiry = new Date(Date.now() + lockdownDuration);
-        this.verbose(2, this.t('switch.verbose.scrambleLockdownDuration', { minutes: this.options.scrambleLockdownDurationMinutes, expiry: expiry.toISOString() }));
+        this.verbose(2, `[SCRAMBLE_EVENT] Lockdown duration: ${this.options.scrambleLockdownDurationMinutes}min | Expiry: ${expiry.toISOString()}`);
 
         if (lockoutPlayers.length === 0) {
-            this.verbose(1, this.t('switch.verbose.scrambleAllExemptNoRecords', { movedCount: affectedPlayers?.length ?? 0 }));
+            this.verbose(1, `[SCRAMBLE_EVENT] All ${affectedPlayers?.length ?? 0} affected players were exempt from lockdown (switch window, queued, or missing eosID) — no lockdown records written.`);
             return;
         }
 
@@ -2671,10 +2663,10 @@ export default class Switch extends S3DiscordPluginBase {
                 return { eosID: p.eosID, steamID: p.steamID ?? null, playerName: p.name, scrambleLockdownExpiry: expiry, lastActiveTimestamp: nowDate };
             });
 
-        this.verbose(3, this.t('switch.verbose.scrambleCreatedRecords', { count: records.length }));
+        this.verbose(3, `[SCRAMBLE_EVENT] Created ${records.length} lockdown records for DB write`);
 
         try {
-            this.verbose(2, this.t('switch.verbose.scrambleStartingDbTx'));
+            this.verbose(2, `[SCRAMBLE_EVENT] Starting DB transaction to write scramble locks...`);
             const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
             if (PlayerCooldowns) {
                 await this._withDb(async (t) => {
@@ -2682,36 +2674,36 @@ export default class Switch extends S3DiscordPluginBase {
                     const chunkSize = 10;
                     for (let i = 0; i < records.length; i += chunkSize) {
                         const chunk = records.slice(i, i + chunkSize);
-                        this.verbose(2, this.t('switch.verbose.scrambleWritingChunk', { chunkIndex: Math.floor(i / chunkSize) + 1, totalChunks: Math.ceil(records.length / chunkSize), chunkSize: chunk.length }));
+                        this.verbose(2, `[SCRAMBLE_EVENT] Writing chunk ${Math.floor(i / chunkSize) + 1}/${Math.ceil(records.length / chunkSize)} (${chunk.length} records)`);
                         await PlayerCooldowns.bulkCreate(chunk, {
                             updateOnDuplicate: ['scrambleLockdownExpiry', 'playerName', 'steamID'],
                             transaction: t
                         });
                     }
                 });
-                this.verbose(1, this.t('switch.verbose.scrambleDbSuccess', { count: records.length, expiry: expiry.toISOString() }));
+                this.verbose(1, `[SCRAMBLE_EVENT] ✅ SUCCESS: Switch lockdown active for ${records.length} players until ${expiry.toISOString()}.`);
             }
 
             try {
                 const embed = {
-                    title: this.t('switch.discord.scrambleEmbedTitle'),
+                    title: this.localize('switch.discord.scrambleEmbedTitle'),
                     color: 0xff9800,
-                    description: this.t('switch.discord.scrambleEmbedDescription', { count: records.length, minutes: this.options.scrambleLockdownDurationMinutes }),
+                    description: this.localize('switch.discord.scrambleEmbedDescription', { count: records.length, minutes: this.options.scrambleLockdownDurationMinutes }),
                     fields: [
-                        { name: this.t('switch.discord.scrambleFieldDurationName'), value: this.t('switch.discord.scrambleFieldDurationValue', { minutes: this.options.scrambleLockdownDurationMinutes }), inline: true },
+                        { name: this.localize('switch.discord.scrambleFieldDurationName'), value: this.localize('switch.discord.scrambleFieldDurationValue', { minutes: this.options.scrambleLockdownDurationMinutes }), inline: true },
                         // Discord relative timestamp (e.g. "in 20 minutes")
-                        { name: this.t('switch.discord.scrambleFieldExpiresName'), value: `<t:${Math.floor(expiry.getTime() / 1000)}:R>`, inline: true },
-                        { name: this.t('switch.discord.scrambleFieldPlayersName'), value: String(records.length), inline: true }
+                        { name: this.localize('switch.discord.scrambleFieldExpiresName'), value: `<t:${Math.floor(expiry.getTime() / 1000)}:R>`, inline: true },
+                        { name: this.localize('switch.discord.scrambleFieldPlayersName'), value: String(records.length), inline: true }
                     ],
                     timestamp: new Date().toISOString()
                 };
                 await this.sendDiscordMessage({ embed });
             } catch (discordErr) {
-                this.verbose(1, this.t('switch.verbose.scrambleDiscordFailed', { message: discordErr.message }));
+                this.verbose(1, `[SCRAMBLE_EVENT] Warning: Failed to send Discord notification: ${discordErr.message}`);
             }
         } catch (err) {
-            this.verbose(1, this.t('switch.verbose.scrambleDbFailed', { message: err.message }));
-            this.verbose(1, this.t('switch.verbose.scrambleStack', { stack: err.stack }));
+            this.verbose(1, `[SCRAMBLE_EVENT] ❌ ERROR updating scramble lockdown: ${err.message}`);
+            this.verbose(1, `[SCRAMBLE_EVENT] Stack trace: ${err.stack}`);
         }
     }
 }

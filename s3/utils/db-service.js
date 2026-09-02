@@ -1584,6 +1584,8 @@ export default class DBService {
               version: prevVersion,
               appliedAt: Date.now(),
               migrationHash: 'drift-recovery',
+              // Not localized: this lands in the schema-version row, so it is
+              // a stored value rather than a message.
               description: 'Rolled back due to schema drift'
             });
           }

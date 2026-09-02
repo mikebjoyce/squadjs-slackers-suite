@@ -56,11 +56,19 @@ export class TBDiagnostics {
   }
 
   async testS3Integration() {
-    const result = { name: 'S³ Integration', pass: false, message: 'Test not run' };
+    const result = {
+      // Stable across languages: tb-commands.js picks this result out of the
+      // array by id. Matching on the localized name broke the moment the name
+      // was translated and the comparison was not.
+      id: 's3Integration',
+      name: this.tb.localize('teamBalancer.status.sIntegration'),
+      pass: false,
+      message: this.tb.localize('teamBalancer.diagnostics.notRun')
+    };
     try {
       const s3db = this.tb.s3db;
       if (!s3db || !s3db.isReady()) {
-        throw new Error('S³ DB not reachable');
+        throw new Error(this.tb.localize('teamBalancer.diagnostics.s3NotReachable'));
       }
 
       // Quick connectivity check — query the model count
@@ -69,7 +77,7 @@ export class TBDiagnostics {
 
       // Verify at least one TB model exists
       if (!tbModelNames.length) {
-        throw new Error('No TeamBalancer models found on S³ connector');
+        throw new Error(this.tb.localize('teamBalancer.diagnostics.noTbModels'));
       }
 
       // Spot-check: query TeamBalancerState to confirm read works
@@ -82,17 +90,25 @@ export class TBDiagnostics {
 
       const tableCount = tbModelNames.length;
       result.pass = true;
-      result.message = `PASS (S³ connected, ${tableCount} TB table${tableCount !== 1 ? 's' : ''})`;
+      result.message = this.tb.localize(
+        tableCount === 1 ? 'teamBalancer.diagnostics.s3PassOneTable' : 'teamBalancer.diagnostics.s3PassTables',
+        { tableCount }
+      );
     } catch (err) {
       result.pass = false;
-      result.message = `FAIL: ${err.message}`;
+      result.message = this.tb.localize('teamBalancer.diagnostics.fail', { error: err.message });
       Logger.verbose('TeamBalancer', 1, `[Diagnostics] S³ Integration test failed: ${err.message}`);
     }
     this.results.push(result);
   }
 
   async testScrambler() {
-    const result = { name: 'Live Scramble Test', pass: false, message: 'Test not run' };
+    const result = {
+      id: 'scrambler',
+      name: this.tb.localize('teamBalancer.status.liveScrambleTest'),
+      pass: false,
+      message: this.tb.localize('teamBalancer.diagnostics.notRun')
+    };
     try {
       const { squads, players } = this.tb.transformSquadJSData(
         this.tb.server.squads,
@@ -101,7 +117,7 @@ export class TBDiagnostics {
 
       if (players.length < 10) {
         result.pass = true; // Not a failure, just not enough players
-        result.message = `SKIPPED (${players.length} players — need ≥ 10)`;
+        result.message = this.tb.localize('teamBalancer.diagnostics.skippedTooFewPlayers', { value: players.length });
         this.results.push(result);
         return;
       }
@@ -115,13 +131,13 @@ export class TBDiagnostics {
 
       if (swapPlan && Array.isArray(swapPlan)) {
         result.pass = true;
-        result.message = `SUCCESS (${swapPlan.length} moves calculated)`;
+        result.message = this.tb.localize('teamBalancer.diagnostics.scramblerSuccess', { value: swapPlan.length });
       } else {
-        throw new Error('Scrambler did not return a valid swap plan.');
+        throw new Error(this.tb.localize('teamBalancer.diagnostics.noValidSwapPlan'));
       }
     } catch (err) {
       result.pass = false;
-      result.message = `FAIL: ${err.message}`;
+      result.message = this.tb.localize('teamBalancer.diagnostics.fail', { error: err.message });
       Logger.verbose('TeamBalancer', 1, `[Diagnostics] Scrambler test failed: ${err.message}`);
     }
     this.results.push(result);

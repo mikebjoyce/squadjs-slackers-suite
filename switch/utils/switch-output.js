@@ -145,7 +145,7 @@ const SwitchOutput = {
       plugin._broadcastTimers.firstBroadcast = setTimeout(() => {
         if (!Number.isFinite(plugin._gameStartTs)) return;
         const remainingMin = Math.floor((windowMs - delayMs) / 60000);
-        plugin.broadcast(`[Switch] Team switching is open. Use '!switch help' for details. Window: ~${remainingMin}m.`);
+        plugin.broadcast(plugin.localize('switch.warn.switchTeamSwitchingOpen', { remainingMin }));
       }, delayMs);
 
       // Periodic reminders
@@ -159,13 +159,13 @@ const SwitchOutput = {
             return;
           }
           const remainingMin = Math.ceil(remainingMs / 60000);
-          plugin.broadcast(`[Switch] ~${remainingMin}m remaining to request a team change. Use '!switch check' to see your eligibility.`);
+          plugin.broadcast(plugin.localize('switch.warn.switchMRemainingRequest', { remainingMin }));
         }, intervalMs);
       }
 
       // Window close broadcast
       plugin._broadcastTimers.closeBroadcast = setTimeout(() => {
-        plugin.broadcast(`[Switch] Team switch window is now closed.`);
+        plugin.broadcast(plugin.localize('switch.warn.switchTeamSwitchWindow'));
         plugin._clearBroadcastTimers();
       }, windowMs);
     };
@@ -223,13 +223,13 @@ const SwitchOutput = {
          const minPlayers = plugin.options.seedTokenBonusMinPlayers ?? 0;
          if (isSeed && bonusEnabled) {
            const minNote = minPlayers > 0
-             ? ` (requires ${minPlayers}+ players online)`
+             ? plugin.localize('switch.labels.seedRequiresPlayers', { seedMinPlayers: minPlayers })
              : '';
-           plugin.broadcast(`[Switch] Seed mode — switches are free (no token cost). You earn +1 bonus switch token for every ${plugin.options.seedTokenBonusMinutes}m of helping seed${minNote}, up to ${bonusAmount} per round — or stay until the round ends and get it anyway. Use '!switch check' to see your balance.`);
+           plugin.broadcast(plugin.localize('switch.warn.switchSeedModeSwitches', { seedTokenBonusMinutes: plugin.options.seedTokenBonusMinutes, minNote, bonusAmount }));
          } else if (isSeed && !bonusEnabled) {
-           plugin.broadcast(`[Switch] Seed mode — switches are free (no token cost). Use '!switch' to change teams anytime.`);
+           plugin.broadcast(plugin.localize('switch.warn.switchSeedModeSwitches2'));
          } else {
-           plugin.broadcast(`[Switch] No cooldown restrictions on this game mode. Use '!switch' to change teams anytime.`);
+           plugin.broadcast(plugin.localize('switch.warn.switchNoCooldownRestrictions'));
          }
        }, intervalMs);
 
@@ -253,13 +253,13 @@ const SwitchOutput = {
 
       // First broadcast after delay
       plugin._broadcastTimers.firstBroadcast = setTimeout(() => {
-        plugin.broadcast(`[Switch] A scramble occurred last round. Returning players cannot change teams this round. New arrivals can still switch — use '!switch check'.`);
+        plugin.broadcast(plugin.localize('switch.warn.switchScrambleOccurredLast'));
       }, delayMs);
 
       // Periodic reminders (closed after switchEnabledMinutes — same as normal broadcast window)
       if (intervalMs > 0) {
         plugin._broadcastTimers.reminderInterval = setInterval(() => {
-          plugin.broadcast(`[Switch] Scramble lockdown active. Returning players cannot change teams this round. New arrivals can still switch — use '!switch check'.`);
+          plugin.broadcast(plugin.localize('switch.warn.switchScrambleLockdownActive'));
         }, intervalMs);
       }
 
@@ -280,7 +280,7 @@ const SwitchOutput = {
       if (plugin._broadcastTimers.genericInfoTimer) return; // already running
 
       plugin._broadcastTimers.genericInfoTimer = setInterval(() => {
-        plugin.broadcast(`[Switch] Want to change teams? Type '!switch' to request a team change. Use '!switch help' to learn more.`);
+        plugin.broadcast(plugin.localize('switch.warn.switchWantChangeTeams'));
       }, 25 * 60 * 1000);
     };
 
@@ -349,7 +349,7 @@ const SwitchOutput = {
         // Verify player is still connected
         const stillHere = plugin.server.players.find(p => p.eosID === eosID);
         if (stillHere) {
-          plugin.warn(eosID, `[Switch] Scoreboard team changes are disabled on this server. Use '!switch' to change teams. '!switch help' for more info.`);
+          plugin.warn(eosID, plugin.localize('switch.warn.switchScoreboardTeamChanges'));
         }
       }, plugin.constructor.JOIN_WARN_DELAY_MS);
 
@@ -394,6 +394,18 @@ const SwitchOutput = {
       return sorted[mid];
     };
 
+    /**
+     * NOT LOCALIZED, deliberately.
+     *
+     * `!switch stats` fetches these embeds back out of Discord history and
+     * parses them: it finds the message by the exact title, finds fields by
+     * name (Stats, Switch Methods, Queue Activity) and reads counts out of
+     * the **Mode:** / **Denied:** / **Queue Wait:** lines. The embed is a
+     * storage format that happens to be readable, so its labels are keys.
+     * Translating any of them silently breaks the scrape — including for
+     * every round already posted, which stays English whatever the config
+     * later says.
+     */
     plugin._buildRoundSummaryEmbed = function () {
       const s = plugin._roundStats;
       if (!s) return null;
@@ -880,20 +892,20 @@ const SwitchOutput = {
 
       // ── Build embed ──
       return {
-        title: `🩺 Switch Plugin Diagnostics  v${VERSION}`,
+        title: plugin.localize('switch.switchDiag.switchPluginDiagnosticsV', { VERSION }),
         color,
         fields: [
-          { name: 'System Health', value: healthLines, inline: false },
-          { name: '\u{1F4CB} Config', value: configLines.join('\n'), inline: false },
-          { name: `\u{1F465} Queue (${totalQueued})`, value: queueLines.join('\n'), inline: false },
-          { name: '\u{1F550} Token & Lock Summary', value: cooldownLines.join('\n'), inline: false },
+          { name: plugin.localize('switch.switchDiag.systemHealth'), value: healthLines, inline: false },
+          { name: plugin.localize('switch.switchDiag.config'), value: configLines.join('\n'), inline: false },
+          { name: plugin.localize('switch.switchDiag.queueTotalqueued', { totalQueued }), value: queueLines.join('\n'), inline: false },
+          { name: plugin.localize('switch.switchDiag.tokenLockSummary'), value: cooldownLines.join('\n'), inline: false },
           // Renamed from "Restricted Players (top 5)", which was neither: the
           // sort key was a mostly-expired lockdown timestamp, and the players it
           // listed were not restricted. This field now answers one question —
           // who cannot switch right now — and says so plainly when nobody can.
           {
             name: state && state.blocked.length > 0
-              ? `\u{1F512} Currently Blocked (${state.blocked.length})`
+              ? plugin.localize('switch.switchDiag.currentlyBlocked', { blockedCount: state.blocked.length })
               : '\u{1F513} Currently Blocked',
             value: playerList,
             inline: false

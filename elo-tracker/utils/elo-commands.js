@@ -90,8 +90,8 @@ const EloCommands = {
       const record = candidates.length ? candidates[0] : null;
       if (!record) {
         return await trackerCtx.respond(player, [
-          `No ELO record found for: ${identifier}`,
-          'Type !elo help for available commands.'
+          tracker.localize('eloTracker.lookupAndRespond.noEloRecordFound', { identifier }),
+          tracker.localize('eloTracker.lookupAndRespond.typeEloHelpFor')
         ].join('\n'));
       }
 
@@ -112,9 +112,9 @@ const EloCommands = {
       return await trackerCtx.respond(player, [
         `=== ${record.name} ===`,
         rankLine,
-        `CSR: ${consRating.toFixed(2)} (μ - 3.0σ)`,
-        `Estimated Skill: ${record.mu.toFixed(2)} μ | Certainty: ${record.sigma.toFixed(2)} σ`,
-        `Record: ${record.wins}W / ${record.losses}L (${record.roundsPlayed} rounds)`,
+        tracker.localize('eloTracker.lookupAndRespond.csr', { consRating: consRating.toFixed(2) }),
+        tracker.localize('eloTracker.lookupAndRespond.estimatedSkillRecordCertainty', { record: record.mu.toFixed(2), record2: record.sigma.toFixed(2) }),
+        tracker.localize('eloTracker.lookupAndRespond.recordWinsWLosses', { wins: record.wins, losses: record.losses, roundsPlayed: record.roundsPlayed }),
         otherMatches
       ].filter(Boolean).join('\n'));
     }
@@ -137,11 +137,11 @@ const EloCommands = {
       // !elo help
       if (sub === 'help') {
         return await this.respond(player, [
-          '=== EloTracker Commands ===',
-          '!elo — Show your current rating and rank',
-          '!elo <name | steamID> — Look up another player',
-          '!elo leaderboard — Top 10 players by rating',
-          '!elo help — Show this message'
+          tracker.localize('eloTracker.onEloCommand.elotrackerCommands'),
+          tracker.localize('eloTracker.onEloCommand.eloShowYourCurrent'),
+          tracker.localize('eloTracker.onEloCommand.eloNameSteamidLook'),
+          tracker.localize('eloTracker.onEloCommand.eloLeaderboardTopPlayers'),
+          tracker.localize('eloTracker.onEloCommand.eloHelpShowThis')
         ].join('\n'));
       }
 
@@ -150,16 +150,16 @@ const EloCommands = {
         try {
           const players = await this.db.getLeaderboard(10, this.options.minRoundsForLeaderboard);
           if (!players.length) {
-            return await this.respond(player, 'No leaderboard data yet.');
+            return await this.respond(player, tracker.localize('eloTracker.onEloCommand.noLeaderboardDataYet'));
           }
           const lines = players.map((p, i) => {
             const consRating = p.mu - (EloCalculator.SIGMA_MULTIPLIER * p.sigma);
             return `#${(i + 1).toString().padStart(2, ' ')} ${p.name.trim()}: ${consRating.toFixed(1)} ${p.wins}W/${p.losses}L`;
           });
-          return await this.respond(player, ['=== ELO Leaderboard ===', ...lines].join('\n'));
+          return await this.respond(player, [tracker.localize('eloTracker.onEloCommand.eloLeaderboard'), ...lines].join('\n'));
         } catch (err) {
           Logger.verbose('EloTracker', 1, `[EloCommands] Leaderboard failed: ${err.message}`);
-          return await this.respond(player, 'Failed to retrieve leaderboard.');
+          return await this.respond(player, tracker.localize('eloTracker.onEloCommand.failedToRetrieveLeaderboard'));
         }
       }
 
@@ -170,7 +170,7 @@ const EloCommands = {
           return await _lookupAndRespond(this, player, identifier);
         } catch (err) {
           Logger.verbose('EloTracker', 1, `[EloCommands] Player lookup failed: ${err.message}`);
-          return await this.respond(player, 'Failed to retrieve player stats.');
+          return await this.respond(player, tracker.localize('eloTracker.onEloCommand.failedToRetrievePlayer'));
         }
       }
 
@@ -180,7 +180,7 @@ const EloCommands = {
         return await _lookupAndRespond(this, player, identifier);
       } catch (err) {
         Logger.verbose('EloTracker', 1, `[EloCommands] Player lookup failed: ${err.message}`);
-        return await this.respond(player, 'Failed to retrieve player stats.');
+        return await this.respond(player, tracker.localize('eloTracker.onEloCommand.failedToRetrievePlayer'));
       }
     };
 
@@ -201,10 +201,10 @@ const EloCommands = {
 
       if (!sub || sub === 'help') {
         return await this.respond(player, [
-          '=== EloTracker Admin Commands ===',
-          '!eloadmin reset <name|steamID|eosID> — Reset a player to default rating',
-          '!eloadmin status — Plugin status and current round info',
-          '!eloadmin help — Show this message'
+          tracker.localize('eloTracker.onEloAdminCommand.elotrackerAdminCommands'),
+          tracker.localize('eloTracker.onEloAdminCommand.eloadminResetNameSteamid'),
+          tracker.localize('eloTracker.onEloAdminCommand.eloadminStatusPluginStatus'),
+          tracker.localize('eloTracker.onEloAdminCommand.eloadminHelpShowThis')
         ].join('\n'));
       }
 
@@ -213,12 +213,12 @@ const EloCommands = {
         const sessionCount = this.session.getSessionCount();
         const cacheCount = this.eloCache.size;
         return await this.respond(player, [
-          '=== EloTracker Status ===',
-          `Version: ${this.constructor.version}`,
-          `Ready: ${this.ready}`,
-          `Session players: ${sessionCount}`,
-          `ELO cache entries: ${cacheCount}`,
-          `Round start: ${this.session.roundStartTime ? new Date(this.session.roundStartTime).toISOString() : 'None'}`
+          tracker.localize('eloTracker.onEloAdminCommand.elotrackerStatus'),
+          tracker.localize('eloTracker.onEloAdminCommand.versionVersion', { version: this.constructor.version }),
+          tracker.localize('eloTracker.onEloAdminCommand.readyReady', { ready: this.ready }),
+          tracker.localize('eloTracker.onEloAdminCommand.sessionPlayersSessioncount', { sessionCount }),
+          tracker.localize('eloTracker.onEloAdminCommand.eloCacheEntriesCachecount', { cacheCount }),
+          tracker.localize('eloTracker.onEloAdminCommand.roundStartValue', { value: this.session.roundStartTime ? new Date(this.session.roundStartTime).toISOString() : 'None' })
         ].join('\n'));
       }
 
@@ -226,7 +226,7 @@ const EloCommands = {
       if (sub === 'reset') {
         const identifier = args.slice(1).join(' ');
         if (!identifier) {
-          return await this.respond(player, 'Usage: !eloadmin reset <name | steamID | eosID>');
+          return await this.respond(player, tracker.localize('eloTracker.onEloAdminCommand.usageEloadminResetName'));
         }
         try {
           // Reset is destructive and irreversible, so unlike !elo it refuses to
@@ -236,29 +236,29 @@ const EloCommands = {
           const candidates = await this._findPlayerCandidates(identifier);
           const record = candidates.length ? candidates[0] : null;
           if (!record) {
-            return await this.respond(player, `No player found: ${identifier}`);
+            return await this.respond(player, tracker.localize('eloTracker.onEloAdminCommand.noPlayerFoundIdentifier', { identifier }));
           }
           if (!EloDatabase.isUnambiguous(candidates)) {
             const names = candidates.slice(0, 5)
               .map((p) => `${String(p.name || '?').trim()} (${p.roundsPlayed || 0} rds)`);
             return await this.respond(player, [
-              `Ambiguous: "${identifier}" is not an exact match.`,
-              `Matched: ${names.join(', ')}`,
-              'Re-run with the full name or a SteamID/EOS ID.'
+              tracker.localize('eloTracker.onEloAdminCommand.ambiguousIdentifierIsNot', { identifier }),
+              tracker.localize('eloTracker.onEloAdminCommand.matchedNames', { names: names.join(', ') }),
+              tracker.localize('eloTracker.onEloAdminCommand.reRunWithThe')
             ].join('\n'));
           }
           const defaults = { mu: EloCalculator.MU_DEFAULT, sigma: EloCalculator.SIGMA_DEFAULT, wins: 0, losses: 0, roundsPlayed: 0 };
           await this.db.upsertPlayerStats(record.eosID, defaults);
           if (this.eloCache.has(record.eosID)) { this.eloCache.set(record.eosID, { mu: defaults.mu, sigma: defaults.sigma }); }
           Logger.verbose('EloTracker', 2, `[EloCommands] Admin ${player.name} reset ELO for ${record.name}`);
-          return await this.respond(player, `Reset ${record.name} to default rating (μ ${defaults.mu}).`);
+          return await this.respond(player, tracker.localize('eloTracker.onEloAdminCommand.resetNameToDefault', { name: record.name, mu: defaults.mu }));
         } catch (err) {
           Logger.verbose('EloTracker', 1, `[EloCommands] Reset failed: ${err.message}`);
-          return await this.respond(player, `Failed to reset player: ${err.message}`);
+          return await this.respond(player, tracker.localize('eloTracker.onEloAdminCommand.failedToResetPlayer', { message: err.message }));
         }
       }
 
-      return await this.respond(player, 'Unknown command. Type !eloadmin help for options.');
+      return await this.respond(player, tracker.localize('eloTracker.onEloAdminCommand.unknownCommandTypeEloadmin'));
     };
   }
 };

@@ -33,6 +33,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { localize as lookupMessage } from '../utils/s3-i18n.js';
 import ClansService from '../utils/clans-service.js';
 import PlayersService from '../utils/players-service.js';
 import { buildPlayersEmbeds, buildClansEmbeds } from '../utils/s3-commands.js';
@@ -134,6 +135,7 @@ function makePlugin({ players, squads, clanOptions = {} }) {
   const clans = new ClansService({ options: { enabled: true, ...clanOptions } });
   return {
     verbose: () => {},
+    localize: (key, vars) => lookupMessage(key, vars),
     services: {
       players: makePlayersService(players, squads),
       clans,
@@ -437,7 +439,7 @@ await runTest('markdown characters in clan tags are escaped', async () => {
 });
 
 await runTest('buildPlayersEmbeds degrades gracefully with no players service', async () => {
-  const embeds = buildPlayersEmbeds({ verbose: () => {}, services: {} });
+  const embeds = buildPlayersEmbeds({ verbose: () => {}, localize: (key, vars) => lookupMessage(key, vars), services: {} });
   assert.equal(embeds.length, 1);
   assert.match(embeds[0].title, /Not Available/);
 });
@@ -646,7 +648,7 @@ await runTest('buildClansEmbeds reports disabled clan grouping', async () => {
 });
 
 await runTest('buildClansEmbeds degrades gracefully with no clans service', async () => {
-  const embeds = buildClansEmbeds({ verbose: () => {}, services: {} });
+  const embeds = buildClansEmbeds({ verbose: () => {}, localize: (key, vars) => lookupMessage(key, vars), services: {} });
   assert.equal(embeds.length, 1);
   assert.match(embeds[0].title, /Not Available/);
 });

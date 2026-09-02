@@ -22,6 +22,7 @@
 'use strict';
 
 import assert from 'node:assert/strict';
+import { localize as lookupMessage } from '../utils/s3-i18n.js';
 import { Sequelize, DataTypes } from 'sequelize';
 
 import DBService from '../utils/db-service.js';
@@ -122,7 +123,11 @@ async function fixture(fn) {
 }
 
 function plugin(db) {
-  return { services: { db }, options: { ignoredGameModes: [] } };
+  return {
+    services: { db },
+    options: { ignoredGameModes: [] },
+    localize: (key, vars) => lookupMessage(key, vars)
+  };
 }
 
 const NOW = Date.now();

@@ -45,7 +45,16 @@ await fs.mkdir(path.join(SANDBOX, 'plugins'), { recursive: true });
 await fs.mkdir(path.join(SANDBOX, 'utils'), { recursive: true });
 
 // s3-plugin-base.js imports these via relative '../utils/...' paths.
-for (const utilFile of ['s3-stderr.js', 's3-common.js']) {
+// The locale catalogues come along because s3-i18n.js imports them in turn —
+// the sandbox resolves real files, so a partial copy fails at module load
+// rather than at the assertion, with no hint as to which import was missed.
+for (const utilFile of [
+  's3-stderr.js',
+  's3-common.js',
+  's3-i18n.js',
+  's3-locale-en.js',
+  's3-locale-pt.js'
+]) {
   await fs.copyFile(
     path.join(HERE, '..', 'utils', utilFile),
     path.join(SANDBOX, 'utils', utilFile)

@@ -122,12 +122,15 @@ const SwitchExplain = {
 
 // ── Helper: format minutes into a human-readable string ──────────
 
-function _formatMinutes(min) {
-  if (min < 60) return `${min} minutes`;
+function _formatMinutes(plugin, min) {
+  if (min < 60) return plugin.localize('switch.explain.durationMinutes', { mins: min });
   const hours = Math.floor(min / 60);
   const mins = min % 60;
-  if (mins === 0) return `${hours} hour${hours !== 1 ? 's' : ''}`;
-  return `${hours} hour${hours !== 1 ? 's' : ''} ${mins} minute${mins !== 1 ? 's' : ''}`;
+  if (mins === 0) return plugin.localize(hours === 1 ? 'switch.explain.durationHour' : 'switch.explain.durationHours', { hours });
+  return plugin.localize('switch.explain.durationHoursMinutes', {
+    hours: plugin.localize(hours === 1 ? 'switch.explain.durationHour' : 'switch.explain.durationHours', { hours }),
+    minutes: plugin.localize(mins === 1 ? 'switch.explain.durationMinute' : 'switch.explain.durationMinutes', { mins })
+  });
 }
 
 // ── Helper: format hours into a human-friendly string ────────────
@@ -135,11 +138,11 @@ function _formatMinutes(min) {
 function _formatCooldown(plugin) {
   if (plugin.options.switchCooldownMinutes > 0) {
     const min = plugin.options.switchCooldownMinutes;
-    return _formatMinutes(min);
+    return _formatMinutes(plugin, min);
   }
   const hrs = plugin.options.switchCooldownHours;
-  if (hrs === 0) return 'none';
-  return `${hrs} hour${hrs !== 1 ? 's' : ''}`;
+  if (hrs === 0) return plugin.localize('switch.labels.none');
+  return plugin.localize(hrs === 1 ? 'switch.explain.durationHour' : 'switch.explain.durationHours', { hours: hrs });
 }
 
 // ── Helper: read max team size from server config ────────────────
@@ -207,10 +210,10 @@ function _buildToleranceTable(plugin) {
 
   if (!dynamicEnabled) {
     return [{
-      range: 'All population levels',
+      range: plugin.localize('switch.explain.allPopulationLevels'),
       extra: 0,
       maxGap: cap,
-      note: 'Dynamic tolerance is disabled. The base limit applies at all player counts.'
+      note: plugin.localize('switch.explain.dynamicToleranceDisabledBase')
     }];
   }
 
@@ -266,27 +269,27 @@ function _buildIntroEmbed(plugin) {
   const scoreboardDisabled = _isScoreboardSwitchDisabled(plugin);
 
   const description = scoreboardDisabled
-    ? 'Squad\'s native team change command is disabled on this server. **`\'!switch\'`** is how you change teams. The plugin enforces balance rules to keep teams fair while still allowing you to play with your friends.'
-    : '**`\'!switch\'`** is an alternative way to change teams. The plugin enforces balance rules to keep teams fair while still allowing you to play with your friends.';
+    ? plugin.localize('switch.explain.squadSNativeTeam')
+    : plugin.localize('switch.explain.switchAlternativeWayChange');
 
   const commandsField = [
-    "**`'!switch'`**        Request a team change",
-    "**`'!switch check'`**  See your eligibility and token balance",
-    "**`'!switch cancel'`** Leave the switch queue"
+    plugin.localize('switch.explain.switchRequestTeamChange'),
+    plugin.localize('switch.explain.switchCheckSeeEligibility'),
+    plugin.localize('switch.explain.switchCancelLeaveSwitch')
   ].join('\n');
 
   const keyRuleField = [
-    'Switching from the bigger team to the smaller team is usually allowed.',
-    'Switching from the smaller team to the bigger team is only allowed if the gap stays within the balance limit (see below).'
+    plugin.localize('switch.explain.switchingFromBiggerTeam'),
+    plugin.localize('switch.explain.switchingFromSmallerTeam')
   ].join('\n');
 
   return {
-    title: 'How Team Switching Works',
+    title: plugin.localize('switch.explain.howTeamSwitchingWorks'),
     description,
     color: 0x3498DB,
     fields: [
-      { name: 'Commands', value: commandsField + '\n*All three commands are typed in all, team or squad chat.*', inline: false },
-      { name: 'Key Rule', value: keyRuleField, inline: false }
+      { name: plugin.localize('switch.explain.commands'), value: commandsField + plugin.localize('switch.explain.allThreeCommandsTyped'), inline: false },
+      { name: plugin.localize('switch.explain.keyRule'), value: keyRuleField, inline: false }
     ]
   };
 }
@@ -299,13 +302,13 @@ function _buildBalanceEmbed(plugin) {
   const rows = _buildToleranceTable(plugin);
 
   const whatNumbersMean = [
-    'The **gap** is the difference in player count between the two teams.',
-    'Example: Team **1** has **42** players, Team **2** has **38**. The gap is **4**.',
+    plugin.localize('switch.explain.gapDifferencePlayerCount'),
+    plugin.localize('switch.explain.exampleTeam1Has'),
     '',
-    `**Tolerance** is how much extra gap the server allows beyond the base limit of **${cap}**. At low population, more tolerance is given so switches are easier. As the server fills up, tolerance shrinks to keep teams fair when it matters most.`
+    plugin.localize('switch.explain.toleranceHowMuchExtra', { cap })
   ].join('\n');
 
-  const tableLines = ['```', 'Players       Extra Tolerance   Max Allowed Gap'];
+  const tableLines = ['```', plugin.localize('switch.explain.playersExtraToleranceMax')];
   for (const row of rows) {
     const rangePad = row.range.padEnd(14);
     tableLines.push(`${rangePad}${String(row.extra).padEnd(18)}${row.maxGap}`);
@@ -321,25 +324,25 @@ function _buildBalanceEmbed(plugin) {
   const gap = exampleRow.maxGap;
 
   const example = [
-    `Example: With **${exampleRow.range}** population, the max allowed gap is **${gap}**.`,
-    `If the bigger team leads by **${gap}**, a switch from the bigger team is allowed (gap shrinks to **${Math.max(0, gap - 2)}**).`,
-    `A switch from the smaller team is not allowed (gap would grow to **${gap + 2}**, exceeding the max of **${gap}**).`
+    plugin.localize('switch.explain.exampleWithPopulationMax', { range: exampleRow.range, gap }),
+    plugin.localize('switch.explain.ifBiggerTeamLeads', { gap, value: Math.max(0, gap - 2) }),
+    plugin.localize('switch.explain.switchFromSmallerTeam', { value: gap + 2, gap })
   ].join('\n');
 
   const hardCap = [
-    `Each team can hold at most **${maxTeamSize}** players (half of **${maxPlayers}** total slots, including **${reserved}** reserved).`,
-    `You cannot switch to a team that is already at **${maxTeamSize}**.`
+    plugin.localize('switch.explain.eachTeamCanHold', { maxTeamSize, maxPlayers, reserved }),
+    plugin.localize('switch.explain.cannotSwitchTeamAlready', { maxTeamSize })
   ].join('\n');
 
   return {
-    title: 'Balance Rules',
-    description: 'A switch is allowed if it does not make the teams too lopsided. The rules depend on how many players are on the server.',
+    title: plugin.localize('switch.explain.balanceRules'),
+    description: plugin.localize('switch.explain.switchAllowedIfDoes'),
     color: 0x2ECC71,
     fields: [
-      { name: 'What the numbers mean', value: whatNumbersMean, inline: false },
-      { name: 'Tolerance Table', value: tableStr, inline: false },
-      { name: 'Example', value: example, inline: false },
-      { name: 'Hard Cap', value: hardCap, inline: false }
+      { name: plugin.localize('switch.explain.whatNumbersMean'), value: whatNumbersMean, inline: false },
+      { name: plugin.localize('switch.explain.toleranceTable'), value: tableStr, inline: false },
+      { name: plugin.localize('switch.explain.example'), value: example, inline: false },
+      { name: plugin.localize('switch.explain.hardCap'), value: hardCap, inline: false }
     ]
   };
 }
@@ -355,36 +358,36 @@ function _buildTokenEmbed(plugin) {
   const seedBonusMinPlayers = plugin.options.seedTokenBonusMinPlayers ?? 0;
 
   const tokenPool = [
-    `Maximum tokens: **${maxTokens}**`,
-    `Refill time: **${cooldownStr}** per token`
+    plugin.localize('switch.explain.maximumTokens', { maxTokens }),
+    plugin.localize('switch.explain.refillTimePerToken', { cooldownStr })
   ].join('\n');
 
-  const poolExplanation = `Tokens refill one at a time, independently. With **${maxTokens}** tokens saved, you can switch ${maxTokens > 1 ? 'up to ' + maxTokens + ' times' : 'once'} before waiting for a refill. This gives you flexibility without allowing unlimited switching.`;
+  const poolExplanation = plugin.localize('switch.explain.tokensRefillOneTime', { maxTokens, value: maxTokens > 1 ? 'up to ' + maxTokens + ' times' : 'once' });
 
   let seedBonusField = null;
   if (seedBonusEnabled) {
     const minNote = seedBonusMinPlayers > 0
-      ? ` (only while **${seedBonusMinPlayers}+** players are online)`
+      ? plugin.localize('switch.explain.onlyWhilePlayersOnline', { seedBonusMinPlayers })
       : '';
     const seedLines = [
-      `During seed rounds, you earn **+1** bonus token for every **${seedBonusMinutes}** minutes you are present${minNote}.`,
-      `You can earn up to **${seedBonusAmount}** bonus token${seedBonusAmount !== 1 ? 's' : ''} per seed round.`,
-      `If the round ends before you have banked a full **${seedBonusMinutes}** minutes, you still get **+1** — as long as you are still on the server when it ends.`,
-      `Bonus tokens stack above your normal cap of **${maxTokens}**, up to a hard ceiling of **${maxTokens + seedBonusAmount}**. At the ceiling you stop earning until you spend one.`
+      plugin.localize('switch.explain.duringSeedRoundsEarn', { seedBonusMinutes, minNote }),
+      plugin.localize(seedBonusAmount === 1 ? 'switch.explain.seedBonusTokenPerRound' : 'switch.explain.seedBonusTokensPerRound', { seedBonusAmount }),
+      plugin.localize('switch.explain.ifRoundEndsBefore', { seedBonusMinutes }),
+      plugin.localize('switch.explain.bonusTokensStackAbove', { maxTokens, seedBonusAmount: maxTokens + seedBonusAmount })
     ].join('\n');
-    seedBonusField = { name: 'Seed Bonus', value: seedLines, inline: false };
+    seedBonusField = { name: plugin.localize('switch.explain.seedBonus'), value: seedLines, inline: false };
   }
 
   const fields = [
-    { name: 'Token Pool', value: tokenPool, inline: false },
-    { name: 'How It Works', value: poolExplanation, inline: false }
+    { name: plugin.localize('switch.explain.tokenPool'), value: tokenPool, inline: false },
+    { name: plugin.localize('switch.explain.howWorks'), value: poolExplanation, inline: false }
   ];
   if (seedBonusField) fields.push(seedBonusField);
-  fields.push({ name: 'Checking Your Balance', value: "Use **`'!switch check'`** to see your current token balance and when your next token refills.", inline: false });
+  fields.push({ name: plugin.localize('switch.explain.checkingBalance'), value: plugin.localize('switch.explain.useSwitchCheckSee'), inline: false });
 
   return {
-    title: 'Switch Tokens',
-    description: `Each **\`'!switch'\`** costs **1** token. Tokens refill automatically over time. You are not locked out for a full cooldown after a single switch.`,
+    title: plugin.localize('switch.explain.switchTokens'),
+    description: plugin.localize('switch.explain.eachSwitchCosts1'),
     color: 0x9B59B6,
     fields
   };
@@ -396,13 +399,13 @@ function _buildFlatCooldownEmbed(plugin) {
   const cooldownStr = _formatCooldown(plugin);
 
   return {
-    title: 'Switch Cooldown',
-    description: `After using **\`'!switch'\`**, you must wait before switching again.`,
+    title: plugin.localize('switch.explain.switchCooldown'),
+    description: plugin.localize('switch.explain.afterUsingSwitchMust'),
     color: 0x9B59B6,
     fields: [
       {
-        name: 'Cooldown',
-        value: `Cooldown: **${cooldownStr}**\n\nYou cannot switch again until the cooldown expires. Use **\`'!switch check'\`** to see your remaining cooldown time.`,
+        name: plugin.localize('switch.explain.cooldown'),
+        value: plugin.localize('switch.explain.cooldownCannotSwitchAgain', { cooldownStr }),
         inline: false
       }
     ]
@@ -428,50 +431,50 @@ function _buildTimeWindowQueueEmbed(plugin) {
   const timeoutSwitchEnabled = plugin.options.queueTimeoutSwitchEnabled === true;
 
   const timeWindowLines = [
-    `You have **${switchWindow} minutes** after joining the server`,
-    '**OR** after the match starts, whichever gives you more time.',
+    plugin.localize('switch.explain.haveMinutesAfterJoining', { switchWindow }),
+    plugin.localize('switch.explain.afterMatchStartsWhichever'),
     '',
-    'If you join mid-match, your personal time window starts when you joined.',
-    `Once both windows close, **\`'!switch'\`** is unavailable for the rest of the match.`
+    plugin.localize('switch.explain.ifJoinMidMatch'),
+    plugin.localize('switch.explain.onceBothWindowsClose')
   ];
 
   let queueLines;
   if (queueEnabled) {
     queueLines = [
-      'If no switch slot is immediately available, you are placed in a queue.',
-      'The queue holds your spot and processes switches as soon as a slot opens.',
-      'For example, when someone on the other team also types **`\'!switch\'`**, that creates room for you to move.',
+      plugin.localize('switch.explain.ifNoSwitchSlot'),
+      plugin.localize('switch.explain.queueHoldsSpotProcesses'),
+      plugin.localize('switch.explain.exampleWhenSomeoneOther'),
       '',
-      'The queue checks for available slots every few seconds as the server updates its player counts. It will not act on incomplete or stale data.',
+      plugin.localize('switch.explain.queueChecksAvailableSlots'),
       '',
-      'Note: the in-game scoreboard can be slow to update. The queue uses its own player count tracking and is more reliable than the scoreboard.',
+      plugin.localize('switch.explain.noteGameScoreboardCan'),
       '',
-      `You have **${queueTimeout} minutes** in the queue before your request expires.`
+      plugin.localize('switch.explain.haveMinutesQueueBefore', { queueTimeout })
     ];
 
     if (timeoutSwitchEnabled) {
-      queueLines.push(`If your queue request reaches the **${queueTimeout}-minute** time limit without a normal slot opening, the system will force-switch you with a slightly relaxed balance limit. This is a fallback so you are not left stranded. The normal balance rules are your best path.`);
+      queueLines.push(plugin.localize('switch.explain.ifQueueRequestReaches', { queueTimeout }));
     } else {
-      queueLines.push('When a queued switch expires, you are removed from the queue.');
+      queueLines.push(plugin.localize('switch.explain.whenQueuedSwitchExpires'));
     }
 
     queueLines.push('');
-    queueLines.push("Use **`'!switch cancel'`** to leave the queue at any time.");
+    queueLines.push(plugin.localize('switch.explain.useSwitchCancelLeave'));
   } else {
     queueLines = [
-      'The queue is currently disabled.',
-      'If no slot is available when you request a switch, you will need to try again later.',
-      'Use **`\'!switch check\'`** to see if a slot is available.'
+      plugin.localize('switch.explain.queueCurrentlyDisabled'),
+      plugin.localize('switch.explain.ifNoSlotAvailable'),
+      plugin.localize('switch.explain.useSwitchCheckSee2')
     ];
   }
 
   return {
-    title: 'Time Window & Queue',
-    description: `You can only use **\`'!switch'\`** during a limited window.${queueEnabled ? ' If teams are currently full, you will be placed in a queue.' : ''}`,
+    title: plugin.localize('switch.explain.timeWindowQueue'),
+    description: plugin.localize('switch.explain.canOnlyUseSwitch', { value: queueEnabled ? plugin.localize('switch.explain.ifTeamsAreCurrently') : '' }),
     color: 0xE67E22,
     fields: [
-      { name: 'Time Window', value: timeWindowLines.join('\n'), inline: false },
-      { name: queueEnabled ? 'The Queue' : 'Queue Status', value: queueLines.join('\n'), inline: false }
+      { name: plugin.localize('switch.explain.timeWindow'), value: timeWindowLines.join('\n'), inline: false },
+      { name: queueEnabled ? plugin.localize('switch.explain.queue') : plugin.localize('switch.explain.queueStatus'), value: queueLines.join('\n'), inline: false }
     ]
   };
 }
@@ -486,52 +489,52 @@ function _buildScrambleEmbed(plugin) {
 
   const whatScrambleDoes = [];
   if (tb) {
-    whatScrambleDoes.push('The scrambler keeps squads and clans together. Your squad and clan group will not be split up.');
+    whatScrambleDoes.push(plugin.localize('switch.explain.scramblerKeepsSquadsClans'));
 
     const clanGrouping = tb.options && tb.options.enableClanTagGrouping === true;
     const pullEntireSquads = tb.options && tb.options.clanGroupingPullEntireSquads === true;
 
     if (clanGrouping && pullEntireSquads) {
-      whatScrambleDoes.push('When a clan group is kept together, the rest of their squad is pulled along with them. No one gets left behind.');
+      whatScrambleDoes.push(plugin.localize('switch.explain.whenClanGroupKept'));
     }
   } else {
-    whatScrambleDoes.push('Team balancing configuration was not available at the time this was generated. Check with an admin for scramble details.');
+    whatScrambleDoes.push(plugin.localize('switch.explain.teamBalancingConfigurationWas'));
   }
 
   const lockoutExplainer = [
-    `After a scramble, **\`'!switch'\`** is locked for all players for **${lockdownMinutes} minutes**.`,
-    'This prevents players from undoing the scramble by switching back.',
+    plugin.localize('switch.explain.afterScrambleSwitchLocked', { lockdownMinutes }),
+    plugin.localize('switch.explain.preventsPlayersFromUndoing'),
     '',
-    'The system is designed to help you play with your friends, even when things go wrong. If a scramble fails to move you, or you reconnect to the wrong team, your restrictions are cleared so you can fix it yourself.'
+    plugin.localize('switch.explain.systemDesignedHelpPlay')
   ];
 
   const lockoutExceptions = [
-    'You are **NOT** locked after a scramble if:',
-    `- You are still within your **${plugin.options.switchEnabledMinutes || 10}-minute** join/match window.`,
-    '- You were already in the switch queue before the scramble fired.',
-    '- The scramble **failed to move you** (RCON error). Your scramble lock is cleared and you may receive a **+1 switch token** so you can use `!switch` immediately to rejoin your group.',
-    '- The scramble failed to keep your squad or clan together. In this case, you are given extra leniency to switch back to your group when your join/match window opens.',
-    '- The scramble was a small Elo-correction ("micro scramble") rather than a full rebalance — those move too few players to warrant a lockout, so **no one is locked**.'
+    plugin.localize('switch.explain.notLockedAfterScramble'),
+    plugin.localize('switch.explain.stillWithinMinuteJoin', { value: plugin.options.switchEnabledMinutes || 10 }),
+    plugin.localize('switch.explain.wereAlreadySwitchQueue'),
+    plugin.localize('switch.explain.scrambleFailedMoveRcon'),
+    plugin.localize('switch.explain.scrambleFailedKeepSquad'),
+    plugin.localize('switch.explain.scrambleWasSmallElo')
   ];
 
   const reconnectText = [
-    'If you disconnect and reconnect to a different team after a scramble,',
-    'your switch restrictions (including the scramble lockout) are cleared.',
-    "You can use **`'!switch'`** immediately to return to your previous team.",
+    plugin.localize('switch.explain.ifDisconnectReconnectDifferent'),
+    plugin.localize('switch.explain.switchRestrictionsIncludingScramble'),
+    plugin.localize('switch.explain.canUseSwitchImmediately'),
     '',
-    'If you reconnect during a faction vote, an ignored game mode, or passive mode,',
-    'your scramble lock is still cleared so you are not stranded. Use `!switch` when the round starts.'
+    plugin.localize('switch.explain.ifReconnectDuringFaction'),
+    plugin.localize('switch.explain.scrambleLockStillCleared')
   ];
 
   return {
-    title: 'Scrambles & Switching',
-    description: 'A scramble is when the server shuffles players to rebalance teams after one-sided rounds. After a scramble, switching is temporarily locked.',
+    title: plugin.localize('switch.explain.scramblesSwitching'),
+    description: plugin.localize('switch.explain.scrambleWhenServerShuffles'),
     color: 0xE74C3C,
     fields: [
-      { name: 'What a Scramble Does', value: whatScrambleDoes.join('\n'), inline: false },
-      { name: 'Post-Scramble Lockout', value: lockoutExplainer.join('\n'), inline: false },
-      { name: 'Lockout Exceptions', value: lockoutExceptions.join('\n'), inline: false },
-      { name: 'Reconnecting After a Scramble', value: reconnectText.join('\n'), inline: false }
+      { name: plugin.localize('switch.explain.whatScrambleDoes'), value: whatScrambleDoes.join('\n'), inline: false },
+      { name: plugin.localize('switch.explain.postScrambleLockout'), value: lockoutExplainer.join('\n'), inline: false },
+      { name: plugin.localize('switch.explain.lockoutExceptions'), value: lockoutExceptions.join('\n'), inline: false },
+      { name: plugin.localize('switch.explain.reconnectingAfterScramble'), value: reconnectText.join('\n'), inline: false }
     ]
   };
 }
@@ -543,25 +546,25 @@ function _buildSpecialCasesEmbed(plugin) {
   const liberalCap = plugin.options.liberalSwitchMaxUnbalancedSlots || 6;
 
   const liberalText = [
-    `During **${liberalModes.join(' & ')}** rounds, switching is relaxed:`,
-    `- No time window limit. Switch at any point during the round.`,
-    `- No token cost. Switches do not consume tokens.`,
-    `- More permissive balance limit. Up to **${liberalCap}** players difference is allowed instead of the normal tolerance.`
+    plugin.localize('switch.explain.duringRoundsSwitchingRelaxed', { value: liberalModes.join(' & ') }),
+    plugin.localize('switch.explain.noTimeWindowLimit'),
+    plugin.localize('switch.explain.noTokenCostSwitches'),
+    plugin.localize('switch.explain.morePermissiveBalanceLimit', { liberalCap })
   ];
 
   const factionVoteText = [
-    "During the faction vote screen between rounds, **`'!switch'`** is unavailable.",
-    'The queue is paused. When the next round begins, the queue is cleared.',
-    "You will need to re-queue if you still want to switch."
+    plugin.localize('switch.explain.duringFactionVoteScreen'),
+    plugin.localize('switch.explain.queuePausedWhenNext'),
+    plugin.localize('switch.explain.willNeedReQueue')
   ];
 
   return {
-    title: 'Special Cases',
-    description: 'Some game modes and situations change how the normal rules apply.',
+    title: plugin.localize('switch.explain.specialCases'),
+    description: plugin.localize('switch.explain.someGameModesSituations'),
     color: 0xF1C40F,
     fields: [
-      { name: `${liberalModes.join(' & ')} Rounds`, value: liberalText.join('\n'), inline: false },
-      { name: 'Faction Vote (Between Rounds)', value: factionVoteText.join('\n'), inline: false }
+      { name: plugin.localize('switch.explain.modeRounds', { liberalModes: liberalModes.join(' & ') }), value: liberalText.join('\n'), inline: false },
+      { name: plugin.localize('switch.explain.factionVoteBetweenRounds'), value: factionVoteText.join('\n'), inline: false }
     ]
   };
 }
@@ -575,29 +578,29 @@ function _buildTipsEmbed(plugin) {
   const clanGrouping = tb && tb.options && tb.options.enableClanTagGrouping === true;
 
   const tips = [
-    `**1. Switch early.** Your **${switchWindow}-minute** window starts when you join. Do not wait until the last minute.`
+    plugin.localize('switch.explain.1SwitchEarlyMinute', { switchWindow })
   ];
 
   if (maxTokens > 1) {
-    tips.push(`**2. Save a token.** With **${maxTokens}** tokens, you can switch more than once before waiting for a refill. This gives you flexibility if you need to switch multiple times in a session.`);
+    tips.push(plugin.localize('switch.explain.2SaveTokenWith', { maxTokens }));
   } else {
-    tips.push(`**2. Plan your switch.** After switching, you must wait through the full cooldown before switching again. Make every switch count.`);
+    tips.push(plugin.localize('switch.explain.2PlanSwitchAfter'));
   }
 
-  tips.push('**3. Use seed rounds.** Seed and Jensen rounds have no token cost and no time limit. Use this time to position yourself on the right team for free.');
+  tips.push(plugin.localize('switch.explain.3UseSeedRounds'));
 
-  tips.push("**4. Check before you act.** **`'!switch check'`** tells you exactly what is blocking you: time window, tokens, scramble lock, or balance. This helps you make an informed decision.");
+  tips.push(plugin.localize('switch.explain.4CheckBeforeAct'));
 
-  tips.push('**5. Squads and clans stay together.** The scrambler preserves squads and clan groups. Even if a scramble fires, your group will not be split up.');
+  tips.push(plugin.localize('switch.explain.5SquadsClansStay'));
 
-  tips.push('**6. The system has your back.** Even when things go wrong (a scramble fails to move you, or you reconnect to the wrong team), your restrictions are cleared and you may receive bonus tokens so you can fix it yourself. You are never permanently stranded.');
+  tips.push(plugin.localize('switch.explain.6SystemHasBack'));
 
   return {
-    title: 'Tips for Playing With Friends',
-    description: 'The system is designed to help you end up on the same team as your friends. Here is how to make the most of it.',
+    title: plugin.localize('switch.explain.tipsPlayingWithFriends'),
+    description: plugin.localize('switch.explain.systemDesignedHelpEnd'),
     color: 0x1ABC9C,
     fields: [
-      { name: 'Best Practices', value: tips.join('\n\n'), inline: false }
+      { name: plugin.localize('switch.explain.bestPractices'), value: tips.join('\n\n'), inline: false }
     ]
   };
 }
@@ -679,6 +682,10 @@ async function _buildSevenDayStatsEmbed(plugin) {
         if (!msg.embeds || msg.embeds.length === 0) continue;
 
         for (const embed of msg.embeds) {
+          // English on purpose, and not a catalogue key: switch-output.js writes
+          // this title as a literal so that the reports already sitting in the
+          // channel stay readable, and history does not re-title itself when the
+          // server's language changes. switch-commands.js matches it the same way.
           if (embed.title !== 'Switch Round Summary') continue;
           foundAny = true;
 
@@ -778,7 +785,7 @@ async function _buildSevenDayStatsEmbed(plugin) {
     const medMin = Math.floor(globalMedianMs / 60000);
     const medSec = Math.round((globalMedianMs % 60000) / 1000);
     const medianStr = medMin > 0
-      ? `${medMin} minute${medMin !== 1 ? 's' : ''}`
+      ? plugin.localize(medMin === 1 ? 'switch.explain.durationMinute' : 'switch.explain.durationMinutes', { mins: medMin })
       : medSec > 0 ? `${medSec} seconds` : 'N/A';
 
     // Average queue wait from medianDurationsMs
@@ -788,55 +795,58 @@ async function _buildSevenDayStatsEmbed(plugin) {
     const avgMin = Math.floor(avgMs / 60000);
     const avgSec = Math.round((avgMs % 60000) / 1000);
     const avgStr = avgMin > 0
-      ? `about ${avgMin} minute${avgMin !== 1 ? 's' : ''}`
-      : avgSec > 0 ? `about ${avgSec} seconds` : 'N/A';
+      ? plugin.localize(avgMin === 1 ? 'switch.explain.aboutMinute' : 'switch.explain.aboutMinutes', { mins: avgMin })
+      : avgSec > 0 ? plugin.localize('switch.explain.aboutSeconds', { avgSec }) : 'N/A';
 
     // ── Build plain-English sentences ─────────────────────────
     const lines = [];
 
     // Success rate
     if (successRate >= 90) {
-      lines.push(`**${successRate.toFixed(2)}%** of attempted switches succeed.`);
+      lines.push(plugin.localize('switch.explain.attemptedSwitchesSucceed', { value: successRate.toFixed(2) }));
     } else if (successRate >= 75) {
-      lines.push(`**${successRate.toFixed(2)}%** of attempted switches succeed, most requests go through.`);
+      lines.push(plugin.localize('switch.explain.attemptedSwitchesSucceedMost', { value: successRate.toFixed(2) }));
     } else {
-      lines.push(`**${successRate.toFixed(2)}%** of attempted switches succeed.`);
+      lines.push(plugin.localize('switch.explain.attemptedSwitchesSucceed', { value: successRate.toFixed(2) }));
     }
 
     lines.push('');
 
     // Qualifier: success rate counts only requests that passed the eligibility gate
-    lines.push('Eligible switches only, requests denied at the eligibility gate (cooldown, time window, etc.) are not counted as attempts.');
+    lines.push(plugin.localize('switch.explain.eligibleSwitchesOnlyRequests'));
 
     lines.push('');
 
     // Instant rate
     if (instantRate >= 50) {
-      lines.push(`Most switches happen instantly — **${instantRate.toFixed(2)}%** go through the moment you type \`!switch\`, with no waiting at all.`);
+      lines.push(plugin.localize('switch.explain.mostSwitchesHappenInstantly', { value: instantRate.toFixed(2) }));
     } else if (instantRate > 0) {
-      lines.push(`**${instantRate.toFixed(2)}%** of switches happen instantly, the rest use the queue.`);
+      lines.push(plugin.localize('switch.explain.switchesHappenInstantlyRest', { value: instantRate.toFixed(2) }));
     } else {
-      lines.push('Switches typically use the queue system.');
+      lines.push(plugin.localize('switch.explain.switchesTypicallyUseQueue'));
     }
 
     lines.push('');
 
     // Queue wait
     if (globalMedianMs > 0) {
-      lines.push(`When a queue wait is needed, the typical wait is **${medianStr}**. The average is **${avgStr}**.`);
+      lines.push(plugin.localize('switch.explain.whenQueueWaitNeeded', { medianStr, avgStr }));
       lines.push('');
     }
 
     // Summary line
     const totalSwitches = totals.success;
-    lines.push(`Based on **${totalSwitches}** successful switch${totalSwitches !== 1 ? 'es' : ''} across **${totals.rounds}** round${totals.rounds !== 1 ? 's' : ''}.`);
+    lines.push(plugin.localize('switch.explain.basedOnSwitchesRounds', {
+      switches: plugin.localize(totalSwitches === 1 ? 'switch.explain.successfulSwitch' : 'switch.explain.successfulSwitches', { totalSwitches }),
+      rounds: plugin.localize(totals.rounds === 1 ? 'switch.explain.acrossRound' : 'switch.explain.acrossRounds', { rounds: totals.rounds })
+    }));
 
     return {
-      title: '📊 !switch Reliability — Last 7 Days',
+      title: plugin.localize('switch.explain.switchReliabilityLast7'),
       description: lines.join('\n'),
       color: 0x3498DB,
       footer: {
-        text: `Switch v${plugin.constructor.version} · updated`
+        text: plugin.localize('switch.explain.switchVUpdated', { version: plugin.constructor.version })
       },
       timestamp: new Date().toISOString()
     };

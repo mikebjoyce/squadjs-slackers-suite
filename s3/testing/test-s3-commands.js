@@ -5,6 +5,7 @@
 import assert from 'node:assert/strict';
 import DBService from '../utils/db-service.js';
 import { Sequelize, DataTypes } from 'sequelize';
+import { localize as lookupMessage } from '../utils/s3-i18n.js';
 
 let cmds;
 
@@ -128,7 +129,7 @@ async function main() {
       attachments: { first: () => ({ url, name: 'test.s3backup.json' }) }
     };
 
-    await handlers.get('db')({ services: { db: target }, verbose: () => {} }, message, args);
+    await handlers.get('db')({ services: { db: target }, verbose: () => {}, localize: (key, vars) => lookupMessage(key, vars) }, message, args);
 
     const embed = captured.map((p) => p?.embeds?.[0]).filter(Boolean).pop();
     const rows = await T.findAll({ raw: true });

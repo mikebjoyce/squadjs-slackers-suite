@@ -128,9 +128,9 @@ const SwitchCommands = {
                 if (p1 && p2) {
                   await plugin._taggedSwitchPlayer(p1.eosID, 'Admin-Force');
                   await plugin._taggedSwitchPlayer(p2.eosID, 'Admin-Force');
-                  plugin.warn(steamID, `Swapped ${p1.name} and ${p2.name}.`);
+                  plugin.warn(steamID, plugin.localize('switch.warn.swapped', { name: p1.name, name2: p2.name }));
                 } else {
-                  plugin.warn(steamID, 'One or both players not found.');
+                  plugin.warn(steamID, plugin.localize('switch.warn.oneBothPlayersNot'));
                 }
               }
               break;
@@ -158,12 +158,12 @@ const SwitchCommands = {
             case 'refresh':
               await plugin.server.updateSquadList();
               await plugin.server.updatePlayerList();
-              plugin.warn(eosID, `Players and squads refreshed.`);
+              plugin.warn(eosID, plugin.localize('switch.warn.playersSquadsRefreshed'));
               break;
             case 'slots':
               await plugin.server.updateSquadList();
               await plugin.server.updatePlayerList();
-              plugin.warn(eosID, `Switch Slots:\nTeam 1: ${plugin.getSwitchSlotsPerTeam(1)}\nTeam 2: ${plugin.getSwitchSlotsPerTeam(2)}`);
+              plugin.warn(eosID, plugin.localize('switch.warn.switchSlotsTeam1', { switchSlotsPerTeam: plugin.getSwitchSlotsPerTeam(1), switchSlotsPerTeam2: plugin.getSwitchSlotsPerTeam(2) }));
               break;
             case "matchend":
               if (!isAdmin) {
@@ -181,11 +181,11 @@ const SwitchCommands = {
               try {
                 const queued = await plugin.addPlayerToMatchendSwitches(pl);
                 plugin.warn(eosID, queued
-                  ? `Player "${pl.name}" queued for switch at match end.`
-                  : `Player "${pl.name}" was already queued for match end — no change.`);
+                  ? plugin.localize('switch.warn.playerQueuedSwitchMatch', { name: pl.name })
+                  : plugin.localize('switch.warn.playerWasAlreadyQueued', { name: pl.name }));
               } catch (err) {
                 plugin.verbose(1, `[Switch] matchend enqueue failed for ${pl.name}: ${err.message || err}`);
-                plugin.warn(eosID, `Failed to queue "${pl.name}": ${err.message || err}`);
+                plugin.warn(eosID, plugin.localize('switch.warn.failedQueue', { name: pl.name, err: err.message || err }));
               }
               break;
             case "doublesquad":
@@ -209,11 +209,11 @@ const SwitchCommands = {
               try {
                 const queuedCount = await plugin.addSquadToMatchendSwitches(+commandSplit[1], commandSplit[2]);
                 plugin.warn(eosID, queuedCount
-                  ? `Squad ${commandSplit[1]} (${commandSplit[2]}): ${queuedCount} player(s) queued for switch at match end.`
-                  : `Squad ${commandSplit[1]} (${commandSplit[2]}): nobody queued (empty squad, or all members already queued).`);
+                  ? plugin.localize('switch.warn.squadPlayerSQueued', { commandSplit1: commandSplit[1], commandSplit2: commandSplit[2], queuedCount })
+                  : plugin.localize('switch.warn.squadNobodyQueuedEmpty', { commandSplit1: commandSplit[1], commandSplit2: commandSplit[2] }));
               } catch (err) {
                 plugin.verbose(1, `[Switch] matchendsquad enqueue failed: ${err.message || err}`);
-                plugin.warn(eosID, `Failed to queue squad ${commandSplit[1]}: ${err.message || err}`);
+                plugin.warn(eosID, plugin.localize('switch.warn.failedQueueSquad', { commandSplit1: commandSplit[1], err: err.message || err }));
               }
               break;
             case "triggermatchend":
@@ -222,9 +222,9 @@ const SwitchCommands = {
                 return;
               }
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
-              plugin.warn(eosID, 'Triggering match-end switch sequence...');
+              plugin.warn(eosID, plugin.localize('switch.warn.triggeringMatchEndSwitch'));
               await plugin.doSwitchMatchend();
-              plugin.warn(eosID, 'Match-end switch sequence complete.');
+              plugin.warn(eosID, plugin.localize('switch.warn.matchEndSwitchSequence'));
               break;
             case "test":
               plugin.warn(eosID, 'Test 1');
@@ -236,9 +236,9 @@ const SwitchCommands = {
               break;
             case "help":
               if (isAdmin) {
-                plugin.warn(eosID, "Admin Controls\nPlayer: now, double, matchend, check, clear\nSquad: squad, doublesquad, matchendsquad");
+                plugin.warn(eosID, plugin.localize('switch.warn.adminControlsPlayerNow'));
               } else {
-                plugin.warn(eosID, `[Switch] Commands\n!switch         | Request a team switch\n!switch check   | Check your eligibility\n!switch explain | How switching works\n!switch cancel  | Leave the queue`);
+                plugin.warn(eosID, plugin.localize('switch.warn.switchCommandsSwitchRequest'));
               }
               break;
             case "explain":
@@ -248,30 +248,30 @@ const SwitchCommands = {
                   ? (plugin.options.switchCooldownMinutes / 60).toFixed(1)
                   : plugin.options.switchCooldownHours;
                 const totalSteps = showTokenMessaging ? 6 : 5;
-                plugin.warn(eosID, `[Switch] How It Works (1/${totalSteps})\nYou can request a switch in the first ${plugin.options.switchEnabledMinutes}m after joining or after match start — whichever gives you more time.`);
+                plugin.warn(eosID, plugin.localize('switch.warn.switchHowWorks1', { totalSteps, switchEnabledMinutes: plugin.options.switchEnabledMinutes }));
                 await delay(5000);
-                plugin.warn(eosID, `[Switch] How It Works (2/${totalSteps})\nIf teams are uneven, you are queued until a slot opens or a swap partner on the other team is found.`);
+                plugin.warn(eosID, plugin.localize('switch.warn.switchHowWorks2', { totalSteps }));
                 await delay(5000);
-                plugin.warn(eosID, `[Switch] How It Works (3/${totalSteps})\nOnce in the queue, you have ${plugin.options.queueTimeoutMinutes}m before your request expires. Use !switch check to see your status.`);
+                plugin.warn(eosID, plugin.localize('switch.warn.switchHowWorks3', { totalSteps, queueTimeoutMinutes: plugin.options.queueTimeoutMinutes }));
                 await delay(5000);
                 // Per §3.6 of the spec: when maxSwitchTokens == 1 (legacy flat-cooldown mode),
           // showTokenMessaging is false and we use the 5-step explain flow identical to
           // the pre-token version. When maxSwitchTokens > 1, we show the 6-step token-aware flow.
           if (showTokenMessaging) {
-                  plugin.warn(eosID, `[Switch] How It Works (4/6)\nEach switch costs 1 token. You hold up to ${plugin.options.maxSwitchTokens} tokens, and each refills individually every ${cooldownHours}h. Use !switch check to see your balance.`);
+                  plugin.warn(eosID, plugin.localize('switch.warn.switchHowWorks4', { maxSwitchTokens: plugin.options.maxSwitchTokens, cooldownHours }));
                   await delay(5000);
                   const seedBonusEnabled = plugin._isSeedBonusEnabled?.() ?? (plugin.options.seedTokenBonusAmount > 0 && plugin.options.seedTokenBonusMinutes > 0);
                   const seedMinPlayers = plugin.options.seedTokenBonusMinPlayers ?? 0;
-                  const seedMinNote = seedMinPlayers > 0 ? ` (requires ${seedMinPlayers}+ players online)` : '';
+                  const seedMinNote = seedMinPlayers > 0 ? plugin.localize('switch.labels.seedRequiresPlayers', { seedMinPlayers }) : '';
                   plugin.warn(eosID, seedBonusEnabled
-                    ? `[Switch] How It Works (5/6)\nDuring seed rounds, you earn +1 bonus switch token for every ${plugin.options.seedTokenBonusMinutes} minutes of presence${seedMinNote} (up to ${plugin.options.seedTokenBonusAmount} per round). Bonus tokens stack above your normal ${plugin.options.maxSwitchTokens}-token cap.`
-                    : `[Switch] How It Works (5/6)\nSeed bonus tokens are disabled on this server.`);
+                    ? plugin.localize('switch.warn.switchHowWorks5', { seedTokenBonusMinutes: plugin.options.seedTokenBonusMinutes, seedMinNote, seedTokenBonusAmount: plugin.options.seedTokenBonusAmount, maxSwitchTokens: plugin.options.maxSwitchTokens })
+                    : plugin.localize('switch.warn.switchHowWorks52'));
                   await delay(5000);
-                  plugin.warn(eosID, `[Switch] How It Works (6/6)\nAfter a scramble, switches are locked for ${plugin.options.scrambleLockdownDurationMinutes}m.\nUse !switch check to see your current status.`);
+                  plugin.warn(eosID, plugin.localize('switch.warn.switchHowWorks6', { scrambleLockdownDurationMinutes: plugin.options.scrambleLockdownDurationMinutes }));
                 } else {
-                  plugin.warn(eosID, `[Switch] How It Works (4/5)\nAfter switching, there is a ${cooldownHours}h cooldown before you can switch again.`);
+                  plugin.warn(eosID, plugin.localize('switch.warn.switchHowWorks42', { cooldownHours }));
                   await delay(5000);
-                  plugin.warn(eosID, `[Switch] How It Works (5/5)\nAfter a scramble, switches are locked for ${plugin.options.scrambleLockdownDurationMinutes}m.\nUse !switch check to see your current status.`);
+                  plugin.warn(eosID, plugin.localize('switch.warn.switchHowWorks53', { scrambleLockdownDurationMinutes: plugin.options.scrambleLockdownDurationMinutes }));
                 }
               }
               break;
@@ -281,13 +281,13 @@ const SwitchCommands = {
                 if (ident) {
                   if (!isAdmin) {
                     plugin.verbose(1, `[Denied] Player ${playerName} (not admin) attempted admin command: ${subCommand}`);
-                    plugin.warn(eosID, 'Only admins can check other players. Use !switch check with no name to see your own status.');
+                    plugin.warn(eosID, plugin.localize('switch.warn.onlyAdminsCanCheck'));
                     return;
                   }
                   plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
                   const result = await plugin.checkPlayer(ident);
-                  if (!result) plugin.warn(eosID, 'Player not found.');
-                  else if (result === 'multiple') plugin.warn(eosID, 'Multiple players found. Please use SteamID.');
+                  if (!result) plugin.warn(eosID, plugin.localize('switch.warn.playerNotFound'));
+                  else if (result === 'multiple') plugin.warn(eosID, plugin.localize('switch.warn.multiplePlayersFoundPlease'));
                   else {
                     const now = new Date();
                     const locked = result.scrambleLockdownExpiry && result.scrambleLockdownExpiry > now;
@@ -306,9 +306,9 @@ const SwitchCommands = {
                           : plugin.options.switchCooldownHours * 60 * 60 * 1000;
                         const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
                         const remaining = Math.ceil((cooldownDuration - (Date.now() - anchor)) / 60000);
-                        cooldownMsg = `Tokens: 0/${plugin.options.maxSwitchTokens}, next in ${remaining}m`;
+                        cooldownMsg = plugin.localize('switch.labels.tokensEmptyNextIn', { maxSwitchTokens: plugin.options.maxSwitchTokens, remaining });
                       } else {
-                        cooldownMsg = `Tokens: ${row.tokenBalance}/${plugin.options.maxSwitchTokens}`;
+                        cooldownMsg = plugin.localize('switch.labels.tokensBalance', { tokenBalance: row.tokenBalance, maxSwitchTokens: plugin.options.maxSwitchTokens });
                       }
                       plugin.verbose(1, `[Check] Admin check result: player=${result.playerName || result.steamID}, locked=${locked}, tokenBalance=${row.tokenBalance}`);
                     } else {
@@ -316,17 +316,17 @@ const SwitchCommands = {
                         ? plugin.options.switchCooldownMinutes * 60 * 1000
                         : plugin.options.switchCooldownHours * 60 * 60 * 1000;
                       const cooldown = result.lastSwitchTimestamp && (new Date(result.lastSwitchTimestamp.getTime() + cooldownDuration) > now);
-                      cooldownMsg = `Cooldown: ${cooldown ? 'Yes' : 'No'}`;
+                      cooldownMsg = plugin.localize('switch.labels.cooldownState', { state: plugin.localize(cooldown ? 'switch.labels.yes' : 'switch.labels.no') });
                       plugin.verbose(1, `[Check] Admin check result: player=${result.playerName || result.steamID}, locked=${locked}, cooldown=${cooldown}`);
                     }
 
-                    plugin.warn(eosID, `Status: ${result.playerName || result.steamID} | Locked: ${locked ? 'Yes' : 'No'} | ${cooldownMsg}`);
+                    plugin.warn(eosID, plugin.localize('switch.warn.statusLocked', { player: result.playerName || result.steamID, locked: plugin.localize(locked ? 'switch.labels.yes' : 'switch.labels.no'), cooldownMsg }));
                   }
                 } else {
                   const eosID = info.player?.eosID;
                   const teamID = info.player?.teamID;
                   if (!eosID || !teamID) {
-                    plugin.warn(eosID, `[Switch] Unable to check eligibility.`);
+                    plugin.warn(eosID, plugin.localize('switch.warn.switchUnableCheckEligibility'));
                     return;
                   }
 
@@ -362,24 +362,24 @@ const SwitchCommands = {
                   plugin._regenTokens(row);
 
                   let cooldownOK = true;
-                  let cooldownMsg = 'Clear';
+                  let cooldownMsg = plugin.localize('switch.labels.clear');
                   if (!isLiberal) {
                     if (row.tokenBalance < 1) {
                       cooldownOK = false;
                       const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : now;
                       const remaining = Math.ceil((cooldownDuration - (now - anchor)) / 60000);
                       if (showTokenMessaging) {
-                        cooldownMsg = `0/${plugin.options.maxSwitchTokens} tokens, next in ${remaining}m`;
+                        cooldownMsg = plugin.localize('switch.labels.tokensEmptyNextInShort', { maxSwitchTokens: plugin.options.maxSwitchTokens, remaining });
                       } else {
-                        cooldownMsg = `${remaining}m remaining`;
+                        cooldownMsg = plugin.localize('switch.labels.minutesRemaining', { remaining });
                       }
                     } else if (showTokenMessaging) {
-                      cooldownMsg = `${row.tokenBalance}/${plugin.options.maxSwitchTokens} tokens`;
+                      cooldownMsg = plugin.localize('switch.labels.tokensBalanceShort', { tokenBalance: row.tokenBalance, maxSwitchTokens: plugin.options.maxSwitchTokens });
                     }
                   }
 
                   let scrambleOK = true;
-                  let scrambleMsg = 'Not active';
+                  let scrambleMsg = plugin.localize('switch.labels.notActive');
                   if (cooldownData && cooldownData.scrambleLockdownExpiry && new Date(cooldownData.scrambleLockdownExpiry).getTime() > now) {
                     scrambleOK = false;
                     const remaining = Math.ceil((new Date(cooldownData.scrambleLockdownExpiry).getTime() - now) / 60000);
@@ -429,7 +429,7 @@ const SwitchCommands = {
                 const ident = commandSplit.splice(1).join(' ');
                 const result = await plugin.checkPlayer(ident);
                 if (!result || result === 'multiple') {
-                  plugin.warn(eosID, 'Player not found or multiple matches.');
+                  plugin.warn(eosID, plugin.localize('switch.warn.playerNotFoundMultiple'));
                   return;
                 }
                 // Reported inline rather than left to the handler's catch-all.
@@ -438,10 +438,10 @@ const SwitchCommands = {
                 // long: the admin saw silence and assumed success.
                 try {
                   await plugin.adminClearPlayer(result.eosID);
-                  plugin.warn(eosID, `Cleared restrictions for ${result.playerName || result.steamID} (seed tokens kept).`);
+                  plugin.warn(eosID, plugin.localize('switch.warn.clearedRestrictionsSeedTokens', { player: result.playerName || result.steamID }));
                 } catch (err) {
                   plugin.verbose(1, `[Admin] clear failed for ${result.playerName || result.eosID}: ${err.message}`);
-                  plugin.warn(eosID, `Clear failed: ${err.message}`);
+                  plugin.warn(eosID, plugin.localize('switch.warn.clearFailed', { message: err.message }));
                 }
               }
               break;
@@ -453,10 +453,10 @@ const SwitchCommands = {
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
               try {
                 const { toppedUp, locksCleared } = await plugin.adminClearAllRestrictions();
-                plugin.warn(eosID, `Restrictions cleared — ${toppedUp} topped up, ${locksCleared} scramble locks lifted. Seed tokens kept. Use !switch wipe confirm to delete all rows.`);
+                plugin.warn(eosID, plugin.localize('switch.warn.restrictionsClearedToppedUp', { toppedUp, locksCleared }));
               } catch (err) {
                 plugin.verbose(1, `[Admin] clearall failed: ${err.message}`);
-                plugin.warn(eosID, `Clear all failed: ${err.message}`);
+                plugin.warn(eosID, plugin.localize('switch.warn.clearAllFailed', { message: err.message }));
               }
               break;
             case "wipe":
@@ -473,26 +473,26 @@ const SwitchCommands = {
                 // seed bonus away" when an admin types the wrong one in a hurry.
                 if ((commandSplit[1] || '').toLowerCase() !== 'confirm') {
                   plugin.warn(eosID,
-                    'Wipe DELETES every cooldown row, including earned seed tokens. This cannot be undone. ' +
-                    'Type !switch wipe confirm to proceed, or !switch clearall to lift restrictions without deleting anything.');
+                    plugin.localize('switch.warn.wipeDeletesEveryCooldown') +
+                    plugin.localize('switch.warn.typeSwitchWipeConfirm'));
                   return;
                 }
                 try {
                   const deleted = await plugin.adminWipeAll();
-                  plugin.warn(eosID, `Wiped ${deleted} cooldown rows — every player is back to a clean default.`);
+                  plugin.warn(eosID, plugin.localize('switch.warn.wipedCooldownRowsEvery', { deleted }));
                 } catch (err) {
                   plugin.verbose(1, `[Admin] wipe failed: ${err.message}`);
-                  plugin.warn(eosID, `Wipe failed: ${err.message}`);
+                  plugin.warn(eosID, plugin.localize('switch.warn.wipeFailed', { message: err.message }));
                 }
               }
               break;
             case 'cancel':
               if (!plugin.options.queueEnabled) {
-                plugin.warn(eosID, '[Switch Queue] Queue is currently disabled.');
+                plugin.warn(eosID, plugin.localize('switch.warn.switchQueueQueueCurrently'));
               } else {
                 const cancelEntry = plugin._findQueueEntry(info.player?.eosID);
                 if (plugin._removePlayerFromQueue(info.player?.eosID)) {
-                  plugin.warn(eosID, '[Switch Queue] Removed — you left the queue.');
+                  plugin.warn(eosID, plugin.localize('switch.warn.switchQueueRemovedLeft'));
                   if (plugin._roundStats && cancelEntry) {
                     const dur = Math.round((Date.now() - cancelEntry.entry.queuedAt) / 1000);
                     plugin._roundStats.queueCancels.push({
@@ -505,15 +505,15 @@ const SwitchCommands = {
                   }
                   plugin.verbose(1, `[Queue] ${playerName} cancelled — left the queue.`);
                 } else {
-                  plugin.warn(eosID, '[Switch Queue] You are not currently in the queue.');
+                  plugin.warn(eosID, plugin.localize('switch.warn.switchQueueNotCurrently'));
                 }
               }
               break;
             default:
               // Show invalid-input notice first, then full help 5s later
-              plugin.warn(eosID, `Unknown subcommand: "${subCommand}". Showing help...`);
+              plugin.warn(eosID, plugin.localize('switch.warn.unknownSubcommandShowingHelp', { subCommand }));
               await delay(5000);
-              plugin.warn(eosID, `[Switch] Commands\n!switch         | Request a team switch\n!switch check   | Check your eligibility\n!switch explain | How switching works\n!switch cancel  | Leave the queue`);
+              plugin.warn(eosID, plugin.localize('switch.warn.switchCommandsSwitchRequest'));
               return;
           }
         } else {
@@ -525,7 +525,7 @@ const SwitchCommands = {
           }
 
           if (plugin.s3IsEndgameFactionVote()) {
-            plugin.warn(eosID, '[Switch] Team changes are locked during faction voting. Try again when the next round starts.');
+            plugin.warn(eosID, plugin.localize('switch.warn.switchTeamChangesLocked'));
             plugin.verbose(1, `[Switch] Denied ${playerName}: faction vote in progress.`);
             return;
           }
@@ -542,22 +542,22 @@ const SwitchCommands = {
           const eligibility = await plugin._checkSwitchEligibility(info.player);
           if (!eligibility.eligible) {
             if (eligibility.reason === 'recent_switch') {
-              plugin.warn(eosID, `[Switch] You just switched — wait ${eligibility.remaining}s before switching again.`);
+              plugin.warn(eosID, plugin.localize('switch.warn.switchJustSwitchedWait', { remaining: eligibility.remaining }));
               plugin.verbose(1, `[Switch] Denied ${playerName}: Post-switch lockout active.`);
               plugin._trackDenial(eosID, playerName, 'recent_switch');
             } else if (eligibility.reason === 'scramble_lock') {
-              plugin.warn(eosID, `[Switch] Scramble lock active — expires in ${eligibility.remaining}m.\nYour switch window may close before this expires.\nUse !switch check to see your full status.`);
+              plugin.warn(eosID, plugin.localize('switch.warn.switchScrambleLockActive', { remaining: eligibility.remaining }));
               plugin.verbose(1, `[Switch] Denied ${playerName}: Scramble lockdown active.`);
               plugin._trackDenial(eosID, playerName, 'scramble_lock');
             } else if (eligibility.reason === 'time_window') {
-              plugin.warn(eosID, `[Switch] Eligibility window closed.\nYou can only request a switch in the first ${plugin.options.switchEnabledMinutes}m after joining or after\nmatch start — whichever gives you more time.\nUse !switch explain for details.`);
+              plugin.warn(eosID, plugin.localize('switch.warn.switchEligibilityWindowClosed', { switchEnabledMinutes: plugin.options.switchEnabledMinutes }));
               plugin.verbose(1, `[Switch] Denied ${playerName}: Match time limit exceeded.`);
               plugin._trackDenial(eosID, playerName, 'time_window');
             } else if (eligibility.reason === 'cooldown') {
               if (plugin.options.maxSwitchTokens > 1) {
-                plugin.warn(eosID, `[Switch] Out of switch tokens — next one in ${eligibility.remaining}m.\nUse !switch check to see your full status.`);
+                plugin.warn(eosID, plugin.localize('switch.warn.switchOutSwitchTokens', { remaining: eligibility.remaining }));
               } else {
-                plugin.warn(eosID, `[Switch] On cooldown — available in ${eligibility.remaining}m.\nUse !switch check to see your full status.`);
+                plugin.warn(eosID, plugin.localize('switch.warn.switchCooldownAvailableM', { remaining: eligibility.remaining }));
               }
               plugin.verbose(1, `[Switch] Denied ${playerName}: Cooldown active.`);
               plugin._trackDenial(eosID, playerName, 'cooldown');
@@ -576,11 +576,11 @@ const SwitchCommands = {
             if (!canActPlayers.canAct(eosID2, 'Switch')) {
               if (!plugin.options.queueEnabled) {
                 plugin.verbose(1, `[Switch] ${playerName}: canAct returned false — queue disabled, asking retry.`);
-                plugin.warn(eosID, '[Switch] Please try again shortly.');
+                plugin.warn(eosID, plugin.localize('switch.warn.switchPleaseTryAgain'));
                 return;
               }
               plugin.verbose(1, `[Switch] ${playerName}: canAct returned false — enqueuing.`);
-              await plugin._enqueuePlayer(info.player, 'Your request has been queued.');
+              await plugin._enqueuePlayer(info.player, plugin.localize('switch.labels.queueReasonQueued'));
               return;
             }
           }
@@ -621,7 +621,7 @@ const SwitchCommands = {
           // v2.0.0: Queue-disabled path — deny early if queue is off and no slot
           if (!plugin.options.queueEnabled) {
             if (availableSwitchSlots <= 0) {
-              plugin.warn(eosID, '[Switch] Queue is currently disabled and no slots are available. Try again shortly.');
+              plugin.warn(eosID, plugin.localize('switch.warn.switchQueueCurrentlyDisabled'));
               return;
             }
             // If queue disabled but slot available, fall through to switch below
@@ -629,12 +629,12 @@ const SwitchCommands = {
             // v2.0.0: FIFO check — if players are already waiting, enqueue behind them
             const queueSameTeam = plugin._switchQueue[teamID === 1 ? 't1' : 't2'].length;
             if (queueSameTeam > 0) {
-              plugin._enqueuePlayer(info.player, 'Other players are already waiting in the queue.');
+              plugin._enqueuePlayer(info.player, plugin.localize('switch.labels.queueReasonOthersWaiting'));
               return;
             }
 
             if (availableSwitchSlots <= 0) {
-              plugin._enqueuePlayer(info.player, 'Teams are currently full on that side.');
+              plugin._enqueuePlayer(info.player, plugin.localize('switch.labels.queueReasonTeamsFull'));
               return;
             }
           }
@@ -654,7 +654,7 @@ const SwitchCommands = {
               switchSuccess = true;
             } else {
               plugin.verbose(1, `[Switch] RCON returned success but team DID NOT CHANGE for ${playerName} (was T${preSwitchTeam}, still T${postSwitchTeam || '??'}). Not recording cooldown.`);
-              plugin.warn(eosID, `[Switch] The server could not complete the team change. Try again later.`);
+              plugin.warn(eosID, plugin.localize('switch.warn.switchServerCouldNot'));
             }
           } catch (err) {
             plugin.verbose(1, `[Switch] RCON exception for ${playerName}: ${err.message}`);
@@ -670,11 +670,11 @@ const SwitchCommands = {
                 switchSuccess = true;
               } else {
                 plugin.verbose(1, `[Switch] Verified after timeout: ${playerName} switch failed (${currentPlayer ? `still on Team ${preSwitchTeam}` : 'player disconnected'})`);
-                plugin.warn(eosID, "[Switch] Switch failed — please try again or contact an admin.");
+                plugin.warn(eosID, plugin.localize('switch.warn.switchSwitchFailedPlease'));
               }
             } else {
               plugin.verbose(1, `Error executing switch: ${err.message}`);
-              plugin.warn(eosID, "[Switch] Switch failed — please try again or contact an admin.");
+              plugin.warn(eosID, plugin.localize('switch.warn.switchSwitchFailedPlease'));
             }
           }
 
@@ -737,14 +737,14 @@ const SwitchCommands = {
                   if (row) {
                     const balance = row.tokenBalance != null ? row.tokenBalance : plugin.options.maxSwitchTokens;
                     if (balance > 0) {
-                      plugin.warn(eosID, `[Switch] Switched! ${balance}/${plugin.options.maxSwitchTokens} tokens remaining.`);
+                      plugin.warn(eosID, plugin.localize('switch.warn.switchSwitchedTokensRemaining', { balance, maxSwitchTokens: plugin.options.maxSwitchTokens }));
                     } else {
                       const cooldownDuration = plugin.options.switchCooldownMinutes > 0
                         ? plugin.options.switchCooldownMinutes * 60 * 1000
                         : plugin.options.switchCooldownHours * 60 * 60 * 1000;
                       const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
                       const remaining = Math.ceil((cooldownDuration - (Date.now() - anchor)) / 60000);
-                      plugin.warn(eosID, `[Switch] Switched! You're out of tokens — next one in ~${remaining}m.`);
+                      plugin.warn(eosID, plugin.localize('switch.warn.switchSwitchedReOut', { remaining }));
                     }
                   }
                 }
@@ -970,7 +970,7 @@ const SwitchCommands = {
       const STATS_LOOKBACK_DAYS = daysArg ? parseInt(daysArg, 10) : 60;
       const afterDate = new Date(Date.now() - STATS_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
 
-      await message.channel.send(`🔍 Scraping switch stats from the last ${STATS_LOOKBACK_DAYS} days...`);
+      await message.channel.send(plugin.localize('switch.handleStatsCommand.scrapingSwitchStatsFrom', { STATS_LOOKBACK_DAYS }));
 
       // ── Aggregate containers ──
       const totals = {
@@ -1002,7 +1002,7 @@ const SwitchCommands = {
       try {
         const reportChan = plugin.channel;
         if (!reportChan) {
-          await message.channel.send('❌ Reporting channel is not available.');
+          await message.channel.send(plugin.localize('switch.handleStatsCommand.reportingChannelIsNot'));
           return;
         }
         while (keepGoing) {
@@ -1101,7 +1101,7 @@ const SwitchCommands = {
         }
       } catch (err) {
         plugin.verbose(1, `[Switch] Stats scrape failed: ${err.message}`);
-        await message.channel.send(`❌ Scrape failed: ${err.message}`);
+        await message.channel.send(plugin.localize('switch.handleStatsCommand.scrapeFailedMessage', { message: err.message }));
         return;
       }
 
@@ -1163,7 +1163,7 @@ const SwitchCommands = {
         summaryLines.push(`**Queue wait:** mean ${avgStr}${medianPart}`);
       }
 
-      fields.push({ name: '📊 Summary', value: summaryLines.join('\n'), inline: false });
+      fields.push({ name: plugin.localize('switch.handleStatsCommand.summary'), value: summaryLines.join('\n'), inline: false });
 
       // ── Movement Types field ──
       if (totals.success > 0) {
@@ -1173,7 +1173,7 @@ const SwitchCommands = {
         moveLines.push(`Queue Pair Trade   ${totals.queueTeamTrade}${pct(totals.queueTeamTrade)}`);
         moveLines.push(`Join Swap          ${totals.queueJoinSwap}${pct(totals.queueJoinSwap)}`);
         moveLines.push(`Timeout Switch     ${totals.queueTimeoutSwitch}${pct(totals.queueTimeoutSwitch)}`);
-        fields.push({ name: `🔄 Movement Types (all ${totals.success} successes)`, value: moveLines.join('\n'), inline: false });
+        fields.push({ name: plugin.localize('switch.handleStatsCommand.movementTypesAllSuccess', { success: totals.success }), value: moveLines.join('\n'), inline: false });
       }
 
       // ── Denial Reasons field ──
@@ -1182,7 +1182,7 @@ const SwitchCommands = {
         denialLines.push(`Cooldown           ${totals.denialCooldown}${dpct(totals.denialCooldown)}`);
         denialLines.push(`Time Window        ${totals.denialTimeWindow}${dpct(totals.denialTimeWindow)}`);
         denialLines.push(`Scramble Lock     ${totals.denialScrambleLock}${dpct(totals.denialScrambleLock)}`);
-        fields.push({ name: `⛔ Denial Reasons (all ${totals.denied} denials)`, value: denialLines.join('\n'), inline: false });
+        fields.push({ name: plugin.localize('switch.handleStatsCommand.denialReasonsAllDenied', { denied: totals.denied }), value: denialLines.join('\n'), inline: false });
       }
 
       // ── Queue Outcomes field ──
@@ -1201,7 +1201,7 @@ const SwitchCommands = {
           outcomeLines.push(`\u2020 Expired entries are from rounds where\n  queueTimeoutSwitchEnabled was off.`);
         }
 
-        fields.push({ name: `📋 Queue Outcomes (all ${totals.totalQueueEntries} queue entries)`, value: outcomeLines.join('\n'), inline: false });
+        fields.push({ name: plugin.localize('switch.handleStatsCommand.queueOutcomesAll', { totalQueueEntries: totals.totalQueueEntries }), value: outcomeLines.join('\n'), inline: false });
       }
 
       // ── Data Quality field (conditional) ──
@@ -1216,20 +1216,20 @@ const SwitchCommands = {
         qualityLines.push(`${totals.missingMedian} rounds lack median data (pre-median embed format)`);
       }
       if (qualityLines.length > 0) {
-        fields.push({ name: '⚠️ Data Quality', value: qualityLines.join('\n'), inline: false });
+        fields.push({ name: plugin.localize('switch.handleStatsCommand.dataQuality'), value: qualityLines.join('\n'), inline: false });
       }
 
       if (!fields.length) {
-        fields.push({ name: 'No Data', value: 'No switch round summaries found in the lookback period.', inline: false });
+        fields.push({ name: plugin.localize('switch.handleStatsCommand.noData'), value: plugin.localize('switch.handleStatsCommand.noSwitchRoundSummaries'), inline: false });
       }
 
       const embed = {
-        title: 'Switch Global Stats',
-        description: `${STATS_LOOKBACK_DAYS}-day aggregate \u00B7 standard-mode rounds`,
+        title: plugin.localize('switch.handleStatsCommand.switchGlobalStats'),
+        description: plugin.localize('switch.handleStatsCommand.statsLookbackDaysDay', { STATS_LOOKBACK_DAYS }),
         color: 0x3498DB,
         fields,
         timestamp: new Date(),
-        footer: { text: `Switch v${plugin.constructor.version}` }
+        footer: { text: plugin.localize('switch.handleStatsCommand.switchVVersion', { version: plugin.constructor.version }) }
       };
 
       await message.channel.send({ embeds: [embed] });
@@ -1265,14 +1265,14 @@ const SwitchCommands = {
       } else if (subCommand === 'check') {
         const ident = args.slice(2).join(' ');
         if (!ident) {
-          await plugin.safeDiscordReply(message, 'Usage: `!switch check <SteamID|Name>`');
+          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.usageSwitchCheckSteamid'));
           return;
         }
         const result = await plugin.checkPlayer(ident);
         if (!result) {
-          await plugin.safeDiscordReply(message, 'Player not found in database.');
+          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.playerNotFoundDatabase'));
         } else if (result === 'multiple') {
-          await plugin.safeDiscordReply(message, '⚠️ Ambiguous result: Multiple matches found. Please refine your search string or use a SteamID.');
+          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.ambiguousResultMultipleMatches'));
         } else {
           const now = new Date();
           const showTokenMessaging = plugin.options.maxSwitchTokens > 1;
@@ -1323,64 +1323,64 @@ const SwitchCommands = {
             desc += `⏱️ **Last Active:** <t:${Math.floor(new Date(result.lastActiveTimestamp).getTime() / 1000)}:f>\n`;
           }
 
-          await message.channel.send({ embeds: [{ title: '🔍 Player Status', description: desc, color: 0x3498db }] });
+          await message.channel.send({ embeds: [{ title: plugin.localize('switch.onDiscordMessage.playerStatus'), description: desc, color: 0x3498db }] });
         }
       } else if (subCommand === 'clear') {
         const ident = args.slice(2).join(' ');
         if (!ident) {
-          await plugin.safeDiscordReply(message, 'Usage: `!switch clear <SteamID|Name>`');
+          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.usageSwitchClearSteamid'));
           return;
         }
         const result = await plugin.checkPlayer(ident);
         if (!result || result === 'multiple') {
-          await plugin.safeDiscordReply(message, 'Player not found or multiple matches.');
+          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.playerNotFoundMultiple'));
           return;
         }
         try {
           const summary = await plugin.adminClearPlayer(result.eosID);
           const detail = summary
-            ? `${summary.tokensBefore} → ${summary.tokensAfter} tokens${summary.lockCleared ? ', scramble lock lifted' : ''}`
-            : 'no row found — already unrestricted';
-          await plugin.safeDiscordReply(message, `✅ Cleared restrictions for **${result.playerName || result.steamID}** (${detail}). Seed tokens kept.`);
+            ? plugin.localize('switch.labels.clearDetail', { tokensBefore: summary.tokensBefore, tokensAfter: summary.tokensAfter, lockNote: summary.lockCleared ? plugin.localize('switch.labels.scrambleLockLifted') : '' })
+            : plugin.localize('switch.labels.clearDetailNoRow');
+          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.clearedRestrictionsSeedTokens', { player: result.playerName || result.steamID, detail }));
         } catch (err) {
           plugin.verbose(1, `[Admin] clear failed for ${result.playerName || result.eosID}: ${err.message}`);
-          await plugin.safeDiscordReply(message, `❌ Clear failed: ${err.message}`);
+          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.clearFailed', { message: err.message }));
         }
       } else if (subCommand === 'clearall') {
         try {
           const { toppedUp, locksCleared } = await plugin.adminClearAllRestrictions();
           await plugin.safeDiscordReply(message,
-            `✅ Restrictions cleared — **${toppedUp}** topped up to ${plugin.options.maxSwitchTokens}, **${locksCleared}** scramble locks lifted. Earned seed tokens kept; use \`!switch wipe confirm\` to delete every row.`
+            plugin.localize('switch.discord.restrictionsClearedToppedUp', { toppedUp, maxSwitchTokens: plugin.options.maxSwitchTokens, locksCleared })
           );
         } catch (err) {
           plugin.verbose(1, `[Admin] clearall failed: ${err.message}`);
-          await plugin.safeDiscordReply(message, `❌ Clear all failed: ${err.message}`);
+          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.clearAllFailed', { message: err.message }));
         }
       } else if (subCommand === 'wipe') {
         // See the in-game `wipe` case — same guard, same reason.
         if ((args[2] || '').toLowerCase() !== 'confirm') {
           await plugin.safeDiscordReply(message,
-            '⚠️ `!switch wipe` **deletes every cooldown row**, including earned seed tokens. This cannot be undone.\n' +
-            'Run `!switch wipe confirm` to proceed, or `!switch clearall` to lift restrictions without deleting anything.');
+            plugin.localize('switch.discord.switchWipeDeletesEvery') +
+            plugin.localize('switch.discord.runSwitchWipeConfirm'));
           return;
         }
         try {
           const deleted = await plugin.adminWipeAll();
-          await plugin.safeDiscordReply(message, `🗑️ Wiped **${deleted}** cooldown rows — every player is back to a clean default.`);
+          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.wipedCooldownRowsEvery', { deleted }));
         } catch (err) {
           plugin.verbose(1, `[Admin] wipe failed: ${err.message}`);
-          await plugin.safeDiscordReply(message, `❌ Wipe failed: ${err.message}`);
+          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.wipeFailed', { message: err.message }));
         }
       } else if (subCommand === 'timelimit' && ['on', 'off'].includes(args[2])) {
         const enabled = args[2] === 'on';
         try {
           await plugin._saveTimeLimitSetting(enabled);
-          const status = enabled ? 'enabled' : 'disabled';
+          const status = plugin.localize(enabled ? 'switch.labels.enabled' : 'switch.labels.disabled');
           await plugin.safeDiscordReply(message,
-            `✅ Switch time limit **${status}**. Players ${enabled ? 'must switch within the first minutes of joining or match start' : 'can switch at any time regardless of join/match time'}.`
+            plugin.localize('switch.discord.switchTimeLimitPlayers', { status, detail: plugin.localize(enabled ? 'switch.labels.timeLimitOnDetail' : 'switch.labels.timeLimitOffDetail') })
           );
         } catch (err) {
-          await plugin.safeDiscordReply(message, `❌ Failed to update setting: ${err.message}`);
+          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.failedUpdateSetting', { message: err.message }));
         }
       } else if (subCommand === 'stats') {
         const args2 = args.slice(2);
@@ -1389,7 +1389,7 @@ const SwitchCommands = {
         try {
           const embeds = plugin._buildExplainMessages();
           if (!embeds || embeds.length === 0) {
-            await plugin.safeDiscordReply(message, 'Could not generate explain content at this time.');
+            await plugin.safeDiscordReply(message, plugin.localize('switch.discord.couldNotGenerateExplain'));
             return;
           }
           // Append 7-day reliability stats embed (gracefully degrades to null if no data)
@@ -1407,40 +1407,40 @@ const SwitchCommands = {
           }
         } catch (err) {
           plugin.verbose(1, `[Explain] Failed to generate explain embeds: ${err.message}`);
-          await plugin.safeDiscordReply(message, `Failed to generate explain output: ${err.message}`);
+          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.failedGenerateExplainOutput', { message: err.message }));
         }
       } else if (subCommand === 'help') {
         const embed = {
-          title: '📜 Switch Plugin Commands',
-          description: 'Available commands:',
+          title: plugin.localize('switch.onDiscordMessage.switchPluginCommands'),
+          description: plugin.localize('switch.onDiscordMessage.availableCommands'),
           fields: [
-            { name: '!switch status', value: 'Show database diagnostics and active locks.' },
-            { name: '!switch check <ident>', value: 'Check cooldown status for a player.' },
-            { name: '!switch clear <ident>', value: 'Lift one player\'s restrictions (keeps earned seed tokens).' },
-            { name: '!switch clearall', value: 'Lift restrictions for everyone (keeps earned seed tokens).' },
-            { name: '!switch wipe confirm', value: 'Delete every cooldown row — a full reset, seed tokens included. The word `confirm` is required.' },
-            { name: '!switch timelimit on|off', value: 'Admin: Toggle join/match time limit for queue entry.' },
-            { name: '!switch stats [days]', value: 'Scrape the last N days of round summaries (default 60).' },
-            { name: '!switch explain', value: 'Generate a detailed explanation of how team switching works.' },
-            { name: '!switch help', value: 'Show this help message.' }
+            { name: '!switch status', value: plugin.localize('switch.onDiscordMessage.showDatabaseDiagnosticsAnd') },
+            { name: '!switch check <ident>', value: plugin.localize('switch.onDiscordMessage.checkCooldownStatusFor') },
+            { name: '!switch clear <ident>', value: plugin.localize('switch.onDiscordMessage.liftOnePlayerS') },
+            { name: '!switch clearall', value: plugin.localize('switch.onDiscordMessage.liftRestrictionsForEveryone') },
+            { name: '!switch wipe confirm', value: plugin.localize('switch.onDiscordMessage.deleteEveryCooldownRow') },
+            { name: '!switch timelimit on|off', value: plugin.localize('switch.onDiscordMessage.adminToggleJoinMatch') },
+            { name: '!switch stats [days]', value: plugin.localize('switch.onDiscordMessage.scrapeTheLastN') },
+            { name: '!switch explain', value: plugin.localize('switch.onDiscordMessage.generateADetailedExplanation') },
+            { name: '!switch help', value: plugin.localize('switch.onDiscordMessage.showThisHelpMessage') }
           ]
         };
         await message.channel.send({ embeds: [embed] });
       } else {
         // Unknown subcommand — show help
         const embed = {
-          title: '📜 Switch Plugin Commands',
-          description: 'Available commands:',
+          title: plugin.localize('switch.onDiscordMessage.switchPluginCommands'),
+          description: plugin.localize('switch.onDiscordMessage.availableCommands'),
           fields: [
-            { name: '!switch status', value: 'Show database diagnostics and active locks.' },
-            { name: '!switch check <ident>', value: 'Check cooldown status for a player.' },
-            { name: '!switch clear <ident>', value: 'Lift one player\'s restrictions (keeps earned seed tokens).' },
-            { name: '!switch clearall', value: 'Lift restrictions for everyone (keeps earned seed tokens).' },
-            { name: '!switch wipe confirm', value: 'Delete every cooldown row — a full reset, seed tokens included. The word `confirm` is required.' },
-            { name: '!switch timelimit on|off', value: 'Admin: Toggle join/match time limit for queue entry.' },
-            { name: '!switch stats [days]', value: 'Scrape the last N days of round summaries (default 60).' },
-            { name: '!switch explain', value: 'Generate a detailed explanation of how team switching works.' },
-            { name: '!switch help', value: 'Show this help message.' }
+            { name: '!switch status', value: plugin.localize('switch.onDiscordMessage.showDatabaseDiagnosticsAnd') },
+            { name: '!switch check <ident>', value: plugin.localize('switch.onDiscordMessage.checkCooldownStatusFor') },
+            { name: '!switch clear <ident>', value: plugin.localize('switch.onDiscordMessage.liftOnePlayerS') },
+            { name: '!switch clearall', value: plugin.localize('switch.onDiscordMessage.liftRestrictionsForEveryone') },
+            { name: '!switch wipe confirm', value: plugin.localize('switch.onDiscordMessage.deleteEveryCooldownRow') },
+            { name: '!switch timelimit on|off', value: plugin.localize('switch.onDiscordMessage.adminToggleJoinMatch') },
+            { name: '!switch stats [days]', value: plugin.localize('switch.onDiscordMessage.scrapeTheLastN') },
+            { name: '!switch explain', value: plugin.localize('switch.onDiscordMessage.generateADetailedExplanation') },
+            { name: '!switch help', value: plugin.localize('switch.onDiscordMessage.showThisHelpMessage') }
           ]
         };
         await message.channel.send({ embeds: [embed] });

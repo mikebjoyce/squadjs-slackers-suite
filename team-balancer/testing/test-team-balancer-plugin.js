@@ -48,6 +48,7 @@ import { fileURLToPath } from 'node:url';
 
 import { buildAssembly, importFromAssembly, cleanAssembly } from '../../s3/testing/plugin-assembly.js';
 import { makeMockServer, makeMockS3, S3_VERSION } from '../../s3/testing/mock-s3.js';
+import { MESSAGES as EN } from '../../s3/utils/s3-locale-en.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_SRC = path.join(HERE, '..', 'plugins', 'team-balancer.js');
@@ -372,6 +373,128 @@ try {
       'server.currentLayer is read again — it is null after a mid-round restart'
     );
   });
+
+  // ── RconMessages ─────────────────────────────────────────────────────────
+  //
+  // These are the round-end broadcasts every player reads. They are built by
+  // CommandHandlers.register() inside the constructor — before prepareToMount()
+  // discovers S³ — and SwapExecutor is handed the same object in that same
+  // constructor and keeps the reference for the life of the plugin. So the
+  // values cannot be plain strings: they would be resolved against the default
+  // language and stay English no matter what the operator configured, and the
+  // bug would be invisible to anyone who does not read the second language.
+  {
+    const server = makeMockServer();
+    const plugin = new TeamBalancer(server, { ...OPTIONS }, {});
+    const messages = plugin.RconMessages;
+
+    await test('RconMessages leaves are accessors, not values snapshotted at construction', async () => {
+      const top = Object.getOwnPropertyDescriptor(messages, 'draw');
+      assert.equal(typeof top?.get, 'function', 'draw is a plain value — it snapshots the default language');
+
+      const nested = Object.getOwnPropertyDescriptor(messages.dominant, 'steamrolled');
+      assert.equal(typeof nested?.get, 'function', 'dominant.steamrolled is a plain value');
+    });
+
+    await test('every read goes back through localize(), so language changes take effect', async () => {
+      const seen = [];
+      const real = plugin.localize;
+      plugin.localize = (key) => { seen.push(key); return '<<resolved>>'; };
+
+      assert.equal(messages.draw, '<<resolved>>');
+      assert.equal(messages.system.trackingEnabled, '<<resolved>>');
+      assert.deepEqual(seen, ['teamBalancer.rconMessages.draw', 'teamBalancer.rconMessages.system.trackingEnabled']);
+
+      plugin.localize = real;
+      assert.equal(messages.draw, EN.teamBalancer.rconMessages.draw);
+    });
+
+    await test('S³ discovery does not replace the object SwapExecutor is holding', async () => {
+      await plugin.prepareToMount();
+      assert.equal(plugin.RconMessages, messages, 'RconMessages was rebuilt — SwapExecutor now holds a stale object');
+    });
+
+    await test('every message matches the catalogue and keeps its placeholders', async () => {
+      const walk = (node, cat, path = []) => {
+        for (const [k, expected] of Object.entries(cat)) {
+          const where = [...path, k].join('.');
+          if (expected && typeof expected === 'object') { walk(node[k], expected, [...path, k]); continue; }
+          assert.equal(node[k], expected, `teamBalancer.rconMessages.${where} does not match the catalogue`);
+          // formatMessage() substitutes at the call site, so localize() must
+          // hand the placeholders back untouched.
+          for (const m of expected.matchAll(/\{(\w+)\}/g)) {
+            assert.ok(node[k].includes(`{${m[1]}}`), `${where} lost placeholder {${m[1]}}`);
+          }
+        }
+      };
+      walk(messages, EN.teamBalancer.rconMessages);
+    });
+
+    await test('the prefix tag stays English and is not a catalogue key', async () => {
+      assert.equal(messages.prefix, '[TeamBalancer]');
+      assert.ok(!('prefix' in EN.teamBalancer.rconMessages), 'prefix was localized — it is a log tag, not prose');
+    });
+
+    await test('the getters survive spreading and serialization', async () => {
+      // Consumers that spread or log the object must see strings, not accessors.
+      const plain = JSON.parse(JSON.stringify(messages));
+      assert.equal(plain.draw, EN.teamBalancer.rconMessages.draw);
+      assert.equal(plain.dominant.stomped, EN.teamBalancer.rconMessages.dominant.stomped);
+      assert.equal({ ...messages }.scrambleCompleteMessage, EN.teamBalancer.rconMessages.scrambleCompleteMessage);
+    });
+  }
+
+  // ─── Diagnostics carry a stable id ──────────────────────────────
+  //
+  // tb-commands.js pulls the two results out of the array to build the RCON
+  // diag page. It used to find them by comparing r.name against a localized
+  // string while TBDiagnostics wrote that name in English — agreeing only in
+  // English, and dereferencing undefined in every other language. The name is
+  // display text now and the id is what code matches on, so this asserts the
+  // ids survive a language that changes every string.
+  {
+    // Imported from source, not the assembly: importFromAssembly resolves a
+    // plugin entry point, and this is a util the plugin pulls in.
+    const { TBDiagnostics } = await import('../utils/tb-diagnostics.js');
+
+    // Stands in for a configured language: every key comes back different, and
+    // nothing that a human reads keeps its English value.
+    const translated = (key) => `«${key}»`;
+    const stubTB = (localize) => ({
+      localize,
+      s3db: null,                       // both probes fail; the ids still have to be there
+      server: { squads: [], players: [] },
+      transformSquadJSData: () => ({ squads: [], players: [] }),
+      options: { scramblePercentage: 0.5 },
+      winStreakTeam: null
+    });
+
+    await test('every diagnostic result carries an id', async () => {
+      const results = await new TBDiagnostics(stubTB((k) => k)).runAll();
+      assert.deepEqual(results.map((r) => r.id), ['s3Integration', 'scrambler']);
+    });
+
+    await test('the ids do not move when the language does', async () => {
+      const results = await new TBDiagnostics(stubTB(translated)).runAll();
+      assert.deepEqual(results.map((r) => r.id), ['s3Integration', 'scrambler']);
+
+      // The display text did move — otherwise this proves nothing.
+      assert.ok(results.every((r) => r.name.startsWith('«')), 'names were not localized');
+
+      // The lookup tb-commands.js performs, under that language.
+      assert.ok(results.find((r) => r.id === 's3Integration'), 'S³ result unreachable by id');
+      assert.ok(results.find((r) => r.id === 'scrambler'), 'scrambler result unreachable by id');
+    });
+
+    await test('tb-commands finds diagnostics by id, never by name', async () => {
+      const src = fs.readFileSync(path.join(HERE, '..', 'utils', 'tb-commands.js'), 'utf8');
+      assert.ok(/results\.find\(\(r\) => r\.id === 's3Integration'\)/.test(src),
+        'the S³ result is no longer matched by id');
+      // \b matters: constructor.name === 'EloTracker' ends in "r.name === ".
+      assert.ok(!/\br\.name === /.test(src), 'a diagnostic result is being matched by its localized name again');
+    });
+  }
+
 } finally {
   cleanAssembly(assembly);
 }

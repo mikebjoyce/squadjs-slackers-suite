@@ -591,14 +591,14 @@ export default class TeamBalancer extends S3PluginBase {
   async _notifyScrambleDiscarded(armedBy, reason) {
     if (armedBy?.name) {
       try {
-        await this.server.rcon.warn(armedBy.name, `${this.RconMessages.prefix} Your scheduled end-of-round scramble was discarded because ${reason}. Re-issue "!scramble matchend" during the round if still needed.`);
+        await this.server.rcon.warn(armedBy.name, `${this.RconMessages.prefix} ${this.localize('teamBalancer.broadcasts.warnAdminMatchEndDiscarded', { reason })}`);
       } catch (err) {
         Logger.verbose('TeamBalancer', 1, `Failed to warn admin about discarded match-end scramble: ${err.message}`);
       }
     }
     if (this.discordChannel) {
       DiscordHelpers.sendDiscordMessage(this.discordChannel, {
-        content: `⚠️ Scheduled end-of-round scramble (armed by **${armedBy?.name || 'unknown'}**) was discarded — ${reason}.`
+        content: this.localize('teamBalancer.broadcasts.discordMatchEndDiscarded', { admin: armedBy?.name || 'unknown', reason })
       });
     }
   }
@@ -861,11 +861,11 @@ export default class TeamBalancer extends S3PluginBase {
     // stopped would send them away from the one thing that would have. Not seed-specific on
     // purpose — the countdown could equally be a streak scramble, and the advice is the same.
     if (this._scramblePending || this._scrambleInProgress) {
-      return ' | A scramble countdown is already running — use !scramble cancel to stop it';
+      return this.localize('teamBalancer.broadcasts.seedScrambleOffPendingScramble');
     }
     // The seed auto-scramble trigger fires on any Seed round end (isSeedMode()) regardless of
     // ignored game mode settings. "off while disabled" is true for any configuration.
-    return this.options.enableSeedAutoScramble ? ' | Seed auto-scramble is off too while disabled' : '';
+    return this.options.enableSeedAutoScramble ? this.localize('teamBalancer.broadcasts.seedScrambleOffDisabled') : '';
   }
 
   /**
@@ -877,9 +877,9 @@ export default class TeamBalancer extends S3PluginBase {
    */
   enableConfirmationText() {
     const base = this.options.enableWinStreakTracking
-      ? 'Win streak tracking enabled.'
-      : 'Plugin enabled — win streak tracking stays off in config.';
-    return `${base}${this.options.enableSeedAutoScramble ? ' | Seed auto-scramble re-armed' : ''}`;
+      ? this.localize('teamBalancer.broadcasts.enableConfirmationStreakOn')
+      : this.localize('teamBalancer.broadcasts.enableConfirmationStreakOff');
+    return `${base}${this.options.enableSeedAutoScramble ? this.localize('teamBalancer.broadcasts.enableConfirmationSeedRearmed') : ''}`;
   }
 
   /**
@@ -889,9 +889,9 @@ export default class TeamBalancer extends S3PluginBase {
    * a trigger that will still not fire afterwards.
    */
   seedAutoScrambleStatus() {
-    if (!this.options.enableSeedAutoScramble) return 'OFF (config)';
-    if (this.manuallyDisabled) return 'OFF (plugin disabled)';
-    return 'ON (at Seed round end)';
+    if (!this.options.enableSeedAutoScramble) return this.localize('teamBalancer.broadcasts.seedStatusConfigOff');
+    if (this.manuallyDisabled) return this.localize('teamBalancer.broadcasts.seedStatusPluginDisabled');
+    return this.localize('teamBalancer.broadcasts.seedStatusActive');
   }
 
   /**
@@ -973,8 +973,7 @@ export default class TeamBalancer extends S3PluginBase {
     const actual = this._s3?.version;
     if (!this._s3VersionAtLeast(required)) {
       throw new Error(
-        `[TeamBalancer] Incompatible S³ version: got ${actual || 'unknown'}, need >=${required}. ` +
-        'Please update SlackersSquadServices.'
+        this.localize('teamBalancer.errors.s3VersionIncompatible', { actual: actual || 'unknown', required })
       );
     }
     Logger.verbose('TeamBalancer', 2, `[S3] Version check passed: S³ v${actual} >= required v${required}`);
@@ -1162,7 +1161,7 @@ export default class TeamBalancer extends S3PluginBase {
             } else {
               Logger.verbose('TeamBalancer', 2, `[7.4m] Discarding stale match-end scramble arm — stored matchId=${dbState.scrambleOnRoundEndBy.matchId}, current=${currentMatchId}.`);
               await this._setScrambleArm(null);
-              await this._notifyScrambleDiscarded(dbState.scrambleOnRoundEndBy, 'a server restart carried it past the round it was armed for');
+              await this._notifyScrambleDiscarded(dbState.scrambleOnRoundEndBy, this.localize('teamBalancer.broadcasts.armDiscardedRestartReason'));
             }
           }
 
@@ -1359,7 +1358,7 @@ export default class TeamBalancer extends S3PluginBase {
     Logger.verbose('TeamBalancer', 2, `[Discord] Received valid command: "${content.substring(0, 80)}" from ${message.author.tag} (${message.author.id}).`);
 
     if (!this.checkDiscordAdminPermission(message.member)) {
-      await message.reply('❌ You do not have permission to use this command.');
+      await message.reply(this.localize('teamBalancer.errors.discordPermissionDenied'));
       return;
     }
 
@@ -1384,7 +1383,7 @@ export default class TeamBalancer extends S3PluginBase {
         DiscordHelpers.sendDiscordMessage(message.channel, { embeds: [DiscordHelpers.buildStatusEmbed(this)] });
         break;
       case 'diag': {
-        await message.channel.send('🔄 Running diagnostics... please wait.');
+        await message.channel.send(this.localize('teamBalancer.discord.commands.diagRunning'));
         const diagnostics = new TBDiagnostics(this);
         const results = await diagnostics.runAll();
 
@@ -1408,27 +1407,18 @@ export default class TeamBalancer extends S3PluginBase {
       case 'help': {
         const helpEmbed = {
           color: 0x3498db,
-          title: '📚 TeamBalancer Command Reference',
-          description: 'Available commands for Discord admins:',
+          title: this.localize('teamBalancer.discord.help.title'),
+          description: this.localize('teamBalancer.discord.help.description'),
           fields: [
-            { name: 'Plugin Commands', value: '`!teambalancer status` - Show current state & win streak\n' +
-              '`!teambalancer diag` - Run diagnostics & dry run\n' +
-              '`!teambalancer on` - Enable win streak tracking\n' +
-              '`!teambalancer off` - Disable win streak tracking\n' +
-              '`!teambalancer export` - Export the round reports JSONL file\n' +
-              '`!teambalancer clear` - Clear the round reports log file' },
-            { name: 'Scramble Commands', value: '`!scramble` - Trigger scramble (with countdown)\n' +
-              '`!scramble now` - Trigger immediate scramble\n' +
-              '`!scramble dry` - Run simulation (dry run)\n' +
-              '`!scramble matchend` - Schedule scramble at end of round\n' +
-              '`!scramble cancel` - Cancel pending countdown' }
+            { name: this.localize('teamBalancer.discord.help.fields.pluginCommands.name'), value: this.localize('teamBalancer.discord.help.fields.pluginCommands.value') },
+            { name: this.localize('teamBalancer.discord.help.fields.scrambleCommands.name'), value: this.localize('teamBalancer.discord.help.fields.scrambleCommands.value') }
           ]
         };
         DiscordHelpers.sendDiscordMessage(message.channel, { embeds: [helpEmbed] });
         break;
       }
       default:
-        await message.reply('Invalid command. Use: `status`, `diag`, `on`, `off`, `export`, `clear`, `help` or `!scramble <now|dry|cancel>`.');
+        await message.reply(this.localize('teamBalancer.discord.commands.invalidCommand'));
     }
   }
 
@@ -1437,11 +1427,11 @@ export default class TeamBalancer extends S3PluginBase {
       const logPath = path.resolve(process.cwd(), this.options.reportLogPath || 'team-balancer-reports.jsonl');
       await fs.promises.access(logPath);
       await message.reply({
-        content: '📄 Here is the TeamBalancer round reports export:',
+        content: this.localize('teamBalancer.discord.export.successContent'),
         files: [{ attachment: logPath, name: 'team-balancer-reports.jsonl' }]
       });
     } catch (err) {
-      await message.reply('❌ The round reports log file does not exist yet or cannot be accessed.');
+      await message.reply(this.localize('teamBalancer.discord.export.fileNotFound'));
     }
   }
 
@@ -1449,9 +1439,9 @@ export default class TeamBalancer extends S3PluginBase {
     try {
       const logPath = path.resolve(process.cwd(), this.options.reportLogPath || 'team-balancer-reports.jsonl');
       await fs.promises.writeFile(logPath, '');
-      await message.reply('✅ The round reports log file has been cleared.');
+      await message.reply(this.localize('teamBalancer.discord.clear.success'));
     } catch (err) {
-      await message.reply(`❌ Failed to clear the round reports log file: ${err.message}`);
+      await message.reply(this.localize('teamBalancer.discord.clear.failed', { error: err.message }));
     }
   }
 
@@ -1466,7 +1456,7 @@ export default class TeamBalancer extends S3PluginBase {
     const VALID_SCRAMBLE_ARGS = ['now', 'dry', 'matchend', 'cancel', 'confirm', 'elo'];
     const badArg = args.find(a => !VALID_SCRAMBLE_ARGS.includes(a));
     if (badArg) {
-      await message.reply(`❌ Unknown argument "${badArg}". Usage: \`!scramble [now|dry|matchend|cancel|confirm|elo]\``);
+      await message.reply(this.localize('teamBalancer.discord.scramble.unknownArg', { badArg }));
       return;
     }
 
@@ -1474,13 +1464,13 @@ export default class TeamBalancer extends S3PluginBase {
 
     if (isConfirm) {
       if (!this.scrambleConfirmation) {
-        await message.reply('⚠️ No pending scramble confirmation found.');
+        await message.reply(this.localize('teamBalancer.discord.scramble.noPendingConfirmation'));
         return;
       }
       const timeoutMs = (this.options.scrambleConfirmationTimeout || 60) * 1000;
       if (Date.now() - this.scrambleConfirmation.timestamp > timeoutMs) {
         this.scrambleConfirmation = null;
-        await message.reply('⚠️ Scramble confirmation expired.');
+        await message.reply(this.localize('teamBalancer.discord.scramble.confirmationExpired'));
         return;
       }
       args = this.scrambleConfirmation.args;
@@ -1496,32 +1486,32 @@ export default class TeamBalancer extends S3PluginBase {
 
     if (isMatchEnd) {
       if (hasNow || hasDry) {
-        await message.reply('❌ "!scramble matchend" cannot be combined with "now" or "dry".');
+        await message.reply(this.localize('teamBalancer.discord.scramble.matchEndIncompatible'));
         return;
       }
       if (this._scrambleOnRoundEnd) {
-        await message.reply('⚠️ A match-end scramble is already scheduled. It will fire when this round ends. Use `!scramble cancel` to cancel it.');
+        await message.reply(this.localize('teamBalancer.discord.scramble.matchEndAlreadyScheduled'));
         return;
       }
       const adminName = message.author?.username || 'unknown';
       await this._setScrambleArm({ name: adminName, eosID: null, scrambleType });
       Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Match-end ${hasElo ? 'micro ' : ''}scramble armed by ${adminName} (Discord)`);
       await message.reply(hasElo
-        ? '✅ Micro scramble scheduled for the end of this round. It will fire automatically when the round ends. Use `!scramble cancel` to cancel it.'
-        : '✅ Scramble scheduled for the end of this round. It will fire automatically when the round ends. Use `!scramble cancel` to cancel it.');
+        ? this.localize('teamBalancer.discord.scramble.matchEndScheduledMicro')
+        : this.localize('teamBalancer.discord.scramble.matchEndScheduled'));
       return;
     }
 
     if (isCancel) {
       this.scrambleConfirmation = null;
       const cancelled = await this.cancelPendingScramble(null, null, false);
-      if (cancelled) await message.reply('✅ Pending scramble cancelled.');
-      else if (this._scrambleInProgress) await message.reply('⚠️ Cannot cancel scramble - it is already executing.');
-      else await message.reply('⚠️ No pending scramble to cancel.');
+      if (cancelled) await message.reply(this.localize('teamBalancer.discord.scramble.cancelSuccess'));
+      else if (this._scrambleInProgress) await message.reply(this.localize('teamBalancer.discord.scramble.cannotCancelExecuting'));
+      else await message.reply(this.localize('teamBalancer.discord.scramble.noPendingToCancel'));
     } else {
       if (this._scramblePending || this._scrambleInProgress) {
         const status = this._scrambleInProgress ? 'executing' : 'pending';
-        await message.reply(`⚠️ Scramble already ${status}. Use \`!scramble cancel\` to cancel.`);
+        await message.reply(this.localize('teamBalancer.discord.scramble.alreadyActive', { status }));
         return;
       }
 
@@ -1529,10 +1519,10 @@ export default class TeamBalancer extends S3PluginBase {
         this.scrambleConfirmation = { timestamp: Date.now(), args: args };
         const scrambleKind = hasElo ? 'micro' : 'full';
         const timing = hasNow
-          ? 'immediately, with no countdown'
-          : `in ${this.options.scrambleAnnouncementDelay}s, after a countdown broadcast`;
+          ? this.localize('teamBalancer.discord.scramble.timingImmediate')
+          : this.localize('teamBalancer.discord.scramble.timingCountdown', { delay: this.options.scrambleAnnouncementDelay });
         const timeoutSec = this.options.scrambleConfirmationTimeout || 60;
-        await message.reply(`⚠️ Confirming will execute a ${scrambleKind} scramble ${timing}. Type \`!scramble confirm\` within ${timeoutSec}s to proceed.`);
+        await message.reply(this.localize('teamBalancer.discord.scramble.confirmPrompt', { scrambleKind, timing, timeoutSec }));
         return;
       }
 
@@ -1553,20 +1543,20 @@ export default class TeamBalancer extends S3PluginBase {
       }
 
       const microLabel = hasElo ? 'micro ' : '';
-      const actionDesc = hasDry ? `dry run ${microLabel}scramble (immediate)` : hasNow ? `immediate ${microLabel}scramble` : `${microLabel}scramble with countdown`;
-      let replyMsg = `🔄 Initiating ${actionDesc}...`;
+      const actionDesc = hasDry ? this.localize('teamBalancer.discord.scramble.actionDryRun', { microLabel }) : hasNow ? this.localize('teamBalancer.discord.scramble.actionImmediate', { microLabel }) : this.localize('teamBalancer.discord.scramble.actionCountdown', { microLabel });
+      let replyMsg = this.localize('teamBalancer.discord.scramble.initiating', { actionDesc });
       if (!hasDry && !hasNow) {
-        replyMsg += `\n⏳ Countdown: ${this.options.scrambleAnnouncementDelay}s\n📢 Broadcast sent to server.`;
+        replyMsg += `\n${this.localize('teamBalancer.discord.scramble.initiatingCountdownSuffix', { delay: this.options.scrambleAnnouncementDelay })}`;
       }
       await message.reply(replyMsg);
       const success = await this.initiateScramble(hasDry, hasDry || hasNow, null, null, null, scrambleType);
-      if (!success) await message.reply('❌ Failed to initiate scramble.');
+      if (!success) await message.reply(this.localize('teamBalancer.discord.scramble.initiateFailed'));
     }
   }
 
   async discordCommandToggle(message, state) {
     if (state === 'on') {
-      if (!this.manuallyDisabled) return message.reply('✅ Win streak tracking is already enabled.');
+      if (!this.manuallyDisabled) return message.reply(this.localize('teamBalancer.discord.toggle.alreadyEnabled'));
       this.manuallyDisabled = false;
       if (this.db) {
         try {
@@ -1579,7 +1569,7 @@ export default class TeamBalancer extends S3PluginBase {
       await this.server.rcon.broadcast(`${this.RconMessages.prefix} ${this.RconMessages.system.trackingEnabled}`);
       this.mirrorRconToDiscord(this.RconMessages.system.trackingEnabled, 'info');
     } else {
-      if (this.manuallyDisabled) return message.reply('✅ Win streak tracking is already disabled.');
+      if (this.manuallyDisabled) return message.reply(this.localize('teamBalancer.discord.toggle.alreadyDisabled'));
       this.manuallyDisabled = true;
       if (this.db) {
         try {
@@ -1588,7 +1578,7 @@ export default class TeamBalancer extends S3PluginBase {
           Logger.verbose('TeamBalancer', 1, `[DB] Failed to persist disabled state: ${err.message}`);
         }
       }
-      await message.reply(`✅ Win streak tracking disabled.${this.seedScrambleOffNote()}`);
+      await message.reply(`${this.localize('teamBalancer.discord.toggle.disabledSuccess')}${this.seedScrambleOffNote()}`);
       await this.resetStreak('Manual disable via Discord');
       await this.server.rcon.broadcast(`${this.RconMessages.prefix} ${this.RconMessages.system.trackingDisabled}`);
       this.mirrorRconToDiscord(this.RconMessages.system.trackingDisabled, 'info');
@@ -1630,7 +1620,7 @@ export default class TeamBalancer extends S3PluginBase {
         const armedBy = this._scrambleOnRoundEndBy;
         Logger.verbose('TeamBalancer', 2, `[onNewGame] Discarding match-end scramble arm (armed by ${armedBy?.name || 'unknown'}) — new round started.`);
         await this._setScrambleArm(null);
-        await this._notifyScrambleDiscarded(armedBy, 'a new round started before the scheduled scramble could fire');
+        await this._notifyScrambleDiscarded(armedBy, this.localize('teamBalancer.broadcasts.armDiscardedNewGameReason'));
       }
 
       try {
@@ -1740,7 +1730,7 @@ export default class TeamBalancer extends S3PluginBase {
           // through so THIS round is evaluated normally by the win-streak path below.
           Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Discarding stale match-end scramble arm: armed for matchId=${armedMatchId} but current round is matchId=${currentMatchId}.`);
           await this._setScrambleArm(null);
-          await this._notifyScrambleDiscarded(armedBy, 'a server restart carried it past the round it was armed for');
+          await this._notifyScrambleDiscarded(armedBy, this.localize('teamBalancer.broadcasts.armDiscardedRestartReason'));
         } else {
           // Same round — fire the deferred scramble.
           await this._setScrambleArm(null);
@@ -2142,6 +2132,7 @@ export default class TeamBalancer extends S3PluginBase {
       if (targetReportChannel && isDominant) {
         DiscordHelpers.sendDiscordMessage(targetReportChannel, {
           embeds: [DiscordHelpers.buildWinStreakEmbed(
+            this,
             teamNames.winnerName,
             winnerID,
             this.winStreakCount,
@@ -2212,7 +2203,7 @@ export default class TeamBalancer extends S3PluginBase {
         this.mirrorRconToDiscord(`${this.RconMessages.prefix} ${message}`, 'warning');
         const targetReportChannel = this.discordReportChannel || this.discordChannel;
         if (targetReportChannel) {
-          DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds: [DiscordHelpers.buildScrambleTriggeredEmbed('Win streak threshold reached', teamNames.winnerName, this.winStreakCount, this.options.scrambleAnnouncementDelay)] });
+          DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds: [DiscordHelpers.buildScrambleTriggeredEmbed(this, this.localize('teamBalancer.discord.embeds.winStreakThresholdReached'), teamNames.winnerName, this.winStreakCount, this.options.scrambleAnnouncementDelay)] });
         }
         this.initiateScramble(false, false).catch(err =>
           Logger.verbose('TeamBalancer', 1, `[initiateScramble] Unhandled error: ${err.message}`)
@@ -2223,7 +2214,7 @@ export default class TeamBalancer extends S3PluginBase {
       
       const targetReportChannel = this.discordReportChannel || this.discordChannel;
       if (targetReportChannel) {
-        const embed = DiscordHelpers.buildFatalErrorEmbed(err, 'Round End Processing', this);
+        const embed = DiscordHelpers.buildFatalErrorEmbed(err, this.localize('teamBalancer.onRoundEnded.roundEndProcessing'), this);
         DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
       }
 
@@ -2417,7 +2408,7 @@ export default class TeamBalancer extends S3PluginBase {
       Logger.verbose('TeamBalancer', 4, 'Scramble initiation blocked: scramble already pending or in progress.');
       return false;
     }
-    const adminName = player?.name || (steamID ? `admin ${steamID}` : 'system');
+    const adminName = player?.name || (steamID ? this.localize('teamBalancer.labels.adminSteamID', { steamID }) : this.localize('teamBalancer.labels.system'));
 
     if (isSimulated) {
       Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Simulating immediate scramble initiated by ${adminName}`);
@@ -2665,7 +2656,7 @@ export default class TeamBalancer extends S3PluginBase {
     }
 
     this._scrambleInProgress = true;    
-    const adminName = player?.name || (steamID ? `admin ${steamID}` : 'system');
+    const adminName = player?.name || (steamID ? this.localize('teamBalancer.labels.adminSteamID', { steamID }) : this.localize('teamBalancer.labels.system'));
     Logger.verbose('TeamBalancer', 4, `Scramble started by ${adminName}`);
 
     let swapPlan = null;
@@ -2974,7 +2965,7 @@ export default class TeamBalancer extends S3PluginBase {
           // (this.discordChannel), live scramble failures go to the report channel (targetReportChannel).
           const failChannel = isSimulated ? this.discordChannel : targetReportChannel;
           if (failChannel) {
-            const embedReason = isMicro ? 'No budget-sized swap reached the parity target.' : 'No valid swap solution found.';
+            const embedReason = isMicro ? 'No budget-sized swap reached the parity target.' : this.localize('teamBalancer.embeds.noValidSwapSolutionFound');
             const embed = DiscordHelpers.buildScrambleFailedEmbed(embedReason, swapPlan?.calculationTime || 0, this);
             DiscordHelpers.sendDiscordMessage(failChannel, { embeds: [embed] });
           }
@@ -2994,7 +2985,7 @@ export default class TeamBalancer extends S3PluginBase {
       
       const targetReportChannel = this.discordReportChannel || this.discordChannel;
       if (targetReportChannel) {
-        const embed = DiscordHelpers.buildFatalErrorEmbed(error, 'Scramble Execution', this);
+        const embed = DiscordHelpers.buildFatalErrorEmbed(error, this.localize('teamBalancer.labels.scrambleExecution'), this);
         DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
       }
 
@@ -3039,12 +3030,12 @@ export default class TeamBalancer extends S3PluginBase {
     this._clearPendingScrambleCountdown();
 
     const adminName = player?.name || steamID; // Prioritize player name
-    const cancelReason = isAutomatic ? 'automatically' : `by admin ${adminName}`;
+    const cancelReason = isAutomatic ? this.localize('teamBalancer.labels.cancelReasonAutomatic') : this.localize('teamBalancer.labels.cancelReasonAdmin', { adminName });
 
     Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Scramble countdown cancelled ${cancelReason}`);
 
       if (!isAutomatic) {
-      const msg = `${this.RconMessages.prefix} Scramble cancelled by admin.`;
+      const msg = `${this.RconMessages.prefix} ${this.localize('teamBalancer.rcon.scrambleCancelledByAdmin')}`;
       Logger.verbose('TeamBalancer', 4, `Broadcasting: "${msg}"`);
       try {
         await this.server.rcon.broadcast(msg);
@@ -3174,7 +3165,7 @@ export default class TeamBalancer extends S3PluginBase {
     try {
       const embed = {
         color: parseInt((colors[type] || colors.info).replace('#', ''), 16),
-        description: `📢 **Server Broadcast**\n${message}`,
+        description: this.localize('teamBalancer.embeds.discordServerBroadcastDescription', { message }),
         timestamp: new Date().toISOString()
       };
       DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds: [embed] });

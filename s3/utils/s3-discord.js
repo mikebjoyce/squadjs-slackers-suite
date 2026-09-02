@@ -142,8 +142,11 @@ class WatchManager {
       sendDiscordMessage(channel, {
         embeds: [{
           color: 0x95a5a6,
-          title: '⏰ Watch Expired',
-          description: `Watch for \`${[...services].join(', ')}\` automatically stopped after ${this._formatDuration(this.defaultWatchDurationMs)}.`,
+          title: this.plugin.localize('slackersSquadServices.watch.watchExpired'),
+          description: this.plugin.localize('slackersSquadServices.watch.watchForServicesAutomatically', {
+            services: [...services].join(', '),
+            duration: this._formatDuration(this.defaultWatchDurationMs)
+          }),
           timestamp: new Date().toISOString()
         }]
       }, 'S3', (...args) => this.plugin.verbose(...args)).catch(() => {});
@@ -220,6 +223,8 @@ class WatchManager {
             sendDiscordMessage(watch.channel, {
               embeds: [{
                 color: 0x2c3e50,
+                // Not localized: the body is raw SquadJS verbose output, and a
+                // translated header on an English log line reads worse than either.
                 title: `${levelLabel} [${svc}] Verbose L${level}`,
                 description: `\`\`\`\n${truncated}\n\`\`\``,
                 timestamp: new Date().toISOString()
@@ -305,7 +310,7 @@ export function registerS3DiscordCommands(plugin) {
         await handler(plugin, message, args);
       } else {
         // Unknown command — show help
-        const embed = buildHelpEmbed();
+        const embed = buildHelpEmbed(plugin);
         await sendDiscordMessage(message.channel, { embeds: [embed] }, 'S3', (...a) => plugin.verbose(...a));
       }
     } catch (err) {
@@ -314,7 +319,7 @@ export function registerS3DiscordCommands(plugin) {
       await sendDiscordMessage(message.channel, {
         embeds: [{
           color: 0xe74c3c,
-          title: `⚠️ Error: !s3 ${sub}`,
+          title: plugin.localize('slackersSquadServices.onDiscordMessage.errorS3Sub', { sub }),
           description: `**${err.message}**`,
           timestamp: new Date().toISOString()
         }]

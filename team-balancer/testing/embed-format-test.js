@@ -17,6 +17,7 @@
  */
 import assert from 'assert';
 import { DiscordHelpers } from '../utils/tb-discord-helpers.js';
+import localize from '../../s3/utils/s3-i18n.js';
 
 let failures = 0;
 const check = (label, fn) => {
@@ -33,7 +34,8 @@ const player = (eosID, name, teamID, squadID) => ({ eosID, name, teamID, squadID
 
 const makeBalancer = (players, squads) => ({
   server: { players, squads },
-  getTeamName: (id) => (String(id) === '1' ? 'USA' : 'RGF')
+  getTeamName: (id) => (String(id) === '1' ? 'USA' : 'RGF'),
+  localize: (key, vars) => localize(key, vars, 'en')
 });
 
 const withPlan = (moves, extras = {}) => {
@@ -377,7 +379,7 @@ check('pushChunkedFields returns what it dropped and appends no notice of its ow
 
   let dropped = 0;
   for (const dir of ['A', 'B', 'C', 'D']) {
-    dropped += DiscordHelpers.pushChunkedFields(embed, Array.from({ length: 40 }, (_, b) => block(b)),
+    dropped += DiscordHelpers.pushChunkedFields(makeBalancer([], []), embed, Array.from({ length: 40 }, (_, b) => block(b)),
       `🔗 Team 1 (USA) ➔ Team 2 (RGF) Clan Grouping (Virtual Squads) ${dir}`, '[96 players]');
   }
 

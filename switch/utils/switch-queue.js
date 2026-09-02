@@ -99,7 +99,7 @@ const SwitchQueue = {
         const existing = plugin._findQueueEntry(eosID).entry;
         const remaining = (plugin._getRemainingQueueMs(existing.queuedAt) / 60000).toFixed(1);
         plugin.warn(eosID,
-          `[Switch Queue]\nYou are already in the queue.\n~${remaining}m auto-expiry | Team ${existing.currentTeamID} → Team ${existing.targetTeamID}\nType !switch cancel to leave.`
+          plugin.localize('switch.warn.switchQueueAlreadyQueue', { remaining, currentTeamID: existing.currentTeamID, targetTeamID: existing.targetTeamID })
         );
         return;
       }
@@ -117,7 +117,7 @@ const SwitchQueue = {
         const pos = sameTeam.findIndex(e => e.eosID === eosID) + 1;
 
         plugin.warn(entry.eosID,
-          `[Switch Queue]\nPosition ${pos} in the queue.\n~${remaining}m remaining | Team ${entry.currentTeamID} → Team ${entry.targetTeamID}\nType !switch cancel to leave.`
+          plugin.localize('switch.warn.switchQueuePositionQueue', { pos, remaining, currentTeamID: entry.currentTeamID, targetTeamID: entry.targetTeamID })
         );
       }, 30_000);
 
@@ -128,7 +128,7 @@ const SwitchQueue = {
       plugin._updateMaxQueueSize();
 
       plugin.warn(eosID,
-        `[Switch Queue]\nAdded to position ${enqueuePos} in the queue.\n~${(plugin._getRemainingQueueMs(queuedAt) / 60000).toFixed(1)}m auto-expiry | Team ${teamID} → Team ${targetTeam}\n${reason}\nType !switch cancel to leave.`
+        plugin.localize('switch.warn.switchQueueAddedPosition', { enqueuePos, remainingQueueMs: (plugin._getRemainingQueueMs(queuedAt) / 60000).toFixed(1), teamID, targetTeam, reason })
       );
       plugin.verbose(1, `[Queue] ${playerName} (T${teamID} → T${targetTeam}) enqueued at position ${enqueuePos}. Queue size: ${plugin._getQueueSize()}`);
 
@@ -216,7 +216,7 @@ const SwitchQueue = {
       plugin.verbose(1, `[Queue] forceQueueSwap: Initiating handshake swap for ${entry.playerName}. Queue size: ${plugin._getQueueSize()}`);
 
       try {
-        plugin.warn(entry.eosID, '[Switch Queue] Swap partner found — switching now.');
+        plugin.warn(entry.eosID, plugin.localize('switch.warn.switchQueueSwapPartner'));
         await plugin._taggedSwitchPlayer(eosID, 'Handshake-Swap');
 
         if (!plugin.isLiberalMode()) {
@@ -251,14 +251,14 @@ const SwitchQueue = {
               if (row) {
                 const balance = row.tokenBalance != null ? row.tokenBalance : plugin.options.maxSwitchTokens;
                 if (balance > 0) {
-                  plugin.warn(entry.eosID, `[Switch] Switched! ${balance}/${plugin.options.maxSwitchTokens} tokens remaining.`);
+                  plugin.warn(entry.eosID, plugin.localize('switch.warn.switchSwitchedTokensRemaining', { balance, maxSwitchTokens: plugin.options.maxSwitchTokens }));
                 } else {
                   const cooldownDuration = plugin.options.switchCooldownMinutes > 0
                     ? plugin.options.switchCooldownMinutes * 60 * 1000
                     : plugin.options.switchCooldownHours * 60 * 60 * 1000;
                   const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
                   const remaining = Math.ceil((cooldownDuration - (Date.now() - anchor)) / 60000);
-                  plugin.warn(entry.eosID, `[Switch] Switched! You're out of tokens — next one in ~${remaining}m.`);
+                  plugin.warn(entry.eosID, plugin.localize('switch.warn.switchSwitchedReOut', { remaining }));
                 }
               }
             }
@@ -332,7 +332,7 @@ const SwitchQueue = {
                   gamePhase
                 });
               }
-              plugin.warn(entry.eosID, `[Switch Queue] Removed — queue timeout reached.\nYour ${plugin.options.queueTimeoutMinutes}m queue timeout expired while waiting.\nUse !switch explain for details.`);
+              plugin.warn(entry.eosID, plugin.localize('switch.warn.switchQueueRemovedQueue', { queueTimeoutMinutes: plugin.options.queueTimeoutMinutes }));
               plugin.verbose(2, `[Queue] ${entry.playerName} expired and removed from queue.`);
             }
           }
@@ -396,7 +396,7 @@ const SwitchQueue = {
               plugin._roundStats.queueRemovals.push({ name: p1.playerName, eosID: p1.eosID, reason: 'team_changed', gamePhase });
             }
             plugin.verbose(1, `[Queue] ${p1.playerName} team changed — removed from queue (now on target team T${s3p1.teamID}).`);
-            plugin.warn(p1.eosID, `[Switch Queue] You are now on team ${s3p1.teamID}.\nYour switch request is complete.`);
+            plugin.warn(p1.eosID, plugin.localize('switch.warn.switchQueueNowTeam', { teamID: s3p1.teamID }));
             continue;
           }
           const s3p2 = plugin._s3?.players?.isReady() ? plugin._s3.players.getPlayer(p2.eosID) : null;
@@ -425,7 +425,7 @@ const SwitchQueue = {
               plugin._roundStats.queueRemovals.push({ name: p2.playerName, eosID: p2.eosID, reason: 'team_changed', gamePhase });
             }
             plugin.verbose(1, `[Queue] ${p2.playerName} team changed — removed from queue (now on target team T${s3p2.teamID}).`);
-            plugin.warn(p2.eosID, `[Switch Queue] You are now on team ${s3p2.teamID}.\nYour switch request is complete.`);
+            plugin.warn(p2.eosID, plugin.localize('switch.warn.switchQueueNowTeam', { teamID: s3p2.teamID }));
             continue;
           }
 
@@ -443,8 +443,8 @@ const SwitchQueue = {
           plugin._removePlayerFromQueue(p1.eosID);
           plugin._removePlayerFromQueue(p2.eosID);
 
-          plugin.warn(p1.eosID, '[Switch Queue] Swap partner found — switching now.');
-          plugin.warn(p2.eosID, '[Switch Queue] Swap partner found — switching now.');
+          plugin.warn(p1.eosID, plugin.localize('switch.warn.switchQueueSwapPartner'));
+          plugin.warn(p2.eosID, plugin.localize('switch.warn.switchQueueSwapPartner'));
 
           await plugin._taggedSwitchPlayer(p1.eosID, 'Player-Queue');
           await plugin._taggedSwitchPlayer(p2.eosID, 'Player-Queue');
@@ -490,14 +490,14 @@ const SwitchQueue = {
                   if (row) {
                     const balance = row.tokenBalance != null ? row.tokenBalance : plugin.options.maxSwitchTokens;
                     if (balance > 0) {
-                      plugin.warn(p.eosID, `[Switch] Switched! ${balance}/${plugin.options.maxSwitchTokens} tokens remaining.`);
+                      plugin.warn(p.eosID, plugin.localize('switch.warn.switchSwitchedTokensRemaining', { balance, maxSwitchTokens: plugin.options.maxSwitchTokens }));
                     } else {
                       const cooldownDuration = plugin.options.switchCooldownMinutes > 0
                         ? plugin.options.switchCooldownMinutes * 60 * 1000
                         : plugin.options.switchCooldownHours * 60 * 60 * 1000;
                       const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
                       const remaining = Math.ceil((cooldownDuration - (Date.now() - anchor)) / 60000);
-                      plugin.warn(p.eosID, `[Switch] Switched! You're out of tokens — next one in ~${remaining}m.`);
+                      plugin.warn(p.eosID, plugin.localize('switch.warn.switchSwitchedReOut', { remaining }));
                     }
                   }
                 } catch (e) {
@@ -569,7 +569,7 @@ const SwitchQueue = {
               plugin._roundStats.queueRemovals.push({ name: entry.playerName, eosID: entry.eosID, reason: 'team_changed', gamePhase });
             }
             plugin.verbose(1, `[Queue] ${entry.playerName} team changed — removed from queue (now on target team T${s3Entry.teamID}).`);
-            plugin.warn(entry.eosID, `[Switch Queue] You are now on team ${s3Entry.teamID}.\nYour switch request is complete.`);
+            plugin.warn(entry.eosID, plugin.localize('switch.warn.switchQueueNowTeam', { teamID: s3Entry.teamID }));
             continue;
           }
 
@@ -601,7 +601,7 @@ const SwitchQueue = {
 
             plugin._removePlayerFromQueue(entry.eosID);
 
-            plugin.warn(entry.eosID, timedOut ? '[Switch Queue] Queue timeout — switching now.' : '[Switch Queue] Balance slot opened — switching now.');
+            plugin.warn(entry.eosID, timedOut ? plugin.localize('switch.warn.switchQueueQueueTimeout') : plugin.localize('switch.warn.switchQueueBalanceSlot'));
             await plugin._taggedSwitchPlayer(entry.eosID, 'Player-Queue');
 
             if (!plugin.isLiberalMode()) {
@@ -638,14 +638,14 @@ const SwitchQueue = {
                   if (row) {
                     const balance = row.tokenBalance != null ? row.tokenBalance : plugin.options.maxSwitchTokens;
                     if (balance > 0) {
-                      plugin.warn(entry.eosID, `[Switch] Switched! ${balance}/${plugin.options.maxSwitchTokens} tokens remaining.`);
+                      plugin.warn(entry.eosID, plugin.localize('switch.warn.switchSwitchedTokensRemaining', { balance, maxSwitchTokens: plugin.options.maxSwitchTokens }));
                     } else {
                       const cooldownDuration = plugin.options.switchCooldownMinutes > 0
                         ? plugin.options.switchCooldownMinutes * 60 * 1000
                         : plugin.options.switchCooldownHours * 60 * 60 * 1000;
                       const anchor = row.tokenRegenAnchor ? new Date(row.tokenRegenAnchor).getTime() : Date.now();
                       const remaining = Math.ceil((cooldownDuration - (Date.now() - anchor)) / 60000);
-                      plugin.warn(entry.eosID, `[Switch] Switched! You're out of tokens — next one in ~${remaining}m.`);
+                      plugin.warn(entry.eosID, plugin.localize('switch.warn.switchSwitchedReOut', { remaining }));
                     }
                   }
                 }

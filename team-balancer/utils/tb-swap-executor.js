@@ -304,6 +304,7 @@ export default class SwapExecutor {
       const targetReportChannel = this.teamBalancer.discordReportChannel || this.teamBalancer.discordChannel;
       if (targetReportChannel) {
         const embed = DiscordHelpers.buildScrambleCompletedEmbed(
+          this.teamBalancer,
           totalMoves,
           movedSuccessfully,
           failedToMove,

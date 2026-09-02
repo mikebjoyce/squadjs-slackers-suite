@@ -37,6 +37,10 @@ const CATEGORY_TESTS = {
     'test-s3-plugin-base-lifecycle.js',
     'test-s3-plugin-base-db.js',
     'test-s3-discord-plugin-base.js',
+    // Static only — no DB, no server. Sits in category 1 because a broken
+    // catalogue makes every downstream plugin's log output nonsense, so it
+    // should fail before the slower suites spend four minutes on it.
+    'test-i18n.js',
     'test-s3-export-import.js',
     'test-s3-commands.js',
     'test-inspection-embeds.js',

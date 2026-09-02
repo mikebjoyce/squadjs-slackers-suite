@@ -50,6 +50,72 @@ import Logger from '../../core/logger.js';
 import { DiscordHelpers } from './tb-discord-helpers.js';
 import { TBDiagnostics } from './tb-diagnostics.js';
 
+/**
+ * Round-end broadcasts and scramble announcements — the most-read text in the
+ * suite, seen by every player after every round.
+ *
+ * Every leaf is a live getter rather than a fixed string. register() runs from
+ * the TeamBalancer constructor, which is BEFORE prepareToMount() discovers S³,
+ * so tb.lang is still the default there: a plain object built here would pin
+ * these broadcasts to English for the life of the process. SwapExecutor is
+ * handed this same object in that constructor and keeps the reference, so the
+ * object identity has to stay stable while the values resolve at read time.
+ *
+ * No vars are passed to localize(), so {team}/{margin}/... come back intact and
+ * tb.formatMessage() substitutes them at the call site exactly as before.
+ */
+const RCON_MESSAGE_PATHS = [
+  'draw',
+  'nonDominant.streakBroken',
+  'nonDominant.invasionAttackWin',
+  'nonDominant.invasionDefendWin',
+  'nonDominant.narrowVictory',
+  'nonDominant.marginalVictory',
+  'nonDominant.tacticalAdvantage',
+  'nonDominant.operationalSuperiority',
+  'dominant.steamrolled',
+  'dominant.stomped',
+  'dominant.dominantVictory',
+  'dominant.invasionAttackStomp',
+  'dominant.invasionDefendStomp',
+  'scrambleAnnouncement',
+  'consecutiveWinsScramble',
+  'singleRoundScramble',
+  'manualScrambleAnnouncement',
+  'immediateManualScramble',
+  'manualMicroScrambleAnnouncement',
+  'immediateManualMicroScramble',
+  'executeScrambleMessage',
+  'executeDryRunMessage',
+  'scrambleCompleteMessage',
+  'scrambleFailedMessage',
+  'playerScrambledWarning',
+  'seedScrambleAnnouncement',
+  'microScrambleAnnouncement',
+  'microScrambleCompleteMessage',
+  'microScrambleFailedMessage',
+  'system.trackingEnabled',
+  'system.trackingDisabled'
+];
+
+function buildRconMessages(tb) {
+  // Not localized: a log/broadcast tag, not prose.
+  const root = { prefix: '[TeamBalancer]' };
+
+  for (const p of RCON_MESSAGE_PATHS) {
+    const segs = p.split('.');
+    let cur = root;
+    for (const s of segs.slice(0, -1)) cur = (cur[s] ??= {});
+    Object.defineProperty(cur, segs.at(-1), {
+      enumerable: true,
+      configurable: true,
+      get: () => tb.localize(`teamBalancer.rconMessages.${p}`)
+    });
+  }
+
+  return root;
+}
+
 const CommandHandlers = {
   register(tb) {
     tb.respond = async function (player, msg) {
@@ -80,58 +146,7 @@ const CommandHandlers = {
       return template;
     };
 
-    tb.RconMessages = {
-      prefix: '[TeamBalancer]',
-      draw: 'Round ended in a Draw!',
-
-      nonDominant: {
-        streakBroken: "{team} ended {loser}'s domination streak | ({margin} tickets)",
-        invasionAttackWin: '{team} defeated defenders | ({margin} tickets)',
-        invasionDefendWin: '{team} held off attackers | ({margin} tickets)',
-
-        narrowVictory: '{team} narrowly defeated {loser} | ({margin} tickets)',
-        marginalVictory: '{team} gained ground on {loser} | ({margin} tickets)',
-        tacticalAdvantage: '{team} pushed through {loser} | ({margin} tickets)',
-        operationalSuperiority: '{team} outmaneuvered {loser} | ({margin} tickets)'
-      },
-
-      dominant: {
-        steamrolled: '{team} steamrolled {loser} | ({margin} tickets)',
-        stomped: '{team} stomped {loser} | ({margin} tickets)',
-        dominantVictory: '{team} dominated {loser} | ({margin} tickets)',
-        invasionAttackStomp: '{team} crushed defenders with force | ({margin} tickets)',
-        invasionDefendStomp: '{team} decisively repelled attackers | ({margin} tickets)'
-      },
-
-      scrambleAnnouncement:
-        '{team} has reached {count} dominant wins ({margin} tickets) | Scrambling in {delay}s...',
-      consecutiveWinsScramble:
-        '{team} has won {count} consecutive rounds | Scrambling in {delay}s...',
-      singleRoundScramble:
-        'Extreme ticket difference detected ({margin} tickets) | Scrambling in {delay}s...',
-      manualScrambleAnnouncement:
-        'Manual team balance triggered by admin | Scrambling in {delay}s...',
-      immediateManualScramble: 'Manual team balance triggered by admin | Scrambling teams...',
-      manualMicroScrambleAnnouncement:
-        'Manual micro scramble triggered by admin | Scrambling in {delay}s...',
-      immediateManualMicroScramble:
-        'Manual micro scramble triggered by admin | Scrambling teams...',
-      executeScrambleMessage: 'Executing scramble...',
-      executeDryRunMessage: 'Dry Run: Simulating scramble...',
-      scrambleCompleteMessage: 'Balance has been restored.',
-      scrambleFailedMessage: 'Scramble failed! No valid solution found.',
-      playerScrambledWarning: "You've been scrambled.",
-      seedScrambleAnnouncement: 'Seed match complete! Scrambling teams in {delay}s...',
-      microScrambleAnnouncement:
-        'Team imbalance detected ({margin}-ticket margin) | Micro scramble in {delay}s...',
-      microScrambleCompleteMessage: 'Balance has been restored. (Micro scramble)',
-      microScrambleFailedMessage: 'No balance change needed. (Micro scramble)',
-
-      system: {
-        trackingEnabled: 'Team Balancer has been enabled.',
-        trackingDisabled: 'Team Balancer has been disabled.'
-      }
-    };
+    tb.RconMessages = buildRconMessages(tb);
 
     tb.onChatMessage = async function (info) {
       const message = info.message?.trim();
@@ -153,23 +168,23 @@ const CommandHandlers = {
         const hours = Math.floor(minutes / 60);
 
         if (hours > 0) {
-          lastScrambleText = `${hours} hour${hours > 1 ? 's' : ''} ago`;
+          lastScrambleText = tb.localize(hours === 1 ? 'teamBalancer.status.hourAgo' : 'teamBalancer.status.hoursAgo', { hours });
         } else {
-          lastScrambleText = `${minutes} minute${minutes !== 1 ? 's' : ''} ago`;
+          lastScrambleText = tb.localize(minutes === 1 ? 'teamBalancer.status.minuteAgo' : 'teamBalancer.status.minutesAgo', { minutes });
         }
       }
       const statusText = !this.ready
         ? 'Initializing...'
         : this.manuallyDisabled
-        ? 'Manually disabled'
+        ? tb.localize('teamBalancer.status.manuallyDisabled')
         : this.options.enableWinStreakTracking
         ? 'Active'
-        : 'Disabled in config';
+        : tb.localize('teamBalancer.status.disabledConfig');
 
       const winStreakText =
         this.winStreakCount > 0
-          ? `${this.getTeamName(this.winStreakTeam)} has ${this.winStreakCount} dominant win(s)`
-          : `No current win streak`;
+          ? tb.localize('teamBalancer.status.hasDominantWinS', { teamName: this.getTeamName(this.winStreakTeam), winStreakCount: this.winStreakCount })
+          : tb.localize('teamBalancer.status.noCurrentWinStreak');
 
       const eloTrackerPlugin = this.server.plugins?.find(p => p.constructor.name === 'EloTracker');
       const eloStatus = this.options?.useEloForBalance ? (eloTrackerPlugin ? 'Active' : 'Unavailable') : 'Disabled';
@@ -179,10 +194,10 @@ const CommandHandlers = {
         `=== TeamBalancer ===`,
         `Version: ${this.constructor.version}`,
         `Status: ${statusText}`,
-        `Elo Integration: ${eloStatus}`,
-        `Dominance Streak: ${winStreakText}`,
-        `Last Scramble: ${lastScrambleText}`,
-        `Max Streak Threshold: ${this.options.maxWinStreak} dominant win(s)`
+        tb.localize('teamBalancer.status.eloIntegration', { eloStatus }),
+        tb.localize('teamBalancer.status.dominanceStreak', { winStreakText }),
+        tb.localize('teamBalancer.status.lastScramble', { lastScrambleText }),
+        tb.localize('teamBalancer.status.maxStreakThresholdDominant', { maxWinStreak: this.options.maxWinStreak })
       ].join('\n');
 
       Logger.verbose('TeamBalancer', 4, `[TeamBalancer] !teambalancer response sent to ${playerName} (${steamID}):\n${infoMsg}`);
@@ -220,7 +235,7 @@ const CommandHandlers = {
         const msg = message.trim().toLowerCase();
         // Allow 'status' to pass through so admins can see the "INITIALIZING" state
         if (!msg.startsWith('status')) {
-          return await this.respond(command.player || { steamID: command.steamID }, 'TeamBalancer is still initializing, please try again in a moment.');
+          return await this.respond(command.player || { steamID: command.steamID }, tb.localize('teamBalancer.warn.teambalancerStillInitializingPlease'));
         }
       }
 
@@ -231,7 +246,7 @@ const CommandHandlers = {
         switch (subcommand) {
           case 'on': {
             if (!this.manuallyDisabled) {
-              return await this.respond(player, 'Win streak tracking is already enabled.');
+              return await this.respond(player, tb.localize('teamBalancer.warn.winStreakTrackingAlready'));
             }
             this.manuallyDisabled = false;
             try {
@@ -251,9 +266,9 @@ const CommandHandlers = {
             if (this.discordChannel) {
               const embed = {
                 color: 0x3498db,
-                title: '🎮 In-Game Command: !teambalancer on',
-                description: `Executed by **${adminName}**`,
-                fields: [{ name: 'Response', value: this.enableConfirmationText(), inline: false }],
+                title: tb.localize('teamBalancer.status.gameCommandTeambalancer'),
+                description: tb.localize('teamBalancer.status.executedBy', { adminName }),
+                fields: [{ name: tb.localize('teamBalancer.status.response'), value: this.enableConfirmationText(), inline: false }],
                 timestamp: new Date().toISOString()
               };
               await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
@@ -262,7 +277,7 @@ const CommandHandlers = {
           }
           case 'off': {
             if (this.manuallyDisabled) {
-              return await this.respond(player, 'Win streak tracking is already disabled.');
+              return await this.respond(player, tb.localize('teamBalancer.warn.winStreakTrackingAlready2'));
             }
             this.manuallyDisabled = true;
             try {
@@ -271,7 +286,7 @@ const CommandHandlers = {
               Logger.verbose('TeamBalancer', 1, `[DB] Failed to persist disabled state: ${err.message}`);
             }
             Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Win streak tracking disabled by ${adminName}`);
-            const response = await this.respond(player, `Win streak tracking disabled.${this.seedScrambleOffNote()}`);
+            const response = await this.respond(player, tb.localize('teamBalancer.warn.winStreakTrackingDisabled', { seedScrambleOffNote: this.seedScrambleOffNote() }));
             try {
               await this.server.rcon.broadcast(
                 `${this.RconMessages.prefix} ${this.RconMessages.system.trackingDisabled}`
@@ -283,9 +298,9 @@ const CommandHandlers = {
               try {
                 const embed = {
                   color: 0x3498db,
-                  title: '🎮 In-Game Command: !teambalancer off',
-                  description: `Executed by **${adminName}**`,
-                fields: [{ name: 'Response', value: `Win streak tracking disabled.${this.seedScrambleOffNote()}`, inline: false }],
+                  title: tb.localize('teamBalancer.status.gameCommandTeambalancerOff'),
+                  description: tb.localize('teamBalancer.status.executedBy', { adminName }),
+                fields: [{ name: tb.localize('teamBalancer.status.response'), value: tb.localize('teamBalancer.status.winStreakTrackingDisabled', { seedScrambleOffNote: this.seedScrambleOffNote() }), inline: false }],
                   timestamp: new Date().toISOString()
                 };
                 await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
@@ -301,22 +316,22 @@ const CommandHandlers = {
             const effectiveStatus = !this.ready
               ? 'INITIALIZING'
               : this.manuallyDisabled
-              ? 'DISABLED (manual)'
+              ? tb.localize('teamBalancer.status.disabledManual')
               : this.options.enableWinStreakTracking
               ? 'ENABLED'
-              : 'DISABLED (config)';
+              : tb.localize('teamBalancer.status.disabledConfig2');
 
             // Win Streak with Threshold
             const maxStreak = this.options?.maxWinStreak || 2;
             const winStreakText = this.winStreakTeam
               ? `${this.getTeamName(this.winStreakTeam)}: ${this.winStreakCount} / ${maxStreak} wins`
-              : `None (Threshold: ${maxStreak} wins)`;
+              : tb.localize('teamBalancer.status.noneThresholdWins', { maxStreak });
 
             const maxConsec = this.options.maxConsecutiveWinsWithoutThreshold;
             const consecText = maxConsec > 0
               ? (this.consecutiveWinsTeam
                   ? `${this.getTeamName(this.consecutiveWinsTeam)}: ${this.consecutiveWinsCount} / ${maxConsec} wins`
-                  : `None (Threshold: ${maxConsec} wins)`)
+                  : tb.localize('teamBalancer.status.noneThresholdWins2', { maxConsec }))
               : 'Disabled';
 
             // Format the last scramble timestamp (Relative for in-game)
@@ -326,9 +341,9 @@ const CommandHandlers = {
               const mins = Math.floor(diff / 60000);
               const hours = Math.floor(mins / 60);
               if (hours > 0) {
-                lastScrambleText = `${hours}h ${mins % 60}m ago`;
+                lastScrambleText = tb.localize('teamBalancer.status.hMAgo', { hours, value: mins % 60 });
               } else {
-                lastScrambleText = `${mins}m ago`;
+                lastScrambleText = tb.localize('teamBalancer.status.mAgo', { mins });
               }
             }
 
@@ -346,15 +361,15 @@ const CommandHandlers = {
 
             // Formatted response for !teambalancer status
             const statusMsg = [
-              `--- TeamBalancer Status ---`,
+              tb.localize('teamBalancer.status.teambalancerStatus'),
               `Version: ${this.constructor.version}`,
-              `Plugin Status: ${effectiveStatus}`,
-              `Elo Integration: ${eloStatus}`,
-              `Win Streak: ${winStreakText}`,
-              `Consecutive Wins: ${consecText}`,
-              `Seed Auto Scramble: ${this.seedAutoScrambleStatus()}`,
-              `Last Scramble: ${lastScrambleText}`,
-              `Players: ${players.length} (T1: ${t1Count} | T2: ${t2Count})`,
+              tb.localize('teamBalancer.status.pluginStatus', { effectiveStatus }),
+              tb.localize('teamBalancer.status.eloIntegration', { eloStatus }),
+              tb.localize('teamBalancer.status.winStreak', { winStreakText }),
+              tb.localize('teamBalancer.status.consecutiveWins', { consecText }),
+              tb.localize('teamBalancer.status.seedAutoScramble', { seedAutoScrambleStatus: this.seedAutoScrambleStatus() }),
+              tb.localize('teamBalancer.status.lastScramble', { lastScrambleText }),
+              tb.localize('teamBalancer.status.playersT1T2', { value: players.length, t1Count, t2Count }),
               `Layer: ${currentLayer}`,
               `---------------------------`
             ].join('\n');
@@ -362,29 +377,31 @@ const CommandHandlers = {
             const response = await this.respond(player, statusMsg);
             if (this.discordChannel) {
               const embed = DiscordHelpers.buildStatusEmbed(this);
-              embed.description = `Executed by **${adminName}**`;
+              embed.description = tb.localize('teamBalancer.status.executedBy', { adminName });
               await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
             }
             return response;
           }
           case 'diag': {
             Logger.verbose('TeamBalancer', 4, 'Diagnostics command received.');
-            await this.server.rcon.warn(player?.name || steamID, 'Running diagnostics... please wait.');
+            await this.server.rcon.warn(player?.name || steamID, tb.localize('teamBalancer.warn.runningDiagnosticsPleaseWait'));
 
             const diagnostics = new TBDiagnostics(this);
             const results = await diagnostics.runAll();
 
-            const s3Result = results.find((r) => r.name === 'S³ Integration');
-            const scrambleResult = results.find((r) => r.name === 'Live Scramble Test');
+            // By id, not by name: the name is display text and moves with the
+            // configured language, so matching on it worked in English only.
+            const s3Result = results.find((r) => r.id === 's3Integration');
+            const scrambleResult = results.find((r) => r.id === 'scrambler');
 
             const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
             // Page 1/3: Diagnostic results
             await this.respond(player, [
-              `--- [TB Diag] ---`,
+              tb.localize('teamBalancer.status.tbDiag'),
               `S³: ${s3Result.pass ? 'PASS' : 'FAIL'}`,
-              `Scramble: ${scrambleResult.message}`,
-              `State: ${this.manuallyDisabled ? 'DISABLED' : 'ENABLED'}`
+              tb.localize('teamBalancer.status.diagScramble', { message: scrambleResult.message }),
+              tb.localize('teamBalancer.status.diagState', { value: this.manuallyDisabled ? 'DISABLED' : 'ENABLED' })
             ].join('\n'));
             await sleep(5500);
 
@@ -404,30 +421,34 @@ const CommandHandlers = {
             const team2Name = this.getTeamName(2);
 
             await this.respond(player, [
-              `Scramble Pending: ${this._scramblePending ? 'Yes' : 'No'}`,
-              `Scramble Active: ${this._scrambleInProgress ? 'Yes' : 'No'}`,
-              `Plyrs: ${players.length} (T1: ${t1Players.length} | T2: ${t2Players.length})`,
-              `Squads: ${squads.length} (T1: ${t1Squads.length} | T2: ${t2Squads.length})`,
-              `Layer: ${layerName} / ${gameMode}`
+              tb.localize('teamBalancer.status.scramblePending', { value: this._scramblePending ? 'Yes' : 'No' }),
+              tb.localize('teamBalancer.status.scrambleActive', { value: this._scrambleInProgress ? 'Yes' : 'No' }),
+              tb.localize('teamBalancer.status.plyrsT1T2', { value: players.length, value2: t1Players.length, value3: t2Players.length }),
+              tb.localize('teamBalancer.status.squadsT1T2', { value: squads.length, value2: t1Squads.length, value3: t2Squads.length }),
+              tb.localize('teamBalancer.status.diagLayer', { layerName, gameMode })
             ].join('\n'));
             await sleep(5500);
 
             // Page 3/3: Key config
             await this.respond(player, [
-              `Thresholds: ${this.options.maxWinStreak} wins / ${this.options?.minTicketsToCountAsDominantWin || 150} tix`,
-              `Scramble: ${(this.options?.scramblePercentage || 0.5) * 100}% | ${this.options?.scrambleAnnouncementDelay}s (Seed: ${this.options?.seedScrambleAnnouncementDelay}s) | ${this.options?.maxScrambleCompletionTime}ms`,
-              `Teams: ${team1Name} | ${team2Name}`,
-              `1-Round: ${this.options?.enableSingleRoundScramble ? `ON (> ${this.options?.singleRoundScrambleThreshold} tix)` : 'OFF'}`,
-              `Invasion: Atk ${this.options?.invasionAttackTeamThreshold} | Def ${this.options?.invasionDefenceTeamThreshold}`,
+              tb.localize('teamBalancer.status.thresholdsWinsTix', { maxWinStreak: this.options.maxWinStreak, value: this.options?.minTicketsToCountAsDominantWin || 150 }),
+              tb.localize('teamBalancer.status.scrambleSSeedS', { value: (this.options?.scramblePercentage || 0.5) * 100, scrambleAnnouncementDelay: this.options?.scrambleAnnouncementDelay, seedScrambleAnnouncementDelay: this.options?.seedScrambleAnnouncementDelay, maxScrambleCompletionTime: this.options?.maxScrambleCompletionTime }),
+              tb.localize('teamBalancer.status.diagTeams', { team1Name, team2Name }),
+              tb.localize('teamBalancer.status.diagSingleRound', {
+                value: this.options?.enableSingleRoundScramble
+                  ? `ON (> ${this.options?.singleRoundScrambleThreshold} tix)`
+                  : 'OFF'
+              }),
+              tb.localize('teamBalancer.status.invasionAtkDef', { invasionAttackTeamThreshold: this.options?.invasionAttackTeamThreshold, invasionDefenceTeamThreshold: this.options?.invasionDefenceTeamThreshold }),
               // Kept on its own short line: 'std' rather than the resolved
               // number so an admin can see at a glance that TC is untuned.
-              `TC: Dom ${this.options?.tcDominantThreshold ?? 'std'} | Mercy ${this.options?.tcSingleRoundScrambleThreshold ?? 'std'}`
+              tb.localize('teamBalancer.status.tcDomMercy', { value: this.options?.tcDominantThreshold ?? 'std', value2: this.options?.tcSingleRoundScrambleThreshold ?? 'std' })
             ].join('\n'));
 
             const targetReportChannel = this.discordReportChannel || this.discordChannel;
             if (targetReportChannel) {
               const embeds = DiscordHelpers.buildDiagEmbeds(this, results);
-              embeds[0].description = `Executed by **${adminName}** (In-Game)\n${embeds[0].description}`;
+              embeds[0].description = tb.localize('teamBalancer.status.executedByGame', { adminName, description: embeds[0].description });
               await DiscordHelpers.sendDiscordMessage(targetReportChannel, { embeds });
             }
             return;
@@ -435,13 +456,13 @@ const CommandHandlers = {
           default: {
             return await this.respond(
               player,
-              'Invalid command. Usage: !teambalancer [status|diag|on|off|help] or !scramble [now|dry|matchend|cancel]'
+              tb.localize('teamBalancer.warn.invalidCommandUsageTeambalancer')
             );
           }
         }
       } catch (err) {
         Logger.verbose('TeamBalancer', 1, `[TeamBalancer] Error processing chat command: ${err?.message || err}`);
-        return await this.respond(player, `Error processing command: ${err.message}`);
+        return await this.respond(player, tb.localize('teamBalancer.warn.errorProcessingCommand', { message: err.message }));
       }
     };
 
@@ -451,7 +472,7 @@ const CommandHandlers = {
       if (!this.options.devMode && command.chat !== 'ChatAdmin') return;
 
       if (!this.ready) {
-        return await this.respond(command.player || { steamID: command.steamID }, 'TeamBalancer is still initializing, please try again in a moment.');
+        return await this.respond(command.player || { steamID: command.steamID }, tb.localize('teamBalancer.warn.teambalancerStillInitializingPlease'));
       }
 
       let args = (command.message?.trim().toLowerCase().split(/\s+/) || []).filter(arg => arg);
@@ -466,7 +487,7 @@ const CommandHandlers = {
       if (badArg) {
         return await this.respond(
           command.player,
-          `Unknown argument "${badArg}". Usage: !scramble [now|dry|matchend|cancel|confirm|elo]`
+          tb.localize('teamBalancer.warn.unknownArgumentUsageScramble', { badArg })
         );
       }
 
@@ -478,12 +499,12 @@ const CommandHandlers = {
 
       if (isConfirm) {
         if (!this.scrambleConfirmation) {
-          return await this.respond(player, 'No pending scramble confirmation found.');
+          return await this.respond(player, tb.localize('teamBalancer.warn.noPendingScrambleConfirmation'));
         }
         const timeoutMs = (this.options.scrambleConfirmationTimeout || 60) * 1000;
         if (Date.now() - this.scrambleConfirmation.timestamp > timeoutMs) {
           this.scrambleConfirmation = null;
-          return await this.respond(player, 'Scramble confirmation expired.');
+          return await this.respond(player, tb.localize('teamBalancer.warn.scrambleConfirmationExpired'));
         }
         args = this.scrambleConfirmation.args;
         this.scrambleConfirmation = null;
@@ -500,23 +521,23 @@ const CommandHandlers = {
         // Handle "!scramble matchend" — arm a deferred scramble for the end of this round.
         if (isMatchEnd) {
           if (hasNow || hasDry) {
-            return await this.respond(player, '"!scramble matchend" cannot be combined with "now" or "dry".');
+            return await this.respond(player, tb.localize('teamBalancer.warn.scrambleMatchendCannotCombined'));
           }
           if (this._scrambleOnRoundEnd) {
-            return await this.respond(player, 'A match-end scramble is already scheduled. It will fire when this round ends. Use "!scramble cancel" to cancel it.');
+            return await this.respond(player, tb.localize('teamBalancer.warn.matchEndScrambleAlready'));
           }
           await this._setScrambleArm({ name: adminName, eosID: player?.eosID ?? null, scrambleType });
           Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Match-end ${hasElo ? 'micro ' : ''}scramble armed by ${adminName}`);
           const armResponseMsg = hasElo
-            ? 'Micro scramble scheduled for the end of this round. It will fire automatically when the round ends. Use "!scramble cancel" to cancel it.'
-            : 'Scramble scheduled for the end of this round. It will fire automatically when the round ends. Use "!scramble cancel" to cancel it.';
+            ? tb.localize('teamBalancer.status.microScrambleScheduledEnd')
+            : tb.localize('teamBalancer.status.scrambleScheduledEndRound');
           const response = await this.respond(player, armResponseMsg);
           if (this.discordChannel) {
             const embed = {
               color: 0x3498db,
-              title: `🎮 In-Game Command: !scramble matchend${hasElo ? ' elo' : ''}`,
-              description: `Executed by **${adminName}**`,
-              fields: [{ name: 'Response', value: armResponseMsg, inline: false }],
+              title: tb.localize('teamBalancer.status.gameCommandScrambleMatchend', { value: hasElo ? ' elo' : '' }),
+              description: tb.localize('teamBalancer.status.executedBy', { adminName }),
+              fields: [{ name: tb.localize('teamBalancer.status.response'), value: armResponseMsg, inline: false }],
               timestamp: new Date().toISOString()
             };
             await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
@@ -530,22 +551,22 @@ const CommandHandlers = {
           const cancelled = await this.cancelPendingScramble(steamID, player, false);
           if (cancelled) {
             Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Scramble cancelled by ${adminName}`);
-            const response = await this.respond(player, 'Pending scramble cancelled.');
+            const response = await this.respond(player, tb.localize('teamBalancer.warn.pendingScrambleCancelled'));
             if (this.discordChannel) {
               const embed = {
                 color: 0x3498db,
-                title: '🎮 In-Game Command: !scramble cancel',
-                description: `Executed by **${adminName}**`,
-                fields: [{ name: 'Response', value: 'Pending scramble cancelled.', inline: false }],
+                title: tb.localize('teamBalancer.status.gameCommandScrambleCancel'),
+                description: tb.localize('teamBalancer.status.executedBy', { adminName }),
+                fields: [{ name: tb.localize('teamBalancer.status.response'), value: tb.localize('teamBalancer.status.pendingScrambleCancelled'), inline: false }],
                 timestamp: new Date().toISOString()
               };
               await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
             }
             return response;
           } else if (this._scrambleInProgress) {
-            return await this.respond(player, 'Cannot cancel scramble - it is already executing.');
+            return await this.respond(player, tb.localize('teamBalancer.warn.cannotCancelScrambleAlready'));
           } else {
-            return await this.respond(player, 'No pending scramble to cancel.');
+            return await this.respond(player, tb.localize('teamBalancer.warn.noPendingScrambleCancel'));
           }
         }
 
@@ -554,7 +575,7 @@ const CommandHandlers = {
           const status = this._scrambleInProgress ? 'executing' : 'pending';
           return await this.respond(
             player,
-            `[WARNING] Scramble already ${status}. Use "!scramble cancel" to cancel pending scrambles.`
+            tb.localize('teamBalancer.warn.warningScrambleAlreadyUse', { status })
           );
         }
 
@@ -563,12 +584,12 @@ const CommandHandlers = {
           this.scrambleConfirmation = { timestamp: Date.now(), args: args };
           const scrambleKind = hasElo ? 'micro' : 'full';
           const timing = hasNow
-            ? 'immediately, with no countdown'
-            : `in ${this.options.scrambleAnnouncementDelay}s, after a countdown broadcast`;
+            ? tb.localize('teamBalancer.status.immediatelyWithNoCountdown')
+            : tb.localize('teamBalancer.status.sAfterCountdownBroadcast', { scrambleAnnouncementDelay: this.options.scrambleAnnouncementDelay });
           const timeoutSec = this.options.scrambleConfirmationTimeout || 60;
           return await this.respond(
             player,
-            `Confirming will execute a ${scrambleKind} scramble ${timing}. Type "!scramble confirm" within ${timeoutSec}s to proceed.`
+            tb.localize('teamBalancer.warn.confirmingWillExecuteScramble', { scrambleKind, timing, timeoutSec })
           );
         }
 
@@ -596,25 +617,25 @@ const CommandHandlers = {
 
         // Log action
         const actionDesc = isSimulated
-          ? `dry run ${hasElo ? 'micro ' : ''}scramble${immediate ? ' (immediate)' : ''}`
-          : `live ${hasElo ? 'micro ' : ''}scramble${immediate ? ' (immediate)' : ''}`;
+          ? tb.localize('teamBalancer.status.dryRunScramble', { value: hasElo ? 'micro ' : '', value2: immediate ? ' (immediate)' : '' })
+          : tb.localize('teamBalancer.status.liveScramble', { value: hasElo ? 'micro ' : '', value2: immediate ? ' (immediate)' : '' });
         Logger.verbose('TeamBalancer', 2, `[TeamBalancer] ${adminName} initiated ${actionDesc}`);
 
         // Respond to admin
         let responseMsg;
         if (isSimulated) {
-          responseMsg = `Initiating dry run ${hasElo ? 'micro ' : ''}scramble (immediate)...`;
+          responseMsg = tb.localize('teamBalancer.status.initiatingDryRunScramble', { value: hasElo ? 'micro ' : '' });
         } else {
           responseMsg = immediate
-            ? `Initiating immediate ${hasElo ? 'micro ' : ''}scramble...`
-            : `Initiating ${hasElo ? 'micro ' : ''}scramble with countdown...`;
+            ? tb.localize('teamBalancer.status.initiatingImmediateScramble', { value: hasElo ? 'micro ' : '' })
+            : tb.localize('teamBalancer.status.initiatingScrambleWithCountdown', { value: hasElo ? 'micro ' : '' });
         }
         if (this.discordChannel) {
           const embed = {
             color: 0x3498db,
-            title: `🎮 In-Game Command: !scramble ${immediate ? 'now' : ''} ${isSimulated ? 'dry' : ''} ${hasElo ? 'elo' : ''}`,
-            description: `Executed by **${adminName}**`,
-            fields: [{ name: 'Response', value: responseMsg, inline: false }],
+            title: tb.localize('teamBalancer.status.gameCommandScramble', { value: immediate ? 'now' : '', value2: isSimulated ? 'dry' : '', value3: hasElo ? 'elo' : '' }),
+            description: tb.localize('teamBalancer.status.executedBy', { adminName }),
+            fields: [{ name: tb.localize('teamBalancer.status.response'), value: responseMsg, inline: false }],
             timestamp: new Date().toISOString()
           };
           await DiscordHelpers.sendDiscordMessage(this.discordChannel, { embeds: [embed] });
@@ -632,13 +653,13 @@ const CommandHandlers = {
         );
 
         if (!success) {
-          return await this.respond(player, 'Failed to initiate scramble - another scramble may be in progress.');
+          return await this.respond(player, tb.localize('teamBalancer.warn.failedInitiateScrambleAnother'));
         }
         
         return responseMsg;
       } catch (err) {
         Logger.verbose('TeamBalancer', 1, `[TeamBalancer] Error processing scramble command: ${err?.message || err}`);
-        return await this.respond(player, `Error processing command: ${err.message}`);
+        return await this.respond(player, tb.localize('teamBalancer.warn.errorProcessingCommand', { message: err.message }));
       }
     };
   }

@@ -35,6 +35,10 @@
  *   using the retryAfter value from the error or response header.
  * - All embed builders accept the TeamBalancer instance (tb) to read
  *   live server state and options. No internal state is stored.
+ * - Everything built here goes to the TeamBalancer channel, which is a staff
+ *   channel: scramble plans, diagnostics and win-streak reports are read by
+ *   admins, never by players. Nothing on this surface is player-facing, which
+ *   is what puts all of it in the admin translation tier.
  *
  * Author:
  * Discord: `real_slacker`
@@ -47,24 +51,25 @@ export const DiscordHelpers = {
   buildStatusEmbed(tb) {
     // Defensive checks
     const effectiveStatus = !tb.ready
-      ? 'INITIALIZING'
+      ? tb.localize('teamBalancer.embeds.initializing')
       : tb.manuallyDisabled
-      ? 'DISABLED (manual)'
+      ? tb.localize('teamBalancer.embeds.disabledManual')
       : tb.options?.enableWinStreakTracking
-      ? 'ENABLED'
-      : 'DISABLED (config)';
+      ? tb.localize('teamBalancer.embeds.enabled')
+      : tb.localize('teamBalancer.embeds.disabledConfig');
 
     const maxStreak = tb.options?.maxWinStreak || 2;
     const winStreakText = tb.winStreakTeam
-      ? `${tb.getTeamName(tb.winStreakTeam)}: ${tb.winStreakCount} / ${maxStreak} wins`
-      : `None (Threshold: ${maxStreak} wins)`;
+      ? tb.localize('teamBalancer.embeds.streakOfWins', { team: tb.getTeamName(tb.winStreakTeam), count: tb.winStreakCount, maxStreak })
+      : tb.localize('teamBalancer.embeds.noneThresholdWins', { maxStreak });
 
     const maxConsecutive = tb.options?.maxConsecutiveWinsWithoutThreshold || 0;
+    const consecutiveLimit = maxConsecutive > 0 ? maxConsecutive : tb.localize('teamBalancer.labels.off');
     const consecutiveText = tb.consecutiveWinsTeam
-      ? `${tb.getTeamName(tb.consecutiveWinsTeam)}: ${tb.consecutiveWinsCount} / ${maxConsecutive > 0 ? maxConsecutive : 'Off'}`
-      : `None (Threshold: ${maxConsecutive > 0 ? maxConsecutive : 'Off'})`;
+      ? tb.localize('teamBalancer.embeds.consecutiveOf', { team: tb.getTeamName(tb.consecutiveWinsTeam), count: tb.consecutiveWinsCount, max: consecutiveLimit })
+      : tb.localize('teamBalancer.embeds.noneThreshold', { value: consecutiveLimit });
 
-    let lastScrambleText = 'Never';
+    let lastScrambleText = tb.localize('teamBalancer.labels.never');
     if (tb.lastScrambleTime) {
       const unixTime = Math.floor(tb.lastScrambleTime / 1000);
       // Discord timestamp: f = short date time, R = relative time
@@ -76,20 +81,22 @@ export const DiscordHelpers = {
     const t2Count = players.filter((p) => p.teamID === 2).length;
 
     const eloTrackerPlugin = tb.server.plugins?.find(p => p.constructor.name === 'EloTracker');
-    const eloStatus = tb.options?.useEloForBalance ? (eloTrackerPlugin ? '✅ Active' : '❌ Unavailable') : '⏹️ Disabled';
+    const eloStatus = tb.options?.useEloForBalance
+      ? (eloTrackerPlugin ? tb.localize('teamBalancer.embeds.eloActive') : tb.localize('teamBalancer.embeds.eloUnavailable'))
+      : tb.localize('teamBalancer.embeds.eloDisabled');
 
     const embed = {
       color: 0x3498db,
-      title: '📊 TeamBalancer Status',
+      title: tb.localize('teamBalancer.embeds.teambalancerStatus'),
       fields: [
-        { name: 'Version', value: tb.constructor.version || 'Unknown', inline: true },
-        { name: 'Plugin Status', value: effectiveStatus, inline: true },
-        { name: 'Elo Integration', value: eloStatus, inline: true },
-        { name: 'Dominant Streak', value: winStreakText, inline: true },
-        { name: 'Consecutive Streak', value: consecutiveText, inline: true },
-        { name: 'Seed Auto Scramble', value: tb.seedAutoScrambleStatus(), inline: true },
-        { name: 'Last Scramble', value: lastScrambleText, inline: false },
-        { name: 'Player Count', value: `Total: ${players.length} | T1: ${t1Count} | T2: ${t2Count}`, inline: false }
+        { name: tb.localize('teamBalancer.embeds.version'), value: tb.constructor.version || tb.localize('teamBalancer.labels.unknown'), inline: true },
+        { name: tb.localize('teamBalancer.embeds.pluginStatus'), value: effectiveStatus, inline: true },
+        { name: tb.localize('teamBalancer.embeds.eloIntegration'), value: eloStatus, inline: true },
+        { name: tb.localize('teamBalancer.embeds.dominantStreak'), value: winStreakText, inline: true },
+        { name: tb.localize('teamBalancer.embeds.consecutiveStreak'), value: consecutiveText, inline: true },
+        { name: tb.localize('teamBalancer.embeds.seedAutoScramble'), value: tb.seedAutoScrambleStatus(), inline: true },
+        { name: tb.localize('teamBalancer.embeds.lastScramble'), value: lastScrambleText, inline: false },
+        { name: tb.localize('teamBalancer.embeds.playerCount'), value: tb.localize('teamBalancer.embeds.totalT1T2', { value: players.length, t1Count, t2Count }), inline: false }
       ],
       timestamp: new Date().toISOString()
     };
@@ -106,8 +113,8 @@ export const DiscordHelpers = {
     const t2Squads = squads.filter((s) => s.teamID === 2);
 
     const scrambleInfo = tb.swapExecutor?.pendingPlayerMoves?.size > 0
-      ? `${tb.swapExecutor.pendingPlayerMoves.size} pending moves`
-      : 'None';
+      ? tb.localize('teamBalancer.embeds.pendingMoves', { size: tb.swapExecutor.pendingPlayerMoves.size })
+      : tb.localize('teamBalancer.labels.none');
 
     // Determine color based on diagnostics if present
     let color = 0x3498db;
@@ -118,37 +125,35 @@ export const DiscordHelpers = {
     // Embed 1: Consolidated runtime state + config (diag-specific fields only)
     const embed1 = {
       color: color,
-      title: '🩺 TeamBalancer Diagnostics',
-      description: `**Plugin Status:** ${
-        !tb.ready
-          ? 'INITIALIZING'
+      title: tb.localize('teamBalancer.embeds.teambalancerDiagnostics'),
+      description: tb.localize('teamBalancer.embeds.pluginStatus2', { dISABLED: !tb.ready
+          ? tb.localize('teamBalancer.embeds.initializing')
           : tb.manuallyDisabled
-          ? 'DISABLED (Manual)'
+          ? tb.localize('teamBalancer.embeds.disabledManual')
           : tb.options?.enableWinStreakTracking
-          ? 'ENABLED'
-          : 'DISABLED (config)'
-      }`,
+          ? tb.localize('teamBalancer.embeds.enabled')
+          : tb.localize('teamBalancer.embeds.disabledConfig') }),
       fields: [
         // Runtime state (what diag tells you that status doesn't)
-        { name: 'Scramble Pending', value: tb._scramblePending ? 'Yes' : 'No', inline: true },
-        { name: 'Scramble Active', value: tb._scrambleInProgress ? 'Yes' : 'No', inline: true },
-        { name: 'Pending Moves', value: scrambleInfo, inline: true },
-        { name: 'Total Players', value: `${players.length}`, inline: true },
-        { name: 'Team 1 | Team 2', value: `${t1Players.length} | ${t2Players.length}`, inline: true },
-        { name: 'Total Squads', value: `${squads.length}`, inline: true },
-        { name: 'Squad Split', value: `T1: ${t1Squads.length} | T2: ${t2Squads.length}`, inline: true },
+        { name: tb.localize('teamBalancer.embeds.scramblePending'), value: tb.localize(tb._scramblePending ? 'teamBalancer.labels.yes' : 'teamBalancer.labels.no'), inline: true },
+        { name: tb.localize('teamBalancer.embeds.scrambleActive'), value: tb.localize(tb._scrambleInProgress ? 'teamBalancer.labels.yes' : 'teamBalancer.labels.no'), inline: true },
+        { name: tb.localize('teamBalancer.embeds.pendingMoves2'), value: scrambleInfo, inline: true },
+        { name: tb.localize('teamBalancer.embeds.totalPlayers'), value: `${players.length}`, inline: true },
+        { name: tb.localize('teamBalancer.embeds.team1Team2'), value: `${t1Players.length} | ${t2Players.length}`, inline: true },
+        { name: tb.localize('teamBalancer.embeds.totalSquads'), value: `${squads.length}`, inline: true },
+        { name: tb.localize('teamBalancer.embeds.squadSplit'), value: `T1: ${t1Squads.length} | T2: ${t2Squads.length}`, inline: true },
         // Key thresholds (what matters for debugging)
-        { name: 'Max Win Threshold', value: `${tb.options?.maxWinStreak || 2} wins`, inline: true },
-        { name: 'Dominant Threshold', value: `${tb.options?.minTicketsToCountAsDominantWin || 150} tickets`, inline: true },
-        { name: 'Seed Auto Scramble', value: tb.seedAutoScrambleStatus(), inline: true },
-        { name: 'Scramble %', value: `${(tb.options?.scramblePercentage || 0.5) * 100}%`, inline: true },
-        { name: 'Scramble Delay / Max', value: `${tb.options?.scrambleAnnouncementDelay}s (Seed: ${tb.options?.seedScrambleAnnouncementDelay}s) / ${tb.options?.maxScrambleCompletionTime}ms`, inline: false },
-        { name: 'Single Round Scramble', value: tb.options?.enableSingleRoundScramble ? `ON (> ${tb.options?.singleRoundScrambleThreshold} tix)` : 'OFF', inline: true },
-        { name: 'Invasion Thresholds', value: `Atk: ${tb.options?.invasionAttackTeamThreshold} | Def: ${tb.options?.invasionDefenceTeamThreshold}`, inline: true },
+        { name: tb.localize('teamBalancer.embeds.maxWinThreshold'), value: tb.localize('teamBalancer.embeds.winsUnit', { value: tb.options?.maxWinStreak || 2 }), inline: true },
+        { name: tb.localize('teamBalancer.embeds.dominantThreshold'), value: tb.localize('teamBalancer.embeds.ticketsUnit', { value: tb.options?.minTicketsToCountAsDominantWin || 150 }), inline: true },
+        { name: tb.localize('teamBalancer.embeds.seedAutoScramble'), value: tb.seedAutoScrambleStatus(), inline: true },
+        { name: tb.localize('teamBalancer.embeds.scramblePercent'), value: `${(tb.options?.scramblePercentage || 0.5) * 100}%`, inline: true },
+        { name: tb.localize('teamBalancer.embeds.scrambleDelayMax'), value: tb.localize('teamBalancer.embeds.sSeedSMs', { scrambleAnnouncementDelay: tb.options?.scrambleAnnouncementDelay, seedScrambleAnnouncementDelay: tb.options?.seedScrambleAnnouncementDelay, maxScrambleCompletionTime: tb.options?.maxScrambleCompletionTime }), inline: false },
+        { name: tb.localize('teamBalancer.embeds.singleRoundScramble'), value: tb.options?.enableSingleRoundScramble ? tb.localize('teamBalancer.embeds.tix', { singleRoundScrambleThreshold: tb.options?.singleRoundScrambleThreshold }) : tb.localize('teamBalancer.embeds.singleRoundOff'), inline: true },
+        { name: tb.localize('teamBalancer.embeds.invasionThresholds'), value: tb.localize('teamBalancer.embeds.atkDef', { invasionAttackTeamThreshold: tb.options?.invasionAttackTeamThreshold, invasionDefenceTeamThreshold: tb.options?.invasionDefenceTeamThreshold }), inline: true },
         // Reads "standard" rather than repeating the number when unset, so the
         // embed shows whether TC is tuned, not just what it currently resolves to.
-        { name: 'TC Thresholds', value: `Dom: ${tb.options?.tcDominantThreshold ?? 'standard'} | Mercy: ${tb.options?.tcSingleRoundScrambleThreshold ?? 'standard'}`, inline: true },
-        { name: 'Discord Options', value: `Mirror: ${tb.options?.mirrorRconBroadcasts ? 'Yes' : 'No'} | Details: ${tb.options?.postScrambleDetails ? 'Yes' : 'No'}`, inline: false },
+        { name: tb.localize('teamBalancer.embeds.tcThresholds'), value: tb.localize('teamBalancer.embeds.domMercy', { value: tb.options?.tcDominantThreshold ?? tb.localize('teamBalancer.labels.standard'), value2: tb.options?.tcSingleRoundScrambleThreshold ?? tb.localize('teamBalancer.labels.standard') }), inline: true },
+        { name: tb.localize('teamBalancer.embeds.discordOptions'), value: tb.localize('teamBalancer.embeds.mirrorDetails', { value: tb.localize(tb.options?.mirrorRconBroadcasts ? 'teamBalancer.labels.yes' : 'teamBalancer.labels.no'), value2: tb.localize(tb.options?.postScrambleDetails ? 'teamBalancer.labels.yes' : 'teamBalancer.labels.no') }), inline: false },
       ],
       timestamp: new Date().toISOString(),
     };
@@ -157,14 +162,14 @@ export const DiscordHelpers = {
 
     // Embed 2: Diagnostic test results (if tests ran)
     if (diagnosticResults) {
-      const resultsEmbeds = this.buildDiagnosticResultsEmbeds(diagnosticResults, color);
+      const resultsEmbeds = this.buildDiagnosticResultsEmbeds(tb, diagnosticResults, color);
       embeds.push(...resultsEmbeds);
     }
 
     return embeds;
   },
 
-  buildDiagnosticResultsEmbeds(diagnosticResults, color) {
+  buildDiagnosticResultsEmbeds(tb, diagnosticResults, color) {
     const embeds = [];
     const formatMessage = (msg) => (msg.length > 1000 ? msg.substring(0, 997) + '...' : msg);
     const maxFieldsPerEmbed = 25; // Discord limit
@@ -175,7 +180,7 @@ export const DiscordHelpers = {
     for (let i = 0; i < diagnosticResults.length; i++) {
       if (i % maxFieldsPerEmbed === 0) {
         const pageNum = Math.floor(i / maxFieldsPerEmbed) + 1;
-        const title = totalPages > 1 ? `🔍 Diagnostic Results (Part ${pageNum})` : `🔍 Diagnostic Results`;
+        const title = totalPages > 1 ? tb.localize('teamBalancer.embeds.diagnosticResultsPart', { pageNum }) : tb.localize('teamBalancer.embeds.diagnosticResults');
         currentEmbed = {
           color: color,
           title: title,
@@ -190,14 +195,14 @@ export const DiscordHelpers = {
     return embeds;
   },
 
-  async createScrambleDetailsMessage(swapPlan, isSimulated, teamBalancer, eloMap = null) {
-    const players = teamBalancer.server.players;
-    const squads = teamBalancer.server.squads;
+  async createScrambleDetailsMessage(swapPlan, isSimulated, tb, eloMap = null) {
+    const players = tb.server.players;
+    const squads = tb.server.squads;
     const currentT1 = players.filter(p => p.teamID == 1).length;
     const currentT2 = players.filter(p => p.teamID == 2).length;
 
-    const f1 = teamBalancer.getTeamName(1);
-    const f2 = teamBalancer.getTeamName(2);
+    const f1 = tb.getTeamName(1);
+    const f2 = tb.getTeamName(2);
 
     // Build lookup maps.
     // Raw SquadJS squad objects do not have a `.players` property (see API ref §7);
@@ -269,7 +274,7 @@ export const DiscordHelpers = {
     const projT1 = currentT1 + movesToT1 - movesToT2;
     const projT2 = currentT2 + movesToT2 - movesToT1;
 
-    let balanceProjectionValue = `**Population:** Team 1 (${f1}): ${currentT1} ➔ ${projT1} | Team 2 (${f2}): ${currentT2} ➔ ${projT2}`;
+    let balanceProjectionValue = tb.localize('teamBalancer.embeds.populationTeam1Team', { f1, currentT1, projT1, f2, currentT2, projT2 });
 
     if (eloMap) {
       let t1Mu = 0, t2Mu = 0, t1Regs = 0, t2Regs = 0;
@@ -331,18 +336,18 @@ export const DiscordHelpers = {
       const pTop15T1 = getTop15Avg(projT1Elos).toFixed(1);
       const pTop15T2 = getTop15Avg(projT2Elos).toFixed(1);
 
-      balanceProjectionValue += `\n**Global ELO Avg:** Team 1: ${avgT1}μ ➔ ${pAvgT1}μ | Team 2: ${avgT2}μ ➔ ${pAvgT2}μ`;
-      balanceProjectionValue += `\n**Top 15 ELO Avg:** Team 1: ${top15T1}μ ➔ ${pTop15T1}μ | Team 2: ${top15T2}μ ➔ ${pTop15T2}μ`;
-      balanceProjectionValue += `\n**Regulars:** Team 1: ${t1Regs} ➔ ${projT1Regs} | Team 2: ${t2Regs} ➔ ${projT2Regs}`;
+      balanceProjectionValue += tb.localize('teamBalancer.embeds.globalEloAvgTeam', { avgT1, pAvgT1, avgT2, pAvgT2 });
+      balanceProjectionValue += tb.localize('teamBalancer.embeds.top15EloAvg', { top15T1, pTop15T1, top15T2, pTop15T2 });
+      balanceProjectionValue += tb.localize('teamBalancer.embeds.regularsTeam1Team', { t1Regs, projT1Regs, t2Regs, projT2Regs });
     }
 
     const embed = {
       color: isSimulated ? 0x9b59b6 : 0x2ecc71,
-      title: isSimulated ? '🧪 Dry Run Scramble Plan' : '🔀 Scramble Execution Plan',
-      description: `**Total players affected:** ${swapPlan.length}\n**Calculation Time:** ${swapPlan.calculationTime || 'N/A'}ms`,
+      title: isSimulated ? tb.localize('teamBalancer.embeds.dryRunScramblePlan') : tb.localize('teamBalancer.embeds.scrambleExecutionPlan'),
+      description: tb.localize('teamBalancer.embeds.totalPlayersAffectedCalculation', { value: swapPlan.length, value2: swapPlan.calculationTime || tb.localize('teamBalancer.labels.notAvailable') }),
       fields: [
         { 
-          name: 'Balance Projection', 
+          name: tb.localize('teamBalancer.embeds.balanceProjection'), 
           value: balanceProjectionValue, 
           inline: false 
         }
@@ -353,7 +358,7 @@ export const DiscordHelpers = {
     // Hoisted: the anchor lookup in a virtual squad header needs it too, not just the rows.
     const squadLabelOf = (eosID) => {
       const sq = squadByEos.get(eosID);
-      return sq ? sq.squadName || `Squad ${sq.squadID}` : '—';
+      return sq ? sq.squadName || tb.localize('teamBalancer.embeds.squadNumber', { squadID: sq.squadID }) : '—';
     };
 
     let skippedLines = 0;
@@ -384,14 +389,14 @@ export const DiscordHelpers = {
           }
           const avgMu = muCount > 0 ? (muSum / muCount).toFixed(1) : '—';
 
-          let header = `Virtual Squad: ${this.formatTags(vs)} ${roster.length}p · Ø${avgMu}μ`;
+          let header = tb.localize('teamBalancer.embeds.virtualSquadP', { tags: this.formatTags(vs), value: roster.length, avgMu });
           // The anchor is the squad the unit was built around; it only tells the reader
           // anything when the unit actually spans several in-game squads.
           const squadCount = new Set(roster.map(id => squadLabelOf(id))).size;
           if (vs.anchorEosID && squadCount > 1) header += ` · ⚓${squadLabelOf(vs.anchorEosID)}`;
-          if (divided) header += ' (divided!)';
+          if (divided) header += tb.localize('teamBalancer.embeds.dividedSuffix');
 
-          return [header, ...this.buildPlayerRows(roster, playerByEos, eloMap, memberSet, {
+          return [header, ...this.buildPlayerRows(tb, roster, playerByEos, eloMap, memberSet, {
             movedOf: divided ? (id => (moveByEos.has(id) ? 'moved' : 'stay')) : null,
             squadLabelOf
           })];
@@ -403,16 +408,18 @@ export const DiscordHelpers = {
         const movers = teamVirtual.reduce(
           (n, { roster }) => n + roster.filter(id => moveByEos.has(id)).length, 0);
 
-        skippedLines += this.pushChunkedFields(embed, blocks,
-          `🔗 Team ${data.srcID} (${data.srcFaction}) ➔ Team ${data.tgtID} (${data.tgtFaction}) Clan Grouping (Virtual Squads)`,
-          `[${movers} players]`);
+        skippedLines += this.pushChunkedFields(tb, embed, blocks,
+          tb.localize('teamBalancer.embeds.teamTeamClanGrouping', { srcID: data.srcID, srcFaction: data.srcFaction, tgtID: data.tgtID, tgtFaction: data.tgtFaction }),
+          tb.localize('teamBalancer.embeds.playersSuffix', { value: movers }));
       }
 
       // ─── Regular squad blocks ─────────────────────────────────────
       if (data.listedTotal === 0) continue;
 
       const blocks = Object.entries(data.squads).map(([sID, playerIDs]) => {
-        const squadName = sID === 'UNASSIGNED' ? 'UNASSIGNED' : (squadByEos.get(playerIDs[0])?.squadName || `Squad ${sID}`);
+        const squadName = sID === 'UNASSIGNED'
+          ? tb.localize('teamBalancer.embeds.unassignedSquad')
+          : (squadByEos.get(playerIDs[0])?.squadName || tb.localize('teamBalancer.embeds.squadNumber', { squadID: sID }));
 
         let squadMuTotal = 0;
         let squadRegs = 0;
@@ -430,18 +437,18 @@ export const DiscordHelpers = {
         const squadAvgMu = playerIDs.length > 0 ? (squadMuTotal / playerIDs.length).toFixed(1) : '25.0';
 
         const header = eloMap
-          ? `[${squadName} - ${squadAvgMu}μ | ${squadRegs} Regs]`
+          ? tb.localize('teamBalancer.embeds.squadHeaderElo', { squadName, squadAvgMu, squadRegs })
           : `[${squadName}]`;
 
         return [
           header.padEnd(16) + ` ${playerIDs.length}p`,
-          ...this.buildPlayerRows(playerIDs, playerByEos, eloMap, null)
+          ...this.buildPlayerRows(tb, playerIDs, playerByEos, eloMap, null)
         ];
       });
 
-      skippedLines += this.pushChunkedFields(embed, blocks,
-        `Team ${data.srcID} (${data.srcFaction}) ➔ Team ${data.tgtID} (${data.tgtFaction})`,
-        `[${data.listedTotal} players]`);
+      skippedLines += this.pushChunkedFields(tb, embed, blocks,
+        tb.localize('teamBalancer.embeds.teamTeam', { srcID: data.srcID, srcFaction: data.srcFaction, tgtID: data.tgtID, tgtFaction: data.tgtFaction }),
+        tb.localize('teamBalancer.embeds.playersSuffix', { value: data.listedTotal }));
     }
 
     // One notice for the whole report, and last so the reader sees it after the lists. The
@@ -449,8 +456,8 @@ export const DiscordHelpers = {
     // exactly one of these.
     if (skippedLines) {
       embed.fields.push({
-        name: '⚠️ Truncated',
-        value: `${skippedLines} further lines omitted to stay within Discord's embed size limit.`,
+        name: tb.localize('teamBalancer.embeds.truncated'),
+        value: tb.localize('teamBalancer.embeds.furtherLinesOmittedStay', { skippedLines }),
         inline: false
       });
     }
@@ -459,17 +466,17 @@ export const DiscordHelpers = {
     // markers nobody can see (a plan without ELO has no ★, one without clans has no ◆/◇).
     const body = embed.fields.map(f => f.value).join('\n');
     const legend = [
-      ['★', 'regular (10+ rounds)'],
-      ['◆', 'clan member (virtual squad)'],
-      ['◇', 'pulled with squad'],
-      ['⚓', 'anchor squad']
+      ['★', tb.localize('teamBalancer.embeds.regular10Rounds')],
+      ['◆', tb.localize('teamBalancer.embeds.clanMemberVirtualSquad')],
+      ['◇', tb.localize('teamBalancer.embeds.pulledWithSquad')],
+      ['⚓', tb.localize('teamBalancer.embeds.anchorSquad')]
     ].filter(([symbol]) => body.includes(symbol)).map(([symbol, text]) => `${symbol} ${text}`);
 
     if (legend.length) embed.footer = { text: legend.join(' · ') };
 
     if (swapPlan.length === 0) {
-      const action = isSimulated ? 'simulation' : 'scramble calculation';
-      embed.footer = { text: `The ${action} resulted in no player moves. This is expected behavior on low-population servers.` };
+      const action = isSimulated ? 'simulation' : tb.localize('teamBalancer.embeds.scrambleCalculation');
+      embed.footer = { text: tb.localize('teamBalancer.embeds.resultedNoPlayerMoves', { action }) };
     }
 
     return embed;
@@ -493,7 +500,7 @@ export const DiscordHelpers = {
   //   squadLabelOf(eosID) — the real in-game squad; a virtual squad spans several of them
   // memberSet turns on the clan marker column: ◆ for the players carrying one of the block's
   // clan tags, ◇ for everyone the unit pulled along. Pass null outside a virtual squad block.
-  buildPlayerRows(eosIDs, playerByEos, eloMap, memberSet, { movedOf = null, squadLabelOf = null } = {}) {
+  buildPlayerRows(tb, eosIDs, playerByEos, eloMap, memberSet, { movedOf = null, squadLabelOf = null } = {}) {
     const showMarker = !!memberSet;
 
     const rows = eosIDs.map(eosID => {
@@ -501,7 +508,7 @@ export const DiscordHelpers = {
       const rating = eloMap ? eloMap.get(eosID) : null;
       return {
         eosID,
-        name: player ? player.name : `Unknown (${eosID.slice(0, 8)}...)`,
+        name: player ? player.name : tb.localize('teamBalancer.embeds.unknownPlayer', { value: eosID.slice(0, 8) }),
         mu: eloMap ? (rating ? rating.mu : 25.0) : null,
         isReg: !!rating && (rating.roundsPlayed || 0) >= 10,
         marker: !showMarker ? ' ' : memberSet.has(eosID) ? '◆' : '◇',
@@ -518,7 +525,7 @@ export const DiscordHelpers = {
 
     return rows.map(r => {
       let line = '  ';
-      if (movedOf) line += `${r.moved.padEnd(5)}  `;
+      if (movedOf) line += `${tb.localize(r.moved === 'moved' ? 'teamBalancer.embeds.movedRow' : 'teamBalancer.embeds.stayRow').padEnd(5)}  `;
       if (eloMap) line += `${r.mu.toFixed(1).padStart(4)}${r.isReg ? '★' : ' '}  `;
       if (showMarker) line += `${r.marker} `;
       if (squadLabelOf) line += `${fit(squadLabelOf(r.eosID), 9)} `;
@@ -539,14 +546,14 @@ export const DiscordHelpers = {
   // did not fit is returned — a shortened report beats a 400 that drops the report entirely.
   // Reporting the shortfall is the caller's job: an embed takes up to four calls (both
   // directions × virtual and regular squads) and gets exactly one truncation notice.
-  pushChunkedFields(embed, blocks, baseName, suffix = '') {
+  pushChunkedFields(tb, embed, blocks, baseName, suffix = '') {
     const codeBlockWrapLen = 13; // ```text\n ... \n```
     const embedCharLimit = 6000;
     // Room for the title, the description, the legend footer and the one truncation notice —
     // none of which are in embed.fields yet (or at all) while this runs.
     const reserve = 320;
     const used = () => embed.fields.reduce((n, f) => n + f.name.length + f.value.length, 0);
-    const nameFor = (part) => (part === 1 ? (suffix ? `${baseName} ${suffix}` : baseName) : `${baseName} (Cont.)`);
+    const nameFor = (part) => (part === 1 ? (suffix ? `${baseName} ${suffix}` : baseName) : tb.localize('teamBalancer.embeds.fieldContinued', { baseName }));
 
     const chunks = [];
     const addLine = (line) => {
@@ -590,14 +597,14 @@ export const DiscordHelpers = {
     return skipped;
   },
 
-  buildWinStreakEmbed(teamName, teamID, streakCount, maxStreak, margin, isDominant) {
+  buildWinStreakEmbed(tb, teamName, teamID, streakCount, maxStreak, margin, isDominant) {
     const embed = {
       color: isDominant ? 0xf39c12 : 0x3498db,
-      title: isDominant ? '🔥 Dominant Win Streak' : '📊 Win Recorded',
+      title: isDominant ? tb.localize('teamBalancer.embeds.dominantWinStreak') : tb.localize('teamBalancer.embeds.winRecorded'),
       fields: [
-        { name: 'Winning Team', value: `${teamName} (Team ${teamID})`, inline: true },
-        { name: 'Streak Progress', value: `**${streakCount}** / ${maxStreak} wins`, inline: true },
-        { name: 'Ticket Margin', value: `+${margin}`, inline: true }
+        { name: tb.localize('teamBalancer.embeds.winningTeam'), value: tb.localize('teamBalancer.embeds.winningTeamValue', { teamName, teamID }), inline: true },
+        { name: tb.localize('teamBalancer.embeds.streakProgress'), value: tb.localize('teamBalancer.embeds.streakProgressValue', { streakCount, maxStreak }), inline: true },
+        { name: tb.localize('teamBalancer.embeds.ticketMargin'), value: `+${margin}`, inline: true }
       ],
       timestamp: new Date().toISOString()
     };
@@ -605,24 +612,24 @@ export const DiscordHelpers = {
     if (isDominant) {
       const remaining = maxStreak - streakCount;
       if (remaining <= 0) {
-        embed.description = '🚨 **Scramble Threshold Reached**\nTeams will be scrambled shortly to restore balance.';
+        embed.description = tb.localize('teamBalancer.embeds.scrambleThresholdReachedTeams');
       } else {
-        embed.description = `**Dominance Detected**\nIf this team wins dominantly **${remaining}** more time(s), a scramble will be triggered.`;
+        embed.description = tb.localize('teamBalancer.embeds.dominanceDetectedIfTeam', { remaining });
       }
     }
 
     return embed;
   },
 
-  buildScrambleTriggeredEmbed(reason, teamName, count, delay) {
+  buildScrambleTriggeredEmbed(tb, reason, teamName, count, delay) {
     const embed = {
       color: 0xf39c12,
-      title: '🚨 Scramble Triggered',
-      description: `**Reason:** ${reason}`,
+      title: tb.localize('teamBalancer.embeds.scrambleTriggered'),
+      description: tb.localize('teamBalancer.embeds.reasonLine', { reason }),
       fields: [
-        { name: 'Dominant Team', value: teamName || 'N/A', inline: true },
-        { name: 'Win Streak', value: count ? `${count} wins` : 'N/A', inline: true },
-        { name: 'Countdown', value: `${delay} seconds`, inline: true }
+        { name: tb.localize('teamBalancer.embeds.dominantTeam'), value: teamName || tb.localize('teamBalancer.labels.notAvailable'), inline: true },
+        { name: tb.localize('teamBalancer.embeds.winStreak'), value: count ? tb.localize('teamBalancer.embeds.winsUnit', { value: count }) : tb.localize('teamBalancer.labels.notAvailable'), inline: true },
+        { name: tb.localize('teamBalancer.embeds.countdown'), value: tb.localize('teamBalancer.embeds.secondsUnit', { delay }), inline: true }
       ],
       timestamp: new Date().toISOString()
     };
@@ -630,19 +637,19 @@ export const DiscordHelpers = {
     return embed;
   },
 
-  buildScrambleCompletedEmbed(totalMoves, movedSuccessfully, failedToMove, disconnected, duration, failedNames = []) {
+  buildScrambleCompletedEmbed(tb, totalMoves, movedSuccessfully, failedToMove, disconnected, duration, failedNames = []) {
     const successRate = totalMoves > 0 ? Math.round((movedSuccessfully / totalMoves) * 100) : 100;
 
     const embed = {
       color: failedToMove > 0 ? 0xf39c12 : 0x2ecc71,
-      title: '✅ Scramble Completed',
+      title: tb.localize('teamBalancer.embeds.scrambleCompleted'),
       fields: [
-        { name: 'Total Moves', value: `${totalMoves}`, inline: true },
-        { name: 'Moved Successfully', value: `${movedSuccessfully}`, inline: true },
-        { name: 'Disconnected', value: `${disconnected}`, inline: true },
-        { name: 'Failed', value: `${failedToMove}`, inline: true },
-        { name: 'Success Rate', value: `${successRate}%`, inline: true },
-        { name: 'Duration', value: `${duration}ms`, inline: true }
+        { name: tb.localize('teamBalancer.embeds.totalMoves'), value: `${totalMoves}`, inline: true },
+        { name: tb.localize('teamBalancer.embeds.movedSuccessfully'), value: `${movedSuccessfully}`, inline: true },
+        { name: tb.localize('teamBalancer.embeds.disconnected'), value: `${disconnected}`, inline: true },
+        { name: tb.localize('teamBalancer.embeds.failed'), value: `${failedToMove}`, inline: true },
+        { name: tb.localize('teamBalancer.embeds.successRate'), value: `${successRate}%`, inline: true },
+        { name: tb.localize('teamBalancer.embeds.duration'), value: `${duration}ms`, inline: true }
       ],
       timestamp: new Date().toISOString()
     };
@@ -650,14 +657,14 @@ export const DiscordHelpers = {
     if (failedToMove > 0) {
       if (failedNames && failedNames.length > 0) {
         const nameList = failedNames.slice(0, 20).join('\n');
-        const trailer = failedNames.length > 20 ? `\n+ ${failedNames.length - 20} more...` : '';
+        const trailer = failedNames.length > 20 ? tb.localize('teamBalancer.embeds.moreNamesOmitted', { value: failedNames.length - 20 }) : '';
         embed.fields.push({
-          name: `Failed Players (${failedNames.length})`,
+          name: tb.localize('teamBalancer.embeds.failedPlayers', { value: failedNames.length }),
           value: `\`\`\`text\n${nameList}${trailer}\n\`\`\``,
           inline: false
         });
       }
-      embed.description = '⚠️ Some players could not be moved. Check logs for details.';
+      embed.description = tb.localize('teamBalancer.embeds.somePlayersCouldNot');
     }
 
     return embed;
@@ -670,11 +677,11 @@ export const DiscordHelpers = {
 
     const embed = {
       color: 0xe74c3c,
-      title: '❌ Scramble Failed',
-      description: `**Reason:** ${reason}`,
+      title: tb.localize('teamBalancer.embeds.scrambleFailed'),
+      description: tb.localize('teamBalancer.embeds.reasonLine', { reason }),
       fields: [
-        { name: 'Calculation Time', value: `${duration}ms`, inline: true },
-        { name: 'Server State', value: `**Total:** ${players.length}\n**T1:** ${t1Count} | **T2:** ${t2Count}`, inline: true }
+        { name: tb.localize('teamBalancer.embeds.calculationTime'), value: `${duration}ms`, inline: true },
+        { name: tb.localize('teamBalancer.embeds.serverState'), value: tb.localize('teamBalancer.embeds.totalT1T22', { value: players.length, t1Count, t2Count }), inline: true }
       ],
       timestamp: new Date().toISOString()
     };
@@ -688,18 +695,18 @@ export const DiscordHelpers = {
 
     const embed = {
       color: 0x992d22,
-      title: '☠️ Fatal Plugin Error',
-      description: `**Context:** ${context}\n**Error:** ${error?.message || error}`,
+      title: tb.localize('teamBalancer.embeds.fatalPluginError'),
+      description: tb.localize('teamBalancer.embeds.contextError', { context, error: error?.message || error }),
       fields: [
-        { name: 'Server State', value: `**Total:** ${players.length}\n**T1:** ${t1Count} | **T2:** ${t2Count}`, inline: true },
-        { name: 'Version', value: tb?.constructor?.version || 'Unknown', inline: true }
+        { name: tb.localize('teamBalancer.embeds.serverState'), value: tb.localize('teamBalancer.embeds.totalT1T22', { value: players.length, t1Count, t2Count }), inline: true },
+        { name: tb.localize('teamBalancer.embeds.version'), value: tb?.constructor?.version || tb.localize('teamBalancer.labels.unknown'), inline: true }
       ],
       timestamp: new Date().toISOString()
     };
 
     if (error?.stack) {
       const stack = error.stack.length > 1000 ? error.stack.substring(0, 1000) + '...' : error.stack;
-      embed.fields.push({ name: 'Stack Trace', value: `\`\`\`js\n${stack}\n\`\`\``, inline: false });
+      embed.fields.push({ name: tb.localize('teamBalancer.embeds.stackTrace'), value: `\`\`\`js\n${stack}\n\`\`\``, inline: false });
     }
 
     return embed;

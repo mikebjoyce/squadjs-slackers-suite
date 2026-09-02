@@ -70,12 +70,21 @@
 import BasePlugin from './base-plugin.js';
 import { stderrError } from '../utils/s3-stderr.js';
 import { versionAtLeast } from '../utils/s3-common.js';
-import { t } from './i18n.js';
+import {
+  localize as lookupMessage,
+  isSupportedLanguage,
+  supportedLanguages,
+  DEFAULT_LANGUAGE
+} from '../utils/s3-i18n.js';
 
 // Module-scope, not per-instance: SmartAssign, Switch and TeamBalancer each
 // extend this class and would otherwise each print their own copy of the
 // same discovery the first time any of them hits it.
 let eosRejectionWarned = false;
+
+// Same reasoning, per language code: an operator who typos one language in
+// config should see one warning, not one per plugin extending this class.
+const languageWarned = new Set();
 
 export default class S3PluginBase extends BasePlugin {
   constructor(server, options, connectors) {
@@ -85,22 +94,42 @@ export default class S3PluginBase extends BasePlugin {
   }
 
   /**
-   * Helper to retrieve configured language or default to English.
+   * The language this plugin renders messages in.
+   *
+   * Read from S³, never from this plugin's own options. Language is a
+   * server-wide property: an operator running a Portuguese server wants the
+   * whole suite in Portuguese, and there is no coherent deployment where
+   * EloTracker speaks English while Switch speaks Portuguese.
+   *
+   * A per-plugin override was considered and dropped. The case for one is
+   * always a per-SURFACE split — English Discord embeds over a Portuguese
+   * server, say — and a per-plugin option cannot express that, because Switch
+   * and TeamBalancer each write to both RCON and Discord from a single value.
+   * Wrong granularity for the only use it would have had, so consumer plugins
+   * deliberately do not declare a `language` option at all. test-i18n.js
+   * asserts they still don't.
+   *
+   * Read off S³ directly rather than through a mounted service: `_s3` is set
+   * during prepareToMount(), earlier than any service becomes available, so
+   * this resolves sooner. It is still null before discovery, so anything
+   * emitted during early mount is English regardless of config — accepted
+   * rather than worked around, since one of those strings is the "S³ not
+   * available" error itself.
    */
   get lang() {
-    return this.options?.language || 'en';
+    return this._s3?.lang || DEFAULT_LANGUAGE;
   }
 
   /**
-   * Translates a message key using the plugin's configured language.
-   * Delegates to i18n.js and automatically injects this.lang.
-   * 
-   * @param {string} key - Translation key (e.g., 'switch.discord.scrambleEmbedTitle')
-   * @param {object} [vars={}] - Variable substitutions (e.g., { count: 12, minutes: 20 })
+   * Resolves a message key to a formatted string in this plugin's language.
+   * Never throws; an unknown key returns the key itself.
+   *
+   * @param {string} key - Dotted key path (e.g. 'switch.discord.scrambleEmbedTitle')
+   * @param {object} [vars={}] - Placeholder values (e.g. { count: 12, minutes: 20 })
    * @returns {string} Formatted localized string
    */
-  t(key, vars = {}) {
-    return t(key, vars, this.lang);
+  localize(key, vars = {}) {
+    return lookupMessage(key, vars, this.lang);
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -116,7 +145,7 @@ export default class S3PluginBase extends BasePlugin {
   _resolveS3() {
     if (!this.server.plugins) {
       throw new Error(
-        t('s3PluginBase.errors.pluginsNotAvailable', {}, this.lang)
+        this.localize('s3PluginBase.errors.pluginsNotAvailable', {})
       );
     }
     const s3 = this.server.plugins.find(
@@ -124,11 +153,27 @@ export default class S3PluginBase extends BasePlugin {
     );
     if (!s3) {
       throw new Error(
-        t('s3PluginBase.errors.servicesRequired', {}, this.lang)
+        this.localize('s3PluginBase.errors.servicesRequired', {})
       );
     }
     this._s3 = s3;
-    this.verbose(2, t('s3PluginBase.verbose.discovered', {}, this.lang));
+
+    // First point at which the inherited language is knowable. Warn rather
+    // than throw: a typo'd language code degrades to English and must not
+    // stop a server booting. Deliberately not localized — the one message
+    // that says the language system is misconfigured has to render in a
+    // language we know is present.
+    const configured = s3?.lang;
+    if (configured && !isSupportedLanguage(configured) && !languageWarned.has(configured)) {
+      languageWarned.add(configured);
+      this.verbose(
+        1,
+        `[S3] Unknown language "${configured}" — falling back to "${DEFAULT_LANGUAGE}". ` +
+        `Available: ${supportedLanguages().join(', ')}.`
+      );
+    }
+
+    this.verbose(2, '[S3] Discovered SlackersSquadServices.');
     return s3;
   }
 
@@ -159,7 +204,7 @@ export default class S3PluginBase extends BasePlugin {
   async _awaitS3Ready(timeoutMs = 30000) {
     if (!this._s3) {
       throw new Error(
-        t('s3PluginBase.errors.notDiscovered', {}, this.lang)
+        this.localize('s3PluginBase.errors.notDiscovered', {})
       );
     }
 
@@ -174,7 +219,7 @@ export default class S3PluginBase extends BasePlugin {
         await this._s3.ready();
         return true;
       } catch (err) {
-        this.verbose(1, t('s3PluginBase.verbose.readyPromiseRejected', { message: err.message }, this.lang));
+        this.verbose(1, `[S3] ready() promise rejected: ${err.message}`);
       }
     }
 
@@ -189,7 +234,7 @@ export default class S3PluginBase extends BasePlugin {
     }
 
     throw new Error(
-      t('s3PluginBase.errors.readyTimeout', { timeoutMs }, this.lang)
+      this.localize('s3PluginBase.errors.readyTimeout', { timeoutMs })
     );
   }
 
@@ -219,9 +264,9 @@ export default class S3PluginBase extends BasePlugin {
     if (this._s3) {
       await this._s3.ready();
       this._s3db = this._s3.db || null;
-      this.verbose(2, t('s3PluginBase.verbose.readyDbAvailable', { available: !!this._s3db }, this.lang));
+      this.verbose(2, `[S3] S³ is ready. DB available: ${!!this._s3db}`);
     } else {
-      this.verbose(1, t('s3PluginBase.verbose.notDiscoveredBeforeMount', {}, this.lang));
+      this.verbose(1, '[S3] S³ not discovered before mount() — _onS3Ready will run without S³.');
     }
     await this._onS3Ready();
   }
@@ -309,11 +354,7 @@ export default class S3PluginBase extends BasePlugin {
     // Log model registrations at level 3 so admins can confirm drift
     // detection coverage during troubleshooting.
     if (options && Array.isArray(options.models) && options.models.length > 0) {
-      this.verbose(3, t('s3PluginBase.verbose.registeredModelsForDrift', {
-        pluginName,
-        count: options.models.length,
-        models: options.models.join(', ')
-      }, this.lang));
+      this.verbose(3, `[${pluginName}] Registered ${options.models.length} model(s) for drift detection: ${options.models.join(', ')}`);
     }
   }
 
@@ -355,7 +396,7 @@ export default class S3PluginBase extends BasePlugin {
     if (!recheck.upToDate) {
       const me = this._s3db.migrationEngine;
       if (me && !me._confirmed) {
-        this.verbose(1, t('s3PluginBase.verbose.migrationsPending', { pluginName }, this.lang));
+        this.verbose(1, `[${pluginName}] Migrations pending but not confirmed. Use !s3 confirm <token> or set autoMigrate: true in S³ config.`);
         // Trigger the Discord prompt via S³'s debounced scheduler.
         // Multiple consumer plugins may call this in rapid succession during
         // initialisation — the scheduler debounces to avoid duplicate embeds.
@@ -534,11 +575,10 @@ export default class S3PluginBase extends BasePlugin {
         if (collision) {
           this.verbose(
             1,
-            t('s3PluginBase.teamChange.warnings.nameCollision', {
-              value,
-              playerName,
-              collisionName: collision.name
-            }, this.lang)
+            `[TC] WARNING: name collision — refusing to send AdminForceTeamChange "${value}" for ` +
+            `${playerName}. ${collision.name} is also connected and their name contains this ` +
+            `substring, so Squad's admin parser could hit either player. No safer identifier ` +
+            `(eosID/steamID) is available. Skipping until the ambiguity clears.`
           );
           continue;
         }
@@ -551,7 +591,7 @@ export default class S3PluginBase extends BasePlugin {
       return { ok: true, type, response: attempt.response };
     }
 
-    this.verbose(2, t('s3PluginBase.teamChange.verbose.allRejected', { playerName }, this.lang));
+    this.verbose(2, `[TC] All identifiers rejected for ${playerName}.`);
     return { ok: false, type: null, response: null };
   }
 
@@ -572,26 +612,29 @@ export default class S3PluginBase extends BasePlugin {
     try {
       response = await this.server.rcon.execute(`AdminForceTeamChange "${value}"`);
     } catch (err) {
-      this.verbose(2, t('s3PluginBase.teamChange.verbose.rconError', { type, value, error: err.message }, this.lang));
+      this.verbose(2, `[TC] RCON error for ${type}="${value}": ${err.message}`);
       return { ok: false, rejected: false, response: null };
     }
 
     const rejected = typeof response === 'string' && /unable to find player/i.test(response);
     if (rejected) {
-      this.verbose(3, t('s3PluginBase.teamChange.verbose.identifierRejected', { type, value }, this.lang));
+      this.verbose(3, `[TC] Identifier ${type}="${value}" rejected — trying next.`);
 
       if (type === 'eosID' && !eosRejectionWarned) {
         eosRejectionWarned = true;
         this.verbose(
           1,
-          t('s3PluginBase.teamChange.warnings.eosRejected', {}, this.lang)
+          `[TC] WARNING: this server rejects eosID in AdminForceTeamChange — falling ` +
+          `back to steamID/playerName. Team changes still work, but every attempt now ` +
+          `costs an extra RCON round-trip. This is the Squad game server's own ` +
+          `admin-command parser, not a SquadJS version issue.`
         );
       }
 
       return { ok: true, rejected: true, response };
     }
 
-    this.verbose(3, t('s3PluginBase.teamChange.verbose.identifierAccepted', { type, value }, this.lang));
+    this.verbose(3, `[TC] Identifier ${type}="${value}" accepted.`);
     return { ok: true, rejected: false, response };
   }
 
@@ -650,7 +693,7 @@ export default class S3PluginBase extends BasePlugin {
    *   - source {string}: Source identifier passed through.
    */
   async _requestTeamChange(eosID, options = {}) {
-    const defaultWarnMessage = t('s3PluginBase.teamChange.defaults.warnMessage', {}, this.lang);
+    const defaultWarnMessage = this.localize('s3PluginBase.teamChange.defaults.warnMessage', {});
     const {
       maxAttempts = 5,
       warnPlayer = false,
@@ -661,7 +704,7 @@ export default class S3PluginBase extends BasePlugin {
     // ── Resolve player via S³ ─────────────────────────────────
     const playerState = this.players?.getPlayer(eosID);
     if (!playerState) {
-      this.verbose(2, t('s3PluginBase.teamChange.verbose.playerNotFound', { eosID }, this.lang));
+      this.verbose(2, `[TC] Player ${eosID} not found in S³ registry — aborting.`);
       return null;
     }
 
@@ -675,12 +718,7 @@ export default class S3PluginBase extends BasePlugin {
 
     this.verbose(
       3,
-      t('s3PluginBase.teamChange.verbose.requesting', {
-        playerName,
-        eosID,
-        targetTeamID,
-        source
-      }, this.lang)
+      `[TC] Requesting team change for ${playerName} (${eosID}) -> T${targetTeamID} (source: ${source})`
     );
 
     // ── Helpers ──────────────────────────────────────────────
@@ -703,14 +741,14 @@ export default class S3PluginBase extends BasePlugin {
       // refreshNow(), they've disconnected. No need to fall back
       // to server.players as S³'s registry is derived from it.
       if (!getFromS3()) {
-        this.verbose(2, t('s3PluginBase.teamChange.verbose.disconnected', { playerName }, this.lang));
+        this.verbose(2, `[TC] ${playerName} disconnected during retry — aborting.`);
         return makeResult(false, null, attempts);
       }
 
       // Already on target team?
       const current = getFromS3();
       if (current && String(current.teamID) === String(targetTeamID)) {
-        this.verbose(3, t('s3PluginBase.teamChange.verbose.alreadyOnTarget', { playerName, targetTeamID }, this.lang));
+        this.verbose(3, `[TC] ${playerName} already on target team T${targetTeamID}.`);
         return makeResult(true, targetTeamID, attempts);
       }
 
@@ -723,7 +761,7 @@ export default class S3PluginBase extends BasePlugin {
       try {
         this._s3?.players?.recordMove(eosID, targetTeamID, source);
       } catch (err) {
-        this.verbose(2, t('s3PluginBase.teamChange.verbose.recordMoveWarning', { error: err.message }, this.lang));
+        this.verbose(2, `[TC] recordMove warning: ${err.message}`);
       }
 
       // Send RCON command. Tries eosID, then steamID, then playerName, in
@@ -739,18 +777,10 @@ export default class S3PluginBase extends BasePlugin {
       // trusted to work, which is why this cascades instead of trusting
       // eosID alone.
       try {
-        this.verbose(3, t('s3PluginBase.teamChange.verbose.attempting', {
-          attempt: attempts + 1,
-          maxAttempts,
-          playerName
-        }, this.lang));
+        this.verbose(3, `[TC] Attempt ${attempts + 1}/${maxAttempts}: switching ${playerName}...`);
         await this._sendTeamChangeCommand(current, playerName);
       } catch (err) {
-        this.verbose(2, t('s3PluginBase.teamChange.verbose.attemptRconFailed', {
-          attempt: attempts + 1,
-          playerName,
-          error: err.message
-        }, this.lang));
+        this.verbose(2, `[TC] Attempt ${attempts + 1} RCON failed for ${playerName}: ${err.message}`);
       }
 
       // Force-refresh S³ player registry after the RCON command so the
@@ -763,58 +793,21 @@ export default class S3PluginBase extends BasePlugin {
     // ── Final check after all attempts ────────────────────────
     const final = getFromS3();
     if (final && String(final.teamID) === String(targetTeamID)) {
-      this.verbose(3, t('s3PluginBase.teamChange.verbose.verifiedOnTarget', {
-        playerName,
-        targetTeamID,
-        attempts
-      }, this.lang));
+      this.verbose(3, `[TC] ✅ ${playerName} verified on T${targetTeamID} after ${attempts} attempts.`);
 
       if (warnPlayer) {
         try {
           await this.server.rcon.warn(playerName, warnMessage);
         } catch (warnErr) {
-          this.verbose(2, t('s3PluginBase.teamChange.verbose.warnFailed', { playerName, error: warnErr.message }, this.lang));
+          this.verbose(2, `[TC] Warn failed for ${playerName}: ${warnErr.message}`);
         }
       }
 
       return makeResult(true, targetTeamID, attempts);
     }
 
-    this.verbose(2, t('s3PluginBase.teamChange.verbose.allAttemptsExhausted', { playerName, maxAttempts }, this.lang));
+    this.verbose(2, `[TC] ❌ ${playerName} — all ${maxAttempts} attempts exhausted.`);
     return makeResult(false, null, attempts);
   }
 
-  /**
-   * Loads localized JSON messages into this.messages automatically.
-   * @param {string} pluginNamespace 
-   * @param {string} [langCode='en']
-   */
-  async loadMessages(pluginNamespace, langCode = 'en') {
-    const safeLang = String(langCode).toLowerCase().replace(/[^a-z0-9_-]/g, '');
-
-    // Path points from s3/plugins/ to top-level locales/ folder
-    const rootLocalesDir = path.resolve(__dirname, '../../locales');
-    const targetPath = path.join(rootLocalesDir, `${safeLang}.json`);
-    const fallbackPath = path.join(rootLocalesDir, 'en.json');
-
-    const fileToLoad = existsSync(targetPath) ? targetPath : fallbackPath;
-
-    try {
-      const module = await import(fileToLoad, { assert: { type: 'json' } });
-      // Assigns only the sub-namespace for this specific plugin (e.g. this.messages['elo-tracker'])
-      this.messages = module.default;
-      this.pluginNamespace = pluginNamespace;
-    } catch (err) {
-      const fallbackModule = await import(fallbackPath, { assert: { type: 'json' } });
-      this.messages = fallbackModule.default;
-    }
-  }
-
-  /**
-   * Global message formatter helper for variables like {playerCount}
-   */
-  formatMessage(template, vars = {}) {
-    if (!template) return '';
-    return template.replace(/\{(\w+)\}/g, (_, key) => vars[key] ?? `{${key}}`);
-  }
 }

@@ -262,8 +262,7 @@ export default class EloTracker extends S3PluginBase {
     const actual = this._s3?.version;
     if (!this._s3VersionAtLeast(required)) {
       throw new Error(
-        `[EloTracker] Incompatible S³ version: got ${actual || 'unknown'}, need >=${required}. ` +
-        'Please update SlackersSquadServices.'
+        this.localize('eloTracker.errors.incompatibleS3Version', { actual: actual || 'unknown', required })
       );
     }
     Logger.verbose('EloTracker', 2, `[S3] Version check passed: S³ v${actual} >= required v${required}`);
@@ -678,7 +677,7 @@ export default class EloTracker extends S3PluginBase {
       const targetChannel = this.discordReportChannel || this.discordPublicChannel || this.discordAdminChannel;
       if (!targetChannel) return;
       const embedData = this.buildRoundStartData();
-      const embed = EloDiscord.buildRoundStartEmbed(embedData);
+      const embed = EloDiscord.buildRoundStartEmbed(this, embedData);
       await EloDiscord.sendDiscordMessage(targetChannel, { embeds: [embed] });
       Logger.verbose('EloTracker', 1, 'Round start embed posted.');
     } catch (err) {
@@ -699,8 +698,8 @@ export default class EloTracker extends S3PluginBase {
           return;
         }
         
-        const embed = EloDiscord.buildRoundStartEmbed(embedData, 'manual');
-        embed.title = `🔀 Post-Scramble Team Balance - ${embedData.layerName || 'Unknown'}`;
+        const embed = EloDiscord.buildRoundStartEmbed(this, embedData, 'manual');
+        embed.title = this.localize('eloTracker.embeds.postScrambleTitle', { layerName: embedData.layerName || 'Unknown' });
         
         const targetChannel = this.discordReportChannel || this.discordPublicChannel || this.discordAdminChannel;
         if (targetChannel) {
@@ -742,7 +741,7 @@ export default class EloTracker extends S3PluginBase {
       Logger.verbose('EloTracker', 1, '[onRoundEnded] Fired but plugin not ready. Skipping.');
       const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
       if (targetReportChannel) {
-        const embed = EloDiscord.buildRoundSkippedEmbed('Plugin not ready at round end', 0, layerName);
+        const embed = EloDiscord.buildRoundSkippedEmbed(this, this.localize('eloTracker.embeds.roundSkipped.pluginNotReady'), 0, layerName);
         await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
       }
       return;
@@ -757,7 +756,7 @@ export default class EloTracker extends S3PluginBase {
       Logger.verbose('EloTracker', 1, `[onRoundEnded] Skipping ELO update: player count ${playerCount} below threshold ${this.options.minPlayersForElo}.`);
       const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
       if (targetReportChannel) {
-        const embed = EloDiscord.buildRoundSkippedEmbed(`Player count below threshold (Gamemode: ${gameMode ?? 'Unknown'})`, playerCount, layerName);
+        const embed = EloDiscord.buildRoundSkippedEmbed(this, this.localize('eloTracker.embeds.roundSkipped.playerCountBelow', { gameMode: gameMode ?? 'Unknown' }), playerCount, layerName);
         await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
       }
       return;
@@ -765,11 +764,11 @@ export default class EloTracker extends S3PluginBase {
 
     const ignoredReason = this._isIgnoredMatch();
     if (ignoredReason) {
-      const label = ignoredReason === 'Unknown' ? 'Game mode unknown — skipping (safe default)' : `Ignored match type: ${ignoredReason}`;
+      const label = ignoredReason === 'Unknown' ? this.localize('eloTracker.embeds.roundSkipped.gameModeUnknown') : this.localize('eloTracker.embeds.roundSkipped.ignoredMatchType', { reason: ignoredReason });
       Logger.verbose('EloTracker', 1, `[onRoundEnded] ${label}`);
       const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
       if (targetReportChannel) {
-        const embed = EloDiscord.buildRoundSkippedEmbed(`Ignored match type: ${ignoredReason}`, playerCount, layerName);
+        const embed = EloDiscord.buildRoundSkippedEmbed(this, this.localize('eloTracker.embeds.roundSkipped.ignoredMatchType', { reason: ignoredReason }), playerCount, layerName);
         await EloDiscord.sendDiscordMessage(targetReportChannel, { embeds: [embed] });
       }
       return;
@@ -795,8 +794,8 @@ export default class EloTracker extends S3PluginBase {
       Logger.verbose('EloTracker', 1, '[onRoundEnded] No eligible participants. Skipping ELO update.');
       const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
       if (targetReportChannel) {
-        const embed = EloDiscord.buildRoundSkippedEmbed(
-          `No eligible participants (0 players met minParticipationRatio of ${this.options.minParticipationRatio})`,
+        const embed = EloDiscord.buildRoundSkippedEmbed(this, 
+          this.localize('eloTracker.embeds.roundSkipped.noEligible', { ratio: this.options.minParticipationRatio }),
           participants.length,
           layerName
         );
@@ -818,8 +817,8 @@ export default class EloTracker extends S3PluginBase {
       Logger.verbose('EloTracker', 1, `[onRoundEnded] Skipping ELO update: One or both teams have no eligible participants (Team 1: ${team1Eligible.length}, Team 2: ${team2Eligible.length}).`);
       const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
       if (targetReportChannel) {
-        const embed = EloDiscord.buildRoundSkippedEmbed(
-          `One or both teams had no eligible participants (Gamemode: ${gameMode ?? 'Unknown'})`,
+        const embed = EloDiscord.buildRoundSkippedEmbed(this, 
+          this.localize('eloTracker.embeds.roundSkipped.oneOrBothIneligible', { gameMode: gameMode ?? 'Unknown' }),
           playerCount,
           layerName
         );
@@ -1046,7 +1045,7 @@ export default class EloTracker extends S3PluginBase {
         const liveT1 = this._getMatchMetrics(this.server.players.filter(p => p.teamID === 1));
         const liveT2 = this._getMatchMetrics(this.server.players.filter(p => p.teamID === 2));
 
-        const embed = EloDiscord.buildRoundSummaryEmbed({
+        const embed = EloDiscord.buildRoundSummaryEmbed(this, {
           layerName: layerName,
           gameMode,
           winningTeamID,

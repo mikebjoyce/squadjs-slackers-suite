@@ -1069,6 +1069,17 @@ embed.addField('Layer', gs.getLayerDisplayName());   // "Sumari Bala Seed v1"
 | `_resolveS3()` | Finds S³ by constructor name. Called in `prepareToMount()`. |
 | `_awaitS3Ready(timeoutMs?)` | Waits for S³ readiness. Fast path + fallback poll. |
 
+**User-facing text** (inherited, not overridden):
+
+| Member | Purpose |
+|--------|---------|
+| `localize(key, vars?)` | Look up a message in the configured language. Unknown key returns the key; missing translation falls back to English. Never throws. |
+| `lang` | The language S³ is configured with, or `en` before S³ is discovered. Read-only — plugins never set it. |
+
+Every string a player or admin reads goes through `localize()`. Values written
+to the database (round-report columns, JSON report fields) stay in English —
+they are data, not display. See `s3/LOCALIZATION.md`.
+
 **DB convenience** (call from `_onS3Ready()`):
 
 | Method | Purpose |
@@ -1873,6 +1884,7 @@ node s3/testing/test-game-state-service.js
 | `test-s3-plugin-base-lifecycle.js` | S3PluginBase discovery, mount/unmount hooks |
 | `test-s3-plugin-base-db.js` | Base class DB: model definition, migration flow |
 | `test-s3-discord-plugin-base.js` | Discord channel setup, `sendDiscordMessage()` |
+| `test-i18n.js` | Catalogue parity, call-site keys and vars, language resolution |
 | `test-s3-export-import.js` | Three-tier export/import, JSON format, validation |
 | `test-s3-commands.js` | All `!s3` command paths, embed builders |
 | `test-command-standardization.js` | Elo lookup helper, Switch help fallback |
@@ -2125,6 +2137,7 @@ S³ must appear **before** consumer plugins:
 | `enableFileLogging` | boolean | `false` | Mirror each DB log write as a JSONL line at `logPath` |
 | `logPath` | string | `'./s3-log.jsonl'` | JSONL mirror path, used only when `enableFileLogging` is true |
 | `autoMigrate` | boolean | `false` | Auto-apply migrations without Discord confirmation |
+| `language` | string | `'en'` | Language for all S³ plugin messages. Available: `en`, `pt`. Set here only — every consumer plugin inherits it and none has a `language` option of its own. Unknown codes fall back to `en` with a warning. See `s3/LOCALIZATION.md` |
 | `stderrDiagnostics` | string | `'off'` | `'off'` / `'mirror'` / `'auto'` — mirror S³ failures to fd 2. See §9.9 |
 | `stderrDedupeWindowSeconds` | number | `60` | Identical stderr events inside the window are counted, not written. See §9.9 |
 

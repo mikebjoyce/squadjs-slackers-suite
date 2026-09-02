@@ -158,6 +158,7 @@ import crypto from 'node:crypto';
 import { registerS3DiscordCommands } from '../utils/s3-discord.js';
 import { configureStderrDiagnostics, flushStderrDiagnostics, stderrError } from '../utils/s3-stderr.js';
 import { buildMigrationEmbed } from '../utils/s3-migration-discord.js';
+import { localize as lookupMessage, DEFAULT_LANGUAGE } from '../utils/s3-i18n.js';
 export default class SlackersSquadServices extends BasePlugin {
   static get description() {
     return "Shared Slacker's Squad Services plugin wiring gameState, factions, clans, db, and players modules.";
@@ -171,6 +172,13 @@ export default class SlackersSquadServices extends BasePlugin {
 
   static get optionsSpecification() {
     return {
+      // The only place language is set. Every S³ plugin reads it through
+      // S3PluginBase's `lang` getter; consumers declare no language option.
+      language: {
+        required: false,
+        description: 'Language for all S³ plugin messages. Available: en, pt. Unknown codes fall back to en with a warning.',
+        default: 'en'
+      },
       database: {
         required: true,
         connector: 'sequelize',
@@ -335,6 +343,17 @@ export default class SlackersSquadServices extends BasePlugin {
   get clans()         { return this.services.clans; }
   get players()       { return this.services.players; }
   get logging()       { return this.services.logging; }
+
+  // The single source of language for the whole suite. S3PluginBase reads this
+  // through this._s3?.lang, so every consumer plugin follows whatever is set
+  // here and declares no language option of its own.
+  get lang()          { return this.options?.language || DEFAULT_LANGUAGE; }
+
+  // S³ extends BasePlugin rather than S3PluginBase, so it does not inherit that
+  // class's localize() and needs its own for its own messages.
+  localize(key, vars = {}) {
+    return lookupMessage(key, vars, this.lang);
+  }
 
   /**
    * Returns a promise that resolves when S³ has fully mounted — all services,
@@ -532,20 +551,20 @@ export default class SlackersSquadServices extends BasePlugin {
           if (missingRows.length > 0) parts.push(missingRows.join('\n'));
           const dataViolations = drift
             .filter(e => e.dataViolations)
-            .map(e => `- **${e.table}**: ${e.dataViolations.map(v => `${v.offenders} row(s) with empty \`${v.column}\``).join(', ')}`);
+            .map(e => `- **${e.table}**: ${e.dataViolations.map(v => this.localize('slackersSquadServices.driftViolations.emptyRows', { offenders: v.offenders, column: v.column })).join(', ')}`);
           if (dataViolations.length > 0) parts.push(dataViolations.join('\n'));
           const description = parts.length > 0
-            ? `Schema or data drift detected — expected state is missing from the live database.\nUse \`!s3 migrate force\` to re-apply.\n\n${parts.join('\n')}`
-            : `Schema drift detected — use \`!s3 migrate verify\` for details.`;
+            ? this.localize('slackersSquadServices.drift.descriptionSummary', { parts: parts.join('\n') })
+            : this.localize('slackersSquadServices.drift.descriptionFallback');
           discordClient.channels.fetch(channelID).then(channel => {
             if (channel) {
               channel.send({
                 embeds: [{
                   color: 0xe74c3c,
-                  title: '⚠️ Schema Drift Detected',
+                  title: this.localize('slackersSquadServices.drift.embedTitle'),
                   description,
                   timestamp: new Date().toISOString(),
-                  footer: { text: 'S³ Schema Verification' }
+                  footer: { text: this.localize('slackersSquadServices.drift.footer') }
                 }]
               }).catch(() => {});
             }
@@ -827,8 +846,8 @@ export default class SlackersSquadServices extends BasePlugin {
     // Build token embed using the existing buildMigrationEmbed helper.
     // The embed already includes generic instructions from buildMigrationEmbed().
     // Append the token-specific line so the admin knows which token to use.
-    const embed = buildMigrationEmbed(pending, 'pending', null);
-    embed.description += `\nToken: \`${token}\``;
+    const embed = buildMigrationEmbed(this, pending, 'pending', null);
+    embed.description += '\n' + this.localize('slackersSquadServices.migrate.tokenLine', { token });
 
     this.verbose(1, `[S3 Migration] ${pending.length} plugin(s) have pending schema migrations. Generated token: ${token}`);
 
