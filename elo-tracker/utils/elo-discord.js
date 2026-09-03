@@ -33,7 +33,7 @@
  *       commands in elo-commands.js so every lookup path resolves a
  *       name identically.
  *
- *   Calculates and displays a "Conservative Rating" (μ - 3σ) 
+ *   Calculates and displays a "Conservative Rating" (μ - 3σ)
  *   as the primary player rank to encourage active play.
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
@@ -316,19 +316,19 @@ export const EloDiscord = {
         { name: tracker.localize('eloTracker.embeds.fieldWinner'), value: tracker.localize('eloTracker.embeds.winnerTickets', { winnerText, ticketDiff }), inline: true },
         { name: tracker.localize('eloTracker.embeds.fieldDuration'), value: durationStr, inline: true },
         { name: tracker.localize('eloTracker.embeds.playerCount'), value: `${totalPlayerCount}`, inline: true },
-        { 
-          name: tracker.localize('eloTracker.embeds.fieldDisparity'), 
+        {
+          name: tracker.localize('eloTracker.embeds.fieldDisparity'),
           value: [
             tracker.localize('eloTracker.embeds.skillBalanceEloDiff', { eloEmoji: getEloEmoji(muDelta), value: muDelta.toFixed(2), muAdvText }),
             tracker.localize('eloTracker.embeds.top15BalanceElo', { eloEmoji: getEloEmoji(top15Delta), value: top15Delta.toFixed(2), top15AdvText }),
             tracker.localize('eloTracker.embeds.regularBalanceRegDiff', { regEmoji: getRegEmoji(leadShare), regDelta, t1Share, t2Share, vetAdvText })
-          ].join('\n'), 
-          inline: false 
+          ].join('\n'),
+          inline: false
         },
-        { 
-          name: tracker.localize('eloTracker.embeds.ratingChanges'), 
-          value: tracker.localize('eloTracker.embeds.team1Team2', { ratingChanges: formatRatingChanges(team1Summary), ratingChanges2: formatRatingChanges(team2Summary) }), 
-          inline: false 
+        {
+          name: tracker.localize('eloTracker.embeds.ratingChanges'),
+          value: tracker.localize('eloTracker.embeds.team1Team2', { ratingChanges: formatRatingChanges(team1Summary), ratingChanges2: formatRatingChanges(team2Summary) }),
+          inline: false
         },
         { name: tracker.localize('eloTracker.embeds.playersUpdated'), value: playersUpdatedCount.toString(), inline: true },
         { name: tracker.localize('eloTracker.embeds.processingTime'), value: `${calculationDuration}ms`, inline: true },
@@ -464,7 +464,7 @@ export const EloDiscord = {
 
   buildClanStatsEmbed(tracker, displayTag, members, rankedCount, totalWins, totalLosses, avgMu, avgSigma, avgCsr, sortedMembers, minRounds = 10) {
     const wr = (totalWins + totalLosses) > 0 ? ((totalWins / (totalWins + totalLosses)) * 100).toFixed(1) : '—';
-    
+
     // Format roster lines (Top 20)
     const rosterLines = sortedMembers.slice(0, 20).map((p, i) => {
       const pCsr = p.mu - (EloCalculator.SIGMA_MULTIPLIER * p.sigma);
@@ -472,7 +472,7 @@ export const EloDiscord = {
       return `${(i + 1).toString().padStart(2)}. ${p.name.padEnd(20)} ${pCsr.toFixed(1).padStart(5)} CSR${prov}`;
     });
 
-    const rosterText = rosterLines.length > 0 
+    const rosterText = rosterLines.length > 0
       ? `\`\`\`text\n${rosterTextHeader()}\n${rosterLines.join('\n')}\n\`\`\``
       : tracker.localize('eloTracker.embeds.noMembersFound');
 
@@ -500,7 +500,7 @@ export const EloDiscord = {
       const csrStr = c.avgCsr === -999 ? 'n/a'.padStart(5) : c.avgCsr.toFixed(1).padStart(5);
       const membersStr = `${c.members.length}m`.padStart(4);
       const wrStr = `${c.wr.toFixed(0)}%`.padStart(4);
-      
+
       return `#${rankStr} ${tagStr} ${csrStr} CSR ${membersStr} ${wrStr}`;
     });
 
@@ -581,7 +581,7 @@ export const EloDiscord = {
 
     const muLeadTeam = t1.avgMu >= t2.avgMu ? 1 : 2;
     const top15LeadTeam = t1.top15Mu >= t2.top15Mu ? 1 : 2;
-    
+
     const totalRegs = t1.tierStats.rCount + t2.tierStats.rCount;
     const leadRegs = Math.max(t1.tierStats.rCount, t2.tierStats.rCount);
     const regShare = totalRegs > 0 ? Math.round((leadRegs / totalRegs) * 100) : 0;
@@ -598,7 +598,7 @@ export const EloDiscord = {
     const title = type === 'manual'
       ? tracker.localize('eloTracker.embeds.liveRoundInfo2', { layerName })
       : tracker.localize('eloTracker.embeds.roundStarted', { layerName });
-    
+
     const embed = {
       color: vUI.color,
       title: title,
@@ -669,7 +669,7 @@ export const EloDiscord = {
         return null;
       };
 
-      const hasAdminRole = (!this.options.discordAdminRoleIDs || this.options.discordAdminRoleIDs.length === 0) || 
+      const hasAdminRole = (!this.options.discordAdminRoleIDs || this.options.discordAdminRoleIDs.length === 0) ||
         (message.member && this.options.discordAdminRoleIDs.some(roleID => message.member.roles.cache.has(roleID)));
 
       // --- Admin-only commands (admin channel only, checked first) ---
@@ -715,7 +715,7 @@ export const EloDiscord = {
 
         if (sub === 'roundinfo') {
           try {
-            const data = this.buildRoundStartData(); 
+            const data = this.buildRoundStartData();
             const embed = EloDiscord.buildRoundStartEmbed(tracker, data, 'manual');
             await EloDiscord.sendDiscordMessage(message.channel, { embeds: [embed] });
           } catch (err) {
@@ -831,7 +831,7 @@ export const EloDiscord = {
               files: [{ attachment: buffer, name: filename }]
             });
           } catch (err) {
-            await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildErrorEmbed(tracker, 'Backup', err)] });
+            await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildErrorEmbed(tracker, tracker.localize('eloTracker.embeds.backup'), err)] });
           }
           return;
         }
@@ -849,9 +849,9 @@ export const EloDiscord = {
               await message.reply(tracker.localize('eloTracker.embeds.invalidBackupFormatMissing'));
               return;
             }
-            
+
             // Schema validation to ensure the JSON matches the expected player format
-            const isValidSchema = json.players.every(p => 
+            const isValidSchema = json.players.every(p =>
               typeof p.eosID === 'string' &&
               typeof p.mu === 'number' &&
               typeof p.sigma === 'number' &&
@@ -859,19 +859,19 @@ export const EloDiscord = {
               typeof p.losses === 'number' &&
               typeof p.roundsPlayed === 'number'
             );
-            
+
              if (!isValidSchema) {
                await message.reply(tracker.localize('eloTracker.embeds.invalidBackupFormatOne'));
                return;
              }
-             
+
              await message.reply(tracker.localize('eloTracker.embeds.restoringPlayersMayTake', { value: json.players.length }));
              await this.db.importPlayerStats(json.players);
              await EloDiscord.sendDiscordMessage(message.channel, {
                embeds: [EloDiscord.buildAdminConfirmEmbed(tracker, tracker.localize('eloTracker.embeds.restoreComplete'), tracker.localize('eloTracker.embeds.restoredPlayersFromBackup', { value: json.players.length }))]
              });
           } catch (err) {
-            await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildErrorEmbed(tracker, 'Restore', err)] });
+            await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildErrorEmbed(tracker, tracker.localize('eloTracker.embeds.restore'), err)] });
           }
           return;
         }
@@ -1021,7 +1021,7 @@ export const EloDiscord = {
         const minRounds = this.options.minRoundsForLeaderboard;
         const totalRanked = await this.db.getTotalRankedPlayers(minRounds);
         const totalPlayers = await this.db.getTotalPlayers();
-        
+
         let targetRank = 1;
         let isCentered = false;
         if (args.length > 1) {
@@ -1031,15 +1031,15 @@ export const EloDiscord = {
             isCentered = true;
           }
         }
-        
+
         if (targetRank > totalRanked && totalRanked > 0) {
           targetRank = totalRanked;
         }
-        
+
         const limit = 25;
         let offset = Math.max(0, targetRank - 13);
         const startRank = offset + 1;
-        
+
         const players = await this.db.getLeaderboard(limit, minRounds, offset);
         const displayTargetRank = isCentered ? targetRank : null;
         await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildLeaderboardEmbed(tracker, players, limit, startRank, totalRanked, totalPlayers, displayTargetRank)] });

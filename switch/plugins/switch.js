@@ -765,6 +765,10 @@ export default class Switch extends S3DiscordPluginBase {
         // v2.2.0: Cache liberal mode before round/layer changes
         if (this._roundStats) {
             this._roundStats.wasLiberalMode = this.isLiberalMode();
+            // Same window, same reason: this is the last moment S³ still
+            // describes the round that is ending, and the first moment its
+            // layer can be trusted. Overwrites whatever NEW_GAME guessed.
+            this._captureRoundIdentity({ settled: true });
         }
 
         this.verbose(2, `[Queue] Round ended — queue preserved (${this._getQueueSize()} entries remain).`);
@@ -1274,7 +1278,7 @@ export default class Switch extends S3DiscordPluginBase {
                 } else {
                     const queueDurationSeconds = Math.round((Date.now() - queueEntry.queuedAt) / 1000);
                     const gamePhase = this._s3?.gameState?.getPhase?.() || 'UNKNOWN';
-                    this._roundStats.queueDisconnects.push({
+                    this._trackRoundStat('queueDisconnects', {
                         name: playerName,
                         eosID,
                         currentTeamID: queueEntry.currentTeamID,
@@ -1483,7 +1487,11 @@ export default class Switch extends S3DiscordPluginBase {
             this.verbose(1, '[NEW_GAME] Queue cleared — players notified.');
         }, 30_000);
 
-        // Post summary for the round that just ended, BEFORE resetting stats
+        // Store and post the round that just ended, BEFORE resetting stats.
+        // Storing runs first and unconditionally — the summary post is
+        // optional and talks to Discord, and neither should be able to cost
+        // us the round's numbers.
+        await this._persistRoundStats();
         await this._postRoundSummary();
 
         // v2.0.0: Store game start timestamp for broadcast timing
@@ -1494,6 +1502,12 @@ export default class Switch extends S3DiscordPluginBase {
 
         // Reset round stats for the new round
         this._roundStats = this._initRoundStats();
+        // Label the fresh round now, provisionally. matchId often has not
+        // resolved at NEW_GAME yet — the seed sweeps below guard on exactly
+        // that — and the layer read here can still be the PREVIOUS round's.
+        // _onLayerChanged fills gaps as they resolve, and onRoundEnded takes
+        // the final say once the layer has settled.
+        this._captureRoundIdentity();
 
         // ── Broadcast timer startup (dual-path) ──────────────────────
         //

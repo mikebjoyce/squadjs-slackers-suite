@@ -231,8 +231,8 @@ export function guildAttachmentLimit(guild) {
   }
 }
 
-export function formatTimestamp(unixMs) {
-  if (!unixMs) return 'N/A';
+export function formatTimestamp(unixMs, naText) {
+  if (!unixMs) return naText;
   return `<t:${Math.floor(unixMs / 1000)}:R>`;
 }
 
@@ -249,13 +249,14 @@ export function buildStatusEmbed(plugin) {
   const db = services.db;
   const sc = services.serverConfig;
 
+  const NA = plugin.localize('slackersSquadServices.labels.notAvailable');
   const phase = gs?.getPhase?.() ?? 'unknown';
   const subState = gs?.getEndgameSubState?.() ?? null;
-  const mode = gs?.getGamemode?.() ?? 'N/A';
+  const mode = gs?.getGamemode?.() ?? NA;
   // Display spelling ("Sumari Bala Seed v1"), not the canonical classname S³
   // stores and compares on. getLayerDisplayName() falls back to the canonical
   // name, so the ?? chain only matters for a gameState that predates it.
-  const layer = gs?.getLayerDisplayName?.() ?? gs?.getLayerName?.() ?? 'N/A';
+  const layer = gs?.getLayerDisplayName?.() ?? gs?.getLayerName?.() ?? NA;
   const playerCount = players?.getAllPlayers?.()?.length ?? 0;
   const globalLockOwner = players?.isGloballyLockedBy?.() ?? null;
   const teamsResolved = players?.areTeamsResolved?.() ?? false;
@@ -277,8 +278,8 @@ export function buildStatusEmbed(plugin) {
     mountLines.push(`${emoji} **${label}**`);
   }
 
-  const team1Name = factions?.getTeamName?.(1) ?? 'Team 1';
-  const team2Name = factions?.getTeamName?.(2) ?? 'Team 2';
+  const team1Name = factions?.getTeamName?.(1) ?? plugin.localize('slackersSquadServices.team.team1');
+  const team2Name = factions?.getTeamName?.(2) ?? plugin.localize('slackersSquadServices.team.team2');
 
   const fields = [
     {
@@ -290,11 +291,11 @@ export function buildStatusEmbed(plugin) {
       name: plugin.localize('slackersSquadServices.status.game'),
       value: [
         plugin.localize('slackersSquadServices.status.phaseAndSubstate', { phase: phaseEmoji(phase), phase2: phase, subState: subState ? ` (${subState})` : '' }),
-        `Mode: **${mode}**`,
+        plugin.localize('slackersSquadServices.status.mode', { mode }),
         plugin.localize('slackersSquadServices.status.layerLayer', { layer: truncate(layer, 40) }),
         isResolving ? plugin.localize('slackersSquadServices.status.resolvingYes') : '',
-        `MatchId: \`${gs?.getMatchId?.() ?? 'N/A'}\``,
-        `Round Start: ${formatTimestamp(gs?.getRoundStartTime?.())}`
+        plugin.localize('slackersSquadServices.status.matchId', { matchId: gs?.getMatchId?.() ?? NA }),
+        plugin.localize('slackersSquadServices.status.roundStart', { roundStart: formatTimestamp(gs?.getRoundStartTime?.(), NA) })
       ].filter(Boolean).join('\n'),
       inline: true
     },
@@ -303,8 +304,8 @@ export function buildStatusEmbed(plugin) {
       value: [
         plugin.localize('slackersSquadServices.status.players', { playerCount }),
         plugin.localize('slackersSquadServices.status.teamNames', { team1Name, team2Name }),
-        teamsResolved ? plugin.localize('slackersSquadServices.status.teamsResolvedYes') : `Teams Resolved: 🟡 No`,
-        `Global Lock: ${globalLockOwner ? `🔒 ${globalLockOwner}` : '🟢 None'}`
+        teamsResolved ? plugin.localize('slackersSquadServices.status.teamsResolvedYes') : plugin.localize('slackersSquadServices.status.teamsResolvedNo'),
+        plugin.localize('slackersSquadServices.status.globalLock', { state: globalLockOwner ? plugin.localize('slackersSquadServices.status.globalLockOwner', { owner: globalLockOwner }) : plugin.localize('slackersSquadServices.status.globalLockNone') })
       ].join('\n'),
       inline: true
     }
@@ -332,113 +333,114 @@ export function buildServicesEmbed(plugin) {
   const players = services.players;
   const db = services.db;
 
+  const NA = plugin.localize('slackersSquadServices.labels.notAvailable');
   const entries = [];
 
   // ── serverConfig ──────────────────────────────────────────────
   const sc = services.serverConfig;
   if (!sc || !sc._isMounted) {
-    entries.push(`⚪ **ServerConfig** — not mounted`);
+    entries.push(plugin.localize('slackersSquadServices.services.notMounted', { service: 'ServerConfig' }));
   } else {
     const loaded = sc.isLoadedSuccessfully?.() ?? false;
-    const path = sc.getConfigPath?.() ?? 'N/A';
-    entries.push(`${loaded ? '🟢' : '🟡'} **ServerConfig** — ${loaded ? 'loaded' : 'mounted, no config found'}`);
-    entries.push(`   Path: \`${truncate(path, 40)}\``);
+    const path = sc.getConfigPath?.() ?? NA;
+    entries.push(plugin.localize('slackersSquadServices.services.serverConfig', { emoji: loaded ? '🟢' : '🟡', state: loaded ? plugin.localize('slackersSquadServices.services.serverConfigLoaded') : plugin.localize('slackersSquadServices.services.serverConfigNoConfig') }));
+    entries.push(plugin.localize('slackersSquadServices.services.path', { path: truncate(path, 40) }));
     const cfg = sc.getConfig?.() ?? {};
-    if (cfg.MaxPlayers) entries.push(`   MaxPlayers: ${cfg.MaxPlayers} | AllowTeamChanges: ${cfg.AllowTeamChanges ?? 'N/A'}`);
+    if (cfg.MaxPlayers) entries.push(plugin.localize('slackersSquadServices.services.maxPlayersLine', { maxPlayers: cfg.MaxPlayers, allowTeamChanges: cfg.AllowTeamChanges ?? NA }));
   }
 
   // ── DB ────────────────────────────────────────────────────────
   if (!db || !db._isMounted) {
-    entries.push(`⚪ **DB** — not mounted`);
+    entries.push(plugin.localize('slackersSquadServices.services.notMounted', { service: 'DB' }));
   } else {
     const connector = db.getConnectorName?.() ?? '?';
     const hasPending = (db.getPendingMigrations?.()?.length ?? 0) > 0;
     let connectorStr;
     if (connector === 'none') {
-      connectorStr = '⚫ No connector';
+      connectorStr = plugin.localize('slackersSquadServices.services.noConnector');
     } else {
       // Check schema drift status
       const drift = db.getLastDriftResult?.();
       if (drift == null) {
         connectorStr = `🟢 ${connector}`; // no check run yet — assume OK
       } else if (drift.length === 0) {
-        connectorStr = `🟢 ${connector} — No schema drift`;
+        connectorStr = plugin.localize('slackersSquadServices.services.noSchemaDrift', { connector });
       } else if (drift.some(e => e.error)) {
-        connectorStr = `🔴 ${connector} — Cannot verify schema`;
+        connectorStr = plugin.localize('slackersSquadServices.services.cannotVerifySchema', { connector });
       } else {
         // Drift detected — summarise
         const tableCount = drift.length;
         const missingCols = drift.filter(e => e.missing).length;
         const extraCols = drift.filter(e => e.extra).length;
         const parts = [];
-        if (missingCols > 0) parts.push(`${missingCols} table(s) missing columns`);
-        if (extraCols > 0) parts.push(`${extraCols} table(s) with extra columns`);
-        connectorStr = `🟠 ${connector} — Schema drift: ${parts.join(', ')}`;
+        if (missingCols > 0) parts.push(plugin.localize('slackersSquadServices.services.driftMissingColumns', { count: missingCols }));
+        if (extraCols > 0) parts.push(plugin.localize('slackersSquadServices.services.driftExtraColumns', { count: extraCols }));
+        connectorStr = plugin.localize('slackersSquadServices.services.schemaDrift', { connector, parts: parts.join(', ') });
       }
     }
-    entries.push(`🟢 **DB** — ${connectorStr}`);
-    entries.push(`   Migrations: ${hasPending ? '🟠 Pending' : '🟢 All current'}`);
+    entries.push(plugin.localize('slackersSquadServices.services.db', { connector: connectorStr }));
+    entries.push(plugin.localize('slackersSquadServices.services.migrations', { state: hasPending ? plugin.localize('slackersSquadServices.services.migrationsPending') : plugin.localize('slackersSquadServices.services.migrationsAllCurrent') }));
     const versionCount = (db._expectedVersions?.size ?? 0);
-    if (versionCount > 0) entries.push(`   Schema versions registered: ${versionCount}`);
+    if (versionCount > 0) entries.push(plugin.localize('slackersSquadServices.services.schemaVersions', { count: versionCount }));
   }
 
   // ── GameState ─────────────────────────────────────────────────
   if (!gs || !gs._isMounted) {
-    entries.push(`⚪ **GameState** — not mounted`);
+    entries.push(plugin.localize('slackersSquadServices.services.notMounted', { service: 'GameState' }));
   } else {
     const phase = gs.getPhase?.() ?? '?';
-    const matchId = gs.getMatchId?.() ?? 'N/A';
+    const matchId = gs.getMatchId?.() ?? NA;
     const resolving = gs.isResolving?.() ?? false;
-    entries.push(`${circleEmoji('phase', phase)} **GameState** — Phase: ${phase}${resolving ? ' (resolving)' : ''}`);
-    entries.push(`   MatchId: \`${matchId}\` | RoundStart: ${formatTimestamp(gs.getRoundStartTime?.())}`);
-    const mode = gs.getGamemode?.() ?? 'N/A';
-    const layer = gs.getLayerDisplayName?.() ?? gs.getLayerName?.() ?? 'N/A';
-    entries.push(`   Mode: ${mode} | Layer: ${truncate(layer, 30)}`);
+    entries.push(plugin.localize('slackersSquadServices.services.gameState', { emoji: circleEmoji('phase', phase), phase, resolving: resolving ? plugin.localize('slackersSquadServices.services.resolvingSuffix') : '' }));
+    entries.push(plugin.localize('slackersSquadServices.services.matchIdRoundStart', { matchId, roundStart: formatTimestamp(gs.getRoundStartTime?.(), NA) }));
+    const mode = gs.getGamemode?.() ?? NA;
+    const layer = gs.getLayerDisplayName?.() ?? gs.getLayerName?.() ?? NA;
+    entries.push(plugin.localize('slackersSquadServices.services.modeLayer', { mode, layer: truncate(layer, 30) }));
     entries.push(`   isLive: ${gs.isLive?.() ? '🟢' : '⚫'} | isStaging: ${gs.isStaging?.() ? '🟡' : '⚫'} | isEnding: ${gs.isEnding?.() ? '🔴' : '⚫'}`);
   }
 
   // ── Factions ─────────────────────────────────────────────────
   const factions = services.factions;
   if (!factions || !factions._isMounted) {
-    entries.push(`⚪ **Factions** — not mounted`);
+    entries.push(plugin.localize('slackersSquadServices.services.notMounted', { service: 'Factions' }));
   } else {
     const hasBoth = factions._hasBothTeams?.() ?? false;
     const hasPolling = factions._teamAbbreviationPollingInterval != null;
-    const t1 = factions.getTeamName?.(1) ?? 'Team 1';
-    const t2 = factions.getTeamName?.(2) ?? 'Team 2';
-    entries.push(`${hasBoth ? '🟢' : '🟡'} **Factions** — ${hasBoth ? 'Both teams resolved' : 'Resolving...'}`);
-    entries.push(`   ${t1} vs ${t2}`);
-    entries.push(`   Polling: ${hasPolling ? '🟢 Running' : '⚫ Stopped'}`);
+    const t1 = factions.getTeamName?.(1) ?? plugin.localize('slackersSquadServices.team.team1');
+    const t2 = factions.getTeamName?.(2) ?? plugin.localize('slackersSquadServices.team.team2');
+    entries.push(plugin.localize('slackersSquadServices.services.factions', { emoji: hasBoth ? '🟢' : '🟡', state: hasBoth ? plugin.localize('slackersSquadServices.services.factionsBothResolved') : plugin.localize('slackersSquadServices.services.factionsResolving') }));
+    entries.push(plugin.localize('slackersSquadServices.services.teamsVs', { team1: t1, team2: t2 }));
+    entries.push(plugin.localize('slackersSquadServices.services.polling', { state: hasPolling ? plugin.localize('slackersSquadServices.services.pollingRunning') : plugin.localize('slackersSquadServices.services.pollingStopped') }));
   }
 
   // ── Clans ─────────────────────────────────────────────────────
   const clans = services.clans;
   if (!clans || !clans._isMounted) {
-    entries.push(`⚪ **Clans** — not mounted`);
+    entries.push(plugin.localize('slackersSquadServices.services.notMounted', { service: 'Clans' }));
   } else {
     const enabled = clans.isEnabled?.() ?? false;
     if (enabled) {
       const groups = clans.extractClanGroups?.(players?.getAllPlayers?.() ?? []) ?? {};
       const groupCount = Object.keys(groups).length;
-      entries.push(`🟢 **Clans** — ${groupCount} group(s) found (min ${clans.options?.minSize ?? 2}, max ${clans.options?.maxSize ?? 18})`);
+      entries.push(plugin.localize('slackersSquadServices.services.clans', { count: groupCount, min: clans.options?.minSize ?? 2, max: clans.options?.maxSize ?? 18 }));
     } else {
-      entries.push(`⚫ **Clans** — disabled in config`);
+      entries.push(plugin.localize('slackersSquadServices.services.clansDisabled'));
     }
   }
 
   // ── Players ───────────────────────────────────────────────────
   if (!players || !players._isMounted) {
-    entries.push(`⚪ **Players** — not mounted`);
+    entries.push(plugin.localize('slackersSquadServices.services.notMounted', { service: 'Players' }));
   } else {
     const allP = players.getAllPlayers?.() ?? [];
     const initialSync = players._initialSyncComplete ?? false;
     const teamsResolved = players.areTeamsResolved?.() ?? false;
     const projected = players._projectedPlayers !== null;
-    entries.push(`${initialSync ? '🟢' : '🟡'} **Players** — ${allP.length} tracked`);
-    entries.push(`   Initial Sync: ${initialSync ? '🟢 Complete' : '🟡 Pending'} | Teams: ${teamsResolved ? '🟢 Resolved' : '🟡 Resolving'}`);
-    entries.push(`   Projection: ${projected ? '🟡 Active' : '⚫ None'}`);
+    entries.push(plugin.localize('slackersSquadServices.services.players', { emoji: initialSync ? '🟢' : '🟡', count: allP.length }));
+    entries.push(plugin.localize('slackersSquadServices.services.initialSyncTeams', { sync: initialSync ? plugin.localize('slackersSquadServices.services.syncComplete') : plugin.localize('slackersSquadServices.services.syncPending'), teams: teamsResolved ? plugin.localize('slackersSquadServices.services.teamsResolvedState') : plugin.localize('slackersSquadServices.services.teamsResolvingState') }));
+    entries.push(plugin.localize('slackersSquadServices.services.projection', { state: projected ? plugin.localize('slackersSquadServices.services.projectionActive') : plugin.localize('slackersSquadServices.services.projectionNone') }));
     const globalLockOwner = players.isGloballyLockedBy?.() ?? null;
-    entries.push(`   Global Lock: ${globalLockOwner ? `🔒 ${globalLockOwner}` : '🟢 None'}`);
+    entries.push(plugin.localize('slackersSquadServices.services.globalLock', { state: globalLockOwner ? plugin.localize('slackersSquadServices.services.globalLockOwner', { owner: globalLockOwner }) : plugin.localize('slackersSquadServices.services.globalLockNone') }));
   }
 
   return {
@@ -455,20 +457,25 @@ export function buildGameStateEmbed(plugin) {
     return { color: 0xe74c3c, title: plugin.localize('slackersSquadServices.gameState.gamestateServiceNotAvailable') };
   }
 
+  const NA = plugin.localize('slackersSquadServices.labels.notAvailable');
   const phase = gs.getPhase?.() ?? 'unknown';
   const sub = gs.getEndgameSubState?.() ?? null;
-  const mode = gs.getGamemode?.() ?? 'N/A';
-  const layer = gs.getLayerDisplayName?.() ?? gs.getLayerName?.() ?? 'N/A';
+  const mode = gs.getGamemode?.() ?? NA;
+  const layer = gs.getLayerDisplayName?.() ?? gs.getLayerName?.() ?? NA;
   const resolving = gs.isResolving?.() ?? false;
-  const matchId = gs.getMatchId?.() ?? 'N/A';
+  const matchId = gs.getMatchId?.() ?? NA;
   const roundStartTime = gs.getRoundStartTime?.() ?? null;
 
   // Detect presence of staging live timer
   const stagingLiveTimerPending = gs._stagingLiveTimer != null;
+  // Hoisted out of the field literal: the read-back guard scans line by line,
+  // and a comparison sharing a line with localize() reads as a translated
+  // string being matched on.
+  const layerUnresolved = gs.isLayerResolved?.() === false;
 
   const fields = [
-    { name: 'Phase', value: `${phaseEmoji(phase)} ${phase}`, inline: true },
-    { name: plugin.localize('slackersSquadServices.gameState.resolving'), value: resolving ? '🟡 Yes' : '⚫ No', inline: true },
+    { name: plugin.localize('slackersSquadServices.gameState.phase'), value: `${phaseEmoji(phase)} ${phase}`, inline: true },
+    { name: plugin.localize('slackersSquadServices.gameState.resolving'), value: resolving ? plugin.localize('slackersSquadServices.gameState.yes') : plugin.localize('slackersSquadServices.gameState.no'), inline: true },
     { name: '', value: '', inline: true }, // spacer
     { name: 'isLive', value: gs.isLive?.() ? '🟢' : '⚫', inline: true },
     { name: 'isStaging', value: gs.isStaging?.() ? '🟡' : '⚫', inline: true },
@@ -476,11 +483,11 @@ export function buildGameStateEmbed(plugin) {
     { name: plugin.localize('slackersSquadServices.gameState.gamemode'), value: mode, inline: true },
     // ⚠️ marks a layer S³ has not actually resolved yet (the 'Unknown'
     // placeholder), so operators can tell it apart from a real layer name.
-    { name: 'Layer', value: `${gs.isLayerResolved?.() === false ? '⚠️ ' : ''}${truncate(layer, 50)}`, inline: true },
+    { name: plugin.localize('slackersSquadServices.gameState.layer'), value: `${layerUnresolved ? '⚠️ ' : ''}${truncate(layer, 50)}`, inline: true },
     { name: 'isIgnoredMode', value: gs.isIgnoredMode?.() ? '🟡' : '⚫', inline: true },
     { name: 'MatchId', value: `\`${matchId}\``, inline: true },
-    { name: plugin.localize('slackersSquadServices.gameState.roundStart'), value: formatTimestamp(roundStartTime), inline: true },
-    { name: plugin.localize('slackersSquadServices.gameState.stagingTimer'), value: stagingLiveTimerPending ? plugin.localize('slackersSquadServices.gameState.pending') : '⚫ None', inline: true }
+    { name: plugin.localize('slackersSquadServices.gameState.roundStart'), value: formatTimestamp(roundStartTime, NA), inline: true },
+    { name: plugin.localize('slackersSquadServices.gameState.stagingTimer'), value: stagingLiveTimerPending ? plugin.localize('slackersSquadServices.gameState.pending') : plugin.localize('slackersSquadServices.gameState.none'), inline: true }
   ];
 
   if (sub) {
@@ -491,8 +498,8 @@ export function buildGameStateEmbed(plugin) {
     fields.push({ name: 'isEndgamePostVoting', value: gs.isEndgamePostVoting?.() ? '🟢' : '⚫', inline: true });
   }
 
-  const lastNew = formatTimestamp(gs.lastNewGameAt);
-  const lastEnd = formatTimestamp(gs.lastRoundEndedAt);
+  const lastNew = formatTimestamp(gs.lastNewGameAt, NA);
+  const lastEnd = formatTimestamp(gs.lastRoundEndedAt, NA);
   fields.push({ name: plugin.localize('slackersSquadServices.gameState.lastNewGame'), value: lastNew, inline: true });
   fields.push({ name: plugin.localize('slackersSquadServices.gameState.lastRoundEnded'), value: lastEnd, inline: true });
 
@@ -510,8 +517,8 @@ export function buildFactionsEmbed(plugin) {
     return { color: 0xe74c3c, title: plugin.localize('slackersSquadServices.factions.factionsServiceNotAvailable') };
   }
 
-  const team1 = factions.getTeamName?.(1) ?? 'Team 1';
-  const team2 = factions.getTeamName?.(2) ?? 'Team 2';
+  const team1 = factions.getTeamName?.(1) ?? plugin.localize('slackersSquadServices.team.team1');
+  const team2 = factions.getTeamName?.(2) ?? plugin.localize('slackersSquadServices.team.team2');
   const cached = factions.getCachedAbbreviations?.() ?? {};
   const hasBoth = factions._hasBothTeams?.() ?? false;
   const hasPolling = factions._teamAbbreviationPollingInterval != null;
@@ -519,16 +526,16 @@ export function buildFactionsEmbed(plugin) {
 
   const stateEmoji = hasBoth ? '🟢' : '🟡';
   const pollingEmoji = hasPolling ? '🟢' : '⚫';
-  const gateEmoji = isResolving ? '🟡 Polling gated (resolving flag active)' : '🟢 Free to poll';
+  const gateEmoji = isResolving ? plugin.localize('slackersSquadServices.factions.pollingGated') : plugin.localize('slackersSquadServices.factions.freeToPoll');
 
   return {
     color: 0xe67e22,
     title: plugin.localize('slackersSquadServices.factions.factions'),
     fields: [
-      { name: plugin.localize('slackersSquadServices.factions.resolution'), value: `${stateEmoji} ${hasBoth ? 'Both teams resolved' : 'Resolving...'}`, inline: true },
-      { name: 'Team 1', value: team1, inline: true },
-      { name: 'Team 2', value: team2, inline: true },
-      { name: plugin.localize('slackersSquadServices.factions.polling'), value: `${pollingEmoji} ${hasPolling ? 'Active' : 'Stopped'}`, inline: true },
+      { name: plugin.localize('slackersSquadServices.factions.resolution'), value: `${stateEmoji} ${hasBoth ? plugin.localize('slackersSquadServices.factions.bothTeamsResolved') : plugin.localize('slackersSquadServices.factions.resolvingEllipsis')}`, inline: true },
+      { name: plugin.localize('slackersSquadServices.team.team1'), value: team1, inline: true },
+      { name: plugin.localize('slackersSquadServices.team.team2'), value: team2, inline: true },
+      { name: plugin.localize('slackersSquadServices.factions.polling'), value: `${pollingEmoji} ${hasPolling ? plugin.localize('slackersSquadServices.factions.active') : plugin.localize('slackersSquadServices.factions.stopped')}`, inline: true },
       { name: plugin.localize('slackersSquadServices.factions.resolvingGate'), value: gateEmoji, inline: true },
       { name: plugin.localize('slackersSquadServices.factions.cachedAbbreviations'), value: `\`\`\`json\n${JSON.stringify(cached, null, 2)}\n\`\`\``, inline: false }
     ],
@@ -677,13 +684,13 @@ export function buildPlayersEmbeds(plugin) {
   const factions = plugin.services.factions;
   const teamLabel = (teamID) => {
     const name = factions?.getTeamName?.(teamID);
-    return name && name !== `Team ${teamID}` ? `${name}` : `Team ${teamID}`;
+    return name && name !== `Team ${teamID}` ? `${name}` : plugin.localize('slackersSquadServices.team.teamN', { teamID });
   };
 
   // ── Meta embed ──────────────────────────────────────────────────
   const gs = plugin.services.gameState;
   const phase = gs?.getPhase?.() ?? 'unknown';
-  const layer = gs?.getLayerDisplayName?.() ?? gs?.getLayerName?.() ?? 'N/A';
+  const layer = gs?.getLayerDisplayName?.() ?? gs?.getLayerName?.() ?? plugin.localize('slackersSquadServices.labels.notAvailable');
 
   const globalOwner = players.isGloballyLockedBy?.() ?? null;
   const playerLocks = players.playerLocks ?? new Map();
@@ -691,8 +698,8 @@ export function buildPlayersEmbeds(plugin) {
 
   const delta = team1.length - team2.length;
   const deltaStr = delta === 0
-    ? '⚖️ Even'
-    : `${delta > 0 ? 'Team 1' : 'Team 2'} +${Math.abs(delta)}`;
+    ? plugin.localize('slackersSquadServices.playersEmbeds.even')
+    : plugin.localize('slackersSquadServices.playersEmbeds.delta', { team: delta > 0 ? plugin.localize('slackersSquadServices.team.team1') : plugin.localize('slackersSquadServices.team.team2'), count: Math.abs(delta) });
 
   const metaFields = [
     { name: plugin.localize('slackersSquadServices.playersEmbeds.population'), value: plugin.localize('slackersSquadServices.playersEmbeds.tracked', { allCount: all.length }), inline: true },
@@ -709,17 +716,17 @@ export function buildPlayersEmbeds(plugin) {
     { name: plugin.localize('slackersSquadServices.playersEmbeds.balance'), value: deltaStr, inline: true },
     {
       name: plugin.localize('slackersSquadServices.playersEmbeds.unassigned'),
-      value: squadDataPending ? plugin.localize('slackersSquadServices.playersEmbeds.unknown') : `${all.length - inSquadIDs.size} not in a squad`,
+      value: squadDataPending ? plugin.localize('slackersSquadServices.playersEmbeds.unknown') : plugin.localize('slackersSquadServices.playersEmbeds.notInASquad', { count: all.length - inSquadIDs.size }),
       inline: true
     },
-    { name: plugin.localize('slackersSquadServices.playersEmbeds.teamsResolved'), value: teamsResolved ? '🟢 Yes' : '🟡 No', inline: true },
-    { name: plugin.localize('slackersSquadServices.playersEmbeds.initialSync'), value: initialSync ? plugin.localize('slackersSquadServices.playersEmbeds.complete') : '🟡 Pending', inline: true },
-    { name: plugin.localize('slackersSquadServices.playersEmbeds.projection'), value: projected ? plugin.localize('slackersSquadServices.playersEmbeds.active') : '⚫ None', inline: true },
+    { name: plugin.localize('slackersSquadServices.playersEmbeds.teamsResolved'), value: teamsResolved ? plugin.localize('slackersSquadServices.playersEmbeds.yes') : plugin.localize('slackersSquadServices.playersEmbeds.no'), inline: true },
+    { name: plugin.localize('slackersSquadServices.playersEmbeds.initialSync'), value: initialSync ? plugin.localize('slackersSquadServices.playersEmbeds.complete') : plugin.localize('slackersSquadServices.playersEmbeds.pending'), inline: true },
+    { name: plugin.localize('slackersSquadServices.playersEmbeds.projection'), value: projected ? plugin.localize('slackersSquadServices.playersEmbeds.active') : plugin.localize('slackersSquadServices.playersEmbeds.none'), inline: true },
     {
       name: plugin.localize('slackersSquadServices.playersEmbeds.locks'),
       value: [
-        globalOwner ? plugin.localize('slackersSquadServices.playersEmbeds.global', { globalOwner }) : 'Global: 🟢 None',
-        `Per-player: ${activeLockCount} active`
+        globalOwner ? plugin.localize('slackersSquadServices.playersEmbeds.global', { globalOwner }) : plugin.localize('slackersSquadServices.playersEmbeds.globalNone'),
+        plugin.localize('slackersSquadServices.playersEmbeds.perPlayer', { count: activeLockCount })
       ].join(' · '),
       inline: false
     }
@@ -808,8 +815,8 @@ export function buildPlayersEmbeds(plugin) {
       // Without a squad snapshot these players are not known to be squadless —
       // we simply have no squad data for them yet. Label accordingly.
       const label = squadDataPending
-        ? `Roster (${leftover.length}) — squad data pending`
-        : `Unassigned (${leftover.length})`;
+        ? plugin.localize('slackersSquadServices.team.rosterSquadDataPending', { count: leftover.length })
+        : plugin.localize('slackersSquadServices.team.unassignedCount', { count: leftover.length });
       pushLineField(
         plugin,
         fields,
@@ -1109,8 +1116,8 @@ export function buildLocksEmbed(plugin) {
     {
       name: plugin.localize('slackersSquadServices.locks.globalLock'),
       value: globalOwner
-        ? plugin.localize('slackersSquadServices.locks.expires', { globalOwner, expiresAt: formatTimestamp(globalLock?.expiresAt ?? 0) })
-        : '🟢 None',
+        ? plugin.localize('slackersSquadServices.locks.expires', { globalOwner, expiresAt: formatTimestamp(globalLock?.expiresAt ?? 0, plugin.localize('slackersSquadServices.labels.notAvailable')) })
+        : plugin.localize('slackersSquadServices.locks.none'),
       inline: false
     }
   ];
@@ -1123,7 +1130,7 @@ export function buildLocksEmbed(plugin) {
     const lockLines = activeLocks.map(([key, l]) => {
       const player = players.registry?.get(key);
       const name = player?.name ?? key;
-      return `**${truncate(name, 20)}**: ${l.source} (exp ${formatTimestamp(l.expiresAt)})`;
+      return plugin.localize('slackersSquadServices.locks.playerLockLine', { name: truncate(name, 20), source: l.source, expiresAt: formatTimestamp(l.expiresAt, plugin.localize('slackersSquadServices.labels.notAvailable')) });
     });
 
     fields.push({
@@ -1165,18 +1172,19 @@ export function buildConfigEmbed(plugin) {
 
   const config = sc.getConfig?.() ?? {};
   const loaded = sc.isLoadedSuccessfully?.() ?? false;
-  const path = sc.getConfigPath?.() ?? 'N/A';
+  const NA = plugin.localize('slackersSquadServices.labels.notAvailable');
+  const path = sc.getConfigPath?.() ?? NA;
 
   const fields = [
-    { name: plugin.localize('slackersSquadServices.config.loaded'), value: loaded ? '🟢 Yes' : '🟡 No (mounted but parsing may have failed)', inline: true },
+    { name: plugin.localize('slackersSquadServices.config.loaded'), value: loaded ? plugin.localize('slackersSquadServices.config.yes') : plugin.localize('slackersSquadServices.config.noMountedButParsing'), inline: true },
     { name: plugin.localize('slackersSquadServices.config.configPath'), value: truncate(path, 50), inline: true },
-    { name: 'AllowTeamChanges', value: `${config.AllowTeamChanges ?? 'N/A'}`, inline: true },
-    { name: 'MaxPlayers', value: `${config.MaxPlayers ?? 'N/A'}`, inline: true },
-    { name: 'NumReservedSlots', value: `${config.NumReservedSlots ?? 'N/A'}`, inline: true },
-    { name: 'TimeBetweenMatches', value: `${config.TimeBetweenMatches ?? 'N/A'}s`, inline: true },
-    { name: 'TimeBeforeVote', value: `${config.TimeBeforeVote ?? 'N/A'}s`, inline: true },
-    { name: 'TeamVote_Duration', value: `${config.TeamVote_Duration ?? 'N/A'}s`, inline: true },
-    { name: 'LayerVoteDuration', value: `${config.LayerVoteDuration ?? 'N/A'}s`, inline: true }
+    { name: 'AllowTeamChanges', value: `${config.AllowTeamChanges ?? NA}`, inline: true },
+    { name: 'MaxPlayers', value: `${config.MaxPlayers ?? NA}`, inline: true },
+    { name: 'NumReservedSlots', value: `${config.NumReservedSlots ?? NA}`, inline: true },
+    { name: 'TimeBetweenMatches', value: `${config.TimeBetweenMatches ?? NA}s`, inline: true },
+    { name: 'TimeBeforeVote', value: `${config.TimeBeforeVote ?? NA}s`, inline: true },
+    { name: 'TeamVote_Duration', value: `${config.TeamVote_Duration ?? NA}s`, inline: true },
+    { name: 'LayerVoteDuration', value: `${config.LayerVoteDuration ?? NA}s`, inline: true }
   ];
 
   return {
@@ -1289,6 +1297,65 @@ function formatRoundDataNote(plugin, availability) {
   return '';
 }
 
+/**
+ * Arguments that look like a flag but are not one this subcommand accepts.
+ *
+ * `!s3 migrate force [--dry-run]` — the usage string pasted verbatim, square
+ * brackets and all — applied a real schema migration on a live server. The
+ * flag was read with an exact-match `args.includes('--dry-run')`, `[--dry-run]`
+ * is not `--dry-run`, so the check returned false and a command whose unflagged
+ * default is destructive took that default without a word. Usage strings are
+ * written to be copied, so this is not an exotic input; it is the obvious one.
+ *
+ * The fix deliberately is not to normalise brackets away and guess what the
+ * operator meant. Flags here come in two polarities — `--dry-run` is a safety
+ * flag whose absence means "destroy", `--confirm` is an arming flag whose
+ * absence means "don't" — and any rule generous enough to rescue a mangled
+ * `--dry-run` would, by the same token, arm a mangled `--confirm`. So the rule
+ * is to refuse instead: a token carrying a dash or a bracket that is not a flag
+ * we recognise is a typo or a paste artefact, and the only safe reading of "the
+ * operator asked for something we did not understand" is to run nothing at all.
+ *
+ * Callers pass the positional arguments they legitimately accept, which on
+ * these handlers are confirmation tokens, plugin names and backup filenames —
+ * none of which carry a leading dash or a bracket, so they pass through.
+ *
+ * @param {string[]} args  - The argument list as tokenised by s3-discord.js.
+ * @param {string[]} known - Exact flag spellings this subcommand accepts.
+ * @returns {string[]} Offending arguments, empty when the command is clean.
+ */
+function strayFlags(args, known) {
+  const knownSet = new Set(known);
+  return args.filter((a) => !knownSet.has(a) && /^[[<("'`]*-|^[[<]/.test(a));
+}
+
+/**
+ * Refuse a command that carries an argument we do not recognise, and say which.
+ * Returns true when the caller must stop.
+ */
+async function rejectStrayFlags(plugin, message, sendDiscordMessage, args, known) {
+  const stray = strayFlags(args, known);
+  if (stray.length === 0) return false;
+
+  await sendDiscordMessage(message.channel, {
+    embeds: [{
+      color: 0xe74c3c,
+      title: plugin.localize('slackersSquadServices.args.unrecognisedArgument'),
+      // `!s3 confirm` takes no flags at all. Rendering that as an empty list
+      // read as a rendering fault when it first went out live, so the two
+      // cases are separate sentences rather than one sentence with a hole.
+      description: plugin.localize('slackersSquadServices.args.nothingWasRun', {
+        args: stray.map((a) => `\`${a}\``).join(', '),
+        accepts: known.length
+          ? plugin.localize('slackersSquadServices.args.acceptsFlags', { known: known.map((k) => `\`${k}\``).join(', ') })
+          : plugin.localize('slackersSquadServices.args.acceptsNoFlags')
+      }),
+      timestamp: new Date().toISOString()
+    }]
+  }, 'S3', (...a) => plugin.verbose(...a));
+  return true;
+}
+
 // Generic to any embed's 4096-char description limit — distinct from
 // pushLineField()'s 1024-char per-field chunking used elsewhere in this file.
 function chunkLines(lines, maxLen) {
@@ -1366,8 +1433,8 @@ function buildPlayerNotFoundEmbed(plugin, identifier) {
 export async function buildSwitchesEmbed(plugin, identifier, rangeArg) {
   const db = plugin.services?.db;
   const range = parseRange(rangeArg);
-  if (range.error) {
-    return [{ color: 0xe74c3c, title: plugin.localize('slackersSquadServices.switches.invalidRange'), description: range.error, timestamp: new Date().toISOString() }];
+  if (range.errorKey) {
+    return [{ color: 0xe74c3c, title: plugin.localize('slackersSquadServices.switches.invalidRange'), description: plugin.localize(range.errorKey, range.errorVars), timestamp: new Date().toISOString() }];
   }
 
   const availability = await checkLoggingAvailability(db, range.fromTs, range.toTs);
@@ -1404,9 +1471,20 @@ export async function buildSwitchesEmbed(plugin, identifier, rangeArg) {
       const self = (r.bySource['Player-Self'] || 0) + (r.bySource['Player-Queue'] || 0) +
         (r.bySource['Switch-Double-Swap'] || 0) + (r.bySource['Handshake-Swap'] || 0);
       const other = r.total - full - micro - legacy - self;
-      const fullStr = legacy > 0 ? `Full: ${full + legacy} (${legacy} legacy)` : `Full: ${full}`;
-      const otherStr = other > 0 ? ` · Other: ${other}` : '';
-      return `**${i + 1}.** ${escapeMarkdown(truncate(r.name ?? r.eosID, 24))} — ${r.total} switches (${r.games} games) · ${fullStr} · Micro: ${micro} · Self: ${self}${otherStr}`;
+      const fullStr = legacy > 0
+        ? plugin.localize('slackersSquadServices.reports.leaderboardFullWithLegacy', { full: full + legacy, legacy })
+        : plugin.localize('slackersSquadServices.reports.leaderboardFull', { full });
+      const otherStr = other > 0 ? plugin.localize('slackersSquadServices.reports.leaderboardOther', { other }) : '';
+      return plugin.localize('slackersSquadServices.reports.leaderboardRow', {
+        rank: i + 1,
+        name: escapeMarkdown(truncate(r.name ?? r.eosID, 24)),
+        total: r.total,
+        games: r.games,
+        fullStr,
+        micro,
+        self,
+        otherStr
+      });
     });
 
     if (lines.length === 0) {
@@ -1447,7 +1525,7 @@ export async function buildSwitchesEmbed(plugin, identifier, rangeArg) {
     const chunks = chunkLines(lines, budget);
     return chunks.map((chunk, i) => ({
       color: 0x3498db,
-      title: chunks.length > 1 ? plugin.localize('slackersSquadServices.switches.teamSwitchLeaderboardI', { i: i + 1, chunksCount: chunks.length }) : '🔀 Team-Switch Leaderboard',
+      title: chunks.length > 1 ? plugin.localize('slackersSquadServices.switches.teamSwitchLeaderboardI', { i: i + 1, chunksCount: chunks.length }) : plugin.localize('slackersSquadServices.switches.teamSwitchLeaderboard'),
       description: i === 0 ? `${header}\n\n${chunk.join('\n')}` : chunk.join('\n'),
       timestamp: new Date().toISOString()
     }));
@@ -1495,8 +1573,8 @@ export async function buildSwitchesEmbed(plugin, identifier, rangeArg) {
 export async function buildKarmaEmbed(plugin, identifier, rangeArg) {
   const db = plugin.services?.db;
   const range = parseRange(rangeArg);
-  if (range.error) {
-    return { color: 0xe74c3c, title: plugin.localize('slackersSquadServices.karma.invalidRange'), description: range.error, timestamp: new Date().toISOString() };
+  if (range.errorKey) {
+    return { color: 0xe74c3c, title: plugin.localize('slackersSquadServices.karma.invalidRange'), description: plugin.localize(range.errorKey, range.errorVars), timestamp: new Date().toISOString() };
   }
   if (!identifier) {
     return { color: 0xe74c3c, title: plugin.localize('slackersSquadServices.karma.missingPlayer'), description: plugin.localize('slackersSquadServices.karma.usageS3KarmaIdent'), timestamp: new Date().toISOString() };
@@ -1543,8 +1621,8 @@ export async function buildKarmaEmbed(plugin, identifier, rangeArg) {
   const games = gamesPlayedMap.get(best.eosID)?.matchIds.size ?? 0;
   const switchRatePct = games > 0 ? ((report.totalSwitches / games) * 100).toFixed(1) : null;
   const gamesSummary = switchRatePct != null
-    ? `in **${games}** games — **${switchRatePct}%** of rounds`
-    : `Games Played: **${games}**`;
+    ? plugin.localize('slackersSquadServices.karma.gamesRate', { games, pct: switchRatePct })
+    : plugin.localize('slackersSquadServices.karma.gamesPlayed', { games });
 
   if (report.totalSwitches === 0) {
     return {
@@ -1562,7 +1640,7 @@ export async function buildKarmaEmbed(plugin, identifier, rangeArg) {
   // player chose themselves, so no re-filtering is needed here.
   const verdict = buildKarmaVerdict(plugin, report.winRate ?? 0, report.decided);
   const sourceLines = groupKarmaBuckets(report.bySource, MANUAL_SOURCE_GROUPS)
-    .map((g) => `${plugin.localize(g.key)}: ${g.wins}/${g.decided} decided (${g.total} total)`);
+    .map((g) => plugin.localize('slackersSquadServices.karma.bySourceLine', { label: plugin.localize(g.key), wins: g.wins, decided: g.decided, total: g.total }));
 
   return {
     color: 0x3498db,
@@ -1621,10 +1699,10 @@ function toCsv(rows) {
 export async function buildSwitchesExport(plugin, rangeArg, periodArg, asJson) {
   const db = plugin.services?.db;
   const range = parseRange(rangeArg);
-  if (range.error) return { error: range.error };
+  if (range.errorKey) return { error: plugin.localize(range.errorKey, range.errorVars) };
 
   if (periodArg && !isPeriodToken(periodArg)) {
-    return { error: `Unknown period "${periodArg}". Use "daily", "weekly", or "monthly".` };
+    return { error: plugin.localize('slackersSquadServices.switchesExport.unknownPeriod', { period: periodArg }) };
   }
   const period = periodArg ? periodArg.toLowerCase() : 'weekly';
 
@@ -1632,14 +1710,14 @@ export async function buildSwitchesExport(plugin, rangeArg, periodArg, asJson) {
   if (!availability.ok) {
     return {
       error: availability.reason === 'dbUnavailable'
-        ? 'The S³ database service is not mounted, or the `S3_PlayerEvents` table does not exist yet.'
-        : 'No `S3_PlayerEvents` rows exist anywhere in the requested date range — check `enableDatabaseLogging` before trusting this export.'
+        ? plugin.localize('slackersSquadServices.switchesExport.dbNotReady')
+        : plugin.localize('slackersSquadServices.switchesExport.noEventRows')
     };
   }
 
   const ignoredGameModes = plugin.options?.ignoredGameModes;
   const result = await getSwitchesByPeriodAndPlayer(db, range.fromTs, range.toTs, period, ignoredGameModes);
-  if (!result.ok) return { error: 'The S³ database service is not mounted.' };
+  if (!result.ok) return { error: plugin.localize('slackersSquadServices.switchesExport.dbNotMounted') };
 
   const rows = result.periods.flatMap((p) => p.players.map((player) => ({
     'Period Start': new Date(p.periodStart).toISOString(),
@@ -1667,7 +1745,7 @@ export async function buildSwitchesExport(plugin, rangeArg, periodArg, asJson) {
       description: [formatReportRange(plugin, range), formatIgnoredModesNote(plugin, ignoredGameModes)].filter(Boolean).join('\n'),
       fields: [
         { name: plugin.localize('slackersSquadServices.switchesExport.periods'), value: `${result.periods.length}`, inline: true },
-        { name: 'Rows', value: `${rows.length}`, inline: true },
+        { name: plugin.localize('slackersSquadServices.switchesExport.rows'), value: `${rows.length}`, inline: true },
         { name: plugin.localize('slackersSquadServices.switchesExport.format'), value: ext.toUpperCase(), inline: true }
       ],
       timestamp: new Date().toISOString()
@@ -1843,12 +1921,14 @@ export async function runDiagnostic(plugin, message, sendDiscordMessage) {
   const phaseEm = phase === 'LIVE' ? '🟢' : phase === 'STAGING' ? '🟡' : phase === 'ENDGAME' ? '🔴' : phasePass ? '🟢' : '🔴';
   results.push({ label: plugin.localize('slackersSquadServices.runDiagnostic.gamePhaseReadable'), emoji: phaseEm, detail: plugin.localize('slackersSquadServices.runDiagnostic.detailPhase', { phase: phase ?? 'NULL' }) });
 
-  const mode = gs?.getGamemode?.() ?? 'N/A';
-  const modeEm = (mode !== 'Unknown' && mode !== 'N/A') ? '🟢' : '🟠';
+  const rawMode = gs?.getGamemode?.() ?? null;
+  const mode = rawMode ?? plugin.localize('slackersSquadServices.labels.notAvailable');
+  const modeEm = (rawMode && rawMode !== 'Unknown') ? '🟢' : '🟠';
   results.push({ label: plugin.localize('slackersSquadServices.runDiagnostic.gamemodeResolved'), emoji: modeEm, detail: plugin.localize('slackersSquadServices.runDiagnostic.detailMode', { mode }) });
 
-  const layer = gs?.getLayerName?.() ?? 'N/A';
-  const layerEm = (layer !== 'Unknown' && layer !== 'N/A') ? '🟢' : '🟠';
+  const rawLayer = gs?.getLayerName?.() ?? null;
+  const layer = rawLayer ?? plugin.localize('slackersSquadServices.labels.notAvailable');
+  const layerEm = (rawLayer && rawLayer !== 'Unknown') ? '🟢' : '🟠';
   results.push({ label: plugin.localize('slackersSquadServices.runDiagnostic.layerNameResolved'), emoji: layerEm, detail: plugin.localize('slackersSquadServices.runDiagnostic.detailLayer', { layer }) });
 
   // ── Factions ──────────────────────────────────────────────────
@@ -1856,8 +1936,8 @@ export async function runDiagnostic(plugin, message, sendDiscordMessage) {
   const t2 = factions?.getTeamName?.(2) ?? 'Team 2';
   const t1Pass = t1 !== 'Team 1';
   const t2Pass = t2 !== 'Team 2';
-  results.push({ label: plugin.localize('slackersSquadServices.runDiagnostic.teamNameResolved'), emoji: t1Pass ? '🟢' : '🟡', detail: t1 });
-  results.push({ label: plugin.localize('slackersSquadServices.runDiagnostic.teamNameResolved2'), emoji: t2Pass ? '🟢' : '🟡', detail: t2 });
+  results.push({ label: plugin.localize('slackersSquadServices.runDiagnostic.teamNameResolved'), emoji: t1Pass ? '🟢' : '🟡', detail: t1Pass ? t1 : plugin.localize('slackersSquadServices.team.team1') });
+  results.push({ label: plugin.localize('slackersSquadServices.runDiagnostic.teamNameResolved2'), emoji: t2Pass ? '🟢' : '🟡', detail: t2Pass ? t2 : plugin.localize('slackersSquadServices.team.team2') });
 
   // ── Players ───────────────────────────────────────────────────
   const allPlayers = players?.getAllPlayers?.() ?? [];
@@ -2034,8 +2114,8 @@ export function createCommandHandlers(context) {
     await sendDiscordMessage(message.channel, {
       embeds: [{
         color: 0x2ecc71,
-        title: '🔬 Watch Started',
-        description: `Relaying verbose logs for \`${target}\` to this channel for ${formatDuration(5 * 60 * 1000)}. Use \`!s3 unwatch\` to stop early.`,
+        title: plugin.localize('slackersSquadServices.watch.watchStarted'),
+        description: plugin.localize('slackersSquadServices.watch.relayingVerboseLogs', { target, duration: formatDuration(5 * 60 * 1000) }),
         timestamp: new Date().toISOString()
       }]
     }, 'S3', (...a) => plugin.verbose(...a));
@@ -2048,10 +2128,10 @@ export function createCommandHandlers(context) {
     await sendDiscordMessage(message.channel, {
       embeds: [{
         color: 0x95a5a6,
-        title: '🛑 Watch Stopped',
+        title: plugin.localize('slackersSquadServices.watch.watchStopped'),
         description: active.length > 0
-          ? `Stopped ${active.length} active watch(es): ${active.map((w) => w.services.join(', ')).join('; ')}`
-          : 'No active watches to stop.',
+          ? plugin.localize('slackersSquadServices.watch.stoppedActiveWatches', { count: active.length, list: active.map((w) => w.services.join(', ')).join('; ') })
+          : plugin.localize('slackersSquadServices.watch.noActiveWatches'),
         timestamp: new Date().toISOString()
       }]
     }, 'S3', (...a) => plugin.verbose(...a));
@@ -2100,15 +2180,15 @@ export function createCommandHandlers(context) {
       for (const [pluginName, expectedVersion] of db._expectedVersions) {
         const p = versionStatus.pending.find((x) => x.pluginName === pluginName);
         const current = p ? p.currentVersion : expectedVersion;
-        const status = p ? `🟠 v${current} → v${expectedVersion} (${p.behind} behind)` : `🟢 v${current} (current)`;
-        lines.push(`**${pluginName}**: ${status}`);
+        const status = p ? plugin.localize('slackersSquadServices.migrate.pluginVersionBehind', { current, expected: expectedVersion, behind: p.behind }) : plugin.localize('slackersSquadServices.migrate.pluginVersionCurrent', { current });
+        lines.push(plugin.localize('slackersSquadServices.migrate.pluginVersionLine', { pluginName, status }));
       }
-      if (lines.length === 0) lines.push('No plugins have registered schema versions.');
+      if (lines.length === 0) lines.push(plugin.localize('slackersSquadServices.migrate.noPluginsRegistered'));
 
       await sendDiscordMessage(message.channel, {
         embeds: [{
           color: versionStatus.upToDate ? 0x2ecc71 : 0xf39c12,
-          title: versionStatus.upToDate ? plugin.localize('slackersSquadServices.migrate.schemaStatusAllCurrent') : '📋 Schema Status — Pending Migrations',
+          title: versionStatus.upToDate ? plugin.localize('slackersSquadServices.migrate.schemaStatusAllCurrent') : plugin.localize('slackersSquadServices.migrate.schemaStatusPendingMigrations'),
           description: lines.join('\n'),
           timestamp: new Date().toISOString()
         }]
@@ -2117,6 +2197,10 @@ export function createCommandHandlers(context) {
     }
 
     if (migrateSub === 'force') {
+      // Before anything else: this branch's unflagged default is to apply
+      // migrations for real, so a mangled `--dry-run` must not reach it.
+      if (await rejectStrayFlags(plugin, message, sendDiscordMessage, args.slice(2), ['--dry-run'])) return;
+
       const db = plugin.services.db;
       const me = db?.migrationEngine;
       const vs = db ? await db.verifySchemaVersions() : null;
@@ -2137,12 +2221,23 @@ export function createCommandHandlers(context) {
       }
 
       const isDryRun = args.includes('--dry-run');
-      const runningEmbed = buildMigrationEmbed(plugin, pending, 'running');
-      await sendDiscordMessage(message.channel, { embeds: [runningEmbed] }, 'S3', (...a) => plugin.verbose(...a));
 
-      // '__force__' satisfies the engine's confirmation gate — the admin
-      // explicitly typing !s3 migrate force IS the confirmation.
-      me.confirmToken('__force__');
+      if (!isDryRun) {
+        const runningEmbed = buildMigrationEmbed(plugin, pending, 'running');
+        await sendDiscordMessage(message.channel, { embeds: [runningEmbed] }, 'S3', (...a) => plugin.verbose(...a));
+
+        // '__force__' satisfies the engine's confirmation gate — the admin
+        // explicitly typing !s3 migrate force IS the confirmation.
+        //
+        // Deliberately not reached on a dry run. confirmToken() latches
+        // `_confirmed` and nothing clears it, and confirmToken() short-circuits
+        // to true whenever that latch is set — so arming the engine here would
+        // leave a *preview* having permanently authorised the next migration,
+        // by any route, with any token. A dry run must have no side effects at
+        // all, and runMigrations() returns above the confirmation gate anyway,
+        // so it never needed the token.
+        me.confirmToken('__force__');
+      }
 
       let totalApplied = 0;
       let totalSkipped = 0;
@@ -2179,16 +2274,16 @@ export function createCommandHandlers(context) {
             if (m.touches) {
               if (m.touches.creates && m.touches.creates.length > 0) {
                 for (const tableName of m.touches.creates) {
-                  lines.push(`    ↳ Creates table: \`${tableName}\``);
+                  lines.push(plugin.localize('slackersSquadServices.migrate.createsTable', { table: tableName }));
                   if (m.touches.columns?.[tableName]) {
-                    lines.push(`    ↳ Columns: ${m.touches.columns[tableName].map((c) => `\`${c}\``).join(', ')}`);
+                    lines.push(plugin.localize('slackersSquadServices.migrate.columnsList', { columns: m.touches.columns[tableName].map((c) => `\`${c}\``).join(', ') }));
                   }
                 }
               }
               if (m.touches.columns) {
                 for (const [tableName, cols] of Object.entries(m.touches.columns)) {
                   if (!m.touches.creates || !m.touches.creates.includes(tableName)) {
-                    lines.push(`    ↳ Columns (\`${tableName}\`): ${cols.map((c) => `\`${c}\``).join(', ')}`);
+                    lines.push(plugin.localize('slackersSquadServices.migrate.columnsForTable', { table: tableName, columns: cols.map((c) => `\`${c}\``).join(', ') }));
                   }
                 }
               }
@@ -2261,16 +2356,16 @@ export function createCommandHandlers(context) {
           if (m.touches) {
             if (m.touches.creates && m.touches.creates.length > 0) {
               for (const tableName of m.touches.creates) {
-                lines.push(`    ↳ Creates table: \`${tableName}\``);
+                lines.push(plugin.localize('slackersSquadServices.migrate.createsTable', { table: tableName }));
                 if (m.touches.columns?.[tableName]) {
-                  lines.push(`    ↳ Columns: ${m.touches.columns[tableName].map((c) => `\`${c}\``).join(', ')}`);
+                  lines.push(plugin.localize('slackersSquadServices.migrate.columnsList', { columns: m.touches.columns[tableName].map((c) => `\`${c}\``).join(', ') }));
                 }
               }
             }
             if (m.touches.columns) {
               for (const [tableName, cols] of Object.entries(m.touches.columns)) {
                 if (!m.touches.creates || !m.touches.creates.includes(tableName)) {
-                  lines.push(`    ↳ Columns (\`${tableName}\`): ${cols.map((c) => `\`${c}\``).join(', ')}`);
+                  lines.push(plugin.localize('slackersSquadServices.migrate.columnsForTable', { table: tableName, columns: cols.map((c) => `\`${c}\``).join(', ') }));
                 }
               }
             }
@@ -2329,7 +2424,7 @@ export function createCommandHandlers(context) {
       const lines = [];
 
       if (errors.length > 0) {
-        lines.push('**❌ Errors**');
+        lines.push(plugin.localize('slackersSquadServices.migrate.errorsHeading'));
         for (const e of errors) {
           lines.push(`  • \`${e.table || e.model}\`: ${e.error}`);
         }
@@ -2337,7 +2432,7 @@ export function createCommandHandlers(context) {
       }
 
       if (missing.length > 0) {
-        lines.push('**🗑️ Missing Columns**');
+        lines.push(plugin.localize('slackersSquadServices.migrate.missingColumnsHeading'));
         for (const m of missing) {
           lines.push(`  • \`${m.table}\`: ${m.missing.map(c => `\`${c}\``).join(', ')}`);
         }
@@ -2345,7 +2440,7 @@ export function createCommandHandlers(context) {
       }
 
       if (missingRows.length > 0) {
-        lines.push('**🧩 Missing Rows**');
+        lines.push(plugin.localize('slackersSquadServices.migrate.missingRowsHeading'));
         for (const r of missingRows) {
           lines.push(`  • \`${r.table}\`: ${r.missingRows.map(row => `\`${row.key}=${row.value}\``).join(', ')}`);
         }
@@ -2353,15 +2448,15 @@ export function createCommandHandlers(context) {
       }
 
       if (dataViolations.length > 0) {
-        lines.push('**🕳️ Unpopulated Data**');
+        lines.push(plugin.localize('slackersSquadServices.migrate.unpopulatedDataHeading'));
         for (const dv of dataViolations) {
-          lines.push(`  • \`${dv.table}\`: ${dv.dataViolations.map(v => `${v.offenders} row(s) with empty \`${v.column}\``).join(', ')}`);
+          lines.push(`  • \`${dv.table}\`: ${dv.dataViolations.map(v => plugin.localize('slackersSquadServices.migrate.rowsWithEmpty', { offenders: v.offenders, column: v.column })).join(', ')}`);
         }
         lines.push('');
       }
 
       if (extra.length > 0) {
-        lines.push('**📦 Extra Columns**');
+        lines.push(plugin.localize('slackersSquadServices.migrate.extraColumnsHeading'));
         for (const x of extra) {
           lines.push(`  • \`${x.table}\`: ${x.extra.map(c => `\`${c}\``).join(', ')}`);
         }
@@ -2387,6 +2482,8 @@ export function createCommandHandlers(context) {
     // purge-deprecated — Scan for and optionally drop _deprecated_* tables/columns
     // ═══════════════════════════════════════════════════════════════
     if (migrateSub === 'purge-deprecated') {
+      if (await rejectStrayFlags(plugin, message, sendDiscordMessage, args.slice(2), ['--confirm'])) return;
+
       const db = plugin.services.db;
       if (!db || !db._isMounted) {
         await sendDiscordMessage(message.channel, {
@@ -2446,7 +2543,7 @@ export function createCommandHandlers(context) {
         const lines = [];
 
         if (deprecatedTables.length > 0) {
-          lines.push(`**📦 Deprecated Tables (${deprecatedTables.length})**`);
+          lines.push(plugin.localize('slackersSquadServices.migrate.deprecatedTablesHeading', { count: deprecatedTables.length }));
           for (const t of deprecatedTables) {
             lines.push(`  • \`${t}\``);
           }
@@ -2454,14 +2551,14 @@ export function createCommandHandlers(context) {
         }
 
         if (deprecatedColumns.length > 0) {
-          lines.push(`**📦 Deprecated Columns (${deprecatedColumns.length})**`);
+          lines.push(plugin.localize('slackersSquadServices.migrate.deprecatedColumnsHeading', { count: deprecatedColumns.length }));
           for (const { table, column } of deprecatedColumns) {
             lines.push(`  • \`${table}\`.\`${column}\``);
           }
           lines.push('');
         }
 
-        lines.push(`Type \`!s3 migrate purge-deprecated --confirm\` to permanently delete ${totalDeprecated} deprecated object(s).`);
+        lines.push(plugin.localize('slackersSquadServices.migrate.typeToPurge', { count: totalDeprecated }));
 
         await sendDiscordMessage(message.channel, {
           embeds: [{
@@ -2484,7 +2581,7 @@ export function createCommandHandlers(context) {
           await qi.dropTable(tableName);
           purgedTables++;
         } catch (err) {
-          errors.push(`Table \`${tableName}\`: ${err.message}`);
+          errors.push(plugin.localize('slackersSquadServices.migrate.errorTable', { table: tableName, error: err.message }));
         }
       }
 
@@ -2493,17 +2590,17 @@ export function createCommandHandlers(context) {
           await qi.removeColumn(table, column);
           purgedColumns++;
         } catch (err) {
-          errors.push(`Column \`${table}\`.\`${column}\`: ${err.message}`);
+          errors.push(plugin.localize('slackersSquadServices.migrate.errorColumn', { table, column, error: err.message }));
         }
       }
 
       const totalPurged = purgedTables + purgedColumns;
       const lines = [];
-      if (purgedTables > 0) lines.push(`Dropped ${purgedTables} deprecated table(s).`);
-      if (purgedColumns > 0) lines.push(`Dropped ${purgedColumns} deprecated column(s).`);
+      if (purgedTables > 0) lines.push(plugin.localize('slackersSquadServices.migrate.droppedTables', { count: purgedTables }));
+      if (purgedColumns > 0) lines.push(plugin.localize('slackersSquadServices.migrate.droppedColumns', { count: purgedColumns }));
       if (errors.length > 0) {
         lines.push('');
-        lines.push(`**⚠️ Errors (${errors.length})**`);
+        lines.push(plugin.localize('slackersSquadServices.migrate.errorsCountHeading', { count: errors.length }));
         for (const e of errors) lines.push(`  • ${e}`);
       }
 
@@ -2524,6 +2621,11 @@ export function createCommandHandlers(context) {
   // ── Confirm ───────────────────────────────────────────────────
 
   handlers.set('confirm', async (plugin, message, args) => {
+    // `!s3 confirm` runs migrations for real and takes no flags at all, so a
+    // pasted `<token>` placeholder stops here rather than being tried as a
+    // token — and, once the engine is armed, silently accepted as one.
+    if (await rejectStrayFlags(plugin, message, sendDiscordMessage, args.slice(1), [])) return;
+
     const token = args[1];
     if (!token) {
       await message.reply(
@@ -2655,6 +2757,10 @@ export function createCommandHandlers(context) {
     }
 
     if (backupSub === 'restore') {
+      // The filename is positional and never carries a dash, so anything
+      // dash-shaped here that is not `--confirm` is a mistake.
+      if (await rejectStrayFlags(plugin, message, sendDiscordMessage, args.slice(2), ['--confirm'])) return;
+
       const isConfirm = args.includes('--confirm');
       const confirmIdx = args.indexOf('--confirm');
       // If --confirm is present, filename is the next arg; otherwise it's args[2]
@@ -2695,7 +2801,7 @@ export function createCommandHandlers(context) {
             fields: [
               { name: plugin.localize('slackersSquadServices.backup.source'), value: `\`${filename}\``, inline: true },
               { name: plugin.localize('slackersSquadServices.backup.target'), value: targetInfo, inline: true },
-              { name: plugin.localize('slackersSquadServices.backup.format'), value: isJsonBackup ? plugin.localize('slackersSquadServices.backup.jsonConnectorAgnostic') : 'SQLite file copy', inline: true },
+              { name: plugin.localize('slackersSquadServices.backup.format'), value: isJsonBackup ? plugin.localize('slackersSquadServices.backup.jsonConnectorAgnostic') : plugin.localize('slackersSquadServices.backup.sqliteFileCopy'), inline: true },
               { name: plugin.localize('slackersSquadServices.backup.instructions'), value: plugin.localize('slackersSquadServices.backup.toProceedUseS3') + filename + '`', inline: false }
             ],
             timestamp: new Date().toISOString()
@@ -2723,7 +2829,7 @@ export function createCommandHandlers(context) {
       }, 'S3', (...a) => plugin.verbose(...a));
 
       try {
-        const result = await restoreFromFile(filename, db, null, dbPath);
+        const result = await restoreFromFile(filename, db, null, dbPath, (k, v) => plugin.localize(k, v));
 
         const isJson = filename.endsWith('.json');
         const summary = isJson
@@ -2861,7 +2967,7 @@ export function createCommandHandlers(context) {
       const expectedCount = db._expectedVersions?.size ?? 0;
 
       // Build schema version lines
-      let schemaLines = 'No plugins have registered schema versions.';
+      let schemaLines = plugin.localize('slackersSquadServices.db.noRegisteredSchemaVersions');
       if (expectedCount > 0) {
         let versionStatus;
         try {
@@ -2890,7 +2996,7 @@ export function createCommandHandlers(context) {
           fields: [
             { name: plugin.localize('slackersSquadServices.db.connector'), value: `${connectorEmoji} \`${connector}\``, inline: true },
             { name: plugin.localize('slackersSquadServices.db.schemaVersions'), value: plugin.localize('slackersSquadServices.db.registered', { expectedCount }), inline: true },
-            { name: plugin.localize('slackersSquadServices.db.migrationsEngine'), value: me ? plugin.localize('slackersSquadServices.db.available') : '⚪ N/A', inline: true },
+            { name: plugin.localize('slackersSquadServices.db.migrationsEngine'), value: me ? plugin.localize('slackersSquadServices.db.available') : plugin.localize('slackersSquadServices.db.notAvailable'), inline: true },
             { name: plugin.localize('slackersSquadServices.db.perPluginVersions'), value: schemaLines, inline: false }
           ],
           timestamp: new Date().toISOString()
@@ -2908,6 +3014,10 @@ export function createCommandHandlers(context) {
         }, 'S3', (...a) => plugin.verbose(...a));
         return;
       }
+
+      // Not destructive, but a mangled `--all` silently exports the wrong
+      // tier, and a backup that quietly omits tables is its own hazard.
+      if (await rejectStrayFlags(plugin, message, sendDiscordMessage, args.slice(2), ['--logs', '--all', '--to-file'])) return;
 
       const hasLogs = args.includes('--logs');
       const hasAll = args.includes('--all');
@@ -3001,7 +3111,7 @@ export function createCommandHandlers(context) {
         if (description.length > 3900) {
           const okCount = statusLines.filter((l) => l.startsWith('✅')).length;
           description = statusLines.filter((l) => !l.startsWith('✅')).join('\n');
-          description = `${okCount} table(s) exported successfully.\n${description}`.slice(0, 3900);
+          description = `${plugin.localize('slackersSquadServices.db.exportTruncatedSummary', { okCount })}\n${description}`.slice(0, 3900);
         }
 
         const payload = {
@@ -3054,6 +3164,10 @@ export function createCommandHandlers(context) {
 
     // ── !s3 db import ─────────────────────────────────────────
     if (dbSub === 'import') {
+      // `--confirm` writes rows; `--dry-run` is what holds it back. Same
+      // asymmetry as `!s3 migrate force`, same guard.
+      if (await rejectStrayFlags(plugin, message, sendDiscordMessage, args.slice(2), ['--confirm', '--dry-run'])) return;
+
       const db = plugin.services?.db;
       if (!db?.isReady()) {
         await sendDiscordMessage(message.channel, {
@@ -3080,7 +3194,7 @@ export function createCommandHandlers(context) {
         }
 
         try {
-          const result = await importFromJSON(db, stagedImportRef.current, { dryRun: isDryRun });
+          const result = await importFromJSON(db, stagedImportRef.current, { dryRun: isDryRun, localize: (k, v) => plugin.localize(k, v) });
 
           const statusLines = Object.entries(result.imported).map(([name, r]) =>
             r.status === 'ok'
@@ -3095,7 +3209,7 @@ export function createCommandHandlers(context) {
           await sendDiscordMessage(message.channel, {
             embeds: [{
               color: isDryRun ? 0x3498db : 0x2ecc71,
-              title: isDryRun ? plugin.localize('slackersSquadServices.db.dryRunComplete') : '✅ Import Complete',
+              title: isDryRun ? plugin.localize('slackersSquadServices.db.dryRunComplete') : plugin.localize('slackersSquadServices.db.importComplete'),
               description: statusLines.join('\n'),
               fields: result.errors.length > 0
                 ? [{ name: plugin.localize('slackersSquadServices.db.warnings'), value: result.errors.join('\n'), inline: false }]
@@ -3151,7 +3265,7 @@ export function createCommandHandlers(context) {
 
         // Validate structure
         const modelNames = db.getModelNames();
-        const validation = await validateImportStructure(parsed, modelNames);
+        const validation = await validateImportStructure(parsed, modelNames, (k, v) => plugin.localize(k, v));
 
         if (!validation.valid) {
           await sendDiscordMessage(message.channel, {

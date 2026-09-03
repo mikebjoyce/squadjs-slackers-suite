@@ -46,11 +46,17 @@ function buildMigrationEmbed(plugin, pending, status = 'pending', result = null)
 
   // Build per-plugin migration lines with plugin name prefix
   const migrationLines = pending.map((p) => {
-    const fromVer = p.currentVersion > 0 ? `v${p.currentVersion}` : '(new)';
+    const fromVer = p.currentVersion > 0
+      ? `v${p.currentVersion}`
+      : plugin.localize('slackersSquadServices.migration.versionNew');
     if (status === 'pending' || status === 'running') {
-      return `  ${p.pluginName}: ${fromVer} → v${p.expectedVersion} (${p.behind} pending)`;
+      return plugin.localize('slackersSquadServices.migration.lineWithPending', {
+        pluginName: p.pluginName, fromVer, toVer: p.expectedVersion, behind: p.behind
+      });
     }
-    return `  ${p.pluginName}: ${fromVer} → v${p.expectedVersion}`;
+    return plugin.localize('slackersSquadServices.migration.line', {
+      pluginName: p.pluginName, fromVer, toVer: p.expectedVersion
+    });
   });
 
   const description = [
@@ -62,12 +68,12 @@ function buildMigrationEmbed(plugin, pending, status = 'pending', result = null)
   if (status === 'pending') {
     description.push(
       '',
-      'Type `!s3 confirm <token>` to run migrations.',
-      'Type `!s3 migrate force` to bypass confirmation.',
-      'Auto-cancels after 5 minutes if no response.',
+      plugin.localize('slackersSquadServices.migration.typeConfirmToRun'),
+      plugin.localize('slackersSquadServices.migration.typeForceToBypass'),
+      plugin.localize('slackersSquadServices.migration.autoCancelsAfterMinutes'),
       '',
-      '> **Note:** If cancelled, migrations remain pending.',
-      '> Use `!s3 migrate force` to run them later.'
+      plugin.localize('slackersSquadServices.migration.noteIfCancelledPending'),
+      plugin.localize('slackersSquadServices.migration.noteUseForceLater')
     );
   }
 
@@ -76,22 +82,22 @@ function buildMigrationEmbed(plugin, pending, status = 'pending', result = null)
     const totalSkipped = result.totalSkipped || 0;
     description.push(
       '',
-      `Applied: **${totalApplied}** | Skipped: **${totalSkipped}**`
+      plugin.localize('slackersSquadServices.migration.appliedSkipped', { totalApplied, totalSkipped })
     );
   }
 
   if (status === 'failed' && result) {
-    const errorMsg = result.error || 'Unknown error';
+    const errorMsg = result.error || plugin.localize('slackersSquadServices.migration.unknownError');
     description.push(
       '',
-      `**Error:** ${errorMsg}`
+      plugin.localize('slackersSquadServices.migration.errorLine', { errorMsg })
     );
   }
 
   if (status === 'cancelled' || status === 'timeout') {
     description.push(
       '',
-      'Migrations have been deferred. The pending state will persist until the next restart or `!s3 migrate force`.'
+      plugin.localize('slackersSquadServices.migration.deferredUntilRestart')
     );
   }
 

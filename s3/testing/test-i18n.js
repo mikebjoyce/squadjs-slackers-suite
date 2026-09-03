@@ -110,7 +110,11 @@ function sourceFilesCallingLocalize() {
         if (!name.endsWith('.js')) continue;
         const full = path.join(abs, name);
         const src = fs.readFileSync(full, 'utf8');
-        if (/\blocalize\s*\(/.test(src)) {
+        // A file that never calls localize() can still own keys: a module
+        // with no plugin handle (s3-switch-reports.js) returns a key for its
+        // caller to render. Scanning only localize() callers left those keys
+        // looking orphaned.
+        if (/\blocalize\s*\(/.test(src) || /\b\w*[Kk]ey:\s*'[\w$]+(?:\.[\w$]+)+'/.test(src)) {
           found.push({ rel: `${dir}/${sub}/${name}`.replace(/\\/g, '/'), abs: full, src });
         }
       }
@@ -256,11 +260,13 @@ function extractDynamicPrefixes(src) {
  * A table row that has to be rendered in one place and written to a CSV in
  * another carries both names, and the renderer calls localize(row.key) — so
  * the key never appears next to localize() and the orphan scan cannot see it.
- * A dotted string literal on a property named exactly `key` is specific enough
+ * The same shape covers a key returned for someone else to render —
+ * parseRange()'s `errorKey`, where the module has no plugin to localize with.
+ * A dotted string literal on a property whose name ends in `key` is specific enough
  * to count as a call site without loosening the rule for anything else.
  */
 function extractTableKeys(src) {
-  return [...src.matchAll(/\bkey:\s*'([\w$]+(?:\.[\w$]+)+)'/g)].map((m) => m[1]);
+  return [...src.matchAll(/\b\w*[Kk]ey:\s*'([\w$]+(?:\.[\w$]+)+)'/g)].map((m) => m[1]);
 }
 
 function optionBlock(src, name) {
@@ -834,12 +840,45 @@ describe('i18n — translator templates', () => {
       ['switch.warn.switchHowWorks1', 'players'],          // case 'explain', unguarded
       ['eloTracker.embeds.leaderboardTitle', 'players'],   // public !elo leaderboard
 
+      // The in-game `!switch check` status card. Every one of these is built
+      // into a local, concatenated into statusMsg and only then handed to
+      // plugin.warn(), so none of them is visible to the direct call-site pass
+      // — they resolve through the variable chain instead. The five
+      // switch.labels.* entries are ALSO rendered by the admin Discord embed,
+      // which is directly visible, so before pass 1b saw the player call site
+      // they were filed as staff text and left out of the player template.
+      ['switch.check.statusHeader', 'players'],
+      ['switch.check.balanceTeamsFull', 'players'],
+      ['switch.check.queuePosition', 'players'],
+      ['switch.labels.clear', 'players'],
+      ['switch.labels.notActive', 'players'],
+      ['switch.labels.minutesRemaining', 'players'],
+      ['switch.labels.tokensBalanceShort', 'players'],
+      // Same block, and the reason the gate walk has to stop at the end of a
+      // line: the `if (!isAdmin)` guarding the `!switch check <ident>` admin
+      // variant sits one line below `if (ident) {`, inside it. A 60-character
+      // window from the depth-1 `if (ident)` reached that depth-2 guard and
+      // marked the whole `case "check":` — this else-branch included —
+      // admin-only.
+      ['switch.warn.switchUnableCheckEligibility', 'players'],
+      // `!teambalancer` with no argument is handled by onChatMessage and is
+      // public; only the argument forms go through the ChatAdmin gate.
+      ['teamBalancer.status.statusLine', 'players'],
+      ['teamBalancer.status.lastScramble', 'players'],
+
       // Only staff can reach these.
       ['teamBalancer.status.sIntegration', 'admins'],      // chat !== 'ChatAdmin' → return
       ['teamBalancer.embeds.scrambleCompleted', 'admins'], // staff channel
       ['switch.explain.allPopulationLevels', 'admins'],     // Discord-only explain report
       ['eloTracker.embeds.fieldVersion', 'admins'],        // inside if (isAdminChannel)
-      ['slackersSquadServices.drift.embedTitle', 'admins']
+      ['slackersSquadServices.drift.embedTitle', 'admins'],
+      // !s3 runs in the S³ admin channel, so its report text is staff text
+      // even though it reads like a public leaderboard.
+      ['slackersSquadServices.reports.leaderboardRow', 'admins'],
+      ['slackersSquadServices.reports.karmaNeutral', 'admins'],
+      // A warn is in-game, but this one answers an admin-gated !teambalancer
+      // argument — the sink says where, the gate says who.
+      ['teamBalancer.warn.pendingScrambleCancelled', 'admins']
     ];
 
     const wrong = [];
@@ -875,7 +914,9 @@ describe('i18n — translator templates', () => {
   //
   // That decision only holds if it is enforced, because the natural thing to do
   // with a new Logger.verbose() is to reach for localize() like every other
-  // string in the file. What was cut is recorded in docs/docsArchive/.
+  // string in the file. The rule is simply: Logger.*, verbose(), stderrError(),
+  // console.* and thrown Error messages take English literals, never a
+  // catalogue key. This test is the enforcement.
 
   test('no localized string reaches the server log', async () => {
     const { logSinkCallSites } = await import(

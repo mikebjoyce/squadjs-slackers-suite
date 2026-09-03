@@ -66,6 +66,8 @@ import { TBDiagnostics } from './tb-diagnostics.js';
  */
 const RCON_MESSAGE_PATHS = [
   'draw',
+  'seedWin',
+  'teamNameArticle',
   'nonDominant.streakBroken',
   'nonDominant.invasionAttackWin',
   'nonDominant.invasionDefendWin',
@@ -154,7 +156,7 @@ const CommandHandlers = {
       if (!message || message.toLowerCase() !== '!teambalancer') return;
 
       const steamID = info.steamID;
-      const playerName = info.player?.name || 'Unknown';
+      const playerName = info.player?.name || tb.localize('teamBalancer.status.unknownPlayer');
       Logger.verbose('TeamBalancer', 4, `General teambalancer info requested by ${playerName} (${steamID})`);
 
       const now = Date.now();
@@ -162,7 +164,7 @@ const CommandHandlers = {
       let lastScrambleText;
 
       if (!this.lastScrambleTime) {
-        lastScrambleText = 'Never';
+        lastScrambleText = tb.localize('teamBalancer.status.never');
       } else {
         const minutes = Math.floor(timeDifference / 60000);
         const hours = Math.floor(minutes / 60);
@@ -174,11 +176,11 @@ const CommandHandlers = {
         }
       }
       const statusText = !this.ready
-        ? 'Initializing...'
+        ? tb.localize('teamBalancer.status.initializingEllipsis')
         : this.manuallyDisabled
         ? tb.localize('teamBalancer.status.manuallyDisabled')
         : this.options.enableWinStreakTracking
-        ? 'Active'
+        ? tb.localize('teamBalancer.status.eloActive')
         : tb.localize('teamBalancer.status.disabledConfig');
 
       const winStreakText =
@@ -187,13 +189,15 @@ const CommandHandlers = {
           : tb.localize('teamBalancer.status.noCurrentWinStreak');
 
       const eloTrackerPlugin = this.server.plugins?.find(p => p.constructor.name === 'EloTracker');
-      const eloStatus = this.options?.useEloForBalance ? (eloTrackerPlugin ? 'Active' : 'Unavailable') : 'Disabled';
+      const eloStatus = this.options?.useEloForBalance
+        ? (eloTrackerPlugin ? tb.localize('teamBalancer.status.eloActive') : tb.localize('teamBalancer.status.eloUnavailable'))
+        : tb.localize('teamBalancer.status.disabled');
 
       // Formatted response for !teambalancer
       const infoMsg = [
-        `=== TeamBalancer ===`,
-        `Version: ${this.constructor.version}`,
-        `Status: ${statusText}`,
+        tb.localize('teamBalancer.status.infoHeader'),
+        tb.localize('teamBalancer.status.statusVersion', { version: this.constructor.version }),
+        tb.localize('teamBalancer.status.statusLine', { statusText }),
         tb.localize('teamBalancer.status.eloIntegration', { eloStatus }),
         tb.localize('teamBalancer.status.dominanceStreak', { winStreakText }),
         tb.localize('teamBalancer.status.lastScramble', { lastScrambleText }),
@@ -314,28 +318,28 @@ const CommandHandlers = {
           case 'status': {
             // Determine the effective plugin status
             const effectiveStatus = !this.ready
-              ? 'INITIALIZING'
+              ? tb.localize('teamBalancer.status.initializing')
               : this.manuallyDisabled
               ? tb.localize('teamBalancer.status.disabledManual')
               : this.options.enableWinStreakTracking
-              ? 'ENABLED'
+              ? tb.localize('teamBalancer.status.enabled')
               : tb.localize('teamBalancer.status.disabledConfig2');
 
             // Win Streak with Threshold
             const maxStreak = this.options?.maxWinStreak || 2;
             const winStreakText = this.winStreakTeam
-              ? `${this.getTeamName(this.winStreakTeam)}: ${this.winStreakCount} / ${maxStreak} wins`
+              ? tb.localize('teamBalancer.status.teamWinsOfThreshold', { teamName: this.getTeamName(this.winStreakTeam), count: this.winStreakCount, threshold: maxStreak })
               : tb.localize('teamBalancer.status.noneThresholdWins', { maxStreak });
 
             const maxConsec = this.options.maxConsecutiveWinsWithoutThreshold;
             const consecText = maxConsec > 0
               ? (this.consecutiveWinsTeam
-                  ? `${this.getTeamName(this.consecutiveWinsTeam)}: ${this.consecutiveWinsCount} / ${maxConsec} wins`
+                  ? tb.localize('teamBalancer.status.teamWinsOfThreshold', { teamName: this.getTeamName(this.consecutiveWinsTeam), count: this.consecutiveWinsCount, threshold: maxConsec })
                   : tb.localize('teamBalancer.status.noneThresholdWins2', { maxConsec }))
-              : 'Disabled';
+              : tb.localize('teamBalancer.status.disabled');
 
             // Format the last scramble timestamp (Relative for in-game)
-            let lastScrambleText = 'Never';
+            let lastScrambleText = tb.localize('teamBalancer.status.never');
             if (this.lastScrambleTime) {
               const diff = Date.now() - this.lastScrambleTime;
               const mins = Math.floor(diff / 60000);
@@ -354,15 +358,17 @@ const CommandHandlers = {
 
             // Layer — from S³, never server.currentLayer (null after a
             // mid-round SquadJS restart, which made this read "Unknown").
-            const currentLayer = this._s3?.gameState?.getLayerName?.() || this.layerNameCached || 'Unknown';
+            const currentLayer = this._s3?.gameState?.getLayerName?.() || this.layerNameCached || tb.localize('teamBalancer.status.unknownLayer');
 
             const eloTrackerPlugin = this.server.plugins?.find(p => p.constructor.name === 'EloTracker');
-            const eloStatus = this.options?.useEloForBalance ? (eloTrackerPlugin ? 'Active' : 'Unavailable') : 'Disabled';
+            const eloStatus = this.options?.useEloForBalance
+              ? (eloTrackerPlugin ? tb.localize('teamBalancer.status.eloActive') : tb.localize('teamBalancer.status.eloUnavailable'))
+              : tb.localize('teamBalancer.status.disabled');
 
             // Formatted response for !teambalancer status
             const statusMsg = [
               tb.localize('teamBalancer.status.teambalancerStatus'),
-              `Version: ${this.constructor.version}`,
+              tb.localize('teamBalancer.status.statusVersion', { version: this.constructor.version }),
               tb.localize('teamBalancer.status.pluginStatus', { effectiveStatus }),
               tb.localize('teamBalancer.status.eloIntegration', { eloStatus }),
               tb.localize('teamBalancer.status.winStreak', { winStreakText }),
@@ -370,7 +376,7 @@ const CommandHandlers = {
               tb.localize('teamBalancer.status.seedAutoScramble', { seedAutoScrambleStatus: this.seedAutoScrambleStatus() }),
               tb.localize('teamBalancer.status.lastScramble', { lastScrambleText }),
               tb.localize('teamBalancer.status.playersT1T2', { value: players.length, t1Count, t2Count }),
-              `Layer: ${currentLayer}`,
+              tb.localize('teamBalancer.status.statusLayer', { layerName: currentLayer }),
               `---------------------------`
             ].join('\n');
 
@@ -399,9 +405,9 @@ const CommandHandlers = {
             // Page 1/3: Diagnostic results
             await this.respond(player, [
               tb.localize('teamBalancer.status.tbDiag'),
-              `S³: ${s3Result.pass ? 'PASS' : 'FAIL'}`,
+              tb.localize('teamBalancer.status.diagS3', { value: s3Result.pass ? tb.localize('teamBalancer.status.resultPass') : tb.localize('teamBalancer.status.resultFail') }),
               tb.localize('teamBalancer.status.diagScramble', { message: scrambleResult.message }),
-              tb.localize('teamBalancer.status.diagState', { value: this.manuallyDisabled ? 'DISABLED' : 'ENABLED' })
+              tb.localize('teamBalancer.status.diagState', { value: this.manuallyDisabled ? tb.localize('teamBalancer.status.disabledUpper') : tb.localize('teamBalancer.status.enabled') })
             ].join('\n'));
             await sleep(5500);
 
@@ -415,14 +421,14 @@ const CommandHandlers = {
             // Layer/gamemode from S³ (single resolver); the local caches are
             // only a mirror of it, kept as a fallback if S³ is unavailable.
             const gs = this._s3?.gameState;
-            const layerName = gs?.getLayerName?.() || this.layerNameCached || 'Unknown';
-            const gameMode = gs?.getGamemode?.() || this.gameModeCached || 'N/A';
+            const layerName = gs?.getLayerName?.() || this.layerNameCached || tb.localize('teamBalancer.status.unknownLayer');
+            const gameMode = gs?.getGamemode?.() || this.gameModeCached || tb.localize('teamBalancer.status.notApplicable');
             const team1Name = this.getTeamName(1);
             const team2Name = this.getTeamName(2);
 
             await this.respond(player, [
-              tb.localize('teamBalancer.status.scramblePending', { value: this._scramblePending ? 'Yes' : 'No' }),
-              tb.localize('teamBalancer.status.scrambleActive', { value: this._scrambleInProgress ? 'Yes' : 'No' }),
+              tb.localize('teamBalancer.status.scramblePending', { value: this._scramblePending ? tb.localize('teamBalancer.status.yes') : tb.localize('teamBalancer.status.no') }),
+              tb.localize('teamBalancer.status.scrambleActive', { value: this._scrambleInProgress ? tb.localize('teamBalancer.status.yes') : tb.localize('teamBalancer.status.no') }),
               tb.localize('teamBalancer.status.plyrsT1T2', { value: players.length, value2: t1Players.length, value3: t2Players.length }),
               tb.localize('teamBalancer.status.squadsT1T2', { value: squads.length, value2: t1Squads.length, value3: t2Squads.length }),
               tb.localize('teamBalancer.status.diagLayer', { layerName, gameMode })
@@ -436,13 +442,13 @@ const CommandHandlers = {
               tb.localize('teamBalancer.status.diagTeams', { team1Name, team2Name }),
               tb.localize('teamBalancer.status.diagSingleRound', {
                 value: this.options?.enableSingleRoundScramble
-                  ? `ON (> ${this.options?.singleRoundScrambleThreshold} tix)`
-                  : 'OFF'
+                  ? tb.localize('teamBalancer.status.singleRoundOn', { value: this.options?.singleRoundScrambleThreshold })
+                  : tb.localize('teamBalancer.status.singleRoundOff')
               }),
               tb.localize('teamBalancer.status.invasionAtkDef', { invasionAttackTeamThreshold: this.options?.invasionAttackTeamThreshold, invasionDefenceTeamThreshold: this.options?.invasionDefenceTeamThreshold }),
               // Kept on its own short line: 'std' rather than the resolved
               // number so an admin can see at a glance that TC is untuned.
-              tb.localize('teamBalancer.status.tcDomMercy', { value: this.options?.tcDominantThreshold ?? 'std', value2: this.options?.tcSingleRoundScrambleThreshold ?? 'std' })
+              tb.localize('teamBalancer.status.tcDomMercy', { value: this.options?.tcDominantThreshold ?? tb.localize('teamBalancer.status.thresholdStandard'), value2: this.options?.tcSingleRoundScrambleThreshold ?? tb.localize('teamBalancer.status.thresholdStandard') })
             ].join('\n'));
 
             const targetReportChannel = this.discordReportChannel || this.discordChannel;
@@ -616,9 +622,8 @@ const CommandHandlers = {
         }
 
         // Log action
-        const actionDesc = isSimulated
-          ? tb.localize('teamBalancer.status.dryRunScramble', { value: hasElo ? 'micro ' : '', value2: immediate ? ' (immediate)' : '' })
-          : tb.localize('teamBalancer.status.liveScramble', { value: hasElo ? 'micro ' : '', value2: immediate ? ' (immediate)' : '' });
+        const scrambleKind = `${hasElo ? 'micro ' : ''}scramble${immediate ? ' (immediate)' : ''}`;
+        const actionDesc = isSimulated ? `dry run ${scrambleKind}` : `live ${scrambleKind}`;
         Logger.verbose('TeamBalancer', 2, `[TeamBalancer] ${adminName} initiated ${actionDesc}`);
 
         // Respond to admin

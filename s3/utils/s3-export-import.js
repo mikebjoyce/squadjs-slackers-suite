@@ -98,6 +98,11 @@ import { pipeline } from 'node:stream/promises';
 import SequelizeLib from 'sequelize';
 import { restoreBackup, listBackups } from './s3-backup.js';
 import { formatSize, timestampString, parseTimestamp } from './s3-common.js';
+// The English catalogue, used only as the default for callers that never reach
+// Discord (tests, the internal restore path). Anything whose strings land in an
+// embed must pass plugin.localize instead, or the operator's configured
+// language is silently ignored for these lines.
+import { localize as localizeEn } from './s3-i18n.js';
 
 // ─── TABLE CLASSIFICATION ────────────────────────────────────────────
 
@@ -142,7 +147,12 @@ const HISTORICAL_TABLES = new Set([
   // Operator-configured Switch settings. Not auto-recoverable — if lost, an
   // admin has to re-enter them by hand — so this belongs in the default tier
   // rather than with the ephemeral state. It was previously in no tier at all.
-  'SwitchPlugin_Settings'
+  'SwitchPlugin_Settings',
+  // One row per round of switch activity. Nothing rebuilds it: once a round
+  // is over its numbers exist nowhere else, and the Discord summaries they
+  // used to be read back out of are not a recovery path for a translated
+  // server.
+  'SwitchPlugin_RoundStats'
 ]);
 
 /**
@@ -423,14 +433,16 @@ export async function exportToJSON(dbService, { tier = 'historical', models = nu
  * @param {object} json - The export object from exportToJSON()
  * @param {object} [options]
  * @param {boolean} [options.dryRun=false] - If true, validate only (no writes)
+ * @param {function} [options.localize] - Message lookup; pass plugin.localize
+ *                                        when the result is rendered to Discord
  * @returns {Promise<{ imported: object, errors: string[] }>}
  */
-export async function importFromJSON(dbService, json, { dryRun = false } = {}) {
+export async function importFromJSON(dbService, json, { dryRun = false, localize = localizeEn } = {}) {
   if (!dbService || !dbService.isReady()) {
     throw new Error('DBService is not ready.');
   }
 
-  const validation = await validateImportStructure(json, dbService.getModelNames());
+  const validation = await validateImportStructure(json, dbService.getModelNames(), localize);
 
   if (!validation.valid) {
     return {
@@ -523,24 +535,26 @@ export async function importFromJSON(dbService, json, { dryRun = false } = {}) {
  *
  * @param {object} json - The export object to validate
  * @param {string[]} modelNames - Known model names from dbService
+ * @param {function} [localize] - Message lookup; pass plugin.localize when the
+ *                                result is rendered to Discord
  * @returns {Promise<{ valid: boolean, warnings: string[], errors: string[] }>}
  */
-export async function validateImportStructure(json, modelNames) {
+export async function validateImportStructure(json, modelNames, localize = localizeEn) {
   const warnings = [];
   const errors = [];
 
   if (!json || typeof json !== 'object') {
-    errors.push('Import data is not a valid JSON object.');
+    errors.push(localize('slackersSquadServices.db.importNotJsonObject'));
     return { valid: false, warnings, errors };
   }
 
   if (json.s3ExportVersion !== 1) {
-    errors.push(`Unsupported export format version: ${json.s3ExportVersion}. Expected 1.`);
+    errors.push(localize('slackersSquadServices.db.importUnsupportedVersion', { version: json.s3ExportVersion }));
     return { valid: false, warnings, errors };
   }
 
   if (!json.tables || typeof json.tables !== 'object') {
-    errors.push('Import data has no "tables" object.');
+    errors.push(localize('slackersSquadServices.db.importNoTablesObject'));
     return { valid: false, warnings, errors };
   }
 
@@ -548,7 +562,7 @@ export async function validateImportStructure(json, modelNames) {
 
   for (const tableName of Object.keys(json.tables)) {
     if (!knownNames.has(tableName)) {
-      warnings.push(`Table "${tableName}" is not a known model — will be skipped during import.`);
+      warnings.push(localize('slackersSquadServices.db.importUnknownTableSkipped', { table: tableName }));
     }
   }
 
@@ -1041,12 +1055,15 @@ function _isStreamFormat(backupPath) {
  * @param {boolean} [options.dryRun=false] - Count rows without writing
  * @param {number} [options.chunkSize=500] - Rows per transaction
  * @param {(level:number,msg:string)=>void} [options.verboseLogger]
+ * @param {function} [options.localize] - Message lookup; pass plugin.localize
+ *                                        when the result is rendered to Discord
  * @returns {Promise<{ imported: object, errors: string[] }>}
  */
 export async function importFromStreamFile(dbService, backupPath, {
   dryRun = false,
   chunkSize = 500,
-  verboseLogger = () => {}
+  verboseLogger = () => {},
+  localize = localizeEn
 } = {}) {
   if (!dbService || !dbService.isReady()) {
     throw new Error('DBService is not ready.');
@@ -1108,7 +1125,7 @@ export async function importFromStreamFile(dbService, backupPath, {
           const name = JSON.parse(opened[1]);
           const model = known.has(name) ? dbService.getModel(name) : null;
           if (!model) {
-            result.errors.push(`Table "${name}" is not a known model — skipped.`);
+            result.errors.push(localize('slackersSquadServices.db.importUnknownTableSkippedStream', { table: name }));
           }
           current = { name, model, buffer: [], count: 0, failed: false };
           continue;
@@ -1176,9 +1193,11 @@ export async function importFromStreamFile(dbService, backupPath, {
  * @param {object} dbService - DBService instance (required for JSON restore)
  * @param {string} [backupDir] - Backup directory (default: './backups')
  * @param {string} [dbPath] - Target database path (required for .sqlite restore)
+ * @param {function} [localize] - Message lookup; pass plugin.localize when the
+ *                                result is rendered to Discord
  * @returns {Promise<object>} Restore result (varies by format)
  */
-export async function restoreFromFile(filename, dbService, backupDir = null, dbPath = null) {
+export async function restoreFromFile(filename, dbService, backupDir = null, dbPath = null, localize = localizeEn) {
   if (!filename) {
     throw new Error('restoreFromFile requires a filename.');
   }
@@ -1213,7 +1232,7 @@ export async function restoreFromFile(filename, dbService, backupDir = null, dbP
     // Written by the streaming exporter — restore it the same way, one row at
     // a time. This is the only path that can restore a multi-hundred-MB backup.
     if (_isStreamFormat(backupPath)) {
-      return importFromStreamFile(dbService, backupPath, { dryRun: false });
+      return importFromStreamFile(dbService, backupPath, { dryRun: false, localize });
     }
 
     // Legacy pretty-printed export: has to be parsed whole. Refuse rather than
@@ -1241,7 +1260,7 @@ export async function restoreFromFile(filename, dbService, backupDir = null, dbP
       throw new Error('Failed to parse JSON backup file.');
     }
 
-    return importFromJSON(dbService, parsed, { dryRun: false });
+    return importFromJSON(dbService, parsed, { dryRun: false, localize });
   }
 
   throw new Error(`Unrecognized backup format: ${filename}. Expected .sqlite or .json.`);

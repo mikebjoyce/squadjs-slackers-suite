@@ -12,6 +12,25 @@
  *
  *   node switch/testing/run-all-tests.js
  *
+ * ─── RUN ONE SUITE AT A TIME ─────────────────────────────────────
+ *
+ * Do not run this concurrently with s3/testing/run-all-tests.js.
+ *
+ * s3/testing/test-i18n.js regenerates s3/locale-templates/ — a fixed,
+ * tracked directory, not a temp one — and reads the results back. Two
+ * runners doing that at once read each other's half-written output, and
+ * test-i18n.js fails with nothing wrong in the code. It reproduces as a
+ * clean pass the moment the suites are run one after the other.
+ *
+ * The engine-backed cases have the same constraint for a different reason:
+ * they create scratch databases named from the process id, so parallel runs
+ * are safe there, but a suite that is killed mid-run leaves one behind.
+ *
+ * Two side effects of a normal run, both expected:
+ *   - s3/locale-templates/* comes back modified. That is the generator,
+ *     not a stray edit.
+ *   - MySQL/Postgres cases SKIP when the engines are not up. Read the skip
+ *     count in the summary; a skip is not a pass.
  */
 
 import { execSync } from 'child_process';
@@ -43,7 +62,12 @@ const testFiles = [
   // report as SKIPPED when the engine is not up on 127.0.0.1:3307 — read the
   // skip count, because a skip is not a pass.
   'test-admin-mutations.js',
-  'test-seed-token-lifecycle.js'
+  'test-seed-token-lifecycle.js',
+  // The round-stats table: its schema, the row the summary embed and the
+  // stored round are both built from, and the backfill's dedupe — which
+  // only fails on MySQL, where DATETIME drops the milliseconds the dedupe
+  // used to match on.
+  'test-round-stats.js'
 ];
 
 console.log('═'.repeat(50));

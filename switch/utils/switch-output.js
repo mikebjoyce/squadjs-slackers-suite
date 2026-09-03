@@ -92,14 +92,193 @@ const SwitchOutput = {
         maxQueueSize: 0,        // peak _getQueueSize() during the round
         queueTimeoutSwitches: [],  // { name, eosID, currentTeamID, toTeam, queueDurationSeconds, gamePhase }
         wasLiberalMode: false,         // cached at round-end
-        queueDurationsMs: [],   // cumulative — used for average wait time
+        // Cumulative — feeds meanQueueMs/medianQueueMs. Deliberately not run
+        // through _trackRoundStat: it holds bare numbers, and every duration
+        // pushed here is already carried as queueDurationSeconds (or
+        // p1/p2DurationSeconds) on the event line logged beside it, so a round
+        // can still be rebuilt from the log without a line per number.
+        queueDurationsMs: [],
+        // Round identity, captured during the round and finalised at
+        // ROUND_ENDED. It cannot simply be read where the row is written: the
+        // row is built in onNewGame, by which point S³ has already advanced
+        // to the NEXT round, so asking gameState there would label every row
+        // with the round that follows it. All three stay null when nothing
+        // ever resolved; the counts are the point and a missing map name does
+        // not void them.
+        matchId: null,
+        layerName: null,
+        gameMode: null
       };
+    };
+
+    /**
+     * Records what round is being played.
+     *
+     * Called from onNewGame (right after the stats reset), on every layer
+     * change, and once more from onRoundEnded with { settled: true }.
+     *
+     * matchId frequently has not resolved yet at NEW_GAME — the seed sweeps
+     * in switch.js guard on exactly that — so it is filled only while still
+     * empty and the first resolved answer wins. Layer and gamemode need the
+     * opposite rule; see below.
+     */
+    plugin._captureRoundIdentity = function ({ settled = false } = {}) {
+      const st = plugin._roundStats;
+      if (!st) return;
+      const gs = plugin._s3?.gameState;
+
+      // First-wins is right for matchId: at NEW_GAME it reads as null until
+      // it resolves, so the first non-null answer is the correct one.
+      if (st.matchId == null) st.matchId = gs?.getMatchId?.() || null;
+
+      // Layer and gamemode cannot use that rule. At NEW_GAME they do not read
+      // as null — they read as the PREVIOUS round's layer, because server
+      // info still describes the map being travelled away from. S³ commits
+      // that value (trusted=true) and fires its layer-change subscribers with
+      // it, so both capture paths see a wrong answer that looks like a right
+      // one, seconds before the real layer arrives. First-wins would then
+      // pin the round to the previous map permanently. Seen live on
+      // 2026-09-02: a Gorodok_RAAS_v1 round stored as AlBasrah_AAS_v1 / AAS.
+      //
+      // The round-end pass is therefore the authoritative one and overwrites:
+      // by ROUND_ENDED the layer has been settled for a whole round.
+      const layerName = gs?.getLayerName?.() || null;
+      const gameMode = gs?.getGamemode?.() || null;
+      if (settled) {
+        if (layerName) st.layerName = layerName;
+        if (gameMode) st.gameMode = gameMode;
+        return;
+      }
+      if (st.layerName == null) st.layerName = layerName;
+      if (st.gameMode == null) st.gameMode = gameMode;
+    };
+
+    /**
+     * Flattens the round's in-memory stats into one persistable row.
+     *
+     * This is the same arithmetic the round-summary embed prints, lifted out
+     * so it can be stored as numbers. Storing it is what lets `!switch stats`
+     * and the 7-day report stop re-reading their own Discord prose — a
+     * scrape that only ever worked because those embeds were English.
+     *
+     * Runs regardless of roundEndSummaryEnabled: whether an operator wants a
+     * message posted every round is a separate question from whether the
+     * numbers survive.
+     *
+     * @returns {object|null} a SwitchPlugin_RoundStats row, or null with no stats
+     */
+    plugin._computeRoundStatsRow = function () {
+      const s = plugin._roundStats;
+      if (!s) return null;
+
+      let toT1 = 0, toT2 = 0;
+      const countDest = (list, key) => {
+        for (const p of list) { if (p[key] === 1) toT1++; else toT2++; }
+      };
+      countDest(s.instantSwitches, 'toTeam');
+      countDest(s.queueNormal, 'toTeam');
+      countDest(s.queueJoinSwaps, 'toTeam');
+      countDest(s.queueTimeoutSwitches, 'toTeam');
+      countDest(s.queueTeamTrades, 'p1ToTeam');
+      countDest(s.queueTeamTrades, 'p2ToTeam');
+
+      // Unrecognised reason strings are bucketed rather than dropped — the
+      // onChatMessage catch-all can produce one, and a denial that lands
+      // nowhere would make the totals stop adding up.
+      const denials = { cooldown: 0, time_window: 0, scramble_lock: 0, recent_switch: 0, other: 0 };
+      for (const d of s.deniedSwitches) {
+        if (Object.prototype.hasOwnProperty.call(denials, d.reason) && d.reason !== 'other') denials[d.reason]++;
+        else denials.other++;
+      }
+
+      const durations = s.queueDurationsMs || [];
+      // Null, not zero, when nobody queued: a round with no queue must not
+      // pull the multi-round average down toward an instant wait.
+      const meanQueueMs = durations.length > 0
+        ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length)
+        : null;
+      const medianQueueMs = durations.length > 0 ? plugin._computeMedian(durations) : null;
+
+      return {
+        matchId: s.matchId,
+        layerName: s.layerName,
+        gameMode: s.gameMode,
+        roundEndedAt: new Date(),
+        liberalMode: !!s.wasLiberalMode,
+        // Live rows are always complete — every field below came from the
+        // round itself. Only backfilled rows set this.
+        incomplete: false,
+        source: 'live',
+        success: s.instantSwitches.length + s.queueNormal.length +
+          s.queueTeamTrades.length + s.queueJoinSwaps.length + s.queueTimeoutSwitches.length,
+        failed: s.queueExpiries.length,
+        denied: s.deniedSwitches.length,
+        toT1,
+        toT2,
+        maxQueueSize: s.maxQueueSize || 0,
+        instant: s.instantSwitches.length,
+        queueNormal: s.queueNormal.length,
+        queueTeamTrade: s.queueTeamTrades.length,
+        queueJoinSwap: s.queueJoinSwaps.length,
+        queueTimeoutSwitch: s.queueTimeoutSwitches.length,
+        denialCooldown: denials.cooldown,
+        denialTimeWindow: denials.time_window,
+        denialScrambleLock: denials.scramble_lock,
+        denialRecentSwitch: denials.recent_switch,
+        denialOther: denials.other,
+        outcomeExpired: s.queueExpiries.length,
+        outcomeDC: s.queueDisconnects.length,
+        outcomeCancelled: s.queueCancels.length,
+        outcomeRemoved: (s.queueRemovals || []).length,
+        meanQueueMs,
+        medianQueueMs
+      };
+    };
+
+    /**
+     * Record one round-stat event, and log it in a single greppable shape.
+     *
+     * Every counter in SwitchPlugin_RoundStats is fed from here, so the log
+     * and the stored row cannot disagree: there is no way to record an event
+     * without emitting its line, because it is the same call.
+     *
+     * That matters because the queue paths are close to untestable on a live
+     * server — a queue only forms when the teams are full and unbalanced,
+     * which a maintainer cannot conjure on demand. Reconstructing a round
+     * from the log afterwards is the practical substitute, so the line has to
+     * be machine-readable, not prose:
+     *
+     *   [RoundStat] queueTeamTrades {"p1Name":"Alice","p2Name":"Bob",...}
+     *
+     * Strip the prefix and JSON.parse the rest. Grep with:
+     *
+     *   grep -o '\[RoundStat\] .*' squadjs.log
+     *
+     * Logged at verbose level 1 deliberately. These are low-frequency (a busy
+     * round is tens of lines, not thousands) and worthless if a server has to
+     * be reconfigured before they appear — by then the round is gone.
+     *
+     * Returns the entry so callers can keep using it.
+     */
+    plugin._trackRoundStat = function (bucket, entry) {
+      const st = plugin._roundStats;
+      if (!st || !Array.isArray(st[bucket])) return entry;
+      st[bucket].push(entry);
+      try {
+        plugin.verbose(1, `[RoundStat] ${bucket} ${JSON.stringify(entry)}`);
+      } catch {
+        // A circular or otherwise unserialisable entry must never take down a
+        // switch. Losing the line is survivable; losing the round is not.
+        plugin.verbose(1, `[RoundStat] ${bucket} (unserialisable entry)`);
+      }
+      return entry;
     };
 
     plugin._updateMaxQueueSize = function () {
       const current = plugin._getQueueSize();
       if (current > plugin._roundStats.maxQueueSize) {
         plugin._roundStats.maxQueueSize = current;
+        plugin.verbose(1, `[RoundStat] maxQueueSize ${JSON.stringify({ size: current })}`);
       }
     };
 
@@ -114,7 +293,7 @@ const SwitchOutput = {
       if (plugin._roundStats._deniedPlayerSet.has(eosID)) return;
       plugin._roundStats._deniedPlayerSet.add(eosID);
       const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
-      plugin._roundStats.deniedSwitches.push({ name: playerName, eosID, reason, gamePhase });
+      plugin._trackRoundStat('deniedSwitches', { name: playerName, eosID, reason, gamePhase });
     };
 
     // ── Broadcast Helpers ──────────────────────────────────────
@@ -293,6 +472,11 @@ const SwitchOutput = {
      * based on the confirmed layer/gamemode and scramble state.
      */
     plugin._onLayerChanged = function (layerName, gameMode) {
+      // Backstop for the round label: at NEW_GAME matchId is routinely still
+      // unresolved. This also runs on the direct call from onNewGame, where
+      // the layer is NOT yet trustworthy — onRoundEnded is what settles it.
+      plugin._captureRoundIdentity();
+
       const isLiberal = plugin._liberalModes.some(m => {
         const candidate = String(m).toLowerCase();
         return (gameMode || '').toLowerCase().includes(candidate) ||
@@ -373,7 +557,9 @@ const SwitchOutput = {
     plugin._formatDuration = function (seconds) {
       const m = Math.floor(seconds / 60);
       const s = seconds % 60;
-      return m > 0 ? `${m}m ${s}s` : `${s}s`;
+      return m > 0
+        ? plugin.localize('switch.roundSummary.durationMinutesSeconds', { mins: m, secs: s })
+        : plugin.localize('switch.roundSummary.durationSeconds', { secs: s });
     };
 
     /**
@@ -410,57 +596,45 @@ const SwitchOutput = {
       const s = plugin._roundStats;
       if (!s) return null;
 
-      const totalSuccess = s.instantSwitches.length + s.queueNormal.length +
-        s.queueTeamTrades.length + s.queueJoinSwaps.length + s.queueTimeoutSwitches.length;
-      const totalFailed = s.queueExpiries.length;
+      // Every count in this embed comes from the row that gets persisted, so
+      // the posted message and the stored numbers can never disagree.
+      const row = plugin._computeRoundStatsRow();
+      const totalSuccess = row.success;
+      const totalFailed = row.failed;
 
       // Average queue wait (only queue-based successes, not instant)
       const queueDurations = s.queueDurationsMs || [];
-      const avgQueueSec = queueDurations.length > 0
-        ? Math.round(queueDurations.reduce((a, b) => a + b, 0) / queueDurations.length / 1000)
-        : 0;
+      const avgQueueSec = Math.round((row.meanQueueMs || 0) / 1000);
       const avgMin = Math.floor(avgQueueSec / 60);
       const avgSec = avgQueueSec % 60;
-      const avgStr = avgMin > 0 ? `${avgMin}m ${avgSec}s` : `${avgSec}s`;
+      const avgStr = avgMin > 0
+        ? plugin.localize('switch.roundSummary.durationMinutesSeconds', { mins: avgMin, secs: avgSec })
+        : plugin.localize('switch.roundSummary.durationSeconds', { secs: avgSec });
 
       // Median queue wait
-      const medianQueueMs = plugin._computeMedian(queueDurations);
+      const medianQueueMs = row.medianQueueMs || 0;
       const medianMin = Math.floor(medianQueueMs / 60000);
       const medianSec = Math.round((medianQueueMs % 60000) / 1000);
-      const medianStr = medianMin > 0 ? `${medianMin}m ${medianSec}s` : `${medianSec}s`;
+      const medianStr = medianMin > 0
+        ? plugin.localize('switch.roundSummary.durationMinutesSeconds', { mins: medianMin, secs: medianSec })
+        : plugin.localize('switch.roundSummary.durationSeconds', { secs: medianSec });
 
       // Per-team destination counts (all success types)
-      let toT1 = 0, toT2 = 0;
-      for (const p of s.instantSwitches) {
-        if (p.toTeam === 1) toT1++; else toT2++;
-      }
-      for (const p of s.queueNormal) {
-        if (p.toTeam === 1) toT1++; else toT2++;
-      }
-      for (const p of s.queueJoinSwaps) {
-        if (p.toTeam === 1) toT1++; else toT2++;
-      }
-      for (const p of s.queueTimeoutSwitches) {
-        if (p.toTeam === 1) toT1++; else toT2++;
-      }
-      for (const p of s.queueTeamTrades) {
-        if (p.p1ToTeam === 1) toT1++; else toT2++;
-        if (p.p2ToTeam === 1) toT1++; else toT2++;
-      }
+      const { toT1, toT2 } = row;
 
       const fields = [];
 
       // ── Restart warning ──
       if (plugin._restartedThisRound) {
         fields.push({
-          name: '⚠️ Notice',
-          value: 'SquadJS was restarted during this round — switch data may be incomplete.',
+          name: plugin.localize('switch.roundSummary.notice'),
+          value: plugin.localize('switch.roundSummary.restartedNotice'),
           inline: false
         });
       }
 
       // ── Field 1: Stats ──
-      const totalDenied = s.deniedSwitches.length;
+      const totalDenied = row.denied;
       const totalRequests = totalSuccess + totalFailed + totalDenied;
       const attemptedRequests = totalSuccess + totalFailed;
       const successRate = attemptedRequests > 0 ? Math.round((totalSuccess / attemptedRequests) * 100) : 0;
@@ -471,44 +645,43 @@ const SwitchOutput = {
       // reason strings (e.g. 'unexpected error' from the onChatMessage catch-all,
       // or any raw SQL/RCON error messages that bypassed sanitization) are
       // bucketed as "other" to prevent ugly text from leaking into the embed.
+      // Only the reasons that occurred are named, in the order they first
+      // occurred — which the row's fixed columns cannot reproduce, so this
+      // one pass stays here. The counts still come from the row.
       const KNOWN_DENIAL_REASONS = ['cooldown', 'time_window', 'scramble_lock', 'recent_switch'];
       const denialReasons = {};
-      let otherDenialCount = 0;
       for (const d of s.deniedSwitches) {
-        if (KNOWN_DENIAL_REASONS.includes(d.reason)) {
-          denialReasons[d.reason] = (denialReasons[d.reason] || 0) + 1;
-        } else {
-          otherDenialCount++;
-        }
+        if (KNOWN_DENIAL_REASONS.includes(d.reason)) denialReasons[d.reason] = (denialReasons[d.reason] || 0) + 1;
       }
+      const otherDenialCount = row.denialOther;
       const denialParts = Object.entries(denialReasons)
         .map(([reason, count]) => `${count} ${reason}`);
-      if (otherDenialCount > 0) denialParts.push(`${otherDenialCount} other`);
+      if (otherDenialCount > 0) denialParts.push(plugin.localize('switch.roundSummary.otherDenials', { count: otherDenialCount }));
       const denialBreakdown = denialParts.join(', ');
 
       const statsLines = [];
-      statsLines.push(`**Mode:** ${s.wasLiberalMode ? 'Liberal (Seed/Jensen)' : 'Standard'}`);
-      statsLines.push(`**Requests:** ${totalRequests} (${totalSuccess} succeeded, ${totalDenied} denied, ${totalFailed} failed)`);
-      statsLines.push(`**Success Rate:** ${successRate}%`);
+      statsLines.push(plugin.localize('switch.roundSummary.mode', { mode: s.wasLiberalMode ? plugin.localize('switch.labels.modeLiberal') : plugin.localize('switch.labels.modeStandard') }));
+      statsLines.push(plugin.localize('switch.roundSummary.requests', { total: totalRequests, succeeded: totalSuccess, denied: totalDenied, failed: totalFailed }));
+      statsLines.push(plugin.localize('switch.roundSummary.successRate', { rate: successRate }));
       if (totalDenied > 0) {
-        statsLines.push(`**Denied:** ${totalDenied} player${totalDenied !== 1 ? 's' : ''} (${denialBreakdown})`);
-        statsLines.push(`**Denial Rate:** ${denyRate}%`);
+        statsLines.push(totalDenied !== 1 ? plugin.localize('switch.roundSummary.deniedPlayersPlural', { count: totalDenied, breakdown: denialBreakdown }) : plugin.localize('switch.roundSummary.deniedPlayers', { count: totalDenied, breakdown: denialBreakdown }));
+        statsLines.push(plugin.localize('switch.roundSummary.denialRate', { rate: denyRate }));
       }
       if (totalFailed > 0) {
-        statsLines.push(`**Fail Rate:** ${failRate}% (${totalFailed} expired)`);
+        statsLines.push(plugin.localize('switch.roundSummary.failRate', { rate: failRate, expired: totalFailed }));
       }
-      statsLines.push(`**Max Queue Size:** ${s.maxQueueSize}`);
-      if (queueDurations.length > 0) statsLines.push(`**Queue Wait:** mean ${avgStr}, median ${medianStr}`);
+      statsLines.push(plugin.localize('switch.roundSummary.maxQueueSize', { size: s.maxQueueSize }));
+      if (queueDurations.length > 0) statsLines.push(plugin.localize('switch.roundSummary.queueWait', { mean: avgStr, median: medianStr }));
       const totalMoves = toT1 + toT2;
       if (totalMoves > 0) {
         const dirPct1 = ` (${((toT1 / totalMoves) * 100).toFixed(1)}%)`;
         const dirPct2 = ` (${((toT2 / totalMoves) * 100).toFixed(1)}%)`;
-        statsLines.push(`**Direction:**`);
+        statsLines.push(plugin.localize('switch.roundSummary.direction'));
         statsLines.push(`→ T1: ${toT1}${dirPct1}`);
         statsLines.push(`→ T2: ${toT2}${dirPct2}`);
       }
 
-      fields.push({ name: '📊 Stats', value: statsLines.join('\n'), inline: false });
+      fields.push({ name: plugin.localize('switch.roundSummary.statsField'), value: statsLines.join('\n'), inline: false });
 
       // ── Field 2: Switch Methods (successes only) ──
       const methodLines = [];
@@ -517,8 +690,8 @@ const SwitchOutput = {
         const names = s.instantSwitches.slice(0, 20).map(p =>
           `${p.name} ${plugin._formatGamePhase(p.gamePhase)} (T${p.fromTeam}→T${p.toTeam})`
         );
-        if (s.instantSwitches.length > 20) names.push(`+ ${s.instantSwitches.length - 20} more...`);
-        methodLines.push(`**Instant Switches (${s.instantSwitches.length})**\n${names.join('\n')}`);
+        if (s.instantSwitches.length > 20) names.push(plugin.localize('switch.roundSummary.moreEllipsis', { count: s.instantSwitches.length - 20 }));
+        methodLines.push(`${plugin.localize('switch.roundSummary.instantSwitchesHeading', { count: s.instantSwitches.length })}\n${names.join('\n')}`);
       }
 
       if (s.queueNormal.length) {
@@ -528,8 +701,8 @@ const SwitchOutput = {
           const dur = m > 0 ? `${m}m ${sec}s` : `${sec}s`;
           return `${p.name} ${plugin._formatGamePhase(p.gamePhase)} (T${p.currentTeamID || '?'}→T${p.toTeam}, ${dur})`;
         });
-        if (s.queueNormal.length > 10) names.push(`+ ${s.queueNormal.length - 10} more...`);
-        methodLines.push(`**Queue Normal (${s.queueNormal.length})**\n${names.join('\n')}`);
+        if (s.queueNormal.length > 10) names.push(plugin.localize('switch.roundSummary.moreEllipsis', { count: s.queueNormal.length - 10 }));
+        methodLines.push(`${plugin.localize('switch.roundSummary.queueNormalHeading', { count: s.queueNormal.length })}\n${names.join('\n')}`);
       }
 
       if (s.queueTeamTrades.length) {
@@ -538,8 +711,8 @@ const SwitchOutput = {
           const d2 = plugin._formatDuration(p.p2DurationSeconds);
           return `${p.p1Name} ${plugin._formatGamePhase(p.gamePhase)} (T${p.p1FromTeam}→T${p.p1ToTeam}, ${d1}) ↔ ${p.p2Name} (T${p.p2FromTeam}→T${p.p2ToTeam}, ${d2})`;
         });
-        if (s.queueTeamTrades.length > 10) names.push(`+ ${s.queueTeamTrades.length - 10} more...`);
-        methodLines.push(`**Queue Team Trade (${s.queueTeamTrades.length})**\n${names.join('\n')}`);
+        if (s.queueTeamTrades.length > 10) names.push(plugin.localize('switch.roundSummary.moreEllipsis', { count: s.queueTeamTrades.length - 10 }));
+        methodLines.push(`${plugin.localize('switch.roundSummary.queueTeamTradeHeading', { count: s.queueTeamTrades.length })}\n${names.join('\n')}`);
       }
 
       if (s.queueJoinSwaps.length) {
@@ -549,8 +722,8 @@ const SwitchOutput = {
           const dur = m > 0 ? `${m}m ${sec}s` : `${sec}s`;
           return `${p.name} ${plugin._formatGamePhase(p.gamePhase)} (T${p.currentTeamID || '?'}→T${p.toTeam}, ${dur})`;
         });
-        if (s.queueJoinSwaps.length > 10) names.push(`+ ${s.queueJoinSwaps.length - 10} more...`);
-        methodLines.push(`**Queue Join Swap (${s.queueJoinSwaps.length})**\n${names.join('\n')}`);
+        if (s.queueJoinSwaps.length > 10) names.push(plugin.localize('switch.roundSummary.moreEllipsis', { count: s.queueJoinSwaps.length - 10 }));
+        methodLines.push(`${plugin.localize('switch.roundSummary.queueJoinSwapHeading', { count: s.queueJoinSwaps.length })}\n${names.join('\n')}`);
       }
 
       if (s.queueTimeoutSwitches.length) {
@@ -560,12 +733,12 @@ const SwitchOutput = {
           const dur = m > 0 ? `${m}m ${sec}s` : `${sec}s`;
           return `${p.name} ${plugin._formatGamePhase(p.gamePhase)} (T${p.currentTeamID || '?'}→T${p.toTeam}, ${dur})`;
         });
-        if (s.queueTimeoutSwitches.length > 10) names.push(`+ ${s.queueTimeoutSwitches.length - 10} more...`);
-        methodLines.push(`**Queue Timeout Switch (${s.queueTimeoutSwitches.length})**\n${names.join('\n')}`);
+        if (s.queueTimeoutSwitches.length > 10) names.push(plugin.localize('switch.roundSummary.moreEllipsis', { count: s.queueTimeoutSwitches.length - 10 }));
+        methodLines.push(`${plugin.localize('switch.roundSummary.queueTimeoutSwitchHeading', { count: s.queueTimeoutSwitches.length })}\n${names.join('\n')}`);
       }
 
       if (methodLines.length > 0) {
-        fields.push({ name: '🔄 Switch Methods', value: methodLines.join('\n\n'), inline: false });
+        fields.push({ name: plugin.localize('switch.roundSummary.switchMethodsField'), value: methodLines.join('\n\n'), inline: false });
       }
 
       // ── Field 3: Queue Activity (non-success outcomes) ──
@@ -573,18 +746,22 @@ const SwitchOutput = {
 
       if (s.queueExpiries.length) {
         const names = s.queueExpiries.slice(0, 20).map(p =>
-          `${p.name} ${plugin._formatGamePhase(p.gamePhase)} (waited ${plugin._formatDuration(p.queueDurationSeconds)})`
+          plugin.localize('switch.roundSummary.expiredEntry', {
+            name: p.name,
+            phase: plugin._formatGamePhase(p.gamePhase),
+            duration: plugin._formatDuration(p.queueDurationSeconds)
+          })
         );
-        if (s.queueExpiries.length > 20) names.push(`+ ${s.queueExpiries.length - 20} more...`);
-        activityLines.push(`**Expired (${s.queueExpiries.length})**\n${names.join('\n')}`);
+        if (s.queueExpiries.length > 20) names.push(plugin.localize('switch.roundSummary.moreEllipsis', { count: s.queueExpiries.length - 20 }));
+        activityLines.push(`${plugin.localize('switch.roundSummary.expiredHeading', { count: s.queueExpiries.length })}\n${names.join('\n')}`);
       }
 
       if (s.deniedSwitches.length) {
         const names = s.deniedSwitches.slice(0, 10).map(p =>
           `${p.name} ${plugin._formatGamePhase(p.gamePhase)}: ${p.reason}`
         );
-        if (s.deniedSwitches.length > 10) names.push(`+ ${s.deniedSwitches.length - 10} more...`);
-        activityLines.push(`**Denied (${s.deniedSwitches.length} unique players)**\n${names.join('\n')}`);
+        if (s.deniedSwitches.length > 10) names.push(plugin.localize('switch.roundSummary.moreEllipsis', { count: s.deniedSwitches.length - 10 }));
+        activityLines.push(`${plugin.localize('switch.roundSummary.deniedHeading', { count: s.deniedSwitches.length })}\n${names.join('\n')}`);
       }
 
       if (s.queueDisconnects.length) {
@@ -594,8 +771,8 @@ const SwitchOutput = {
           const to = p.targetTeamID ? `T${p.targetTeamID}` : '?';
           return `${p.name} (${from}→${to}, ${dur})`;
         });
-        if (s.queueDisconnects.length > 20) names.push(`+ ${s.queueDisconnects.length - 20} more...`);
-        activityLines.push(`**DC'd in Queue (${s.queueDisconnects.length})**\n${names.join('\n')}`);
+        if (s.queueDisconnects.length > 20) names.push(plugin.localize('switch.roundSummary.moreEllipsis', { count: s.queueDisconnects.length - 20 }));
+        activityLines.push(`${plugin.localize('switch.roundSummary.dcdInQueueHeading', { count: s.queueDisconnects.length })}\n${names.join('\n')}`);
       }
 
       if (s.queueCancels.length) {
@@ -605,33 +782,58 @@ const SwitchOutput = {
           const to = p.toTeam ? `T${p.toTeam}` : '?';
           return `${p.name} (${from}→${to}, ${dur})`;
         });
-        if (s.queueCancels.length > 20) names.push(`+ ${s.queueCancels.length - 20} more...`);
-        activityLines.push(`**Cancelled (${s.queueCancels.length})**\n${names.join('\n')}`);
+        if (s.queueCancels.length > 20) names.push(plugin.localize('switch.roundSummary.moreEllipsis', { count: s.queueCancels.length - 20 }));
+        activityLines.push(`${plugin.localize('switch.roundSummary.cancelledHeading', { count: s.queueCancels.length })}\n${names.join('\n')}`);
       }
 
       if (s.queueRemovals && s.queueRemovals.length) {
         const names = s.queueRemovals.slice(0, 20).map(p =>
           `${p.name} ${plugin._formatGamePhase(p.gamePhase)}: ${p.reason}`
         );
-        if (s.queueRemovals.length > 20) names.push(`+ ${s.queueRemovals.length - 20} more...`);
-        activityLines.push(`**Removed (${s.queueRemovals.length})**\n${names.join('\n')}`);
+        if (s.queueRemovals.length > 20) names.push(plugin.localize('switch.roundSummary.moreEllipsis', { count: s.queueRemovals.length - 20 }));
+        activityLines.push(`${plugin.localize('switch.roundSummary.removedHeading', { count: s.queueRemovals.length })}\n${names.join('\n')}`);
       }
 
       if (activityLines.length > 0) {
-        fields.push({ name: 'ℹ️ Queue Activity', value: activityLines.join('\n\n'), inline: false });
+        fields.push({ name: plugin.localize('switch.roundSummary.queueActivityField'), value: activityLines.join('\n\n'), inline: false });
       }
 
       if (!fields.length) {
-        fields.push({ name: 'No Activity', value: 'No switch activity this round.', inline: false });
+        fields.push({ name: plugin.localize('switch.roundSummary.noActivityField'), value: plugin.localize('switch.roundSummary.noActivityValue'), inline: false });
       }
 
       return {
-        title: 'Switch Round Summary',
+        title: plugin.localize('switch.roundSummary.title'),
         color: 0x3498DB,
         fields,
         timestamp: new Date(),
-        footer: { text: `Switch v${plugin.constructor.version}` }
+        footer: { text: plugin.localize('switch.roundSummary.footer', { version: plugin.constructor.version }) }
       };
+    };
+
+    /**
+     * Stores the round that just ended.
+     *
+     * Deliberately NOT gated on roundEndSummaryEnabled. That option decides
+     * whether a message gets posted every round, which is a question about
+     * channel noise; turning it off must not also throw the numbers away and
+     * leave `!switch stats` reporting on a partial history.
+     *
+     * Never throws. A round ending is not allowed to fail because the DB is
+     * down — the worst outcome here is one missing row in a report.
+     */
+    plugin._persistRoundStats = async function () {
+      try {
+        if (typeof plugin.recordRoundStats !== 'function') return;
+        const row = plugin._computeRoundStatsRow();
+        if (!row) return;
+        const ok = await plugin.recordRoundStats(row);
+        plugin.verbose(2, ok
+          ? `[RoundStats] Stored round ${row.matchId || '(no matchId)'}: ${row.success} success, ${row.denied} denied, ${row.failed} expired.`
+          : '[RoundStats] Round not stored — DB unavailable.');
+      } catch (err) {
+        plugin.verbose(1, `[RoundStats] Failed to store round: ${err.message}`);
+      }
     };
 
     plugin._postRoundSummary = async function () {
@@ -694,21 +896,25 @@ const SwitchOutput = {
       const VERSION = plugin.constructor.version;
 
       // ── System health checks ──
-      let dbOk = false, dbLabel = 'Unknown';
-      let rconOk = false, rconLabel = 'N/A';
-      let s3Ok = false, s3Label = 'Not available';
+      let dbOk = false, dbLabel = plugin.localize('switch.switchDiag.healthUnknown');
+      let rconOk = false, rconLabel = plugin.localize('switch.switchDiag.healthNotApplicable');
+      let s3Ok = false, s3Label = plugin.localize('switch.switchDiag.healthNotAvailable');
+      // Tracked as a flag rather than re-read off s3Label: the label is
+      // translated, so comparing it against the English word 'Partial' would
+      // pick the wrong emoji in every language but English.
+      let s3Partial = false;
 
       // DB check
       try {
         if (plugin._s3db?.isReady()) {
           await plugin._s3db.sequelize.authenticate();
           dbOk = true;
-          dbLabel = 'Connected';
+          dbLabel = plugin.localize('switch.switchDiag.healthConnected');
         } else {
-          dbLabel = 'S³ DB not available';
+          dbLabel = plugin.localize('switch.switchDiag.healthS3DbNotAvailable');
         }
       } catch (err) {
-        dbLabel = `Error: ${err.message}`;
+        dbLabel = plugin.localize('switch.switchDiag.healthError', { message: err.message });
       }
 
       // RCON latency check
@@ -716,27 +922,28 @@ const SwitchOutput = {
         const start = Date.now();
         await plugin.server.rcon.execute('ListPlayers');
         rconOk = true;
-        rconLabel = `${Date.now() - start}ms`;
+        rconLabel = plugin.localize('switch.switchDiag.healthLatency', { ms: Date.now() - start });
       } catch (err) {
-        rconLabel = `Error: ${err.message}`;
+        rconLabel = plugin.localize('switch.switchDiag.healthError', { message: err.message });
       }
 
       // S³ integration check (like TB's testS3Integration)
       try {
         if (plugin._s3?.gameState?.isReady?.() && plugin._s3?.players?.isReady?.() && plugin._s3?.players?.canAct) {
           s3Ok = true;
-          s3Label = 'Ready';
+          s3Label = plugin.localize('switch.switchDiag.healthReady');
         } else if (plugin._s3?.gameState?.isReady?.() || plugin._s3?.players?.isReady?.()) {
-          s3Label = 'Partial';
+          s3Partial = true;
+          s3Label = plugin.localize('switch.switchDiag.healthPartial');
         }
       } catch (err) {
-        s3Label = `Error: ${err.message}`;
+        s3Label = plugin.localize('switch.switchDiag.healthError', { message: err.message });
       }
 
       const healthLines = [
-        `${dbOk ? '🟢' : '🔴'} Database        ${dbLabel}`,
-        `${rconOk ? '🟢' : '🔴'} RCON            ${rconLabel}`,
-        `${s3Ok ? '🟢' : s3Label === 'Partial' ? '🟠' : '🔴'} S³ Integration   ${s3Label}`
+        plugin.localize('switch.switchDiag.healthDatabase', { emoji: dbOk ? '🟢' : '🔴', label: dbLabel }),
+        plugin.localize('switch.switchDiag.healthRcon', { emoji: rconOk ? '🟢' : '🔴', label: rconLabel }),
+        plugin.localize('switch.switchDiag.healthS3Integration', { emoji: s3Ok ? '🟢' : s3Partial ? '🟠' : '🔴', label: s3Label })
       ].join('\n');
 
       // ── Config snapshot ──
@@ -753,36 +960,36 @@ const SwitchOutput = {
         const elapsed = Date.now() - plugin._gameStartTs;
         const remainingMs = plugin.options.switchEnabledMinutes * 60 * 1000 - elapsed;
         if (remainingMs <= 0) {
-          configLines.push(`**Switching:** Closed`);
+          configLines.push(plugin.localize('switch.switchDiag.switchingClosed'));
         } else {
           const remainingMin = Math.ceil(remainingMs / 60000);
-          configLines.push(`**Switching:** Open (~${remainingMin}m remaining)`);
+          configLines.push(plugin.localize('switch.switchDiag.switchingOpen', { remaining: remainingMin }));
         }
       } else if (plugin.timeLimitEnabled) {
-        configLines.push(`**Switching:** Limit enabled (not yet started)`);
+        configLines.push(plugin.localize('switch.switchDiag.switchingLimitNotStarted'));
       } else {
-        configLines.push(`**Switching:** No time limit`);
+        configLines.push(plugin.localize('switch.switchDiag.switchingNoTimeLimit'));
       }
-      configLines.push(`**Mode:** ${isLiberal ? 'Liberal (Seed/Jensen)' : 'Standard'}`);
+      configLines.push(plugin.localize('switch.switchDiag.mode', { mode: isLiberal ? plugin.localize('switch.labels.modeLiberal') : plugin.localize('switch.labels.modeStandard') }));
       // Scramble lockdown is tracked per-player in the DB (scrambleLockdownExpiry).
       // Show the config duration rather than a transient runtime flag — the flag
       // is consumed by _onLayerChanged() for broadcast routing and is only briefly
       // true between round end and layer resolution.
       const scrambleMinutes = plugin.options.scrambleLockdownDurationMinutes;
-      configLines.push(`**Scramble Lockdown:** ${scrambleMinutes} min per player`);
+      configLines.push(plugin.localize('switch.switchDiag.scrambleLockdown', { minutes: scrambleMinutes }));
       // v2.3.0: Show token bucket config
       const maxTokens = plugin.options.maxSwitchTokens;
-      configLines.push(`**Switch Tokens:** ${maxTokens}`);
+      configLines.push(plugin.localize('switch.switchDiag.switchTokens', { max: maxTokens }));
       // Cooldown duration is a static config value — show it here alongside
       // the other durations (Scramble Lockdown, Queue Timeout) for consistency.
       const cooldownDurationLabel = plugin.options.switchCooldownMinutes > 0
-        ? `${plugin.options.switchCooldownMinutes} min`
-        : `${plugin.options.switchCooldownHours}h`;
-      configLines.push(`**Token Refill:** ${cooldownDurationLabel} per token`);
+        ? plugin.localize('switch.switchDiag.cooldownMinutes', { minutes: plugin.options.switchCooldownMinutes })
+        : plugin.localize('switch.switchDiag.cooldownHours', { hours: plugin.options.switchCooldownHours });
+      configLines.push(plugin.localize('switch.switchDiag.tokenRefill', { label: cooldownDurationLabel }));
       // "AllowTeamChanges" = RCON AllowTeamChanges setting. When off, players
       // cannot use the in-game scoreboard to swap teams — they must use !switch.
-      configLines.push(`**AllowTeamChanges:** ${plugin._changeTeamDisabled ? 'Off' : 'On'}`);
-      configLines.push(`**Queue Timeout:** ${plugin.options.queueTimeoutMinutes}m`);
+      configLines.push(plugin.localize('switch.switchDiag.allowTeamChanges', { state: plugin._changeTeamDisabled ? plugin.localize('switch.switchDiag.off') : plugin.localize('switch.switchDiag.on') }));
+      configLines.push(plugin.localize('switch.switchDiag.queueTimeout', { minutes: plugin.options.queueTimeoutMinutes }));
 
       // ── Queue status ──
       //
@@ -795,7 +1002,7 @@ const SwitchOutput = {
 
       const queueLines = [];
       if (totalQueued === 0) {
-        queueLines.push('⚫ Empty');
+        queueLines.push(plugin.localize('switch.switchDiag.queueEmpty'));
       } else {
         // Use live Date.now() here rather than the shared 'now' snapshot — queue
         // wait times are relative and should be accurate to the moment of display.
@@ -803,7 +1010,9 @@ const SwitchOutput = {
           const sec = Math.round((Date.now() - queuedAt) / 1000);
           const m = Math.floor(sec / 60);
           const s = sec % 60;
-          return m > 0 ? `${m}m ${s}s` : `${s}s`;
+          return m > 0
+        ? plugin.localize('switch.roundSummary.durationMinutesSeconds', { mins: m, secs: s })
+        : plugin.localize('switch.roundSummary.durationSeconds', { secs: s });
         };
         // Merge both sub-queues and sort oldest-first for a unified view.
         const allEntries = [
@@ -816,7 +1025,7 @@ const SwitchOutput = {
           queueLines.push(`${entry._dir}: **${entry.playerName}** (${formatWait(entry.queuedAt)})`);
         }
         if (allEntries.length > 10) {
-          queueLines.push(`... and ${allEntries.length - 10} more`);
+          queueLines.push(plugin.localize('switch.switchDiag.andMore', { count: allEntries.length - 10 }));
         }
       }
 
@@ -846,26 +1055,26 @@ const SwitchOutput = {
       }
 
       const cooldownLines = [];
-      let playerList = '⚫ Nobody is blocked from switching';
+      let playerList = plugin.localize('switch.switchDiag.nobodyBlocked');
 
       if (!state) {
-        cooldownLines.push('Unavailable — database not ready');
-        playerList = '⚫ Unavailable';
+        cooldownLines.push(plugin.localize('switch.switchDiag.unavailableDbNotReady'));
+        playerList = plugin.localize('switch.switchDiag.unavailable');
       } else {
         // "Out of Tokens" replaces "Players Below Cap". Below-cap was never a
         // restriction: with maxSwitchTokens at 2, a player holding 1 can still
         // switch. Only an empty wallet actually blocks anyone.
-        cooldownLines.push(`Out of Tokens:         ${state.outOfTokens}`);
-        cooldownLines.push(`Scramble Locked:       ${state.scrambleLocked}`);
-        cooldownLines.push(`Holding <${maxTokens} tokens:    ${state.belowCap}`);
+        cooldownLines.push(plugin.localize('switch.switchDiag.outOfTokens', { count: state.outOfTokens }));
+        cooldownLines.push(plugin.localize('switch.switchDiag.scrambleLocked', { count: state.scrambleLocked }));
+        cooldownLines.push(plugin.localize('switch.switchDiag.holdingTokens', { max: maxTokens, count: state.belowCap }));
         // Qualified as "online" because the count only includes connected
         // players now — an offline row's presence clock accrues nothing, and
         // counting those was reporting 75 seeders on an empty server.
-        cooldownLines.push(`Seed Accruing (online): ${state.seedAccruing}${state.rosterReady ? '' : ' (roster unavailable)'}`);
+        cooldownLines.push(plugin.localize('switch.switchDiag.seedAccruing', { count: state.seedAccruing, rosterNote: state.rosterReady ? '' : plugin.localize('switch.switchDiag.rosterUnavailable') }));
         // Explicitly labelled as retention, not surveillance. "Tracked Players:
         // 378" read as though the plugin were watching 378 people; it is simply
         // how many rows are inside the pruning window.
-        cooldownLines.push(`Rows (${plugin.options.pruneInactivePlayerDays}d retention):  ${state.total}`);
+        cooldownLines.push(plugin.localize('switch.switchDiag.rowsRetention', { days: plugin.options.pruneInactivePlayerDays, count: state.total }));
 
         if (state.blocked.length > 0) {
           const shown = state.blocked.slice(0, 5);
@@ -875,12 +1084,12 @@ const SwitchOutput = {
             if (p.tokenBalance < 1) {
               const anchor = p.tokenRegenAnchor ? new Date(p.tokenRegenAnchor).getTime() : Date.now();
               const nextAt = Math.floor((anchor + cooldownDurationMs) / 1000);
-              parts.push(`🎫 0/${maxTokens}, next <t:${nextAt}:R>`);
+              parts.push(plugin.localize('switch.switchDiag.tokenNext', { max: maxTokens, nextAt }));
             }
             return `${p.online ? '🟢' : '⚫'} **${p.playerName || p.steamID || p.eosID}**: ${parts.join(' ')}`;
           }).join('\n');
           if (state.blocked.length > shown.length) {
-            playerList += `\n... and ${state.blocked.length - shown.length} more`;
+            playerList += '\n' + plugin.localize('switch.switchDiag.andMore', { count: state.blocked.length - shown.length });
           }
         }
       }
@@ -906,7 +1115,7 @@ const SwitchOutput = {
           {
             name: state && state.blocked.length > 0
               ? plugin.localize('switch.switchDiag.currentlyBlocked', { blockedCount: state.blocked.length })
-              : '\u{1F513} Currently Blocked',
+              : plugin.localize('switch.switchDiag.currentlyBlockedNone'),
             value: playerList,
             inline: false
           }

@@ -287,6 +287,123 @@ function sinkOf(node) {
   return null;
 }
 
+// ── pass 1b: the string that reaches its sink through a variable ──
+
+/**
+ * `enclosing()` only sees the construct that immediately consumes a
+ * localize() call, which misses every surface assembled a line at a time:
+ *
+ *     let cooldownMsg = plugin.localize('switch.labels.minutesRemaining', …);
+ *     …
+ *     statusMsg += `[X] Cooldown | ${cooldownMsg}\n`;
+ *     …
+ *     plugin.warn(eosID, statusMsg);
+ *
+ * Nothing is wrong with that code, but the direct pass reads it as "no
+ * evidence", so the key falls through to its surface's verdict. For the
+ * in-game `!switch check` card that verdict was `admins`, because the same
+ * five labels are also rendered by the admin Discord embed, and THAT call
+ * site is directly visible. The status card every player reads was therefore
+ * filed as staff text and left out of the player template.
+ *
+ * This resolves the chain: seed each variable with the sinks of the calls it
+ * is passed to, then propagate backwards across assignments until stable, so
+ * `cooldownMsg` inherits `statusMsg`'s sink. Consulted only when the direct
+ * pass found nothing, so it can add evidence but never overturn it.
+ */
+
+/** RHS ranges of every `x =` / `x +=` in a file, innermost last. */
+function assignmentRanges(src, masked) {
+  const out = [];
+  // No trailing \s* after the operator: mask() blanks string and template
+  // BODIES to spaces, so `let msg = `…`;` is an `=` followed by a long run of
+  // spaces. A greedy \s* eats the whole literal, start lands on the `;`, and
+  // every such assignment is recorded as an empty range and dropped.
+  const re = /(?:^|[;{}()\n])\s*(?:const\s+|let\s+|var\s+)?([A-Za-z_$][\w$]*)\s*(\+?=)(?![=>])/g;
+  let m;
+  while ((m = re.exec(masked)) !== null) {
+    const start = m.index + m[0].length;
+    let depth = 0;
+    let i = start;
+    for (; i < masked.length; i++) {
+      const c = masked[i];
+      if (c === '(' || c === '[' || c === '{') depth++;
+      else if (c === ')' || c === ']' || c === '}') { if (depth === 0) break; depth--; }
+      else if ((c === ';' || c === '\n') && depth === 0) break;
+    }
+    if (i > start) out.push({ lhs: m[1], start, end: i });
+    re.lastIndex = start;
+  }
+  return out;
+}
+
+const IDENT = /\b([A-Za-z_$][\w$]*)\b/g;
+
+/**
+ * Map of variable name → the sinks it can reach, for one file.
+ *
+ * Deliberately name-based and file-scoped: two functions in one file that
+ * reuse a name share a verdict. That over-includes rather than under-includes,
+ * which is the safe direction here — pass 2 still decides WHICH audience, and
+ * an extra string in a template costs a translator nothing.
+ */
+function variableSinks(src, masked) {
+  const sinks = new Map();
+  const add = (name, sink) => {
+    if (!sinks.has(name)) sinks.set(name, new Set());
+    sinks.get(name).add(sink);
+  };
+
+  // Seed: every identifier handed to a call that is itself a sink.
+  const call = /\b([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\(/g;
+  let m;
+  while ((m = call.exec(masked)) !== null) {
+    const sink = sinkOf({ kind: 'call', name: m[1].replace(/\s+/g, '') });
+    if (!sink) continue;
+    const open = m.index + m[0].length - 1;
+    let depth = 0;
+    let i = open;
+    for (; i < masked.length; i++) {
+      const c = masked[i];
+      if (c === '(') depth++;
+      else if (c === ')') { depth--; if (depth === 0) break; }
+    }
+    const args = src.slice(open + 1, i);
+    let id;
+    IDENT.lastIndex = 0;
+    while ((id = IDENT.exec(args)) !== null) add(id[1], sink);
+  }
+
+  // Propagate backwards over assignments until nothing new appears.
+  const asg = assignmentRanges(src, masked);
+  for (let pass = 0; pass < 8; pass++) {
+    let changed = false;
+    for (const a of asg) {
+      const have = sinks.get(a.lhs);
+      if (!have || !have.size) continue;
+      const rhs = src.slice(a.start, a.end);
+      let id;
+      IDENT.lastIndex = 0;
+      while ((id = IDENT.exec(rhs)) !== null) {
+        if (id[1] === a.lhs) continue;
+        const before = sinks.get(id[1])?.size ?? 0;
+        for (const s of have) add(id[1], s);
+        if ((sinks.get(id[1])?.size ?? 0) !== before) changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+  return { sinks, asg };
+}
+
+/** The sinks a localize() call at `at` reaches via the variable it feeds. */
+function indirectSinks({ sinks, asg }, at) {
+  const owner = asg.filter((a) => at >= a.start && at < a.end).pop();
+  if (!owner) return null;
+  const s = sinks.get(owner.lhs);
+  return s && s.size ? s : null;
+}
+
 // ── pass 2: can an ordinary player reach this line? ──────────────
 
 /** A block header that is only entered in an admin context. */
@@ -388,7 +505,17 @@ function guardAtTopLevel(text, masked, open, end, at) {
     if (c !== 'i' && c !== 'c') continue;      // cheap prefilter: if / chat
     // Braces come from masked, the guard itself from text: 'ChatAdmin' is a
     // string literal, and mask() blanks those.
-    if (ADMIN_GUARD.test(text.slice(i, i + 60))) tops.push(i);
+    //
+    // Clamped to this line. Both guard forms are single-line constructs, and a
+    // window that runs past the newline reads a guard out of a DEEPER block as
+    // though it sat here: `if (ident) {` with `if (!isAdmin) { … return; }` on
+    // the next line is 60 characters end to end, so the depth-1 `if (ident)`
+    // matched the depth-2 guard and marked its whole enclosing block
+    // admin-only. That is what filed the in-game `!switch check` status card —
+    // the else-branch any player reaches — as staff text.
+    const eol = text.indexOf('\n', i);
+    const window = text.slice(i, eol === -1 ? i + 60 : Math.min(eol, i + 60));
+    if (ADMIN_GUARD.test(window)) tops.push(i);
   }
   if (!tops.length) return false;
   if (!labels.length) return true;
@@ -508,17 +635,23 @@ export async function classifyKeys() {
     const masked = mask(src);
     const text = maskComments(src);
     const staff = sink => sink === 'discord' && STAFF_DISCORD.some((d) => rel.startsWith(d));
+    const flow = variableSinks(src, masked);
     const re = /\blocalize\(\s*'([^']+)'/g;
     let m;
     while ((m = re.exec(src)) !== null) {
-      const sink = sinkOf(enclosing(masked, src, m.index));
-      // A log sink is a defect, not a tier — logSinkCallSites() reports it and
-      // the test suite fails on it. Here it simply contributes no evidence,
-      // which leaves the key to its surface or to the player default.
-      if (!sink || sink === 'log') continue;
-      const tier = staff(sink) || adminOnly(rel, src, text, masked, m.index) ? 'admins' : 'players';
-      if (!direct.has(m[1])) direct.set(m[1], new Set());
-      direct.get(m[1]).add(tier);
+      const directSink = sinkOf(enclosing(masked, src, m.index));
+      // Only reach for the variable chain when nothing consumes the call
+      // directly, so pass 1b adds evidence but never overturns it.
+      const found = directSink ? [directSink] : [...(indirectSinks(flow, m.index) ?? [])];
+      for (const sink of found) {
+        // A log sink is a defect, not a tier — logSinkCallSites() reports it
+        // and the test suite fails on it. Here it simply contributes no
+        // evidence, which leaves the key to its surface or the player default.
+        if (!sink || sink === 'log') continue;
+        const tier = staff(sink) || adminOnly(rel, src, text, masked, m.index) ? 'admins' : 'players';
+        if (!direct.has(m[1])) direct.set(m[1], new Set());
+        direct.get(m[1]).add(tier);
+      }
     }
   }
 
@@ -580,7 +713,10 @@ function render(node, indent = 2) {
       lines.push(render(v, indent + 2));
       lines.push(`${pad}},`);
     } else {
-      lines.push(`${pad}// EN: ${v.__en.replace(/\n/g, '\\n')}`);
+      // trimEnd: a catalogue string may legitimately end in a space (it gets
+      // concatenated with the next fragment at runtime), but carrying that
+      // into a comment only produces trailing whitespace in generated files.
+      lines.push(`${pad}// EN: ${v.__en.replace(/\n/g, '\\n')}`.trimEnd());
       lines.push(`${pad}${safeKey}: '',`);
     }
   }

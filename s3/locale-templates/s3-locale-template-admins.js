@@ -1,6 +1,6 @@
 /**
  * ─────────────────────────────────────────────────────────────────
- *  ADMIN-FACING TRANSLATION TEMPLATE — 901 strings
+ *  ADMIN-FACING TRANSLATION TEMPLATE — 1158 strings
  * ─────────────────────────────────────────────────────────────────
  *
  *  GENERATED FILE — do not edit in place.
@@ -39,7 +39,7 @@
  *
  *  Strings only your staff can reach: replies to admin-gated commands, the
  *  scramble and diagnostic reports in your staff channel, and the admin half
- *  of !elo. 901 strings — the bulk of what an admin reads day to day,
+ *  of !elo. 1158 strings — the bulk of what an admin reads day to day,
  *  but read by a handful of people who opted into running the thing, so a
  *  missed one costs far less than a missed broadcast.
  *
@@ -77,6 +77,10 @@ export const MESSAGES = {
     },
   },
   slackersSquadServices: {
+    labels: {
+      // EN: N/A
+      notAvailable: '',
+    },
     drift: {
       // EN: ⚠️ Schema Drift Detected
       embedTitle: '',
@@ -112,10 +116,108 @@ export const MESSAGES = {
       teamNames: '',
       // EN: Teams Resolved: 🟢 Yes
       teamsResolvedYes: '',
+      // EN: Teams Resolved: 🟡 No
+      teamsResolvedNo: '',
+      // EN: Mode: **{mode}**
+      mode: '',
+      // EN: MatchId: `{matchId}`
+      matchId: '',
+      // EN: Round Start: {roundStart}
+      roundStart: '',
+      // EN: Global Lock: {state}
+      globalLock: '',
+      // EN: 🔒 {owner}
+      globalLockOwner: '',
+      // EN: 🟢 None
+      globalLockNone: '',
     },
     services: {
       // EN: 🔧 S³ Service Status
       sServiceStatus: '',
+      // EN: ⚪ **{service}** — not mounted
+      notMounted: '',
+      // EN: {emoji} **ServerConfig** — {state}
+      serverConfig: '',
+      // EN: loaded
+      serverConfigLoaded: '',
+      // EN: mounted, no config found
+      serverConfigNoConfig: '',
+      // EN:    Path: `{path}`
+      path: '',
+      // EN:    MaxPlayers: {maxPlayers} | AllowTeamChanges: {allowTeamChanges}
+      maxPlayersLine: '',
+      // EN: 🟢 **DB** — {connector}
+      db: '',
+      // EN: ⚫ No connector
+      noConnector: '',
+      // EN: 🟢 {connector} — No schema drift
+      noSchemaDrift: '',
+      // EN: 🔴 {connector} — Cannot verify schema
+      cannotVerifySchema: '',
+      // EN: 🟠 {connector} — Schema drift: {parts}
+      schemaDrift: '',
+      // EN: {count} table(s) missing columns
+      driftMissingColumns: '',
+      // EN: {count} table(s) with extra columns
+      driftExtraColumns: '',
+      // EN:    Migrations: {state}
+      migrations: '',
+      // EN: 🟠 Pending
+      migrationsPending: '',
+      // EN: 🟢 All current
+      migrationsAllCurrent: '',
+      // EN:    Schema versions registered: {count}
+      schemaVersions: '',
+      // EN: {emoji} **GameState** — Phase: {phase}{resolving}
+      gameState: '',
+      // EN:  (resolving)
+      resolvingSuffix: '',
+      // EN:    MatchId: `{matchId}` | RoundStart: {roundStart}
+      matchIdRoundStart: '',
+      // EN:    Mode: {mode} | Layer: {layer}
+      modeLayer: '',
+      // EN: {emoji} **Factions** — {state}
+      factions: '',
+      // EN: Both teams resolved
+      factionsBothResolved: '',
+      // EN: Resolving...
+      factionsResolving: '',
+      // EN:    {team1} vs {team2}
+      teamsVs: '',
+      // EN:    Polling: {state}
+      polling: '',
+      // EN: 🟢 Running
+      pollingRunning: '',
+      // EN: ⚫ Stopped
+      pollingStopped: '',
+      // EN: 🟢 **Clans** — {count} group(s) found (min {min}, max {max})
+      clans: '',
+      // EN: ⚫ **Clans** — disabled in config
+      clansDisabled: '',
+      // EN: {emoji} **Players** — {count} tracked
+      players: '',
+      // EN:    Initial Sync: {sync} | Teams: {teams}
+      initialSyncTeams: '',
+      // EN: 🟢 Complete
+      syncComplete: '',
+      // EN: 🟡 Pending
+      syncPending: '',
+      // EN: 🟢 Resolved
+      teamsResolvedState: '',
+      // EN: 🟡 Resolving
+      teamsResolvingState: '',
+      // EN:    Projection: {state}
+      projection: '',
+      // EN: 🟡 Active
+      projectionActive: '',
+      // EN: ⚫ None
+      projectionNone: '',
+      // EN:    Global Lock: {state}
+      globalLock: '',
+      // EN: 🔒 {owner}
+      globalLockOwner: '',
+      // EN: 🟢 None
+      globalLockNone: '',
     },
     gameState: {
       // EN: 🔴 GameState Service Not Available
@@ -138,6 +240,16 @@ export const MESSAGES = {
       resolving: '',
       // EN: Gamemode
       gamemode: '',
+      // EN: 🟡 Yes
+      yes: '',
+      // EN: ⚫ No
+      no: '',
+      // EN: ⚫ None
+      none: '',
+      // EN: Phase
+      phase: '',
+      // EN: Layer
+      layer: '',
     },
     factions: {
       // EN: 🔴 Factions Service Not Available
@@ -152,6 +264,18 @@ export const MESSAGES = {
       resolution: '',
       // EN: Polling
       polling: '',
+      // EN: Both teams resolved
+      bothTeamsResolved: '',
+      // EN: Resolving...
+      resolvingEllipsis: '',
+      // EN: Active
+      active: '',
+      // EN: Stopped
+      stopped: '',
+      // EN: 🟡 Polling gated (resolving flag active)
+      pollingGated: '',
+      // EN: 🟢 Free to poll
+      freeToPoll: '',
     },
     playersEmbeds: {
       // EN: 🔴 Players Service Not Available
@@ -176,21 +300,21 @@ export const MESSAGES = {
       locks: '',
       // EN: ⚠️ Squad Data Pending
       squadDataPending: '',
-      // EN: S³ has not snapshotted `server.squads` yet — it only does so on a tick 
+      // EN: S³ has not snapshotted `server.squads` yet — it only does so on a tick
       sHasNotSnapshotted: '',
       // EN: where every player has a resolved teamID. Rosters below are flat until then.
       whereEveryPlayerHas: '',
       // EN: ⚠️ Team Unresolved ({awaitingCount})
       teamUnresolved: '',
-      // EN: S³ has no teamID for these players yet — initial sync or the 
+      // EN: S³ has no teamID for these players yet — initial sync or the
       sHasNoTeamid: '',
       // EN: post-`NEW_GAME` null window. Not a game state; it should clear on its own.
       postNewGameNull: '',
       // EN: 🩹 Stuck Client ({stuckCount})
       stuckClient: '',
-      // EN: These players have reported no teamID for far longer than a round 
+      // EN: These players have reported no teamID for far longer than a round
       thesePlayersHaveReported: '',
-      // EN: transition takes, so S³ has stopped counting them towards team resolution — 
+      // EN: transition takes, so S³ has stopped counting them towards team resolution —
       transitionTakesSoS: '',
       // EN: the rest of the lobby is unaffected. This clears when they reconnect.
       theRestOfThe: '',
@@ -208,6 +332,24 @@ export const MESSAGES = {
       projection: '',
       // EN: Global: 🔒 **{globalOwner}**
       global: '',
+      // EN: {count} not in a squad
+      notInASquad: '',
+      // EN: 🟢 Yes
+      yes: '',
+      // EN: 🟡 No
+      no: '',
+      // EN: 🟡 Pending
+      pending: '',
+      // EN: ⚫ None
+      none: '',
+      // EN: Global: 🟢 None
+      globalNone: '',
+      // EN: ⚖️ Even
+      even: '',
+      // EN: {team} +{count}
+      delta: '',
+      // EN: Per-player: {count} active
+      perPlayer: '',
     },
     team: {
       // EN: *No players on this team.*
@@ -220,6 +362,16 @@ export const MESSAGES = {
       roster: '',
       // EN: Truncated
       truncated: '',
+      // EN: Team 1
+      team1: '',
+      // EN: Team 2
+      team2: '',
+      // EN: Team {teamID}
+      teamN: '',
+      // EN: Roster ({count}) — squad data pending
+      rosterSquadDataPending: '',
+      // EN: Unassigned ({count})
+      unassignedCount: '',
     },
     clansEmbeds: {
       // EN: 🔴 Clans Service Not Available
@@ -252,7 +404,7 @@ export const MESSAGES = {
       noneSurvivedTheGrouping: '',
       // EN: 🛡️ Clan Groups
       clanGroups: '',
-      // EN: Pipeline order: extract → strip recruit suffix → normalize → 
+      // EN: Pipeline order: extract → strip recruit suffix → normalize →
       pipelineOrderExtractStrip: '',
       // EN: corroboration gate → ignoreList → Damerau-Levenshtein merge → size bounds.\n
       corroborationGateIgnorelistDamerau: '',
@@ -286,6 +438,8 @@ export const MESSAGES = {
       expires: '',
       // EN: Per-Player Locks ({activeLocksCount})
       perPlayerLocksActivelockscount: '',
+      // EN: **{name}**: {source} (exp {expiresAt})
+      playerLockLine: '',
       // EN: Per-Player Locks
       perPlayerLocks: '',
       // EN: 🟢 None active
@@ -294,6 +448,8 @@ export const MESSAGES = {
       lockPriorityOrder: '',
       // EN: 🔒 Lock State
       lockState: '',
+      // EN: 🟢 None
+      none: '',
     },
     config: {
       // EN: 🔴 ServerConfig Service Not Available
@@ -304,6 +460,10 @@ export const MESSAGES = {
       serverConfiguration: '',
       // EN: Loaded
       loaded: '',
+      // EN: 🟢 Yes
+      yes: '',
+      // EN: 🟡 No (mounted but parsing may have failed)
+      noMountedButParsing: '',
     },
     switches: {
       // EN: ❌ Invalid Range
@@ -354,6 +514,12 @@ export const MESSAGES = {
       switchKarma: '',
       // EN: By Source
       bySource: '',
+      // EN: in **{games}** games — **{pct}%** of rounds
+      gamesRate: '',
+      // EN: Games Played: **{games}**
+      gamesPlayed: '',
+      // EN: {label}: {wins}/{decided} decided ({total} total)
+      bySourceLine: '',
       // EN: No `TB_RoundReport` rows exist anywhere in the requested date range, even though TeamBalancer is installed.
       noTbRoundreportRows: '',
       // EN: This almost always means TeamBalancer's own `enableDatabaseLogging` was off for the whole window, not that no rounds were played — check the TeamBalancer config before trusting karma numbers from this range.
@@ -368,6 +534,16 @@ export const MESSAGES = {
       periods: '',
       // EN: Format
       format: '',
+      // EN: Rows
+      rows: '',
+      // EN: Unknown period "{period}". Use "daily", "weekly", or "monthly".
+      unknownPeriod: '',
+      // EN: The S³ database service is not mounted, or the `S3_PlayerEvents` table does not exist yet.
+      dbNotReady: '',
+      // EN: No `S3_PlayerEvents` rows exist anywhere in the requested date range — check `enableDatabaseLogging` before trusting this export.
+      noEventRows: '',
+      // EN: The S³ database service is not mounted.
+      dbNotMounted: '',
     },
     runDiagnostic: {
       // EN: DB schema drift
@@ -435,6 +611,16 @@ export const MESSAGES = {
       // EN: {count} check(s) with non-green status. Review the results above.
       nonGreenSummary: '',
     },
+    args: {
+      // EN: ❌ Unrecognised Argument
+      unrecognisedArgument: '',
+      // EN: Did not understand {args}, so nothing was run.\n\n{accepts}\n\nFlags must be typed exactly. Copying a usage line brings its `[ ]` or `< >` along, and a wrapped flag is not that flag.
+      nothingWasRun: '',
+      // EN: This subcommand accepts: {known}
+      acceptsFlags: '',
+      // EN: This subcommand takes no flags.
+      acceptsNoFlags: '',
+    },
     migrate: {
       // EN: ✅ No Pending Migrations
       noPendingMigrations: '',
@@ -476,9 +662,53 @@ export const MESSAGES = {
       usageS3MigratePending: '',
       // EN: Token: `{token}`
       tokenLine: '',
+      // EN: 📋 Schema Status — Pending Migrations
+      schemaStatusPendingMigrations: '',
+      // EN: 🟠 v{current} → v{expected} ({behind} behind)
+      pluginVersionBehind: '',
+      // EN: 🟢 v{current} (current)
+      pluginVersionCurrent: '',
+      // EN: **{pluginName}**: {status}
+      pluginVersionLine: '',
+      // EN: No plugins have registered schema versions.
+      noPluginsRegistered: '',
+      // EN:     ↳ Creates table: `{table}`
+      createsTable: '',
+      // EN:     ↳ Columns: {columns}
+      columnsList: '',
+      // EN:     ↳ Columns (`{table}`): {columns}
+      columnsForTable: '',
+      // EN: **❌ Errors**
+      errorsHeading: '',
+      // EN: **🗑️ Missing Columns**
+      missingColumnsHeading: '',
+      // EN: **🧩 Missing Rows**
+      missingRowsHeading: '',
+      // EN: **🕳️ Unpopulated Data**
+      unpopulatedDataHeading: '',
+      // EN: **📦 Extra Columns**
+      extraColumnsHeading: '',
+      // EN: {offenders} row(s) with empty `{column}`
+      rowsWithEmpty: '',
+      // EN: **📦 Deprecated Tables ({count})**
+      deprecatedTablesHeading: '',
+      // EN: **📦 Deprecated Columns ({count})**
+      deprecatedColumnsHeading: '',
+      // EN: Type `!s3 migrate purge-deprecated --confirm` to permanently delete {count} deprecated object(s).
+      typeToPurge: '',
+      // EN: Table `{table}`: {error}
+      errorTable: '',
+      // EN: Column `{table}`.`{column}`: {error}
+      errorColumn: '',
+      // EN: Dropped {count} deprecated table(s).
+      droppedTables: '',
+      // EN: Dropped {count} deprecated column(s).
+      droppedColumns: '',
+      // EN: **⚠️ Errors ({count})**
+      errorsCountHeading: '',
     },
     confirm: {
-      // EN: Usage: `!s3 confirm <token>` — token shown in the startup migration prompt. 
+      // EN: Usage: `!s3 confirm <token>` — token shown in the startup migration prompt.
       usageS3ConfirmToken: '',
       // EN: Check `!s3 migrate status` to see if migrations are pending.
       checkS3MigrateStatus: '',
@@ -488,7 +718,7 @@ export const MESSAGES = {
       theDatabaseServiceOr: '',
       // EN: ❌ Invalid or Expired Token
       invalidOrExpiredToken: '',
-      // EN: The token did not match the latest migration prompt, or the 5-minute window expired. 
+      // EN: The token did not match the latest migration prompt, or the 5-minute window expired.
       theTokenDidNot: '',
       // EN: Check `!s3 migrate status` for pending migrations and use `!s3 migrate force` to bypass the confirmation flow.
       checkS3MigrateStatus2: '',
@@ -524,7 +754,7 @@ export const MESSAGES = {
       thisWillRestoreThe: '',
       // EN: JSON (connector-agnostic)
       jsonConnectorAgnostic: '',
-      // EN: To proceed, use:\n`!s3 backup restore --confirm 
+      // EN: To proceed, use:\n`!s3 backup restore --confirm
       toProceedUseS3: '',
       // EN: ⏳ Restoring Database…
       restoringDatabase: '',
@@ -564,6 +794,8 @@ export const MESSAGES = {
       format: '',
       // EN: Instructions
       instructions: '',
+      // EN: SQLite file copy
+      sqliteFileCopy: '',
     },
     db: {
       // EN: 💾 Database Commands
@@ -576,12 +808,18 @@ export const MESSAGES = {
       dbStatus: '',
       // EN: Schema Versions
       schemaVersions: '',
+      // EN: No plugins have registered schema versions.
+      noRegisteredSchemaVersions: '',
+      // EN: {okCount} table(s) exported successfully.
+      exportTruncatedSummary: '',
       // EN: 🟢 {expectedCount} registered
       registered: '',
       // EN: Migrations Engine
       migrationsEngine: '',
       // EN: 🟢 Available
       available: '',
+      // EN: ⚪ N/A
+      notAvailable: '',
       // EN: Per-Plugin Versions
       perPluginVersions: '',
       // EN: ❌ DB Service Not Ready
@@ -666,6 +904,18 @@ export const MESSAGES = {
       confirmDryRunRe: '',
       // EN: Rows are upserted by primary key. No existing rows are deleted.
       rowsAreUpsertedBy: '',
+      // EN: ✅ Import Complete
+      importComplete: '',
+      // EN: Import data is not a valid JSON object.
+      importNotJsonObject: '',
+      // EN: Unsupported export format version: {version}. Expected 1.
+      importUnsupportedVersion: '',
+      // EN: Import data has no "tables" object.
+      importNoTablesObject: '',
+      // EN: Table "{table}" is not a known model — will be skipped during import.
+      importUnknownTableSkipped: '',
+      // EN: Table "{table}" is not a known model — skipped.
+      importUnknownTableSkippedStream: '',
     },
     onDiscordMessage: {
       // EN: ⚠️ Error: !s3 {sub}
@@ -804,12 +1054,84 @@ export const MESSAGES = {
       sMigrationCancelled: '',
       // EN: ⏰ S³ Migration Auto-Cancelled
       sMigrationAutoCancelled: '',
+      // EN: (new)
+      versionNew: '',
+      // EN:   {pluginName}: {fromVer} → v{toVer} ({behind} pending)
+      lineWithPending: '',
+      // EN:   {pluginName}: {fromVer} → v{toVer}
+      line: '',
+      // EN: Type `!s3 confirm <token>` to run migrations.
+      typeConfirmToRun: '',
+      // EN: Type `!s3 migrate force` to bypass confirmation.
+      typeForceToBypass: '',
+      // EN: Auto-cancels after 5 minutes if no response.
+      autoCancelsAfterMinutes: '',
+      // EN: > **Note:** If cancelled, migrations remain pending.
+      noteIfCancelledPending: '',
+      // EN: > Use `!s3 migrate force` to run them later.
+      noteUseForceLater: '',
+      // EN: Applied: **{totalApplied}** | Skipped: **{totalSkipped}**
+      appliedSkipped: '',
+      // EN: Unknown error
+      unknownError: '',
+      // EN: **Error:** {errorMsg}
+      errorLine: '',
+      // EN: Migrations have been deferred. The pending state will persist until the next restart or `!s3 migrate force`.
+      deferredUntilRestart: '',
     },
     watch: {
       // EN: ⏰ Watch Expired
       watchExpired: '',
       // EN: Watch for `{services}` automatically stopped after {duration}.
       watchForServicesAutomatically: '',
+      // EN: 🔬 Watch Started
+      watchStarted: '',
+      // EN: Relaying verbose logs for `{target}` to this channel for {duration}. Use `!s3 unwatch` to stop early.
+      relayingVerboseLogs: '',
+      // EN: 🛑 Watch Stopped
+      watchStopped: '',
+      // EN: Stopped {count} active watch(es): {list}
+      stoppedActiveWatches: '',
+      // EN: No active watches to stop.
+      noActiveWatches: '',
+    },
+    reports: {
+      // EN: ⚪ Not enough decided self/untracked switches yet to judge ({decided} so far, need {minSample}+).
+      karmaNotEnough: '',
+      // EN: 🟠 Strongly favors the winning team — landed on the winner **{pct}%** of the time after a self/untracked switch.
+      karmaStrongWinner: '',
+      // EN: 🟡 Leans toward the winning team (**{pct}%**).
+      karmaLeansWinner: '',
+      // EN: ⚪ Neutral — no clear pattern (**{pct}%**).
+      karmaNeutral: '',
+      // EN: 🟢 Leans toward the losing team (**{pct}%**).
+      karmaLeansLoser: '',
+      // EN: 🟢🟢 Strongly favors the losing team (**{pct}%**).
+      karmaStrongLoser: '',
+      // EN: *(capped at 180 days)*
+      rangeCapped: '',
+      // EN: *Excludes {modes} rounds.*
+      excludesModes: '',
+      // EN: ⚠️ *No TeamBalancer round data logged in this range — games-played counts below may read 0 even for active players. Check TeamBalancer's `enableDatabaseLogging`.*
+      noRoundDataNote: '',
+      // EN: Full = Full Scramble (legacy = pre-split Balancer moves, before Full/Micro were tracked separately — still full scrambles) · Micro = Elo-Diff Scramble · Self = player-initiated switch (self-serve, queued, handshake, or double-swap) · Other = SmartAssign, admin-forced, or untracked in-game switches
+      leaderboardLegend: '',
+      // EN: *(none)*
+      none: '',
+      // EN: Invalid range "{arg}" — must be a positive number of days/weeks.
+      rangeInvalidNumber: '',
+      // EN: Invalid date range "{arg}".
+      rangeInvalidDates: '',
+      // EN: Could not parse range "{arg}". Use "30d", "2w", or "YYYY-MM-DD..YYYY-MM-DD".
+      rangeUnparseable: '',
+      // EN: **{rank}.** {name} — {total} switches ({games} games) · {fullStr} · Micro: {micro} · Self: {self}{otherStr}
+      leaderboardRow: '',
+      // EN: Full: {full}
+      leaderboardFull: '',
+      // EN: Full: {full} ({legacy} legacy)
+      leaderboardFullWithLegacy: '',
+      // EN:  · Other: {other}
+      leaderboardOther: '',
     },
   },
   switch: {
@@ -836,8 +1158,6 @@ export const MESSAGES = {
       multiplePlayersFoundPlease: '',
       // EN: Status: {player} | Locked: {locked} | {cooldownMsg}
       statusLocked: '',
-      // EN: [Switch] Unable to check eligibility.
-      switchUnableCheckEligibility: '',
       // EN: Player not found or multiple matches.
       playerNotFoundMultiple: '',
       // EN: Cleared restrictions for {player} (seed tokens kept).
@@ -848,7 +1168,7 @@ export const MESSAGES = {
       restrictionsClearedToppedUp: '',
       // EN: Clear all failed: {message}
       clearAllFailed: '',
-      // EN: Wipe DELETES every cooldown row, including earned seed tokens. This cannot be undone. 
+      // EN: Wipe DELETES every cooldown row, including earned seed tokens. This cannot be undone.
       wipeDeletesEveryCooldown: '',
       // EN: Type !switch wipe confirm to proceed, or !switch clearall to lift restrictions without deleting anything.
       typeSwitchWipeConfirm: '',
@@ -914,8 +1234,6 @@ export const MESSAGES = {
       failedGenerateExplainOutput: '',
     },
     labels: {
-      // EN:  (requires {seedMinPlayers}+ players online)
-      seedRequiresPlayers: '',
       // EN: Tokens: 0/{maxSwitchTokens}, next in {remaining}m
       tokensEmptyNextIn: '',
       // EN: Tokens: {tokenBalance}/{maxSwitchTokens}
@@ -926,16 +1244,6 @@ export const MESSAGES = {
       yes: '',
       // EN: No
       no: '',
-      // EN: Clear
-      clear: '',
-      // EN: 0/{maxSwitchTokens} tokens, next in {remaining}m
-      tokensEmptyNextInShort: '',
-      // EN: {remaining}m remaining
-      minutesRemaining: '',
-      // EN: {tokenBalance}/{maxSwitchTokens} tokens
-      tokensBalanceShort: '',
-      // EN: Not active
-      notActive: '',
       // EN: {tokensBefore} → {tokensAfter} tokens{lockNote}
       clearDetail: '',
       // EN: , scramble lock lifted
@@ -958,6 +1266,10 @@ export const MESSAGES = {
       queueReasonTeamsFull: '',
       // EN: none
       none: '',
+      // EN: Liberal (Seed/Jensen)
+      modeLiberal: '',
+      // EN: Standard
+      modeStandard: '',
     },
     explain: {
       // EN: All population levels
@@ -1018,6 +1330,10 @@ export const MESSAGES = {
       refillTimePerToken: '',
       // EN: Tokens refill one at a time, independently. With **{maxTokens}** tokens saved, you can switch {value} before waiting for a refill. This gives you flexibility without allowing unlimited switching.
       tokensRefillOneTime: '',
+      // EN: up to {maxTokens} times
+      upToNTimes: '',
+      // EN: once
+      onceOnly: '',
       // EN:  (only while **{seedBonusMinPlayers}+** players are online)
       onlyWhilePlayersOnline: '',
       // EN: During seed rounds, you earn **+1** bonus token for every **{seedBonusMinutes}** minutes you are present{minNote}.
@@ -1176,6 +1492,10 @@ export const MESSAGES = {
       bestPractices: '',
       // EN: about {avgSec} seconds
       aboutSeconds: '',
+      // EN: {secs} seconds
+      durationSeconds: '',
+      // EN: N/A
+      statNotAvailable: '',
       // EN: **{value}%** of attempted switches succeed.
       attemptedSwitchesSucceed: '',
       // EN: **{value}%** of attempted switches succeed, most requests go through.
@@ -1233,13 +1553,21 @@ export const MESSAGES = {
       // EN: {liberalModes} Rounds
       modeRounds: '',
     },
+    backfill: {
+      // EN: ❌ No reporting channel configured — there is nothing to read.
+      noReportingChannel: '',
+      // EN: 🔍 Reading round summaries from the last {days} days...
+      starting: '',
+      // EN: ❌ Backfill failed: {message}
+      failed: '',
+      // EN: No round summaries found in the last {days} days.
+      nothingFound: '',
+      // EN: ✅ Backfill complete — {scanned} summaries read, {inserted} rounds added, {skipped} already stored.
+      done: '',
+    },
     handleStatsCommand: {
-      // EN: 🔍 Scraping switch stats from the last {STATS_LOOKBACK_DAYS} days...
-      scrapingSwitchStatsFrom: '',
-      // EN: ❌ Reporting channel is not available.
-      reportingChannelIsNot: '',
-      // EN: ❌ Scrape failed: {message}
-      scrapeFailedMessage: '',
+      // EN: ❌ Round stats are not available — the database is still starting up.
+      statsDbUnavailable: '',
       // EN: 📊 Summary
       summary: '',
       // EN: 🔄 Movement Types (all {success} successes)
@@ -1252,7 +1580,7 @@ export const MESSAGES = {
       dataQuality: '',
       // EN: No Data
       noData: '',
-      // EN: No switch round summaries found in the lookback period.
+      // EN: No rounds recorded in this period. Rounds are stored as they end — if the plugin was updated recently, use `!switch backfill` to recover older ones from the round summaries already in the reporting channel.
       noSwitchRoundSummaries: '',
       // EN: Switch Global Stats
       switchGlobalStats: '',
@@ -1260,6 +1588,70 @@ export const MESSAGES = {
       statsLookbackDaysDay: '',
       // EN: Switch v{version}
       switchVVersion: '',
+      // EN: **Rounds:** {count}
+      roundsRecorded: '',
+      // EN: **Requests/round:** {value}
+      requestsPerRound: '',
+      // EN: **Total requests:** {count}
+      totalRequests: '',
+      // EN:   ✅ Succeeded    {count}  ({pct}% of total)
+      succeededLine: '',
+      // EN:   ⛔ Denied         {count}  ({pct}% of total)
+      deniedLine: '',
+      // EN:   ❌ Failed           {count}  ({pct}% of total)
+      failedLine: '',
+      // EN: **Success rate (excl. denials):** {rate}%  ({success}/{attempted})
+      successRateLine: '',
+      // EN: **Direction:**
+      direction: '',
+      // EN: **Max queue size reached:** {size}
+      maxQueueSizeReached: '',
+      // EN: **Queue wait:** mean {mean}{medianPart}
+      queueWait: '',
+      // EN: , median {median}
+      medianPart: '',
+      // EN: Instant            {count}{pct}
+      moveInstant: '',
+      // EN: Queue Solo         {count}{pct}
+      moveQueueSolo: '',
+      // EN: Queue Pair Trade   {count}{pct}
+      moveQueuePairTrade: '',
+      // EN: Join Swap          {count}{pct}
+      moveJoinSwap: '',
+      // EN: Timeout Switch     {count}{pct}
+      moveTimeoutSwitch: '',
+      // EN: Cooldown           {count}{pct}
+      denialCooldown: '',
+      // EN: Time Window        {count}{pct}
+      denialTimeWindow: '',
+      // EN: Scramble Lock     {count}{pct}
+      denialScrambleLock: '',
+      // EN: Recent Switch     {count}{pct}
+      denialRecentSwitch: '',
+      // EN: Other                 {count}{pct}
+      denialOther: '',
+      // EN: Succeeded          {count}{pct}
+      outcomeSucceeded: '',
+      // EN: Disconnected      {count}{pct}
+      outcomeDisconnected: '',
+      // EN: Cancelled          {count}{pct}
+      outcomeCancelled: '',
+      // EN: Expired              {count}{pct}
+      outcomeExpired: '',
+      // EN: Removed            {count}{pct}
+      outcomeRemoved: '',
+      // EN: † Expired entries are from rounds where\n  queueTimeoutSwitchEnabled was off.
+      expiredFootnote: '',
+      // EN: {count} liberal-mode rounds excluded
+      liberalRoundsExcluded: '',
+      // EN: {count} rounds had incomplete data (pre-v2.2.0 format)
+      incompleteRounds: '',
+      // EN: {count} rounds lack median data (pre-median embed format)
+      missingMedian: '',
+      // EN: {count} rounds recovered from history — durations rounded to the second
+      backfilledRounds: '',
+      // EN: Capped at the most recent {count} rounds — narrow the day range for the full picture
+      roundsTruncated: '',
     },
     onDiscordMessage: {
       // EN: 🔍 Player Status
@@ -1280,8 +1672,10 @@ export const MESSAGES = {
       deleteEveryCooldownRow: '',
       // EN: Admin: Toggle join/match time limit for queue entry.
       adminToggleJoinMatch: '',
-      // EN: Scrape the last N days of round summaries (default 60).
-      scrapeTheLastN: '',
+      // EN: Aggregate the last N days of recorded rounds (default 60).
+      aggregateTheLastN: '',
+      // EN: One-shot: recover rounds from older summaries in the reporting channel (default 90 days).
+      recoverRoundsFromHistory: '',
       // EN: Generate a detailed explanation of how team switching works.
       generateADetailedExplanation: '',
       // EN: Show this help message.
@@ -1300,6 +1694,154 @@ export const MESSAGES = {
       tokenLockSummary: '',
       // EN: 🔒 Currently Blocked ({blockedCount})
       currentlyBlocked: '',
+      // EN: **Switching:** Closed
+      switchingClosed: '',
+      // EN: **Switching:** Open (~{remaining}m remaining)
+      switchingOpen: '',
+      // EN: **Switching:** Limit enabled (not yet started)
+      switchingLimitNotStarted: '',
+      // EN: **Switching:** No time limit
+      switchingNoTimeLimit: '',
+      // EN: **Mode:** {mode}
+      mode: '',
+      // EN: **Scramble Lockdown:** {minutes} min per player
+      scrambleLockdown: '',
+      // EN: **Switch Tokens:** {max}
+      switchTokens: '',
+      // EN: {minutes} min
+      cooldownMinutes: '',
+      // EN: {hours}h
+      cooldownHours: '',
+      // EN: **Token Refill:** {label} per token
+      tokenRefill: '',
+      // EN: **AllowTeamChanges:** {state}
+      allowTeamChanges: '',
+      // EN: On
+      on: '',
+      // EN: Off
+      off: '',
+      // EN: **Queue Timeout:** {minutes}m
+      queueTimeout: '',
+      // EN: ⚫ Empty
+      queueEmpty: '',
+      // EN: ... and {count} more
+      andMore: '',
+      // EN: ⚫ Nobody is blocked from switching
+      nobodyBlocked: '',
+      // EN: Unavailable — database not ready
+      unavailableDbNotReady: '',
+      // EN: ⚫ Unavailable
+      unavailable: '',
+      // EN: Out of Tokens:         {count}
+      outOfTokens: '',
+      // EN: Scramble Locked:       {count}
+      scrambleLocked: '',
+      // EN: Holding <{max} tokens:    {count}
+      holdingTokens: '',
+      // EN: Seed Accruing (online): {count}{rosterNote}
+      seedAccruing: '',
+      // EN:  (roster unavailable)
+      rosterUnavailable: '',
+      // EN: Rows ({days}d retention):  {count}
+      rowsRetention: '',
+      // EN: 🎫 0/{max}, next <t:{nextAt}:R>
+      tokenNext: '',
+      // EN: Unknown
+      healthUnknown: '',
+      // EN: N/A
+      healthNotApplicable: '',
+      // EN: Not available
+      healthNotAvailable: '',
+      // EN: Connected
+      healthConnected: '',
+      // EN: S³ DB not available
+      healthS3DbNotAvailable: '',
+      // EN: Ready
+      healthReady: '',
+      // EN: Partial
+      healthPartial: '',
+      // EN: Error: {message}
+      healthError: '',
+      // EN: {ms}ms
+      healthLatency: '',
+      // EN: {emoji} Database        {label}
+      healthDatabase: '',
+      // EN: {emoji} RCON            {label}
+      healthRcon: '',
+      // EN: {emoji} S³ Integration   {label}
+      healthS3Integration: '',
+      // EN: 🔓 Currently Blocked
+      currentlyBlockedNone: '',
+    },
+    roundSummary: {
+      // EN: ⚠️ Notice
+      notice: '',
+      // EN: SquadJS was restarted during this round — switch data may be incomplete.
+      restartedNotice: '',
+      // EN: {count} other
+      otherDenials: '',
+      // EN: **Mode:** {mode}
+      mode: '',
+      // EN: **Requests:** {total} ({succeeded} succeeded, {denied} denied, {failed} failed)
+      requests: '',
+      // EN: **Success Rate:** {rate}%
+      successRate: '',
+      // EN: **Denied:** {count} player ({breakdown})
+      deniedPlayers: '',
+      // EN: **Denied:** {count} players ({breakdown})
+      deniedPlayersPlural: '',
+      // EN: **Denial Rate:** {rate}%
+      denialRate: '',
+      // EN: **Fail Rate:** {rate}% ({expired} expired)
+      failRate: '',
+      // EN: **Max Queue Size:** {size}
+      maxQueueSize: '',
+      // EN: **Queue Wait:** mean {mean}, median {median}
+      queueWait: '',
+      // EN: {mins}m {secs}s
+      durationMinutesSeconds: '',
+      // EN: {secs}s
+      durationSeconds: '',
+      // EN: **Direction:**
+      direction: '',
+      // EN: 📊 Stats
+      statsField: '',
+      // EN: 🔄 Switch Methods
+      switchMethodsField: '',
+      // EN: ℹ️ Queue Activity
+      queueActivityField: '',
+      // EN: No Activity
+      noActivityField: '',
+      // EN: No switch activity this round.
+      noActivityValue: '',
+      // EN: Switch Round Summary
+      title: '',
+      // EN: Switch v{version}
+      footer: '',
+      // EN: + {count} more...
+      moreEllipsis: '',
+      // EN: **Instant Switches ({count})**
+      instantSwitchesHeading: '',
+      // EN: **Queue Normal ({count})**
+      queueNormalHeading: '',
+      // EN: **Queue Team Trade ({count})**
+      queueTeamTradeHeading: '',
+      // EN: **Queue Join Swap ({count})**
+      queueJoinSwapHeading: '',
+      // EN: **Queue Timeout Switch ({count})**
+      queueTimeoutSwitchHeading: '',
+      // EN: **Expired ({count})**
+      expiredHeading: '',
+      // EN: **Denied ({count} unique players)**
+      deniedHeading: '',
+      // EN: **DC'd in Queue ({count})**
+      dcdInQueueHeading: '',
+      // EN: **Cancelled ({count})**
+      cancelledHeading: '',
+      // EN: **Removed ({count})**
+      removedHeading: '',
+      // EN: {name} {phase} (waited {duration})
+      expiredEntry: '',
     },
   },
   teamBalancer: {
@@ -1658,10 +2200,18 @@ export const MESSAGES = {
       duration: '',
       // EN: \n+ {value} more...
       moreNamesOmitted: '',
+      // EN: No budget-sized swap reached the parity target.
+      noBudgetSizedSwap: '',
+      // EN: simulation
+      simulation: '',
     },
     warn: {
+      // EN: Win streak tracking disabled.{seedScrambleOffNote}
+      winStreakTrackingDisabled: '',
       // EN: Running diagnostics... please wait.
       runningDiagnosticsPleaseWait: '',
+      // EN: Pending scramble cancelled.
+      pendingScrambleCancelled: '',
     },
     status: {
       // EN: Manually disabled
@@ -1672,14 +2222,6 @@ export const MESSAGES = {
       hasDominantWinS: '',
       // EN: No current win streak
       noCurrentWinStreak: '',
-      // EN: Elo Integration: {eloStatus}
-      eloIntegration: '',
-      // EN: Dominance Streak: {winStreakText}
-      dominanceStreak: '',
-      // EN: Last Scramble: {lastScrambleText}
-      lastScramble: '',
-      // EN: Max Streak Threshold: {maxWinStreak} dominant win(s)
-      maxStreakThresholdDominant: '',
       // EN: 🎮 In-Game Command: !teambalancer on
       gameCommandTeambalancer: '',
       // EN: Executed by **{adminName}**
@@ -1750,10 +2292,6 @@ export const MESSAGES = {
       immediatelyWithNoCountdown: '',
       // EN: in {scrambleAnnouncementDelay}s, after a countdown broadcast
       sAfterCountdownBroadcast: '',
-      // EN: dry run {value}scramble{value2}
-      dryRunScramble: '',
-      // EN: live {value}scramble{value2}
-      liveScramble: '',
       // EN: Initiating dry run {value}scramble (immediate)...
       initiatingDryRunScramble: '',
       // EN: Initiating immediate {value}scramble...
@@ -1782,6 +2320,44 @@ export const MESSAGES = {
       diagTeams: '',
       // EN: 1-Round: {value}
       diagSingleRound: '',
+      // EN: INITIALIZING
+      initializing: '',
+      // EN: ENABLED
+      enabled: '',
+      // EN: DISABLED
+      disabledUpper: '',
+      // EN: Disabled
+      disabled: '',
+      // EN: {teamName}: {count} / {threshold} wins
+      teamWinsOfThreshold: '',
+      // EN: Unknown
+      unknownLayer: '',
+      // EN: N/A
+      notApplicable: '',
+      // EN: Active
+      eloActive: '',
+      // EN: Unavailable
+      eloUnavailable: '',
+      // EN: Layer: {layerName}
+      statusLayer: '',
+      // EN: S³: {value}
+      diagS3: '',
+      // EN: PASS
+      resultPass: '',
+      // EN: FAIL
+      resultFail: '',
+      // EN: Yes
+      yes: '',
+      // EN: No
+      no: '',
+      // EN: ON (> {value} tix)
+      singleRoundOn: '',
+      // EN: OFF
+      singleRoundOff: '',
+      // EN: Initializing...
+      initializingEllipsis: '',
+      // EN: std
+      thresholdStandard: '',
     },
     onRoundEnded: {
       // EN: Round End Processing
@@ -1792,34 +2368,8 @@ export const MESSAGES = {
     embeds: {
       // EN: 🔀 Post-Scramble Team Balance - {layerName}
       postScrambleTitle: '',
-      roundSkipped: {
-        // EN: Game mode unknown — skipping (safe default)
-        gameModeUnknown: '',
-      },
-      // EN:  Team 1  |   Category   |  Team 2 
-      team1CategoryTeam: '',
-      // EN: Team Avg
-      teamAvg: '',
-      // EN: Regs Avg
-      regsAvg: '',
-      // EN: Top 15 Avg
-      top15Avg: '',
-      // EN: Team {muLeadTeam} advantage
-      teamAdvantage: '',
-      // EN: Team {top15LeadTeam} advantage
-      teamAdvantage2: '',
-      // EN: **Skill Balance:** {eloEmoji} {value}μ Elo diff ({muAdvText})
-      skillBalanceEloDiff: '',
-      // EN: **Top 15 Balance:** {eloEmoji} {value}μ Elo diff ({top15AdvText})
-      top15BalanceElo: '',
-      // EN: **Regular Balance:** {regEmoji} {regDelta} Reg diff ({t1Share}% vs {t2Share}% Share | {vetAdvText})
-      regularBalanceRegDiff: '',
-      // EN: Highly Calibrated
-      highlyCalibrated: '',
       // EN: Initial Calibration
       initialCalibration: '',
-      // EN: {wins} Wins / {losses} Losses
-      winsLosses: '',
       // EN: **Provisional** — {roundsPlayed} rounds played. Rank visible after {minRounds} rounds. ({totalPlayersFmt} total tracked)
       provisionalRoundsPlayedRank: '',
       // EN: Rank **#{rank}** of **{totalRankedFmt}** ranked players ({totalPlayersFmt} total).\nTop {topPercent}% of all players
@@ -1876,6 +2426,8 @@ export const MESSAGES = {
       resetDefaultRating: '',
       // EN: 📦 ELO Backup — {value} players
       eloBackupPlayers: '',
+      // EN: Backup
+      backup: '',
       // EN: Please attach a backup JSON file with the !elo restore command.
       pleaseAttachBackupJson: '',
       // EN: Invalid backup format: missing players array.
@@ -1888,22 +2440,8 @@ export const MESSAGES = {
       restoreComplete: '',
       // EN: Restored {value} players from backup.
       restoredPlayersFromBackup: '',
-      // EN: `!elo` or `!elo me` — Look up your own linked ELO rating and local leaderboard
-      eloEloMeLook: '',
-      // EN: `!elo <name | steamID | eosID>` — Look up another player
-      eloNameSteamidEosid: '',
-      // EN: `!elo link <SteamID>` — Link your Discord account to your SteamID
-      eloLinkSteamidLink: '',
-      // EN: `!elo leaderboard [rank]` — Show 25 players, optionally centered around a specific rank
-      eloLeaderboardRankShow: '',
-      // EN: `!elo clans` — Show the top 25 clans by average CSR
-      eloClansShowTop: '',
-      // EN: `!elo clan <tag>` — Show detailed stats and roster for a clan
-      eloClanTagShow: '',
-      // EN: `!elo explain` — Explains the ranking algorithm and symbols
-      eloExplainExplainsRanking: '',
-      // EN: `!elo help` — Show this message
-      eloHelpShowMessage: '',
+      // EN: Restore
+      restore: '',
       // EN: 🛡️ Admin Commands (admin channel only)
       adminCommandsAdminChannel: '',
       // EN: `!elo status` — Plugin status and current round info
@@ -1928,14 +2466,6 @@ export const MESSAGES = {
       durationMinutes: '',
       // EN: {seconds}s
       durationSeconds: '',
-      // EN: Visitors
-      matrixVisitors: '',
-      // EN: Provisional
-      matrixProvisional: '',
-      // EN: Regulars
-      matrixRegulars: '',
-      // EN: Veterancy
-      matrixVeterancy: '',
       // EN: Team 1
       team1: '',
       // EN: Team 2
@@ -1946,20 +2476,12 @@ export const MESSAGES = {
       tie: '',
       // EN: Team {team} advantage
       teamNumberAdvantage: '',
-      // EN: Balanced
-      balanced: '',
       // EN: (Uncertainty: **-{sigma}σ**)
       uncertainty: '',
       // EN: Version
       fieldVersion: '',
       // EN: Ready
       fieldReady: '',
-      // EN: Calibrated
-      calibrated: '',
-      // EN: Establishing
-      establishing: '',
-      // EN: **{pct}% winrate**
-      winrateBold: '',
       // EN: **{value} CSR** (μ - 3σ)
       csrValue: '',
       // EN: Unranked

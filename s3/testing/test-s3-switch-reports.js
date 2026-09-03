@@ -259,12 +259,12 @@ test('parseRange: explicit date range resolves exact UTC bounds', () => {
 
 test('parseRange: reversed date range is an error', () => {
   const r = parseRange('2026-01-31..2026-01-01');
-  assert.ok(r.error);
+  assert.ok(r.errorKey);
 });
 
 test('parseRange: garbage input is an error', () => {
   const r = parseRange('not-a-range');
-  assert.ok(r.error);
+  assert.ok(r.errorKey);
 });
 
 test('looksLikeRangeToken: recognises day/week and date-range shorthand, rejects names', () => {

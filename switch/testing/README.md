@@ -138,12 +138,54 @@ node switch/testing/test-dialect-literals.js
 node switch/testing/test-scramble-lockdown.js
 node switch/testing/test-admin-mutations.js
 node switch/testing/test-seed-token-lifecycle.js
+node switch/testing/test-round-stats.js
 ```
+
+### Run one suite at a time
+
+**Do not run this runner concurrently with `s3/testing/run-all-tests.js`.**
+
+`s3/testing/test-i18n.js` regenerates `s3/locale-templates/` — a fixed,
+tracked directory, not a temporary one — and reads the results back. Two
+runners doing that at once read each other's half-written output, and
+`test-i18n.js` fails with nothing wrong in the code. Run them one after the
+other and it passes. If you get exactly one failure and it is `test-i18n.js`,
+check this before looking at the diff.
+
+Two side effects of a normal run, both expected:
+
+- `s3/locale-templates/*` comes back modified. That is the generator doing its
+  job, not a stray edit.
+- MySQL and Postgres cases report as **SKIPPED** when those engines are not
+  running. Read the skip count in the summary — a skip is not a pass. To run
+  them:
+
+  ```bash
+  docker run -d --name s3-test-mysql -e MYSQL_ROOT_PASSWORD=root \
+    -p 3307:3306 mysql:8
+  docker run -d --name s3-test-postgres -e POSTGRES_PASSWORD=postgres \
+    -p 5433:5432 postgres:16-alpine
+  ```
 
 ## What's NOT Tested (Remains Manual QA)
 
 - **Full integration** requiring a live SquadJS server, RCON, or Discord — these are manual QA
 - **Queue stability gate / pair trading logic** — unchanged by the token system
+
+  Note that the queue paths are close to unreachable in manual QA too: a queue
+  only forms when the teams are full and unbalanced, which is not something a
+  maintainer can conjure on a test box. Every round-stat event is therefore
+  logged as it is recorded, in one machine-readable shape, so a real round can
+  be reconstructed afterwards from the server log:
+
+  ```bash
+  grep -o '\[RoundStat\] .*' squadjs.log
+  # [RoundStat] queueTeamTrades {"p1Name":"Alice","p2Name":"Bob",...}
+  ```
+
+  Strip the prefix and `JSON.parse` the rest. `test-round-stats.js` holds the
+  log and the stored row to the same numbers, and fails if any counter is ever
+  recorded without a line.
 - **Stats scraper regex parsing** — unchanged
 - **Round summary embed format** — unchanged
 - **Broadcast timers and join-warn scheduling** — unchanged

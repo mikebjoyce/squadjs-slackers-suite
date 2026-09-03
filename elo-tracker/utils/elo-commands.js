@@ -99,11 +99,11 @@ const EloCommands = {
       let rankLine;
       const consRating = record.mu - (EloCalculator.SIGMA_MULTIPLIER * record.sigma);
       if (record.roundsPlayed < minRounds) {
-        rankLine = `Rank: Provisional (${record.roundsPlayed}/${minRounds} rounds)`;
+        rankLine = tracker.localize('eloTracker.lookupAndRespond.rankProvisional', { roundsPlayed: record.roundsPlayed, minRounds });
       } else {
         const rank = await trackerCtx.db.getPlayerRank(record.eosID, minRounds);
         const total = await trackerCtx.db.getTotalPlayers();
-        rankLine = `Rank: #${rank} (of ${total} total)`;
+        rankLine = tracker.localize('eloTracker.lookupAndRespond.rankPlacement', { rank, total });
       }
 
       // null whenever the match was exact — see EloDatabase.formatOtherMatches().

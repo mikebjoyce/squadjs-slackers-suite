@@ -475,7 +475,7 @@ export const DiscordHelpers = {
     if (legend.length) embed.footer = { text: legend.join(' · ') };
 
     if (swapPlan.length === 0) {
-      const action = isSimulated ? 'simulation' : tb.localize('teamBalancer.embeds.scrambleCalculation');
+      const action = tb.localize(isSimulated ? 'teamBalancer.embeds.simulation' : 'teamBalancer.embeds.scrambleCalculation');
       embed.footer = { text: tb.localize('teamBalancer.embeds.resultedNoPlayerMoves', { action }) };
     }
 

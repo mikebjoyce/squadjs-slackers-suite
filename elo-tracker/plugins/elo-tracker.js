@@ -531,7 +531,7 @@ export default class EloTracker extends S3PluginBase {
     this.server.on('CHAT_COMMAND:eloadmin', this.listeners.onEloAdminCommand);
 
     // Layer info is owned by S³ gameState — it resolves at mount, on events, and provides getLayerName()/getGamemode()
-    
+
     if (this.options.discordClient) {
       this.options.discordClient.removeListener('message', this.listeners.onDiscordMessage);
       this.options.discordClient.on('message', this.listeners.onDiscordMessage);
@@ -594,14 +594,14 @@ export default class EloTracker extends S3PluginBase {
      this._roundStartEmbedPending = Date.now();
      this._ratingsCommittedPromise = new Promise(resolve => { this._ratingsCommittedResolve = resolve; });
 
-     // NOTE (null-teamID transient): SquadJS RCON polling may return players with 
-     // teamID === null immediately after NEW_GAME fires (see SQUADJS_PLUGIN_DEV_REFERENCE.md, 
-     // Section 3). At full-server scale (93–99 players), the ENTIRE roster can be null-teamID 
-     // for up to ~35 seconds as players load into the new map. The session manager will record 
-     // these null-teamID states as initial segments; when teamID resolves, a "team switch" is 
-     // detected and a new segment is opened. This means players' null-teamID wait time (~30–35s) 
-     // contributes nothing to their timeOnTeam1 or timeOnTeam2, and thus does not factor into 
-     // participationRatio. This is expected behaviour and harmless — the impact is <1% of a 
+     // NOTE (null-teamID transient): SquadJS RCON polling may return players with
+     // teamID === null immediately after NEW_GAME fires (see SQUADJS_PLUGIN_DEV_REFERENCE.md,
+     // Section 3). At full-server scale (93–99 players), the ENTIRE roster can be null-teamID
+     // for up to ~35 seconds as players load into the new map. The session manager will record
+     // these null-teamID states as initial segments; when teamID resolves, a "team switch" is
+     // detected and a new segment is opened. This means players' null-teamID wait time (~30–35s)
+     // contributes nothing to their timeOnTeam1 or timeOnTeam2, and thus does not factor into
+     // participationRatio. This is expected behaviour and harmless — the impact is <1% of a
      // typical round. All tracking resumes normally once teamIDs resolve.
    }
 
@@ -687,9 +687,9 @@ export default class EloTracker extends S3PluginBase {
 
   async onTeamBalancerScramble(data) {
     if (!this.ready) return;
-    
+
     Logger.verbose('EloTracker', 1, '[onTeamBalancerScramble] Event received. Waiting 5s to capture post-scramble state...');
-    
+
     this._scrambleEmbedTimer = setTimeout(async () => {
       try {
         const embedData = this.buildRoundStartData();
@@ -697,10 +697,10 @@ export default class EloTracker extends S3PluginBase {
           Logger.verbose('EloTracker', 1, '[onTeamBalancerScramble] Data not ready, skipping embed.');
           return;
         }
-        
+
         const embed = EloDiscord.buildRoundStartEmbed(this, embedData, 'manual');
         embed.title = this.localize('eloTracker.embeds.postScrambleTitle', { layerName: embedData.layerName || 'Unknown' });
-        
+
         const targetChannel = this.discordReportChannel || this.discordPublicChannel || this.discordAdminChannel;
         if (targetChannel) {
           await EloDiscord.sendDiscordMessage(targetChannel, { embeds: [embed] });
@@ -794,7 +794,7 @@ export default class EloTracker extends S3PluginBase {
       Logger.verbose('EloTracker', 1, '[onRoundEnded] No eligible participants. Skipping ELO update.');
       const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
       if (targetReportChannel) {
-        const embed = EloDiscord.buildRoundSkippedEmbed(this, 
+        const embed = EloDiscord.buildRoundSkippedEmbed(this,
           this.localize('eloTracker.embeds.roundSkipped.noEligible', { ratio: this.options.minParticipationRatio }),
           participants.length,
           layerName
@@ -817,7 +817,7 @@ export default class EloTracker extends S3PluginBase {
       Logger.verbose('EloTracker', 1, `[onRoundEnded] Skipping ELO update: One or both teams have no eligible participants (Team 1: ${team1Eligible.length}, Team 2: ${team2Eligible.length}).`);
       const targetReportChannel = this.discordReportChannel || this.discordAdminChannel;
       if (targetReportChannel) {
-        const embed = EloDiscord.buildRoundSkippedEmbed(this, 
+        const embed = EloDiscord.buildRoundSkippedEmbed(this,
           this.localize('eloTracker.embeds.roundSkipped.oneOrBothIneligible', { gameMode: gameMode ?? 'Unknown' }),
           playerCount,
           layerName
@@ -895,12 +895,15 @@ export default class EloTracker extends S3PluginBase {
         spreadSnapshot = teamRegulars.map((r, i) => ({ ...r, label: `${i + 1}.` }));
       } else {
         const midIndex = Math.floor(teamRegulars.length / 2);
+        const topLabel = this.localize('eloTracker.embeds.spreadTop');
+        const midLabel = this.localize('eloTracker.embeds.spreadMid');
+        const botLabel = this.localize('eloTracker.embeds.spreadBot');
         spreadSnapshot = [
-          { ...teamRegulars[0], label: 'Top:' },
-          { ...teamRegulars[1], label: 'Top:' },
-          { ...teamRegulars[midIndex], label: 'Mid:' },
-          { ...teamRegulars[teamRegulars.length - 2], label: 'Bot:' },
-          { ...teamRegulars[teamRegulars.length - 1], label: 'Bot:' }
+          { ...teamRegulars[0], label: topLabel },
+          { ...teamRegulars[1], label: topLabel },
+          { ...teamRegulars[midIndex], label: midLabel },
+          { ...teamRegulars[teamRegulars.length - 2], label: botLabel },
+          { ...teamRegulars[teamRegulars.length - 1], label: botLabel }
         ];
       }
 
@@ -1105,11 +1108,11 @@ export default class EloTracker extends S3PluginBase {
     const regLower = Math.min(t1.tierStats.rCount, t2.tierStats.rCount);
     const regRatio = regLower > 0 ? regHigher / regLower : (regHigher > 0 ? Infinity : 1);
     const isPopImbalance = regRatio > this.thresholds.imbalanceRatio && regHigher > regLower;
-    
-    const veteranLead = t1.tierStats.rCount === t2.tierStats.rCount ? 'Tie' : 
+
+    const veteranLead = t1.tierStats.rCount === t2.tierStats.rCount ? 'Tie' :
       (t1.tierStats.rCount > t2.tierStats.rCount ? 'Team 1' : 'Team 2');
 
-    const matchVeterancy = (t1.count + t2.count) > 0 
+    const matchVeterancy = (t1.count + t2.count) > 0
       ? (t1.tierStats.rCount + t2.tierStats.rCount) / (t1.count + t2.count)
       : 0;
 

@@ -883,6 +883,25 @@ export default class TeamBalancer extends S3PluginBase {
   }
 
   /**
+   * A faction name as it should read inside a victory broadcast — "Militia" →
+   * "The Militia". The article is catalogue text rather than a literal because
+   * English is the only language this rule is correct in; a translator whose
+   * language takes no article, or a different one per gender, sets
+   * `teamNameArticle` to "{name}" or to the right form and the broadcast reads
+   * naturally instead of carrying an English "The" into the middle of a
+   * translated sentence.
+   *
+   * Names that already carry an article, generic "Team 1"/"Team 2" labels, and
+   * servers running useGenericTeamNamesInBroadcasts are passed through
+   * untouched.
+   */
+  articleName(name) {
+    if (this.options.useGenericTeamNamesInBroadcasts) return name;
+    if (!name || /^The\s+/i.test(name) || name.startsWith('Team ')) return name;
+    return this.formatMessage(this.RconMessages.teamNameArticle, { name });
+  }
+
+  /**
    * Seed auto-scramble state as one line, for the status and diag surfaces.
    * Config blockers are reported BEFORE the manual toggle: both of them need a config edit plus a
    * restart, and naming the runtime-fixable reason first sends an admin to "!teambalancer on" for
@@ -1860,13 +1879,13 @@ export default class TeamBalancer extends S3PluginBase {
         Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Ignored match ended (${this.gameModeCached} / ${this.layerNameCached}). Resetting streak metrics.`);
 
         // Reached only when no seed auto-scramble fired — that path returned above.
-        let broadcastWinnerName = winnerName;
-        let broadcastLoserName = loserName;
-        if (!this.options.useGenericTeamNamesInBroadcasts) {
-          if (!/^The\s+/i.test(winnerName) && !winnerName.startsWith('Team ')) broadcastWinnerName = 'The ' + winnerName;
-          if (!/^The\s+/i.test(loserName) && !loserName.startsWith('Team ')) broadcastLoserName = 'The ' + loserName;
-        }
-        const msg = `${this.RconMessages.prefix} ${broadcastWinnerName} defeated ${broadcastLoserName} | (${margin} tickets)`;
+        const broadcastWinnerName = this.articleName(winnerName);
+        const broadcastLoserName = this.articleName(loserName);
+        const msg = `${this.RconMessages.prefix} ${this.formatMessage(this.RconMessages.seedWin, {
+          team: broadcastWinnerName,
+          loser: broadcastLoserName,
+          margin
+        })}`;
         try {
           await this.server.rcon.broadcast(msg);
         } catch (err) {
@@ -1924,16 +1943,8 @@ export default class TeamBalancer extends S3PluginBase {
         }
       }
 
-      let broadcastWinnerName = winnerName;
-      let broadcastLoserName = loserName;
-      if (!this.options.useGenericTeamNamesInBroadcasts) {
-        if (!/^The\s+/i.test(winnerName) && !winnerName.startsWith('Team ')) {
-          broadcastWinnerName = 'The ' + winnerName;
-        }
-        if (!/^The\s+/i.test(loserName) && !loserName.startsWith('Team ')) {
-          broadcastLoserName = 'The ' + loserName;
-        }
-      }
+      const broadcastWinnerName = this.articleName(winnerName);
+      const broadcastLoserName = this.articleName(loserName);
 
       // ── Gamemode branch ────────────────────────────────────────
       // Invasion is asymmetric — attackers and defenders win on different
@@ -2965,7 +2976,7 @@ export default class TeamBalancer extends S3PluginBase {
           // (this.discordChannel), live scramble failures go to the report channel (targetReportChannel).
           const failChannel = isSimulated ? this.discordChannel : targetReportChannel;
           if (failChannel) {
-            const embedReason = isMicro ? 'No budget-sized swap reached the parity target.' : this.localize('teamBalancer.embeds.noValidSwapSolutionFound');
+            const embedReason = this.localize(isMicro ? 'teamBalancer.embeds.noBudgetSizedSwap' : 'teamBalancer.embeds.noValidSwapSolutionFound');
             const embed = DiscordHelpers.buildScrambleFailedEmbed(embedReason, swapPlan?.calculationTime || 0, this);
             DiscordHelpers.sendDiscordMessage(failChannel, { embeds: [embed] });
           }

@@ -192,7 +192,7 @@ const SwitchQueue = {
         if (plugin._roundStats) {
           const qDuration = Math.round((Date.now() - entry.queuedAt) / 1000);
           const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
-          plugin._roundStats.queueJoinSwaps.push({
+          plugin._trackRoundStat('queueJoinSwaps', {
             name: entry.playerName,
             eosID: entry.eosID,
             type: 'consume',
@@ -270,7 +270,7 @@ const SwitchQueue = {
         if (plugin._roundStats) {
           const qDuration = Math.round((Date.now() - entry.queuedAt) / 1000);
           const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
-          plugin._roundStats.queueJoinSwaps.push({
+          plugin._trackRoundStat('queueJoinSwaps', {
             name: entry.playerName,
             eosID: entry.eosID,
             type: 'swap',
@@ -325,7 +325,7 @@ const SwitchQueue = {
               if (plugin._roundStats) {
                 const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
                 const queueDurationSeconds = Math.round((nowTs - entry.queuedAt) / 1000);
-                plugin._roundStats.queueExpiries.push({
+                plugin._trackRoundStat('queueExpiries', {
                   name: entry.playerName,
                   eosID: entry.eosID,
                   queueDurationSeconds,
@@ -377,7 +377,7 @@ const SwitchQueue = {
             if (plugin._roundStats) {
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
               const queueDurationSeconds = Math.round((Date.now() - p1.queuedAt) / 1000);
-              plugin._roundStats.queueDisconnects.push({
+              plugin._trackRoundStat('queueDisconnects', {
                 name: p1.playerName,
                 eosID: p1.eosID,
                 currentTeamID: p1.currentTeamID,
@@ -393,7 +393,7 @@ const SwitchQueue = {
             plugin._removePlayerFromQueue(p1.eosID);
             if (plugin._roundStats) {
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
-              plugin._roundStats.queueRemovals.push({ name: p1.playerName, eosID: p1.eosID, reason: 'team_changed', gamePhase });
+              plugin._trackRoundStat('queueRemovals', { name: p1.playerName, eosID: p1.eosID, reason: 'team_changed', gamePhase });
             }
             plugin.verbose(1, `[Queue] ${p1.playerName} team changed — removed from queue (now on target team T${s3p1.teamID}).`);
             plugin.warn(p1.eosID, plugin.localize('switch.warn.switchQueueNowTeam', { teamID: s3p1.teamID }));
@@ -406,7 +406,7 @@ const SwitchQueue = {
             if (plugin._roundStats) {
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
               const queueDurationSeconds = Math.round((Date.now() - p2.queuedAt) / 1000);
-              plugin._roundStats.queueDisconnects.push({
+              plugin._trackRoundStat('queueDisconnects', {
                 name: p2.playerName,
                 eosID: p2.eosID,
                 currentTeamID: p2.currentTeamID,
@@ -422,7 +422,7 @@ const SwitchQueue = {
             plugin._removePlayerFromQueue(p2.eosID);
             if (plugin._roundStats) {
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
-              plugin._roundStats.queueRemovals.push({ name: p2.playerName, eosID: p2.eosID, reason: 'team_changed', gamePhase });
+              plugin._trackRoundStat('queueRemovals', { name: p2.playerName, eosID: p2.eosID, reason: 'team_changed', gamePhase });
             }
             plugin.verbose(1, `[Queue] ${p2.playerName} team changed — removed from queue (now on target team T${s3p2.teamID}).`);
             plugin.warn(p2.eosID, plugin.localize('switch.warn.switchQueueNowTeam', { teamID: s3p2.teamID }));
@@ -512,7 +512,7 @@ const SwitchQueue = {
             const dur1 = Math.round((Date.now() - p1.queuedAt) / 1000);
             const dur2 = Math.round((Date.now() - p2.queuedAt) / 1000);
             const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
-            plugin._roundStats.queueTeamTrades.push({
+            plugin._trackRoundStat('queueTeamTrades', {
               p1Name: p1.playerName,
               p2Name: p2.playerName,
               p1FromTeam: p1.currentTeamID,
@@ -550,7 +550,7 @@ const SwitchQueue = {
             if (plugin._roundStats) {
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
               const queueDurationSeconds = Math.round((Date.now() - entry.queuedAt) / 1000);
-              plugin._roundStats.queueDisconnects.push({
+              plugin._trackRoundStat('queueDisconnects', {
                 name: entry.playerName,
                 eosID: entry.eosID,
                 currentTeamID: entry.currentTeamID,
@@ -566,7 +566,7 @@ const SwitchQueue = {
             plugin._removePlayerFromQueue(entry.eosID);
             if (plugin._roundStats) {
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
-              plugin._roundStats.queueRemovals.push({ name: entry.playerName, eosID: entry.eosID, reason: 'team_changed', gamePhase });
+              plugin._trackRoundStat('queueRemovals', { name: entry.playerName, eosID: entry.eosID, reason: 'team_changed', gamePhase });
             }
             plugin.verbose(1, `[Queue] ${entry.playerName} team changed — removed from queue (now on target team T${s3Entry.teamID}).`);
             plugin.warn(entry.eosID, plugin.localize('switch.warn.switchQueueNowTeam', { teamID: s3Entry.teamID }));
@@ -659,7 +659,7 @@ const SwitchQueue = {
               const qDuration = Math.round((Date.now() - entry.queuedAt) / 1000);
               const gamePhase = plugin._s3?.gameState?.getPhase?.() || 'UNKNOWN';
               if (timedOut) {
-            plugin._roundStats.queueTimeoutSwitches.push({
+            plugin._trackRoundStat('queueTimeoutSwitches', {
               name: entry.playerName,
               eosID: entry.eosID,
               currentTeamID: entry.currentTeamID,
@@ -668,7 +668,7 @@ const SwitchQueue = {
               gamePhase
             });
           } else {
-            plugin._roundStats.queueNormal.push({
+            plugin._trackRoundStat('queueNormal', {
                 name: entry.playerName,
                 eosID: entry.eosID,
                 currentTeamID: entry.currentTeamID,

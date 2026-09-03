@@ -57,7 +57,7 @@
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
- * parseRange(argString)                        — "30d" / "2w" / "YYYY-MM-DD..YYYY-MM-DD" -> {fromTs,toTs}|{error}
+ * parseRange(argString)                        — "30d" / "2w" / "YYYY-MM-DD..YYYY-MM-DD" -> {fromTs,toTs}|{errorKey,errorVars}
  * looksLikeRangeToken(token)                   — cheap test used to split "<ident> <range>" args
  * checkLoggingAvailability(s3db, fromTs, toTs) — detects a logging-disabled gap vs. a genuine zero
  * resolvePlayers(s3db, identifier)             — tiered ID/name lookup against S3_PlayerEvents
@@ -189,7 +189,12 @@ export function looksLikeRangeToken(token) {
 
 /**
  * @param {string|null} argString
- * @returns {{fromTs:number,toTs:number,capped?:boolean}|{error:string}}
+ * A rejection comes back as a catalogue key plus its variables rather than
+ * a finished sentence: this module has no plugin handle, so it cannot
+ * localize, and a returned English sentence would land in a Discord embed
+ * untranslated no matter what locale the server runs.
+ *
+ * @returns {{fromTs:number,toTs:number,capped?:boolean}|{errorKey:string,errorVars:object}}
  */
 export function parseRange(argString) {
   const now = Date.now();
@@ -203,7 +208,7 @@ export function parseRange(argString) {
   if (daysMatch) {
     const n = parseInt(daysMatch[1], 10);
     if (!Number.isFinite(n) || n <= 0) {
-      return { error: `Invalid range "${arg}" — must be a positive number of days/weeks.` };
+      return { errorKey: 'slackersSquadServices.reports.rangeInvalidNumber', errorVars: { arg } };
     }
     const days = daysMatch[2].toLowerCase() === 'w' ? n * 7 : n;
     const cappedDays = Math.min(days, MAX_RANGE_DAYS);
@@ -215,13 +220,13 @@ export function parseRange(argString) {
     const from = Date.parse(`${dateRangeMatch[1]}T00:00:00Z`);
     const to = Date.parse(`${dateRangeMatch[2]}T23:59:59Z`);
     if (!Number.isFinite(from) || !Number.isFinite(to) || from > to) {
-      return { error: `Invalid date range "${arg}".` };
+      return { errorKey: 'slackersSquadServices.reports.rangeInvalidDates', errorVars: { arg } };
     }
     const cappedFrom = Math.max(from, to - MAX_RANGE_DAYS * DAY_MS);
     return { fromTs: cappedFrom, toTs: to, capped: cappedFrom > from };
   }
 
-  return { error: `Could not parse range "${arg}". Use "30d", "2w", or "YYYY-MM-DD..YYYY-MM-DD".` };
+  return { errorKey: 'slackersSquadServices.reports.rangeUnparseable', errorVars: { arg } };
 }
 
 /**

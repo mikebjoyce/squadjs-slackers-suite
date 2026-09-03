@@ -18,7 +18,9 @@
  *   Must be called during _onS3Ready() after S³ DB is confirmed ready.
  *   Adds to plugin: timeLimitEnabled, _loadTimeLimitSetting,
  *   _saveTimeLimitSetting, _loadExplainMessageId,
- *   _saveExplainMessageId, cleanup, checkPlayer.
+ *   _saveExplainMessageId, cleanup, checkPlayer,
+ *   recordRoundStats, getRoundStatsTotals, backfillRoundStats,
+ *   getEarliestLiveRoundStat.
  *   Also calls defineModel(), registerExpectedVersion(),
  *   registerMigrations(), and verifyAndRunMigrations() on the plugin.
  *
@@ -178,10 +180,103 @@ const SwitchDB = {
       // other two Switch tables.
     }, { timestamps: false, freezeTableName: true, exportTier: 'historical' });
 
+    // One row per completed round — the aggregate the round-summary embed
+    // prints, kept as numbers instead of re-read out of Discord prose later.
+    // Deliberately NOT per-player: both consumers (!switch stats and the 7-day
+    // explain embed) only ever sum across rounds, so a per-player table would
+    // be two orders of magnitude larger for nothing either of them asks.
+    //
+    // exportTier 'historical': it cannot be rebuilt from live play the way a
+    // cooldown can. Once a round is over its numbers exist nowhere else.
+    plugin.defineModel('SwitchPlugin_RoundStats', {
+      id: {
+        type: plugin._s3db.getDataTypes().INTEGER,
+        primaryKey: true,
+        autoIncrement: true
+      },
+      // Both nullable: a round can end while S³'s gameState is mid-resolve,
+      // and losing the layer label is not a reason to lose the counts.
+      matchId: {
+        type: plugin._s3db.getDataTypes().STRING,
+        allowNull: true
+      },
+      layerName: {
+        type: plugin._s3db.getDataTypes().STRING,
+        allowNull: true
+      },
+      gameMode: {
+        type: plugin._s3db.getDataTypes().STRING,
+        allowNull: true
+      },
+      // The range clock for every query against this table.
+      roundEndedAt: {
+        type: plugin._s3db.getDataTypes().DATE,
+        allowNull: false
+      },
+      // Liberal rounds are excluded from every aggregate — switching is
+      // unrestricted then, so their numbers describe a different system.
+      // Stored rather than filtered at write time so the count of what was
+      // excluded stays reportable.
+      liberalMode: {
+        type: plugin._s3db.getDataTypes().BOOLEAN,
+        allowNull: false,
+        defaultValue: false
+      },
+      // True only for backfilled rounds whose embed predated the current
+      // format, so the data-quality line can say how many rows are partial.
+      incomplete: {
+        type: plugin._s3db.getDataTypes().BOOLEAN,
+        allowNull: false,
+        defaultValue: false
+      },
+      // 'live' (written at round end) or 'scraped' (recovered from a Discord
+      // embed by !switch backfill). Scraped rows are lower fidelity — the
+      // embed rounds durations to whole seconds and never carried the raw
+      // per-entry array — so the two must stay tellable apart rather than
+      // silently averaging together.
+      source: {
+        type: plugin._s3db.getDataTypes().STRING,
+        allowNull: false,
+        defaultValue: 'live'
+      },
+      success: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      failed: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      denied: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      toT1: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      toT2: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      maxQueueSize: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      instant: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      queueNormal: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      queueTeamTrade: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      queueJoinSwap: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      queueTimeoutSwitch: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      denialCooldown: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      denialTimeWindow: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      denialScrambleLock: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      denialRecentSwitch: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      denialOther: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      outcomeExpired: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      outcomeDC: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      outcomeCancelled: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      outcomeRemoved: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
+      // Null means the round had no queue entries at all, which is not the
+      // same as a mean of zero. A scraped old-format round can have a mean
+      // and a null median; that pairing is what the "missing median" count
+      // in the stats embed reports.
+      meanQueueMs: {
+        type: plugin._s3db.getDataTypes().INTEGER,
+        allowNull: true
+      },
+      medianQueueMs: {
+        type: plugin._s3db.getDataTypes().INTEGER,
+        allowNull: true
+      }
+    }, { timestamps: false, exportTier: 'historical' });
+
     // ── Migration Registration ─────────────────────────────────
 
-    plugin.registerExpectedVersion('switch', 5, {
-      models: ['SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_Endmatches', 'SwitchPlugin_Settings']
+    plugin.registerExpectedVersion('switch', 6, {
+      models: ['SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_Endmatches', 'SwitchPlugin_Settings', 'SwitchPlugin_RoundStats']
     });
     plugin.registerMigrations('switch', [
       {
@@ -451,8 +546,61 @@ const SwitchDB = {
             }
           }
         }
+      },
+      {
+        version: 6,
+        description: 'Create SwitchPlugin_RoundStats for per-round switch aggregates',
+        // No index on roundEndedAt, deliberately. Sequelize emits ALTER TABLE
+        // for addIndex on MySQL and a bare CREATE INDEX needs its own grant,
+        // and neither is worth buying here: this table takes one row per
+        // round, so a busy server writes a few thousand a year and the range
+        // filter is a trivial scan on every engine the suite supports.
+        touches: {
+          creates: ['SwitchPlugin_RoundStats']
+        },
+        up: async (qi) => {
+          const existing = await qi.showAllTables();
+          if (!existing.includes('SwitchPlugin_RoundStats')) {
+            await qi.createTable('SwitchPlugin_RoundStats', {
+              id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+              matchId: { type: qi.DataTypes.STRING, allowNull: true },
+              layerName: { type: qi.DataTypes.STRING, allowNull: true },
+              gameMode: { type: qi.DataTypes.STRING, allowNull: true },
+              roundEndedAt: { type: qi.DataTypes.DATE, allowNull: false },
+              liberalMode: { type: qi.DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+              incomplete: { type: qi.DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+              source: { type: qi.DataTypes.STRING, allowNull: false, defaultValue: 'live' },
+              success: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              failed: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              denied: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              toT1: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              toT2: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              maxQueueSize: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              instant: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              queueNormal: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              queueTeamTrade: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              queueJoinSwap: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              queueTimeoutSwitch: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              denialCooldown: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              denialTimeWindow: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              denialScrambleLock: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              denialRecentSwitch: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              denialOther: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              outcomeExpired: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              outcomeDC: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              outcomeCancelled: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              outcomeRemoved: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              meanQueueMs: { type: qi.DataTypes.INTEGER, allowNull: true },
+              medianQueueMs: { type: qi.DataTypes.INTEGER, allowNull: true }
+            });
+          }
+        },
+        down: async (qi) => {
+          await qi.dropTable('SwitchPlugin_RoundStats');
+        }
       }
     ]);
+
 
     // Run any pending migrations.
     //
@@ -1121,6 +1269,188 @@ const SwitchDB = {
 
       plugin.verbose(1, `[Admin] Wiped ${deleted} cooldown rows.`);
       return deleted;
+    };
+
+
+    // ── Round Stats ────────────────────────────────────────────
+
+    /**
+     * Persists one round's aggregate.
+     *
+     * Silently no-ops when the DB is unavailable or the table has not been
+     * migrated yet: a missed round is a gap in a report, and it must never be
+     * the thing that stops a round from ending. _withDb() already swallows and
+     * reports; the model guard covers the window between mount and migration.
+     *
+     * @param {object} row — the shape _computeRoundStatsRow() returns
+     * @returns {Promise<boolean>} true when a row was written
+     */
+    plugin.recordRoundStats = async function (row) {
+      const RoundStats = plugin._getModel('SwitchPlugin_RoundStats');
+      if (!RoundStats || !row) return false;
+      const written = await plugin._withDb(async (t) => {
+        await RoundStats.create(row, { transaction: t });
+        return true;
+      });
+      return written === true;
+    };
+
+    /**
+     * Sums every stored round in a window into the shape both report embeds
+     * already render.
+     *
+     * Rows are fetched and reduced in JS rather than summed in SQL. Two
+     * reasons: the median-of-medians needs the individual values, not a total;
+     * and SUM/CAST semantics differ enough between SQLite and MySQL that a
+     * single aggregate query would need proving on both engines to be trusted,
+     * which buys nothing at this table's size — one row per round is a few
+     * thousand a year.
+     *
+     * `limit` is a blast radius, not a page size. A caller asking for an
+     * absurd window gets the most recent MAX_ROWS rounds rather than an
+     * out-of-memory crash, and truncated is set so the embed can say so.
+     *
+     * @param {Date} fromDate — inclusive lower bound on roundEndedAt
+     * @param {Date} [toDate] — inclusive upper bound; defaults to now
+     * @returns {Promise<object|null>} totals, or null if the DB is unavailable
+     */
+    plugin.getRoundStatsTotals = async function (fromDate, toDate) {
+      const RoundStats = plugin._getModel('SwitchPlugin_RoundStats');
+      if (!RoundStats) return null;
+
+      const MAX_ROWS = 20000;
+      const rows = await plugin._withDb(async (t) => RoundStats.findAll({
+        where: { roundEndedAt: { [Op.between]: [fromDate, toDate || new Date()] } },
+        order: [['roundEndedAt', 'DESC']],
+        limit: MAX_ROWS,
+        transaction: t
+      }));
+      if (!rows) return null;
+
+      const totals = {
+        rounds: 0,
+        standardRounds: 0,
+        liberalRounds: 0,
+        success: 0, failed: 0, denied: 0, toT1: 0, toT2: 0,
+        maxQueueSize: 0,
+        instant: 0, queueNormal: 0, queueTeamTrade: 0, queueJoinSwap: 0, queueTimeoutSwitch: 0,
+        denialCooldown: 0, denialTimeWindow: 0, denialScrambleLock: 0,
+        denialRecentSwitch: 0, denialOther: 0,
+        outcomeExpired: 0, outcomeDC: 0, outcomeCancelled: 0, outcomeRemoved: 0,
+        incompleteRounds: 0,
+        totalQueueEntries: 0,
+        queueDurationsMs: [],
+        medianDurationsMs: [],
+        missingMedian: 0,
+        scrapedRounds: 0,
+        truncated: rows.length >= MAX_ROWS
+      };
+
+      const SUMMED = [
+        'success', 'failed', 'denied', 'toT1', 'toT2',
+        'instant', 'queueNormal', 'queueTeamTrade', 'queueJoinSwap', 'queueTimeoutSwitch',
+        'denialCooldown', 'denialTimeWindow', 'denialScrambleLock',
+        'denialRecentSwitch', 'denialOther',
+        'outcomeExpired', 'outcomeDC', 'outcomeCancelled', 'outcomeRemoved'
+      ];
+
+      for (const r of rows) {
+        totals.rounds++;
+        // Liberal rounds are counted and then dropped: switching is
+        // unrestricted then, so folding their numbers in would describe a
+        // system nobody was actually using.
+        if (r.liberalMode) { totals.liberalRounds++; continue; }
+        totals.standardRounds++;
+        if (r.source === 'scraped') totals.scrapedRounds++;
+        if (r.incomplete) totals.incompleteRounds++;
+
+        for (const k of SUMMED) totals[k] += r[k] || 0;
+        if (r.maxQueueSize > totals.maxQueueSize) totals.maxQueueSize = r.maxQueueSize;
+
+        totals.totalQueueEntries += (r.queueNormal || 0) + (r.queueTeamTrade || 0) +
+          (r.queueJoinSwap || 0) + (r.queueTimeoutSwitch || 0) +
+          (r.outcomeExpired || 0) + (r.outcomeDC || 0) + (r.outcomeCancelled || 0) + (r.outcomeRemoved || 0);
+
+        // A null mean means the round had no queue entries at all — not a
+        // wait of zero — so it contributes nothing rather than dragging the
+        // average down. A mean without a median is a backfilled round from
+        // before the summary printed one.
+        if (r.meanQueueMs != null) {
+          totals.queueDurationsMs.push(r.meanQueueMs);
+          if (r.medianQueueMs != null) totals.medianDurationsMs.push(r.medianQueueMs);
+          else totals.missingMedian++;
+        }
+      }
+
+      return totals;
+    };
+
+    /**
+     * The timestamp of the oldest round recorded live.
+     *
+     * The backfill needs it as a stop line. A live row is stamped at NEW_GAME;
+     * the summary message for that same round lands a second or two later, so
+     * the two timestamps never match and the dedupe cannot see they are the
+     * same round. Refusing to scrape anything at or after this point is what
+     * keeps the overlap from being counted twice.
+     *
+     * @returns {Promise<Date|null>} null when nothing was recorded live yet
+     */
+    plugin.getEarliestLiveRoundStat = async function () {
+      const RoundStats = plugin._getModel('SwitchPlugin_RoundStats');
+      if (!RoundStats) return null;
+      const row = await plugin._withDb(async (t) => RoundStats.findOne({
+        where: { source: 'live' },
+        order: [['roundEndedAt', 'ASC']],
+        attributes: ['roundEndedAt'],
+        transaction: t
+      }));
+      return row ? new Date(row.roundEndedAt) : null;
+    };
+
+    /**
+     * Bulk-inserts backfilled rounds, skipping any whose roundEndedAt is
+     * already present.
+     *
+     * Scraped rounds have no matchId — the summary embed never printed one —
+     * so the dedupe key is the round-end timestamp the embed carries.
+     *
+     * Matched to the second, with a second of slack, and NOT by equality. A
+     * probe against MySQL 8 on 127.0.0.1:3307 stored 00:00:10.999 as
+     * 00:00:10 — DATETIME carries no fractional digits unless asked, so an
+     * `Op.in` on the original millisecond Dates matched nothing and a re-run
+     * inserted every row a second time. SQLite keeps the milliseconds and hid
+     * it. The slack covers an engine that rounds where this one truncates;
+     * rounds are minutes apart, so it can never merge two real ones.
+     *
+     * @param {object[]} rows
+     * @returns {Promise<{inserted:number, skipped:number}>}
+     */
+    plugin.backfillRoundStats = async function (rows) {
+      const RoundStats = plugin._getModel('SwitchPlugin_RoundStats');
+      if (!RoundStats || !rows?.length) return { inserted: 0, skipped: 0 };
+
+      const times = rows.map((r) => new Date(r.roundEndedAt).getTime());
+      const lo = new Date(Math.min(...times) - 1000);
+      const hi = new Date(Math.max(...times) + 1000);
+
+      const result = await plugin._withDb(async (t) => {
+        const existing = await RoundStats.findAll({
+          where: { roundEndedAt: { [Op.between]: [lo, hi] } },
+          attributes: ['roundEndedAt'],
+          transaction: t
+        });
+        const seen = new Set();
+        for (const r of existing) {
+          const sec = Math.floor(new Date(r.roundEndedAt).getTime() / 1000);
+          seen.add(sec - 1); seen.add(sec); seen.add(sec + 1);
+        }
+        const fresh = rows.filter((r) => !seen.has(Math.floor(new Date(r.roundEndedAt).getTime() / 1000)));
+        if (fresh.length) await RoundStats.bulkCreate(fresh, { transaction: t });
+        return { inserted: fresh.length, skipped: rows.length - fresh.length };
+      });
+
+      return result || { inserted: 0, skipped: 0 };
     };
 
     // ── Load persisted settings ────────────────────────────────

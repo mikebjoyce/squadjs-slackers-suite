@@ -1,6 +1,6 @@
 /**
  * ─────────────────────────────────────────────────────────────────
- *  PLAYER-FACING TRANSLATION TEMPLATE — 266 strings
+ *  PLAYER-FACING TRANSLATION TEMPLATE — 319 strings
  * ─────────────────────────────────────────────────────────────────
  *
  *  GENERATED FILE — do not edit in place.
@@ -40,7 +40,7 @@
  *  Every string here can be read by any player, whether or not they asked to
  *  be: broadcasts the whole server sees at once, AdminWarn popups a single
  *  player reads mid-round, and the public Discord replies anyone in the
- *  channel gets from !elo stats or the leaderboard. 266 strings —
+ *  channel gets from !elo stats or the leaderboard. 319 strings —
  *  the smallest tier, and the only one where an untranslated string lands in
  *  front of someone who never chose the server's language.
  *
@@ -82,30 +82,6 @@ export const MESSAGES = {
       inGameUntracked: '',
       // EN: Other
       other: '',
-    },
-    reports: {
-      // EN: ⚪ Not enough decided self/untracked switches yet to judge ({decided} so far, need {minSample}+).
-      karmaNotEnough: '',
-      // EN: 🟠 Strongly favors the winning team — landed on the winner **{pct}%** of the time after a self/untracked switch.
-      karmaStrongWinner: '',
-      // EN: 🟡 Leans toward the winning team (**{pct}%**).
-      karmaLeansWinner: '',
-      // EN: ⚪ Neutral — no clear pattern (**{pct}%**).
-      karmaNeutral: '',
-      // EN: 🟢 Leans toward the losing team (**{pct}%**).
-      karmaLeansLoser: '',
-      // EN: 🟢🟢 Strongly favors the losing team (**{pct}%**).
-      karmaStrongLoser: '',
-      // EN: *(capped at 180 days)*
-      rangeCapped: '',
-      // EN: *Excludes {modes} rounds.*
-      excludesModes: '',
-      // EN: ⚠️ *No TeamBalancer round data logged in this range — games-played counts below may read 0 even for active players. Check TeamBalancer's `enableDatabaseLogging`.*
-      noRoundDataNote: '',
-      // EN: Full = Full Scramble (legacy = pre-split Balancer moves, before Full/Micro were tracked separately — still full scrambles) · Micro = Elo-Diff Scramble · Self = player-initiated switch (self-serve, queued, handshake, or double-swap) · Other = SmartAssign, admin-forced, or untracked in-game switches
-      leaderboardLegend: '',
-      // EN: *(none)*
-      none: '',
     },
   },
   switch: {
@@ -166,6 +142,8 @@ export const MESSAGES = {
       switchHowWorks53: '',
       // EN: Only admins can check other players. Use !switch check with no name to see your own status.
       onlyAdminsCanCheck: '',
+      // EN: [Switch] Unable to check eligibility.
+      switchUnableCheckEligibility: '',
       // EN: [Switch Queue] Queue is currently disabled.
       switchQueueQueueCurrently: '',
       // EN: [Switch Queue] Removed — you left the queue.
@@ -235,6 +213,52 @@ export const MESSAGES = {
       // EN: [Switch] Scoreboard team changes are disabled on this server. Use '!switch' to change teams. '!switch help' for more info.
       switchScoreboardTeamChanges: '',
     },
+    labels: {
+      // EN:  (requires {seedMinPlayers}+ players online)
+      seedRequiresPlayers: '',
+      // EN: Clear
+      clear: '',
+      // EN: 0/{maxSwitchTokens} tokens, next in {remaining}m
+      tokensEmptyNextInShort: '',
+      // EN: {remaining}m remaining
+      minutesRemaining: '',
+      // EN: {tokenBalance}/{maxSwitchTokens} tokens
+      tokensBalanceShort: '',
+      // EN: Not active
+      notActive: '',
+    },
+    check: {
+      // EN: [Switch] Status:
+      statusHeader: '',
+      // EN: Balance
+      rowBalance: '',
+      // EN: Time
+      rowTime: '',
+      // EN: Cooldown
+      rowCooldown: '',
+      // EN: Scramble
+      rowScramble: '',
+      // EN: Queue
+      rowQueue: '',
+      // EN: Open
+      timeOpen: '',
+      // EN: Closed ({connMin}m join, {matchMin}m match)
+      timeClosed: '',
+      // EN: Slot available
+      balanceSlotAvailable: '',
+      // EN: Teams full
+      balanceTeamsFull: '',
+      // EN: Seed Mode
+      seedMode: '',
+      // EN:  ({tokenBalance}/{maxSwitchTokens} tokens)
+      seedModeTokens: '',
+      // EN: Position {pos}, ~{remainingMin}m timeout remaining
+      queuePosition: '',
+      // EN: Type !switch to request.
+      hintRequest: '',
+      // EN: Use !switch explain.
+      hintExplain: '',
+    },
   },
   teamBalancer: {
     rcon: {
@@ -244,6 +268,10 @@ export const MESSAGES = {
     rconMessages: {
       // EN: Round ended in a Draw!
       draw: '',
+      // EN: {team} defeated {loser} | ({margin} tickets)
+      seedWin: '',
+      // EN: The {name}
+      teamNameArticle: '',
       nonDominant: {
         // EN: {team} ended {loser}'s domination streak | ({margin} tickets)
         streakBroken: '',
@@ -342,8 +370,6 @@ export const MESSAGES = {
       winStreakTrackingAlready: '',
       // EN: Win streak tracking is already disabled.
       winStreakTrackingAlready2: '',
-      // EN: Win streak tracking disabled.{seedScrambleOffNote}
-      winStreakTrackingDisabled: '',
       // EN: Invalid command. Usage: !teambalancer [status|diag|on|off|help] or !scramble [now|dry|matchend|cancel]
       invalidCommandUsageTeambalancer: '',
       // EN: Error processing command: {message}
@@ -358,8 +384,6 @@ export const MESSAGES = {
       scrambleMatchendCannotCombined: '',
       // EN: A match-end scramble is already scheduled. It will fire when this round ends. Use "!scramble cancel" to cancel it.
       matchEndScrambleAlready: '',
-      // EN: Pending scramble cancelled.
-      pendingScrambleCancelled: '',
       // EN: Cannot cancel scramble - it is already executing.
       cannotCancelScrambleAlready: '',
       // EN: No pending scramble to cancel.
@@ -370,6 +394,26 @@ export const MESSAGES = {
       confirmingWillExecuteScramble: '',
       // EN: Failed to initiate scramble - another scramble may be in progress.
       failedInitiateScrambleAnother: '',
+    },
+    status: {
+      // EN: Elo Integration: {eloStatus}
+      eloIntegration: '',
+      // EN: Dominance Streak: {winStreakText}
+      dominanceStreak: '',
+      // EN: Last Scramble: {lastScrambleText}
+      lastScramble: '',
+      // EN: Max Streak Threshold: {maxWinStreak} dominant win(s)
+      maxStreakThresholdDominant: '',
+      // EN: Never
+      never: '',
+      // EN: Version: {version}
+      statusVersion: '',
+      // EN: Unknown
+      unknownPlayer: '',
+      // EN: === TeamBalancer ===
+      infoHeader: '',
+      // EN: Status: {statusText}
+      statusLine: '',
     },
     diagnostics: {
       // EN: Test not run
@@ -401,11 +445,25 @@ export const MESSAGES = {
         playerCountBelow: '',
         // EN: Ignored match type: {reason}
         ignoredMatchType: '',
+        // EN: Game mode unknown — skipping (safe default)
+        gameModeUnknown: '',
         // EN: No eligible participants (0 players met minParticipationRatio of {ratio})
         noEligible: '',
         // EN: One or both teams had no eligible participants (Gamemode: {gameMode})
         oneOrBothIneligible: '',
       },
+      // EN:  Team 1  |   Category   |  Team 2
+      team1CategoryTeam: '',
+      // EN: Team Avg
+      teamAvg: '',
+      // EN: Regs Avg
+      regsAvg: '',
+      // EN: Top 15 Avg
+      top15Avg: '',
+      // EN: Team {muLeadTeam} advantage
+      teamAdvantage: '',
+      // EN: Team {top15LeadTeam} advantage
+      teamAdvantage2: '',
       // EN: 🏆 Round Ended
       roundEnded: '',
       // EN: **Veterancy: {icon} {label}**\n*Percentage of established "Regular" players (10+ rounds) in the match.*\n\n{generateMatrixTable}
@@ -414,6 +472,12 @@ export const MESSAGES = {
       mapLayer: '',
       // EN: Player Count
       playerCount: '',
+      // EN: **Skill Balance:** {eloEmoji} {value}μ Elo diff ({muAdvText})
+      skillBalanceEloDiff: '',
+      // EN: **Top 15 Balance:** {eloEmoji} {value}μ Elo diff ({top15AdvText})
+      top15BalanceElo: '',
+      // EN: **Regular Balance:** {regEmoji} {regDelta} Reg diff ({t1Share}% vs {t2Share}% Share | {vetAdvText})
+      regularBalanceRegDiff: '',
       // EN: Rating Changes
       ratingChanges: '',
       // EN: **Team 1:** {ratingChanges}\n**Team 2:** {ratingChanges2}
@@ -426,6 +490,10 @@ export const MESSAGES = {
       ratingSpreadRegulars: '',
       // EN: No regulars played this round
       noRegularsPlayedRound: '',
+      // EN: Highly Calibrated
+      highlyCalibrated: '',
+      // EN: {wins} Wins / {losses} Losses
+      winsLosses: '',
       // EN: CSR (Competitive Skill Rank)
       csrCompetitiveSkillRank: '',
       // EN: Estimated Skill (μ)
@@ -508,6 +576,22 @@ export const MESSAGES = {
       elotrackerCommandReference: '',
       // EN: 🌐 Public Commands
       publicCommands: '',
+      // EN: `!elo` or `!elo me` — Look up your own linked ELO rating and local leaderboard
+      eloEloMeLook: '',
+      // EN: `!elo <name | steamID | eosID>` — Look up another player
+      eloNameSteamidEosid: '',
+      // EN: `!elo link <SteamID>` — Link your Discord account to your SteamID
+      eloLinkSteamidLink: '',
+      // EN: `!elo leaderboard [rank]` — Show 25 players, optionally centered around a specific rank
+      eloLeaderboardRankShow: '',
+      // EN: `!elo clans` — Show the top 25 clans by average CSR
+      eloClansShowTop: '',
+      // EN: `!elo clan <tag>` — Show detailed stats and roster for a clan
+      eloClanTagShow: '',
+      // EN: `!elo explain` — Explains the ranking algorithm and symbols
+      eloExplainExplainsRanking: '',
+      // EN: `!elo help` — Show this message
+      eloHelpShowMessage: '',
       // EN: No linked ELO record found. Please use `!elo link <Your17DigitSteamID>` to link your account first!
       noLinkedEloRecord: '',
       // EN: ELO Lookup
@@ -526,6 +610,22 @@ export const MESSAGES = {
       veterancyModerate: '',
       // EN: High ({pct}%)
       veterancyHigh: '',
+      // EN: Visitors
+      matrixVisitors: '',
+      // EN: Provisional
+      matrixProvisional: '',
+      // EN: Regulars
+      matrixRegulars: '',
+      // EN: Veterancy
+      matrixVeterancy: '',
+      // EN: Top:
+      spreadTop: '',
+      // EN: Mid:
+      spreadMid: '',
+      // EN: Bot:
+      spreadBot: '',
+      // EN: Balanced
+      balanced: '',
       // EN: {winnerText} (+{ticketDiff} tickets)
       winnerTickets: '',
       // EN: Winner
@@ -546,6 +646,12 @@ export const MESSAGES = {
       fieldGlossary: '',
       // EN: Unknown
       unknownLayer: '',
+      // EN: Calibrated
+      calibrated: '',
+      // EN: Establishing
+      establishing: '',
+      // EN: **{pct}% winrate**
+      winrateBold: '',
       // EN: **{value} μ**
       muValue: '',
       // EN: {reliability} (**{sigma} σ**)
@@ -632,6 +738,10 @@ export const MESSAGES = {
       estimatedSkillRecordCertainty: '',
       // EN: Record: {wins}W / {losses}L ({roundsPlayed} rounds)
       recordWinsWLosses: '',
+      // EN: Rank: Provisional ({roundsPlayed}/{minRounds} rounds)
+      rankProvisional: '',
+      // EN: Rank: #{rank} (of {total} total)
+      rankPlacement: '',
     },
   },
 };

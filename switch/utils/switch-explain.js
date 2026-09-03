@@ -60,17 +60,17 @@ const SwitchExplain = {
    */
   register(plugin) {
     /**
-     * Build a 7-day reliability stats embed from historical round summaries.
-     * Scrapes the reporting channel for "Switch Round Summary" embeds from the
-     * last 7 days, aggregates standard-mode rounds, and returns a single embed
-     * with plain-English sentences.
+     * Build a 7-day reliability stats embed from the stored round aggregates.
+     * Sums the standard-mode rows written at the end of each round and returns
+     * a single embed with plain-English sentences.
      *
      * Returns null if no data is available (graceful degradation — caller should
      * drop the stats embed from the message rather than showing an empty embed).
      *
-     * Dependencies: requires _parseMode, _parseMoveTypes, _parseDenialReasons,
-     * _parseQueueOutcomes, _parseRoundStatsField, and _computeMedianFromMs to
-     * have been registered on the plugin by SwitchCommands.register().
+     * Dependencies: requires getRoundStatsTotals, registered on the plugin by
+     * SwitchDB.register(), and _computeMedianFromMs from
+     * SwitchCommands.register(). It used to need the whole family of embed
+     * parsers; those now serve only the one-shot backfill.
      *
      * @returns {object|null} Discord embed object, or null if no data
      */
@@ -362,7 +362,7 @@ function _buildTokenEmbed(plugin) {
     plugin.localize('switch.explain.refillTimePerToken', { cooldownStr })
   ].join('\n');
 
-  const poolExplanation = plugin.localize('switch.explain.tokensRefillOneTime', { maxTokens, value: maxTokens > 1 ? 'up to ' + maxTokens + ' times' : 'once' });
+  const poolExplanation = plugin.localize('switch.explain.tokensRefillOneTime', { maxTokens, value: maxTokens > 1 ? plugin.localize('switch.explain.upToNTimes', { maxTokens }) : plugin.localize('switch.explain.onceOnly') });
 
   let seedBonusField = null;
   if (seedBonusEnabled) {
@@ -609,10 +609,13 @@ function _buildTipsEmbed(plugin) {
 // ── 7-Day Stats Embed ──────────────────────────────────────────
 
 /**
- * Build a 7-day reliability stats embed from historical round summaries.
- * Scrapes the reporting channel for "Switch Round Summary" embeds from the
- * last 7 days, aggregates standard-mode rounds, and returns a single embed
- * with plain-English sentences.
+ * Build a 7-day reliability stats embed from the stored round aggregates.
+ * Sums the standard-mode rows written at the end of each round and returns a
+ * single embed with plain-English sentences.
+ *
+ * Liberal-mode rounds are excluded by getRoundStatsTotals: switching is
+ * unrestricted then, so a reliability figure drawn from them would describe a
+ * system nobody was actually using.
  *
  * Returns null if no data is available (graceful degradation — caller should
  * drop the stats embed from the message rather than showing an empty embed).
@@ -622,150 +625,18 @@ function _buildTipsEmbed(plugin) {
  */
 async function _buildSevenDayStatsEmbed(plugin) {
   try {
-    const channel = plugin.channel;
-    if (!channel) {
-      // No reporting channel configured — round summaries are posted to
-      // channelID, which may differ from explainChannelID. If channelID
-      // is unset, there are no summaries to scrape, so we silently drop
-      // the stats embed. The explain embeds still post fine.
-      plugin.verbose(2, '[Explain] No reporting channel available — 7-day stats embed omitted.');
+    // Read the stored rounds instead of re-parsing round-summary embeds out
+    // of Discord history. The scrape this replaces matched the embed title
+    // and field names in English, so it returned nothing at all on a
+    // translated server — and it cost fifty channel fetches to do it.
+    if (typeof plugin.getRoundStatsTotals !== 'function') {
+      plugin.verbose(2, '[Explain] Round stats unavailable — 7-day stats embed omitted.');
       return null;
     }
 
-    const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
-    let lastID = null;
-    let foundAny = false;
-    const totals = {
-      rounds: 0,
-      success: 0,
-      failed: 0,
-      denied: 0,
-      instant: 0,
-      queueNormal: 0,
-      queueTeamTrade: 0,
-      queueJoinSwap: 0,
-      queueTimeoutSwitch: 0,
-      outcomeExpired: 0,
-      outcomeDC: 0,
-      outcomeCancelled: 0,
-      outcomeRemoved: 0,
-      denialCooldown: 0,
-      denialTimeWindow: 0,
-      denialScrambleLock: 0,
-      medianDurationsMs: [],
-      toT1: 0,
-      toT2: 0
-    };
-
-    // Scrape in batches of 100 with 300ms delay between batches
-    for (let i = 0; i < 50; i++) {
-      const options = { limit: 100 };
-      if (lastID) options.before = lastID;
-
-      let messages;
-      try {
-        messages = await channel.messages.fetch(options);
-      } catch (_) {
-        break; // rate limited or channel unavailable
-      }
-
-      if (!messages || messages.size === 0) break;
-
-      for (const [, msg] of messages) {
-        // Stop if we've gone past 7 days
-        if (msg.createdTimestamp < sevenDaysAgo) {
-          foundAny = true; // we found at least something in range
-          // We can't break the outer loop easily, but we'll stop processing
-          continue;
-        }
-
-        if (!msg.embeds || msg.embeds.length === 0) continue;
-
-        for (const embed of msg.embeds) {
-          // English on purpose, and not a catalogue key: switch-output.js writes
-          // this title as a literal so that the reports already sitting in the
-          // channel stay readable, and history does not re-title itself when the
-          // server's language changes. switch-commands.js matches it the same way.
-          if (embed.title !== 'Switch Round Summary') continue;
-          foundAny = true;
-
-          // Skip liberal-mode rounds
-          const mode = plugin._parseMode ? plugin._parseMode(embed) : null;
-          if (mode === 'liberal') continue;
-
-          totals.rounds++;
-
-          // Parse stats field — first locate the 📊 Stats field by name, then pass its value
-          const statsField = embed.fields?.find(f => f.name?.includes('Stats'));
-          if (plugin._parseRoundStatsField && statsField?.value) {
-            const stats = plugin._parseRoundStatsField(statsField.value);
-            totals.success += stats.success;
-            totals.failed += stats.failed;
-            totals.denied += stats.denied;
-            totals.toT1 += stats.toT1;
-            totals.toT2 += stats.toT2;
-          }
-
-          // Parse queue wait from the stats field: extract mean and median
-          // for the 7-day aggregate. Matches the format written by
-          // switch-output.js _buildRoundSummaryEmbed():
-          //   "**Queue Wait:** mean 2m 15s, median 3m 10s"
-          if (statsField?.value) {
-            const queueMatch = statsField.value.match(
-              /\*\*Queue Wait:\*\* mean\s*(?:(\d+)m )?(\d+)s, median\s*(?:(\d+)m )?(\d+)s/
-            );
-            if (queueMatch) {
-              const mm = queueMatch[3] ? parseInt(queueMatch[3], 10) : 0;
-              const ms = parseInt(queueMatch[4], 10);
-              totals.medianDurationsMs.push((mm * 60 + ms) * 1000);
-            }
-          }
-
-          // Parse move types
-          if (plugin._parseMoveTypes) {
-            const moves = plugin._parseMoveTypes(embed);
-            totals.instant += moves.instant;
-            totals.queueNormal += moves.queueNormal;
-            totals.queueTeamTrade += moves.queueTeamTrade;
-            totals.queueJoinSwap += moves.queueJoinSwap;
-            totals.queueTimeoutSwitch += moves.queueTimeoutSwitch;
-          }
-
-          // Parse denial reasons
-          if (plugin._parseDenialReasons) {
-            const reasons = plugin._parseDenialReasons(embed);
-            totals.denialCooldown += reasons.cooldown;
-            totals.denialTimeWindow += reasons.time_window;
-            totals.denialScrambleLock += reasons.scramble_lock;
-          }
-
-          // Parse queue outcomes
-          if (plugin._parseQueueOutcomes) {
-            const outcomes = plugin._parseQueueOutcomes(embed);
-            totals.outcomeExpired += outcomes.expired;
-            totals.outcomeDC += outcomes.dc;
-            totals.outcomeCancelled += outcomes.cancelled;
-            totals.outcomeRemoved += outcomes.removed;
-          }
-        }
-      }
-
-      // Track the oldest message ID for the next batch
-      const oldest = messages.last();
-      if (oldest) {
-        lastID = oldest.id;
-        // If the oldest message is older than 7 days, we're done
-        if (oldest.createdTimestamp < sevenDaysAgo) break;
-      } else {
-        break;
-      }
-
-      // Throttle: 300ms between batches
-      await new Promise(r => setTimeout(r, 300));
-    }
-
-    // If no data at all, return null (caller drops the embed)
-    if (!foundAny || totals.rounds === 0) return null;
+    const sevenDaysAgo = new Date(Date.now() - (7 * 24 * 60 * 60 * 1000));
+    const totals = await plugin.getRoundStatsTotals(sevenDaysAgo);
+    if (!totals || totals.standardRounds === 0) return null;
 
     // ── Compute statistics ────────────────────────────────────
     // NOTE: "attempted" includes both successes and failures (switches that
@@ -786,17 +657,19 @@ async function _buildSevenDayStatsEmbed(plugin) {
     const medSec = Math.round((globalMedianMs % 60000) / 1000);
     const medianStr = medMin > 0
       ? plugin.localize(medMin === 1 ? 'switch.explain.durationMinute' : 'switch.explain.durationMinutes', { mins: medMin })
-      : medSec > 0 ? `${medSec} seconds` : 'N/A';
+      : medSec > 0 ? plugin.localize('switch.explain.durationSeconds', { secs: medSec }) : plugin.localize('switch.explain.statNotAvailable');
 
-    // Average queue wait from medianDurationsMs
-    const avgMs = totals.medianDurationsMs.length > 0
-      ? Math.round(totals.medianDurationsMs.reduce((a, b) => a + b, 0) / totals.medianDurationsMs.length)
+    // Average queue wait. The scrape could only ever recover per-round
+    // medians, so it averaged those and called it a mean; the stored rows
+    // carry each round's actual mean, so this is now the thing it claims.
+    const avgMs = totals.queueDurationsMs.length > 0
+      ? Math.round(totals.queueDurationsMs.reduce((a, b) => a + b, 0) / totals.queueDurationsMs.length)
       : 0;
     const avgMin = Math.floor(avgMs / 60000);
     const avgSec = Math.round((avgMs % 60000) / 1000);
     const avgStr = avgMin > 0
       ? plugin.localize(avgMin === 1 ? 'switch.explain.aboutMinute' : 'switch.explain.aboutMinutes', { mins: avgMin })
-      : avgSec > 0 ? plugin.localize('switch.explain.aboutSeconds', { avgSec }) : 'N/A';
+      : avgSec > 0 ? plugin.localize('switch.explain.aboutSeconds', { avgSec }) : plugin.localize('switch.explain.statNotAvailable');
 
     // ── Build plain-English sentences ─────────────────────────
     const lines = [];
@@ -838,7 +711,7 @@ async function _buildSevenDayStatsEmbed(plugin) {
     const totalSwitches = totals.success;
     lines.push(plugin.localize('switch.explain.basedOnSwitchesRounds', {
       switches: plugin.localize(totalSwitches === 1 ? 'switch.explain.successfulSwitch' : 'switch.explain.successfulSwitches', { totalSwitches }),
-      rounds: plugin.localize(totals.rounds === 1 ? 'switch.explain.acrossRound' : 'switch.explain.acrossRounds', { rounds: totals.rounds })
+      rounds: plugin.localize(totals.standardRounds === 1 ? 'switch.explain.acrossRound' : 'switch.explain.acrossRounds', { rounds: totals.standardRounds })
     }));
 
     return {

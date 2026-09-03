@@ -16,6 +16,24 @@
  * Category 3 = test plans (informational listing only)
  *
  * Exit code: 0 = all pass, 1 = any failure
+ *
+ * ─── RUN ONE SUITE AT A TIME ─────────────────────────────────────
+ *
+ * Do not run this concurrently with switch/testing/run-all-tests.js, or
+ * with a second copy of itself.
+ *
+ * test-i18n.js regenerates s3/locale-templates/ — a fixed, tracked
+ * directory, not a temp one — and reads the results back. Two runners
+ * doing that at once read each other's half-written output, and
+ * test-i18n.js fails with nothing wrong in the code. It reproduces as a
+ * clean pass the moment the suites are run one after the other. If you
+ * see exactly one failure and it is test-i18n.js, check this first.
+ *
+ * Two side effects of a normal run, both expected:
+ *   - s3/locale-templates/* comes back modified. That is the generator,
+ *     not a stray edit.
+ *   - MySQL/Postgres cases SKIP when the engines are not up. Read the skip
+ *     count; a skip is not a pass.
  */
 
 'use strict';
@@ -41,6 +59,12 @@ const CATEGORY_TESTS = {
     // catalogue makes every downstream plugin's log output nonsense, so it
     // should fail before the slower suites spend four minutes on it.
     'test-i18n.js',
+    // The other half of the i18n guarantee: test-i18n.js proves the catalogue
+    // is sound, this proves the embeds actually use it. Renders every builder
+    // through a bracketing localize() and fails on prose that never went
+    // through the catalogue — including literals assigned to intermediate
+    // variables, which no static scan of display anchors can see.
+    'test-i18n-render.js',
     'test-s3-export-import.js',
     'test-s3-commands.js',
     'test-inspection-embeds.js',
@@ -111,6 +135,7 @@ const CATEGORY_TESTS = {
     'test-team-change-retry.js',
     'test-request-team-change-eosid.js',
     'test-migration-pipeline.js',
+    'test-migrate-flag-safety.js',
     'test-command-routing.js'
   ],
   4: [

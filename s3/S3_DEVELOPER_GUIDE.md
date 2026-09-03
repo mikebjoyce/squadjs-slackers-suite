@@ -1740,7 +1740,7 @@ table names. Several deliberately differ (model `S3GameStateEvents` → table
 
 | Tier | Flag | Models included |
 |------|------|-----------------|
-| Historical | (default) | `S3SchemaVersions`, `Elo_PlayerStats`, `Elo_RoundHistory`, `Elo_RoundPlayers`, `SA_AssignmentLog`, `TB_RoundReport`, `SwitchPlugin_Settings` |
+| Historical | (default) | `S3SchemaVersions`, `Elo_PlayerStats`, `Elo_RoundHistory`, `Elo_RoundPlayers`, `SA_AssignmentLog`, `TB_RoundReport`, `SwitchPlugin_Settings`, `SwitchPlugin_RoundStats` |
 | Logging | `--logs` | Above + `S3PlayerEvents`, `S3GameStateEvents`, `S3PlayerSnapshots` |
 | All | `--all` | Above + all auto-recoverable state: `S3GameState`, `S3_PlayerSession`, `S3PlayerReconnect`, `SwitchPlugin_PlayerCooldowns`, `SwitchPlugin_Endmatches`, `Elo_PluginState`, `TeamBalancerState` |
 
@@ -1885,6 +1885,7 @@ node s3/testing/test-game-state-service.js
 | `test-s3-plugin-base-db.js` | Base class DB: model definition, migration flow |
 | `test-s3-discord-plugin-base.js` | Discord channel setup, `sendDiscordMessage()` |
 | `test-i18n.js` | Catalogue parity, call-site keys and vars, language resolution |
+| `test-i18n-render.js` | Renders every embed builder through a pseudo-locale; fails on prose that never reached the catalogue |
 | `test-s3-export-import.js` | Three-tier export/import, JSON format, validation |
 | `test-s3-commands.js` | All `!s3` command paths, embed builders |
 | `test-command-standardization.js` | Elo lookup helper, Switch help fallback |
@@ -1906,6 +1907,7 @@ node s3/testing/test-game-state-service.js
 | `test-migration-partial-retry.js` | A migration whose `up()` commits real DDL/DML but fails post-commit `touches` verification is safely retryable — `addColumn`/`bulkInsert` don't crash on a raw duplicate-column/duplicate-key error, real engines |
 | `test-migration-data-assertions.js` | Migrations' data effects are asserted, not assumed — see `TASK_MIGRATION_DATA_ASSERTIONS.md` |
 | `test-drift-recovery-matrix.js` | Drift recovery across every DB state a server can be in — brand new, behind, drifted, behind *and* drifted, multi-plugin — on SQLite, MySQL and Postgres |
+| `test-migrate-flag-safety.js` | A destructive command whose safety flag is misspelled — `[--dry-run]`, brackets and all, as copied from a usage line — refuses instead of taking its destructive default, and a dry run leaves no trace, including an armed confirmation gate |
 | `test-command-routing.js` | `!s3` subcommand dispatch and argument parsing |
 | `test-inspection-embeds.js` | Inspection/embed builders render without throwing on sparse data |
 | `test-sa-per-player-lock.js` | Per-player lock acquisition/release under contention |

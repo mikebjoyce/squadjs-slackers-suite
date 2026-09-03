@@ -429,18 +429,20 @@ test('tier sets use model names, not table names', () => {
 
 test('the production model roster is fully accounted for', () => {
   // Ground truth: the 13 models a real production export emitted on 2026-08-19,
-  // plus the 4 that were invisible. If a future change adds a model without
-  // assigning it a tier, this list and the tier sets fall out of step.
+  // plus the 4 that were invisible, plus SwitchPlugin_RoundStats, which
+  // postdates that export. If a future change adds a model without assigning
+  // it a tier, this list and the tier sets fall out of step.
   const PRODUCTION_ROSTER = [
     'S3SchemaVersions', 'S3PlayerEvents', 'S3GameStateEvents', 'S3PlayerSnapshots',
     'S3GameState', 'S3PlayerReconnect', 'S3_PlayerSession',
     'SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_Endmatches', 'SwitchPlugin_Settings',
+    'SwitchPlugin_RoundStats',
     'TeamBalancerState', 'TB_RoundReport',
     'Elo_PluginState', 'Elo_PlayerStats', 'Elo_RoundHistory', 'Elo_RoundPlayers',
     'SA_AssignmentLog'
   ];
 
-  assert.equal(PRODUCTION_ROSTER.length, 17, 'roster drifted');
+  assert.equal(PRODUCTION_ROSTER.length, 18, 'roster drifted');
 
   const union = new Set();
   for (const set of Object.values(TIER_SETS)) for (const n of set) union.add(n);
@@ -643,7 +645,7 @@ const PLUGIN_DIRS = ['s3', 'elo-tracker', 'team-balancer', 'smart-assign', 'swit
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /** Every model in the repo. A change to this number is a deliberate act. */
-const EXPECTED_DEFINITION_SITES = 17;
+const EXPECTED_DEFINITION_SITES = 18;
 
 function collectSourceFiles() {
   const files = [];
