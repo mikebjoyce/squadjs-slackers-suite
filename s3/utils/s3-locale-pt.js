@@ -2,6 +2,8 @@
  * ─────────────────────────────────────────────────────────────────
  *  s3-locale-pt.js — Portuguese message catalogue
  * ─────────────────────────────────────────────────────────────────
+ *  Translation by Lucas Kruger (@LKrugerr).
+ *
  *  Keys are <plugin>.<surface>.<name>. English is the source of
  *  truth; every other catalogue mirrors its keys and placeholders.
  *

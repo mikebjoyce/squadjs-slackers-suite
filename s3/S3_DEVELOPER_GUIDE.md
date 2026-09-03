@@ -2139,7 +2139,7 @@ S³ must appear **before** consumer plugins:
 | `enableFileLogging` | boolean | `false` | Mirror each DB log write as a JSONL line at `logPath` |
 | `logPath` | string | `'./s3-log.jsonl'` | JSONL mirror path, used only when `enableFileLogging` is true |
 | `autoMigrate` | boolean | `false` | Auto-apply migrations without Discord confirmation |
-| `language` | string | `'en'` | Language for all S³ plugin messages. Available: `en`, `pt`. Set here only — every consumer plugin inherits it and none has a `language` option of its own. Unknown codes fall back to `en` with a warning. See `s3/LOCALIZATION.md` |
+| `language` | string | `'en'` | Language for all S³ plugin messages. Available: `en`, and `pt` as a partial catalogue — untranslated keys fall back to `en` individually, so a partial language renders as a mix. Set here only — every consumer plugin inherits it and none has a `language` option of its own. Unknown codes fall back to `en` with a warning. See `s3/LOCALIZATION.md` |
 | `stderrDiagnostics` | string | `'off'` | `'off'` / `'mirror'` / `'auto'` — mirror S³ failures to fd 2. See §9.9 |
 | `stderrDedupeWindowSeconds` | number | `60` | Identical stderr events inside the window are counted, not written. See §9.9 |
 

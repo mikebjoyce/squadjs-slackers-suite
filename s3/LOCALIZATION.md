@@ -3,7 +3,10 @@
 S³ plugins can render their messages in a language other than English. This
 document covers configuring it, adding strings, and contributing a language.
 
-Currently shipping: **English (`en`)** and **Portuguese (`pt`)**.
+Currently shipping: **English (`en`)**, and **Portuguese (`pt`)** as a
+partial catalogue — a minority of the suite is translated so far and everything
+else falls back to English. That is a usable state, not a broken one, but set
+`pt` expecting a mixed-language server rather than a Portuguese one.
 
 ---
 
@@ -141,8 +144,8 @@ leaderboard are the same tier, because a random player reads both.
 
 | Template | Strings | Who reads it |
 |---|---|---|
-| `s3-locale-template-players.js` | **266** | Any player — broadcasts, AdminWarn popups, public `!elo` replies |
-| `s3-locale-template-admins.js` | 901 | Your staff — admin-gated commands, scramble and diagnostic reports |
+| `s3-locale-template-players.js` | **319** | Any player — broadcasts, AdminWarn popups, public `!elo` replies |
+| `s3-locale-template-admins.js` | 1158 | Your staff — admin-gated commands, scramble and diagnostic reports |
 
 **Start with the player tier.** It is the smallest by a wide margin and the
 only one where an untranslated string lands in front of someone who never chose
@@ -190,6 +193,23 @@ node tools/make-locale-templates.mjs
 The test suite fails if the committed templates are stale, so they cannot
 silently drift from the catalogue, and it checks that no key lands in two tiers
 — which would make `mergeMessages` pick a winner instead of joining them.
+
+### Finishing a catalogue that already exists
+
+The instructions above are for a language with no catalogue yet. If
+`s3-locale-<code>.js` is already there and partly filled, **do not copy a
+template over it** — that silently discards whatever is already translated, and
+because missing keys fall back to English rather than erroring, nothing tells
+you it happened.
+
+Edit the existing file instead, and use the template as the checklist of what is
+still missing: every key in the tier is listed there, each with its English
+original on the line above. Copy across the entries whose value is still `''`,
+fill them in, and leave the rest of the file alone.
+
+The same rule covers the reverse case. A catalogue that already carries both
+tiers is using `mergeMessages`; adding keys means adding them inside the right
+argument, not appending a third one.
 
 ### Don't sort by surface name — several of them lie
 

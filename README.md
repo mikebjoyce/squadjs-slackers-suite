@@ -239,6 +239,12 @@ the JSONL/file output — set `enableDatabaseLogging: false` on that plugin's co
 block. JSONL/file logging is a separate set of options per plugin (e.g. SmartAssign's
 `enableEventLogging` + `logPath`, S³'s `enableFileLogging`) and is unaffected either way.
 
+## Contributing
+
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** — it covers the handful of repo
+conventions that are not discoverable from the source, and is worth two minutes
+before opening a PR.
+
 ## For Plugin Developers
 
 If you're building a new plugin that consumes S³, see the **[S³ Developer Guide](s3/S3_DEVELOPER_GUIDE.md)** — it covers the service catalog, access patterns, base classes (`S3PluginBase` / `S3DiscordPluginBase`), migration workflow, event model, and integration checklist.
@@ -307,6 +313,7 @@ GitHub: https://github.com/mikebjoyce
 
 - **Davide Fantino** ([fantinodavide](https://github.com/fantinodavide)) — For the open-source Switch plugin that the v2 Switch is based on.
 - **Hans-Vader** ([Hans-Vader](https://github.com/Hans-Vader)) — For contributions to the Team Balancer plugin.
+- **Lucas Kruger** ([LKrugerr](https://github.com/LKrugerr)) — For the Portuguese translation, and for raising localization as a gap in the first place.
 
 ---
 
