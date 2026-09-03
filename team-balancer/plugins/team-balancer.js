@@ -1072,9 +1072,8 @@ export default class TeamBalancer extends S3PluginBase {
           // also add it here so new installs get the full schema from day one. Delta migrations
           // should guard with describeTable() checks so they are safe no-ops on new installs.
           up: async (qi) => {
-            const existing = await qi.showAllTables();
 
-            if (!existing.includes('TeamBalancerState')) {
+            if (!(await qi.tableExists('TeamBalancerState'))) {
               await qi.createTable('TeamBalancerState', {
                 id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: false, defaultValue: 1 },
                 winStreakTeam: { type: qi.DataTypes.INTEGER, allowNull: true },
@@ -1088,7 +1087,7 @@ export default class TeamBalancer extends S3PluginBase {
               });
             }
 
-            if (!existing.includes('TB_RoundReport')) {
+            if (!(await qi.tableExists('TB_RoundReport'))) {
               await qi.createTable('TB_RoundReport', {
                 id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
                 matchId: { type: qi.DataTypes.STRING(20), allowNull: true },
@@ -1131,8 +1130,7 @@ export default class TeamBalancer extends S3PluginBase {
           // New installs get this column from v1's createTable, so we guard with describeTable()
           // to make this a safe no-op when the column already exists.
           up: async (qi) => {
-            const existing = await qi.showAllTables();
-            if (existing.includes('TeamBalancerState')) {
+            if (await qi.tableExists('TeamBalancerState')) {
               const cols = await qi.describeTable('TeamBalancerState');
               if (!cols.scrambleOnRoundEndBy) {
                 await qi.addColumn('TeamBalancerState', 'scrambleOnRoundEndBy', {
@@ -1143,8 +1141,7 @@ export default class TeamBalancer extends S3PluginBase {
             }
           },
           down: async (qi) => {
-            const existing = await qi.showAllTables();
-            if (existing.includes('TeamBalancerState')) {
+            if (await qi.tableExists('TeamBalancerState')) {
               await qi.removeColumn('TeamBalancerState', 'scrambleOnRoundEndBy');
             }
           }

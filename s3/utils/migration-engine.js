@@ -155,6 +155,40 @@ function describePermissionError(err) {
 }
 
 /**
+ * Does `existing` contain `name`, ignoring identifier case?
+ *
+ * showAllTables() reports the names the engine actually stores, and those are
+ * not always the names we asked for. MySQL with lower_case_table_names=1 folds
+ * every identifier to lowercase on disk, so a server that was asked for
+ * `SwitchPlugin_RoundStats` reports `switchplugin_roundstats` back. Statements
+ * that name the table are folded the same way, so createTable, describeTable
+ * and every query keep working — showAllTables() is the one place the
+ * difference is visible, and an exact-match comparison there reads a table that
+ * exists as missing.
+ *
+ * That has two costs, both of which have been paid on a live server. A create
+ * guard concludes the table is absent and reissues the CREATE; a positive guard
+ * (`if the table is there, alter it`) concludes it is absent and silently skips
+ * the body it was protecting, which is the worse of the two because nothing
+ * fails.
+ *
+ * Entries are strings on every dialect the suite runs except some Postgres
+ * paths, which return `{ tableName, schema }`.
+ *
+ * @param {Array<string|{tableName:string}>} existing - showAllTables() result
+ * @param {string} name - The table name the caller is asking about
+ * @returns {boolean}
+ */
+function hasTable(existing, name) {
+  if (!Array.isArray(existing) || typeof name !== 'string') return false;
+  const target = name.toLowerCase();
+  return existing.some((entry) => {
+    const actual = typeof entry === 'string' ? entry : entry?.tableName;
+    return typeof actual === 'string' && actual.toLowerCase() === target;
+  });
+}
+
+/**
  * Create a QueryInterface object bound to a specific DBService + transaction.
  * Passed as the sole argument to migration up()/down() handlers.
  */
@@ -305,7 +339,7 @@ function createQueryInterface(sequelize, db, transaction, { isReapply = false } 
       }
       // Check existence first — no-op if already gone (e.g. orphan tables from partial runs)
       const tables = await sequelize.getQueryInterface().showAllTables({ transaction });
-      if (!tables.includes(tableName)) return;
+      if (!hasTable(tables, tableName)) return;
       const timestamp = Date.now();
       const deprecatedName = `${tableName}_deprecated_${timestamp}`;
       await qi.renameTable(tableName, deprecatedName, { transaction });
@@ -399,6 +433,18 @@ function createQueryInterface(sequelize, db, transaction, { isReapply = false } 
     async showAllTables() {
       const qi = sequelize.getQueryInterface();
       return qi.showAllTables({ transaction });
+    },
+
+    /**
+     * Does this table exist? Use this in migration guards instead of
+     * `(await qi.showAllTables()).includes(name)`, which is case-sensitive and
+     * therefore wrong on MySQL with lower_case_table_names=1. See hasTable().
+     * @param {string} tableName
+     * @returns {Promise<boolean>}
+     */
+    async tableExists(tableName) {
+      const qi = sequelize.getQueryInterface();
+      return hasTable(await qi.showAllTables({ transaction }), tableName);
     },
 
     /**
@@ -1215,7 +1261,7 @@ export default class MigrationEngine {
     if (migration.touches.creates) {
       const existing = await qi.showAllTables();
       for (const tableName of migration.touches.creates) {
-        if (!existing.includes(tableName)) {
+        if (!hasTable(existing, tableName)) {
           failures.push(`Table "${tableName}" was not created (permission denied?)`);
           missingTables.add(tableName);
         }

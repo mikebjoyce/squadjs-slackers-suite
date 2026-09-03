@@ -65,6 +65,25 @@ import SwitchExplain from '../utils/switch-explain.js';
 import { buildAssembly, importFromAssembly, cleanAssembly } from '../../s3/testing/plugin-assembly.js';
 
 const TABLE = 'SwitchPlugin_RoundStats';
+
+/**
+ * Is TABLE among the names the engine reports, ignoring identifier case?
+ *
+ * MySQL with lower_case_table_names=1 — which is what the production server
+ * runs — stores the table as `switchplugin_roundstats` and reports that name
+ * back from showAllTables(), while every statement naming the table keeps
+ * working. An exact match here fails on a server that is perfectly healthy.
+ *
+ * @param {Array<string|{tableName:string}>} tables - showAllTables() result
+ * @returns {boolean}
+ */
+function hasRoundStatsTable(tables) {
+  const target = TABLE.toLowerCase();
+  return tables.some((entry) => {
+    const actual = typeof entry === 'string' ? entry : entry?.tableName;
+    return typeof actual === 'string' && actual.toLowerCase() === target;
+  });
+}
 const ASSEMBLY = buildAssembly('.tmp-switch-round-stats');
 const Switch = await importFromAssembly(ASSEMBLY, 'switch.js');
 
@@ -384,7 +403,7 @@ await onEachEngine('migration v6 creates the round stats table', async (dialect)
     assert.ok(ctx.model, 'SwitchPlugin_RoundStats should be a registered model');
     const qi = ctx.seq.getQueryInterface();
     const tables = await qi.showAllTables();
-    assert.ok(tables.includes(TABLE), `migration should have created ${TABLE}`);
+    assert.ok(hasRoundStatsTable(tables), `migration should have created ${TABLE} — found: ${tables.join(', ')}`);
 
     // Every column the row builder writes has to exist, or the first round
     // end of the day fails on a live server rather than in this file.
@@ -452,7 +471,7 @@ await runTest('migration v6 runs under a production-shaped MySQL grant (CREATE, 
     const ctx = await buildPlugin({ dialect: 'mysql', connection: restricted });
     try {
       const tables = await ctx.seq.getQueryInterface().showAllTables();
-      assert.ok(tables.includes(TABLE), `${TABLE} should have been created without ALTER`);
+      assert.ok(hasRoundStatsTable(tables), `${TABLE} should have been created without ALTER — found: ${tables.join(', ')}`);
 
       // And the table has to be usable, not merely present: the grant covers
       // DML, so a round must still store and read back.

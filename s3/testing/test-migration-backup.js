@@ -115,8 +115,7 @@ async function main() {
       description: 'idempotent create of a table that already exists',
       touches: { creates: ['big_log'] },
       up: async (qi) => {
-        const existing = await qi.showAllTables();
-        if (!existing.includes('big_log')) await qi.createTable('big_log', {});
+        if (!(await qi.tableExists('big_log'))) await qi.createTable('big_log', {});
       },
       down: async () => {}
     }]);

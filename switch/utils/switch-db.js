@@ -289,8 +289,7 @@ const SwitchDB = {
           creates: ['SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_Endmatches']
         },
         up: async (qi) => {
-          const existing = await qi.showAllTables();
-          if (!existing.includes('SwitchPlugin_PlayerCooldowns')) {
+          if (!(await qi.tableExists('SwitchPlugin_PlayerCooldowns'))) {
             await qi.createTable('SwitchPlugin_PlayerCooldowns', {
               eosID: { type: qi.DataTypes.STRING, primaryKey: true, allowNull: false },
               steamID: { type: qi.DataTypes.STRING, allowNull: true },
@@ -300,7 +299,7 @@ const SwitchDB = {
               scrambleLockdownExpiry: { type: qi.DataTypes.DATE, allowNull: true }
             });
           }
-          if (!existing.includes('SwitchPlugin_Endmatches')) {
+          if (!(await qi.tableExists('SwitchPlugin_Endmatches'))) {
             await qi.createTable('SwitchPlugin_Endmatches', {
               id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
               name: { type: qi.DataTypes.STRING },
@@ -325,8 +324,7 @@ const SwitchDB = {
           }
         },
         up: async (qi) => {
-          const existing = await qi.showAllTables();
-          if (!existing.includes('SwitchPlugin_Settings')) {
+          if (!(await qi.tableExists('SwitchPlugin_Settings'))) {
             await qi.createTable('SwitchPlugin_Settings', {
               key: { type: qi.DataTypes.STRING, primaryKey: true, allowNull: false },
               value: { type: qi.DataTypes.STRING, allowNull: false }
@@ -356,8 +354,7 @@ const SwitchDB = {
           }
         },
         up: async (qi) => {
-          const existing = await qi.showAllTables();
-          if (existing.includes('SwitchPlugin_PlayerCooldowns')) {
+          if (await qi.tableExists('SwitchPlugin_PlayerCooldowns')) {
             const columns = await qi.describeTable('SwitchPlugin_PlayerCooldowns');
             if (!columns.tokenBalance) {
               await qi.addColumn('SwitchPlugin_PlayerCooldowns', 'tokenBalance', {
@@ -413,8 +410,7 @@ const SwitchDB = {
           // up migration cannot be recovered — this is intentionally irreversible
           // by design (the expand-contract pattern drops the old column only when
           // the "contract" step is ready, but the deleted rows are gone regardless).
-          const existing = await qi.showAllTables();
-          if (existing.includes('SwitchPlugin_PlayerCooldowns')) {
+          if (await qi.tableExists('SwitchPlugin_PlayerCooldowns')) {
             const columns = await qi.describeTable('SwitchPlugin_PlayerCooldowns');
             if (columns.tokenBalance) {
               await qi.removeColumn('SwitchPlugin_PlayerCooldowns', 'tokenBalance');
@@ -450,8 +446,7 @@ const SwitchDB = {
           }
         },
         up: async (qi) => {
-          const existing = await qi.showAllTables();
-          if (existing.includes('SwitchPlugin_Settings')) {
+          if (await qi.tableExists('SwitchPlugin_Settings')) {
             const SettingsModel = qi.db.getModel('SwitchPlugin_Settings');
             if (SettingsModel) {
               const row = await SettingsModel.findByPk('explainMessageId', { transaction: qi.transaction });
@@ -498,8 +493,7 @@ const SwitchDB = {
           }
         },
         up: async (qi) => {
-          const existing = await qi.showAllTables();
-          if (existing.includes('SwitchPlugin_PlayerCooldowns')) {
+          if (await qi.tableExists('SwitchPlugin_PlayerCooldowns')) {
             const columns = await qi.describeTable('SwitchPlugin_PlayerCooldowns');
             if (!columns.lastActiveTimestamp) {
               await qi.addColumn('SwitchPlugin_PlayerCooldowns', 'lastActiveTimestamp', {
@@ -538,8 +532,7 @@ const SwitchDB = {
           }
         },
         down: async (qi) => {
-          const existing = await qi.showAllTables();
-          if (existing.includes('SwitchPlugin_PlayerCooldowns')) {
+          if (await qi.tableExists('SwitchPlugin_PlayerCooldowns')) {
             const columns = await qi.describeTable('SwitchPlugin_PlayerCooldowns');
             if (columns.lastActiveTimestamp) {
               await qi.removeColumn('SwitchPlugin_PlayerCooldowns', 'lastActiveTimestamp');
@@ -559,8 +552,7 @@ const SwitchDB = {
           creates: ['SwitchPlugin_RoundStats']
         },
         up: async (qi) => {
-          const existing = await qi.showAllTables();
-          if (!existing.includes('SwitchPlugin_RoundStats')) {
+          if (!(await qi.tableExists('SwitchPlugin_RoundStats'))) {
             await qi.createTable('SwitchPlugin_RoundStats', {
               id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
               matchId: { type: qi.DataTypes.STRING, allowNull: true },

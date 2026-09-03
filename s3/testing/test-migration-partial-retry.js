@@ -205,7 +205,12 @@ async function runSuite(label, dbFactory, reopenOnSameStorage) {
     await test(`[${label}] up() commits real DDL/DML even though verification fails`, async () => {
       assert.ok(firstErr, 'expected the first run to throw on verification failure');
       const tables = await sequelize.getQueryInterface().showAllTables();
-      assert.ok(tables.includes('PRProbe'), 'PRProbe should exist — v1 createTable committed');
+      // Compared case-insensitively: MySQL with lower_case_table_names=1 reports
+      // `prprobe`, and an exact match here would fail on a server that is fine.
+      assert.ok(
+        tables.some((t) => String(typeof t === 'string' ? t : t?.tableName).toLowerCase() === 'prprobe'),
+        `PRProbe should exist — v1 createTable committed. Found: ${tables.join(', ')}`
+      );
       const cols = await sequelize.getQueryInterface().describeTable('PRProbe');
       assert.ok(cols.addedColumn, 'addedColumn should exist — v2 addColumn committed');
       const indexes = await sequelize.getQueryInterface().showIndex('PRProbe');

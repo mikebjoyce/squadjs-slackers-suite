@@ -46,6 +46,22 @@ function test(name, fn) {
   tests.push({ name, fn });
 }
 
+/**
+ * Does `tables` contain `name`, ignoring identifier case?
+ *
+ * This file runs its MySQL fixtures against a real server, and a server
+ * initialized with lower_case_table_names=1 (production's setting) folds
+ * every table name it stores, so an exact-match check here would fail on a
+ * healthy migration. See hasTable() in migration-engine.js for the full story.
+ */
+function hasTable(tables, name) {
+  const target = name.toLowerCase();
+  return tables.some((entry) => {
+    const actual = typeof entry === 'string' ? entry : entry?.tableName;
+    return typeof actual === 'string' && actual.toLowerCase() === target;
+  });
+}
+
 // A skip is neither a pass nor a failure and must be counted separately \u2014
 // see docs/core/AI_AGENTS_OVERVIEW.md "A green suite is not dialect coverage".
 class SkipTest extends Error {
@@ -669,7 +685,7 @@ async function runCreateTableTest(harness, expectSuccess) {
 
     const qi = sequelize.getQueryInterface();
     const tables = await qi.showAllTables();
-    assert.ok(tables.includes('TestTable'), 'TestTable should exist in DB');
+    assert.ok(hasTable(tables, 'TestTable'), `TestTable should exist in DB — found: ${tables.join(', ')}`);
   } else {
     let rejected = false;
     try {
@@ -682,7 +698,7 @@ async function runCreateTableTest(harness, expectSuccess) {
     // Verify table was NOT created
     const qi = sequelize.getQueryInterface();
     const tables = await qi.showAllTables();
-    assert.ok(!tables.includes('TestTable'), 'TestTable must NOT exist after failed migration');
+    assert.ok(!hasTable(tables, 'TestTable'), `TestTable must NOT exist after failed migration — found: ${tables.join(', ')}`);
   }
 }
 

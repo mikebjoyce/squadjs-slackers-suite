@@ -224,10 +224,14 @@ for (const { name: dialect } of DIALECTS) {
       const qi = seq.getQueryInterface();
       const existing = await qi.showAllTables();
       const normalized = existing.map((t) => (typeof t === 'string' ? t : t.tableName));
+      // Compared case-insensitively: MySQL with lower_case_table_names=1 reports
+      // `s3_schemaversions` for a table declared as `S3_SchemaVersions`. The
+      // assertion above pins the declared name, so folding here loses nothing.
+      const folded = new Set(normalized.map((t) => String(t).toLowerCase()));
 
       for (const expectedTable of Object.values(PREVIOUSLY_INVISIBLE)) {
         assert.ok(
-          normalized.includes(expectedTable),
+          folded.has(expectedTable.toLowerCase()),
           `table ${expectedTable} not present after mount. Found: ${normalized.join(', ')}`
         );
       }

@@ -125,6 +125,20 @@ function getLiveQI(sequelize) {
   return sequelize.getQueryInterface();
 }
 
+/**
+ * Does `tables` contain `name`, ignoring identifier case? Use this for a
+ * "does this table exist" assertion. The case-folding regression tests below
+ * check the fold itself and intentionally stay case-sensitive — see hasTable()
+ * in migration-engine.js for the full story.
+ */
+function hasTable(tables, name) {
+  const target = name.toLowerCase();
+  return tables.some((entry) => {
+    const actual = typeof entry === 'string' ? entry : entry?.tableName;
+    return typeof actual === 'string' && actual.toLowerCase() === target;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Permission helpers (Windows + Unix)
 // ---------------------------------------------------------------------------
@@ -349,7 +363,7 @@ test('Running migrations creates tables via up()', async () => {
 
     // Verify via live DB
     const tables = await qi.showAllTables();
-    assert.ok(tables.includes('TestTable'), 'TestTable should exist in DB');
+    assert.ok(hasTable(tables, 'TestTable'), `TestTable should exist in DB — found: ${tables.join(', ')}`);
 
     // Describe and check columns
     const columns = await qi.describeTable('TestTable');
@@ -627,11 +641,98 @@ test('Read-only SQLite file causes runMigrations() to reject (reproduces origina
   try {
     const qi = getLiveQI(harness3.sequelize);
     const tables = await qi.showAllTables();
-    assert.ok(!tables.includes('ShouldNotExist'),
-      'ShouldNotExist table must NOT exist after failed migration');
+    assert.ok(!hasTable(tables, 'ShouldNotExist'),
+      `ShouldNotExist table must NOT exist after failed migration — found: ${tables.join(', ')}`);
   } finally {
     await harness3.sequelize.close();
     fs.rmSync(backupDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Case-folded identifiers
+//
+// MySQL with lower_case_table_names=1 stores every table name lowercased, so
+// showAllTables() reports `switchplugin_roundstats` for a table created as
+// `SwitchPlugin_RoundStats` while every statement that names the table keeps
+// working. SQLite matches identifiers case-insensitively for the same reason,
+// so a table physically created lowercase reproduces the live behaviour here
+// exactly, with no mocking: the create succeeds, and only the name that comes
+// back out is folded.
+// ---------------------------------------------------------------------------
+
+test('Verification accepts a created table whose name came back case-folded', async () => {
+  const harness = await createTestHarness();
+  try {
+    const { engine, sequelize } = harness;
+
+    engine.registerMigrations('fold-plugin', [
+      {
+        version: 1,
+        description: 'Create a table the engine will see back under a folded name',
+        touches: { creates: ['MixedCase_Thing'] },
+        up: async (qi) => {
+          // Created lowercase on purpose — this is the name the live server
+          // stores, and the name showAllTables() will report.
+          await qi.createTable('mixedcase_thing', {
+            id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true }
+          });
+        },
+        down: async (qi) => { await qi.dropTable('mixedcase_thing'); }
+      }
+    ]);
+
+    engine.confirmToken('__auto__');
+    const result = await engine.runMigrations('fold-plugin');
+
+    assert.equal(result.applied, 1, 'the migration should apply, not fail verification');
+
+    // The premise: the stored name really is not the declared one.
+    const tables = await getLiveQI(sequelize).showAllTables();
+    assert.ok(
+      // case-fold-scan:allow — asserting the exact-case MISS is the point of this check
+      !tables.includes('MixedCase_Thing'),
+      'premise broken — showAllTables() returned the declared casing, so this test proves nothing'
+    );
+  } finally {
+    await destroyTestHarness(harness);
+  }
+});
+
+test('qi.tableExists() matches a table regardless of identifier case', async () => {
+  const harness = await createTestHarness();
+  try {
+    const { engine } = harness;
+    await harness.sequelize.query('CREATE TABLE mixedcase_probe (id INTEGER PRIMARY KEY)');
+
+    let sawDeclaredCasing = null;
+    let sawStoredCasing = null;
+    let includesSaidPresent = null;
+
+    engine.registerMigrations('probe-plugin', [
+      {
+        version: 1,
+        description: 'Probe the wrapper from inside a real migration',
+        touches: {},
+        up: async (qi) => {
+          sawDeclaredCasing = await qi.tableExists('MixedCase_Probe');
+          sawStoredCasing = await qi.tableExists('mixedcase_probe');
+          // case-fold-scan:allow — asserting the exact-case MISS is the point of this check
+          includesSaidPresent = (await qi.showAllTables()).includes('MixedCase_Probe');
+        },
+        down: async () => {}
+      }
+    ]);
+
+    engine.confirmToken('__auto__');
+    await engine.runMigrations('probe-plugin');
+
+    assert.equal(sawDeclaredCasing, true, 'tableExists() missed the table under its declared casing');
+    assert.equal(sawStoredCasing, true, 'tableExists() missed the table under its stored casing');
+    assert.equal(includesSaidPresent, false,
+      'premise broken — a bare includes() found it, so tableExists() is not being tested');
+  } finally {
+    await destroyTestHarness(harness);
   }
 });
 

@@ -210,28 +210,6 @@ const TABLE = Object.freeze({
   PLAYERCOUNT: 'DBLog_PlayerCounts'
 });
 
-/**
- * Does `existing` already contain this table, ignoring identifier case?
- *
- * `showAllTables()` reports the names the engine actually stores, and those are
- * not always the names we asked for: MySQL with lower_case_table_names=1 folds
- * every table name to lowercase on disk, so a server whose data was created by
- * core's db-log reports `dblog_wounds` even though core asked for
- * `DBLog_Wounds`. An exact-match guard would conclude the table is missing,
- * issue a CREATE, and abort the migration on "table already exists".
- *
- * @param {Array<string|{tableName:string}>} existing - showAllTables() result
- * @param {string} name - The table name this migration would create
- * @returns {boolean}
- */
-function tableExists(existing, name) {
-  const target = name.toLowerCase();
-  return existing.some((entry) => {
-    const actual = typeof entry === 'string' ? entry : entry?.tableName;
-    return typeof actual === 'string' && actual.toLowerCase() === target;
-  });
-}
-
 const MODEL = Object.freeze({
   SERVER: 'DBLog_Server',
   MATCH: 'DBLog_Match',
@@ -461,7 +439,7 @@ export default class DBLog extends S3PluginBase {
         version: 1,
         description: 'Create DBLog_Servers, DBLog_Matches, DBLog_Players, DBLog_Wounds, DBLog_Deaths, DBLog_Revives, DBLog_TickRates, DBLog_PlayerCounts',
         // No pre-migration backup needed — every createTable is wrapped in an
-        // idempotent `!existing.includes()` guard, so on a live server with
+        // idempotent `qi.tableExists()` guard, so on a live server with
         // pre-existing DBLog_* tables (created by the core db-log plugin this
         // replaces), zero DDL runs. On a fresh install, createTable is atomic
         // and the only thing at risk is an empty table. A `tier: 'all'` JSON
@@ -474,16 +452,15 @@ export default class DBLog extends S3PluginBase {
         },
         up: async (qi) => {
           const DT = qi.DataTypes;
-          const existing = await qi.showAllTables();
 
-          if (!tableExists(existing, TABLE.SERVER)) {
+          if (!(await qi.tableExists(TABLE.SERVER))) {
             await qi.createTable(TABLE.SERVER, {
               id: { type: DT.INTEGER, primaryKey: true, autoIncrement: true },
               name: { type: DT.STRING }
             }, { timestamps: false });
           }
 
-          if (!tableExists(existing, TABLE.MATCH)) {
+          if (!(await qi.tableExists(TABLE.MATCH))) {
             await qi.createTable(TABLE.MATCH, {
               id: { type: DT.INTEGER, primaryKey: true, autoIncrement: true },
               server: { type: DT.INTEGER, allowNull: false },
@@ -498,7 +475,7 @@ export default class DBLog extends S3PluginBase {
             }, { timestamps: false });
           }
 
-          if (!tableExists(existing, TABLE.TICKRATE)) {
+          if (!(await qi.tableExists(TABLE.TICKRATE))) {
             await qi.createTable(TABLE.TICKRATE, {
               id: { type: DT.INTEGER, primaryKey: true, autoIncrement: true },
               server: { type: DT.INTEGER, allowNull: false },
@@ -508,7 +485,7 @@ export default class DBLog extends S3PluginBase {
             }, { timestamps: false });
           }
 
-          if (!tableExists(existing, TABLE.PLAYERCOUNT)) {
+          if (!(await qi.tableExists(TABLE.PLAYERCOUNT))) {
             await qi.createTable(TABLE.PLAYERCOUNT, {
               id: { type: DT.INTEGER, primaryKey: true, autoIncrement: true },
               server: { type: DT.INTEGER, allowNull: false },
@@ -520,7 +497,7 @@ export default class DBLog extends S3PluginBase {
             }, { timestamps: false });
           }
 
-          if (!tableExists(existing, TABLE.PLAYER)) {
+          if (!(await qi.tableExists(TABLE.PLAYER))) {
             await qi.createTable(TABLE.PLAYER, {
               id: { type: DT.INTEGER, primaryKey: true, autoIncrement: true },
               eosID: { type: DT.STRING, unique: true },
@@ -548,18 +525,18 @@ export default class DBLog extends S3PluginBase {
             teamkill: { type: DT.BOOLEAN }
           });
 
-          if (!tableExists(existing, TABLE.WOUND)) {
+          if (!(await qi.tableExists(TABLE.WOUND))) {
             await qi.createTable(TABLE.WOUND, combatColumns(), { timestamps: false, ...UTF8MB4 });
           }
 
-          if (!tableExists(existing, TABLE.DEATH)) {
+          if (!(await qi.tableExists(TABLE.DEATH))) {
             await qi.createTable(TABLE.DEATH, {
               ...combatColumns(),
               woundTime: { type: DT.DATE }
             }, { timestamps: false, ...UTF8MB4 });
           }
 
-          if (!tableExists(existing, TABLE.REVIVE)) {
+          if (!(await qi.tableExists(TABLE.REVIVE))) {
             await qi.createTable(TABLE.REVIVE, {
               ...combatColumns(),
               woundTime: { type: DT.DATE },

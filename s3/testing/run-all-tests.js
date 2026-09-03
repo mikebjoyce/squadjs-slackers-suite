@@ -65,6 +65,10 @@ const CATEGORY_TESTS = {
     // through the catalogue — including literals assigned to intermediate
     // variables, which no static scan of display anchors can see.
     'test-i18n-render.js',
+    // Static only — no DB, no server. Sits here for the same reason as
+    // test-i18n.js: fails fast, before the slower suites spend minutes on a
+    // class of bug this catches in milliseconds.
+    'test-identifier-case.js',
     'test-s3-export-import.js',
     'test-s3-commands.js',
     'test-inspection-embeds.js',

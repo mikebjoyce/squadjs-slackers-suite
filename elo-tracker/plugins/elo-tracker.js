@@ -364,15 +364,14 @@ export default class EloTracker extends S3PluginBase {
             creates: ['Elo_PluginStates', 'Elo_PlayerStats', 'Elo_RoundHistories', 'Elo_RoundPlayers']
           },
           up: async (qi) => {
-            const existing = await qi.showAllTables();
 
-            if (!existing.includes('Elo_PluginStates')) {
+            if (!(await qi.tableExists('Elo_PluginStates'))) {
               await qi.createTable('Elo_PluginStates', {
                 id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: false, defaultValue: 1 }
               }, { timestamps: false });
             }
 
-            if (!existing.includes('Elo_PlayerStats')) {
+            if (!(await qi.tableExists('Elo_PlayerStats'))) {
               await qi.createTable('Elo_PlayerStats', {
                 eosID: { type: qi.DataTypes.STRING, primaryKey: true, allowNull: false },
                 steamID: { type: qi.DataTypes.STRING, allowNull: true },
@@ -387,7 +386,7 @@ export default class EloTracker extends S3PluginBase {
               }, { timestamps: false, charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci' });
             }
 
-            if (!existing.includes('Elo_RoundHistories')) {
+            if (!(await qi.tableExists('Elo_RoundHistories'))) {
               await qi.createTable('Elo_RoundHistories', {
                 id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
                 layerName: { type: qi.DataTypes.STRING, allowNull: true },
@@ -399,7 +398,7 @@ export default class EloTracker extends S3PluginBase {
               }, { timestamps: false });
             }
 
-            if (!existing.includes('Elo_RoundPlayers')) {
+            if (!(await qi.tableExists('Elo_RoundPlayers'))) {
               await qi.createTable('Elo_RoundPlayers', {
                 id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
                 matchId: { type: qi.DataTypes.STRING(20), allowNull: true },
@@ -436,8 +435,7 @@ export default class EloTracker extends S3PluginBase {
             columns: { Elo_RoundHistories: ['matchId'] }
           },
           up: async (qi) => {
-            const existing = await qi.showAllTables();
-            if (existing.includes('Elo_RoundHistories')) {
+            if (await qi.tableExists('Elo_RoundHistories')) {
               const info = await qi.describeTable('Elo_RoundHistories');
               if (!info.matchId) {
                 await qi.addColumn('Elo_RoundHistories', 'matchId', {
@@ -448,8 +446,7 @@ export default class EloTracker extends S3PluginBase {
             }
           },
           down: async (qi) => {
-            const existing = await qi.showAllTables();
-            if (existing.includes('Elo_RoundHistories')) {
+            if (await qi.tableExists('Elo_RoundHistories')) {
               const info = await qi.describeTable('Elo_RoundHistories');
               if (info.matchId) {
                 await qi.removeColumn('Elo_RoundHistories', 'matchId');

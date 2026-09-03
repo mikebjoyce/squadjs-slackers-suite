@@ -1886,6 +1886,7 @@ node s3/testing/test-game-state-service.js
 | `test-s3-discord-plugin-base.js` | Discord channel setup, `sendDiscordMessage()` |
 | `test-i18n.js` | Catalogue parity, call-site keys and vars, language resolution |
 | `test-i18n-render.js` | Renders every embed builder through a pseudo-locale; fails on prose that never reached the catalogue |
+| `test-identifier-case.js` | Static scan: no source compares a `showAllTables()` result by equality — MySQL with `lower_case_table_names=1` folds table names, and an exact match reads a live table as missing |
 | `test-s3-export-import.js` | Three-tier export/import, JSON format, validation |
 | `test-s3-commands.js` | All `!s3` command paths, embed builders |
 | `test-command-standardization.js` | Elo lookup helper, Switch help fallback |

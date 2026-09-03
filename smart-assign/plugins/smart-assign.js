@@ -390,8 +390,7 @@ export default class SmartAssign extends S3PluginBase {
               creates: ['SA_AssignmentLog']
             },
             up: async (qi) => {
-              const existing = await qi.showAllTables();
-              if (!existing.includes('SA_AssignmentLog')) {
+              if (!(await qi.tableExists('SA_AssignmentLog'))) {
                 await qi.createTable('SA_AssignmentLog', {
                   id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
                   matchId: { type: qi.DataTypes.STRING, allowNull: true },
