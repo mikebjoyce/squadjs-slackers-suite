@@ -29,6 +29,9 @@
  *   5. Foreign-key toggles                            — s3-export-import.js.
  *   6. Backup fallback                                — getDatabasePath() is null
  *      off SQLite, so the JSON export path must engage.
+ *   7. Reserved-word identifiers in raw SQL           — MySQL rejects an
+ *      unquoted `key`; SQLite and Postgres accept it. The mirror image of (1),
+ *      and the case the all-lowercase diagnostic rule does not catch.
  *
  * ─── USAGE ───────────────────────────────────────────────────────
  *
@@ -766,6 +769,110 @@ for (const { name } of DIALECTS) {
         assert.equal(restored.tokenBalance, 7, 'restored value is wrong');
       } finally {
         await model.drop().catch(() => {});
+      }
+    }));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7. Reserved-word identifiers in raw SQL
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The mirror image of case 1. camelCase folding is fatal on Postgres and
+// invisible on SQLite/MySQL; a reserved word is fatal on MySQL and invisible on
+// SQLite/Postgres. The guide's diagnostic rule for case 1 — "safe if every
+// identifier is already all-lowercase" — does NOT catch this one, because `key`
+// is already lowercase and still fails. Hence separate cover.
+//
+// Live instance: SwitchPlugin_Settings.key. It has always worked because every
+// access goes through Sequelize, which quotes unconditionally. The hazard
+// appears the first time raw SQL touches such a column.
+
+const RESERVED_COLUMN = 'key';
+
+for (const { name } of DIALECTS) {
+  test(`[${name}] a reserved word is a legal column name when quoted`, async () =>
+    withDialect(name, async (db, seq) => {
+      const table = `T_Reserved_${RUN_ID}`;
+      const q = (id) => db.quoteIdentifier(id);
+      await seq.query(`DROP TABLE IF EXISTS ${q(table)}`).catch(() => {});
+      try {
+        await seq.query(`
+          CREATE TABLE ${q(table)} (
+            ${q(RESERVED_COLUMN)} VARCHAR(64) PRIMARY KEY,
+            ${q('value')} VARCHAR(64) NOT NULL
+          );
+        `);
+        await seq.query(
+          `INSERT INTO ${q(table)} (${q(RESERVED_COLUMN)}, ${q('value')}) VALUES (:k, :v)`,
+          { replacements: { k: 'explainMessageId', v: '{}' } }
+        );
+        const [rows] = await seq.query(
+          `SELECT ${q(RESERVED_COLUMN)} FROM ${q(table)} WHERE ${q(RESERVED_COLUMN)} = :k`,
+          { replacements: { k: 'explainMessageId' } }
+        );
+        assert.equal(rows.length, 1, 'quoted SELECT on a reserved-word column found nothing');
+
+        // Bare CREATE INDEX is the path the restricted-grant migrations use,
+        // so it has to tolerate the reserved word too.
+        await seq.query(`CREATE INDEX ${q(`idx_${table}_k`)} ON ${q(table)} (${q(RESERVED_COLUMN)})`);
+      } finally {
+        await seq.query(`DROP TABLE IF EXISTS ${q(table)}`).catch(() => {});
+      }
+    }));
+
+  test(`[${name}] UNQUOTED reserved word is the defect this replaces`, async () =>
+    withDialect(name, async (db, seq) => {
+      const table = `T_ReservedRaw_${RUN_ID}`;
+      const q = (id) => db.quoteIdentifier(id);
+      await seq.query(`DROP TABLE IF EXISTS ${q(table)}`).catch(() => {});
+      try {
+        let threw = null;
+        try {
+          await seq.query(`
+            CREATE TABLE ${q(table)} (
+              ${RESERVED_COLUMN} VARCHAR(64) PRIMARY KEY,
+              value VARCHAR(64) NOT NULL
+            );
+          `);
+        } catch (err) {
+          threw = err;
+        }
+
+        if (db.getDialect() === 'mysql') {
+          // KEY is reserved: the unquoted form is a syntax error (ER_PARSE_ERROR).
+          assert.ok(threw, 'expected mysql to reject an unquoted reserved word');
+          assert.match(String(threw.message), /syntax|1064/i);
+        } else {
+          // Reserved on MySQL only. This is exactly why a SQLite-only run
+          // cannot be trusted for raw SQL.
+          assert.equal(threw, null, `${name} should tolerate the unquoted reserved word`);
+        }
+      } finally {
+        await seq.query(`DROP TABLE IF EXISTS ${q(table)}`).catch(() => {});
+      }
+    }));
+
+  test(`[${name}] the Sequelize model layer quotes a reserved word for you`, async () =>
+    withDialect(name, async (db, seq) => {
+      // Mirrors SwitchPlugin_Settings: a `key`/`value` table reached only
+      // through the model. This is why the live table has never broken.
+      const table = `T_ReservedModel_${RUN_ID}`;
+      const M = seq.define(table, {
+        key: { type: DataTypes.STRING(64), primaryKey: true },
+        value: { type: DataTypes.STRING(64), allowNull: false }
+      }, { tableName: table, freezeTableName: true, timestamps: false });
+
+      try {
+        await M.sync();
+        await M.create({ key: 'timeLimitEnabled', value: 'true' });
+        const row = await M.findByPk('timeLimitEnabled');
+        assert.ok(row, 'model could not read back its own reserved-word PK');
+        assert.equal(row.value, 'true');
+        await M.upsert({ key: 'timeLimitEnabled', value: 'false' });
+        assert.equal((await M.findByPk('timeLimitEnabled')).value, 'false');
+        assert.equal(await M.count({ where: { key: 'timeLimitEnabled' } }), 1);
+      } finally {
+        await M.drop().catch(() => {});
       }
     }));
 }

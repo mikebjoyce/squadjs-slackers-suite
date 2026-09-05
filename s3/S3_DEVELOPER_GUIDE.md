@@ -990,6 +990,19 @@ Two related traps in the same family:
 - **`LIKE` is case-sensitive on Postgres.** SQLite's `LIKE` is case-insensitive for ASCII and MySQL's default collation is case-insensitive, so a name lookup that works on both silently stops matching on Postgres. Use `caseInsensitiveLikeOp()`. Do **not** reach for `Op.iLike` directly — it is a syntax error on SQLite and MySQL.
 - **`LIKE ... ESCAPE '\'` cannot be written portably.** MySQL processes backslash escapes inside string literals and the other two do not, so whichever spelling you pick is a hard error somewhere: `ESCAPE '\\'` fails on SQLite with *"ESCAPE expression must be a single character"*. Use `caseInsensitiveLikeLiteral()`, which escapes with `!` instead.
 
+- **Reserved words are the mirror image of the camelCase trap, and they fail on a different engine.** `KEY`, `ORDER`, `GROUP`, `RANK` and friends are reserved on MySQL but merely keywords on SQLite and Postgres, so an unquoted reference to a column named `key` succeeds on two of the three engines and is `ERROR 1064` on MySQL. Verified on all three:
+
+  | Statement | MySQL 8 | SQLite | Postgres |
+  |---|---|---|---|
+  | `CREATE TABLE t (key VARCHAR(64) PRIMARY KEY, …)` | `ERROR 1064` | succeeds | succeeds |
+  | `SELECT key FROM t` | `ERROR 1064` | succeeds | succeeds |
+  | `INSERT … SELECT` naming `key` unquoted | `ER_PARSE_ERROR` | succeeds | succeeds |
+  | any of them with the identifier quoted | succeeds | succeeds | succeeds |
+
+  Note the asymmetry against the camelCase trap above: that one is invisible on two engines and fatal on Postgres, this one is invisible on two engines and fatal on MySQL. There is no single engine you can develop against that catches both — which is what `test-dialect-portability.js` is for.
+
+  A reserved word is therefore a perfectly legal column name *provided every reference is quoted*, which is why `SwitchPlugin_Settings.key` has always worked: it is only ever reached through Sequelize, which quotes unconditionally. The danger appears the first time raw SQL touches such a column. Note that the diagnostic rule above ("safe only if every identifier is already all-lowercase") does **not** catch this: `key` is already lowercase and still fails. Quote every identifier in raw SQL, not merely the mixed-case ones. When naming a *new* column, prefer a non-reserved word outright (`lockKey` over `key`) so the hazard cannot be reintroduced by a future call site.
+
 Regression cover for all of this lives in `s3/testing/test-dialect-portability.js`, which runs each statement against real SQLite, MySQL and Postgres engines. A mock cannot catch this class of defect — it has no dialect to model.
 
 ### 7.11 — Reading `server.currentLayer` Instead of S³
