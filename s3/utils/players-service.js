@@ -215,6 +215,9 @@ export default class PlayersService {
     this._onPlayerConnectedCallbacks = [];
     // Snapshot of the last fully-resolved team list. Used to build projections when teamIDs go null.
     this._lastStablePlayers = null;
+    // True between NEW_GAME and the next fully-resolved snapshot: the only span
+    // in which the projection is entitled to assume teams flipped 1↔2.
+    this._transitionSinceStable = false;
     // Active projection map when we detect the null-teamID window after NEW_GAME.
     this._projectedPlayers = null;
     // Snapshot of this.server.squads (raw SquadJS squad objects), refreshed each tick
@@ -229,6 +232,25 @@ export default class PlayersService {
     // Edge-triggers the mass-unresolved log so a round transition does not
     // reprint it on every tick.
     this._systemicUnresolved = false;
+    // Keys whose team has been OBSERVED on a real team since the current round
+    // began. Cleared at NEW_GAME, because at that instant every registry row
+    // still holds the team that player had in the round that just ended.
+    //
+    // BUG HISTORY (2026-09-05): without this, both consumers of the registry's
+    // team data trusted last round's values across the boundary. `areTeamsResolved()`
+    // answered "yes" from the stale rows on the first tick after NEW_GAME — so
+    // GameStateService cleared `resolving` before a single post-transition teamID
+    // had been looked at — and the tick diff below then read the whole roster's
+    // reassignment as N individual team changes. A 15-player round transition
+    // logged 15 TEAM_CHANGE events attributed to "Admin". The null-teamID
+    // projection was supposed to absorb that, but it only ever arms when RCON
+    // happens to serve a null mid-transition; that round it never did.
+    //
+    // Confirmation is about PROVENANCE, not timing: it answers "have I seen this
+    // player on a real team in THIS round", which is the question both callers
+    // were actually asking. That makes it correct regardless of the order the S³
+    // plugin delegates the tick in, which is what the null heuristic was not.
+    this._teamConfirmedKeys = new Set();
 
     this.PRIORITY = {
       TeamBalancer: 3,
@@ -327,6 +349,11 @@ export default class PlayersService {
     // quarantine a player on their first tick back without any grace.
     this._unresolvedSince.clear();
     this._stuckKeys.clear();
+    // Same reasoning: a remount re-runs initial sync, which re-observes every
+    // player and re-confirms them. Carrying confirmations across a remount would
+    // vouch for teams this process has not actually seen.
+    this._teamConfirmedKeys.clear();
+    this._transitionSinceStable = false;
     this.verboseLogger(2, '[Players] Unmounted.');
   }
 
@@ -511,6 +538,19 @@ export default class PlayersService {
       .filter((s) => s.players.length > 0);
   }
 
+  /**
+   * True when every tracked player has been seen on a real team IN THIS ROUND.
+   *
+   * The "in this round" half is load-bearing and is why `_teamConfirmedKeys`
+   * exists. GameStateService calls this to decide whether to clear `resolving`,
+   * and the S³ plugin delegates each UPDATED_PLAYER_INFORMATION tick
+   * gameState → factions → players — so this is answered against a registry that
+   * has NOT yet ingested the tick in flight. Reading `teamID` alone, the answer
+   * on the first tick after NEW_GAME came from rows still holding the previous
+   * round's teams, and `resolving` cleared before any post-transition team had
+   * been observed. Requiring confirmation makes a stale read merely stale ("as of
+   * last tick everyone was confirmed for this round") instead of wrong.
+   */
   areTeamsResolved() {
     const entries = [...this.registry.entries()];
     if (!entries.length) return false;
@@ -519,7 +559,32 @@ export default class PlayersService {
     // BUDGET_EXPIRED deadline rather than on PLAYERS_RESOLVED — for every round
     // that player stayed connected.
     if (!entries.some(([, p]) => this._isRealTeam(p?.teamID))) return false;
-    return entries.every(([key, p]) => this._isRealTeam(p?.teamID) || this._stuckKeys.has(key));
+    return entries.every(([key, p]) =>
+      (this._isRealTeam(p?.teamID) && this._teamConfirmedKeys.has(key)) || this._stuckKeys.has(key)
+    );
+  }
+
+  /**
+   * Drop every per-round team confirmation. Called by the S³ plugin on NEW_GAME.
+   *
+   * The registry deliberately keeps its rows across the boundary — reconnect
+   * memory, sessions and locks all depend on that — so the teams in it are the
+   * previous round's until each player is observed again. This is the moment
+   * that stops them being trusted. See `_teamConfirmedKeys`.
+   */
+  handleNewGame() {
+    const cleared = this._teamConfirmedKeys.size;
+    this._teamConfirmedKeys.clear();
+    // Arms the projection's 1↔2 flip for the next null window only. Cleared
+    // again the moment a fully-resolved snapshot is taken, so a null window
+    // later in the round projects teams as they stand instead of guessing a
+    // swap that never happened. See `_buildProjection`.
+    this._transitionSinceStable = true;
+    // Edge-triggered by NEW_GAME, so once per round rather than per tick.
+    this.verboseLogger(
+      2,
+      `[Players] NEW_GAME — cleared ${cleared} team confirmation(s); teams are unconfirmed until re-observed this round.`
+    );
   }
 
   /**
@@ -960,6 +1025,12 @@ export default class PlayersService {
     // `keyed`, not players.length: a roster S³ could not key a single player
     // out of has resolved nothing, and must not be reported as settled.
     const allResolved = keyed > 0 && !hasNullTeams;
+    // Who was already confirmed for this round BEFORE this tick's observations
+    // are folded in. The loop below confirms players as it walks them, so the
+    // live set cannot answer "was this a change, or the first sighting?" by the
+    // time it is asked. Both the tick diff and _reconcileProjection() need the
+    // pre-tick answer. Bounded by the roster, so the copy is cheap.
+    const confirmedBeforeTick = new Set(this._teamConfirmedKeys);
     let joinCount = 0;
     let leaveCount = 0;
     let teamChangeCount = 0;
@@ -975,6 +1046,14 @@ export default class PlayersService {
       if (!result) continue;
 
       current.add(result.key);
+
+      // Observing a player on a real team is what confirms them for this round,
+      // whatever else happens to them below (new, initial sync, mid-transition).
+      // Done before the emission gate so a player is confirmed exactly once, on
+      // the tick that first sees them.
+      if (this._isRealTeam(result.state?.teamID)) {
+        this._teamConfirmedKeys.add(result.key);
+      }
 
       if (result.isNew) {
         joinCount++;
@@ -999,23 +1078,48 @@ export default class PlayersService {
       // emissions while projection is active (or on the first tick where null teams
       // appear but projection hasn't been built yet); genuine changes during this
       // window are deferred and emitted by _reconcileProjection() on tear-down.
-      if (
-        !hasNullTeams &&
-        !this._projectedPlayers &&
+      //
+      // That gate only ever arms when RCON actually serves a null, which is a
+      // property of the server's timing rather than of the round transition — see
+      // `_teamConfirmedKeys` for the round where it never did and this diff
+      // reported the whole roster as switched. The confirmation check below is
+      // the one that does not depend on that luck.
+      const teamsTrustworthy = !hasNullTeams && !this._projectedPlayers;
+      const realTeamDiff =
         String(previousTeamID) !== String(nextTeamID) &&
         this._isRealTeam(previousTeamID) &&
-        this._isRealTeam(nextTeamID)
-      ) {
-        teamChangeCount++;
-        const attribution = this._consumeMoveAttribution(result.state, nextTeamID) || this._defaultTeamChangeSource();
+        this._isRealTeam(nextTeamID);
+
+      if (teamsTrustworthy && realTeamDiff) {
+        // Consumed only inside this branch, exactly as before: an attribution
+        // must not be burned on a diff that is never going to be reported.
+        const attribution = this._consumeMoveAttribution(result.state, nextTeamID);
         const playerName = result.state.name || result.key;
-        this.verboseLogger(1, `[Players] TEAM_CHANGE: ${playerName} (${result.key}) ${previousTeamID}→${nextTeamID}, source=${attribution}`);
-        this.server.emit('S3_PLAYER_TEAM_CHANGED', {
-          player: { ...result.state },
-          previousTeamID,
-          teamID: nextTeamID,
-          source: attribution
-        });
+
+        // ── First sighting this round is a baseline, not a change ──
+        // A player whose team has not been observed since NEW_GAME has no
+        // previous team for THIS round; `previousTeamID` is the team they held in
+        // the round that just ended, and the difference is the game reassigning
+        // sides, not a switch anybody made. The one exception is an attributed
+        // move: if a plugin recorded an intentional move to exactly this team,
+        // that is positive evidence of a real switch, and it is reported even on
+        // the first sighting.
+        if (confirmedBeforeTick.has(result.key) || attribution) {
+          teamChangeCount++;
+          const source = attribution || this._defaultTeamChangeSource();
+          this.verboseLogger(1, `[Players] TEAM_CHANGE: ${playerName} (${result.key}) ${previousTeamID}→${nextTeamID}, source=${source}`);
+          this.server.emit('S3_PLAYER_TEAM_CHANGED', {
+            player: { ...result.state },
+            previousTeamID,
+            teamID: nextTeamID,
+            source
+          });
+        } else {
+          this.verboseLogger(
+            2,
+            `[Players] Baseline (not a team change): ${playerName} (${result.key}) held ${previousTeamID} last round, first seen on ${nextTeamID} this round.`
+          );
+        }
       }
     }
 
@@ -1024,6 +1128,7 @@ export default class PlayersService {
         if (current.has(key)) continue;
         this.registry.delete(key);
         this._deindexPlayer(tracked, key);
+        this._teamConfirmedKeys.delete(key);
       }
 
       // Mark all players registered during initial sync as having join emitted.
@@ -1081,6 +1186,9 @@ export default class PlayersService {
 
         this.registry.delete(key);
         this._deindexPlayer(tracked, key);
+        // Forget the confirmation with the player, so a reconnect re-baselines
+        // instead of being diffed against the team they had before they left.
+        this._teamConfirmedKeys.delete(key);
 
         leaveCount++;
 
@@ -1115,7 +1223,8 @@ export default class PlayersService {
     this._refreshProjectionState({
       current,
       allResolved,
-      hasNullTeams
+      hasNullTeams,
+      confirmedBeforeTick
     });
 
     // Snapshot squad data when teams are resolved (metadata stable even during null-window)
@@ -1362,7 +1471,20 @@ export default class PlayersService {
   // all players while teams re-establish (~30-90s). Instead of blocking all
   // join/assignment logic during this window, we serve a projected player list
   // built from the last stable snapshot, with teams flipped (1↔2) to match the
-  // known round-transition swap. This design was originally specified in
+  // known round-transition swap.
+  //
+  // A null window is NOT exclusive to round transitions, though: the trigger is
+  // `hasNullTeams = blocking.size > 0`, so a single unresolved player arms all of
+  // this. The blast radius is small — `_syncProjection` runs on the same tick as
+  // the build and overwrites the projected team of everyone who DID resolve, so
+  // the flip only ever survives on players who are actually null. But for those
+  // players it is still a guess about a swap that may not have happened, so it is
+  // gated on `_transitionSinceStable`: armed by NEW_GAME, dropped as soon as a
+  // fully-resolved snapshot is taken. A player who goes null later in the round
+  // and comes back on the same team is not a switch, and must not be reported as
+  // one.
+  //
+  // This design was originally specified in
   // DesignDocs/player-state-manager-design.md and was subsumed into PlayersService
   // during initial implementation (S³ uses one lifecycle, not a separate singleton).
   //
@@ -1371,13 +1493,14 @@ export default class PlayersService {
   //      Decides whether to build, update, or tear down the projection.
   //   2. _snapshotRegistry() — copies the current registry as a stable baseline
   //      when all teamIDs are real (1/2). Used as the projection seed.
-  //   3. _buildProjection(snapshot) — flips team 1↔2 on the stable snapshot to
-  //      produce projected state representing post-swap reality.
+  //   3. _buildProjection(snapshot, { flip }) — seeds projected state from the
+  //      stable snapshot, flipping team 1↔2 only when the window follows a
+  //      NEW_GAME. A null window inside a round is not a swap (see below).
   //   4. _syncProjection(currentKeys) — keeps projected state in sync with live
   //      data (names, squad IDs, new joiners) while the null window is active.
-  //   5. _reconcileProjection() — when the null window resolves, logs mismatches
-  //      between projected and actual teams for diagnostics. No corrective RCON
-  //      commands are issued — log-only reconciliation.
+  //   5. _reconcileProjection(confirmedBeforeTick) — when the null window
+  //      resolves, emits deferred S3_PLAYER_TEAM_CHANGED for genuine mid-window
+  //      swaps and logs the mismatch. No corrective RCON commands are issued.
   //
   // Key invariants:
   //   - getPlayer()/getAllPlayers() return projected data when projection is active
@@ -1385,23 +1508,36 @@ export default class PlayersService {
   //   - _projectedPlayers is null when not in the projection window (fast path).
   //   - Team-change emissions are suppressed during the null window (both old/new
   //     team must be real before S3_PLAYER_TEAM_CHANGED fires).
+  //
+  // THIS SUBSYSTEM IS AN OPTIMISATION, NOT THE CORRECTNESS BOUNDARY. All of it is
+  // conditional on RCON actually serving a null teamID during the transition, which
+  // is a property of server timing — on 2026-09-05 a 15-player transition produced
+  // no null tick at all and none of this armed. What keeps a round transition from
+  // being read as a roster-wide team change is `_teamConfirmedKeys`: a player's
+  // first sighting on a real team in a round is a baseline, never a change. Do not
+  // reintroduce logic that depends on the null window having been observed.
   // ---------------------------------------------------------------------------
 
-  _refreshProjectionState({ current, allResolved, hasNullTeams }) {
+  _refreshProjectionState({ current, allResolved, hasNullTeams, confirmedBeforeTick = null }) {
     // When we have a fully-resolved player list, cache it as a stable baseline.
     // This baseline is flipped when the null-teamID window appears after NEW_GAME.
     if (allResolved) {
       if (this._projectedPlayers) {
-        this._reconcileProjection();
+        this._reconcileProjection(confirmedBeforeTick);
         this._projectedPlayers = null;
       }
 
       this._lastStablePlayers = this._snapshotRegistry();
+      // This snapshot IS the post-transition reality, so any later null window
+      // in this round must project teams forward as they stand, not flip them.
+      this._transitionSinceStable = false;
     }
 
     // Only build projection once per resolving window, using the last stable snapshot.
     if (hasNullTeams && this._lastStablePlayers && !this._projectedPlayers) {
-      this._projectedPlayers = this._buildProjection(this._lastStablePlayers);
+      this._projectedPlayers = this._buildProjection(this._lastStablePlayers, {
+        flip: this._transitionSinceStable
+      });
       if (this._projectedPlayers.size) {
         this.verboseLogger(2, `[Players] Projection active for ${this._projectedPlayers.size} players.`);
       }
@@ -1420,14 +1556,20 @@ export default class PlayersService {
     return new Map([...this.registry.entries()].map(([key, state]) => [key, { ...state }]));
   }
 
-  _buildProjection(snapshot) {
+  // `flip` is armed by NEW_GAME and disarmed by the next resolved snapshot,
+  // because the 1↔2 swap is a property of the round transition and of nothing
+  // else. The flip only ends up mattering for players who are genuinely null
+  // (`_syncProjection` corrects everyone who resolved), and mid-round that is
+  // typically one stuck client. Flipping them would have _reconcileProjection
+  // report a swap when they return on the team they never left.
+  _buildProjection(snapshot, { flip = false } = {}) {
     const projected = new Map();
 
     for (const [key, state] of snapshot.entries()) {
       if (!this._isRealTeam(state.teamID)) continue;
 
       // Flip teams 1 <-> 2 to match the known swap at round transition.
-      const teamID = state.teamID === 1 ? 2 : 1;
+      const teamID = flip ? (state.teamID === 1 ? 2 : 1) : state.teamID;
       projected.set(key, { ...state, teamID });
     }
 
@@ -1467,40 +1609,92 @@ export default class PlayersService {
     }
   }
 
-  _reconcileProjection() {
+  _reconcileProjection(confirmedBeforeTick = null) {
     // When the null window resolves, emit deferred S3_PLAYER_TEAM_CHANGED events
     // for any players whose actual team differs from the projected (flipped) team.
     // These represent genuine mid-window swaps — not the round-transition 1↔2 flip.
     //
     // We do NOT issue corrective RCON commands here; this is diagnostics + deferred
     // emission only. Projected-vs-actual matches (the common case) are silently correct.
+    //
+    // A projected team is a GUESS — `_buildProjection` assumes the transition
+    // flips 1↔2, which is the common shape and not a guarantee. For a player who
+    // has not been observed on a real team since NEW_GAME, that guess is the only
+    // "previous team" on offer, and reporting a change against it would invent a
+    // switch out of an assumption — the same false-flood shape, one code path
+    // over, on any round the game did not flip. Only players already confirmed
+    // this round have a previous team worth diffing against.
+    //
+    // Attribution is the exception. A plugin-initiated move names the player and
+    // the destination team, so it is evidence independent of the projection and
+    // stands even with no confirmed team this round. This path is the ONLY one
+    // that can report such a move: the tick-diff gate in handleUpdatedPlayerInfo
+    // is closed for the whole window (teamsTrustworthy is false while
+    // _projectedPlayers is set, including on the tick that resolves it, because
+    // the projection is torn down after that loop). Dropping unattributed
+    // unconfirmed players here while keeping attributed ones is the whole point.
     let deferredCount = 0;
+    let baselineCount = 0;
 
     for (const [key, projected] of this._projectedPlayers.entries()) {
       const actual = this.registry.get(key);
       if (!actual || !this._isRealTeam(actual.teamID)) continue;
 
-      if (String(projected.teamID) !== String(actual.teamID)) {
-        const name = actual.name || projected.name || key;
-        this.verboseLogger(
-          2,
-          `[Players Projection] ${name} projected team ${projected.teamID} -> actual ${actual.teamID}`
-        );
+      // Attribution is checked first, and against the player's last OBSERVED
+      // team rather than the projected one. A plugin move that happens to land
+      // where the projection guessed is still a real move, and diffing it
+      // against a guess would either hide it or misreport where it came from.
+      // _lastStablePlayers is still the pre-window snapshot here — the caller
+      // re-snapshots only after this returns.
+      const attribution = this._consumeMoveAttribution(actual, actual.teamID);
+      if (attribution) {
+        const stableTeam = this._lastStablePlayers?.get(key)?.teamID;
+        const previousTeamID = this._isRealTeam(stableTeam) ? stableTeam : projected.teamID;
 
-        // Emit deferred team-change — this player genuinely swapped during the
-        // projection window (not just the round-transition 1↔2 flip).
-        this.server.emit('S3_PLAYER_TEAM_CHANGED', {
-          player: { ...actual },
-          previousTeamID: projected.teamID,
-          teamID: actual.teamID,
-          source: 'Deferred/Projection'
-        });
-        deferredCount++;
+        if (String(previousTeamID) !== String(actual.teamID)) {
+          this.server.emit('S3_PLAYER_TEAM_CHANGED', {
+            player: { ...actual },
+            previousTeamID,
+            teamID: actual.teamID,
+            source: attribution
+          });
+          deferredCount++;
+        }
+        continue;
       }
+
+      if (String(projected.teamID) === String(actual.teamID)) continue;
+
+      if (confirmedBeforeTick && !confirmedBeforeTick.has(key)) {
+        baselineCount++;
+        continue;
+      }
+
+      const name = actual.name || projected.name || key;
+      this.verboseLogger(
+        2,
+        `[Players Projection] ${name} projected team ${projected.teamID} -> actual ${actual.teamID}`
+      );
+
+      // Emit deferred team-change — this player genuinely swapped during the
+      // projection window (not just the round-transition 1↔2 flip).
+      this.server.emit('S3_PLAYER_TEAM_CHANGED', {
+        player: { ...actual },
+        previousTeamID: projected.teamID,
+        teamID: actual.teamID,
+        source: 'Deferred/Projection'
+      });
+      deferredCount++;
     }
 
     if (deferredCount > 0) {
       this.verboseLogger(2, `[Players Projection] ${deferredCount} deferred TEAM_CHANGE(s) emitted.`);
+    }
+    if (baselineCount > 0) {
+      this.verboseLogger(
+        2,
+        `[Players Projection] ${baselineCount} projected-vs-actual mismatch(es) treated as this round's baseline — not observed on a real team since NEW_GAME.`
+      );
     }
   }
 

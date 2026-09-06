@@ -608,13 +608,19 @@ S³ emits application-level events that consumer plugins can listen on via `this
 | `S3_ROUND_LIVE` | gameState | `{ roundStartTime, matchId, layerName, gamemode }` | STAGING → LIVE phase transition, when the staging timer elapses |
 | `S3_PLAYER_JOINED` | players | `{ player, previousTeamID, source }` | New player registered on a tick (suppressed during initial sync) |
 | `S3_PLAYER_LEFT` | players | `{ player, source }` | Player dropped from registry (present in previous tick, absent in current) |
-| `S3_PLAYER_TEAM_CHANGED` | players | `{ player, previousTeamID, teamID, source }` | Team change detected via tick diff (suppressed during initial sync) |
+| `S3_PLAYER_TEAM_CHANGED` | players | `{ player, previousTeamID, teamID, source }` | Team change detected via tick diff (suppressed during initial sync, and for a player's first sighting of a round — see below) |
 | `S3_PLAYER_RECONNECTED` | players | `{ player, previousTeamID, disconnectedAt, reconnectedAt }` | Returning player matched against reconnect memory |
 | `S3_PLAYERS_UPDATED` | players | `{ joinCount, leaveCount, teamChangeCount, playerCount, isInitialSync, projectionActive, source }` | End of **every** `UPDATED_PLAYER_INFORMATION` tick, including the initial-sync tick |
 | `S3_PLAYER_LOCK_CHANGED` | players | `{ key, source, locked, expiresAt }` | Per-player lock acquired or expired |
 | `S3_GLOBAL_LOCK_CHANGED` | players | `{ source, locked, expiresAt }` | Global lock (Team Balancer) acquired or cleared |
 
 > **⚠️ Not emitted on mid-round mount.** `S3_ROUND_LIVE` has a single emit site in `game-state-service.js`, inside the STAGING timer callback. If S³ mounts mid-round (the `roundStartTime` backfill path in `mount()`), no `S3_ROUND_LIVE` event fires for that round — a plugin restarted mid-round and relying on this event for its initial snapshot will miss it until the *next* round. Confirm this is intended before depending on it for anything that must run once per round.
+
+> **⚠️ A round transition is not a team change.** `S3_PLAYER_TEAM_CHANGED` reports a player *moving between teams within a round*. It deliberately does **not** fire for the wholesale reassignment the game performs at a round boundary: a player's first sighting on a real team after `NEW_GAME` establishes this round's baseline, because the team still in the registry at that moment is the one they held in the round that just *ended*. The single exception is a move a plugin recorded with `players.recordMove()` — an attribution is positive evidence of an intentional switch, so it is reported even on a first sighting, with its own `source`.
+>
+> This matters if you count switches, apply cooldowns, or track team history: **do not** reconstruct "who changed teams this round" by diffing your own snapshot across `NEW_GAME`, because that reproduces the exact defect this rule exists to prevent. On 2026-09-05 a 15-player transition emitted 15 `S3_PLAYER_TEAM_CHANGED` events attributed to `Admin`; see `PlayersService._teamConfirmedKeys` and `s3/testing/test-round-transition-team-baseline.js`.
+>
+> Changes that happen while teamIDs are null **are** still reported, deferred until the window resolves, with `source: 'Deferred/Projection'` — but only for players already confirmed on a real team this round, since only they have a previous team that was observed rather than assumed. Note that the null window is not exclusive to round starts: `hasNullTeams` is true whenever *any* one player is unresolved, which mid-round is an ordinary joining or stuck client. The projection's 1↔2 flip is therefore armed only between `NEW_GAME` and the next fully-resolved tick; a mid-round window projects teams forward unchanged. Attributed moves are diffed against the player's last observed team and reported regardless of confirmation.
 
 Listen in `_onS3Ready()` or `mount()`:
 
@@ -1876,7 +1882,8 @@ node s3/testing/test-game-state-service.js
 |------|--------------|
 | `test-game-state-service.js` | Phase transitions, matchId/roundStartTime, stale recovery, ENDGAME timer chain |
 | `test-db-service.js` | Model registration, migration workflow, schema versioning |
-| `test-players-service.js` | Player tracking, reconnect detection, locks, team change attribution |
+| `test-players-service.js` | Player tracking, reconnect detection, locks, team change attribution, per-round team confirmation |
+| `test-round-transition-team-baseline.js` | Replays the 2026-09-05 round transition: a new round's team assignment must never be reported as a roster-wide team change, and `resolving` must outlive the first post-NEW_GAME tick |
 | `test-clans-service.js` | Tag extraction, normalisation, grouping, clan team detection |
 | `test-factions-service.js` | Team abbreviation resolution, faction caching |
 | `test-server-config-service.js` | Config parsing, accessor accuracy |

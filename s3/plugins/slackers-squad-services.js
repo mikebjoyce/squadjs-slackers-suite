@@ -24,7 +24,7 @@
  *     mount()                    — Mounts services in order (serverConfig→db→gameState→factions→clans→players→logging),
  *                                   binds server events, registers Discord !s3 commands.
  *     unmount()                  — Unbinds events, unmounts services in reverse order, cleans up Discord.
- *     handleNewGame(data)         — Delegates NEW_GAME to gameState and factions.
+ *     handleNewGame(data)         — Delegates NEW_GAME to gameState, factions and players.
  *     handleRoundEnded(data)      — Delegates ROUND_ENDED to gameState and factions.
  *     handleLayerInfoUpdated(d)   — Delegates UPDATED_LAYER_INFORMATION to gameState.
  *                                   (recovery-timing only — that event carries no
@@ -87,7 +87,7 @@
  *   - logging:      JSONL and DB logging for S³ player/game state events.
  *
  * Delegated SquadJS Events:
- *   NEW_GAME                  → gameState, factions
+ *   NEW_GAME                  → gameState, factions, players
  *   ROUND_ENDED               → gameState, factions
  *   UPDATED_LAYER_INFORMATION  → gameState
  *   UPDATED_SERVER_INFORMATION → gameState
@@ -674,6 +674,14 @@ export default class SlackersSquadServices extends BasePlugin {
 
     if (this.services.factions?.handleNewGame) {
       this.services.factions.handleNewGame(data);
+    }
+
+    // Players must be told a round started, or the teams already in its registry
+    // — last round's — keep being treated as current. That is what made a whole
+    // roster's reassignment read as individual team changes. Order-independent:
+    // it only drops per-round confirmations. See PlayersService._teamConfirmedKeys.
+    if (this.services.players?.handleNewGame) {
+      this.services.players.handleNewGame(data);
     }
   }
 

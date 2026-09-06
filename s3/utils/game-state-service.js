@@ -1100,7 +1100,24 @@ export default class GameStateService {
     //    Checks raw `this.server.players` directly — the unmanaged, full server player list.
     //    This is a degraded-mode safety net that still works when no PlayersService has mounted.
 
-    // Flat access via S³ plugin getters
+    // ── THIS RUNS BEFORE PLAYERSSERVICE HAS INGESTED THE TICK ────────
+    // The S³ plugin delegates UPDATED_PLAYER_INFORMATION in a fixed order —
+    // gameState → factions → players — so the registry read below is the state
+    // as of the END OF THE PREVIOUS TICK, not the tick in flight.
+    //
+    // BUG HISTORY (2026-09-05): that made this the line that broke the resolving
+    // window. On the first tick after NEW_GAME the registry still held the
+    // previous round's teams, all of them real, so areTeamsResolved() said yes
+    // and `resolving` cleared before one post-transition teamID had been looked
+    // at — the window collapsed to nothing on every round transition, and
+    // PlayersService then read the reassignment as a roster-wide team change.
+    //
+    // areTeamsResolved() is now provenance-gated (it requires each player to
+    // have been OBSERVED on a real team since NEW_GAME), which makes a stale
+    // read merely one tick behind instead of wrong: the worst case is that
+    // `resolving` clears one tick later than it strictly could, well inside the
+    // budget floored at four ticks. Do not "fix" this by reordering the
+    // delegation — the guarantee belongs in the data, not in the call order.
     const playersService = this.parent?.players || null;
     if (playersService?.areTeamsResolved) {
       const allResolved = playersService.areTeamsResolved();

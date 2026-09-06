@@ -86,6 +86,10 @@ const CATEGORY_TESTS = {
     // cases in test-game-state-service.js could sit failing on a poll race.
     'test-game-state-service.js',
     'test-players-service.js',
+    // Replays the 2026-09-05 round transition that was reported as a roster-wide
+    // team change. Drives gameState and players together, in the S³ plugin's real
+    // delegation order, because the defect lived in the seam between them.
+    'test-round-transition-team-baseline.js',
     'test-clans-service.js',
     'test-factions-service.js',
     'test-server-config-service.js',
