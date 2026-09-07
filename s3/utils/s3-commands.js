@@ -3970,6 +3970,28 @@ export function createCommandHandlers(context) {
       const statusEmoji = hasPending ? '🟠' : '🟢';
       const statusText = hasPending ? 'Pending migrations' : 'All current';
 
+      // This command used to say "All current" while !s3 services was
+      // simultaneously reporting a schema-drift warning for the same
+      // database — the two commands were answering different questions
+      // (pending migrations vs. live-schema drift) and neither said so.
+      // getLastDriftResult() is the same drift check services reads;
+      // surfacing it here too means an operator reading only db status,
+      // which is what the setup runbook tells them to do, still sees it.
+      // Extra-only drift (a column a migration deliberately left behind —
+      // see the note in switch-db.js on SwitchPlugin_PlayerCooldowns) is
+      // reported informationally and does not affect statusEmoji/statusText
+      // above, matching db-service.js's own gate logic: only missing
+      // columns, missing rows, or violated data post-conditions block
+      // anything.
+      const drift = db.getLastDriftResult?.();
+      let driftField = plugin.localize('slackersSquadServices.db.schemaDriftNone');
+      if (drift && drift.length > 0) {
+        const hasMissing = drift.some((e) => e.missing || e.missingRows || e.dataViolations);
+        driftField = hasMissing
+          ? plugin.localize('slackersSquadServices.db.schemaDriftMissing', { count: drift.length })
+          : plugin.localize('slackersSquadServices.db.schemaDriftExtraOnly', { count: drift.length });
+      }
+
       await sendDiscordMessage(message.channel, {
         embeds: [{
           color: hasPending ? 0xf39c12 : 0x2ecc71,
@@ -3978,6 +4000,7 @@ export function createCommandHandlers(context) {
             { name: plugin.localize('slackersSquadServices.db.connector'), value: `${connectorEmoji} \`${connector}\``, inline: true },
             { name: plugin.localize('slackersSquadServices.db.schemaVersions'), value: plugin.localize('slackersSquadServices.db.registered', { expectedCount }), inline: true },
             { name: plugin.localize('slackersSquadServices.db.migrationsEngine'), value: me ? plugin.localize('slackersSquadServices.db.available') : plugin.localize('slackersSquadServices.db.notAvailable'), inline: true },
+            { name: plugin.localize('slackersSquadServices.db.schemaDriftField'), value: driftField, inline: true },
             { name: plugin.localize('slackersSquadServices.db.perPluginVersions'), value: schemaLines, inline: false }
           ],
           timestamp: new Date().toISOString()

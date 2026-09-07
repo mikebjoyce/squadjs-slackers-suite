@@ -1,6 +1,6 @@
 /**
  * ─────────────────────────────────────────────────────────────────
- *  ADMIN-FACING TRANSLATION TEMPLATE — 1306 strings
+ *  ADMIN-FACING TRANSLATION TEMPLATE — 1310 strings
  * ─────────────────────────────────────────────────────────────────
  *
  *  GENERATED FILE — do not edit in place.
@@ -39,7 +39,7 @@
  *
  *  Strings only your staff can reach: replies to admin-gated commands, the
  *  scramble and diagnostic reports in your staff channel, and the admin half
- *  of !elo. 1306 strings — the bulk of what an admin reads day to day,
+ *  of !elo. 1310 strings — the bulk of what an admin reads day to day,
  *  but read by a handful of people who opted into running the thing, so a
  *  missed one costs far less than a missed broadcast.
  *
@@ -1026,6 +1026,14 @@ export const MESSAGES = {
       notAvailable: '',
       // EN: Per-Plugin Versions
       perPluginVersions: '',
+      // EN: Schema Drift
+      schemaDriftField: '',
+      // EN: 🟢 None
+      schemaDriftNone: '',
+      // EN: 🟠 {count} table(s) missing columns or rows — !s3 migrate force can fix this
+      schemaDriftMissing: '',
+      // EN: 🔵 {count} table(s) with extra columns — informational only, no action needed
+      schemaDriftExtraOnly: '',
       // EN: ❌ DB Service Not Ready
       dbServiceNotReady2: '',
       // EN: ⏳ Exporting ({tier})…
