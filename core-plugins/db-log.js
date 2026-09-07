@@ -276,9 +276,16 @@ export default class DBLog extends S3PluginBase {
   }
 
   _checkS3Version() {
-    // Baseline only — defineModel/registerMigrations/_withDb/_getModel have
-    // been present since S³ 1.0.0, same floor as SmartAssign/TeamBalancer.
-    const required = '1.0.0';
+    // 1.8.0 — every model this plugin defines declares a `scopeKind`, and an S³
+    // older than 1.8.0 has no `scopePredicateFor()` to turn one into a query.
+    // This plugin's own reads and writes are safe either way: it stamps rows
+    // from `overrideServerID` or `server.id` and filters on that column
+    // explicitly at every call site. What breaks is the work S³ does on its
+    // behalf — the declarations are accepted and ignored, so an export carries
+    // every server's rows while reporting itself as this server's, and an
+    // import writes a sibling's rows in without noticing whose they were.
+    // Nothing throws, which is why this is checked at mount.
+    const required = '1.8.0';
     const actual = this._s3?.version;
     if (!this._s3VersionAtLeast(required)) {
       throw new Error(
@@ -351,7 +358,14 @@ export default class DBLog extends S3PluginBase {
     this.defineModel(MODEL.SERVER, {
       id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
       name: { type: DataTypes.STRING }
-    }, { tableName: TABLE.SERVER, timestamps: false, exportTier: 'logging' });
+    }, {
+      tableName: TABLE.SERVER,
+      timestamps: false,
+      exportTier: 'logging',
+      // The primary key is the server id — this table IS the server list every
+      // other db-log row's `server` column points at.
+      scopeKind: 'server-key'
+    });
 
     this.defineModel(MODEL.MATCH, {
       id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
@@ -364,7 +378,17 @@ export default class DBLog extends S3PluginBase {
       startTime: { type: DataTypes.DATE, allowNull: false },
       endTime: { type: DataTypes.DATE },
       winner: { type: DataTypes.STRING }
-    }, { tableName: TABLE.MATCH, timestamps: false, exportTier: 'logging' });
+    }, {
+      tableName: TABLE.MATCH,
+      timestamps: false,
+      exportTier: 'logging',
+      // db-log has always scoped its rows, and it names the column `server`
+      // rather than `serverID`. Honouring the existing name costs a parameter;
+      // renaming a column in a plugin this suite does not own costs a migration
+      // and breaks anyone reading the table directly.
+      scopeKind: 'server-column',
+      scopeColumn: 'server'
+    });
 
     this.defineModel(MODEL.TICKRATE, {
       id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
@@ -372,7 +396,7 @@ export default class DBLog extends S3PluginBase {
       match: { type: DataTypes.INTEGER, allowNull: true },
       time: { type: DataTypes.DATE, allowNull: false },
       tickRate: { type: DataTypes.FLOAT, allowNull: false }
-    }, { tableName: TABLE.TICKRATE, timestamps: false, exportTier: 'logging' });
+    }, { tableName: TABLE.TICKRATE, timestamps: false, exportTier: 'logging', scopeKind: 'server-column', scopeColumn: 'server' });
 
     this.defineModel(MODEL.PLAYERCOUNT, {
       id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
@@ -382,7 +406,7 @@ export default class DBLog extends S3PluginBase {
       players: { type: DataTypes.INTEGER, allowNull: false },
       publicQueue: { type: DataTypes.INTEGER, allowNull: false },
       reserveQueue: { type: DataTypes.INTEGER, allowNull: false }
-    }, { tableName: TABLE.PLAYERCOUNT, timestamps: false, exportTier: 'logging' });
+    }, { tableName: TABLE.PLAYERCOUNT, timestamps: false, exportTier: 'logging', scopeKind: 'server-column', scopeColumn: 'server' });
 
     this.defineModel(MODEL.PLAYER, {
       id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
@@ -390,7 +414,16 @@ export default class DBLog extends S3PluginBase {
       steamID: { type: DataTypes.STRING, allowNull: false, unique: true },
       lastName: { type: DataTypes.STRING },
       lastIP: { type: DataTypes.STRING }
-    }, { tableName: TABLE.PLAYER, timestamps: false, exportTier: 'historical', ...UTF8MB4 });
+    }, {
+      tableName: TABLE.PLAYER,
+      timestamps: false,
+      exportTier: 'historical',
+      // One row per person, keyed by their unique ids and carrying no `server`
+      // column — the only db-log table that is community-wide, and the reason
+      // this classification cannot be derived from the plugin's own convention.
+      scopeKind: 'global',
+      ...UTF8MB4
+    });
 
     const combatColumns = (DT) => ({
       id: { type: DT.INTEGER, primaryKey: true, autoIncrement: true },
@@ -411,13 +444,17 @@ export default class DBLog extends S3PluginBase {
     });
 
     this.defineModel(MODEL.WOUND, combatColumns(DataTypes), {
-      tableName: TABLE.WOUND, timestamps: false, exportTier: 'logging', ...UTF8MB4
+      tableName: TABLE.WOUND, timestamps: false, exportTier: 'logging',
+      scopeKind: 'server-column', scopeColumn: 'server', ...UTF8MB4
     });
 
     this.defineModel(MODEL.DEATH, {
       ...combatColumns(DataTypes),
       woundTime: { type: DataTypes.DATE }
-    }, { tableName: TABLE.DEATH, timestamps: false, exportTier: 'logging', ...UTF8MB4 });
+    }, {
+      tableName: TABLE.DEATH, timestamps: false, exportTier: 'logging',
+      scopeKind: 'server-column', scopeColumn: 'server', ...UTF8MB4
+    });
 
     this.defineModel(MODEL.REVIVE, {
       ...combatColumns(DataTypes),
@@ -426,7 +463,10 @@ export default class DBLog extends S3PluginBase {
       reviverName: { type: DataTypes.STRING },
       reviverTeamID: { type: DataTypes.INTEGER },
       reviverSquadID: { type: DataTypes.INTEGER }
-    }, { tableName: TABLE.REVIVE, timestamps: false, exportTier: 'logging', ...UTF8MB4 });
+    }, {
+      tableName: TABLE.REVIVE, timestamps: false, exportTier: 'logging',
+      scopeKind: 'server-column', scopeColumn: 'server', ...UTF8MB4
+    });
   }
 
   _registerMigrations() {

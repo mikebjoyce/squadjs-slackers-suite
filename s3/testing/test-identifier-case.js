@@ -55,8 +55,18 @@ const SCAN_DIRS = [
   'smart-assign/plugins', 'smart-assign/utils', 'smart-assign/testing',
   'switch/plugins', 'switch/utils', 'switch/testing',
   'team-balancer/plugins', 'team-balancer/utils', 'team-balancer/testing',
-  's3/plugins', 's3/utils', 's3/testing',
+  's3/plugins', 's3/utils', 's3/testing', 's3/tools',
+  'elo-tracker/tools',
   'tools'
+];
+
+// Directories that hold no database code and are excluded on purpose. Named
+// here rather than left out, so the coverage check below reports a genuinely
+// new directory instead of being quietly widened to whatever exists.
+const NOT_SCANNED = [
+  'node_modules', '.git', 'docs', 'backups', 's3/backups', 'team-balancer/backups',
+  's3/locale-templates', 'TeamBalancerScrambleReports',
+  'team-balancer/TeamBalancerScrambleReports'
 ];
 
 let passed = 0;
@@ -176,6 +186,52 @@ test('the scan can fail — it detects both banned shapes and clears the correct
     "if ((await qi.showAllTables()).includes('T')) { } // case-fold-scan:allow — testing the marker\n" +
     "if ((await qi.showAllTables()).includes('U')) { }";
   assert.equal(findCaseSensitiveComparisons(stillCaught).length, 1, 'marker suppressed an unmarked line too');
+});
+
+/**
+ * Every file that mentions showAllTables(), anywhere in the repository.
+ *
+ * The scan above is only as good as SCAN_DIRS, and a directory missing from
+ * that list fails silently: the scan passes, having read nothing. That is not
+ * hypothetical — `s3/tools/schema-health.js` reads the table list and decides
+ * what is missing, and it sat outside the list from the day the list was
+ * written. So the list is checked against the repository rather than trusted.
+ */
+function collectAllSourceFiles(dir, out = []) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    const rel = path.relative(REPO_ROOT, full).replace(/\\/g, '/');
+    if (entry.isDirectory()) {
+      if (entry.name.startsWith('.')) continue;
+      if (NOT_SCANNED.includes(rel)) continue;
+      collectAllSourceFiles(full, out);
+    } else if (/\.(js|mjs|cjs)$/.test(entry.name)) {
+      out.push(rel);
+    }
+  }
+  return out;
+}
+
+test('every file that reads the table list is inside the scan', () => {
+  const scanned = new Set(
+    collectSourceFiles().map((f) => path.relative(REPO_ROOT, f).replace(/\\/g, '/'))
+  );
+
+  const unscanned = [];
+  for (const rel of collectAllSourceFiles(REPO_ROOT)) {
+    if (scanned.has(rel) || EXCLUDE_FILES.has(rel)) continue;
+    const source = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+    // Any of the three ways the suite asks a database what tables it holds.
+    if (/showAllTables|sqlite_master|information_schema/.test(source)) unscanned.push(rel);
+  }
+
+  assert.deepEqual(
+    unscanned,
+    [],
+    'these files read the table list but sit outside SCAN_DIRS, so the scan above\n' +
+    '  never looks at them. Add their directory to SCAN_DIRS:\n\n    ' +
+    unscanned.join('\n    ') + '\n'
+  );
 });
 
 test('no source file compares showAllTables() output by equality', () => {

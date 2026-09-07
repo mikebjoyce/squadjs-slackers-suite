@@ -737,6 +737,75 @@ test('qi.tableExists() matches a table regardless of identifier case', async () 
 });
 
 // ---------------------------------------------------------------------------
+// The s3-core bootstrap group
+// ---------------------------------------------------------------------------
+//
+// S3_Locks and S3_Servers are created unconditionally during mount(), before
+// any migration can be serialised, and are then registered as a group so
+// drift verification has a manifest to check them against. The group would be
+// permanently behind if nothing recorded it applied — and a group that is
+// permanently behind is not cosmetic: every consumer plugin's
+// verifyAndRunMigrations() reads the same verdict and prompts for confirmation
+// of work that is already done, at every boot.
+
+test('mount() records the s3-core group as applied, without confirmation', async () => {
+  const harness = await createTestHarness();
+  try {
+    const { dbService } = harness;
+
+    // The engine createTestHarness() swaps in is a fresh one; ask the database,
+    // which is where mount() wrote the row.
+    const row = await dbService.SchemaVersionsModel.findOne({ where: { pluginName: 's3-core' } });
+    assert.ok(row, 's3-core must have a recorded version after mount');
+    assert.equal(row.version, 1);
+
+    // Not the drift-recovery sentinel: a bootstrap row must be indistinguishable
+    // from one a normal run would have written.
+    assert.equal(row.migrationHash.length, 64, 'the recorded hash must be a real sha256 of up()');
+
+    // And nothing was confirmed to get there.
+    assert.equal(dbService.migrationEngine._confirmed, false);
+  } finally {
+    await destroyTestHarness(harness);
+  }
+});
+
+test('a freshly mounted database reports no pending schema work', async () => {
+  const harness = await createTestHarness();
+  try {
+    const result = await harness.dbService.verifySchemaVersions();
+    assert.equal(result.upToDate, true,
+      `fresh mount reported pending: ${(result.pending || []).map((x) => x.pluginName).join(', ')}`);
+  } finally {
+    await destroyTestHarness(harness);
+  }
+});
+
+test('markBootstrapApplied is idempotent and never rolls a version backwards', async () => {
+  const harness = await createTestHarness();
+  try {
+    const { dbService } = harness;
+    const engine = dbService.migrationEngine;
+
+    // The swapped-in engine has no groups registered, so re-register s3-core
+    // the way mount() did and confirm a second marking is a no-op.
+    await dbService._registerCoreMigrations();
+    const again = await engine.markBootstrapApplied('s3-core');
+    assert.equal(again.recorded, null, 'a group already at the target version must not be rewritten');
+
+    const rows = await dbService.SchemaVersionsModel.findAll({ where: { pluginName: 's3-core' } });
+    assert.equal(rows.length, 1, 'exactly one row per group');
+    assert.equal(rows[0].version, 1);
+
+    // An unregistered group has no target to record.
+    const none = await engine.markBootstrapApplied('never-registered');
+    assert.equal(none.recorded, null);
+  } finally {
+    await destroyTestHarness(harness);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Run
 // ---------------------------------------------------------------------------
 

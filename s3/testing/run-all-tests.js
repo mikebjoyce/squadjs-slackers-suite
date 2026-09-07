@@ -94,6 +94,16 @@ const CATEGORY_TESTS = {
     // SQLite coverage always runs; the MySQL/Postgres cases self-skip when
     // those engines are unreachable, so this stays a Category 1 test.
     'test-dialect-portability.js',
+    // The orphan scan folds every identifier it compares, which is only
+    // exercisable against an engine that folds. Same self-skip shape.
+    'test-db-orphans.js',
+    // Export scoping is a WHERE clause built from a declaration, and both
+    // halves have to be checked against a real engine. Same self-skip shape.
+    'test-export-scope.js',
+    // The import half. The overwrite probe is a query and the foreign-key
+    // suppression is a session variable, so neither is checkable on logic
+    // alone. Same self-skip shape.
+    'test-import-scope.js',
     // Same shape: SQLite always runs, MySQL/Postgres self-skip when unreachable.
     'test-migration-bulk-types.js',
     // touches.data post-conditions: same shape again, all three engines.
@@ -103,9 +113,43 @@ const CATEGORY_TESTS = {
     'test-drift-recovery-matrix.js',
     // Spawns child processes to assert stdout/stderr separation.
     'test-stderr-diagnostics.js',
+    // Also spawns real child processes, and for the same reason: the migration
+    // lock's guarantee is cross-process, and two service objects in one process
+    // are serialised by the process rather than by the lock. SQLite only, since
+    // the lock has no dialect branch.
+    'test-multi-process-locking.js',
+    // Server identity: how the id every server-scoped row carries is resolved,
+    // and what happens to a value that cannot work. Builds one flattened
+    // assembly, because the plugin classes only import in the shipped layout.
+    'test-server-identity.js',
+    // Server registry: who else is writing to this database. Runs on a
+    // file-backed SQLite so two DBServices can contest one row — `:memory:`
+    // would give each connection a database of its own and there would be
+    // nothing to collide over.
+    'test-server-registry.js',
+    // Which server answers a Discord command, and how many times. Same
+    // file-backed SQLite for the same reason, plus one assembly, because
+    // TeamBalancer's scope table only imports in the shipped layout.
+    'test-discord-routing.js',
+    // The two singleton tables whose primary key is the server id. Also
+    // file-backed SQLite, and for the same reason: the four boot orders are
+    // two DBServices meeting over one legacy row. Builds an assembly, because
+    // TeamBalancer's model and wrapper are the shipped ones rather than
+    // stand-ins.
+    'test-singleton-scoping.js',
+    // Third time this file has gained a note like the two above: this one was
+    // written, passed by hand, and then listed under "uncategorized test
+    // files" — printed on every run and executed on none of them. Adding a
+    // test file and adding it to a category are two separate acts, and the
+    // runner reports the gap rather than failing on it.
+    'test-community-options.js',
     // Replays every plugin's real migrations across DB states, so it is slower
     // than the rest.
     'test-migration-conformance.js',
+    // What conformance does not ask: whether the rows that came out of a
+    // Class B rename are the rows that went in. Same shape as the suites
+    // above — SQLite always runs, MySQL and Postgres self-skip.
+    'test-multi-server-scoping.js',
     // A migration whose up() commits real DDL/DML but fails post-commit
     // touches verification must be safely retryable, not crash forever on a
     // raw duplicate-column/duplicate-key driver error. SQLite always runs,
@@ -143,7 +187,12 @@ const CATEGORY_TESTS = {
     'test-command-routing.js'
   ],
   4: [
-    'test-migration-permissions.js'
+    'test-migration-permissions.js',
+    // Two real child processes against one MySQL database. Category 4 rather
+    // than 1 because there is no SQLite arm to fall back on: the point is the
+    // engine the deployment runs, and a run without Docker proves nothing
+    // here rather than proving less.
+    'test-two-process-isolation.js'
   ]
 };
 
@@ -234,9 +283,19 @@ async function main() {
       let output = '';
 
       try {
+        // Four minutes, not one. `test-migration-conformance.js` replays every
+        // registered migration against SQLite, MySQL and Postgres in turn and
+        // takes a little over a minute on its own, so a 60-second cap reported
+        // 121 passing assertions as a suite failure — the worst kind of red,
+        // because the thing it points at is fine and the runner is not.
+        //
+        // The cap is here to stop a hung engine connection holding the whole
+        // run open, and four minutes still does that. Anything legitimately
+        // slower than this belongs in its own file rather than in a longer
+        // number here.
         output = execSync(`node "${testPath}"`, {
           cwd: path.resolve(__dirname, '..', '..'),
-          timeout: 60000,
+          timeout: 4 * 60 * 1000,
           encoding: 'utf-8',
           stdio: ['pipe', 'pipe', 'pipe']
         });

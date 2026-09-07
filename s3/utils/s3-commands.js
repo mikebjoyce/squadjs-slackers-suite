@@ -10,17 +10,50 @@
  * (sendDiscordMessage, WatchManager, listener registration) in
  * s3-discord.js.
  *
+ * ─── ROUTING (multi-server) ──────────────────────────────────────
+ *
+ * Every process running this suite sees every message in the shared
+ * admin channel, so a command typed once arrives at all of them.
+ * scopeForS3Command() below classifies each verb into one of the
+ * COMMAND_SCOPE values from s3-discord-routing.js, and that
+ * classification is what decides which processes answer:
+ *
+ *   SERVER_READ         every server answers, labelled
+ *   SERVER_MUTATING     the targeted server acts, and a target is
+ *                       required rather than assumed
+ *   COMMUNITY_READ      one process answers for the community
+ *   COMMUNITY_MUTATING  one process acts, under a claim, once
+ *   TOKEN_CONFIRM       the token is the routing — whoever minted it
+ *
+ * The classification lives here rather than in the router because it
+ * is a fact about what each verb does, and the router has no way to
+ * know that. Two cases are worth reading the comments for. !s3 locks
+ * and !s3 config look community-wide from their names and are not:
+ * both render THIS process's answer, and on a multi-server install
+ * the answers genuinely differ. And !s3 players / !s3 clans are
+ * ordinary server reads that ask for a target anyway, because a full
+ * roster is several embeds and three servers answering at once is a
+ * screen of them. That one is a volume exception, not a correctness
+ * one.
+ *
+ * On a single-server install none of this is reachable in a way an
+ * admin would notice: one live server means one responder, and the
+ * labels degrade to the server's own name.
+ *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * createCommandHandlers(context)
  *   Returns { handlers: Map<string, handlerFn>, runDiagnostic }
  *   where handlerFn is (plugin, message, args) => Promise<void>.
  *
+ * Routing:  scopeForS3Command(args) → { scope, selectorRequired }
  * Utility:  formatDuration, phaseEmoji, circleEmoji, serviceCircle,
- *           checkmark (kept for legacy compat), truncate
+ *           checkmark (kept for legacy compat), truncate,
+ *           guildAttachmentLimit, formatTimestamp
  * Embeds:   buildStatusEmbed, buildServicesEmbed, buildGameStateEmbed,
  *           buildFactionsEmbed, buildLocksEmbed, buildConfigEmbed,
- *           buildKarmaEmbed, buildSwitchesExport, buildHelpEmbed
+ *           buildKarmaEmbed, buildSwitchesExport, buildServersEmbed,
+ *           buildHelpEmbed
  * Embed sets (return an array — one Discord message, several embeds):
  *           buildPlayersEmbeds, buildClansEmbeds, buildSwitchesEmbed
  * Tests:    runDiagnostic  (inject sendDiscordMessage)
@@ -59,18 +92,31 @@
  * s3-backup.js           — canBackup, listBackups, restoreBackup
  * s3-export-import.js    — exportToFile, gzipFileForAttachment, importFromJSON, etc.
  * s3-common.js           — formatSize
+ * s3-discord-routing.js  — COMMAND_SCOPE (the classification vocabulary)
+ * s3-server-label.js     — how a server names itself in an answer
  *
  */
 import { buildMigrationEmbed } from './s3-migration-discord.js';
 import { canBackup, listBackups, restoreBackup } from './s3-backup.js';
 import {
   importFromJSON,
+  planImport,
   validateImportStructure,
   restoreFromFile,
   exportToFile,
   gzipFileForAttachment
 } from './s3-export-import.js';
 import { formatSize } from './s3-common.js';
+import { COMMAND_SCOPE } from './s3-discord-routing.js';
+import { serverLabels, serverDisplayName } from './s3-server-label.js';
+// Only for the three statics the registry embed needs — freshness and the
+// BIGINT read. Both live next to the column definitions they interpret, which
+// is where a second, drifting copy of "is this row fresh" is easiest to avoid.
+import DBService from './db-service.js';
+// The one list of community-affecting options and the one phrasing of a
+// disagreement. A second copy here is how the embed and the mount warning end
+// up describing the same divergence in two different vocabularies.
+import { OPTION_KIND, parseCommunityOptions, describeDisagreement } from './community-options.js';
 import {
   parseRange,
   looksLikeRangeToken,
@@ -556,6 +602,31 @@ export function buildFactionsEmbed(plugin) {
  * @param {number} [opts.maxFields=3] - Max fields to spend on this list.
  * @param {boolean} [opts.inline=false]
  */
+/**
+ * Table-name prefixes the suite claims. Used by `!s3 db orphans` to tell a
+ * table this suite left behind from one that belongs to SquadJS core or to
+ * something else sharing the database entirely — dropping the wrong table is
+ * the one mistake this command must never invite.
+ *
+ * Lower-case, because every comparison against them folds: production MySQL
+ * runs lower_case_table_names=1.
+ */
+const SUITE_TABLE_PREFIXES = [
+  's3_', 'sa_', 'elo_', 'tb_', 'switchplugin_', 'teambalancer', 'smartassign'
+];
+
+/**
+ * Orphans this suite created deliberately, and what replaced each. Anything
+ * not listed here is still reported — an unrecognized orphan is the more
+ * interesting kind — it just gets no arrow.
+ */
+const ABANDONED_BY = {
+  's3_playerreconnects': 'S3_ServerReconnects',
+  's3_playersessions': 'S3_ServerSessions',
+  'switchplugin_settings': 'SwitchPlugin_ServerSettings',
+  'elo_pluginstates': null
+};
+
 function pushLineField(plugin, fields, name, lines, opts = {}) {
   const { maxFields = 3, inline = false } = opts;
   if (!lines?.length) return;
@@ -1164,6 +1235,280 @@ export function buildLocksEmbed(plugin) {
   };
 }
 
+/**
+ * Render one registry row as the short reference an operator types back.
+ *
+ * The id is always shown alongside the alias, because the id is what appears in
+ * log lines and the alias is what appears in commands, and the moment those two
+ * have to be matched up by hand is the moment the wrong server gets targeted.
+ *
+ * The advertised name comes last when there is one worth showing. `label` is
+ * how a caller rendering several rows at once hands in the shortened form —
+ * what to drop from a name can only be worked out by comparing it with the
+ * others, and a row on its own has nothing to compare against.
+ */
+function describeServerRow(row, label = serverDisplayName(row, { maxLength: 40 })) {
+  const name = row.alias ? `\`${row.alias}\`` : `\`#${row.serverID}\``;
+  return `${name} (id ${row.serverID}${label ? ` — ${label}` : ''})`;
+}
+
+/**
+ * Turn an import plan into the two things an operator has to read before
+ * agreeing: what will happen to each table, and whose rows are at risk.
+ *
+ * The overwrite count is the one that matters and the one nothing used to
+ * report. `model.upsert()` matches on the primary key, and for every table
+ * keyed on an autoincrement `id` that key says nothing about which server a
+ * row belongs to — so an envelope taken from a pre-multi-server database
+ * addresses ids that now belong to a sibling, and each one of those is a
+ * silent replacement of a row somebody else is still using.
+ *
+ * @param {object} plugin - The S³ plugin instance
+ * @param {object} plan - From planImport()
+ * @param {object[]} registered - Registry rows, for naming servers
+ * @returns {{lines: string[], fields: object[]}}
+ */
+function renderImportPlan(plugin, plan, registered) {
+  const L = (key, vars) => plugin.localize(`slackersSquadServices.db.${key}`, vars);
+  const names = (ids) => describeServerIDs(registered, ids, L('serverNotRegistered'));
+
+  const lines = Object.entries(plan.tables).map(([name, entry]) => {
+    if (entry.status === 'skipped') return `⏭️ **${name}**: ${L('importNotRestorable', { table: name })}`;
+    if (entry.status === 'unknown') return `❌ **${name}**: ${L('importNoModelForTable', { table: name, rows: String(entry.total) })}`;
+    if (entry.status === 'error') return `❌ **${name}**: ${entry.error}`;
+
+    // Tags, not columns: on a single-server install every one of these is
+    // zero and the line reads exactly as it did before any of this existed.
+    const tags = [];
+    if (entry.stamp > 0) tags.push(L('importTagAdopted', { n: entry.stamp }));
+    if (entry.remap > 0) tags.push(L('importTagRemapped', { n: entry.remap }));
+    if (entry.foreign > 0) tags.push(L('importTagForeign', { n: entry.foreign }));
+    if (entry.skip > 0) tags.push(L('importTagSkipped', { n: entry.skip }));
+    if (entry.overwrite === null) tags.push(L('importTagOverwriteUnknown'));
+    else if (entry.overwrite > 0) tags.push(L('importTagOverwritten', { n: entry.overwrite }));
+
+    const written = entry.write + entry.stamp + entry.remap + entry.foreign;
+    return `✅ **${name}**: ${written} rows${tags.length > 0 ? ` (${tags.join(' · ')})` : ''}`;
+  });
+
+  const fields = [{
+    name: L('importScopeHeader'),
+    value: plan.remapServer
+      ? L('importScopeRemap', { serverID: String(plan.serverID) })
+      : plan.allServers
+        ? L('importScopeAll')
+        : L('importScopeOwn', { serverID: String(plan.serverID) }),
+    inline: false
+  }];
+
+  if (plan.totals.stamp > 0) {
+    fields.push({ name: L('importLegacyHeader'), value: L('importLegacyRule', { n: plan.totals.stamp, serverID: String(plan.serverID) }), inline: false });
+  }
+
+  fields.push({
+    name: L('importOverwriteHeader'),
+    value: plan.totals.overwrite > 0
+      ? L('importOverwriteLine', {
+        n: plan.totals.overwrite,
+        servers: plan.overwrittenServerIDs.length > 0 ? names(plan.overwrittenServerIDs) : L('importOverwriteUnattributed')
+      })
+      : L('importOverwriteNone'),
+    inline: false
+  });
+
+  if (plan.totals.skip > 0) {
+    fields.push({ name: L('importSkippedHeader'), value: L('importSkippedLine', { n: plan.totals.skip, servers: names(plan.skippedServerIDs) }), inline: false });
+  }
+
+  if (plan.totals.foreign > 0) {
+    fields.push({ name: L('importForeignHeader'), value: L('importForeignLine', { n: plan.totals.foreign, servers: names(plan.writtenServerIDs.filter((id) => id !== plan.serverID)) }), inline: false });
+  }
+
+  if (plan.unknownTables.length > 0) {
+    fields.push({
+      name: L('importUnknownHeader'),
+      value: L('importUnknownLine', { tables: plan.unknownTables.map((t) => `\`${t.name}\` (${t.rows})`).join(', ') }),
+      inline: false
+    });
+  }
+
+  return { lines, fields };
+}
+
+/**
+ * Render a set of server ids the way an operator has to read them before
+ * agreeing to something: by name.
+ *
+ * Every confirmation in the export and import surface names the servers it
+ * will touch rather than counting them, because "this will overwrite rows on
+ * 2 servers" is not a sentence anyone can check against what they meant.
+ *
+ * An id with no registry row still renders. That is a server that was
+ * forgotten, or an envelope taken from a community this database is not, and
+ * both are exactly the cases an operator needs to see before agreeing —
+ * dropping them would understate what the operation touches. `unknownLabel`
+ * is passed in already localized because this file's row renderer is
+ * structure rather than prose, and one untranslated word inside a translated
+ * embed is worse than either.
+ *
+ * @param {object[]} rows - Registry rows, from getRegisteredServers()
+ * @param {Array<number>} ids - Server ids to render, in any order
+ * @param {string|null} [unknownLabel] - Shown for an id with no registry row
+ * @returns {string} Comma-separated, ids ascending
+ */
+export function describeServerIDs(rows, ids, unknownLabel = null) {
+  const list = Array.isArray(rows) ? rows : [];
+  const labels = serverLabels(list, { maxLength: 40 });
+  const byID = new Map(list.map((row) => [row.serverID, row]));
+
+  return [...new Set(ids)]
+    .sort((a, b) => a - b)
+    .map((id) => {
+      const row = byID.get(id);
+      if (row) return describeServerRow(row, labels.get(id));
+      return `\`#${id}\` (id ${id}${unknownLabel ? ` — ${unknownLabel}` : ''})`;
+    })
+    .join(', ');
+}
+
+/**
+ * The server registry — who else writes to this database.
+ *
+ * Everything that can silently disagree between servers is surfaced here rather
+ * than in a command of its own: the suite version each row was written by, the
+ * community-affecting option values behind it, and each host's clock skew
+ * against the database. This is the one command an operator already runs to see
+ * the server list, so it is where a disagreement has a chance of being noticed
+ * before it becomes a symptom.
+ *
+ * Registered and live are both shown, and they are different questions. The
+ * count is what the operator-facing gates use — a stale row is still a server
+ * the community owns, and dropping back to implicit targeting because a process
+ * happens to be restarting is exactly the hazard the selectors exist for.
+ * Freshness is per row because it says whether a `--server` aimed at that row
+ * would reach anything.
+ *
+ * @param {object} plugin - The S³ plugin instance
+ * @returns {Promise<object>} A Discord embed
+ */
+export async function buildServersEmbed(plugin) {
+  const db = plugin.services.db;
+  const NA = plugin.localize('slackersSquadServices.labels.notAvailable');
+
+  if (!db || !db.isReady() || !db.ServersModel) {
+    return {
+      color: 0xe74c3c,
+      title: plugin.localize('slackersSquadServices.servers.title'),
+      description: plugin.localize('slackersSquadServices.servers.registryUnavailable')
+    };
+  }
+
+  const rows = await db.getRegisteredServers();
+  if (rows.length === 0) {
+    return {
+      color: 0x95a5a6,
+      title: plugin.localize('slackersSquadServices.servers.title'),
+      description: plugin.localize('slackersSquadServices.servers.empty')
+    };
+  }
+
+  const now = await db.dbNow();
+  const mine = db.getServerID();
+
+  // Worked out across the whole registry rather than per row: what is padding
+  // in a server name is whatever every server's name also says, and one row
+  // read on its own cannot show that.
+  const labels = serverLabels(rows);
+
+  const fields = rows.map((row) => {
+    const fresh = DBService.isServerRowFresh(row, now);
+    const lastSeen = DBService._asEpochMs(row.lastSeenAt);
+
+    const lines = [
+      plugin.localize('slackersSquadServices.servers.lastSeenLine', {
+        state: fresh
+          ? plugin.localize('slackersSquadServices.servers.stateLive')
+          : plugin.localize('slackersSquadServices.servers.stateStale'),
+        age: lastSeen === null ? NA : formatDuration(Math.max(0, now - lastSeen))
+      }),
+      plugin.localize('slackersSquadServices.servers.suiteVersionLine', { version: row.suiteVersion || NA }),
+      plugin.localize('slackersSquadServices.servers.addressLine', {
+        host: row.host || NA,
+        queryPort: row.queryPort ?? NA,
+        rconPort: row.rconPort ?? NA
+      })
+    ];
+
+    // Surfaced per row rather than only logged, because the log line is written
+    // on the machine whose clock is wrong. The operator asking why a lock
+    // expired early is reading one Discord channel, not three server consoles.
+    if (row.clockSkewMs !== null && row.clockSkewMs !== undefined) {
+      lines.push(plugin.localize('slackersSquadServices.servers.clockSkewLine', {
+        skew: `${row.clockSkewMs > 0 ? '+' : ''}${row.clockSkewMs}`
+      }));
+    }
+
+    // A divergence here is the whole subject of the config-divergence work, and
+    // this is where it becomes visible without anyone going looking for it.
+    const options = parseCommunityOptions(row.communityOptions);
+    if (options && Object.keys(options).length > 0) {
+      lines.push(plugin.localize('slackersSquadServices.servers.optionsLine', {
+        options: Object.entries(options).map(([k, v]) => `${k}=${v}`).join(', ')
+      }));
+    }
+
+    const label = labels.get(row.serverID);
+
+    const heading = [
+      row.alias ? `\`${row.alias}\`` : plugin.localize('slackersSquadServices.servers.unnamed'),
+      `(id ${row.serverID})`,
+      row.serverID === mine ? plugin.localize('slackersSquadServices.servers.thisServer') : '',
+      label ? `— ${label}` : ''
+    ].filter(Boolean).join(' ');
+
+    return { name: truncate(heading, 256), value: truncate(lines.join('\n'), 1024), inline: false };
+  });
+
+  // Where an operator sees the community-option picture. A per-row options
+  // line already shows the values; what it cannot do is make two of them
+  // differing across six fields visible, or say which of the three treatments
+  // in community-options.js the divergence is getting.
+  const { resolved, disagreements } = await db.getCommunityOptionSummary();
+  if (disagreements.length > 0) {
+    const lines = disagreements.map((entry) => {
+      const what = describeDisagreement(entry);
+      if (entry.kind === OPTION_KIND.RESOLVED) {
+        const winner = resolved[entry.name];
+        return plugin.localize('slackersSquadServices.servers.configResolvedLine', {
+          disagreement: what,
+          server: winner ? (winner.alias || `#${winner.serverID}`) : NA
+        });
+      }
+      if (entry.kind === OPTION_KIND.MUST_AGREE) {
+        return plugin.localize('slackersSquadServices.servers.configRefuseLine', { disagreement: what });
+      }
+      return plugin.localize('slackersSquadServices.servers.configDifferLine', { disagreement: what });
+    });
+
+    fields.push({
+      name: plugin.localize('slackersSquadServices.servers.configHeading'),
+      value: truncate(lines.join('\n'), 1024),
+      inline: false
+    });
+  }
+
+  const live = rows.filter((row) => DBService.isServerRowFresh(row, now)).length;
+
+  return {
+    color: 0x3498db,
+    title: plugin.localize('slackersSquadServices.servers.title'),
+    description: plugin.localize('slackersSquadServices.servers.summary', { registered: rows.length, live }),
+    fields,
+    timestamp: new Date().toISOString(),
+    footer: { text: plugin.localize('slackersSquadServices.servers.footer') }
+  };
+}
+
 export function buildConfigEmbed(plugin) {
   const sc = plugin.services.serverConfig;
   if (!sc) {
@@ -1733,7 +2078,9 @@ export async function buildSwitchesExport(plugin, rangeArg, periodArg, asJson) {
   const ext = asJson ? 'json' : 'csv';
   const fromStr = new Date(range.fromTs).toISOString().slice(0, 10);
   const toStr = new Date(range.toTs).toISOString().slice(0, 10);
-  const filename = `s3-switches-${period}-${fromStr}_to_${toStr}.${ext}`;
+  // The rows are this server's, and a CSV downloaded into a folder beside
+  // the neighbour's has nothing else left to say so.
+  const filename = `s3-switches${plugin.serverFileTag?.() || ''}-${period}-${fromStr}_to_${toStr}.${ext}`;
   const buffer = asJson
     ? Buffer.from(JSON.stringify(rows, null, 2), 'utf-8')
     : Buffer.from('\uFEFF' + toCsv(rows), 'utf-8');
@@ -1770,7 +2117,8 @@ export function buildHelpEmbed(plugin) {
           plugin.localize('slackersSquadServices.help.s3PlayersPopulationOverview'),
           plugin.localize('slackersSquadServices.help.s3ClansClanGroups'),
           plugin.localize('slackersSquadServices.help.s3LocksGlobalAnd'),
-          plugin.localize('slackersSquadServices.help.s3ConfigServerConfiguration')
+          plugin.localize('slackersSquadServices.help.s3ConfigServerConfiguration'),
+          plugin.localize('slackersSquadServices.help.s3ServersRegistry')
         ].join('\n'),
         inline: false
       },
@@ -1817,11 +2165,14 @@ export function buildHelpEmbed(plugin) {
           plugin.localize('slackersSquadServices.help.s3ConfirmTokenConfirm'),
           plugin.localize('slackersSquadServices.help.s3MigrateForceDry'),
           plugin.localize('slackersSquadServices.help.s3MigratePreviewPreview'),
+          plugin.localize('slackersSquadServices.help.s3MigrateDdlEmit'),
           plugin.localize('slackersSquadServices.help.s3MigrateVerifyRun'),
           plugin.localize('slackersSquadServices.help.s3MigratePurgeDeprecated'),
           plugin.localize('slackersSquadServices.help.s3BackupCreateCreate'),
           plugin.localize('slackersSquadServices.help.s3BackupListList'),
-          plugin.localize('slackersSquadServices.help.s3BackupRestoreFilename')
+          plugin.localize('slackersSquadServices.help.s3BackupRestoreFilename'),
+          plugin.localize('slackersSquadServices.help.s3ServersAlias'),
+          plugin.localize('slackersSquadServices.help.s3ServersForget')
         ].join('\n'),
         inline: false
       },
@@ -1996,6 +2347,130 @@ export async function runDiagnostic(plugin, message, sendDiscordMessage) {
  * @param {object} context.stagedImportRef - { current: null|object } for import staging
  * @returns {{ handlers: Map<string, Function>, runDiagnostic: Function }}
  */
+/**
+ * Which server answers `!s3 <verb>`, and whether it may answer unasked.
+ *
+ * Sixteen live verbs, not eighteen: `watch` and `unwatch` sit inside the
+ * S3_WATCH_DEPRECATED block comment above and are not registered, so they
+ * are not tagged. A grep for `handlers.set(` returns them anyway, which is
+ * exactly the kind of counting this table is meant to stop.
+ *
+ * **Re-enabling `watch` needs per-server attribution before it needs a
+ * scope.** It relays verbose log lines into a Discord channel, and on a
+ * shared channel two servers' logs interleave into one stream with nothing
+ * in a line saying which process wrote it — a debugging tool that makes the
+ * thing being debugged harder to see. Whoever turns it back on either stamps
+ * the server on every relayed line or makes the relay a per-server read with
+ * a required selector; only then is there a scope worth arguing about.
+ *
+ * **The tag belongs to the verb an operator types, not to the handler that
+ * dispatches it.** One `servers` handler covers a community read and two
+ * community mutations; one `db` handler covers three reads and a write that
+ * replaces the database. Reading only the outer verb would let `!s3 db
+ * import` through on the same terms as `!s3 db status`.
+ *
+ * **And every tag here came from reading the body.** Two are not what the
+ * name suggests. `!s3 locks` reports the in-process service locks that
+ * `buildLocksEmbed()` reads out of memory — it has nothing to do with the
+ * `S3_Locks` table that backs migrations and Discord claims, despite the
+ * name, so it is one server's answer and not the community's. `!s3 config`
+ * is the same shape: it renders THIS process's resolved options, which on a
+ * multi-server install genuinely differ between servers.
+ *
+ * @param {string[]} args - Arguments with `!s3` already removed.
+ * @returns {{scope: string, selectorRequired: boolean}}
+ */
+export function scopeForS3Command(args) {
+  const verb = String(args?.[0] ?? '').toLowerCase();
+  const sub = String(args?.[1] ?? '').toLowerCase();
+
+  switch (verb) {
+    // ── One server's own state ──
+    case 'status':
+    case 'services':
+    case 'gamestate':
+    case 'factions':
+    case 'locks':
+    case 'config':
+    case 'switches':
+    case 'karma':
+    case 'diag':
+      return { scope: COMMAND_SCOPE.SERVER_READ, selectorRequired: false };
+
+    // Same scope, but buildPlayersEmbeds() and buildClansEmbeds() return an
+    // array rather than one embed — a full roster runs to several. Three
+    // servers broadcasting a roster apiece is a screen of embeds from one
+    // typed command, so these ask for a target instead of answering
+    // together. That is a volume exception, not a correctness one.
+    case 'players':
+    case 'clans':
+      return { scope: COMMAND_SCOPE.SERVER_READ, selectorRequired: true };
+
+    // ── The registry ──
+    case 'servers':
+      return {
+        scope: (sub === 'alias' || sub === 'forget')
+          ? COMMAND_SCOPE.COMMUNITY_MUTATING
+          : COMMAND_SCOPE.COMMUNITY_READ,
+        selectorRequired: false
+      };
+
+    // ── The whole database ──
+    case 'db':
+      return {
+        scope: sub === 'import' ? COMMAND_SCOPE.COMMUNITY_MUTATING : COMMAND_SCOPE.COMMUNITY_READ,
+        selectorRequired: false
+      };
+
+    case 'backup': {
+      // The backup directory belongs to the PROCESS, not to the community.
+      // Each server reads and writes its own `backups/`, so an arbitrary
+      // process claiming `!s3 backup list` answers with a file list that
+      // exists on one host, and `restore <filename>` claimed by a process
+      // that does not hold that file just fails. The database a restore
+      // writes is shared — that is what its confirmation is for — but the
+      // file it reads is not, and the routing has to follow the file.
+      //
+      // `list` broadcasts: one short embed per server, and seeing all of
+      // them side by side is the point. `create` and `restore` each write a
+      // filesystem and which filesystem is the whole question, so both name
+      // their server. A bare `!s3 backup` is a usage reply and stays
+      // community-read so one process answers it rather than all of them.
+      if (sub === 'create' || sub === 'restore') {
+        return { scope: COMMAND_SCOPE.SERVER_MUTATING, selectorRequired: false };
+      }
+      if (sub === 'list') {
+        return { scope: COMMAND_SCOPE.SERVER_READ, selectorRequired: false };
+      }
+      return { scope: COMMAND_SCOPE.COMMUNITY_READ, selectorRequired: false };
+    }
+
+    case 'migrate':
+      // `pending`, `status`, `preview`, `verify` and `ddl` report; `force`,
+      // `purge-deprecated` and `adopt-state` write. A bare `!s3 migrate` is
+      // a usage reply and costs nothing either way, so it lands with the
+      // reads.
+      return {
+        scope: (sub === 'force' || sub === 'purge-deprecated' || sub === 'adopt-state')
+          ? COMMAND_SCOPE.COMMUNITY_MUTATING
+          : COMMAND_SCOPE.COMMUNITY_READ,
+        selectorRequired: false
+      };
+
+    // The token IS the routing. MigrationEngine mints it at arm time and
+    // confirmToken() rejects anything it did not mint, so this reaches the
+    // arming process by construction — and a claim would hand it to an
+    // arbitrary one, which then rejects a token it never minted while the
+    // process holding the armed migration never sees the message.
+    case 'confirm':
+      return { scope: COMMAND_SCOPE.TOKEN_CONFIRM, selectorRequired: false };
+
+    // `help`, and every unknown verb, which falls through to the help embed.
+    default:
+      return { scope: COMMAND_SCOPE.COMMUNITY_READ, selectorRequired: false };
+  }
+}
+
 export function createCommandHandlers(context) {
   const { sendDiscordMessage, watchManager, stagedImportRef } = context;
 
@@ -2040,6 +2515,144 @@ export function createCommandHandlers(context) {
 
   handlers.set('config', async (plugin, message, args) => {
     const embed = buildConfigEmbed(plugin);
+    await sendDiscordMessage(message.channel, { embeds: [embed] }, 'S3', (...a) => plugin.verbose(...a));
+  });
+
+  // ── Server registry ───────────────────────────────────────────
+  //
+  // Listing is inspection; `alias` and `forget` are not. They live under the
+  // same command anyway, because the operator who needs to rename or retire a
+  // server is looking at the listing when they decide to, and a second command
+  // name is a second thing to remember correctly at the wrong moment.
+
+  /**
+   * Turn an operator-typed token into exactly one registry row, or reply with
+   * why it could not, and return null.
+   *
+   * The refusal is the point. `resolveServerToken()` never picks a winner from
+   * an ambiguous token, so this never has one to report — it lists the
+   * candidates and lets the operator name the one they meant. Resolving to the
+   * first row would convert the one wrong-server case that is detectable into
+   * the one that is silent.
+   */
+  const resolveServerOrExplain = async (plugin, message, db, token) => {
+    const resolved = await db.resolveServerToken(token);
+    if (resolved.row) return resolved.row;
+
+    const ambiguous = Boolean(resolved.ambiguous);
+    const rows = resolved.ambiguous ?? resolved.candidates ?? [];
+    const candidateLabels = serverLabels(rows, { maxLength: 40 });
+    const listing = rows.length > 0
+      ? rows.map((r) => describeServerRow(r, candidateLabels.get(r.serverID))).join('\n')
+      : plugin.localize('slackersSquadServices.servers.noneRegistered');
+
+    await sendDiscordMessage(message.channel, {
+      embeds: [{
+        color: 0xe74c3c,
+        title: ambiguous
+          ? plugin.localize('slackersSquadServices.servers.ambiguousTitle')
+          : plugin.localize('slackersSquadServices.servers.notFoundTitle'),
+        description: ambiguous
+          ? plugin.localize('slackersSquadServices.servers.ambiguousDescription', { token: truncate(String(token), 40), candidates: truncate(listing, 1500) })
+          : plugin.localize('slackersSquadServices.servers.notFoundDescription', { token: truncate(String(token), 40), candidates: truncate(listing, 1500) }),
+        timestamp: new Date().toISOString()
+      }]
+    }, 'S3', (...a) => plugin.verbose(...a));
+
+    return null;
+  };
+
+  handlers.set('servers', async (plugin, message, args) => {
+    const serversSub = args[1]?.toLowerCase();
+    const db = plugin.services.db;
+
+    if (!db || !db.isReady() || !db.ServersModel) {
+      await sendDiscordMessage(message.channel, {
+        embeds: [{
+          color: 0xe74c3c,
+          title: plugin.localize('slackersSquadServices.servers.title'),
+          description: plugin.localize('slackersSquadServices.servers.registryUnavailable'),
+          timestamp: new Date().toISOString()
+        }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+      return;
+    }
+
+    if (serversSub === 'alias') {
+      const target = args[2];
+      const requested = args[3];
+      if (!target || !requested) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xf39c12, title: plugin.localize('slackersSquadServices.servers.aliasUsageTitle'), description: plugin.localize('slackersSquadServices.servers.aliasUsage'), timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      const row = await resolveServerOrExplain(plugin, message, db, target);
+      if (!row) return;
+
+      const outcome = await db.setServerAlias(row.serverID, requested);
+      await sendDiscordMessage(message.channel, {
+        embeds: [{
+          color: outcome.ok ? 0x2ecc71 : 0xe74c3c,
+          title: outcome.ok
+            ? plugin.localize('slackersSquadServices.servers.aliasSetTitle')
+            : plugin.localize('slackersSquadServices.servers.aliasRefusedTitle'),
+          description: outcome.ok
+            ? plugin.localize('slackersSquadServices.servers.aliasSet', { serverID: row.serverID, previous: row.alias || plugin.localize('slackersSquadServices.servers.unnamed'), alias: outcome.alias })
+            : plugin.localize('slackersSquadServices.servers.aliasRefused', { reason: truncate(outcome.reason, 1500) }),
+          timestamp: new Date().toISOString()
+        }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+      return;
+    }
+
+    if (serversSub === 'forget') {
+      const target = args[2];
+      if (!target) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xf39c12, title: plugin.localize('slackersSquadServices.servers.forgetUsageTitle'), description: plugin.localize('slackersSquadServices.servers.forgetUsage'), timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      const row = await resolveServerOrExplain(plugin, message, db, target);
+      if (!row) return;
+
+      // The freshness refusal inside forgetServer() would catch this too, but
+      // it would report it as "still running — stop it first", which is a
+      // strange thing to read about the process you are typing at.
+      if (row.serverID === db.getServerID()) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xe74c3c, title: plugin.localize('slackersSquadServices.servers.forgetRefusedTitle'), description: plugin.localize('slackersSquadServices.servers.forgetSelf'), timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      const outcome = await db.forgetServer(row.serverID);
+      await sendDiscordMessage(message.channel, {
+        embeds: [{
+          color: outcome.ok ? 0x2ecc71 : 0xe74c3c,
+          title: outcome.ok
+            ? plugin.localize('slackersSquadServices.servers.forgottenTitle')
+            : plugin.localize('slackersSquadServices.servers.forgetRefusedTitle'),
+          description: outcome.ok
+            ? plugin.localize('slackersSquadServices.servers.forgotten', { server: describeServerRow(outcome.row) })
+            : plugin.localize('slackersSquadServices.servers.forgetRefused', { reason: truncate(outcome.reason, 1500) }),
+          timestamp: new Date().toISOString()
+        }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+      return;
+    }
+
+    if (serversSub) {
+      await sendDiscordMessage(message.channel, {
+        embeds: [{ color: 0xf39c12, title: plugin.localize('slackersSquadServices.servers.unknownSubTitle'), description: plugin.localize('slackersSquadServices.servers.unknownSub', { sub: truncate(serversSub, 40) }), timestamp: new Date().toISOString() }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+      return;
+    }
+
+    const embed = await buildServersEmbed(plugin);
     await sendDiscordMessage(message.channel, { embeds: [embed] }, 'S3', (...a) => plugin.verbose(...a));
   });
 
@@ -2098,6 +2711,16 @@ export function createCommandHandlers(context) {
   // The WatchManager class still exists in s3-discord.js for reference.
   // If re-enabled, uncomment the two handler registrations below and the
   // watch/unwatch lines in buildHelpEmbed().
+  //
+  // And give both a scope in scopeForS3Command(). A watch relays THIS
+  // process's verbose output, so it is a server read — but a broadcast one
+  // would attach every server's log stream to one channel off one command,
+  // and each would keep streaming with nothing in the scrollback to say how
+  // many are running. It wants selectorRequired, the same as the other reads
+  // whose replies do not divide. `unwatch` is the counterpart and has the
+  // sharper edge: stopping the wrong server's relay looks exactly like
+  // stopping the right one. An untagged verb defaults to a community read,
+  // which is wrong for both.
   //
   /*
   handlers.set('watch', async (plugin, message, args) => {
@@ -2481,6 +3104,102 @@ export function createCommandHandlers(context) {
     // ═══════════════════════════════════════════════════════════════
     // purge-deprecated — Scan for and optionally drop _deprecated_* tables/columns
     // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════
+    // ddl — the exact SQL to run by hand under a restricted grant
+    // ═══════════════════════════════════════════════════════════════
+    // The live MySQL user has CREATE but not ALTER, so `!s3 migrate force`
+    // cannot apply a column-adding migration there at all. Until now that
+    // ended with a driver error in Discord and an operator reconstructing the
+    // statement from the model source. This prints the statement instead.
+    if (migrateSub === 'ddl') {
+      if (await rejectStrayFlags(plugin, message, sendDiscordMessage, args.slice(2), [])) return;
+
+      const db = plugin.services.db;
+      const me = db?.migrationEngine;
+
+      if (!db || !me) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xe74c3c, title: plugin.localize('slackersSquadServices.migrate.dbServiceNotAvailable'), description: plugin.localize('slackersSquadServices.migrate.theDatabaseServiceHas'), timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      const onlyPlugin = args[2] || null;
+
+      let generated;
+      try {
+        generated = await me.buildHandApplyDdl({ pluginName: onlyPlugin });
+      } catch (err) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xe74c3c, title: plugin.localize('slackersSquadServices.migrate.ddlGenerationFailed'), description: plugin.localize('slackersSquadServices.migrate.ddlGenerationFailedBody', { message: err.message }), timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      const noteLines = generated.notes.length > 0
+        ? ['', plugin.localize('slackersSquadServices.migrate.ddlNotesHeading'), ...generated.notes.map((n) => `• ${n}`)]
+        : [];
+
+      if (generated.statements.length === 0) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{
+            color: 0x2ecc71,
+            title: plugin.localize('slackersSquadServices.migrate.ddlNothingToApply'),
+            description: [
+              onlyPlugin
+                ? plugin.localize('slackersSquadServices.migrate.ddlNothingToApplyScoped', { pluginName: onlyPlugin })
+                : plugin.localize('slackersSquadServices.migrate.ddlNothingToApplyBody'),
+              ...noteLines
+            ].join('\n'),
+            timestamp: new Date().toISOString()
+          }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      // The SQL itself is deliberately unlocalized — it is what the operator
+      // pastes into a client, and translating around it would only risk
+      // changing it. Only the prose framing goes through localize().
+      const sqlLines = [];
+      let currentGroup = null;
+      for (const statement of generated.statements) {
+        const group = `${statement.pluginName} v${statement.version}`;
+        if (group !== currentGroup) {
+          if (sqlLines.length > 0) sqlLines.push('');
+          sqlLines.push(`-- ${group}`);
+          currentGroup = group;
+        }
+        sqlLines.push(statement.sql);
+      }
+
+      const intro = plugin.localize('slackersSquadServices.migrate.ddlIntro');
+      // Fence overhead is "```sql\n" + "\n```"; the slack below covers the
+      // intro, the blank line after it, and the paging suffix in the title.
+      const budget = Math.max(4096 - intro.length - 64, 500);
+      const chunks = chunkLines(sqlLines, budget);
+
+      const embeds = chunks.map((chunk, i) => ({
+        color: 0x3498db,
+        title: chunks.length > 1
+          ? plugin.localize('slackersSquadServices.migrate.ddlTitlePaged', { dialect: generated.dialect, i: i + 1, count: chunks.length })
+          : plugin.localize('slackersSquadServices.migrate.ddlTitle', { dialect: generated.dialect }),
+        description: (i === 0 ? intro + '\n' : '') + '```sql\n' + chunk.join('\n') + '\n```',
+        timestamp: new Date().toISOString()
+      }));
+
+      // Notes ride on the last page, outside the fence, so they are never
+      // mistaken for something to paste.
+      if (noteLines.length > 0) {
+        const last = embeds[embeds.length - 1];
+        last.description += '\n' + noteLines.join('\n');
+      }
+
+      for (const embed of embeds) {
+        await sendDiscordMessage(message.channel, { embeds: [embed] }, 'S3', (...a) => plugin.verbose(...a));
+      }
+      return;
+    }
+
     if (migrateSub === 'purge-deprecated') {
       if (await rejectStrayFlags(plugin, message, sendDiscordMessage, args.slice(2), ['--confirm'])) return;
 
@@ -2615,6 +3334,180 @@ export function createCommandHandlers(context) {
       return;
     }
 
+    // ══════════════════════════════════════════════════════════════
+    // adopt-state — Move the legacy singleton rows onto this server's id
+    // ══════════════════════════════════════════════════════════════
+    //
+    // `S3_GameState` and `TeamBalancerState` are per-server singletons whose
+    // primary key IS the server id — scopeKind 'server-key' — so an install
+    // that has always run `server.id: 3` still holds its round state and its
+    // win streak in a row numbered 1, written before any of this existed. That
+    // row genuinely is server 3’s, and from inside the process the situation is
+    // indistinguishable from a new server 3 joining a community whose incumbent
+    // declares 1: same config, same empty registry, opposite correct answers.
+    // The deciding fact is operator knowledge and it is in no table, so it is
+    // typed rather than inferred. Nothing renumbers implicitly — not on boot
+    // order, not on an empty registry, not on row age.
+    //
+    // An install declaring serverID 1, which is every stock config, never needs
+    // this: its row is already numbered 1, and the command says so rather than
+    // reporting a successful no-op.
+    //
+    // ONE DEPARTURE FROM THE DESIGN, and it is deliberate. The design called
+    // for refusing when the target server already has a row. That refusal is
+    // vacuous: by the time an admin can type anything S³ has mounted,
+    // _recoverPersistedState() has found no row at the declared id and written
+    // a fresh one, and TeamBalancer’s initDB() has done the same. The target
+    // row therefore always exists, and a command that refuses on its existence
+    // refuses every time it is ever run. What that refusal was protecting — do
+    // not silently destroy real state — is served here instead by printing the
+    // row that would be replaced, field by field, and requiring --confirm after
+    // the admin has read it.
+    if (migrateSub === 'adopt-state') {
+      if (await rejectStrayFlags(plugin, message, sendDiscordMessage, args.slice(2), ['--confirm'])) return;
+
+      const db = plugin.services.db;
+      if (!db || !db._isMounted) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xe74c3c, title: plugin.localize('slackersSquadServices.migrate.dbServiceNotAvailable'), description: plugin.localize('slackersSquadServices.migrate.theDatabaseServiceHas'), timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      // Not a configurable: 1 is the literal both models were pinned at before
+      // the key meant anything.
+      const LEGACY_ID = 1;
+      const serverID = db.getServerID();
+      const isConfirm = args.includes('--confirm');
+
+      if (serverID === LEGACY_ID) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0x2ecc71, title: plugin.localize('slackersSquadServices.migrate.adoptStateNothingTitle'), description: plugin.localize('slackersSquadServices.migrate.adoptStateNoopBody'), timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      // Declaration, not discovery. The tables are the ones that declared
+      // scopeKind 'server-key' at their own defineModel() call site, which
+      // includes TeamBalancer’s — consumer plugins register onto this same
+      // DBService. A hardcoded pair here would go stale the first time a third
+      // singleton is added, and go stale silently.
+      const singletons = db.getModelsByScopeKind('server-key');
+
+      const fmt = (v) =>
+        v === null || v === undefined ? 'null' : typeof v === 'object' ? JSON.stringify(v) : String(v);
+      const describeRow = (row) => {
+        const json = row?.toJSON ? row.toJSON() : row;
+        const parts = Object.entries(json || {})
+          .filter(([k]) => k !== 'id')
+          .map(([k, v]) => `${k}=${fmt(v)}`);
+        return parts.length ? parts.join(', ') : plugin.localize('slackersSquadServices.migrate.adoptStateNoOtherColumns');
+      };
+
+      const plan = [];
+      const skipped = [];
+
+      for (const name of singletons) {
+        const model = db.getModel(name);
+        if (!model) continue;
+        let legacy = null;
+        let target = null;
+        try {
+          legacy = await model.findByPk(LEGACY_ID);
+          target = await model.findByPk(serverID);
+        } catch (err) {
+          skipped.push({ table: model.tableName, reason: err.message });
+          continue;
+        }
+        if (!legacy) {
+          skipped.push({ table: model.tableName, reason: plugin.localize('slackersSquadServices.migrate.adoptStateNoLegacyRow') });
+          continue;
+        }
+        plan.push({ name, table: model.tableName, legacy, target });
+      }
+
+      if (plan.length === 0) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0x2ecc71, title: plugin.localize('slackersSquadServices.migrate.adoptStateNothingTitle'), description: plugin.localize('slackersSquadServices.migrate.adoptStateNothingBody', { serverID }), timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      // ── Report mode (no --confirm) ──────────────────────────
+      if (!isConfirm) {
+        const lines = [];
+        for (const entry of plan) {
+          lines.push(plugin.localize('slackersSquadServices.migrate.adoptStateWillMove', { table: entry.table, serverID }));
+          lines.push(plugin.localize('slackersSquadServices.migrate.adoptStateKeepingRow', { fields: describeRow(entry.legacy) }));
+          if (entry.target) {
+            lines.push(plugin.localize('slackersSquadServices.migrate.adoptStateReplacingRow', { fields: describeRow(entry.target) }));
+          }
+          lines.push('');
+        }
+        for (const s of skipped) {
+          lines.push(plugin.localize('slackersSquadServices.migrate.adoptStateSkipped', { table: s.table, reason: s.reason }));
+        }
+        lines.push(plugin.localize('slackersSquadServices.migrate.adoptStateTypeToConfirm', { serverID }));
+
+        await sendDiscordMessage(message.channel, {
+          embeds: [{
+            color: 0x3498db,
+            title: plugin.localize('slackersSquadServices.migrate.adoptStateFound', { count: plan.length }),
+            description: lines.join('\n'),
+            timestamp: new Date().toISOString()
+          }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      // ── Adopt (--confirm) ────────────────────────────────
+      // One transaction across every table, with an explicit handle: this repo
+      // runs no CLS, so a bare call inside would open a transaction of its own.
+      // All-or-nothing is the point — a half-adopted pair leaves the round state
+      // on one id and the win streak on another, which no later run can untangle.
+      try {
+        await db.withTransactionWithRetry(async (t) => {
+          for (const entry of plan) {
+            const model = db.getModel(entry.name);
+            // The target row — this boot's fresh initialisation, or whatever the
+            // admin just read in the preview — has to go first, or the UPDATE
+            // collides with the primary key it is moving onto.
+            if (entry.target) {
+              await model.destroy({ where: { id: serverID }, transaction: t });
+            }
+            await model.update({ id: serverID }, { where: { id: LEGACY_ID }, transaction: t });
+          }
+        });
+      } catch (err) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xe74c3c, title: plugin.localize('slackersSquadServices.migrate.adoptStateFailedTitle'), description: plugin.localize('slackersSquadServices.migrate.adoptStateFailedBody', { message: err.message }), timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      // S³'s own round state is re-read here rather than left to the restart,
+      // because this process rewrites that row on the next phase change and
+      // would put its pre-adoption state straight back over the adopted one.
+      // Everything else that caches a singleton in memory — TeamBalancer’s win
+      // streak — lives behind its own plugin and only picks the adopted row up
+      // on a restart, which is what the completion message asks for.
+      try {
+        await plugin.services.gameState?._recoverPersistedState?.();
+      } catch (err) {
+        plugin.verbose(1, `[S3 adopt-state] Could not re-read game state after adoption: ${err.message}`);
+      }
+
+      await sendDiscordMessage(message.channel, {
+        embeds: [{
+          color: 0x2ecc71,
+          title: plugin.localize('slackersSquadServices.migrate.adoptStateDoneTitle', { count: plan.length }),
+          description: plugin.localize('slackersSquadServices.migrate.adoptStateDoneBody', { serverID }),
+          timestamp: new Date().toISOString()
+        }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+      return;
+    }
+
     await message.reply(plugin.localize('slackersSquadServices.migrate.usageS3MigratePending'));
   });
 
@@ -2719,6 +3612,12 @@ export function createCommandHandlers(context) {
 
     if (backupSub === 'list') {
       const backups = listBackups();
+      // Which host this list came from is not cosmetic: on a multi-server
+      // install every process keeps its own `backups/`, and a filename shown
+      // here can only be restored on the server that answered.
+      const listDB = plugin.services?.db;
+      const listRegistered = listDB?.isReady?.() ? await listDB.getRegisteredServers() : [];
+      const listMultiServer = listRegistered.length > 1;
       if (backups.length === 0) {
         await sendDiscordMessage(message.channel, {
           embeds: [{ color: 0x95a5a6, title: plugin.localize('slackersSquadServices.backup.noBackupsFound'), description: plugin.localize('slackersSquadServices.backup.noDatabaseBackupsHave'), timestamp: new Date().toISOString() }]
@@ -2748,7 +3647,14 @@ export function createCommandHandlers(context) {
               name: plugin.localize('slackersSquadServices.backup.restore'),
               value: plugin.localize('slackersSquadServices.backup.toRestoreABackup'),
               inline: false
-            }
+            },
+            ...(listMultiServer ? [{
+              name: plugin.localize('slackersSquadServices.backup.thisServerOnlyHeader'),
+              value: plugin.localize('slackersSquadServices.backup.thisServerOnlyBody', {
+                server: describeServerIDs(listRegistered, [listDB.getServerID()])
+              }),
+              inline: false
+            }] : [])
           ],
           timestamp: new Date().toISOString()
         }]
@@ -2793,6 +3699,55 @@ export function createCommandHandlers(context) {
           ? 'database tables (JSON import)'
           : `\`${dbPath || '(unknown)'}\``;
 
+        // A restore cannot be narrowed to one server — the file holds the
+        // community's rows and the database it writes is shared — so this
+        // confirmation is the only thing standing between an admin and a
+        // community-wide rollback. It names every registered server rather
+        // than counting them: "this affects 3 servers" is not a sentence
+        // anyone can check against what they meant to do.
+        const rdb = plugin.services?.db;
+        const rRegistered = rdb?.isReady?.() ? await rdb.getRegisteredServers() : [];
+        const rMultiServer = rRegistered.length > 1;
+        const rLive = rMultiServer && typeof rdb.getLiveServers === 'function'
+          ? (await rdb.getLiveServers()).filter((row) => row.serverID !== rdb.getServerID())
+          : [];
+        const extraFields = [];
+        if (rMultiServer) {
+          extraFields.push({
+            name: plugin.localize('slackersSquadServices.backup.affectsHeader'),
+            value: plugin.localize('slackersSquadServices.backup.affectsBody', {
+              servers: describeServerIDs(rRegistered, rRegistered.map((row) => row.serverID))
+            }),
+            inline: false
+          });
+        }
+        if (isJsonBackup) {
+          // Said here because it cannot be fixed here. A JSON restore is one
+          // transaction per chunk, so a production-sized file is hundreds of
+          // them and a failure halfway through leaves the database part old
+          // and part new. Staging tables and a swap would make it atomic and
+          // are a different piece of work; what this owes an operator in the
+          // meantime is that the risk is stated before they agree to it, and
+          // that the failure reports what landed rather than only that it
+          // failed.
+          extraFields.push({
+            name: plugin.localize('slackersSquadServices.backup.partialHeader'),
+            value: plugin.localize('slackersSquadServices.backup.partialBody'),
+            inline: false
+          });
+        } else if (rLive.length > 0) {
+          // Refused at the confirmation rather than at the write, so the
+          // admin finds out before typing --confirm. restoreFromFile() checks
+          // again at the moment of the copy, which is the check that counts.
+          extraFields.push({
+            name: plugin.localize('slackersSquadServices.backup.fileCopyBlockedHeader'),
+            value: plugin.localize('slackersSquadServices.backup.fileCopyBlockedBody', {
+              servers: describeServerIDs(rRegistered, rLive.map((row) => row.serverID))
+            }),
+            inline: false
+          });
+        }
+
         await sendDiscordMessage(message.channel, {
           embeds: [{
             color: 0xe67e22,
@@ -2802,7 +3757,8 @@ export function createCommandHandlers(context) {
               { name: plugin.localize('slackersSquadServices.backup.source'), value: `\`${filename}\``, inline: true },
               { name: plugin.localize('slackersSquadServices.backup.target'), value: targetInfo, inline: true },
               { name: plugin.localize('slackersSquadServices.backup.format'), value: isJsonBackup ? plugin.localize('slackersSquadServices.backup.jsonConnectorAgnostic') : plugin.localize('slackersSquadServices.backup.sqliteFileCopy'), inline: true },
-              { name: plugin.localize('slackersSquadServices.backup.instructions'), value: plugin.localize('slackersSquadServices.backup.toProceedUseS3') + filename + '`', inline: false }
+              { name: plugin.localize('slackersSquadServices.backup.instructions'), value: plugin.localize('slackersSquadServices.backup.toProceedUseS3') + filename + '`', inline: false },
+              ...extraFields
             ],
             timestamp: new Date().toISOString()
           }]
@@ -2836,11 +3792,35 @@ export function createCommandHandlers(context) {
           ? `Imported ${Object.values(result.imported || {}).filter((r) => r.status === 'ok').reduce((s, r) => s + r.rows, 0)} rows across ${Object.keys(result.imported || {}).length} tables.`
           : `File restored successfully.`;
 
+        // A streamed restore commits per chunk and isolates each table, so
+        // one table can fail while the rest are written — and the result that
+        // comes back from that is not an exception, it is a success object
+        // with error entries inside it. Reporting a green tick over the top
+        // of that is the failure mode this guards: the operator's next move
+        // after a restore is to bring the servers up, and they need to know
+        // the database is part old and part new BEFORE they do.
+        const restoredTables = Object.entries(result.imported || {});
+        const restoreFailures = restoredTables.filter(([, r]) => r?.status === 'error');
+        const restorePartial = restoreFailures.length > 0;
+
         await sendDiscordMessage(message.channel, {
           embeds: [{
-            color: 0x2ecc71,
-            title: plugin.localize('slackersSquadServices.backup.databaseRestored'),
+            color: restorePartial ? 0xe67e22 : 0x2ecc71,
+            title: restorePartial
+              ? plugin.localize('slackersSquadServices.backup.databaseRestoredPartly')
+              : plugin.localize('slackersSquadServices.backup.databaseRestored'),
             description: plugin.localize('slackersSquadServices.backup.successfullyRestoredFilenameSummary', { filename, summary }),
+            ...(restorePartial ? {
+              fields: [{
+                name: plugin.localize('slackersSquadServices.backup.partialHeader'),
+                value: plugin.localize('slackersSquadServices.backup.partialLanded', {
+                  failed: String(restoreFailures.length),
+                  tables: restoreFailures.map(([n]) => `\`${n}\``).join(', '),
+                  ok: String(restoredTables.length - restoreFailures.length)
+                }),
+                inline: false
+              }]
+            } : {}),
             timestamp: new Date().toISOString()
           }]
         }, 'S3', (...a) => plugin.verbose(...a));
@@ -2930,6 +3910,7 @@ export function createCommandHandlers(context) {
           title: plugin.localize('slackersSquadServices.db.databaseCommands'),
           description: [
             plugin.localize('slackersSquadServices.db.s3DbStatusConnector'),
+            plugin.localize('slackersSquadServices.db.s3DbOrphansTables'),
             plugin.localize('slackersSquadServices.db.s3DbExportExport'),
             plugin.localize('slackersSquadServices.db.s3DbExportLogs'),
             plugin.localize('slackersSquadServices.db.s3DbExportAll'),
@@ -3005,6 +3986,119 @@ export function createCommandHandlers(context) {
       return;
     }
 
+    // ── !s3 db orphans ───────────────────────────────────────────
+    //
+    // Tables carrying one of the suite’s prefixes that no registered model
+    // points at. They are not a fault: a primary key cannot be altered in
+    // place on SQLite or on the deployed MySQL grant, so every move to a
+    // composite key created a new table beside the old one, and the old one
+    // stayed because that same grant has no DROP either. The migrations that
+    // built them are recorded in production, which makes them contracts, so
+    // they are recreated on a fresh install as well.
+    //
+    // Read-only by design. This lists and counts; it never drops. An operator
+    // with the grant can act on the list, and one without it at least knows
+    // what the extra tables are.
+    if (dbSub === 'orphans') {
+      if (await rejectStrayFlags(plugin, message, sendDiscordMessage, args.slice(2), [])) return;
+
+      const db = plugin.services?.db;
+      if (!db?.isReady()) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xe74c3c, title: plugin.localize('slackersSquadServices.db.dbServiceNotReady'), description: plugin.localize('slackersSquadServices.db.theDatabaseServiceIs'), timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      const qi = db.sequelize.getQueryInterface();
+      let allTables;
+      try {
+        allTables = await qi.showAllTables();
+      } catch (err) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{ color: 0xe74c3c, title: plugin.localize('slackersSquadServices.db.orphanScanFailed'), description: plugin.localize('slackersSquadServices.db.couldNotListTables', { message: err.message }), timestamp: new Date().toISOString() }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      // showAllTables() returns strings on some dialects and {tableName} on
+      // others, and MySQL with lower_case_table_names=1 — which is what
+      // production runs — hands back `switchplugin_settings` for a table
+      // declared `SwitchPlugin_Settings`. Every comparison below folds, or the
+      // live table set would match nothing there and the command would report
+      // the entire schema as orphaned.
+      const stored = allTables
+        .map((t) => (typeof t === 'string' ? t : t?.tableName))
+        .filter(Boolean);
+
+      const live = new Set(
+        db.getModelNames()
+          .map((name) => db.getModel(name)?.tableName)
+          .filter(Boolean)
+          .map((t) => String(t).toLowerCase())
+      );
+
+      const orphans = stored.filter((t) => {
+        const folded = String(t).toLowerCase();
+        if (live.has(folded)) return false;
+        return SUITE_TABLE_PREFIXES.some((p) => folded.startsWith(p));
+      });
+
+      if (orphans.length === 0) {
+        await sendDiscordMessage(message.channel, {
+          embeds: [{
+            color: 0x2ecc71,
+            title: plugin.localize('slackersSquadServices.db.noOrphanTables'),
+            description: plugin.localize('slackersSquadServices.db.everyTableCarryingAn'),
+            timestamp: new Date().toISOString()
+          }]
+        }, 'S3', (...a) => plugin.verbose(...a));
+        return;
+      }
+
+      const q = (id) => db.quoteIdentifier(id);
+      const lines = [];
+      for (const table of orphans.sort()) {
+        // Deliberately community-wide, and the one raw count in the suite
+        // that is. An orphan has no model and no serverID to filter on — it
+        // is either older than the column or holds both servers’ stranded
+        // rows — and the question being asked is how much is stuck in there
+        // in total, not how much of it was this server’s.
+        let count = null;
+        try {
+          const rows = await db.sequelize.query(
+            `SELECT COUNT(*) AS ${q('n')} FROM ${q(table)}`,
+            { type: db.sequelize.constructor.QueryTypes.SELECT }
+          );
+          count = Number(rows?.[0]?.n ?? 0);
+        } catch {
+          // A table we can list but cannot read is still worth naming.
+          count = null;
+        }
+        const replacement = ABANDONED_BY[String(table).toLowerCase()];
+        const rows = count === null
+          ? plugin.localize('slackersSquadServices.db.rowsUnreadable')
+          : plugin.localize('slackersSquadServices.db.nRows', { count });
+        lines.push(`\`${table}\` — ${rows}${replacement ? ` → \`${replacement}\`` : ''}`);
+      }
+
+      await sendDiscordMessage(message.channel, {
+        embeds: [{
+          color: 0x3498db,
+          title: plugin.localize('slackersSquadServices.db.orphanTables', { count: orphans.length }),
+          description: [
+            plugin.localize('slackersSquadServices.db.theseTablesCarryA'),
+            '',
+            ...lines,
+            '',
+            plugin.localize('slackersSquadServices.db.s3NeverDropsA'),
+          ].join('\n'),
+          timestamp: new Date().toISOString()
+        }]
+      }, 'S3', (...a) => plugin.verbose(...a));
+      return;
+    }
+
     // ── !s3 db export [--logs | --all] [--to-file] ────────────
     if (dbSub === 'export') {
       const db = plugin.services?.db;
@@ -3017,12 +4111,25 @@ export function createCommandHandlers(context) {
 
       // Not destructive, but a mangled `--all` silently exports the wrong
       // tier, and a backup that quietly omits tables is its own hazard.
-      if (await rejectStrayFlags(plugin, message, sendDiscordMessage, args.slice(2), ['--logs', '--all', '--to-file'])) return;
+      if (await rejectStrayFlags(plugin, message, sendDiscordMessage, args.slice(2), ['--logs', '--all', '--to-file', '--all-servers'])) return;
 
       const hasLogs = args.includes('--logs');
       const hasAll = args.includes('--all');
       const hasToFile = args.includes('--to-file');
       const tier = hasAll ? 'all' : hasLogs ? 'logs' : 'historical';
+
+      // `--all` and `--all-servers` are different axes and both get typed under
+      // pressure: one widens the tier, the other widens the servers. The flags
+      // are compared exactly, so `--all-servers` never reads as `--all`.
+      //
+      // Scoping is applied only where there is something to scope away from. On
+      // a single-server install the predicate changes nothing except drop rows
+      // whose serverID is still NULL — a table between its migration and its
+      // backfill — and silently shrinking the backup on the one install that
+      // exists is a worse trade than exporting rows nobody else owns.
+      const registered = await db.getRegisteredServers();
+      const multiServer = registered.length > 1;
+      const allServers = args.includes('--all-servers') || !multiServer;
 
       // The export always goes to a file first, whatever flags were given.
       // Building it in memory to decide whether it fits in Discord is what
@@ -3044,6 +4151,7 @@ export function createCommandHandlers(context) {
         const result = await exportToFile(db, null, {
           tier,
           retention: 5,
+          allServers,
           verboseLogger: (...a) => plugin.verbose(...a)
         });
 
@@ -3085,6 +4193,28 @@ export function createCommandHandlers(context) {
             inline: false
           }
         ];
+
+        // Only on a multi-server community. On a single-server install the
+        // answer is always "this server", and a field saying so on every export
+        // is noise on the deployment that has no scoping question to ask.
+        if (multiServer) {
+          const contained = result.containedServerIDs || [];
+          fields.push({
+            name: plugin.localize('slackersSquadServices.db.exportScope'),
+            value: plugin.localize(
+              allServers
+                ? 'slackersSquadServices.db.exportScopeCommunity'
+                : 'slackersSquadServices.db.exportScopeServer',
+              {
+                serverID: String(db.getServerID()),
+                contained: contained.length > 0
+                  ? describeServerIDs(registered, contained, plugin.localize('slackersSquadServices.db.serverNotRegistered'))
+                  : plugin.localize('slackersSquadServices.db.exportScopeNoScopedRows')
+              }
+            ),
+            inline: false
+          });
+        }
 
         // Only try to compress and attach when the operator did not ask for a
         // file-only export. gzipFileForAttachment streams the compression and
@@ -3166,7 +4296,7 @@ export function createCommandHandlers(context) {
     if (dbSub === 'import') {
       // `--confirm` writes rows; `--dry-run` is what holds it back. Same
       // asymmetry as `!s3 migrate force`, same guard.
-      if (await rejectStrayFlags(plugin, message, sendDiscordMessage, args.slice(2), ['--confirm', '--dry-run'])) return;
+      if (await rejectStrayFlags(plugin, message, sendDiscordMessage, args.slice(2), ['--confirm', '--dry-run', '--all-servers', '--remap-server'])) return;
 
       const db = plugin.services?.db;
       if (!db?.isReady()) {
@@ -3178,6 +4308,15 @@ export function createCommandHandlers(context) {
 
       const isConfirm = args.includes('--confirm');
       const isDryRun = args.includes('--dry-run');
+
+      // The two ways of widening an import past this server's own rows, and
+      // they are opposite intentions rather than degrees of one: `--all-servers`
+      // restores each row to the server it names, `--remap-server` folds every
+      // row onto this one. importFromJSON() refuses both together.
+      const allServers = args.includes('--all-servers');
+      const remapServer = args.includes('--remap-server');
+      const widened = allServers || remapServer;
+      const registered = await db.getRegisteredServers();
 
       // ── !s3 db import --confirm [--dry-run] ──────────────────
       if (isConfirm) {
@@ -3194,13 +4333,48 @@ export function createCommandHandlers(context) {
         }
 
         try {
-          const result = await importFromJSON(db, stagedImportRef.current, { dryRun: isDryRun, localize: (k, v) => plugin.localize(k, v) });
+          // A widened import writes rows this server does not own, so it gets a
+          // second step: the first `--confirm --all-servers` shows the plan and
+          // writes nothing, the second one writes. The plain import keeps its
+          // single step — nothing is being decided on somebody else's behalf.
+          //
+          // Armed on the staged envelope rather than in a timer, because the
+          // thing being agreed to is THIS file against THIS database, and both
+          // are already pinned by the staging step.
+          if (widened && !isDryRun && !(stagedImportRef.widenedArmed === (allServers ? 'all' : 'remap'))) {
+            const preview = await planImport(db, stagedImportRef.current, { allServers, remapServer });
+            const rendered = renderImportPlan(plugin, preview, registered);
+            stagedImportRef.widenedArmed = allServers ? 'all' : 'remap';
+            await sendDiscordMessage(message.channel, {
+              embeds: [{
+                color: 0xf39c12,
+                title: plugin.localize('slackersSquadServices.db.importWidenedTitle'),
+                description: [plugin.localize('slackersSquadServices.db.importWidenedBody'), '', ...rendered.lines].join('\n').slice(0, 3900),
+                fields: rendered.fields,
+                timestamp: new Date().toISOString()
+              }]
+            }, 'S3', (...a) => plugin.verbose(...a));
+            return;
+          }
 
-          const statusLines = Object.entries(result.imported).map(([name, r]) =>
-            r.status === 'ok'
-              ? `✅ **${name}**: ${r.rows} rows${r.dryRun ? ' (dry run)' : ''}`
-              : `❌ **${name}**: ${r.error}`
-          );
+          const result = await importFromJSON(db, stagedImportRef.current, {
+            dryRun: isDryRun,
+            localize: (k, v) => plugin.localize(k, v),
+            allServers,
+            remapServer
+          });
+
+          // Rendered from the plan the write was actually made on, so the
+          // summary cannot describe a different operation from the one that ran.
+          const rendered = result.plan ? renderImportPlan(plugin, result.plan, registered) : null;
+          const statusLines = rendered ? rendered.lines : Object.entries(result.imported).map(([name, r]) => {
+            if (r.status === 'ok') return `✅ **${name}**: ${r.rows} rows${r.dryRun ? ' (dry run)' : ''}`;
+            // A skip is neither a success nor a failure, and rendering it as
+            // either misleads: as a tick it claims rows landed, and as a cross
+            // it reads as a restore that went wrong.
+            if (r.status === 'skipped') return `⏭️ **${name}**: ${r.reason}`;
+            return `❌ **${name}**: ${r.error}`;
+          });
 
           const summary = isDryRun
             ? `Dry run complete — would import rows across ${Object.keys(result.imported).length} tables.`
@@ -3210,10 +4384,13 @@ export function createCommandHandlers(context) {
             embeds: [{
               color: isDryRun ? 0x3498db : 0x2ecc71,
               title: isDryRun ? plugin.localize('slackersSquadServices.db.dryRunComplete') : plugin.localize('slackersSquadServices.db.importComplete'),
-              description: statusLines.join('\n'),
-              fields: result.errors.length > 0
-                ? [{ name: plugin.localize('slackersSquadServices.db.warnings'), value: result.errors.join('\n'), inline: false }]
-                : [],
+              description: statusLines.join('\n').slice(0, 3900),
+              fields: [
+                ...(rendered ? rendered.fields : []),
+                ...(result.errors.length > 0
+                  ? [{ name: plugin.localize('slackersSquadServices.db.warnings'), value: result.errors.join('\n'), inline: false }]
+                  : [])
+              ],
               footer: { text: summary },
               timestamp: new Date().toISOString()
             }]
@@ -3221,6 +4398,7 @@ export function createCommandHandlers(context) {
 
           if (!isDryRun) {
             stagedImportRef.current = null; // Clear after execution
+            stagedImportRef.widenedArmed = null;
           }
         } catch (err) {
           await sendDiscordMessage(message.channel, {
@@ -3281,18 +4459,19 @@ export function createCommandHandlers(context) {
 
         // Stage the import
         stagedImportRef.current = parsed;
+        stagedImportRef.widenedArmed = null;
 
         const tableCount = Object.keys(parsed.tables).length;
         const totalRows = Object.values(parsed.rowCounts || {}).reduce((s, c) => s + c, 0);
 
-        // Build per-table preview
-        const previewLines = Object.entries(parsed.results || {}).map(([name, r]) =>
-          r.status === 'ok'
-            ? `✅ **${name}**: ${r.rows} rows`
-            : `❌ **${name}**: ${r.error}`
-        );
-
         const warnLines = validation.warnings.map((w) => `⚠️ ${w}`);
+
+        // Planned here, against the live database, rather than only described
+        // from the file's own row counts. The counts in the envelope say what
+        // was exported; only a query against this database can say what would
+        // be overwritten, and that is the number worth reading twice.
+        const stagedPlan = await planImport(db, parsed, { allServers, remapServer });
+        const stagedRender = renderImportPlan(plugin, stagedPlan, registered);
 
         // This step only ever reads and validates the attachment — it cannot
         // write. Say so plainly: someone who has just uploaded a production
@@ -3307,7 +4486,7 @@ export function createCommandHandlers(context) {
               '',
               plugin.localize('slackersSquadServices.db.tablesAndRows', { tableCount, totalRows }),
               '',
-              ...previewLines,
+              ...stagedRender.lines,
               ...warnLines,
               '',
               // `--dry-run` is not read at this step, so a caller who passed it
@@ -3323,7 +4502,8 @@ export function createCommandHandlers(context) {
               // would invite someone to trust a green dry run that proves nothing.
               plugin.localize('slackersSquadServices.db.confirmDryRunRe'),
               plugin.localize('slackersSquadServices.db.rowsAreUpsertedBy')
-            ].join('\n'),
+            ].join('\n').slice(0, 3900),
+            fields: stagedRender.fields,
             timestamp: new Date().toISOString()
           }]
         }, 'S3', (...a) => plugin.verbose(...a));

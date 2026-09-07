@@ -5,8 +5,10 @@
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Regression cover for the Postgres-portability defects documented in
- * docs/TASK_POSTGRES_PORTABILITY.md. Every case here runs the SQL against a
+ * Regression cover for a set of dialect-portability defects: Postgres folding
+ * unquoted identifiers to lower case, MySQL collation deciding a comparison
+ * SQLite decides differently, and an ESCAPE clause each engine parses its own
+ * way. Every case here runs the SQL against a
  * REAL engine, because this whole class of defect is invisible to a mock by
  * construction: a hand-written mock cannot model Postgres identifier folding,
  * MySQL collation, or SQLite's ESCAPE parsing. The mock suite in
@@ -23,8 +25,8 @@
  *   2. DBService.caseInsensitiveLikeOp                — Switch checkPlayer().
  *   3. DBService.caseInsensitiveLikeLiteral           — EloTracker searchPlayer(),
  *      incl. apostrophes and literal % / _ in the search term.
- *   4. Bootstrap DDL quoting                          — S3_PlayerReconnects /
- *      S3_PlayerSessions, plus backward-compatibility with tables an older
+ *   4. Bootstrap DDL quoting                          — S3_ServerReconnects /
+ *      S3_ServerSessions, plus backward-compatibility with tables an older
  *      build created unquoted (the "don't break live SQLite/MySQL" guarantee).
  *   5. Foreign-key toggles                            — s3-export-import.js.
  *   6. Backup fallback                                — getDatabasePath() is null
@@ -656,7 +658,7 @@ for (const { name } of DIALECTS) {
           // lower case, so the quoted DDL genuinely IS a different table. Only
           // reachable on a Postgres deployment that ran a pre-fix build — and
           // Postgres was never a supported target, which is why this is
-          // tolerated rather than migrated. See docs/TASK_POSTGRES_PORTABILITY.md.
+          // tolerated rather than migrated.
           const [rows] = await seq.query(
             `SELECT tablename AS n FROM pg_tables WHERE schemaname='public' AND lower(tablename)=lower('${table}')`
           );
@@ -741,10 +743,16 @@ for (const { name } of DIALECTS) {
       assert.equal(db.getDatabasePath(), null, 'no connectors map was supplied, so this must be null');
 
       const table = `T_Backup_${RUN_ID}`;
+      // The scope declaration is not decoration here. Import resolves it
+      // through scopePredicateFor(), which refuses a model that declares
+      // nothing rather than guessing from the columns — so a stand-in with no
+      // scope errors out and the round-trip below proves nothing. Global
+      // mirrors the table this stands in for: a token balance follows the
+      // player across the community.
       const model = db.defineModel(table, {
         eosID: { type: DataTypes.STRING(64), primaryKey: true },
         tokenBalance: { type: DataTypes.INTEGER, defaultValue: 0 }
-      }, { tableName: table, freezeTableName: true, timestamps: false });
+      }, { tableName: table, freezeTableName: true, timestamps: false, scopeKind: 'global' });
       await model.sync({ force: true });
 
       try {
@@ -783,9 +791,12 @@ for (const { name } of DIALECTS) {
 // identifier is already all-lowercase" — does NOT catch this one, because `key`
 // is already lowercase and still fails. Hence separate cover.
 //
-// Live instance: SwitchPlugin_Settings.key. It has always worked because every
-// access goes through Sequelize, which quotes unconditionally. The hazard
-// appears the first time raw SQL touches such a column.
+// Live instance: SwitchPlugin_ServerSettings.key. For years this only ever
+// worked by luck of routing — every access went through Sequelize, which
+// quotes unconditionally. That stopped being true in Phase 4: switch v4 and
+// v9 both write raw SQL against this column, so the quoting these cases
+// describe is now load-bearing on the deployed engine rather than a
+// precaution against a future edit.
 
 const RESERVED_COLUMN = 'key';
 
@@ -854,8 +865,9 @@ for (const { name } of DIALECTS) {
 
   test(`[${name}] the Sequelize model layer quotes a reserved word for you`, async () =>
     withDialect(name, async (db, seq) => {
-      // Mirrors SwitchPlugin_Settings: a `key`/`value` table reached only
-      // through the model. This is why the live table has never broken.
+      // Mirrors SwitchPlugin_ServerSettings when it is reached through the
+      // model, which is still how the plugin reads and writes it. The raw-SQL
+      // path the migrations take is the case above.
       const table = `T_ReservedModel_${RUN_ID}`;
       const M = seq.define(table, {
         key: { type: DataTypes.STRING(64), primaryKey: true },

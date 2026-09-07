@@ -53,6 +53,26 @@
   *
   * - bulkIncrementPlayerStats() INCREMENTS wins, losses, and roundsPlayed.
   *   All other fields are overwritten. Do not pass cumulative totals.
+  * - Both increment paths take lock: t.LOCK.UPDATE on the read.
+  *   Elo_PlayerStats is community-wide by design — one rating per
+  *   player across every server — so with two servers on one database
+  *   a round ending on each at once is a read-modify-write two
+  *   processes interleave, and the counters end short with nothing
+  *   reporting it. bulkIncrementPlayerStats() also orders its locked
+  *   read by eosID, because two round-ends locking overlapping
+  *   rosters in each server's own player order is a textbook deadlock
+  *   rather than a hypothetical one.
+  * - The lock is a no-op on SQLite rather than an error: the dialect
+  *   has no row locks and Sequelize omits the clause instead of
+  *   rejecting it. SQLite reaches the right answer by a different
+  *   route — it rejects the losing writer with SQLITE_BUSY and
+  *   withTransactionWithRetry re-runs the whole transaction from the
+  *   read. That retry is load-bearing on SQLite, not a convenience;
+  *   narrowing it would break the increment silently.
+  * - Row-scoped tables here stamp serverID from
+  *   this._s3db?.getServerID?.() ?? null at write time. The ratings
+  *   table itself carries no serverID and is not meant to: a rating
+  *   is a fact about a player, not about where they earned it.
   * - importPlayerStats() chunks at 500 records per transaction to
   *   prevent SQLite write contention.
   * - pruneStaleEntries() removes provisional players unseen for 30 days
@@ -139,7 +159,7 @@ export default class EloDatabase {
 
     try {
       // Verify all 4 models are accessible; log row counts as sanity check
-      const modelNames = ['Elo_PluginState', 'Elo_PlayerStats', 'Elo_RoundHistory', 'Elo_RoundPlayers'];
+      const modelNames = ['Elo_PlayerStats', 'Elo_RoundHistory', 'Elo_RoundPlayers'];
       for (const name of modelNames) {
         const model = this._s3db.getModel(name);
         if (!model) {
@@ -154,17 +174,9 @@ export default class EloDatabase {
         : 0;
       this.verbose(1, `[DB] PlayerStats table initialized: ${playerStatsCount} rows found on startup.`);
 
-      // Ensure PluginState row exists (id=1) for backwards-compatible checks
-      const psModel = this._s3db.getModel('Elo_PluginState');
-      if (psModel) {
-        await this._s3db.withTransaction(async (t) => {
-          await psModel.findOrCreate({
-            where: { id: 1 },
-            defaults: { id: 1 },
-            transaction: t
-          });
-        });
-      }
+      // The Elo_PluginState findOrCreate that used to sit here is gone with
+      // its model. It wrote one row, `{ id: 1 }`, on every mount, for
+      // "backwards-compatible checks" that no code performs.
 
       this.verbose(1, '[DB] Database initialized.');
       return true;
@@ -560,7 +572,19 @@ export default class EloDatabase {
     try {
       return await this._s3db.withTransactionWithRetry(async (t) => {
         const model = this._s3db.getModel('Elo_PlayerStats');
-        const existing = await model.findOne({ where: { eosID }, transaction: t });
+        // Elo_PlayerStats is community-wide by design — one rating per player
+        // across every server — so with two servers pointed at one database
+        // this read and the update below are a read-modify-write two
+        // processes can now interleave. Locking the row for the rest of the
+        // transaction is what makes them queue instead.
+        //
+        // A no-op on SQLite rather than an error: the dialect has no row
+        // locks and Sequelize omits the clause instead of rejecting it
+        // (verified against sqlite ::memory: and MySQL 8 side by side — the
+        // MySQL SELECT carries FOR UPDATE, the SQLite one does not). The
+        // single-writer deployments this ships to keep behaving exactly as
+        // they did.
+        const existing = await model.findOne({ where: { eosID }, lock: t.LOCK.UPDATE, transaction: t });
         if (existing) {
           await existing.update(fields, { transaction: t });
           return existing.toJSON();
@@ -583,6 +607,12 @@ export default class EloDatabase {
         const eosIDs = updates.map((u) => u.eosID);
         const existing = await model.findAll({
           where: { eosID: { [Op.in]: eosIDs } },
+          // Ordered so the locks are taken in the same sequence on every
+          // server. Two round-ends landing at once on overlapping rosters is
+          // the ordinary case for a shared Elo table, and unordered
+          // acquisition is how that becomes a deadlock rather than a wait.
+          order: [['eosID', 'ASC']],
+          lock: t.LOCK.UPDATE,
           transaction: t
         });
         const existingMap = new Map(existing.map((r) => [r.eosID, r]));
@@ -627,7 +657,13 @@ export default class EloDatabase {
     if (!this.isReady()) return null;
     try {
       return await this._s3db.withTransactionWithRetry(async (t) => {
-        const record = await this._s3db.getModel('Elo_RoundHistory').create(data, { transaction: t });
+        // Spread last so it wins over anything the caller happened to put in
+        // `data`. This method takes an opaque object from a caller that is
+        // assembling a round result; the server it ran on is not the round
+        // result's to decide, and stamping at the only insert means no future
+        // caller can omit it.
+        const row = { ...data, serverID: this._s3db?.getServerID?.() ?? null };
+        const record = await this._s3db.getModel('Elo_RoundHistory').create(row, { transaction: t });
         return record.toJSON();
       }, { totalTimeoutMs: ROUND_END_DB_TIMEOUT_MS });
     } catch (error) {
@@ -856,7 +892,11 @@ export default class EloDatabase {
     try {
       return await this._s3db.withTransactionWithRetry(async (t) => {
         if (playerRows && playerRows.length > 0) {
-          await this._s3db.getModel('Elo_RoundPlayers').bulkCreate(playerRows, { transaction: t });
+          const serverID = this._s3db?.getServerID?.() ?? null;
+          await this._s3db.getModel('Elo_RoundPlayers').bulkCreate(
+            playerRows.map((r) => ({ ...r, serverID })),
+            { transaction: t }
+          );
         }
         this.verbose(4, `[DB] Inserted ${playerRows ? playerRows.length : 0} player records for round ${roundHistoryId}`);
         return { roundHistoryId, playerCount: playerRows ? playerRows.length : 0 };

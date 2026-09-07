@@ -34,6 +34,21 @@
  *   _getModel(name)
  *   _withDb(fn)
  *
+ * ─── COMMUNITY-AFFECTING OPTIONS ─────────────────────────────────
+ *
+ *   recordCommunityOptions(values)      — post-validation, at mount
+ *   resolvedCommunityOption(g, k, dflt) — the community value, read sync
+ *   strictestCommunityOption(g, k, dflt)— the strictest registered value
+ *   communityOptionRefusal(group)       — a reason string, or null
+ *
+ * Writes and reads want different tools here. A write that would apply
+ * one server's value to every server's rows should decline while the
+ * registry disagrees, which is communityOptionRefusal(). A read has to
+ * answer something, and answering out of this.options makes the same
+ * command in the same channel return a different list depending on
+ * which process replied, which is what strictestCommunityOption() is
+ * for.
+ *
  * ─── SERVICE ACCESSORS ───────────────────────────────────────────
  *
  *   get s3()          → this._s3 reference
@@ -43,6 +58,18 @@
  *   get clans()       → this._s3?.clans
  *   get factions()    → this._s3?.factions
  *   get serverConfig()→ this._s3?.serverConfig
+ *   get serverID()    → this._s3?.serverID, or null before discovery
+ *
+ * ─── DISCORD ROUTING ─────────────────────────────────────────────
+ *
+ *   routeDiscordCommand(opts)      — which server answers, and with what
+ *   buildRoutingRefusalEmbed(v)    — the embed for a refusing verdict
+ *
+ * ─── SERVER IDENTITY ─────────────────────────────────────────────
+ *
+ *   get requiresServerIdentity() → true by default. A plugin that writes
+ *     only community-wide rows can override it to false and keep mounting
+ *     while S³ is refusing a contested server id.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
@@ -70,12 +97,28 @@
 import BasePlugin from './base-plugin.js';
 import { stderrError } from '../utils/s3-stderr.js';
 import { versionAtLeast } from '../utils/s3-common.js';
+import { enforcedDisagreement, describeDisagreement } from '../utils/community-options.js';
 import {
   localize as lookupMessage,
   isSupportedLanguage,
   supportedLanguages,
   DEFAULT_LANGUAGE
 } from '../utils/s3-i18n.js';
+import {
+  routeDiscordCommand as routeCommand,
+  buildRoutingRefusalEmbed as buildRefusalEmbed
+} from '../utils/s3-discord-routing.js';
+import { applyServerLabel as labelPayload, readServerLabel } from '../utils/s3-server-label.js';
+import { PendingActions, PENDING } from '../utils/s3-pending-actions.js';
+
+/**
+ * How long a process with no matching token waits before claiming the
+ * right to say so. Long enough for the process that does hold it to have
+ * claimed first, short enough that a mistyped token is answered while the
+ * admin is still looking at the channel.
+ */
+const CONFIRM_REJECT_GRACE_MS = 2000;
+import { readLiveContext, renderLiveContext, CONTEXT } from '../utils/s3-live-context.js';
 
 // Module-scope, not per-instance: SmartAssign, Switch and TeamBalancer each
 // extend this class and would otherwise each print their own copy of the
@@ -91,6 +134,10 @@ export default class S3PluginBase extends BasePlugin {
     super(server, options, connectors);
     this._s3 = null;
     this._s3db = null;
+    // Two-step admin commands live here rather than in a field per command.
+    // Built eagerly because arming must not be the thing that discovers the
+    // store is missing — that is the path this exists to make reliable.
+    this._pending = new PendingActions();
   }
 
   /**
@@ -118,6 +165,35 @@ export default class S3PluginBase extends BasePlugin {
    */
   get lang() {
     return this._s3?.lang || DEFAULT_LANGUAGE;
+  }
+
+  /**
+   * The id S³ stamps onto server-scoped rows, or null before S³ is discovered.
+   *
+   * Null rather than a default, deliberately: a consumer that writes rows keyed
+   * by this before discovery would be writing them under an identity S³ has not
+   * agreed to, and a wrong id is worse than a missing one because it silently
+   * claims another server's rows. Callers on a write path should treat null as
+   * "not ready yet", the same way they already treat a null service.
+   */
+  get serverID() {
+    return this._s3?.serverID ?? null;
+  }
+
+  /**
+   * Whether this plugin's rows are keyed by the server id.
+   *
+   * True by default, because that is what a consumer of this base class
+   * normally is, and the safe answer to "does this write server-scoped data?"
+   * is yes — a plugin that gets it wrong in this direction refuses to mount
+   * during an incident, and one that gets it wrong the other way writes into
+   * another community's rows.
+   *
+   * Override to false only for a plugin whose every model declares
+   * `scopeKind: 'global'`.
+   */
+  get requiresServerIdentity() {
+    return true;
   }
 
   /**
@@ -263,6 +339,23 @@ export default class S3PluginBase extends BasePlugin {
     await super.mount();
     if (this._s3) {
       await this._s3.ready();
+
+      // S³ found another live process claiming this server id. Every row this
+      // plugin would write is keyed by that id, so mounting means adding to
+      // somebody else's data — which is the failure the check exists to stop,
+      // not a degraded mode to run in. S³ itself stays up; only the plugins
+      // that write under the contested identity refuse.
+      const blocked = this._s3.serverIdentityBlocked;
+      if (blocked && this.requiresServerIdentity) {
+        const err = new Error(
+          `[${this.constructor.name}] refusing to mount: ${blocked}. ` +
+          'Give each install its own overrideServerID, or set forceServerClaim on S³ if this is a ' +
+          'port change rather than a second server.'
+        );
+        this.verbose(1, err.message);
+        throw err;
+      }
+
       this._s3db = this._s3.db || null;
       this.verbose(2, `[S3] S³ is ready. DB available: ${!!this._s3db}`);
     } else {
@@ -488,6 +581,104 @@ export default class S3PluginBase extends BasePlugin {
   }
 
   // ═══════════════════════════════════════════════════════════════
+  //  COMMUNITY-AFFECTING OPTIONS
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Record this plugin's community-affecting option values onto the server's
+   * registry row.
+   *
+   * Call it **after** the plugin's own clamping, not before. Switch forces a
+   * non-positive `maxSwitchTokens` to 1 at mount; recording the raw config
+   * value would report two agreeing servers as divergent and two divergent
+   * ones as agreeing.
+   *
+   * @param {object} values - `{optionKey: number}`
+   * @returns {Promise<boolean>}
+   */
+  async recordCommunityOptions(values) {
+    if (!this._s3db || typeof this._s3db.recordCommunityOptions !== 'function') return false;
+    return await this._s3db.recordCommunityOptions(this.constructor.name || 'plugin', values);
+  }
+
+  /**
+   * The community value for one option, or `fallback` when none is in force.
+   *
+   * Synchronous on purpose: the reads this exists for happen inside a token
+   * balance computation on the switch path, which cannot await a query. The
+   * cache behind it is refreshed on every heartbeat, so the worst case is a
+   * value that was correct one round ago.
+   *
+   * A missing resolution means “no community value”, not zero — a community of
+   * one, or a boot before the registry has been read — and the caller's own
+   * configured option is the right answer in both.
+   *
+   * @param {string} group - A `COMMUNITY_OPTION_GROUPS` name
+   * @param {string} key - One of that group's keys
+   * @param {*} fallback - Usually `this.options[key]`
+   */
+  resolvedCommunityOption(group, key, fallback) {
+    const resolved = this._s3db?.communityOptions?.resolved?.[group];
+    const value = resolved?.values?.[key];
+    return value === undefined ? fallback : value;
+  }
+
+  /**
+   * The strictest value the registered servers hold for a must-agree option.
+   *
+   * For the reads, where `communityOptionRefusal()` is the wrong tool. A
+   * write that would apply one server's value to everybody's rows should
+   * decline; a read has to answer, and answering out of `this.options`
+   * makes the same command in the same channel return a different list
+   * depending on which process happened to win the claim — a wrong answer
+   * with nothing visibly wrong about it.
+   *
+   * So: the highest candidate across the registry, which for a threshold is
+   * the strictest. Two properties make that the right tie-break rather than
+   * merely a deterministic one. It is the same number on every process, so
+   * the answer stops depending on the election. And it never shows a player
+   * a placement that one of the community's own servers would consider
+   * unearned — erring toward the server that asked for more evidence.
+   *
+   * When the servers agree there is no disagreement entry to read, and this
+   * process's own configured value IS the community value, so the fallback
+   * is exact rather than approximate. Same on a single-server install, and
+   * same before the registry has been read once.
+   *
+   * @param {string} group - A `COMMUNITY_OPTION_GROUPS` name
+   * @param {string} key - One of that group's keys
+   * @param {number} fallback - Usually `this.options[key]`
+   * @returns {number}
+   */
+  strictestCommunityOption(group, key, fallback) {
+    const entry = (this._s3db?.communityOptions?.disagreements || [])
+      .find((d) => d.name === group);
+    if (!entry) return fallback;
+
+    const values = (entry.values || [])
+      .map((candidate) => candidate?.values?.[key])
+      .filter((v) => typeof v === 'number' && Number.isFinite(v));
+    return values.length === 0 ? fallback : Math.max(...values);
+  }
+
+  /**
+   * Why a community-wide write must decline right now, or null.
+   *
+   * Only ever non-null for a must-agree option. A may-differ one never comes
+   * back from here, so naming the wrong option cannot accidentally start
+   * enforcing agreement on something two admins are entitled to disagree about.
+   *
+   * @param {string} group - A `COMMUNITY_OPTION_GROUPS` name
+   * @returns {string|null} A reason, phrased for a log line or a Discord reply
+   */
+  communityOptionRefusal(group) {
+    const entry = enforcedDisagreement(this._s3db?.communityOptions, group);
+    if (!entry) return null;
+    return `the registered servers disagree on ${describeDisagreement(entry)}, and this write would apply ` +
+      'one of those values to every server’s rows';
+  }
+
+  // ═══════════════════════════════════════════════════════════════
   //  SERVICE ACCESSORS
   // ═══════════════════════════════════════════════════════════════
 
@@ -511,6 +702,368 @@ export default class S3PluginBase extends BasePlugin {
 
   /** @returns {object|null} S³ server configuration service. */
   get serverConfig() { return this._s3?.serverConfig || null; }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  DISCORD ROUTING
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Decides whether THIS process should answer a Discord command.
+   *
+   * Every plugin in the suite shares one Discord server, so on a two-server
+   * install every process sees every command and, without this, every
+   * process answers it. The gate parses and strips a `--server` selector,
+   * and returns one of three verdicts: act on it, drop it silently because
+   * another server owns it, or refuse it because the operator has to say
+   * which server they meant. See `s3/utils/s3-discord-routing.js`.
+   *
+   * **It lives on this class rather than being imported at the call site**
+   * because the install flattens `s3/utils/` and `<plugin>/utils/` into one
+   * directory: no import specifier written in a consumer plugin resolves
+   * both in this repository and at the target. This class does not have
+   * that problem — `s3/plugins/` and the flattened `plugins/` sit the same
+   * distance from `utils/` — so the consumers reach the gate through here.
+   *
+   * On a single-server install (nothing registered, or one row) every call
+   * returns `act` with the arguments untouched, and no lock is taken.
+   *
+   * @param {object} opts
+   * @param {string} opts.scope - A `COMMAND_SCOPE` value
+   * @param {string[]} opts.args - The raw argument list, selector included
+   * @param {string} opts.messageID - The Discord message snowflake
+   * @param {string} [opts.command] - The command, for the refusal text
+   * @param {boolean} [opts.selectorRequired] - Refuse a bare server read
+   *        rather than broadcasting it. For the replies too large to arrive
+   *        once per server.
+   * @returns {Promise<{routing: string, args: string[], reason?: string,
+   *          candidates?: Array, token?: string, command?: string}>}
+   */
+  async routeDiscordCommand({ scope, args, messageID, command, selectorRequired = false } = {}) {
+    return routeCommand({
+      db: this._s3db,
+      scope,
+      args,
+      messageID,
+      command,
+      selectorRequired,
+      verbose: (level, msg) => this.verbose(level, msg)
+    });
+  }
+
+  /**
+   * Renders a refusing verdict from `routeDiscordCommand()` as an embed.
+   *
+   * Localized through this plugin's own `localize()`, so the refusal comes
+   * back in the same language as everything else the plugin says.
+   *
+   * @param {object} verdict - A verdict whose `routing` is `refuse`
+   * @returns {object} A Discord embed object
+   */
+  buildRoutingRefusalEmbed(verdict) {
+    return buildRefusalEmbed(verdict, (key, vars) => this.localize(key, vars));
+  }
+
+  /**
+   * Appends this server's label to every embed in a Discord payload.
+   *
+   * A no-op until S³ publishes a label, and on a single-server install it
+   * never does — so this is safe to call unconditionally, and the sender
+   * that calls it needs no knowledge of the registry.
+   *
+   * It exists on the base class because of where the module lives. EloTracker
+   * and TeamBalancer send through their own helper objects, in their own
+   * `utils/` directories, and no import specifier from there resolves both in
+   * this repository and in the flattened layout install.cjs produces. This
+   * class is in `s3/plugins/`, which reaches `../utils/` in both, so those
+   * plugins hand the function to their sender from here instead:
+   *
+   *   EloDiscord.applyServerLabel = (payload) => this.applyServerLabel(payload);
+   *
+   * @param {object} payload - { embeds: [...] } or { embed: {...} }
+   * @returns {object} The payload, labelled if there is a label
+   */
+  applyServerLabel(payload) {
+    return labelPayload(payload);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  TWO-STEP CONFIRMATIONS
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * This server, as a fragment safe to put in a filename.
+   *
+   * Two commands answer with a file rather than an embed, so there is no
+   * footer to label and the filename is the only place the answer can say
+   * where it came from. Empty on a single-server install, where the files
+   * keep the names they have always had.
+   *
+   * Whether the tag describes the file's SCOPE or merely its author
+   * depends on the command: a switches export holds one server's rows, an
+   * Elo backup holds the whole community's ratings and the tag says only
+   * which process produced it. Both are worth saying — two files in one
+   * channel's scrollback are otherwise told apart by their timestamps.
+   *
+   * @returns {string} `-<slug>`, or '' when there is nothing to say
+   */
+  serverFileTag() {
+    const server = this.serverDescriptor();
+    if (!server) return '';
+    const slug = String(server)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 24)
+      .replace(/-+$/, '');
+    return slug === '' ? '' : `-${slug}`;
+  }
+
+  /**
+   * Whether this community has more than one registered server.
+   *
+   * The same cached count the routing gate reads, refreshed on the
+   * registry heartbeat. Every multi-server behaviour hangs off this: at one
+   * registered server nothing arms differently, no token is minted and no
+   * title changes, which is the zero-delta guarantee stated as a branch
+   * rather than hoped for across a dozen call sites.
+   *
+   * @returns {boolean}
+   */
+  isMultiServer() {
+    const count = this._s3db?.getKnownServerCount?.();
+    return Number.isFinite(count) && count > 1;
+  }
+
+  /**
+   * How to name this server to an admin: the label, else the alias, else
+   * `#<id>`. Null when there is only one server to talk about.
+   *
+   * @returns {string|null}
+   */
+  serverDescriptor() {
+    if (!this.isMultiServer()) return null;
+    const label = readServerLabel();
+    if (label) return label;
+    const id = this._s3db?.getServerID?.();
+    return Number.isFinite(id) ? `#${id}` : null;
+  }
+
+  /**
+   * Put the server in an embed title, where a mutation cannot be misread.
+   *
+   * The footer every embed gets (§ the label module) is right for a read
+   * and too quiet for a scramble: a reply confirming that something was
+   * DONE to a live game has to name the game in the line the eye lands on.
+   * A no-op on a single-server install.
+   *
+   * @param {string} title
+   * @returns {string}
+   */
+  titleWithServer(title) {
+    const server = this.serverDescriptor();
+    const text = typeof title === 'string' ? title : '';
+    if (!server) return text;
+    // Server first. A title is truncated from the right by Discord and by
+    // every narrow client, and the half that must survive is which server.
+    return text === '' ? server : `${server} — ${text}`;
+  }
+
+  /**
+   * Arm a two-step action, and describe what is about to happen to it.
+   *
+   * ─── THE SINGLE-SERVER PATH IS THE OLD ONE ───
+   *
+   * At one registered server this arms and returns no token and no prompt
+   * lines, so the caller prints exactly the prompt it printed before and
+   * the admin types exactly the bare `confirm` they typed before.
+   *
+   * ─── AND THE MULTI-SERVER PATH REFUSES RATHER THAN GUESSES ───
+   *
+   * A prompt that cannot say what it is about to change is not a
+   * confirmation. When the live context cannot be read the action is not
+   * armed at all and `refusal` explains why, rather than falling through
+   * to a token that confirms nothing in particular.
+   *
+   * @param {object} opts
+   * @param {string} opts.kind - Action family, e.g. 'scramble'
+   * @param {*} opts.payload - What the confirm path needs to execute
+   * @param {string} opts.command - What the admin types to confirm
+   * @param {number} [opts.ttlMs] - Deadline for this arm
+   * @param {string} [opts.radius='server'] - 'server' confirms against this
+   *        server's live game; 'community' says how many servers share the
+   *        data instead, because that is what the command touches
+   * @returns {{armed: boolean, token: string|null, lines: string[], refusal: string|null}}
+   */
+  armConfirmation({ kind, payload, command = '', ttlMs, radius = 'server' } = {}) {
+    const server = this.serverDescriptor();
+
+    if (!server) {
+      this._pending.arm(kind, payload, { ttlMs });
+      return { armed: true, token: null, lines: [], refusal: null };
+    }
+
+    let opening;
+
+    if (radius === 'community') {
+      // A community mutation is not confirmed against one server's live
+      // game, because that is not what it touches. Naming the radius is
+      // the honest opening line, and a round state nobody is about to
+      // change would reassure against the wrong thing entirely.
+      const count = this._s3db?.getKnownServerCount?.();
+      opening = this.localize('s3Confirm.targetCommunity', {
+        count: Number.isFinite(count) ? String(count) : '?',
+        server
+      });
+    } else {
+      const context = readLiveContext(this._s3);
+      if (context.status !== CONTEXT.OK) {
+        return {
+          armed: false,
+          token: null,
+          lines: [],
+          refusal: this.localize('s3Confirm.contextUnavailable', { server })
+        };
+      }
+      opening = this.localize('s3Confirm.target', {
+        server,
+        context: renderLiveContext(context, (key, vars) => this.localize(key, vars))
+      });
+    }
+
+    const { token, ttlMs: life } = this._pending.arm(kind, payload, { ttlMs });
+    return {
+      armed: true,
+      token,
+      lines: [
+        opening,
+        this.localize('s3Confirm.token', { command, token }),
+        this.localize('s3Confirm.expires', { seconds: String(Math.round(life / 1000)) })
+      ],
+      refusal: null
+    };
+  }
+
+  /**
+   * Take an armed action back out, by token where there is one.
+   *
+   * A bare confirm with no token is the single-server path and the in-game
+   * path — the latter arrives over this server's own RCON, so the process
+   * that armed it is the only one that can be reading it, and a token
+   * would be ceremony with nothing to disambiguate.
+   *
+   * @param {string} kind
+   * @param {string|null} [token]
+   * @returns {{status: string, payload?: *}}
+   */
+  takeConfirmation(kind, token = null) {
+    const key = typeof token === 'string' ? token.trim() : '';
+    if (key === '') return this._pending.takeNewest(kind);
+    return this._pending.take(key, kind);
+  }
+
+  /**
+   * Declare which Discord channel this server uses for a named purpose.
+   *
+   * @param {string} name
+   * @param {string|null} channelID
+   * @returns {Promise<boolean>}
+   */
+  async recordChannelBinding(name, channelID) {
+    if (typeof this._s3db?.recordChannelBinding !== 'function') return false;
+    return await this._s3db.recordChannelBinding(name, channelID);
+  }
+
+  /**
+   * The other registered servers pointing the same named channel at the
+   * same id. Empty on a single-server install, which is what makes every
+   * shared-channel guard inert there.
+   *
+   * @param {string} name
+   * @param {string|null} channelID
+   * @returns {Promise<Array<{serverID: number, alias: string|null}>>}
+   */
+  async channelSharers(name, channelID) {
+    if (typeof this._s3db?.getChannelSharers !== 'function') return [];
+    return await this._s3db.getChannelSharers(name, channelID);
+  }
+
+  /** Drop every armed action of a kind. What a `cancel` verb does. */
+  cancelConfirmations(kind) {
+    return this._pending.cancel(kind);
+  }
+
+  /** Whether anything of this kind is armed and still inside its window. */
+  hasConfirmation(kind) {
+    return this._pending.has(kind);
+  }
+
+  /** The reasons `takeConfirmation()` can fail, for a caller's switch. */
+  get PENDING() {
+    return PENDING;
+  }
+
+  /**
+   * Whether this process is the one that replies to a token confirm.
+   *
+   * ─── WHY A TOKEN CONFIRM IS THE ONE COMMAND WITH NO ELECTION ───
+   *
+   * Every other command is handed to an arbitrary process by the claim,
+   * and for a token confirm that is exactly wrong: the arbitrary winner
+   * would reject a token it never minted while the process actually
+   * holding the armed action never sees the message. So the gate lets
+   * every process inspect one, and the token itself decides — an election
+   * settled at arm time rather than at reply time, and a stricter one,
+   * because it picks the correct process rather than any process.
+   *
+   * ─── WHICH LEAVES A TOKEN NOBODY HOLDS ───
+   *
+   * Mistyped, expired, or armed on a process that has since restarted.
+   * Every process rejects it, so without something here the admin gets
+   * either silence or one copy of the rejection per server. The claim is
+   * what makes it exactly one.
+   *
+   * ─── AND WHY THE REJECTION WAITS ───
+   *
+   * A rejecting process has no work to do and would reach the claim well
+   * ahead of the one that is executing the confirmed action, winning it,
+   * and printing "that token is not recognised" into the channel while
+   * the scramble it names runs on the neighbour. The grace is what orders
+   * the two: it costs the common case nothing, because the holder does
+   * not wait, and it costs a genuinely bad token a couple of seconds
+   * before an accurate answer.
+   *
+   * @param {string|number} messageID
+   * @param {boolean} matched - Whether THIS process held the token
+   * @returns {Promise<boolean>} Whether to send a reply
+   */
+  async claimConfirmReply(messageID, matched) {
+    const db = this._s3db;
+    if (!db?.claimDiscordMessage || !this.isMultiServer()) return true;
+
+    const key = `discord:${messageID}`;
+
+    if (matched) {
+      // Claimed to shut the rejectors up, not to ask permission. The
+      // action this is replying about has already been taken, and a
+      // process that did something and then said nothing about it is the
+      // worst outcome available here.
+      try { await db.claimDiscordMessage(key); } catch { /* reply anyway */ }
+      return true;
+    }
+
+    // Not unref-ed: this promise is what the reply is waiting on, and a
+    // timer the event loop is allowed to skip is one that never resolves it.
+    await new Promise((resolve) => { setTimeout(resolve, CONFIRM_REJECT_GRACE_MS); });
+
+    try {
+      const claim = await db.claimDiscordMessage(key);
+      return claim?.claimed === true;
+    } catch {
+      // Something else is already replying, probably. One silence beats N
+      // copies of a rejection that may not even be true.
+      return false;
+    }
+  }
 
   // ═══════════════════════════════════════════════════════════════
   //  TEAM CHANGE

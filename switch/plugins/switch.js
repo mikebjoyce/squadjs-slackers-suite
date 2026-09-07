@@ -68,11 +68,19 @@ const POST_SWITCH_LOCKOUT_MS = 10_000;
  *
  * ─── S³ INTEGRATION ──────────────────────────────────────────────
  *
- * DB models are managed via S³ MigrationEngine . Tables
- * (SwitchPlugin_PlayerCooldowns, SwitchPlugin_Endmatches) are created
- * through version-tracked migrations on the S³ connector, replacing
- * the old createModel() / sync({alter}) / raw ALTER TABLE pattern.
- * All transactions use s3db.withTransactionWithRetry().
+ * DB models are managed via S³ MigrationEngine. Five tables —
+ * SwitchPlugin_PlayerCooldowns, SwitchPlugin_PlayerServerState,
+ * SwitchPlugin_Endmatches, SwitchPlugin_ServerSettings and
+ * SwitchPlugin_RoundStats — are created through version-tracked
+ * migrations on the S³ connector, replacing the old createModel() /
+ * sync({alter}) / raw ALTER TABLE pattern. All transactions use
+ * s3db.withTransactionWithRetry(). See switch-db.js for the models
+ * and for which of them is per-server and which community-wide.
+ *
+ * Requires S³ 1.8.0 or later, checked at mount. The reason is at the
+ * check itself rather than here, because the failure modes an older
+ * S³ produces are not uniform and reading them next to the version
+ * string is what makes them legible.
  *
  * S³ (Slacker's Squad Services) is the centralised service container
  * for shared state across Slacker's Squad plugins.  It owns the
@@ -104,6 +112,33 @@ const POST_SWITCH_LOCKOUT_MS = 10_000;
  *   - TEAM_BALANCER_SCRAMBLE_EXECUTED: applies scramble lockdown to affected
  *     players for a configurable duration. Skipped entirely for TeamBalancer's
  *     'EloDiff' micro scramble.
+ *
+ * ─── MULTI-SERVER (v2.6.0) ───────────────────────────────────────
+ *
+ * A community can run this plugin on several Squad servers against
+ * one database and one Discord server. What that changes here:
+ *
+ * Tokens are community-wide. One player carries one balance across
+ * every server, spends it wherever they play, and regenerates it
+ * once. That is a deliberate answer rather than a fallout of the
+ * schema — a per-server balance would let a player spend a full
+ * allowance on each server in turn.
+ *
+ * Scramble lockdowns and seed progress are per-server, because a
+ * scramble happens on a server and a seed round is a server's round.
+ * The same player holds a row per server for those.
+ *
+ * Because maxSwitchTokens sets the cap on a shared balance, the two
+ * servers have to agree on it. _regenTokens() reads it on every
+ * in-game switch, so a mismatch does not merely confuse an admin
+ * report: it stops a cross-server player's tokens regenerating at
+ * all, silently. S³'s community-option check is what catches that,
+ * and it is the reason the option is compared across the registry
+ * rather than trusted per process.
+ *
+ * Discord admin commands route through S³ so that one typed command
+ * is answered once. In-game commands need none of that, since a chat
+ * message only ever reaches the process running that server.
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
@@ -146,7 +181,7 @@ const POST_SWITCH_LOCKOUT_MS = 10_000;
  * full explain embed sequence plus a 7-day reliability stats embed to
  * the designated channel. The embed is generated once on SquadJS
  * startup — no periodic refresh. The message ID is persisted in
- * SwitchPlugin_Settings so it survives SquadJS restarts.
+ * SwitchPlugin_ServerSettings so it survives SquadJS restarts, per server.
  *
  * ─── COMMANDS ────────────────────────────────────────────────────
  *
@@ -200,7 +235,7 @@ const POST_SWITCH_LOCKOUT_MS = 10_000;
  *
  */
 export default class Switch extends S3DiscordPluginBase {
-    static version = '2.5.7';
+    static version = '2.6.0';
 
     static get description() {
         return "Switch plugin with persistent join timers";
@@ -454,6 +489,9 @@ export default class Switch extends S3DiscordPluginBase {
         // end doesn't silently drop players who requested a match-end switch.
         this._matchendQueue = [];
         this._reconnectLockoutClearTimeouts = new Map();
+        // Serialises the two seed-grant reconcilers against each other. See
+        // _withSeedGrantLock().
+        this._seedGrantChain = Promise.resolve();
 
          // v2.3.0 Stage 2: Seed presence tracking
          this._seedPresenceProcessing = false;  // re-entrancy guard for seed bonus checks
@@ -501,6 +539,26 @@ export default class Switch extends S3DiscordPluginBase {
              this.options.seedTokenBonusMinPlayers = 0;
          }
 
+        // ── Community-affecting options ────────────────────
+        // AFTER the clamping above, deliberately: the block just overwrote a
+        // non-positive maxSwitchTokens with 1, and recording the config value
+        // instead would report two agreeing servers as divergent and two
+        // divergent ones as agreeing.
+        this._configuredOptions = {
+            maxSwitchTokens: this.options.maxSwitchTokens,
+            switchCooldownMinutes: this.options.switchCooldownMinutes,
+            switchCooldownHours: this.options.switchCooldownHours,
+            pruneInactivePlayerDays: this.options.pruneInactivePlayerDays
+        };
+        await this.recordCommunityOptions(this._configuredOptions);
+        this._applyCommunityOptions();
+
+        // Declared so `!switch backfill` can tell whether the reporting
+        // channel is this server's alone. It scrapes that channel's history
+        // as data, and on a shared one there is no honest way to tell whose
+        // rounds it is reading.
+        await this.recordChannelBinding('switchReporting', this.options.channelID || null);
+
         this._liberalModes = (this.options.liberalSwitchGameModes || ['Seed', 'Jensen']).map(m => String(m).toLowerCase());
         this._roundStats = this._initRoundStats();
         this._restartedThisRound = true;
@@ -542,7 +600,20 @@ export default class Switch extends S3DiscordPluginBase {
         // calls _s3db.caseInsensitiveLikeOp(), both added in S³ 1.2.2. Against an
         // older S³ these are undefined, so the seed-bonus UPDATE would throw
         // mid-grant rather than failing at mount where it is diagnosable.
-        const required = '1.6.0';
+        //
+        // 1.8.0 — the multi-server surface, and the failure modes are not
+        // uniform. recordCommunityOptions() and resolvedCommunityOption()
+        // are plain calls inside mount(), so an older S³ throws a TypeError
+        // partway through mount, with a stack that names the base class
+        // rather than the version. The routing gate in switch-commands.js is
+        // optional-chained and does not throw at all: it simply never runs,
+        // so on a shared database every process answers every !switch
+        // command and every server-mutating one acts without a selector.
+        // The models declare scopeKind, which an older defineModel() accepts
+        // and ignores, so an export reports every server's rows as this
+        // server's. Checking the version first is what turns three unrelated
+        // symptoms into one legible refusal.
+        const required = '1.8.0';
         const actual = this._s3?.version;
         if (!this._s3VersionAtLeast(required)) {
             throw new Error(
@@ -681,7 +752,15 @@ export default class Switch extends S3DiscordPluginBase {
             let dbRequests = [];
             if (Endmatches) {
                 try {
-                    dbRequests = await Endmatches.findAll();
+                    // This server's queue, not the community's. The write
+                    // stamps serverID and this read has to match it: a bare
+                    // findAll() here would force-switch a player who queued
+                    // on the neighbour — eosIDs are community-wide, so one
+                    // who is connected to both servers resolves and moves on
+                    // the wrong one.
+                    dbRequests = await Endmatches.findAll({
+                        where: { serverID: this._serverID() }
+                    });
                 } catch (err) {
                     this.verbose(1, `[Switch] doSwitchMatchend: DB unreachable, processing in-memory queue only: ${err.message}`);
                 }
@@ -743,7 +822,17 @@ export default class Switch extends S3DiscordPluginBase {
             const ids = resolved.map(r => r.id).filter((id) => id != null);
             if (Endmatches && ids.length > 0) {
                 try {
-                    const cleared = await Endmatches.destroy({ where: { id: { [Op.in]: ids } } });
+                    // Scoped as well as keyed, and deliberately belt-and-braces:
+                    // `id` is one autoincrement sequence across the whole table,
+                    // so these ids cannot name another server's row, and the read
+                    // that produced them is scoped anyway. Removing the predicate
+                    // breaks no case — confirmed by reverting it — and it stays
+                    // because a DELETE that carries its own scope can be read
+                    // correctly on its own, without tracing where `ids` came from.
+                    // The read above is the one doing the work.
+                    const cleared = await Endmatches.destroy({
+                        where: { serverID: this._serverID(), id: { [Op.in]: ids } }
+                    });
                     this.verbose(1, `[Switch] Matchend: processed ${resolved.length} requests (${failed} failed), cleared ${cleared} rows.`);
                 } catch (err) {
                     this.verbose(1, `[Switch] Matchend: processed ${resolved.length} requests (${failed} failed), but failed to clear DB rows: ${err.message}`);
@@ -869,6 +958,40 @@ export default class Switch extends S3DiscordPluginBase {
      }
 
     /**
+     * Point this.options at the community's resolved token settings.
+     *
+     * **Why this overwrites this.options rather than changing the read sites.**
+     * These three options are read from roughly sixty places across six files —
+     * warnings, embeds, diagnostics, the queue, the seed sweeps, and the
+     * gameplay path. A community-wide bucket has to have a community-wide cap at
+     * every one of them, and a rewrite of sixty call sites is a rewrite that
+     * misses one. The one it misses is silent: the lower-capped server takes
+     * _regenTokens()'s else branch, resets tokenRegenAnchor on every appearance,
+     * and a player who plays both servers stops regenerating altogether with
+     * nothing in any log. Resolving at the single point every read already goes
+     * through makes that class of miss impossible.
+     *
+     * this.options is already the post-validation config in this plugin — mount()
+     * clamps maxSwitchTokens into it — so this extends an existing meaning rather
+     * than inventing one: this.options is what is in force, _configuredOptions is
+     * what the operator typed.
+     *
+     * Always resolved against _configuredOptions, never against the current
+     * this.options. Folding an override back into its own input would make a
+     * later loss of resolution keep the last override forever.
+     */
+    _applyCommunityOptions() {
+        if (!this._configuredOptions) return;
+        const configured = this._configuredOptions;
+        this.options.maxSwitchTokens =
+            this.resolvedCommunityOption('maxSwitchTokens', 'maxSwitchTokens', configured.maxSwitchTokens);
+        this.options.switchCooldownMinutes =
+            this.resolvedCommunityOption('switchCooldown', 'switchCooldownMinutes', configured.switchCooldownMinutes);
+        this.options.switchCooldownHours =
+            this.resolvedCommunityOption('switchCooldown', 'switchCooldownHours', configured.switchCooldownHours);
+    }
+
+    /**
      * Lazy token regeneration — brings a player's token balance current
      * based on elapsed time since tokenRegenAnchor.
      *
@@ -974,6 +1097,83 @@ export default class Switch extends S3DiscordPluginBase {
         else this.recentSwitches.push({ eosID, datetime: new Date() });
     }
 
+    /**
+     * This process's server id — the scope every SwitchPlugin_PlayerServerState
+     * read and write narrows to.
+     *
+     * Safe on the switch hot path: DBService settles the id at construction,
+     * before anything mounts, and getServerID() is a property read rather
+     * than a query. The fallback covers a harness that mounts the plugin with
+     * no S³ DB at all, where the model lookup beside it has already returned
+     * null and the caller has already given up.
+     *
+     * A method on the class rather than something register() attaches,
+     * because the paths that need it run whether or not register() has: an
+     * absent model is a guard those paths already have, an absent function is
+     * a TypeError inside a catch that reports it as a database error.
+     */
+    _serverID() {
+        return this._s3db?.getServerID?.() ?? 1;
+    }
+
+    /** The per-server half of the cooldown split. Null before migration v7. */
+    _getServerStateModel() {
+        return this._getModel('SwitchPlugin_PlayerServerState');
+    }
+
+    /**
+     * This server’s per-server row for one player, or null.
+     *
+     * findOne, never findByPk: the key is (serverID, eosID) and Sequelize has
+     * no findByPk for a composite one. That is the point rather than the
+     * inconvenience — a read that forgets its server does not compile into a
+     * working query the way findByPk(eosID) against the old single-table
+     * shape silently would have.
+     */
+    async _readServerState(eosID, opts = {}) {
+        const ServerState = this._getServerStateModel();
+        if (!ServerState) return null;
+        return ServerState.findOne({
+            where: { serverID: this._serverID(), eosID },
+            transaction: opts.transaction
+        });
+    }
+
+    /**
+     * Set per-server fields for one player, creating this server’s row for
+     * them if it does not exist yet.
+     *
+     * Creating rather than no-opping matters: a player’s first scramble on a
+     * server they have played for months is the first time this table has
+     * heard of them, and an UPDATE ... WHERE would silently write nothing.
+     * lastActiveTimestamp is stamped on every create because it is this
+     * table's own retention clock — a row that never gets one is immortal,
+     * exactly as the community-wide column of the same name documents.
+     *
+     * @param {string} eosID
+     * @param {object} fields — columns to set
+     * @param {object} [opts] — { transaction }
+     * @returns {Promise<boolean>} false when the model is unavailable
+     */
+    async _writeServerState(eosID, fields, opts = {}) {
+        const ServerState = this._getServerStateModel();
+        if (!ServerState) return false;
+        const serverID = this._serverID();
+        const now = new Date();
+        const [, created] = await ServerState.findOrCreate({
+            where: { serverID, eosID },
+            defaults: { serverID, eosID, lastActiveTimestamp: now, ...fields },
+            transaction: opts.transaction
+        });
+        if (!created) {
+            await ServerState.update(fields, {
+                where: { serverID, eosID },
+                transaction: opts.transaction
+            });
+        }
+        return true;
+    }
+
     async _checkSwitchEligibility(player) {
         const eosID = player?.eosID;
         if (!eosID) return { eligible: false, reason: 'missing_eos' };
@@ -1004,13 +1204,19 @@ export default class Switch extends S3DiscordPluginBase {
         // catch-all) is worse than temporarily skipping enforcement.
         const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
         let cooldownData = null;
+        let serverState = null;
         let dbUnavailable = false;
         if (PlayerCooldowns) {
             if (this._s3db?.shouldSkipDb?.()) {
                 dbUnavailable = true;
             } else {
                 try {
+                    // Two reads since the split: the wallet is the community’s
+                    // and the lock is this server’s. Both fail open together —
+                    // the same catch, because a player told "you are locked" by
+                    // a half-read is worse than a player who briefly is not.
                     cooldownData = await PlayerCooldowns.findByPk(eosID);
+                    serverState = await this._readServerState(eosID);
                 } catch (err) {
                     dbUnavailable = true;
                     this.reportError('DB', `Error checking cooldown for ${eosID}: ${err.message}`, err);
@@ -1030,9 +1236,11 @@ export default class Switch extends S3DiscordPluginBase {
             return { eligible: true };
         }
 
-        // Scramble lock is an independent override — token availability never overrides it
-        if (cooldownData && cooldownData.scrambleLockdownExpiry && new Date(cooldownData.scrambleLockdownExpiry).getTime() > now) {
-            const remaining = Math.ceil((new Date(cooldownData.scrambleLockdownExpiry).getTime() - now) / 60000);
+        // Scramble lock is an independent override — token availability never overrides it.
+        // Read off this server’s row: a scramble on another server is not a
+        // reason to refuse a switch here, and before the split it was.
+        if (serverState && serverState.scrambleLockdownExpiry && new Date(serverState.scrambleLockdownExpiry).getTime() > now) {
+            const remaining = Math.ceil((new Date(serverState.scrambleLockdownExpiry).getTime() - now) / 60000);
             return { eligible: false, reason: 'scramble_lock', remaining };
         }
 
@@ -1105,8 +1313,9 @@ export default class Switch extends S3DiscordPluginBase {
         const hadCooldown_obsolete = row.lastSwitchTimestamp != null;
         const hasTokenDebt = row.tokenBalance != null && row.tokenBalance < maxTokens;
         const now = Date.now();
-        const hadScrambleLock = row.scrambleLockdownExpiry != null
-            && new Date(row.scrambleLockdownExpiry).getTime() > now;
+        const side = await this._readServerState(eosID);
+        const hadScrambleLock = side?.scrambleLockdownExpiry != null
+            && new Date(side.scrambleLockdownExpiry).getTime() > now;
 
         if (!hadCooldown_obsolete && !hasTokenDebt && !hadScrambleLock) return;
 
@@ -1119,16 +1328,27 @@ export default class Switch extends S3DiscordPluginBase {
         // something. Same fix shape as adminClearPlayer() in switch-db.js.
         const toppedUp = Math.max(row.tokenBalance != null ? row.tokenBalance : maxTokens, maxTokens);
 
+        // One transaction over both tables, handle threaded explicitly — this
+        // repo has no CLS, so an omitted { transaction: t } runs outside and a
+        // rollback would leave the halves disagreeing about whether the player
+        // is remediated.
         await this._withDb(async (t) => {
             await PlayerCooldowns.update(
                 {
                     lastSwitchTimestamp: null,
                     tokenBalance: toppedUp,
-                    tokenRegenAnchor: null,
-                    scrambleLockdownExpiry: null
+                    tokenRegenAnchor: null
                 },
                 { where: { eosID }, transaction: t }
             );
+            if (hadScrambleLock) {
+                // UPDATE, not the create-or-update helper: hadScrambleLock is
+                // only true because a row was read a moment ago.
+                await this._getServerStateModel()?.update(
+                    { scrambleLockdownExpiry: null, lastActiveTimestamp: new Date() },
+                    { where: { serverID: this._serverID(), eosID }, transaction: t }
+                );
+            }
         });
 
         // Reset joinTime so the player's switch eligibility window reopens.
@@ -1158,10 +1378,14 @@ export default class Switch extends S3DiscordPluginBase {
      * @param {string} name — Player name (for logging)
      */
     async _clearReconnectScrambleLock(eosID, name) {
-        const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
-        if (!PlayerCooldowns) return;
+        const ServerState = this._getServerStateModel();
+        if (!ServerState) return;
 
-        const row = await PlayerCooldowns.findByPk(eosID);
+        // Reads and writes one table now. The cooldown row it used to open
+        // with was only ever the carrier for the lock column; a player with a
+        // lock here necessarily has a row here, so the guard is not lost.
+        const serverID = this._serverID();
+        const row = await this._readServerState(eosID);
         if (!row) return;
 
         const now = Date.now();
@@ -1171,9 +1395,9 @@ export default class Switch extends S3DiscordPluginBase {
         if (!hadScrambleLock) return;
 
         await this._withDb(async (t) => {
-            await PlayerCooldowns.update(
-                { scrambleLockdownExpiry: null },
-                { where: { eosID }, transaction: t }
+            await ServerState.update(
+                { scrambleLockdownExpiry: null, lastActiveTimestamp: new Date() },
+                { where: { serverID, eosID }, transaction: t }
             );
         });
 
@@ -1218,8 +1442,9 @@ export default class Switch extends S3DiscordPluginBase {
 
         const now = Date.now();
         const maxTokens = this.options.maxSwitchTokens;
-        const hadScrambleLock = row.scrambleLockdownExpiry != null
-            && new Date(row.scrambleLockdownExpiry).getTime() > now;
+        const side = await this._readServerState(eosID);
+        const hadScrambleLock = side?.scrambleLockdownExpiry != null
+            && new Date(side.scrambleLockdownExpiry).getTime() > now;
         const balance = row.tokenBalance != null ? row.tokenBalance : maxTokens;
         const belowCap = balance < maxTokens;
 
@@ -1228,13 +1453,28 @@ export default class Switch extends S3DiscordPluginBase {
             return false;
         }
 
+        // Both halves, one transaction, handle threaded — no CLS in this repo.
+        // The remediation this path exists for is "a scramble stranded you":
+        // clearing the lock without granting the token, or the reverse, leaves
+        // the player stranded in a way neither half can be blamed for.
         await this._withDb(async (t) => {
-            const fields = { scrambleLockdownExpiry: null };
             if (belowCap) {
-                fields.tokenBalance = this._s3db.incrementLiteral('tokenBalance', 1);
-                fields.tokenRegenAnchor = null;
+                await PlayerCooldowns.update(
+                    {
+                        tokenBalance: this._s3db.incrementLiteral('tokenBalance', 1),
+                        tokenRegenAnchor: null
+                    },
+                    { where: { eosID }, transaction: t }
+                );
             }
-            await PlayerCooldowns.update(fields, { where: { eosID }, transaction: t });
+            // Unconditional, matching what it replaces: the old statement set
+            // the lock to null whether or not one was held, and the guard above
+            // has already established that one of the two reasons applies.
+            await this._writeServerState(
+                eosID,
+                { scrambleLockdownExpiry: null, lastActiveTimestamp: new Date() },
+                { transaction: t }
+            );
         });
 
         // Reset joinTime so the player's switch eligibility window reopens.
@@ -1422,6 +1662,12 @@ export default class Switch extends S3DiscordPluginBase {
         if (Endmatches) {
             try {
                 const row = await Endmatches.create({
+                    // The queue this row backs is drained on the next boot,
+                    // and without the stamp a restart on either server would
+                    // replay the other's queued switches. doSwitchMatchend()
+                    // filters on it — both the read and the DELETE — so this
+                    // is the value that decides whose queue a row belongs to.
+                    serverID: this._serverID(),
                     name: player.name,
                     steamID: player.steamID,
                     eosID: player.eosID,
@@ -1479,6 +1725,13 @@ export default class Switch extends S3DiscordPluginBase {
 
     onNewGame = async () => {
         this.verbose(1, '[NEW_GAME] Round started — null-teamID window handled by S³ players service.');
+
+        // The registry snapshot behind this is refreshed on S³'s heartbeat, which
+        // is also the round roll. Whichever of the two handlers runs first, the
+        // resolved cap is at worst one round old — and a server joining or
+        // leaving the community mid-session is exactly the case a mount-time
+        // read alone would never notice.
+        this._applyCommunityOptions();
 
         // Clear the queue — round transition invalidates all stored teamIDs
         this._clearAllQueueEntries('New round');
@@ -1578,9 +1831,37 @@ export default class Switch extends S3DiscordPluginBase {
      * step 2 still resets stale connected rows on its next tick, exactly as it
      * did before this sweep existed.
      */
+    /**
+     * Runs one seed-grant reconciler at a time.
+     *
+     * A grant used to be one atomic UPDATE whose WHERE clause did double duty
+     * as a compare-and-swap, and the comments on both callers record why: an
+     * ENDGAME grant and a periodic tick in flight together silently lost one
+     * of them. That statement cannot survive the split — the wallet it
+     * credits and the seed state it spends are different tables now, and no
+     * portable single statement spans both — so the claim and the credit are
+     * two statements inside one transaction, and something has to keep a
+     * second reconciler out from between them.
+     *
+     * A promise chain is enough, and only because of what the split changed:
+     * every row either reconciler touches carries this process’s serverID, so
+     * the contenders are two async paths in one single-threaded process
+     * rather than N processes over a shared table. That is also why this is
+     * not the shared re-entrancy guard the old comment rejected — that one
+     * would have had to hold across servers, where a promise cannot reach.
+     *
+     * Failures do not break the chain: the next caller runs either way, and a
+     * rejected inner promise is still the caller’s to catch.
+     */
+    _withSeedGrantLock(fn) {
+        const run = this._seedGrantChain.then(fn, fn);
+        this._seedGrantChain = run.then(() => {}, () => {});
+        return run;
+    }
+
     async _sweepStaleSeedState() {
-        const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
-        if (!PlayerCooldowns) return 0;
+        const ServerState = this._getServerStateModel();
+        if (!ServerState) return 0;
 
         const currentMatchId = this._s3?.gameState?.getMatchId?.() || null;
         if (!currentMatchId) {
@@ -1591,13 +1872,20 @@ export default class Switch extends S3DiscordPluginBase {
         try {
             let swept = 0;
             await this._withDb(async (t) => {
-                const [count] = await PlayerCooldowns.update(
+                const [count] = await ServerState.update(
                     {
                         seedPresenceStart: null,
                         seedBonusTokensEarned: 0
                     },
                     {
                         where: {
+                            // Scoped, and the matchId is why: it names a round on
+                            // THIS server. Unscoped, every NEW_GAME here would
+                            // retire the seed state of every other server in the
+                            // community, whose rounds this id has nothing to say
+                            // about — a seeder on server B loses their accrued
+                            // presence every time server A rolls a map.
+                            serverID: this._serverID(),
                             [Op.or]: [
                                 { lastSeedBonusRoundID: null },
                                 { lastSeedBonusRoundID: { [Op.ne]: currentMatchId } }
@@ -1685,6 +1973,18 @@ export default class Switch extends S3DiscordPluginBase {
                     { where: { eosID }, transaction: t }
                 );
             }
+            // The per-server table keeps its own clock, meaning "last seen
+            // HERE", and it is the only thing that can ever retire a row for a
+            // player who moved to another server months ago. UPDATE only,
+            // never a create: a row that carries nothing should not spring
+            // into existence because somebody connected once.
+            const ServerState = this._getServerStateModel();
+            if (ServerState) {
+                await ServerState.update(
+                    { lastActiveTimestamp: new Date() },
+                    { where: { serverID: this._serverID(), eosID }, transaction: t }
+                );
+            }
         }).catch(err => {
             this.verbose(2, `[LastActive] Failed to update lastActiveTimestamp for ${name || eosID}: ${err.message}`);
         });
@@ -1720,57 +2020,75 @@ export default class Switch extends S3DiscordPluginBase {
             const currentMatchId = this._s3?.gameState?.getMatchId?.() || null;
             if (this._s3?.gameState?.isSeedMode?.() && this._isSeedAccrualActive() && currentMatchId) {
                 const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
-                if (PlayerCooldowns) {
+                const ServerState = this._getServerStateModel();
+                if (PlayerCooldowns && ServerState) {
+                    // Two rows to consider now, and they are independent: a
+                    // regular on this server has a wallet and no seed row until
+                    // the first seed round they are present for, and a player
+                    // who seeded here last month has a seed row whose wallet the
+                    // community prune could have taken. Neither absence implies
+                    // the other, so each is created on its own terms.
                     const row = await PlayerCooldowns.findByPk(eosID);
-                    if (!row) {
-                        await PlayerCooldowns.create({
-                            eosID,
-                            steamID: data.player?.steamID || null,
-                            playerName: name,
-                            tokenBalance: this.options.maxSwitchTokens,
-                            seedPresenceStart: new Date(),
-                            seedBonusTokensEarned: 0,
-                            lastSeedBonusRoundID: currentMatchId,
-                            firstSeenTimestamp: new Date(),
-                            lastActiveTimestamp: new Date()
-                        });
-                        this.verbose(2, `[SeedPresence] ${name}: joined during seed mode — created row with seedPresenceStart.`);
-                    } else if (row.lastSeedBonusRoundID !== currentMatchId) {
-                        // NEW ROUND for this row — reset the whole per-round block.
-                        // JS !== treats NULL as different, so this also heals legacy
-                        // rows written before the matchId guard above existed.
-                        //
-                        // v2.5.6: this branch is now tested FIRST. It used to sit
-                        // below the seedPresenceStart check, which meant a row with
-                        // a stale round id but a null clock took the bootstrap path
-                        // and kept the previous round's seedBonusTokensEarned.
-                        await PlayerCooldowns.update(
-                            {
+                    const side = await this._readServerState(eosID);
+
+                    await this._withDb(async (t) => {
+                        if (!row) {
+                            await PlayerCooldowns.create({
+                                eosID,
+                                steamID: data.player?.steamID || null,
+                                playerName: name,
+                                tokenBalance: this.options.maxSwitchTokens,
+                                firstSeenTimestamp: new Date(),
+                                lastActiveTimestamp: new Date()
+                            }, { transaction: t });
+                        }
+
+                        if (!side) {
+                            await this._writeServerState(eosID, {
                                 seedPresenceStart: new Date(),
                                 seedBonusTokensEarned: 0,
-                                lastSeedBonusRoundID: currentMatchId
-                            },
-                            { where: { eosID } }
-                        );
-                        this.verbose(2, `[SeedPresence] ${name}: reconnected in new seed round — reset per-round state.`);
-                    } else if (!row.seedPresenceStart) {
-                        // SAME round, clock not running — the player disconnected
-                        // earlier this round and has just come back.
-                        //
-                        // v2.5.6: restart the CLOCK ONLY. seedBonusTokensEarned is
-                        // per-round, not per-connection: zeroing it here handed the
-                        // player a fresh seedTokenBonusAmount allowance every time
-                        // they reconnected, which became reachable the moment
-                        // onS3PlayerLeft started nulling seedPresenceStart on leave.
-                        // lastSeedBonusRoundID is already currentMatchId — that is
-                        // the branch condition — so it does not need rewriting.
-                        await PlayerCooldowns.update(
-                            { seedPresenceStart: new Date() },
-                            { where: { eosID } }
-                        );
-                        this.verbose(2, `[SeedPresence] ${name}: rejoined mid seed round — restarted presence clock (bonus counter kept at ${row.seedBonusTokensEarned}).`);
-                    }
-                    // else: clock already running for this round — leave it alone
+                                lastSeedBonusRoundID: currentMatchId,
+                                lastActiveTimestamp: new Date()
+                            }, { transaction: t });
+                            this.verbose(2, `[SeedPresence] ${name}: joined during seed mode — created row with seedPresenceStart.`);
+                        } else if (side.lastSeedBonusRoundID !== currentMatchId) {
+                            // NEW ROUND for this row — reset the whole per-round block.
+                            // JS !== treats NULL as different, so this also heals legacy
+                            // rows written before the matchId guard above existed.
+                            //
+                            // v2.5.6: this branch is now tested FIRST. It used to sit
+                            // below the seedPresenceStart check, which meant a row with
+                            // a stale round id but a null clock took the bootstrap path
+                            // and kept the previous round's seedBonusTokensEarned.
+                            await ServerState.update(
+                                {
+                                    seedPresenceStart: new Date(),
+                                    seedBonusTokensEarned: 0,
+                                    lastSeedBonusRoundID: currentMatchId,
+                                    lastActiveTimestamp: new Date()
+                                },
+                                { where: { serverID: this._serverID(), eosID }, transaction: t }
+                            );
+                            this.verbose(2, `[SeedPresence] ${name}: reconnected in new seed round — reset per-round state.`);
+                        } else if (!side.seedPresenceStart) {
+                            // SAME round, clock not running — the player disconnected
+                            // earlier this round and has just come back.
+                            //
+                            // v2.5.6: restart the CLOCK ONLY. seedBonusTokensEarned is
+                            // per-round, not per-connection: zeroing it here handed the
+                            // player a fresh seedTokenBonusAmount allowance every time
+                            // they reconnected, which became reachable the moment
+                            // onS3PlayerLeft started nulling seedPresenceStart on leave.
+                            // lastSeedBonusRoundID is already currentMatchId — that is
+                            // the branch condition — so it does not need rewriting.
+                            await ServerState.update(
+                                { seedPresenceStart: new Date(), lastActiveTimestamp: new Date() },
+                                { where: { serverID: this._serverID(), eosID }, transaction: t }
+                            );
+                            this.verbose(2, `[SeedPresence] ${name}: rejoined mid seed round — restarted presence clock (bonus counter kept at ${side.seedBonusTokensEarned}).`);
+                        }
+                        // else: clock already running for this round — leave it alone
+                    });
                 }
             }
         } catch (err) {
@@ -1826,12 +2144,24 @@ export default class Switch extends S3DiscordPluginBase {
         // leaving them with a stopped clock until the next reconciler tick
         // restarts it. Awaiting costs a few milliseconds on a disconnect and
         // removes the ordering question entirely. Errors are still swallowed.
+        // Two statements since the split, one per table, in one transaction.
+        // The retention stamp belongs to both clocks — "last seen anywhere" and
+        // "last seen here" — and the presence clock belongs only to this
+        // server's. Both are UPDATE ... WHERE and neither creates: a leave is
+        // not a reason for a row to exist.
         await this._withDb(async (t) => {
             const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
             if (PlayerCooldowns) {
                 await PlayerCooldowns.update(
-                    { lastActiveTimestamp: new Date(), seedPresenceStart: null },
+                    { lastActiveTimestamp: new Date() },
                     { where: { eosID }, transaction: t }
+                );
+            }
+            const ServerState = this._getServerStateModel();
+            if (ServerState) {
+                await ServerState.update(
+                    { lastActiveTimestamp: new Date(), seedPresenceStart: null },
+                    { where: { serverID: this._serverID(), eosID }, transaction: t }
                 );
             }
         }).catch(err => {
@@ -2068,54 +2398,128 @@ export default class Switch extends S3DiscordPluginBase {
             return;
         }
 
+        const ServerState = this._getServerStateModel();
+        if (!ServerState) return;
+        const serverID = this._serverID();
+
         try {
-            // Atomic UPDATE as the compare-and-swap defense against a concurrent
-            // S3_PLAYERS_UPDATED tick. The periodic grant targets rows with a full
-            // threshold of accrued time; this targets rows with none earned. The
-            // WHERE clauses are the race defense — no shared re-entrancy guard,
-            // which previously caused silent grant loss when a tick happened to be
-            // in flight as the round ended.
-            //
-            // seedPresenceStart is nulled rather than reset to NOW: the round is
-            // over, there is no more presence to accrue.
-            //
-            // Uses _s3db.incrementLiteral for the additive increments — safe
-            // (integer, no user input) and identifier-quoted so the camelCase
-            // columns survive Postgres identifier folding.
-            const whereClause = {
-                eosID: { [Op.in]: connectedEosIDs },
-                seedPresenceStart: {
-                    [Op.ne]: null,
-                    [Op.lt]: endgameStartedAt
-                },
-                seedBonusTokensEarned: 0,
-                tokenBalance: { [Op.lt]: maxTokens + bonusAmount }
-            };
+            let qualifying = [];
+            let grantCount = 0;
+            let closedCount = 0;
 
-            // Capture qualifying rows BEFORE the UPDATE so notifications go to
-            // exactly the players this grant targets, rather than re-querying by
-            // post-UPDATE field values (which can match unrelated rows).
-            const qualifying = await PlayerCooldowns.findAll({
-                where: whereClause,
-                attributes: ['eosID', 'playerName', 'tokenBalance']
-            });
+            // One transaction, and the reconciler lock around it. The claim on
+            // the seed row and the credit to the wallet are two statements now
+            // and they must not be separable: a claim without a credit is the
+            // player’s presence spent for nothing, a credit without a claim is
+            // a token they can earn again on the next tick.
+            await this._withSeedGrantLock(() => this._withDb(async (t) => {
+                // The claim, and still a compare-and-swap: the WHERE targets rows
+                // with presence started before this round ended and nothing
+                // earned yet, so re-running it after a partial commit matches
+                // nothing. Scoped to this server, which is what makes the lock
+                // above sufficient — no other process can hold these rows.
+                //
+                // seedPresenceStart is nulled rather than reset to NOW: the round
+                // is over, there is no more presence to accrue.
+                const claimWhere = {
+                    serverID,
+                    eosID: { [Op.in]: connectedEosIDs },
+                    seedPresenceStart: {
+                        [Op.ne]: null,
+                        [Op.lt]: endgameStartedAt
+                    },
+                    seedBonusTokensEarned: 0
+                };
 
-            const [grantCount] = await PlayerCooldowns.update(
-                {
-                    tokenBalance: this._s3db.incrementLiteral('tokenBalance', 1),
-                    seedBonusTokensEarned: this._s3db.incrementLiteral('seedBonusTokensEarned', 1),
-                    seedPresenceStart: null,
-                    lastSeedBonusRoundID: currentMatchId
-                },
-                { where: whereClause }
-            );
+                const candidates = await ServerState.findAll({
+                    where: claimWhere, attributes: ['eosID'], raw: true, transaction: t
+                });
+                const candidateIDs = candidates.map((r) => r.eosID);
+
+                if (candidateIDs.length > 0) {
+                    // The wallet ceiling used to be a conjunct of the one WHERE
+                    // clause. It is a fact about a different table now, so it is
+                    // read in the same transaction and applied as a set: a player
+                    // already holding a full bonus is not claimed at all, which
+                    // is what keeps a claim from ever being spent without a
+                    // token coming back for it.
+                    //
+                    // Doubles as the notification snapshot, so the warn below
+                    // names the balance these players actually had.
+                    qualifying = await PlayerCooldowns.findAll({
+                        where: {
+                            eosID: { [Op.in]: candidateIDs },
+                            tokenBalance: { [Op.lt]: maxTokens + bonusAmount }
+                        },
+                        attributes: ['eosID', 'playerName', 'tokenBalance'],
+                        transaction: t
+                    });
+                    const grantIDs = qualifying.map((r) => r.eosID);
+
+                    if (grantIDs.length > 0) {
+                        // Uses _s3db.incrementLiteral for the additive increments —
+                        // safe (integer, no user input) and identifier-quoted so the
+                        // camelCase columns survive Postgres identifier folding.
+                        const [claimed] = await ServerState.update(
+                            {
+                                seedBonusTokensEarned: this._s3db.incrementLiteral('seedBonusTokensEarned', 1),
+                                seedPresenceStart: null,
+                                lastSeedBonusRoundID: currentMatchId,
+                                lastActiveTimestamp: new Date()
+                            },
+                            { where: { ...claimWhere, eosID: { [Op.in]: grantIDs } }, transaction: t }
+                        );
+
+                        if (claimed > 0) {
+                            // The ceiling is restated here rather than trusted from
+                            // the read above. It is the absolute wallet cap and the
+                            // only thing bounding a player across consecutive seed
+                            // rounds; a statement that credits tokens should carry
+                            // it whatever the caller believes.
+                            await PlayerCooldowns.update(
+                                { tokenBalance: this._s3db.incrementLiteral('tokenBalance', 1) },
+                                {
+                                    where: {
+                                        eosID: { [Op.in]: grantIDs },
+                                        tokenBalance: { [Op.lt]: maxTokens + bonusAmount }
+                                    },
+                                    transaction: t
+                                }
+                            );
+                        }
+                        if (claimed !== grantIDs.length) {
+                            // Unreachable while the lock holds and the rows carry
+                            // this serverID. If it ever prints, one of those two is
+                            // no longer true and the grant path needs a real lock.
+                            this.verbose(1, `[SeedPresence] ENDGAME consolation: claimed ${claimed} of ${grantIDs.length} targeted rows — a second writer reached these rows.`);
+                        }
+                        grantCount = claimed;
+                    }
+                }
+
+                // Close the round for every connected player, not only grant
+                // recipients. The round is over — nobody should carry presence
+                // into the gap. Without this, anyone who earned via the periodic
+                // grant keeps seedPresenceStart set forever, which makes their
+                // row permanently unprunable and inflates the tracked-player
+                // count. Inside the same transaction as the claim, so a rollback
+                // does not leave the round closed but ungranted.
+                const [closed] = await ServerState.update(
+                    { seedPresenceStart: null },
+                    {
+                        where: {
+                            serverID,
+                            eosID: { [Op.in]: connectedEosIDs },
+                            seedPresenceStart: { [Op.ne]: null }
+                        },
+                        transaction: t
+                    }
+                );
+                closedCount = closed;
+            }));
 
             if (grantCount > 0) {
                 this.verbose(1, `[SeedPresence] ENDGAME consolation: granted +1 seed bonus token to ${grantCount} players.`);
-                // NOTE: The pre-grant findAll runs outside the atomic UPDATE, so a
-                // concurrent periodic grant could modify rows between the SELECT and
-                // the UPDATE. The consequence is a spurious warn (a duplicate message),
-                // never a lost grant. Acceptable.
                 try {
                   for (const row of qualifying) {
                     if (row.eosID) {
@@ -2128,25 +2532,11 @@ export default class Switch extends S3DiscordPluginBase {
                   this.verbose(1, `[SeedPresence] Error notifying players of seed bonus: ${notifyErr.message}`);
                 }
             } else if (qualifying.length > 0) {
-                // Shouldn't happen — the SELECT and UPDATE share a WHERE clause. If it
-                // does, something modified the rows in between and it's worth knowing.
-                this.verbose(1, `[SeedPresence] ENDGAME consolation: ${qualifying.length} rows qualified but the UPDATE matched none.`);
+                // Shouldn't happen — the read and the claim share a WHERE clause
+                // and run under the same lock. If it does, it's worth knowing.
+                this.verbose(1, `[SeedPresence] ENDGAME consolation: ${qualifying.length} rows qualified but the claim matched none.`);
             }
 
-            // Close the round for every connected player, not only grant recipients.
-            // The round is over — nobody should carry presence into the gap. Without
-            // this, anyone who earned via the periodic grant keeps seedPresenceStart
-            // set forever, which makes their row permanently unprunable and inflates
-            // the tracked-player count.
-            const [closedCount] = await PlayerCooldowns.update(
-                { seedPresenceStart: null },
-                {
-                    where: {
-                        eosID: { [Op.in]: connectedEosIDs },
-                        seedPresenceStart: { [Op.ne]: null }
-                    }
-                }
-            );
             if (closedCount > 0) {
                 this.verbose(2, `[SeedPresence] ENDGAME: cleared seedPresenceStart for ${closedCount} connected players.`);
             }
@@ -2208,175 +2598,262 @@ export default class Switch extends S3DiscordPluginBase {
 
         if (connectedEosIDs.length === 0) return;
 
-        try {
-            // ═══════════════════════════════════════════════════════════
-            // Step 1: Bulk-create rows for connected players with no row.
-            // Replaces _initSeedPresenceForAll's per-player create loop.
-            // ═══════════════════════════════════════════════════════════
-            const existingRows = await PlayerCooldowns.findAll({
-                where: { eosID: { [Op.in]: connectedEosIDs } },
-                attributes: ['eosID'],
-                raw: true
-            });
-            const existingEosIDs = new Set(existingRows.map(r => r.eosID));
-            const missingEosIDs = connectedEosIDs.filter(id => !existingEosIDs.has(id));
+        const ServerState = this._getServerStateModel();
+        if (!ServerState) return;
+        const serverID = this._serverID();
 
-            if (missingEosIDs.length > 0) {
+        try {
+            let qualifying = [];
+            let grantCount = 0;
+
+            // The whole reconciler runs under one lock and one transaction.
+            // Step 3 used to be a single atomic UPDATE and that statement was
+            // the race defence; it spans two tables now, so the serialisation
+            // has to come from somewhere else. See _withSeedGrantLock().
+            await this._withSeedGrantLock(() => this._withDb(async (t) => {
                 const nowDate = new Date(now);
-                const toCreate = missingEosIDs.map(eosID => {
-                    const player = (allPlayers || []).find(p => p.eosID === eosID);
-                    return {
+
+                // ═══════════════════════════════════════════════════════════
+                // Step 1: bulk-create the rows this tick needs — on both tables.
+                // ═══════════════════════════════════════════════════════════
+                // Two absences to cover, and neither implies the other: a
+                // regular here has a wallet and no seed row until the first
+                // seed round they are present for, and a player who seeded here
+                // months ago can have a seed row whose wallet the community
+                // prune has since taken.
+                const existingWallets = await PlayerCooldowns.findAll({
+                    where: { eosID: { [Op.in]: connectedEosIDs } },
+                    attributes: ['eosID', 'tokenBalance'],
+                    raw: true,
+                    transaction: t
+                });
+                const walletByEosID = new Map(existingWallets.map((r) => [r.eosID, r.tokenBalance]));
+                const missingWallets = connectedEosIDs.filter((id) => !walletByEosID.has(id));
+
+                if (missingWallets.length > 0) {
+                    const toCreate = missingWallets.map((eosID) => {
+                        const player = (allPlayers || []).find((p) => p.eosID === eosID);
+                        return {
+                            eosID,
+                            steamID: player?.steamID || null,
+                            playerName: player?.name || null,
+                            tokenBalance: maxTokens,
+                            firstSeenTimestamp: nowDate,
+                            lastActiveTimestamp: nowDate
+                        };
+                    });
+                    // ignoreDuplicates: the findAll above and this insert are not
+                    // atomic. A concurrent join handler or token-spend upsert can
+                    // create the same eosID in between; without this the resulting
+                    // UniqueConstraintError would unwind to the outer catch and skip
+                    // steps 2 and 3 entirely, costing every player a tick of accrual
+                    // over one duplicate row.
+                    await PlayerCooldowns.bulkCreate(toCreate, { ignoreDuplicates: true, transaction: t });
+                    for (const id of missingWallets) walletByEosID.set(id, maxTokens);
+                    this.verbose(2, `[SeedPresence] Created rows for ${missingWallets.length} connected players with no existing row.`);
+                }
+
+                const existingState = await ServerState.findAll({
+                    where: { serverID, eosID: { [Op.in]: connectedEosIDs } },
+                    attributes: ['eosID'],
+                    raw: true,
+                    transaction: t
+                });
+                const stateEosIDs = new Set(existingState.map((r) => r.eosID));
+                const missingState = connectedEosIDs.filter((id) => !stateEosIDs.has(id));
+
+                if (missingState.length > 0) {
+                    // Stamps lastActiveTimestamp for the same reason the wallet
+                    // side does: it is this table's retention clock, and a row
+                    // created without one can never be pruned.
+                    await ServerState.bulkCreate(missingState.map((eosID) => ({
+                        serverID,
                         eosID,
-                        steamID: player?.steamID || null,
-                        playerName: player?.name || null,
-                        tokenBalance: maxTokens,
                         seedPresenceStart: nowDate,
                         seedBonusTokensEarned: 0,
                         lastSeedBonusRoundID: currentMatchId,
-                        firstSeenTimestamp: nowDate,
                         lastActiveTimestamp: nowDate
-                    };
-                });
-                // ignoreDuplicates: the findAll above and this insert are not atomic.
-                // A concurrent join handler or token-spend upsert can create the same
-                // eosID in between; without this the resulting UniqueConstraintError
-                // would unwind to the outer catch and skip steps 2 and 3 entirely,
-                // costing every player a tick of accrual over one duplicate row.
-                await PlayerCooldowns.bulkCreate(toCreate, { ignoreDuplicates: true });
-                this.verbose(2, `[SeedPresence] Created rows for ${missingEosIDs.length} connected players with no existing row.`);
-            }
-
-            // ═══════════════════════════════════════════════════════════
-            // Step 2: Idempotent bulk reset — bring stale rows current
-            // and bootstrap null-seedPresenceStart rows for the current round.
-            // Scoped to connected players only.
-            // ═══════════════════════════════════════════════════════════
-            // NULL is spelled out deliberately. `lastSeedBonusRoundID != 'abc'`
-            // evaluates to UNKNOWN against a NULL column under ANSI three-valued
-            // logic — true in SQLite, MySQL and Postgres alike — so a row with
-            // presence set and a NULL round id would be skipped here AND skipped by
-            // step 3 (which requires equality), stranding the player for the whole
-            // round. Never let a WHERE clause depend on three-valued logic.
-            //
-            // Rows already at the ceiling are excluded: they cannot earn anything
-            // this round, so re-stamping them every tick is pure write amplification.
-            // They are picked up again by this same clause once they spend down.
-            // v2.5.6: split into TWO statements, for the same reason the join
-            // handler's branches were split. The single UPDATE below used to
-            // write seedBonusTokensEarned: 0 for both arms, which meant the
-            // bootstrap arm — "this row's clock isn't running" — silently handed
-            // back the player's whole per-round bonus allowance. That is a
-            // per-ROUND counter; only a change of round may reset it.
-            //
-            // Arm A: the row belongs to a previous round. Reset everything.
-            // Mostly redundant now that _sweepStaleSeedState() runs at NEW_GAME,
-            // but kept as the self-healing path for rows the sweep could not see
-            // (matchId unresolved at NEW_GAME, or a row created afterwards by a
-            // token spend).
-            const staleRoundWhere = {
-                eosID: { [Op.in]: connectedEosIDs },
-                tokenBalance: { [Op.lt]: maxTokens + bonusCap },
-                [Op.or]: [
-                    { lastSeedBonusRoundID: null },
-                    { lastSeedBonusRoundID: { [Op.ne]: currentMatchId } }
-                ]
-            };
-
-            const [staleCount] = await PlayerCooldowns.update(
-                {
-                    seedPresenceStart: new Date(now),
-                    seedBonusTokensEarned: 0,
-                    lastSeedBonusRoundID: currentMatchId
-                },
-                { where: staleRoundWhere }
-            );
-
-            // Arm B: the row is already stamped with the current round but its
-            // clock is not running — the player joined before seed mode began,
-            // accrual just activated, or they reconnected after onS3PlayerLeft
-            // stopped their clock. Start the clock and touch nothing else.
-            const [bootstrapCount] = await PlayerCooldowns.update(
-                { seedPresenceStart: new Date(now) },
-                {
-                    where: {
-                        eosID: { [Op.in]: connectedEosIDs },
-                        tokenBalance: { [Op.lt]: maxTokens + bonusCap },
-                        lastSeedBonusRoundID: currentMatchId,
-                        seedPresenceStart: null
-                    }
+                    })), { ignoreDuplicates: true, transaction: t });
+                    this.verbose(2, `[SeedPresence] Created per-server seed rows for ${missingState.length} connected players.`);
                 }
-            );
 
-            const resetCount = staleCount + bootstrapCount;
-            if (resetCount > 0) {
-                this.verbose(2, `[SeedPresence] Round ${currentMatchId}: reset ${staleCount} stale rows, started ${bootstrapCount} presence clocks.`);
-            }
+                // The wallet ceiling was a conjunct of every statement below and
+                // is a fact about the other table now. Resolved once, here, into
+                // the set of players who could earn anything this tick — one
+                // extra read per tick, bounded by the roster, and it keeps steps
+                // 2 and 3 matching exactly the rows they matched before the
+                // split. A row at the ceiling is skipped rather than re-stamped;
+                // it comes back into scope on its own once the player spends down.
+                const belowCeiling = connectedEosIDs.filter(
+                    (id) => (walletByEosID.get(id) ?? maxTokens) < maxTokens + bonusCap
+                );
+                if (belowCeiling.length === 0) return;
 
-            // ═══════════════════════════════════════════════════════════
-            // Step 3: Grant bonus tokens to qualifying players.
-            // Scoped to connected players, with a tokenBalance ceiling.
-            // ═══════════════════════════════════════════════════════════
-            const grantWhere = {
-                eosID: { [Op.in]: connectedEosIDs },
-                seedPresenceStart: {
-                    [Op.ne]: null,
-                    [Op.lte]: new Date(now - thresholdMs)
-                },
-                seedBonusTokensEarned: { [Op.lt]: bonusCap },
-                // Token ceiling — seed grants intentionally push tokenBalance above
-                // maxSwitchTokens, but never past maxSwitchTokens + seedTokenBonusAmount.
-                // This is the absolute wallet cap: it, not the per-round counter, is
-                // what bounds a player across consecutive seed rounds.
-                tokenBalance: { [Op.lt]: maxTokens + bonusCap },
-                // Equality is safe because step 2 scopes every connected row that is
-                // below the ceiling to currentMatchId. Rows step 2 deliberately skipped
-                // (at the ceiling) fail this too — correct, they have nothing to earn.
-                lastSeedBonusRoundID: currentMatchId
-            };
+                // ═══════════════════════════════════════════════════════════
+                // Step 2: idempotent bulk reset, in two arms.
+                // ═══════════════════════════════════════════════════════════
+                // NULL is spelled out deliberately. `lastSeedBonusRoundID != x`
+                // evaluates to UNKNOWN against a NULL column under ANSI
+                // three-valued logic — true in SQLite, MySQL and Postgres alike —
+                // so a row with presence set and a NULL round id would be skipped
+                // here AND skipped by step 3 (which requires equality), stranding
+                // the player for the whole round. Never let a WHERE clause depend
+                // on three-valued logic.
+                //
+                // v2.5.6: split into TWO statements, for the same reason the join
+                // handler's branches were split. The single UPDATE below used to
+                // write seedBonusTokensEarned: 0 for both arms, which meant the
+                // bootstrap arm — "this row’s clock isn’t running" — silently
+                // handed back the player’s whole per-round bonus allowance. That
+                // is a per-ROUND counter; only a change of round may reset it.
+                //
+                // Arm A: the row belongs to a previous round. Reset everything.
+                // Mostly redundant now that _sweepStaleSeedState() runs at
+                // NEW_GAME, but kept as the self-healing path for rows the sweep
+                // could not see (matchId unresolved at NEW_GAME, or a row created
+                // afterwards by a token spend).
+                const [staleCount] = await ServerState.update(
+                    {
+                        seedPresenceStart: nowDate,
+                        seedBonusTokensEarned: 0,
+                        lastSeedBonusRoundID: currentMatchId,
+                        lastActiveTimestamp: nowDate
+                    },
+                    {
+                        where: {
+                            serverID,
+                            eosID: { [Op.in]: belowCeiling },
+                            [Op.or]: [
+                                { lastSeedBonusRoundID: null },
+                                { lastSeedBonusRoundID: { [Op.ne]: currentMatchId } }
+                            ]
+                        },
+                        transaction: t
+                    }
+                );
 
-            // Capture the players who will actually be granted THIS tick, so the
-            // notification only fires for just-granted players — not every player
-            // who earned a token earlier this round.
-            const qualifying = await PlayerCooldowns.findAll({
-                where: grantWhere,
-                attributes: ['eosID', 'playerName', 'tokenBalance', 'seedBonusTokensEarned']
-            });
+                // Arm B: the row is already stamped with the current round but its
+                // clock is not running — the player joined before seed mode began,
+                // accrual just activated, or they reconnected after onS3PlayerLeft
+                // stopped their clock. Start the clock and touch nothing else.
+                const [bootstrapCount] = await ServerState.update(
+                    { seedPresenceStart: nowDate, lastActiveTimestamp: nowDate },
+                    {
+                        where: {
+                            serverID,
+                            eosID: { [Op.in]: belowCeiling },
+                            lastSeedBonusRoundID: currentMatchId,
+                            seedPresenceStart: null
+                        },
+                        transaction: t
+                    }
+                );
 
-            // Atomic UPDATE: grants +1 token per qualifying chunk of seed presence time.
-            // Each grant increments seedBonusTokensEarned by 1; the WHERE clause
-            // ensures we never exceed the per-round cap (seedTokenBonusAmount) or the
-            // absolute token ceiling (maxSwitchTokens + bonusCap).
-            //
-            // seedPresenceStart is reset to NOW (not nulled) so the player can earn
-            // another +1 after another thresholdMs of presence — this is the multi-grant
-            // mechanic. seedPresenceStart is only set to null on seed→non-seed transition
-            // (see _grantSeedBonusAtEndgame).
-            //
-            // Uses _s3db.incrementLiteral for the additive tokenBalance increment
-            // since the addition is safe (integer, no user input); the helper quotes
-            // the camelCase identifiers so the statement is Postgres-safe.
-            const [grantCount] = await PlayerCooldowns.update(
-                {
-                    tokenBalance: this._s3db.incrementLiteral('tokenBalance', 1),
-                    seedBonusTokensEarned: this._s3db.incrementLiteral('seedBonusTokensEarned', 1),
-                    seedPresenceStart: new Date(now),
+                const resetCount = staleCount + bootstrapCount;
+                if (resetCount > 0) {
+                    this.verbose(2, `[SeedPresence] Round ${currentMatchId}: reset ${staleCount} stale rows, started ${bootstrapCount} presence clocks.`);
+                }
+
+                // ═══════════════════════════════════════════════════════════
+                // Step 3: claim the presence, then credit the wallet.
+                // ═══════════════════════════════════════════════════════════
+                // The claim is the statement that must not run twice: it is what
+                // spends a chunk of accrued presence. seedPresenceStart is reset
+                // to NOW rather than nulled, so the player can earn another +1
+                // after another thresholdMs — this is the multi-grant mechanic;
+                // it is only nulled on the round-close sweep in
+                // _grantSeedBonusAtEndgame.
+                //
+                // Equality on lastSeedBonusRoundID is safe because step 2 scopes
+                // every connected row below the ceiling to currentMatchId. Rows
+                // step 2 deliberately skipped (at the ceiling) fail this too —
+                // correct, they have nothing to earn.
+                const claimWhere = {
+                    serverID,
+                    eosID: { [Op.in]: belowCeiling },
+                    seedPresenceStart: {
+                        [Op.ne]: null,
+                        [Op.lte]: new Date(now - thresholdMs)
+                    },
+                    seedBonusTokensEarned: { [Op.lt]: bonusCap },
                     lastSeedBonusRoundID: currentMatchId
-                },
-                { where: grantWhere }
-            );
+                };
+
+                const candidates = await ServerState.findAll({
+                    where: claimWhere, attributes: ['eosID', 'seedBonusTokensEarned'], raw: true, transaction: t
+                });
+                if (candidates.length === 0) return;
+                const earnedByEosID = new Map(candidates.map((r) => [r.eosID, r.seedBonusTokensEarned]));
+
+                // The absolute wallet cap, re-read here rather than inferred from
+                // belowCeiling: steps 1 and 2 have run since, and this is the
+                // bound that stops a player accumulating across consecutive seed
+                // rounds. Doubles as the notification snapshot, so the warn names
+                // the balance these players actually had.
+                const walletRows = await PlayerCooldowns.findAll({
+                    where: {
+                        eosID: { [Op.in]: candidates.map((r) => r.eosID) },
+                        tokenBalance: { [Op.lt]: maxTokens + bonusCap }
+                    },
+                    attributes: ['eosID', 'playerName', 'tokenBalance'],
+                    transaction: t
+                });
+                const grantIDs = walletRows.map((r) => r.eosID);
+                if (grantIDs.length === 0) return;
+
+                // Uses _s3db.incrementLiteral for the additive increments since
+                // the addition is safe (integer, no user input); the helper quotes
+                // the camelCase identifiers so the statement is Postgres-safe.
+                const [claimed] = await ServerState.update(
+                    {
+                        seedBonusTokensEarned: this._s3db.incrementLiteral('seedBonusTokensEarned', 1),
+                        seedPresenceStart: nowDate,
+                        lastSeedBonusRoundID: currentMatchId,
+                        lastActiveTimestamp: nowDate
+                    },
+                    { where: { ...claimWhere, eosID: { [Op.in]: grantIDs } }, transaction: t }
+                );
+
+                if (claimed > 0) {
+                    await PlayerCooldowns.update(
+                        { tokenBalance: this._s3db.incrementLiteral('tokenBalance', 1) },
+                        {
+                            where: {
+                                eosID: { [Op.in]: grantIDs },
+                                tokenBalance: { [Op.lt]: maxTokens + bonusCap }
+                            },
+                            transaction: t
+                        }
+                    );
+                }
+                if (claimed !== grantIDs.length) {
+                    // Unreachable while the lock holds and the rows carry this
+                    // serverID. If it ever prints, one of those two is no longer
+                    // true and this path needs a real row lock.
+                    this.verbose(1, `[SeedPresence] Periodic grant: claimed ${claimed} of ${grantIDs.length} targeted rows — a second writer reached these rows.`);
+                }
+
+                grantCount = claimed;
+                // Carries the per-round counter across from the claim snapshot so
+                // the warn can say "n of cap", which lives on the other table.
+                qualifying = walletRows.map((r) => ({
+                    eosID: r.eosID,
+                    playerName: r.playerName,
+                    tokenBalance: r.tokenBalance,
+                    seedBonusTokensEarned: earnedByEosID.get(r.eosID) ?? 0
+                }));
+            }));
 
             if (grantCount > 0) {
                 this.verbose(1, `[SeedPresence] Granted +1 seed bonus token to ${grantCount} players via periodic check.`);
-                // Notify only the players captured before the UPDATE — these are the
-                // exact players who just earned a token. Using the pre-grant snapshot
-                // avoids re-warning players who were granted on a previous tick.
+                // Notify only the players captured before the claim — these are
+                // the exact players who just earned a token. Using the pre-claim
+                // snapshot avoids re-warning players granted on a previous tick.
                 //
-                // NOTE: The pre-grant findAll runs outside the atomic UPDATE, so there's
-                // a theoretical race where _grantSeedBonusAtEndgame could modify rows
-                // between the SELECT and the UPDATE. The consequence is a spurious warn
-                // (a player who was transition-granted between the two queries gets warned
-                // even though the periodic UPDATE didn't match them) — a duplicate message,
-                // not a lost grant. This is acceptable.
+                // The spurious-warn race this note used to describe is gone:
+                // the snapshot and the claim are inside one transaction, and
+                // _grantSeedBonusAtEndgame cannot run between them because both
+                // reconcilers share _withSeedGrantLock().
                 try {
                   for (const row of qualifying) {
                     if (row.eosID) {
@@ -2490,9 +2967,24 @@ export default class Switch extends S3DiscordPluginBase {
             // Send each embed as its own message (one per message) to stay
             // under Discord's 6000-character per-message embed sum limit.
             // This matches the !switch explain command pattern in switch-commands.js.
+            // Two servers may point `explainChannelID` at one channel, and
+            // each keeps its own message ids in its own settings row — so
+            // each maintains its own set and neither deletes the other's.
+            // That arrangement is correct but illegible until the embeds say
+            // whose rules they describe: fourteen embeds of switch policy in
+            // one channel, two of every heading, and the numbers differ
+            // wherever the two servers are configured differently.
+            //
+            // The footer on all of them, and the server in the TITLE of the
+            // first, which is the one a reader scrolls to. Both are no-ops on
+            // a single-server install, where the set is unchanged.
             const messageIDs = [];
-            for (const embed of embeds) {
-                const sent = await channel.send({ embeds: [embed] });
+            for (const [index, embed] of embeds.entries()) {
+                const labelled = this.applyServerLabel({ embeds: [embed] }).embeds[0];
+                if (index === 0 && labelled.title) {
+                    labelled.title = this.titleWithServer(labelled.title);
+                }
+                const sent = await channel.send({ embeds: [labelled] });
                 messageIDs.push(sent.id);
                 // Small delay between sends to avoid Discord rate limits
                 await new Promise(r => setTimeout(r, 250));
@@ -2674,7 +3166,7 @@ export default class Switch extends S3DiscordPluginBase {
         const nowDate = new Date();
         const records = lockoutPlayers
             .map(p => {
-                return { eosID: p.eosID, steamID: p.steamID ?? null, playerName: p.name, scrambleLockdownExpiry: expiry, lastActiveTimestamp: nowDate };
+                return { eosID: p.eosID, steamID: p.steamID ?? null, playerName: p.name, lastActiveTimestamp: nowDate };
             });
 
         this.verbose(3, `[SCRAMBLE_EVENT] Created ${records.length} lockdown records for DB write`);
@@ -2682,20 +3174,50 @@ export default class Switch extends S3DiscordPluginBase {
         try {
             this.verbose(2, `[SCRAMBLE_EVENT] Starting DB transaction to write scramble locks...`);
             const PlayerCooldowns = this._getModel('SwitchPlugin_PlayerCooldowns');
-            if (PlayerCooldowns) {
+            const ServerState = this._getServerStateModel();
+            if (PlayerCooldowns && ServerState) {
+                const serverID = this._serverID();
+                // The lock rows, keyed by (serverID, eosID). Built from the same
+                // list as the identity rows above and written in the same
+                // transaction: a lock without an identity row is a restriction on
+                // a player the community-wide table has never heard of, and an
+                // identity row without its lock is a scramble that quietly did
+                // not apply. This repo has no CLS, so both writes take the handle
+                // explicitly — an omitted one runs outside the transaction and
+                // the catch below reports a success that half happened.
+                const lockRecords = records.map((r) => ({
+                    serverID,
+                    eosID: r.eosID,
+                    scrambleLockdownExpiry: expiry,
+                    lastActiveTimestamp: nowDate
+                }));
+
                 await this._withDb(async (t) => {
                     // Write in chunks of 10 to avoid SQLite parameter limits and keep transactions short
                     const chunkSize = 10;
                     for (let i = 0; i < records.length; i += chunkSize) {
                         const chunk = records.slice(i, i + chunkSize);
                         this.verbose(2, `[SCRAMBLE_EVENT] Writing chunk ${Math.floor(i / chunkSize) + 1}/${Math.ceil(records.length / chunkSize)} (${chunk.length} records)`);
+                        // scrambleLockdownExpiry is gone from this list because it
+                        // is gone from this table. lastActiveTimestamp stays off it
+                        // deliberately, as before: an existing row’s value belongs
+                        // to the join and leave handlers that track it accurately.
                         await PlayerCooldowns.bulkCreate(chunk, {
-                            updateOnDuplicate: ['scrambleLockdownExpiry', 'playerName', 'steamID'],
+                            updateOnDuplicate: ['playerName', 'steamID'],
+                            transaction: t
+                        });
+                        // The expiry MUST be in this list. A player scrambled twice
+                        // — two scrambles in one evening, or a re-scramble after a
+                        // failed move — already has a row at (serverID, eosID), and
+                        // an insert without an update clause is a duplicate-key
+                        // error on every engine rather than an extended lockdown.
+                        await ServerState.bulkCreate(lockRecords.slice(i, i + chunkSize), {
+                            updateOnDuplicate: ['scrambleLockdownExpiry', 'lastActiveTimestamp'],
                             transaction: t
                         });
                     }
                 });
-                this.verbose(1, `[SCRAMBLE_EVENT] ✅ SUCCESS: Switch lockdown active for ${records.length} players until ${expiry.toISOString()}.`);
+                this.verbose(1, `[SCRAMBLE_EVENT] ✅ SUCCESS: Switch lockdown active for ${records.length} players on server ${serverID} until ${expiry.toISOString()}.`);
             }
 
             try {

@@ -69,6 +69,8 @@ import { Sequelize } from 'sequelize';
 
 import DBService from '../utils/db-service.js';
 import PlayersService from '../utils/players-service.js';
+import GameStateService from '../utils/game-state-service.js';
+import LoggingService from '../utils/logging-service.js';
 import SwitchDB from '../../switch/utils/switch-db.js';
 import { buildAssembly, importFromAssembly, cleanAssembly } from './plugin-assembly.js';
 
@@ -307,9 +309,16 @@ const ADAPTERS = [
     pluginName: 's3-players',
     label: 's3-players',
     async register(db) {
-      // PlayersService registers its migrations inside _initReconnectPersistence().
-      // Calling the prototype method against a probe reaches the real registration
-      // without mounting the service (which would want a server and gameState).
+      // PlayersService registers BOTH its migrations inside
+      // _initReconnectPersistence(), but defines the v2 table’s model in
+      // _initSessionPersistence(). Calling the prototype methods against a probe
+      // reaches the real registration without mounting the service (which would
+      // want a server and gameState).
+      //
+      // Both are called, in mount order, because an adapter that registers a
+      // migration without the model it creates is not the plugin: the
+      // hand-apply generator resolves a table through its model, so half a
+      // registration reads as a generator defect rather than a test gap.
       const probe = {
         reconnectPersistence: true,
         _getDbService: () => db,
@@ -317,6 +326,34 @@ const ADAPTERS = [
         verboseLogger: () => {}
       };
       await PlayersService.prototype._initReconnectPersistence.call(probe);
+      await PlayersService.prototype._initSessionPersistence.call(probe);
+    }
+  },
+  {
+    pluginName: 's3-gamestate',
+    label: 's3-gamestate',
+    async register(db) {
+      // GameStateService registers inside _initPersistence(). Object.create over
+      // the prototype rather than a plain object literal, because that method
+      // reaches _getDbService()/_getSequelize()/_getDataTypes() on the prototype
+      // — a literal would have to reimplement all three and could then drift
+      // from what the service actually does.
+      const probe = Object.create(GameStateService.prototype);
+      probe.parent = { db };
+      await GameStateService.prototype._initPersistence.call(probe);
+    }
+  },
+  {
+    pluginName: 's3-logging',
+    label: 's3-logging',
+    async register(db) {
+      const probe = Object.create(LoggingService.prototype);
+      probe.dbService = db;
+      probe.verboseLogger = () => {};
+      // No JSONL mirror: this covers the schema, and file logging would put a
+      // write queue and a path into a test that has neither.
+      probe.enableFileLogging = false;
+      await LoggingService.prototype._initModels.call(probe);
     }
   }
 ];
@@ -695,6 +732,81 @@ for (const adapter of ADAPTERS) {
             `re-apply from v${k} applied ${result.applied}, expected ${all.length - k}`
           );
           await readBackAllModels(ctx.db, `re-applied from v${k}`);
+        }
+      } finally {
+        await closeDb(ctx);
+      }
+    });
+
+    // ---- the hand-apply route ----
+    //
+    // A grant with CREATE and no ALTER cannot run an ADD COLUMN, so on those
+    // deployments `!s3 migrate ddl` IS the upgrade path: the operator pastes
+    // its output as a user that holds the grant, then records the version.
+    // A migration whose DDL cannot be rendered is therefore not merely
+    // awkward there — it cannot be applied at all.
+    //
+    // The failure this catches is quiet in a different way than the ones
+    // above. Those all run the migration, so anything that stops it running
+    // — including a `touches` entry written in model spelling, which was
+    // mutation-tested here and fails all four — is already covered. What is
+    // NOT covered is a migration that applies perfectly on every engine and
+    // still cannot be handed to an operator: a `creates` naming a table no
+    // registered model resolves to renders no CREATE TABLE at all, and the
+    // generator says so in a note rather than by throwing. That is how the
+    // s3-players adapter was found registering half a service. So the notes
+    // are asserted, not just the statement count — a silent note is exactly
+    // the shape of DDL an operator would paste and believe complete.
+    //
+    // The declared-columns half below is the same claim from the other side:
+    // every column the pending migration says it adds and the live table
+    // does not have must come back as a statement, or the ALTER-less
+    // deployment has no route to that version.
+    test(`[${dialect}] ${adapter.label}: pending migrations render as hand-apply DDL`, async () => {
+      if (!reachability.get(dialect)) return SKIP;
+      const ctx = await openDb(dialect);
+      try {
+        const all = await registerSchema(ctx.db, adapter);
+        if (all.length < 2) return; // nothing can be pending on a one-migration group
+
+        // Stand the database up one version short, then put the full set
+        // back so the newest is genuinely pending against real live tables.
+        stageVersions(ctx.db, adapter.pluginName, all.slice(0, -1));
+        await applyPending(ctx.db, adapter.pluginName);
+        stageVersions(ctx.db, adapter.pluginName, all);
+
+        const ddl = await ctx.db.migrationEngine.buildHandApplyDdl({ pluginName: adapter.pluginName });
+
+        const unresolved = ddl.notes.filter((n) => /not an attribute of model|No registered model resolves/.test(n));
+        assert.equal(
+          unresolved.length, 0,
+          `the generator could not resolve part of the pending migration: ${unresolved.join(" | ")}`
+        );
+
+        // Every column the pending migration declares and the database does
+        // not yet have must come back as a statement. Columns it already has
+        // are skipped by design, so this compares against the live table
+        // rather than against the declaration alone.
+        const pendingMigration = all.at(-1);
+        const qi = ctx.db.getConnector().getQueryInterface();
+        for (const [table, columns] of Object.entries(pendingMigration.touches?.columns || {})) {
+          let present;
+          try {
+            present = new Set(Object.keys(await qi.describeTable(table)).map((c) => c.toLowerCase()));
+          } catch {
+            continue; // the table itself is new; its CREATE carries the columns
+          }
+          for (const column of columns) {
+            if (present.has(String(column).toLowerCase())) continue;
+            const rendered = ddl.statements.some(
+              (s) => s.kind === 'column' && s.table === table && new RegExp(column, 'i').test(s.sql)
+            );
+            assert.ok(
+              rendered,
+              `${adapter.pluginName} v${pendingMigration.version} declares ${table}.${column} but no DDL was ` +
+              'rendered for it, so a grant without ALTER has no way to apply this migration'
+            );
+          }
         }
       } finally {
         await closeDb(ctx);

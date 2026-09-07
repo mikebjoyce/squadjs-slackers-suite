@@ -36,6 +36,24 @@
  *   Calculates and displays a "Conservative Rating" (μ - 3σ)
  *   as the primary player rank to encourage active play.
  *
+ * ─── ROUTING (v2.2.0, multi-server) ──────────────────────────────
+ *
+ * Ratings are community-wide — one player, one rating, however many
+ * servers they play on — so most of what this file builds is the
+ * same answer whichever process renders it. That is exactly why the
+ * routing matters: without a gate, three processes would each post
+ * an identical leaderboard to the same channel.
+ *
+ * registerDiscordCommands() routes through
+ * tracker.routeDiscordCommand?.() before dispatch, and the two
+ * admin mutations arm through tracker.armConfirmation?.() so the
+ * process that mints a confirmation token is the process that acts
+ * on it. Both are optional-chained, so against an older S³ they do
+ * not throw — the commands simply never run. EloTracker's S³ floor
+ * is a hard 1.8.0 for that reason: silent inaction is a worse
+ * failure than a refusal, so the version check is what has to catch
+ * it.
+ *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
  * Logger (../../core/logger.js)
@@ -80,6 +98,123 @@
 import Logger from '../../core/logger.js';
 import EloCalculator from './elo-calculator.js';
 import EloDatabase from './elo-database.js';
+
+/**
+ * Which server answers `!elo <verb>`.
+ *
+ * The split follows what the verb reads rather than the channel the command
+ * arrived in: a rating belongs to a player and not to a server, so `me`, `leaderboard`,
+ * `clan`, `clans`, `link` and `explain` all read community-wide data and one
+ * process answering is the correct answer, not a compromise.
+ *
+ * **A community read must resolve its options from the registry, not from
+ * `this.options`.** `leaderboard` is the case that makes it concrete: with
+ * `minRoundsForLeaderboard` set differently on two servers, the same command
+ * in the same channel returns a different leaderboard depending on which
+ * process happened to win the claim — a wrong answer with nothing wrong
+ * about it on the page. The community option summary is what settles it, and
+ * it is resolved at the call site rather than here.
+ *
+ * `status` and `roundinfo` are the exceptions and are genuinely per-server:
+ * one reports this process's session cache and rating cache, the other the
+ * round this server is currently playing.
+ *
+ * `reset` is community-wide and destructive — it wipes `Elo_PlayerStats` for
+ * every server at once. Its bare-word `confirm` is tagged with it rather than
+ * as a token confirm, because there is no token yet: requiring `--server`
+ * routes the confirm to the process that armed it, which is the guarantee a
+ * token will give and the one available now.
+ *
+ * `restore` downloads an attachment and imports it into community-wide
+ * tables. Ungated, every process imports the same file concurrently.
+ *
+ * @param {string} sub
+ * @returns {{scope: string, selectorRequired: boolean}}
+ *
+ * The scope values are literal strings rather than the COMMAND_SCOPE
+ * constants because this file cannot import an S³ util — the suite ships
+ * flattened, and no single specifier resolves both here and at the target.
+ * `test-discord-routing.js` asserts every value this returns is one
+ * COMMAND_SCOPE declares, which is what importing them would have bought.
+ */
+export function scopeForEloCommand(sub, args = []) {
+  // Everything but `reset` is decided by the verb alone, so the argument
+  // list is optional and a caller with only a verb still gets the right
+  // answer for every other command on this surface.
+  const rest = (Array.isArray(args) ? args.slice(1) : []).map((a) => String(a).toLowerCase());
+
+  switch (String(sub ?? '').toLowerCase()) {
+    case 'status':
+    case 'roundinfo':
+      return { scope: 'server-read', selectorRequired: false };
+
+    case 'reset':
+      // A confirm carrying a token minted at arm time routes itself: the
+      // arm lives in one process's memory, and a claim would hand the
+      // message to an arbitrary process that would reject a token it
+      // never minted. A bare `reset confirm` on a single-server install
+      // never gets here with a token and stays a community mutation.
+      if (rest.includes('confirm') && rest.some((a) => /^[0-9a-f]{4}$/.test(a))) {
+        return { scope: 'token-confirm', selectorRequired: false };
+      }
+      return { scope: 'community-mutating', selectorRequired: false };
+
+    case 'restore':
+      // Same shape as `reset` above: the token minted at arm time is the
+      // routing, so the confirm must reach every process rather than an
+      // elected one. Without a token this is the ordinary community
+      // mutation it has always been.
+      if (rest.includes('confirm') && rest.some((a) => /^[0-9a-f]{4}$/.test(a))) {
+        return { scope: 'token-confirm', selectorRequired: false };
+      }
+      return { scope: 'community-mutating', selectorRequired: false };
+
+    // `backup`, `me`, `leaderboard`, `clan`, `clans`, `link`, `explain`,
+    // `help`, and a bare `!elo`, which is `me`.
+    default:
+      return { scope: 'community-read', selectorRequired: false };
+  }
+}
+
+/**
+ * How long `!elo reset` stays armed. Read by both the arm and the confirm,
+ * which spent a while as two copies of the same literal.
+ */
+export const ELO_RESET_CONFIRM_MS = 30000;
+
+/**
+ * Download a backup attachment and check it is one.
+ *
+ * Separated from the import so the same validation runs at arm time and at
+ * confirm time. A file that passed once and fails the second time is not a
+ * case worth trusting: Discord attachment URLs expire, and an admin should
+ * hear that rather than watch a restore report success over nothing.
+ *
+ * @param {string} url
+ * @returns {Promise<{players: object[]}|{errorKey: string}>}
+ */
+async function fetchBackupPlayers(url) {
+  const response = await fetch(url);
+  const json = await response.json();
+
+  if (!Array.isArray(json.players)) {
+    return { errorKey: 'eloTracker.embeds.invalidBackupFormatMissing' };
+  }
+
+  // Schema validation to ensure the JSON matches the expected player format
+  const isValidSchema = json.players.every(p =>
+    typeof p.eosID === 'string' &&
+    typeof p.mu === 'number' &&
+    typeof p.sigma === 'number' &&
+    typeof p.wins === 'number' &&
+    typeof p.losses === 'number' &&
+    typeof p.roundsPlayed === 'number'
+  );
+
+  if (!isValidSchema) return { errorKey: 'eloTracker.embeds.invalidBackupFormatOne' };
+
+  return { players: json.players };
+}
 
 const formatDuration = (tracker, ms) => {
   const seconds = Math.floor((ms / 1000) % 60);
@@ -172,6 +307,13 @@ export const EloDiscord = {
         delete payload.embed;
       }
     }
+
+    // Which server this came from, when there is more than one. `this` is
+    // EloDiscord, and EloTracker sets the function on it at mount — this
+    // file cannot import it, because the module lives in `s3/utils/` in the
+    // source tree and beside this one in the layout install.cjs produces.
+    // Absent, on a single-server install, or before mount: no label.
+    payload = this.applyServerLabel?.(payload) ?? payload;
 
     const channelId = channel?.id || 'unknown';
     const channelName = channel?.name || 'unknown';
@@ -650,7 +792,30 @@ export const EloDiscord = {
 
       if (!isAdminChannel && !isPublicChannel) return;
 
-      const args = content.replace(/^!elo\s*/i, '').trim().split(/\s+/).filter(Boolean);
+      const rawArgs = content.replace(/^!elo\s*/i, '').trim().split(/\s+/).filter(Boolean);
+
+      // ── Routing gate ──────────────────────────────────────────
+      // After the channel gate and before the verb dispatch. Inert on a
+      // single-server install, and it strips the selector so the name
+      // lookups below never search for a player called `--server`.
+      const { scope, selectorRequired } = scopeForEloCommand(rawArgs[0], rawArgs);
+      const verdict = (await this.routeDiscordCommand?.({
+        scope,
+        selectorRequired,
+        args: rawArgs,
+        messageID: message.id,
+        command: `!elo ${rawArgs[0] || ''}`.trim()
+      })) ?? { routing: 'act', args: rawArgs };
+
+      if (verdict.routing === 'drop') return;
+      if (verdict.routing === 'refuse') {
+        await message.channel.send({
+          embeds: [this.buildRoutingRefusalEmbed(verdict)]
+        });
+        return;
+      }
+
+      const args = verdict.args;
       const sub = args[0]?.toLowerCase();
 
       // S³ ClansService delegation — uses this._s3 (set by elo-tracker.js mount())
@@ -674,6 +839,42 @@ export const EloDiscord = {
 
       // --- Admin-only commands (admin channel only, checked first) ---
       if (isAdminChannel) {
+        /**
+         * Re-read a backup and import it, announcing both ends.
+         *
+         * A closure inside the admin gate rather than a module-scope
+         * function, and that placement is load-bearing:
+         * `make-locale-templates.mjs` classifies a string by the gate it
+         * sits behind, and EloTracker's Discord channel is a PUBLIC one
+         * with an admin block inside it. Lifted out of this block, three
+         * admin-only strings read as player-facing and land in the
+         * translation tier that every player sees.
+         *
+         * @param {string} url
+         */
+        const runEloRestore = async (url) => {
+          try {
+            const parsed = await fetchBackupPlayers(url);
+            if (parsed.errorKey) {
+              await message.reply(tracker.localize(parsed.errorKey));
+              return;
+            }
+
+            await message.reply(tracker.localize('eloTracker.embeds.restoringPlayersMayTake', { value: parsed.players.length }));
+            await this.db.importPlayerStats(parsed.players);
+            const doneTitle = tracker.localize('eloTracker.embeds.restoreComplete');
+            await EloDiscord.sendDiscordMessage(message.channel, {
+              embeds: [EloDiscord.buildAdminConfirmEmbed(
+                tracker,
+                this.titleWithServer?.(doneTitle) ?? doneTitle,
+                tracker.localize('eloTracker.embeds.restoredPlayersFromBackup', { value: parsed.players.length })
+              )]
+            });
+          } catch (err) {
+            await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildErrorEmbed(tracker, tracker.localize('eloTracker.embeds.restore'), err)] });
+          }
+        };
+
         const adminCommands = ['status', 'roundinfo', 'reset', 'backup', 'restore'];
         if (adminCommands.includes(sub) && !hasAdminRole) {
            await message.reply(tracker.localize('eloTracker.embeds.doNotHavePermission'));
@@ -725,10 +926,33 @@ export const EloDiscord = {
         }
 
         if (sub === 'reset') {
-          const identifier = args.slice(1).join(' ');
+          const resetArgs = args.slice(1);
+
+          // The token only exists alongside `confirm`, and it is only
+          // pulled out of the arguments there. Four hex characters is a
+          // perfectly ordinary in-game name — `cafe`, `dead`, `beef` — so
+          // stripping the shape unconditionally would make
+          // `!elo reset beef` a confirm instead of a player reset.
+          const wantsConfirm = resetArgs.some((a) => String(a).toLowerCase() === 'confirm');
+          const resetToken = wantsConfirm
+            ? (resetArgs.find((a) => /^[0-9a-f]{4}$/.test(String(a).toLowerCase())) ?? null)
+            : null;
+          const identifier = resetArgs.filter((a) => a !== resetToken).join(' ');
 
           if (!identifier) {
-            await message.reply(tracker.localize('eloTracker.embeds.willWipeAllElo'));
+            const arm = this.armConfirmation?.({
+              kind: 'eloReset',
+              payload: true,
+              command: '!elo reset confirm',
+              ttlMs: ELO_RESET_CONFIRM_MS,
+              radius: 'community'
+            }) ?? { armed: true, lines: [], refusal: null };
+            if (!arm.armed) {
+              await message.reply(arm.refusal);
+              return;
+            }
+            const warning = tracker.localize('eloTracker.embeds.willWipeAllElo');
+            await message.reply(arm.lines.length ? `${warning}\n${arm.lines.join('\n')}` : warning);
             this._resetConfirmPending = { timestamp: Date.now() };
             return;
           }
@@ -738,12 +962,20 @@ export const EloDiscord = {
           // a player literally named "Confirm" — leaving the admin thinking the
           // wipe had been declined when it was simply never matched.
           if (identifier.toLowerCase() === 'confirm') {
-            if (!this._resetConfirmPending || Date.now() - this._resetConfirmPending.timestamp > 30000) {
+            const held = this._takeEloReset(resetToken);
+
+            // A token confirm is inspected by every process, so the one
+            // that does not hold it must not be the one that answers. The
+            // claim inside decides which single process says so when no
+            // process holds it at all.
+            if (resetToken && !(await (this.claimConfirmReply?.(message.id, held) ?? true))) return;
+
+            if (!held) {
               await message.reply(tracker.localize('eloTracker.embeds.noPendingResetConfirmation'));
               this._resetConfirmPending = null;
+              this.cancelConfirmations?.('eloReset');
               return;
             }
-            this._resetConfirmPending = null;
             try {
               // Auto-backup before wiping the database
               try {
@@ -754,7 +986,7 @@ export const EloDiscord = {
                   players
                 }, null, 2);
                 const buffer = Buffer.from(payload, 'utf-8');
-                const filename = `elo-pre-reset-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+                const filename = `elo-pre-reset-backup${this.serverFileTag?.() || ''}-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
                 await message.channel.send({
                   content: tracker.localize('eloTracker.embeds.autoBackupBeforeReset', { value: players.length }),
                   files: [{ attachment: buffer, name: filename }]
@@ -765,12 +997,20 @@ export const EloDiscord = {
                 return;
               }
 
+              // Both unscoped, and both deliberately. Ratings are
+              // community-wide by design — one player, one rating, whichever
+              // server they played on — so a reset that spared the neighbour's
+              // round history would leave a log of rounds behind ratings that
+              // no longer exist. Elo_RoundHistories is server-column scoped,
+              // so this is the case where the predicate is the wrong answer
+              // rather than a forgotten one.
               const _PlayerStats = this.db.getModel('Elo_PlayerStats');
               const _RoundHistory = this.db.getModel('Elo_RoundHistory');
               if (_PlayerStats) await _PlayerStats.destroy({ where: {} });
               if (_RoundHistory) await _RoundHistory.destroy({ where: {} });
               this.eloCache.clear();
-              await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildAdminConfirmEmbed(tracker, tracker.localize('eloTracker.embeds.eloReset'), tracker.localize('eloTracker.embeds.allRatingsRoundHistory'))] });
+              const doneTitle = tracker.localize('eloTracker.embeds.eloReset');
+              await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildAdminConfirmEmbed(tracker, this.titleWithServer?.(doneTitle) ?? doneTitle, tracker.localize('eloTracker.embeds.allRatingsRoundHistory'))] });
             } catch (err) {
               await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildErrorEmbed(tracker, tracker.localize('eloTracker.embeds.eloReset'), err)] });
             }
@@ -825,7 +1065,7 @@ export const EloDiscord = {
               players
             }, null, 2);
             const buffer = Buffer.from(payload, 'utf-8');
-            const filename = `elo-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+            const filename = `elo-backup${this.serverFileTag?.() || ''}-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
             await message.channel.send({
               content: tracker.localize('eloTracker.embeds.eloBackupPlayers', { value: players.length }),
               files: [{ attachment: buffer, name: filename }]
@@ -837,42 +1077,72 @@ export const EloDiscord = {
         }
 
         if (sub === 'restore') {
+          // ── The confirm half ────────────────────────────────────
+          // Only on a multi-server install, and only there. A community
+          // of one restores exactly the way it always has: attach the
+          // file, and the import runs.
+          const restoreArgs = args.slice(1);
+          const wantsConfirm = restoreArgs.some((a) => String(a).toLowerCase() === 'confirm');
+          const restoreToken = wantsConfirm
+            ? (restoreArgs.find((a) => /^[0-9a-f]{4}$/.test(String(a).toLowerCase())) ?? null)
+            : null;
+
+          if (wantsConfirm && this.isMultiServer?.()) {
+            const taken = this.takeConfirmation('eloRestore', restoreToken);
+            const held = taken.status === 'ok';
+            if (restoreToken && !(await this.claimConfirmReply(message.id, held))) return;
+            if (!held) {
+              await message.reply(tracker.localize('eloTracker.embeds.noPendingRestoreConfirmation'));
+              return;
+            }
+            await runEloRestore(taken.payload);
+            return;
+          }
+
           if (!message.attachments.size) {
             await message.reply(tracker.localize('eloTracker.embeds.pleaseAttachBackupJson'));
             return;
           }
+
+          const attachment = message.attachments.first();
+
+          // Validated before the arm, not after the confirm. An admin who
+          // is told to type a token has been told the file is good, and
+          // discovering at confirm time that it never parsed would spend
+          // the confirmation on nothing.
+          let parsed;
           try {
-            const attachment = message.attachments.first();
-            const response = await fetch(attachment.url);
-            const json = await response.json();
-            if (!Array.isArray(json.players)) {
-              await message.reply(tracker.localize('eloTracker.embeds.invalidBackupFormatMissing'));
-              return;
-            }
-
-            // Schema validation to ensure the JSON matches the expected player format
-            const isValidSchema = json.players.every(p =>
-              typeof p.eosID === 'string' &&
-              typeof p.mu === 'number' &&
-              typeof p.sigma === 'number' &&
-              typeof p.wins === 'number' &&
-              typeof p.losses === 'number' &&
-              typeof p.roundsPlayed === 'number'
-            );
-
-             if (!isValidSchema) {
-               await message.reply(tracker.localize('eloTracker.embeds.invalidBackupFormatOne'));
-               return;
-             }
-
-             await message.reply(tracker.localize('eloTracker.embeds.restoringPlayersMayTake', { value: json.players.length }));
-             await this.db.importPlayerStats(json.players);
-             await EloDiscord.sendDiscordMessage(message.channel, {
-               embeds: [EloDiscord.buildAdminConfirmEmbed(tracker, tracker.localize('eloTracker.embeds.restoreComplete'), tracker.localize('eloTracker.embeds.restoredPlayersFromBackup', { value: json.players.length }))]
-             });
+            parsed = await fetchBackupPlayers(attachment.url);
           } catch (err) {
             await EloDiscord.sendDiscordMessage(message.channel, { embeds: [EloDiscord.buildErrorEmbed(tracker, tracker.localize('eloTracker.embeds.restore'), err)] });
+            return;
           }
+          if (parsed.errorKey) {
+            await message.reply(tracker.localize(parsed.errorKey));
+            return;
+          }
+
+          const arm = this.armConfirmation?.({
+            kind: 'eloRestore',
+            payload: attachment.url,
+            command: '!elo restore confirm',
+            radius: 'community'
+          }) ?? { armed: true, lines: [], refusal: null };
+
+          if (!arm.armed) {
+            await message.reply(arm.refusal);
+            return;
+          }
+
+          // No lines is the single-server install, where nothing changed.
+          if (arm.lines.length === 0) {
+            await runEloRestore(attachment.url);
+            return;
+          }
+
+          await message.reply(
+            `${tracker.localize('eloTracker.embeds.restoreWillOverwrite', { value: parsed.players.length })}\n${arm.lines.join('\n')}`
+          );
           return;
         }
       }
@@ -996,7 +1266,7 @@ export const EloDiscord = {
             return;
           }
 
-          const minRounds = this.options.minRoundsForLeaderboard;
+          const minRounds = this.leaderboardMinRounds();
           const provisional = player.roundsPlayed < minRounds;
           const rank = provisional ? null : await this.db.getPlayerRank(player.eosID, minRounds);
           const totalRanked = await this.db.getTotalRankedPlayers(minRounds);
@@ -1018,7 +1288,7 @@ export const EloDiscord = {
       }
 
       if (sub === 'leaderboard') {
-        const minRounds = this.options.minRoundsForLeaderboard;
+        const minRounds = this.leaderboardMinRounds();
         const totalRanked = await this.db.getTotalRankedPlayers(minRounds);
         const totalPlayers = await this.db.getTotalPlayers();
 
@@ -1067,7 +1337,7 @@ export const EloDiscord = {
           return;
         }
 
-        const minRounds = this.options.minRoundsForLeaderboard;
+        const minRounds = this.leaderboardMinRounds();
         let totalWins = 0, totalLosses = 0, totalMu = 0, totalSigma = 0, rankedCount = 0, totalCsr = 0;
         const rawCounts = {};
 
@@ -1117,7 +1387,7 @@ export const EloDiscord = {
         }
 
         const allPlayers = await this.db.exportPlayerStats();
-        const minRounds = this.options.minRoundsForLeaderboard;
+        const minRounds = this.leaderboardMinRounds();
         const clans = {};
 
         allPlayers.forEach(p => {
@@ -1171,7 +1441,7 @@ export const EloDiscord = {
         return;
       }
 
-      const minRounds = this.options.minRoundsForLeaderboard;
+      const minRounds = this.leaderboardMinRounds();
       const provisional = player.roundsPlayed < minRounds;
       const rank = provisional ? null : await this.db.getPlayerRank(player.eosID, minRounds);
       const totalRanked = await this.db.getTotalRankedPlayers(minRounds);

@@ -20,6 +20,7 @@
  *                            was parsed successfully.
  *   getConfig()          — Returns all config values as a flat object.
  *   getConfigPath()      — Returns the resolved config directory path.
+ *   getServerName()         — Server.cfg ServerName, or null.
  *   getAllowTeamChanges()   — Server.cfg AllowTeamChanges setting.
  *   getMaxPlayers()         — Server.cfg MaxPlayers setting.
  *   getNumReservedSlots()   — Server.cfg NumReservedSlots setting.
@@ -41,6 +42,13 @@
  * - Config file parse errors silently fall back to DEFAULT_CONFIG.
  * - Mount-order critical: consumed by gameState for ENDGAME timer chain.
  * - Only reads files at mount time — does not watch for file changes.
+ * - getServerName() is what a community running several servers is
+ *   identified by in admin and player messaging. There is deliberately
+ *   no default for it: a made-up name would be written to the registry
+ *   and shown beside another server's real one. Missing means null, and
+ *   readers fall back to the configured alias. See s3-server-label.js
+ *   for how the raw ServerName is turned into something short enough to
+ *   put in an embed title.
  *
  */
 import { readFileSync, existsSync } from 'node:fs';
@@ -49,6 +57,11 @@ import { join, resolve, dirname } from 'node:path';
 // Default fallback values (from current config file contents)
 const DEFAULT_CONFIG = {
   // Server.cfg defaults
+  // There is no sensible default name. A wrong one is worse than none:
+  // it would be written to the registry and shown beside another server's
+  // real name, so a missing ServerName= line leaves this null and every
+  // reader falls back to the alias.
+  ServerName: null,
   AllowTeamChanges: false,
   MaxPlayers: 100,
   NumReservedSlots: 2,
@@ -178,6 +191,7 @@ export default class ServerConfigService {
 
     // Parse Server.cfg
     const serverKeys = [
+      'ServerName',
       'AllowTeamChanges',
       'MaxPlayers',
       'NumReservedSlots',
@@ -227,6 +241,24 @@ export default class ServerConfigService {
   }
 
   // Individual getters for direct access
+
+  /**
+   * The server's advertised name, straight off disk.
+   *
+   * Available at mount, which is the whole point of reading it here: RCON's
+   * `server.serverName` carries the same string but arrives later, and the
+   * registry write that wants a name happens in between.
+   *
+   * Coerced to a string because parseConfigFile() turns anything that looks
+   * numeric into a Number, and a server named "1945" is a legal Squad name.
+   *
+   * @returns {string|null} - ServerName setting, or null when unset
+   */
+  getServerName() {
+    const name = this._config.ServerName;
+    if (name === null || name === undefined || name === '') return null;
+    return String(name);
+  }
 
   /**
    * @returns {boolean} - AllowTeamChanges setting

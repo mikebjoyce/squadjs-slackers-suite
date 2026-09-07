@@ -16,17 +16,39 @@
  *   Attaches a Discord message listener for !s3 commands and returns
  *   a cleanup function to call during unmount().
  *
+ * sendDiscordMessage(channel, content, tag, verbose) (function)
+ *   Resilient Discord message sender (rate-limit, v12 fallback,
+ *   empty-message guard). Exported so the shipped send path can be
+ *   exercised directly; inside the suite only this file calls it.
+ *
  * Internal:
- *   sendDiscordMessage()  — Resilient Discord message sender (rate-limit,
- *                           v12 fallback, empty-message guard).
  *   WatchManager          — Manages verbose-log interception and relay
  *                           to Discord channels with configurable TTL.
  *   onDiscordMessage      — Message handler (parses !s3, dispatches to
  *                           commandHandlers, catches errors).
  *
+ * ─── ROUTING (multi-server) ──────────────────────────────────────
+ *
+ * Every process running this suite watches the same admin channel,
+ * so one typed command arrives at all of them. onDiscordMessage
+ * runs a routing gate between the channel gate and the verb
+ * dispatch: scopeForS3Command() classifies the verb, and
+ * routeDiscordCommand() decides whether this process acts, stays
+ * quiet, or refuses with an explanation.
+ *
+ * The gate sits where it does on purpose. It is after the channel
+ * check so a message in the wrong channel costs nothing, and before
+ * the dispatch so the handlers below never learn that selectors
+ * exist — they receive verdict.args with any --server already
+ * stripped. On a single-server install the gate is inert: it strips
+ * a selector nobody types and returns act.
+ *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
- * s3-commands.js — createCommandHandlers, buildHelpEmbed
+ * s3-commands.js — createCommandHandlers, buildHelpEmbed,
+ *                  scopeForS3Command
+ * s3-discord-routing.js — routeDiscordCommand, ROUTING,
+ *                  buildRoutingRefusalEmbed
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
@@ -41,7 +63,9 @@
  *   infrastructure only (channel setup, message listener, watch relay).
  *
  */
-import { createCommandHandlers, buildHelpEmbed } from './s3-commands.js';
+import { createCommandHandlers, buildHelpEmbed, scopeForS3Command } from './s3-commands.js';
+import { routeDiscordCommand, buildRoutingRefusalEmbed, ROUTING } from './s3-discord-routing.js';
+import { applyServerLabel } from './s3-server-label.js';
 
 /**
  * Send a Discord message with embed(s). Resilient: normalises embed→embeds,
@@ -52,7 +76,7 @@ import { createCommandHandlers, buildHelpEmbed } from './s3-commands.js';
  * @param {Function} [verboseLogger=()=>{}] - Plugin's verbose logger
  * @returns {Promise<boolean>}
  */
-async function sendDiscordMessage(channel, content, pluginTag = 'S3', verboseLogger = () => {}) {
+export async function sendDiscordMessage(channel, content, pluginTag = 'S3', verboseLogger = () => {}) {
   if (!channel) {
     verboseLogger(1, `[${pluginTag} Discord] Send failed: No channel available`);
     return false;
@@ -72,6 +96,10 @@ async function sendDiscordMessage(channel, content, pluginTag = 'S3', verboseLog
       delete payload.embed;
     }
   }
+
+  // Which server this came from, when there is more than one. A no-op on a
+  // single-server install, because S³ publishes nothing there.
+  payload = applyServerLabel(payload);
 
   const executeSend = async (data, isRetry = false) => {
     try {
@@ -300,7 +328,32 @@ export function registerS3DiscordCommands(plugin) {
     const channelID = plugin.options.channelID;
     if (!channelID || message.channel.id !== channelID) return;
 
-    const args = content.replace(/^!s3\s*/i, '').trim().split(/\s+/).filter(Boolean);
+    const rawArgs = content.replace(/^!s3\s*/i, '').trim().split(/\s+/).filter(Boolean);
+
+    // ── Routing gate ──────────────────────────────────────────────
+    // After the channel gate and before the verb dispatch, so `args[0]`
+    // below never learns that selectors exist. Inert on a single-server
+    // install: it strips a `--server` nobody types and returns act.
+    const { scope, selectorRequired } = scopeForS3Command(rawArgs);
+    const verdict = await routeDiscordCommand({
+      db: plugin.services.db,
+      scope,
+      selectorRequired,
+      args: rawArgs,
+      messageID: message.id,
+      command: `!s3 ${rawArgs.slice(0, 2).join(' ')}`.trim(),
+      verbose: (...a) => plugin.verbose(...a)
+    });
+
+    if (verdict.routing === ROUTING.DROP) return;
+    if (verdict.routing === ROUTING.REFUSE) {
+      await sendDiscordMessage(message.channel, {
+        embeds: [buildRoutingRefusalEmbed(verdict, (k, v) => plugin.localize(k, v))]
+      }, 'S3', (...a) => plugin.verbose(...a));
+      return;
+    }
+
+    const args = verdict.args;
     const sub = args[0]?.toLowerCase();
 
     try {

@@ -27,6 +27,34 @@
  * about — see DEFAULT_EXPORT_TIER in db-service.js for why the fallback errs
  * towards including too much.
  *
+ * ─── TWO AXES, NOT ONE ───────────────────────────────────────────
+ *
+ * Tier answers "how much of the data", and it is not the only
+ * question once a community runs more than one server. Scope answers
+ * "whose data", and the two are independent: any tier can be taken
+ * for one server or for the whole community.
+ *
+ * Scope also comes from the model's own declaration rather than from
+ * a list here. `scopePredicateFor()` turns a model's `scopeKind` into
+ * a predicate, and `allServers: false` applies it to every
+ * server-scoped table while leaving global tables alone — a
+ * community-wide table is community-wide in every export, because
+ * one row is the answer for everyone.
+ *
+ * The envelope records what was taken rather than leaving it to be
+ * inferred from the filename: `scope` ('server' or 'community'),
+ * the exporting `serverID`, and `containedServerIDs`, which is the
+ * set actually present in the rows. A restore reads those instead of
+ * trusting the operator's memory of which server a file came from.
+ *
+ * Import is where the two axes stop being symmetrical.
+ * `makeImportPolicy()` treats `allServers` and `remapServer` as
+ * different intentions rather than as degrees of one: adopting rows
+ * that arrived without an id, taking a sibling's rows knowingly, and
+ * rewriting rows onto this server are three separate decisions, and
+ * collapsing them is how a restore quietly folds two servers into
+ * one. `planImport()` renders all of it before anything is written.
+ *
  * Additions:
  *   exportToFile() — Streams the export to a timestamped .s3backup.json file
  *     in the backup directory. Used by MigrationEngine as the pre-migration
@@ -46,15 +74,24 @@
  *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
- *   exportToJSON(dbService, { includeEphemeral, flags })
+ *   exportToJSON(dbService, { tier, models, allServers })
  *     Enumerates dbService.models, filters by classification tier,
  *     runs findAll({ raw: true }) per table with per-table try-catch.
  *     Returns structured JSON with tables, rowCounts, results.
+ *     `allServers: false` narrows every server-scoped table to this
+ *     process's server; global tables are community-wide either way.
  *
- *   importFromJSON(dbService, json, { dryRun })
+ *   importFromJSON(dbService, json, { dryRun, allServers, remapServer })
  *     Validates structure, upserts per table inside a single Sequelize
  *     transaction. Per-table try-catch allows partial recovery. FK
- *     checks disabled for transaction duration. Returns { imported, errors }.
+ *     checks disabled for transaction duration. Foreign rows are skipped
+ *     unless asked for. Returns { imported, errors, plan }.
+ *
+ *   planImport(dbService, json, { allServers, remapServer })
+ *     What an import WOULD do, per table, without writing: rows written,
+ *     adopted, remapped, skipped, and overwritten — the last with the
+ *     servers those existing rows currently belong to. What the
+ *     confirmation is rendered from, and what the real import then runs.
  *
  *   validateImportStructure(json, modelNames)
  *     Checks s3ExportVersion === 1, table names exist as models,
@@ -64,9 +101,11 @@
  *     JSON.stringify + optional gzip if > 1 MB. Pre-checks size against
  *     Discord's 25 MB boosted limit. Returns { filename, buffer, sizeBytes }.
  *
- *   exportToFile(dbService, backupDir, { tier, retention, models, batchSize })
+ *   exportToFile(dbService, backupDir, { tier, retention, models, batchSize, allServers })
  *     Streams a JSON export to backupDir as a timestamped file, one row batch
- *     at a time. Bounded memory on any database size.
+ *     at a time. Bounded memory on any database size. Defaults to the whole
+ *     community, because its first caller is the pre-migration backup and a
+ *     shared schema migrates for everyone at once.
  *     Returns { filename, path, sizeBytes, rowCounts, results, ... } or null.
  *
  *   gzipFileForAttachment(filePath, { limitBytes })
@@ -88,6 +127,10 @@
  *   export or import. Failed tables are flagged in results with the error.
  * - Import uses upsert (no deletes) — rows not in the import are left
  *   untouched. This prevents accidental data loss.
+ * - Import stamps the importing server’s id onto a server-scoped row that
+ *   arrives without one, and never onto a row that has one. That is what lets
+ *   a backup taken before this suite was multi-server restore onto a server
+ *   that now is, without folding a second server’s rows into the first.
  *
  */
 import fs from 'node:fs';
@@ -139,6 +182,10 @@ import { localize as localizeEn } from './s3-i18n.js';
  */
 const HISTORICAL_TABLES = new Set([
   'S3SchemaVersions',
+  // The server registry. Aliases and first-seen dates are operator-set or
+  // one-shot: nothing in live play rewrites them, so a lost row loses which
+  // server an admin's --server token used to name.
+  'S3Servers',
   'Elo_PlayerStats',
   'Elo_RoundHistory',
   'Elo_RoundPlayers',
@@ -171,13 +218,22 @@ const LOGGING_TABLES = new Set([
  */
 const EPHEMERAL_TABLES = new Set([
   'S3GameState',
+  // Cross-process lock rows. Restoring these would resurrect locks held by
+  // processes that no longer exist, so they are ephemeral in the strongest
+  // sense: a fresh database is strictly better than a restored one.
+  'S3Locks',
   'S3_PlayerSession',
   // Reconnect memory — rebuilt from live play, and entries expire on their own.
   // Previously in no tier at all.
   'S3PlayerReconnect',
   'SwitchPlugin_PlayerCooldowns',
+  // The per-server half of the cooldown split: a scramble lock and a seed
+  // clock, both of which describe a round that is over by the time anyone
+  // restores a backup. Same tier as the wallet it was split out of, which is
+  // what keeps an --all export self-consistent rather than restoring one
+  // half of a player against a missing other half.
+  'SwitchPlugin_PlayerServerState',
   'SwitchPlugin_Endmatches',
-  'Elo_PluginState',
   'TeamBalancerState'
 ]);
 
@@ -193,7 +249,408 @@ export const TIER_SETS = Object.freeze({
   ephemeral: EPHEMERAL_TABLES
 });
 
-// ─── HELPERS ─────────────────────────────────────────────────────────
+/**
+ * Models a restore never writes, whatever tier they sit in.
+ *
+ * This is a **separate decision from the export tier**, and deliberately so.
+ * `S3Locks` is `ephemeral`, which puts its rows inside an `--all` backup — that
+ * is right for a backup, which is a snapshot of the database as it stood, and
+ * an operator diffing two of them should be able to see which process held the
+ * migration lock at the time.
+ *
+ * Restoring those rows is a different question with a different answer. A lock
+ * row is a claim by a live process, and every process that held one at backup
+ * time is gone by restore time. Reinstating one hands a claim to nobody:
+ * `acquireLock()` steals a row only once its `expiresAt` has passed, so a
+ * restored migration lock stalls every process's migration until the clock
+ * catches up with a deadline that was set on a different day. The TTL bounds
+ * that wait rather than removing it, and it bounds it at the wrong end — the
+ * restore is exactly the moment migrations need to run.
+ *
+ * The alternative was to promote the TTL steal from a nicety to a correctness
+ * requirement and lean on it here. That trade was refused: it would make a
+ * restore's usability depend on a lock TTL chosen for live contention, and it
+ * still leaves the stall. Skipping the write costs nothing, because a fresh
+ * lock table is not merely acceptable after a restore — it is strictly better
+ * than the restored one.
+ *
+ * Skipped tables are reported as `status: 'skipped'`, not as an error and not
+ * as `ok` with zero rows: an operator reading the restore summary should see
+ * that the table was passed over on purpose rather than that it happened to be
+ * empty.
+ */
+export const IMPORT_SKIPPED_MODELS = Object.freeze(new Set(['S3Locks']));
+
+/**
+ * Build the function that gives an imported row a server to belong to.
+ *
+ * A `server-column` model’s rows are told apart by one column, and an
+ * envelope can be missing it two ways. A backup taken before the column
+ * existed has no such field at all; a backup taken from a table whose primary
+ * key changed — the old table had no server in it, the new one keys on
+ * (serverID, key) NOT NULL — has rows that cannot be written without one. In
+ * both cases the rows came from the only server there was, and the server
+ * doing the restore is it.
+ *
+ * Only where the value is absent. An envelope from a community already
+ * running several servers carries real ids, and those say which server each
+ * row belongs to. Overwriting them would fold every server’s rows onto
+ * whichever one happened to run the restore, which is worse than the failure
+ * this fixes because it succeeds quietly.
+ *
+ * Returns identity for a global or `server-key` model, for an undeclared one,
+ * and for a declared column the model does not actually have — the
+ * classification is declared ahead of the migrations that add the columns, so
+ * a column named here is not yet a column that exists.
+ *
+ * The returned function returns the row unchanged when it stamps nothing, so
+ * callers can count stamped rows by identity rather than re-checking.
+ *
+ * @param {object} dbService - DBService instance
+ * @param {string} modelName - Registered model name (the envelope’s key)
+ * @param {object} model - The Sequelize model for that name
+ * @returns {(row: object) => object}
+ */
+function makeServerIDStamper(dbService, modelName, model) {
+  let column = null;
+  try {
+    if (dbService.getModelScopeKind?.(modelName) === 'server-column') {
+      const declared = dbService.getModelScopeColumn(modelName);
+      const attributes = model?.rawAttributes || model?.getAttributes?.() || {};
+      if (declared && attributes[declared]) column = declared;
+    }
+  } catch {
+    // An import is not the place to fail over a classification lookup.
+    column = null;
+  }
+  if (!column) return (row) => row;
+
+  const serverID = dbService.getServerID();
+  return (row) => (
+    row[column] === undefined || row[column] === null
+      ? { ...row, [column]: serverID }
+      : row
+  );
+}
+
+/**
+ * What an import decides to do with one row.
+ *
+ * Five outcomes rather than write/skip, because an operator agreeing to an
+ * import is agreeing to five different things and only one of them is
+ * ordinary. `stamp` adopts a row that names no server; `remap` takes a row
+ * that names a DIFFERENT server and claims it for this one; `foreign` writes
+ * it back to the server it names, which on a single-server install leaves
+ * rows no query will ever return.
+ */
+export const IMPORT_ROW_ACTIONS = Object.freeze({
+  WRITE: 'write',
+  STAMP: 'stamp',
+  REMAP: 'remap',
+  FOREIGN: 'foreign',
+  SKIP: 'skip'
+});
+
+/**
+ * Build the decision an import makes about every row of one table.
+ *
+ * The default is the narrow one: rows belonging to this server are written,
+ * rows belonging to a sibling are skipped. Two flags widen it, and they are
+ * different intentions rather than degrees of the same one — `allServers`
+ * restores each row to the server it names, `remapServer` folds every row
+ * onto this one. Passing both is a contradiction and the caller refuses it.
+ *
+ * A row carrying no server id is adopted rather than skipped, whatever the
+ * flags say. That is the legacy-envelope rule, and it is the difference
+ * between a pre-multi-server backup restoring and a pre-multi-server backup
+ * reporting success per table having written nothing — and that backup is the
+ * most likely thing anyone ever restores.
+ *
+ * Global models, and server-column models whose column has not landed yet,
+ * have no per-row question to answer and write everything.
+ *
+ * Throws for a model whose scope was never declared, the same way
+ * `scopePredicateFor()` does. The caller turns that into a per-table error;
+ * an import that cannot tell whose rows these are must not write them.
+ *
+ * @param {object} dbService
+ * @param {string} modelName
+ * @param {object} model
+ * @param {object} [options]
+ * @param {boolean} [options.allServers=false]
+ * @param {boolean} [options.remapServer=false]
+ * @returns {{column: string|null, serverID: number, classify: (row: object) => {action: string, row: object, from?: number}}}
+ */
+function makeImportPolicy(dbService, modelName, model, { allServers = false, remapServer = false } = {}) {
+  const serverID = dbService.getServerID();
+  const scope = dbService.scopePredicateFor(modelName);
+
+  if (!scope) {
+    return { column: null, serverID, classify: (row) => ({ action: IMPORT_ROW_ACTIONS.WRITE, row }) };
+  }
+
+  const column = scope.column;
+  return {
+    column,
+    serverID,
+    classify(row) {
+      const raw = row[column];
+      if (raw === undefined || raw === null) {
+        return { action: IMPORT_ROW_ACTIONS.STAMP, row: { ...row, [column]: serverID } };
+      }
+
+      const from = Number(raw);
+      if (from === serverID) return { action: IMPORT_ROW_ACTIONS.WRITE, row };
+      if (remapServer) return { action: IMPORT_ROW_ACTIONS.REMAP, row: { ...row, [column]: serverID }, from };
+      if (allServers) return { action: IMPORT_ROW_ACTIONS.FOREIGN, row, from };
+      return { action: IMPORT_ROW_ACTIONS.SKIP, row, from };
+    }
+  };
+}
+
+/** How many rows one existence probe asks about. */
+const OVERWRITE_PROBE_CHUNK = 200;
+
+/**
+ * Which of the rows about to be written are already there, and whose they are.
+ *
+ * `model.upsert()` matches on the primary key, and for the nine tables keyed
+ * on an autoincrement `id` that key says nothing about which server a row
+ * belongs to. An envelope taken from a pre-multi-server database therefore
+ * addresses `id`s that now belong to a sibling, and every one of those
+ * upserts is a silent overwrite of somebody else's row.
+ *
+ * So this asks, before anything is written: of the keys in this envelope,
+ * which exist, and which server does each of those rows currently say it
+ * belongs to. The second half is the part worth reading — "142 rows will be
+ * overwritten" is a number, and "142 rows currently belonging to `northern-2`
+ * will be overwritten" is a decision.
+ *
+ * Asked in chunks rather than one row at a time, and skipped entirely for a
+ * model with no primary key, where upsert cannot match an existing row.
+ *
+ * @param {object} model - Sequelize model
+ * @param {string|null} scopeColumn - The model's server discriminator, if any
+ * @param {object[]} rows - The rows as they will be WRITTEN, after any remap
+ * @returns {Promise<{overwrite: number, servers: number[]}>}
+ */
+async function countExistingRows(model, scopeColumn, rows) {
+  const pks = Array.isArray(model.primaryKeyAttributes) ? model.primaryKeyAttributes : [];
+  if (pks.length === 0 || rows.length === 0) return { overwrite: 0, servers: [] };
+
+  const Op = model.sequelize?.constructor?.Op || model.sequelize?.Sequelize?.Op || SequelizeLib.Op;
+  if (!Op) return { overwrite: 0, servers: [] };
+
+  // A row missing part of its key cannot be matched against an existing one —
+  // an autoincrement id the envelope never carried, most often — so it is an
+  // insert rather than an overwrite and is left out of the probe.
+  const keyed = rows.filter((row) => pks.every((k) => row[k] !== undefined && row[k] !== null));
+  if (keyed.length === 0) return { overwrite: 0, servers: [] };
+
+  const attributes = [...new Set([...pks, ...(scopeColumn ? [scopeColumn] : [])])];
+  const servers = new Set();
+  let overwrite = 0;
+
+  for (let i = 0; i < keyed.length; i += OVERWRITE_PROBE_CHUNK) {
+    const chunk = keyed.slice(i, i + OVERWRITE_PROBE_CHUNK);
+    const where = pks.length === 1
+      ? { [pks[0]]: { [Op.in]: chunk.map((row) => row[pks[0]]) } }
+      : { [Op.or]: chunk.map((row) => Object.fromEntries(pks.map((k) => [k, row[k]]))) };
+
+    const existing = await model.findAll({ raw: true, attributes, where });
+    overwrite += existing.length;
+    if (scopeColumn) {
+      for (const row of existing) noteServerID(servers, row[scopeColumn]);
+    }
+  }
+
+  return { overwrite, servers: [...servers].sort((a, b) => a - b) };
+}
+
+/**
+ * Work out what an import would do, per table, without writing anything.
+ *
+ * This is what the confirmation is rendered from, and it is deliberately the
+ * same code path the real import then runs: a dry run that predicted the
+ * import by different means would be a second implementation of the rules,
+ * and the one that matters is the one that writes.
+ *
+ * `unknownTables` names envelope keys no model answers to. Those were
+ * previously a warning inside a result that otherwise read as a success —
+ * which is how a restore quietly omits a whole table. A model name changing
+ * is one way to get here; a plugin not being mounted in this process is the
+ * other, and on a shared database that one is ordinary.
+ *
+ * @param {object} dbService
+ * @param {object} json - A parsed export envelope
+ * @param {object} [options]
+ * @param {boolean} [options.allServers=false]
+ * @param {boolean} [options.remapServer=false]
+ * @returns {Promise<object>} The plan
+ */
+export async function planImport(dbService, json, { allServers = false, remapServer = false } = {}) {
+  const plan = {
+    serverID: dbService.getServerID(),
+    allServers,
+    remapServer,
+    tables: {},
+    unknownTables: [],
+    writtenServerIDs: [],
+    overwrittenServerIDs: [],
+    skippedServerIDs: [],
+    totals: { total: 0, write: 0, stamp: 0, remap: 0, foreign: 0, skip: 0, overwrite: 0 }
+  };
+
+  const written = new Set();
+  const overwritten = new Set();
+  const skipped = new Set();
+
+  for (const [name, rawRows] of Object.entries(json?.tables || {})) {
+    const rows = Array.isArray(rawRows) ? rawRows : [];
+    plan.totals.total += rows.length;
+
+    if (IMPORT_SKIPPED_MODELS.has(name)) {
+      plan.tables[name] = { status: 'skipped', total: rows.length };
+      continue;
+    }
+
+    const model = dbService.getModel(name);
+    if (!model) {
+      plan.unknownTables.push({ name, rows: rows.length });
+      plan.tables[name] = { status: 'unknown', total: rows.length };
+      continue;
+    }
+
+    let policy;
+    try {
+      policy = makeImportPolicy(dbService, name, model, { allServers, remapServer });
+    } catch (err) {
+      plan.tables[name] = { status: 'error', total: rows.length, error: err.message };
+      continue;
+    }
+
+    const entry = {
+      status: 'ok',
+      total: rows.length,
+      write: 0, stamp: 0, remap: 0, foreign: 0, skip: 0,
+      overwrite: 0,
+      overwriteServerIDs: [],
+      // Every foreign server this table mentions, whatever became of its
+      // rows...
+      sourceServerIDs: [],
+      // ...and the subset whose rows were actually left behind. The two are
+      // the same list until a widening flag is on, and the one a summary has
+      // to name is this one — saying "rows belonging to X were skipped" when
+      // they were in fact written is the wrong direction to be wrong in.
+      skipServerIDs: []
+    };
+
+    const toWrite = [];
+    const sources = new Set();
+    const skippedHere = new Set();
+    for (const row of rows) {
+      const decision = policy.classify(row);
+      entry[decision.action] += 1;
+      if (decision.from !== undefined) noteServerID(sources, decision.from);
+      if (decision.action === IMPORT_ROW_ACTIONS.SKIP) {
+        noteServerID(skipped, decision.from);
+        noteServerID(skippedHere, decision.from);
+        continue;
+      }
+      toWrite.push(decision.row);
+      if (policy.column) noteServerID(written, decision.row[policy.column]);
+    }
+    entry.sourceServerIDs = [...sources].sort((a, b) => a - b);
+    entry.skipServerIDs = [...skippedHere].sort((a, b) => a - b);
+
+    try {
+      // Counted against the rows as they will be written, not as they arrived:
+      // a remap changes the very column the match is made on for a server-key
+      // model, so probing the envelope's own values would count the wrong rows.
+      const existing = await countExistingRows(model, policy.column, toWrite);
+      entry.overwrite = existing.overwrite;
+      entry.overwriteServerIDs = existing.servers;
+      for (const id of existing.servers) overwritten.add(id);
+    } catch (err) {
+      // A table that cannot be probed is still importable. Say the count is
+      // unknown rather than reporting zero, which would read as "nothing of
+      // yours is at risk".
+      entry.overwrite = null;
+      entry.overwriteError = err.message;
+    }
+
+    for (const key of ['write', 'stamp', 'remap', 'foreign', 'skip']) plan.totals[key] += entry[key];
+    if (typeof entry.overwrite === 'number') plan.totals.overwrite += entry.overwrite;
+    plan.tables[name] = entry;
+  }
+
+  plan.writtenServerIDs = [...written].sort((a, b) => a - b);
+  plan.overwrittenServerIDs = [...overwritten].sort((a, b) => a - b);
+  plan.skippedServerIDs = [...skipped].sort((a, b) => a - b);
+  return plan;
+}
+
+/**
+ * Upper bound on the ids recorded in `containedServerIDs`.
+ *
+ * The honest value of that field is one entry per server in the community,
+ * so a handful. A cap is here because the field is built from row data: a
+ * table whose scope column holds something other than a server id — a
+ * misclassified model, a column that was repurposed — would otherwise turn
+ * a hundred-million-row export into a hundred-million-entry array in the
+ * envelope header. Overflowing sets `containedServerIDsTruncated`, which is
+ * a louder signal that something is wrong than a giant array would be.
+ */
+const MAX_CONTAINED_SERVER_IDS = 64;
+
+/**
+ * Record one row's server id, if it has a usable one.
+ *
+ * Nulls are skipped rather than recorded as a distinct "unattributed"
+ * entry: a null here is a pre-multi-server row, and the import side already
+ * has a rule for those (makeServerIDStamper attributes them to whoever runs
+ * the restore). Listing them in `containedServerIDs` would put a value in
+ * the field that names no server.
+ *
+ * @param {Set<number>} set
+ * @param {*} value - The raw column value
+ * @returns {boolean} False once the cap is reached and the value was dropped
+ */
+function noteServerID(set, value) {
+  if (value === null || value === undefined) return true;
+  const id = Number(value);
+  if (!Number.isFinite(id)) return true;
+  if (set.has(id)) return true;
+  if (set.size >= MAX_CONTAINED_SERVER_IDS) return false;
+  set.add(id);
+  return true;
+}
+
+/**
+ * How one model's rows narrow to one server during an export.
+ *
+ * Wraps DBService.scopePredicateFor() with the one behaviour an exporter
+ * needs on top of it: an undeclared model is fatal for a scoped export and
+ * harmless for a community-wide one. A community-wide export applies no
+ * predicate at all, so not knowing the classification costs nothing; a
+ * scoped export that swallowed the error would ship a sibling's rows inside
+ * a file labelled as one server's.
+ *
+ * @param {object} dbService
+ * @param {string} name - Model name
+ * @param {boolean} allServers
+ * @returns {{column: string, value: number}|null}
+ */
+function exportScopeFor(dbService, name, allServers) {
+  try {
+    return dbService.scopePredicateFor?.(name) ?? null;
+  } catch (err) {
+    if (!allServers) throw err;
+    return null;
+  }
+}
+
+// ─── HELPERS ──────────────────────────────────────────────
 
 /**
  * Map the operator-facing export flag onto the set of model tiers it covers.
@@ -240,6 +697,156 @@ export function filterByTier(dbService, { tier = 'historical', models = null } =
 }
 
 /**
+ * Which models an export was asked for but did not actually deliver, split by
+ * whether the envelope says so.
+ *
+ * ─── WHY THIS EXISTS ───
+ *
+ * An export's `results` map is per-model, and every entry in it is an entry the
+ * exporter knew to write. Nothing has ever compared that map against what was
+ * asked for, so a model can go missing in a way that leaves no trace at all: it
+ * was named in an explicit `models` list, is not in the registry,
+ * `filterByTier()` dropped it, and it then appears nowhere — not in `tables`,
+ * not in `results`, not as an error. Every line of the envelope says `ok` and
+ * the table is simply not in the backup.
+ *
+ * That is the case this exists for, and it is why the comparison is against the
+ * REQUESTED set rather than against `filterByTier()`'s output. Comparing the
+ * envelope to the filtered list is a tautology: the filter is what built it.
+ *
+ * ─── WHY A FAILED READ IS NOT THE SAME THING ───
+ *
+ * A table that errored is already in `results` with its driver message, so the
+ * envelope is not lying about it — it is loud, and it is returned separately as
+ * `failed`. It also has a legitimate cause that a backup must survive: drift
+ * repair. When a column a model declares is missing from the live table, every
+ * read of that model fails, and the migration that fixes it is the one about to
+ * run. Treating that as "no backup, refuse to migrate" would make the repair
+ * path unreachable on exactly the databases that need it.
+ *
+ * @param {string[]} requested - Model names the export was supposed to cover
+ * @param {Record<string, {status: string, error?: string}>} results
+ * @returns {{missing: Array<{model: string, reason: string}>, failed: Array<{model: string, reason: string}>}}
+ */
+export function findEnvelopeGaps(requested, results = {}) {
+  const missing = [];
+  const failed = [];
+  for (const name of requested) {
+    const entry = results[name];
+    if (!entry) {
+      missing.push({ model: name, reason: 'not in the registry — nothing was exported for it' });
+    } else if (entry.status !== 'ok') {
+      failed.push({ model: name, reason: entry.error || entry.status });
+    }
+  }
+  return { missing, failed };
+}
+
+/**
+ * Which of these models have no table in the database yet.
+ *
+ * ─── WHY A MISSING TABLE IS NOT A GAP ───
+ *
+ * The pre-migration backup is scoped from `touches`, and a migration group
+ * routinely creates a table at v1 and changes it at v2. Both are pending on a
+ * fresh install, so the export is asked for a model whose table does not exist
+ * yet and comes back with the driver's "no such table". That reads exactly like
+ * a failed read of a real table, and it is the opposite: there is nothing there
+ * to lose, so there is nothing a backup could have protected.
+ *
+ * Answered from `showAllTables()` rather than from the error string, which is a
+ * different sentence on each of the three engines.
+ *
+ * @param {object} dbService
+ * @param {string[]} modelNames
+ * @returns {Promise<Set<string>>} The subset whose table is absent
+ */
+export async function findAbsentTables(dbService, modelNames) {
+  const absent = new Set();
+  if (modelNames.length === 0) return absent;
+
+  const connector = dbService?.getConnector?.();
+  if (!connector || typeof connector.getQueryInterface !== 'function') return absent;
+
+  let live;
+  try {
+    live = await connector.getQueryInterface().showAllTables();
+  } catch {
+    // Cannot tell. Leave every gap standing — the safe direction here is to
+    // report a backup as incomplete when it might be.
+    return absent;
+  }
+
+  // Prod MySQL runs lower_case_table_names=1, so the comparison folds.
+  const present = new Set(live.map((t) => String(t?.tableName ?? t).toLowerCase()));
+  for (const name of modelNames) {
+    const model = dbService.getModel?.(name);
+    if (!model) continue; // unregistered: a genuine gap, not an absent table
+    if (!present.has(String(model.tableName || model.name).toLowerCase())) absent.add(name);
+  }
+  return absent;
+}
+
+/**
+ * Tables that exist in the database and that no exported model covers.
+ *
+ * ─── WHY THE REGISTRY IS NOT ENOUGH ───
+ *
+ * `findEnvelopeGaps()` answers "did the export deliver what it was asked for",
+ * and the answer is bounded by the registry — which is whatever `defineModel()`
+ * happened to run in THIS process. A plugin that is installed but not mounted
+ * registers nothing, so its tables are not requested, not exported, and not
+ * missing: they are invisible, and every line of the envelope still says `ok`.
+ *
+ * That is not hypothetical. An archived production export carries seventeen
+ * models at `tier: "all"`, all `ok`, and `core-plugins/db-log.js`'s eight tables
+ * appear in none of them — while `S3_SchemaVersions` inside that same file
+ * records db-log migrated hours earlier. The artifact cannot distinguish "the
+ * exporter never saw those models" from "the plugin was unmounted in between",
+ * and it had no way to say either.
+ *
+ * The database is the only thing that knows. So for an export that claims to be
+ * the whole database, ask it.
+ *
+ * ─── WHY THIS IS A WARNING AND NOT A FAILURE ───
+ *
+ * A shared database legitimately holds tables this suite does not own — core
+ * SquadJS, other plugins, the operator's own. Refusing to export because they
+ * exist would be wrong, and on a live install it would refuse every time. What
+ * is wrong is claiming an S³ export is a backup of the database without saying
+ * which tables it left out. So this names them and lets the caller decide.
+ *
+ * @param {object} dbService
+ * @param {string[]} exportedModelNames - Models that actually landed in the envelope
+ * @returns {Promise<string[]>} Table names, as the database spells them
+ */
+export async function findUnexportedTables(dbService, exportedModelNames) {
+  const connector = dbService?.getConnector?.();
+  if (!connector || typeof connector.getQueryInterface !== 'function') return [];
+
+  let live;
+  try {
+    live = await connector.getQueryInterface().showAllTables();
+  } catch {
+    // Not every connector answers this, and an export that cannot enumerate the
+    // database is not thereby a failed export — it is one that cannot make the
+    // stronger claim. Say nothing rather than something false.
+    return [];
+  }
+
+  // Prod MySQL runs lower_case_table_names=1, so every comparison here folds.
+  const covered = new Set();
+  for (const name of exportedModelNames) {
+    const model = dbService.getModel?.(name);
+    if (model) covered.add(String(model.tableName || model.name).toLowerCase());
+  }
+
+  return live
+    .map((t) => String(t?.tableName ?? t))
+    .filter((t) => !covered.has(t.toLowerCase()));
+}
+
+/**
  * Disable foreign key constraint checks for the duration of an import
  * transaction. Dialect-agnostic — handles SQLite, Postgres, MySQL.
  * SQLite: no-op (FK checks off by default via WAL pragmas).
@@ -255,23 +862,39 @@ export function filterByTier(dbService, { tier = 'historical', models = null } =
  * role may issue — it only defers constraints declared DEFERRABLE, so it is a
  * partial measure, but it is strictly better than aborting the import.
  *
+ * ⚠️ **Must be given the transaction that does the writing.** These are SESSION
+ * variables, and every statement here goes through Sequelize's connection pool,
+ * so issued bare they land on whichever connection happens to be free and the
+ * upserts then run on a different one with checks still enabled. A Sequelize
+ * transaction holds one connection for its whole life, so passing the handle is
+ * what makes the suppression reach the rows it is meant to cover. This is the
+ * same mistake the advisory lock made — a session-scoped primitive issued
+ * through a pool — and it was found by grepping for the pattern rather than by
+ * hitting the symptom.
+ *
+ * On Postgres it is not merely safer but load-bearing: `SET CONSTRAINTS ALL
+ * DEFERRED` only applies within the current transaction, so outside one the
+ * fallback path does nothing whatsoever.
+ *
  * @param {import('sequelize').Sequelize} connector
  * @param {(level: number, msg: string) => void} [verboseLogger]
+ * @param {import('sequelize').Transaction} [transaction]
  * @returns {Promise<void>}
  */
-async function disableForeignKeyChecks(connector, verboseLogger = () => {}) {
+async function disableForeignKeyChecks(connector, verboseLogger = () => {}, transaction = null) {
   if (!connector || typeof connector.query !== 'function') return;
   const dialect = typeof connector.getDialect === 'function' ? connector.getDialect() : 'sqlite';
+  const opts = transaction ? { transaction } : {};
 
   if (dialect === 'postgres') {
     try {
-      await connector.query('SET session_replication_role = replica');
+      await connector.query('SET session_replication_role = replica', opts);
     } catch (err) {
       verboseLogger(2, `[ExportImport] session_replication_role unavailable (${err.message}) — falling back to SET CONSTRAINTS ALL DEFERRED. FK checks are only deferred for DEFERRABLE constraints.`);
-      await connector.query('SET CONSTRAINTS ALL DEFERRED');
+      await connector.query('SET CONSTRAINTS ALL DEFERRED', opts);
     }
   } else if (dialect === 'mysql') {
-    await connector.query('SET FOREIGN_KEY_CHECKS = 0');
+    await connector.query('SET FOREIGN_KEY_CHECKS = 0', opts);
   }
   // SQLite: FK checks are off by default — no-op
 }
@@ -280,23 +903,31 @@ async function disableForeignKeyChecks(connector, verboseLogger = () => {}) {
  * Re-enable foreign key constraint checks after an import transaction.
  * Mirrors disableForeignKeyChecks(), including the Postgres fallback.
  *
+ * Takes the same transaction handle, and for a second reason: MySQL does not
+ * reset session variables when a connection returns to the pool, so a
+ * connection released with `FOREIGN_KEY_CHECKS = 0` stays that way for whatever
+ * borrows it next. Restoring on the same connection that disabled it is what
+ * stops the suppression outliving the import.
+ *
  * @param {import('sequelize').Sequelize} connector
  * @param {(level: number, msg: string) => void} [verboseLogger]
+ * @param {import('sequelize').Transaction} [transaction]
  * @returns {Promise<void>}
  */
-async function enableForeignKeyChecks(connector, verboseLogger = () => {}) {
+async function enableForeignKeyChecks(connector, verboseLogger = () => {}, transaction = null) {
   if (!connector || typeof connector.query !== 'function') return;
   const dialect = typeof connector.getDialect === 'function' ? connector.getDialect() : 'sqlite';
+  const opts = transaction ? { transaction } : {};
 
   if (dialect === 'postgres') {
     try {
-      await connector.query('SET session_replication_role = DEFAULT');
+      await connector.query('SET session_replication_role = DEFAULT', opts);
     } catch (err) {
       verboseLogger(2, `[ExportImport] Could not restore session_replication_role (${err.message}) — restoring constraints via SET CONSTRAINTS ALL IMMEDIATE.`);
-      await connector.query('SET CONSTRAINTS ALL IMMEDIATE');
+      await connector.query('SET CONSTRAINTS ALL IMMEDIATE', opts);
     }
   } else if (dialect === 'mysql') {
-    await connector.query('SET FOREIGN_KEY_CHECKS = 1');
+    await connector.query('SET FOREIGN_KEY_CHECKS = 1', opts);
   }
   // SQLite: no-op
 }
@@ -354,12 +985,19 @@ function enforceJsonRetention(dir, maxCount) {
  * and runs findAll({ raw: true }) on each included table. Per-table
  * try-catch — a single failure does not abort the whole export.
  *
+ * `allServers: false` adds a WHERE to every server-scoped table. Global
+ * tables are exported whole regardless, because there is no per-server
+ * subset of them — which also means a "one server" envelope still carries
+ * community-wide rows, and an import of it still touches the community.
+ *
  * @param {object} dbService - DBService instance
  * @param {object} [options]
  * @param {string} [options.tier='historical'] - 'historical', 'logs', or 'all'
- * @returns {Promise<object>} { tables, rowCounts, results, s3ExportVersion, exportedAt, connector }
+ * @param {string[]|null} [options.models=null] - Explicit model allowlist
+ * @param {boolean} [options.allServers=true] - False narrows to this server
+ * @returns {Promise<object>} { tables, rowCounts, results, complete, s3ExportVersion, exportedAt, connector, serverID, scope, containedServerIDs }
  */
-export async function exportToJSON(dbService, { tier = 'historical', models = null } = {}) {
+export async function exportToJSON(dbService, { tier = 'historical', models = null, allServers = true } = {}) {
   if (!dbService || !dbService.isReady()) {
     throw new Error('DBService is not ready.');
   }
@@ -379,6 +1017,13 @@ export async function exportToJSON(dbService, { tier = 'historical', models = nu
     s3ExportVersion: 1,
     exportedAt: Date.now(),
     connector: connectorName,
+    // Who took it and what it claims to cover. `scope` is the operator's
+    // intent and `containedServerIDs` is what the rows actually say, and they
+    // are separate fields because they disagree in the case that matters: a
+    // scoped export of a table whose serverID column has not landed yet
+    // contains rows attributed to nobody.
+    serverID: dbService.getServerID?.() ?? null,
+    scope: allServers ? 'community' : 'server',
     tier,
     tiers: Object.fromEntries(selected.map((name) => [name, dbService.getEffectiveModelTier(name)])),
     tables: {},
@@ -406,10 +1051,21 @@ export async function exportToJSON(dbService, { tier = 'historical', models = nu
 
   const present = selected.filter((name) => dbService.getModel(name));
 
+  const contained = new Set();
+  let truncated = false;
+
   for (const name of present) {
     const model = dbService.getModel(name);
     try {
-      const rows = await model.findAll({ raw: true });
+      const scope = exportScopeFor(dbService, name, allServers);
+      const query = { raw: true };
+      if (scope && !allServers) query.where = { [scope.column]: scope.value };
+      const rows = await model.findAll(query);
+      if (scope) {
+        for (const row of rows) {
+          if (!noteServerID(contained, row[scope.column])) { truncated = true; break; }
+        }
+      }
       result.tables[name] = rows;
       result.rowCounts[name] = rows.length;
       result.results[name] = { status: 'ok', rows: rows.length };
@@ -418,7 +1074,72 @@ export async function exportToJSON(dbService, { tier = 'historical', models = nu
     }
   }
 
+  result.containedServerIDs = [...contained].sort((a, b) => a - b);
+  if (truncated) result.containedServerIDsTruncated = true;
+
+  await _stampCoverage(dbService, result, { requested: models, selected, tier, results: result.results });
+
   return result;
+}
+
+/**
+ * Record, on the envelope itself, how much of what it claims to cover it
+ * actually covers. Shared by both exporters so the two cannot drift.
+ *
+ * Three fields, kept separate on purpose because they carry different weight:
+ *
+ *   `complete` / `incomplete`   The hard signal, and the narrow one: a model the
+ *                               export was asked for that left no trace in the
+ *                               envelope at all. A caller treating this file as
+ *                               a safety net — the pre-migration backup — must
+ *                               refuse it when this is false.
+ *   `failedTables`              A table the exporter tried and could not read.
+ *                               Loud already, since its driver message is in
+ *                               `results`, and survivable: a drifted table fails
+ *                               every read until the migration repairs it.
+ *   `unexportedTables`          Informational, and only for an export claiming
+ *                               the whole database. Names tables the process
+ *                               could not have exported because nothing
+ *                               registered a model for them. A shared database
+ *                               has these legitimately, so it is a warning.
+ */
+async function _stampCoverage(dbService, envelope, { requested, selected, tier, results }) {
+  const asked = Array.isArray(requested) && requested.length > 0 ? requested : selected;
+  const { missing, failed } = findEnvelopeGaps(asked, results);
+
+  envelope.complete = missing.length === 0;
+  if (missing.length > 0) envelope.incomplete = missing;
+
+  if (failed.length > 0) {
+    // A table the database does not have yet is not a failure worth reporting.
+    // This is the ordinary shape of a fresh install: v1 creates the table, v2
+    // changes it, both are pending, and the backup is scoped from the union of
+    // what they touch — so the export is asked for a table that will not exist
+    // until the run it is protecting.
+    const absent = await findAbsentTables(dbService, failed.map((g) => g.model));
+    if (absent.size > 0) envelope.absentTables = [...absent];
+    const real = failed.filter((g) => !absent.has(g.model));
+    if (real.length > 0) envelope.failedTables = real;
+  }
+
+  // Only an export with no model allowlist, at the widest tier, is claiming to
+  // be the database. A scoped or tiered export never made that claim, and
+  // listing "unexported" tables against it would be noise.
+  const claimsWholeDatabase = !(Array.isArray(requested) && requested.length > 0) && tier === 'all';
+  if (!claimsWholeDatabase) return;
+
+  const exported = Object.keys(results).filter((name) => results[name]?.status === 'ok');
+  const unexported = await findUnexportedTables(dbService, exported);
+  if (unexported.length === 0) return;
+
+  envelope.unexportedTables = unexported;
+  envelope.warnings = envelope.warnings || [];
+  envelope.warnings.push(
+    `This export covers ${exported.length} registered model(s) and is NOT a backup of the database: ` +
+    `${unexported.length} table(s) present in it have no registered model and were not exported — ` +
+    `${unexported.join(', ')}. Tables owned by other plugins appear here whenever those plugins are ` +
+    'not mounted in this process.'
+  );
 }
 
 /**
@@ -429,17 +1150,43 @@ export async function exportToJSON(dbService, { tier = 'historical', models = nu
  * table does not abort previously imported tables. FK checks are
  * disabled for the transaction duration.
  *
+ * Rows belonging to a sibling server are SKIPPED unless the caller asks for
+ * them, and the two ways of asking mean different things — see
+ * makeImportPolicy(). Rows carrying no server id are adopted by this server
+ * whatever the flags say, because that is every pre-multi-server backup.
+ *
+ * The returned `plan` is what the write was agreed to on the strength of:
+ * per table, how many rows are written, adopted, remapped, left with a
+ * sibling, skipped, and — the one an operator most needs — overwritten, with
+ * the servers those existing rows currently belong to.
+ *
  * @param {object} dbService - DBService instance
  * @param {object} json - The export object from exportToJSON()
  * @param {object} [options]
  * @param {boolean} [options.dryRun=false] - If true, validate only (no writes)
  * @param {function} [options.localize] - Message lookup; pass plugin.localize
  *                                        when the result is rendered to Discord
- * @returns {Promise<{ imported: object, errors: string[] }>}
+ * @param {boolean} [options.allServers=false] - Write foreign rows as they are
+ * @param {boolean} [options.remapServer=false] - Rewrite foreign rows to this server
+ * @returns {Promise<{ imported: object, errors: string[], plan: object }>}
  */
-export async function importFromJSON(dbService, json, { dryRun = false, localize = localizeEn } = {}) {
+export async function importFromJSON(dbService, json, {
+  dryRun = false,
+  localize = localizeEn,
+  allServers = false,
+  remapServer = false
+} = {}) {
   if (!dbService || !dbService.isReady()) {
     throw new Error('DBService is not ready.');
+  }
+
+  // Two different intentions, not two degrees of one. `--all-servers` restores
+  // each row to the server it names; `--remap-server` folds every row onto this
+  // one. An operator who typed both has not said which, and guessing picks
+  // between "leave rows nothing on this install can read" and "merge two
+  // servers' histories" on their behalf.
+  if (allServers && remapServer) {
+    return { imported: {}, errors: [localize('slackersSquadServices.db.importFlagsConflict')] };
   }
 
   const validation = await validateImportStructure(json, dbService.getModelNames(), localize);
@@ -454,72 +1201,110 @@ export async function importFromJSON(dbService, json, { dryRun = false, localize
   const connector = dbService.getConnector();
   const result = { imported: {}, errors: [...validation.warnings] };
 
+  // Worked out before anything is written, and returned either way. A dry run
+  // renders it as the confirmation; a real run carries it so the summary can
+  // say what the write was agreed to on the strength of.
+  const plan = await planImport(dbService, json, { allServers, remapServer });
+  result.plan = plan;
+
+  /** Turn one table's plan entry into the line the caller reports. */
+  const reportFor = (name, entry, extra = {}) => {
+    if (entry.status === 'skipped') {
+      return {
+        status: 'skipped',
+        rows: 0,
+        reason: localize('slackersSquadServices.db.importNotRestorable', { table: name }),
+        ...extra
+      };
+    }
+    if (entry.status === 'unknown') {
+      // Loud, and per table. This used to be a warning in a list beside a
+      // per-table "Model not found", inside a result whose other lines were
+      // ticks — which is how a whole table goes missing from a restore that
+      // reads as a success.
+      return {
+        status: 'error',
+        rows: 0,
+        error: localize('slackersSquadServices.db.importNoModelForTable', { table: name, rows: String(entry.total) }),
+        ...extra
+      };
+    }
+    if (entry.status === 'error') {
+      return { status: 'error', rows: 0, error: entry.error, ...extra };
+    }
+    return {
+      status: 'ok',
+      rows: entry.write + entry.stamp + entry.remap + entry.foreign,
+      ...(entry.stamp > 0 ? { stamped: entry.stamp } : {}),
+      ...(entry.remap > 0 ? { remapped: entry.remap } : {}),
+      ...(entry.foreign > 0 ? { foreign: entry.foreign } : {}),
+      ...(entry.skip > 0 ? { skippedRows: entry.skip, skippedServerIDs: entry.skipServerIDs } : {}),
+      ...(entry.overwrite ? { overwrite: entry.overwrite, overwriteServerIDs: entry.overwriteServerIDs } : {}),
+      ...extra
+    };
+  };
+
   if (dryRun) {
-    // Dry run: report what would be imported without writing
-    for (const [tableName, rows] of Object.entries(json.tables)) {
-      result.imported[tableName] = { status: 'ok', rows: rows.length, dryRun: true };
+    // A dry run has to predict the real run exactly, which is why both read the
+    // same plan rather than each deciding the rules for themselves.
+    for (const [name, entry] of Object.entries(plan.tables)) {
+      result.imported[name] = reportFor(name, entry, { dryRun: true });
     }
     return result;
   }
 
-  // Execute inside a single transaction
+  /**
+   * Write one table's importable rows, re-deriving the same decisions the plan
+   * made. Re-derived rather than carried: the rows are already in memory here,
+   * and holding a second copy of every table alongside the envelope is what
+   * this module spent a release learning not to do.
+   */
+  const writeTable = async (name, model, transaction) => {
+    const policy = makeImportPolicy(dbService, name, model, { allServers, remapServer });
+    let written = 0;
+    for (const row of json.tables[name]) {
+      const decision = policy.classify(row);
+      if (decision.action === IMPORT_ROW_ACTIONS.SKIP) continue;
+      await model.upsert(decision.row, transaction ? { transaction } : {});
+      written += 1;
+    }
+    return written;
+  };
+
+  /** Every table's write, in envelope order, with per-table isolation. */
+  const importAll = async (transaction) => {
+    for (const [name, entry] of Object.entries(plan.tables)) {
+      if (entry.status !== 'ok') {
+        result.imported[name] = reportFor(name, entry);
+        continue;
+      }
+
+      const model = dbService.getModel(name);
+      try {
+        const written = await writeTable(name, model, transaction);
+        result.imported[name] = reportFor(name, entry, { rows: written });
+      } catch (err) {
+        result.imported[name] = { status: 'error', error: err.message };
+      }
+    }
+  };
+
   if (connector && typeof connector.transaction === 'function') {
     const fkLogger = typeof dbService.verboseLogger === 'function' ? dbService.verboseLogger : () => {};
-    await disableForeignKeyChecks(connector, fkLogger);
-    try {
-      await connector.transaction(async (transaction) => {
-        for (const [tableName, rows] of Object.entries(json.tables)) {
-          const model = dbService.getModel(tableName);
-          if (!model) {
-            result.imported[tableName] = { status: 'error', error: 'Model not found' };
-            continue;
-          }
-
-          if (rows.length === 0) {
-            result.imported[tableName] = { status: 'ok', rows: 0 };
-            continue;
-          }
-
-          try {
-            let upserted = 0;
-            for (const row of rows) {
-              await model.upsert(row, { transaction });
-              upserted += 1;
-            }
-            result.imported[tableName] = { status: 'ok', rows: upserted };
-          } catch (err) {
-            result.imported[tableName] = { status: 'error', error: err.message };
-          }
-        }
-      });
-    } finally {
-      await enableForeignKeyChecks(connector, fkLogger);
-    }
+    await connector.transaction(async (transaction) => {
+      // Inside the transaction, not around it. These are session variables and
+      // every statement goes through the pool — see disableForeignKeyChecks().
+      await disableForeignKeyChecks(connector, fkLogger, transaction);
+      try {
+        await importAll(transaction);
+      } finally {
+        // Before the connection goes back to the pool, not after.
+        await enableForeignKeyChecks(connector, fkLogger, transaction);
+      }
+    });
   } else {
     // Fallback: no transaction support — upsert directly
-    for (const [tableName, rows] of Object.entries(json.tables)) {
-      const model = dbService.getModel(tableName);
-      if (!model) {
-        result.imported[tableName] = { status: 'error', error: 'Model not found' };
-        continue;
-      }
-
-      if (rows.length === 0) {
-        result.imported[tableName] = { status: 'ok', rows: 0 };
-        continue;
-      }
-
-      try {
-        let upserted = 0;
-        for (const row of rows) {
-          await model.upsert(row);
-          upserted += 1;
-        }
-        result.imported[tableName] = { status: 'ok', rows: upserted };
-      } catch (err) {
-        result.imported[tableName] = { status: 'error', error: err.message };
-      }
-    }
+    await importAll(null);
   }
 
   return result;
@@ -736,11 +1521,17 @@ class _BufferedWriter {
  *
  * Composite or absent primary keys fall back to OFFSET: correct, just slower.
  *
+ * A scope predicate is combined with the cursor under `Op.and` rather than
+ * merged into one object, because for a `server-key` model the two clauses
+ * name the SAME column — the primary key IS the server id — and a plain
+ * spread would drop whichever clause was written first.
+ *
  * @param {object} model - Sequelize model
  * @param {number} batchSize
+ * @param {object|null} [where] - Scope predicate applied to every page
  * @yields {object[]} A batch of raw rows
  */
-async function* _iterateRowBatches(model, batchSize) {
+async function* _iterateRowBatches(model, batchSize, where = null) {
   const pkAttrs = Array.isArray(model.primaryKeyAttributes) ? model.primaryKeyAttributes : [];
   const Op = model.sequelize?.constructor?.Op || model.sequelize?.Sequelize?.Op || SequelizeLib.Op;
   const pk = pkAttrs.length === 1 && Op ? pkAttrs[0] : null;
@@ -749,7 +1540,11 @@ async function* _iterateRowBatches(model, batchSize) {
     let last = null;
     for (;;) {
       const query = { raw: true, order: [[pk, 'ASC']], limit: batchSize };
-      if (last !== null) query.where = { [pk]: { [Op.gt]: last } };
+      const clauses = [];
+      if (where) clauses.push(where);
+      if (last !== null) clauses.push({ [pk]: { [Op.gt]: last } });
+      if (clauses.length === 1) query.where = clauses[0];
+      else if (clauses.length > 1) query.where = { [Op.and]: clauses };
       const rows = await model.findAll(query);
       if (rows.length === 0) return;
       yield rows;
@@ -761,7 +1556,9 @@ async function* _iterateRowBatches(model, batchSize) {
   } else {
     let offset = 0;
     for (;;) {
-      const rows = await model.findAll({ raw: true, limit: batchSize, offset });
+      const query = { raw: true, limit: batchSize, offset };
+      if (where) query.where = where;
+      const rows = await model.findAll(query);
       if (rows.length === 0) return;
       yield rows;
       offset += rows.length;
@@ -798,14 +1595,20 @@ async function* _iterateRowBatches(model, batchSize) {
  * @param {number} [options.retention=5] - Max JSON backup files to keep
  * @param {string[]|null} [options.models=null] - Explicit model allowlist
  * @param {number} [options.batchSize] - Rows per query
+ * @param {boolean} [options.allServers=true] - False narrows to this server
  * @param {(level:number,msg:string)=>void} [options.verboseLogger]
- * @returns {Promise<{ filename: string, path: string, sizeBytes: number, rowCounts: object, results: object, warnings: string[], connector: string, tier: string }|null>}
+ * @returns {Promise<{ filename: string, path: string, sizeBytes: number, rowCounts: object, results: object, warnings: string[], complete: boolean, incomplete?: Array<{model: string, reason: string}>, unexportedTables?: string[], connector: string, tier: string }|null>}
  */
 export async function exportToFile(dbService, backupDir = null, {
   tier = 'all',
   retention = 5,
   models = null,
   batchSize = DEFAULT_BATCH_SIZE,
+  // Community-wide by default, unlike the operator-facing `!s3 db export`.
+  // The first caller of this function is MigrationEngine's pre-migration
+  // backup, and a shared schema migrates for every server at once — a backup
+  // holding one server's rows would be no use to the restore that needs it.
+  allServers = true,
   verboseLogger = () => {}
 } = {}) {
   if (!dbService || !dbService.isReady()) {
@@ -853,6 +1656,15 @@ export async function exportToFile(dbService, backupDir = null, {
   }
   const present = selected.filter((name) => dbService.getModel(name));
 
+  // Filled in by _stampCoverage() once the tables have streamed, then written
+  // into the tail of the file and returned to the caller.
+  const coverage = { warnings };
+
+  // Accumulated while streaming rather than queried, so it costs nothing on
+  // top of a pass the export was making anyway.
+  const contained = new Set();
+  let truncated = false;
+
   const backupFilename = `s3backup-${timestampString(Date.now())}.json`;
   const backupPath = path.join(resolvedDir, backupFilename);
   const partialPath = `${backupPath}.partial`;
@@ -866,9 +1678,13 @@ export async function exportToFile(dbService, backupDir = null, {
     await w.write(`  "s3StreamFormat": ${STREAM_FORMAT_VERSION},\n`);
     await w.write(`  "exportedAt": ${Date.now()},\n`);
     await w.write(`  "connector": ${JSON.stringify(connectorName)},\n`);
+    await w.write(`  "serverID": ${JSON.stringify(dbService.getServerID?.() ?? null)},\n`);
+    await w.write(`  "scope": ${JSON.stringify(allServers ? 'community' : 'server')},\n`);
     await w.write(`  "tier": ${JSON.stringify(tier)},\n`);
     await w.write(`  "tiers": ${JSON.stringify(Object.fromEntries(selected.map((n) => [n, dbService.getEffectiveModelTier(n)])))},\n`);
-    if (warnings.length > 0) await w.write(`  "warnings": ${JSON.stringify(warnings)},\n`);
+    // `warnings` is written in the tail, not here: the coverage assertion below
+    // can only be made once every table has streamed, and one warnings array is
+    // easier to read than two keys that mean the same thing.
     await w.write('  "tables": {\n');
 
     let firstTable = true;
@@ -880,11 +1696,14 @@ export async function exportToFile(dbService, backupDir = null, {
       const model = dbService.getModel(name);
       let count = 0;
       try {
-        for await (const batch of _iterateRowBatches(model, batchSize)) {
+        const scope = exportScopeFor(dbService, name, allServers);
+        const where = scope && !allServers ? { [scope.column]: scope.value } : null;
+        for await (const batch of _iterateRowBatches(model, batchSize, where)) {
           let chunk = '';
           for (const row of batch) {
             chunk += (count === 0 ? '' : ',\n') + JSON.stringify(row);
             count += 1;
+            if (scope && !noteServerID(contained, row[scope.column])) truncated = true;
           }
           await w.write(chunk);
         }
@@ -899,7 +1718,21 @@ export async function exportToFile(dbService, backupDir = null, {
     }
 
     await w.write('\n  },\n');
+
+    // Coverage goes in the file, not only in the return value. The return value
+    // is gone the moment the command that took the backup finishes; the file is
+    // what somebody reads six months later while deciding whether to trust it.
+    await _stampCoverage(dbService, coverage, { requested: models, selected, tier, results });
+
+    await w.write(`  "containedServerIDs": ${JSON.stringify([...contained].sort((a, b) => a - b))},\n`);
+    if (truncated) await w.write('  "containedServerIDsTruncated": true,\n');
     await w.write(`  "rowCounts": ${JSON.stringify(rowCounts)},\n`);
+    if (coverage.warnings.length > 0) await w.write(`  "warnings": ${JSON.stringify(coverage.warnings)},\n`);
+    await w.write(`  "complete": ${JSON.stringify(coverage.complete)},\n`);
+    if (coverage.incomplete) await w.write(`  "incomplete": ${JSON.stringify(coverage.incomplete)},\n`);
+    if (coverage.absentTables) await w.write(`  "absentTables": ${JSON.stringify(coverage.absentTables)},\n`);
+    if (coverage.failedTables) await w.write(`  "failedTables": ${JSON.stringify(coverage.failedTables)},\n`);
+    if (coverage.unexportedTables) await w.write(`  "unexportedTables": ${JSON.stringify(coverage.unexportedTables)},\n`);
     await w.write(`  "results": ${JSON.stringify(results)}\n`);
     await w.write('}\n');
     await w.flush();
@@ -938,9 +1771,18 @@ export async function exportToFile(dbService, backupDir = null, {
     sizeBytes: writtenStat.size,
     rowCounts,
     results,
-    warnings,
+    warnings: coverage.warnings,
+    complete: coverage.complete,
+    incomplete: coverage.incomplete,
+    absentTables: coverage.absentTables,
+    failedTables: coverage.failedTables,
+    unexportedTables: coverage.unexportedTables,
     connector: connectorName,
-    tier
+    tier,
+    serverID: dbService.getServerID?.() ?? null,
+    scope: allServers ? 'community' : 'server',
+    containedServerIDs: [...contained].sort((a, b) => a - b),
+    containedServerIDsTruncated: truncated || undefined
   };
 }
 
@@ -1078,9 +1920,18 @@ export async function importFromStreamFile(dbService, backupPath, {
     if (dryRun || rows.length === 0) return;
     if (connector && typeof connector.transaction === 'function') {
       // No CLS in this codebase — the transaction handle has to be passed
-      // explicitly to every call inside it.
+      // explicitly to every call inside it. That includes the FK suppression:
+      // this path has no single enclosing transaction to hang it on, so each
+      // chunk suppresses and restores on its own pinned connection. Slightly
+      // more statements than one bare SET at the top; the bare SET reached a
+      // connection the writes never used.
       await connector.transaction(async (transaction) => {
-        for (const row of rows) await model.upsert(row, { transaction });
+        if (!dryRun) await disableForeignKeyChecks(connector, fkLogger, transaction);
+        try {
+          for (const row of rows) await model.upsert(row, { transaction });
+        } finally {
+          if (!dryRun) await enableForeignKeyChecks(connector, fkLogger, transaction);
+        }
       });
     } else {
       for (const row of rows) await model.upsert(row);
@@ -1091,15 +1942,25 @@ export async function importFromStreamFile(dbService, backupPath, {
   const rl = readline.createInterface({ input, crlfDelay: Infinity });
 
   let inTables = false;
-  /** @type {{name:string, model:object|null, buffer:object[], count:number, failed:boolean}|null} */
+  /** @type {{name:string, model:object|null, skipped:boolean, buffer:object[], count:number, stamped:number, stamp:(row:object)=>object, failed:boolean}|null} */
   let current = null;
 
   const finishTable = async () => {
     if (!current) return;
+    if (current.skipped) {
+      result.imported[current.name] = {
+        status: 'skipped',
+        rows: 0,
+        reason: localize('slackersSquadServices.db.importNotRestorable', { table: current.name }),
+        ...(dryRun ? { dryRun: true } : {})
+      };
+      current = null;
+      return;
+    }
     if (current.model && !current.failed) {
       try {
         await upsertChunk(current.model, current.buffer);
-        result.imported[current.name] = { status: 'ok', rows: current.count, ...(dryRun ? { dryRun: true } : {}) };
+        result.imported[current.name] = { status: 'ok', rows: current.count, ...(dryRun ? { dryRun: true } : {}), ...(current.stamped > 0 ? { stamped: current.stamped } : {}) };
       } catch (err) {
         result.imported[current.name] = { status: 'error', error: err.message, rows: current.count };
       }
@@ -1109,7 +1970,8 @@ export async function importFromStreamFile(dbService, backupPath, {
     current = null;
   };
 
-  if (!dryRun) await disableForeignKeyChecks(connector, fkLogger);
+  // FK suppression lives in upsertChunk(), pinned to each chunk's transaction —
+  // issued here it would land on a pooled connection the writes never touch.
   try {
     for await (const rawLine of rl) {
       const line = rawLine.replace(/\r$/, '');
@@ -1123,11 +1985,29 @@ export async function importFromStreamFile(dbService, backupPath, {
         const opened = line.match(/^ {4}("(?:[^"\\]|\\.)*"): \[$/);
         if (opened) {
           const name = JSON.parse(opened[1]);
-          const model = known.has(name) ? dbService.getModel(name) : null;
-          if (!model) {
+          const skipped = IMPORT_SKIPPED_MODELS.has(name);
+          // A skipped table carries no model deliberately: every guard below
+          // already declines to parse or buffer rows for a table without one,
+          // so the skip costs one flag rather than a second condition on each
+          // of them. The flag is what keeps it out of the unknown-table
+          // warning — being passed over on purpose is not a malformed file.
+          const model = (!skipped && known.has(name)) ? dbService.getModel(name) : null;
+          if (!model && !skipped) {
             result.errors.push(localize('slackersSquadServices.db.importUnknownTableSkippedStream', { table: name }));
           }
-          current = { name, model, buffer: [], count: 0, failed: false };
+          current = {
+            name,
+            model,
+            skipped,
+            buffer: [],
+            count: 0,
+            stamped: 0,
+            // Resolved once per table rather than per row: the scope lookup and
+            // the attribute check do not change between rows, and this path
+            // exists for files with millions of them.
+            stamp: model ? makeServerIDStamper(dbService, name, model) : (row) => row,
+            failed: false
+          };
           continue;
         }
         // `  },` closes the tables object; everything after it is trailer
@@ -1156,7 +2036,11 @@ export async function importFromStreamFile(dbService, backupPath, {
         continue;
       }
 
-      current.buffer.push(row);
+      // Stamped at buffer time, not at write time, so a dry run counts what a
+      // real run would stamp without writing anything.
+      const toWrite = current.stamp(row);
+      if (toWrite !== row) current.stamped += 1;
+      current.buffer.push(toWrite);
       current.count += 1;
       if (current.buffer.length >= chunkSize) {
         const batch = current.buffer;
@@ -1173,7 +2057,6 @@ export async function importFromStreamFile(dbService, backupPath, {
   } finally {
     rl.close();
     input.destroy();
-    if (!dryRun) await enableForeignKeyChecks(connector, fkLogger);
   }
 
   verboseLogger(2, `[ExportImport] Streamed import of ${path.basename(backupPath)}: ${Object.keys(result.imported).length} table(s).`);
@@ -1221,6 +2104,40 @@ export async function restoreFromFile(filename, dbService, backupDir = null, dbP
     if (!dbPath) {
       throw new Error('dbPath is required for .sqlite backup restore.');
     }
+
+    // The one operation here whose honest answer is "unsafe" rather than
+    // "unrouted". A .sqlite restore is fs.copyFileSync() over the database
+    // file, and a sibling process holds that same file open with its own page
+    // cache and its own write-ahead log. Replacing it underneath that process
+    // does not roll it back — it leaves it reading pages that no longer belong
+    // to the file it thinks it opened, and the damage surfaces minutes later
+    // as unreadable rows rather than as an error anyone can connect to this
+    // command. So it is refused rather than warned about. The refusal lifts
+    // itself: stop the other servers, and their heartbeats lapse out of the
+    // freshness window on their own.
+    let liveSiblings = [];
+    try {
+      if (dbService && typeof dbService.getLiveServers === 'function') {
+        const me = dbService.getServerID();
+        liveSiblings = (await dbService.getLiveServers()).filter((row) => row.serverID !== me);
+      }
+    } catch {
+      // A registry that cannot be read looks like the single-server case from
+      // here, and refusing every restore because the check itself failed would
+      // cost more than the hazard it guards.
+      liveSiblings = [];
+    }
+    if (liveSiblings.length > 0) {
+      const who = liveSiblings.map((row) => `#${row.serverID}`).join(', ');
+      throw new Error(
+        `Refusing to restore ${filename} by file copy: ${liveSiblings.length} other server ` +
+        `process${liveSiblings.length === 1 ? ' is' : 'es are'} live on this database (${who}). ` +
+        'Overwriting the file underneath them corrupts it rather than rolling it back. Stop ' +
+        'them and retry, or restore from a .json backup, which writes through the database ' +
+        'instead of around it.'
+      );
+    }
+
     return restoreBackup(filename, dbPath, resolvedDir);
   }
 
@@ -1260,7 +2177,15 @@ export async function restoreFromFile(filename, dbService, backupDir = null, dbP
       throw new Error('Failed to parse JSON backup file.');
     }
 
-    return importFromJSON(dbService, parsed, { dryRun: false, localize });
+    // Community-wide, deliberately, and not the default `!s3 db import` uses.
+    // An import takes a file an operator chose, so it narrows to this server
+    // until told otherwise. A backup is not an arbitrary file: both
+    // `!s3 backup create` and MigrationEngine's pre-migration backup write
+    // every server's rows, and this is the path that puts them back. A
+    // rollback that quietly omitted the siblings would restore a database that
+    // never existed. The streaming path above reaches the same place through
+    // makeServerIDStamper(), which writes each row back to the server it names.
+    return importFromJSON(dbService, parsed, { dryRun: false, localize, allServers: true });
   }
 
   throw new Error(`Unrecognized backup format: ${filename}. Expected .sqlite or .json.`);

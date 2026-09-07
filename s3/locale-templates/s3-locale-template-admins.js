@@ -1,6 +1,6 @@
 /**
  * ─────────────────────────────────────────────────────────────────
- *  ADMIN-FACING TRANSLATION TEMPLATE — 1158 strings
+ *  ADMIN-FACING TRANSLATION TEMPLATE — 1306 strings
  * ─────────────────────────────────────────────────────────────────
  *
  *  GENERATED FILE — do not edit in place.
@@ -39,7 +39,7 @@
  *
  *  Strings only your staff can reach: replies to admin-gated commands, the
  *  scramble and diagnostic reports in your staff channel, and the admin half
- *  of !elo. 1158 strings — the bulk of what an admin reads day to day,
+ *  of !elo. 1306 strings — the bulk of what an admin reads day to day,
  *  but read by a handful of people who opted into running the thing, so a
  *  missed one costs far less than a missed broadcast.
  *
@@ -63,6 +63,36 @@ export const MESSAGES = {
       // EN: Slackers Squad Services
       embedFooter: '',
     },
+  },
+  s3ServerLabel: {
+    // EN: {alias}
+    footer: '',
+  },
+  s3LiveContext: {
+    // EN: {players} players, {elapsed} into the round, {layer}
+    line: '',
+    // EN: seeding — {players} players, {elapsed} into the round, {layer}
+    seedingLine: '',
+    // EN: {minutes}m
+    elapsedMinutes: '',
+    // EN: unknown time
+    elapsedUnknown: '',
+    // EN: layer unknown
+    layerUnknown: '',
+  },
+  s3Confirm: {
+    // EN: About to act on {server} — {context}.
+    target: '',
+    // EN: About to act on data shared by all {count} registered servers, not only {server}.
+    targetCommunity: '',
+    // EN: Confirm with: {command} {token}
+    token: '',
+    // EN: Expires in {seconds}s.
+    expires: '',
+    // EN: Cannot read what is happening on {server} right now, so there is nothing to confirm against. Try again once it has reported in.
+    contextUnavailable: '',
+    // EN: No pending action matches that token. It may have expired, or another admin may have already completed it.
+    unknownToken: '',
   },
   s3PluginBase: {
     errors: {
@@ -90,6 +120,110 @@ export const MESSAGES = {
       descriptionSummary: '',
       // EN: Schema drift detected — use `!s3 migrate verify` for details.
       descriptionFallback: '',
+    },
+    routing: {
+      // EN: ⛔ Which Server?
+      selectorRequiredTitle: '',
+      // EN: `{command}` acts on one server, and this database has more than one registered — so it has to be told which:\n\n{candidates}\n\nAdd `--server <alias>` (or `-s <alias>`) and send it again. Nothing was done.\n\nThere is deliberately no remembered target. A channel that quietly holds a server gives a correct-looking answer about the wrong one, and the scrollback contains nothing that explains why.
+      selectorRequiredDescription: '',
+      // EN: ⛔ That Server Is Not Answering
+      unreachableTitle: '',
+      // EN: `{token}` names a registered server, but no process has written a heartbeat for it recently — so nothing would have run and nothing was done.\n\n{candidates}\n\nStart that server's SquadJS, or target one that is live. The registration is left alone: a stopped server is still a server the community owns, and `!s3 servers forget` is the command that removes one.
+      unreachableDescription: '',
+      // EN: ⛔ Which Server?
+      selectorMissingValueTitle: '',
+      // EN: `--server` was given with nothing after it, so nothing was done. Name one of these:\n\n{candidates}
+      selectorMissingValueDescription: '',
+    },
+    serverRegistry: {
+      // EN: ⛔ Server Identity Collision
+      collisionTitle: '',
+      // EN: Another SquadJS process is already live under server id `{serverID}` — its `{fields}` differ from this one, and it was last seen {age}s ago.\n\nThe server-scoped plugins have refused to mount so the two installs do not write into each other's rows. Give each install its own `overrideServerID`, or set `forceServerClaim` on S³ if this is a port change rather than a second server.
+      collisionDescription: '',
+      // EN: S³ Server Registry
+      collisionFooter: '',
+      // EN: ⛔ Suite Version Mismatch
+      versionMismatchTitle: '',
+      // EN: This install is on `{version}`, and {others} is live on the same database.\n\nThe server-scoped plugins have refused to mount. A mixed pair is not a degraded state that limps along: the older process writes against a schema it does not know about, and a community-wide command answered by it runs a superseded handler against shared data — neither of which announces itself.\n\nStop every process in the community, upgrade them all to the same version, then start them.
+      versionMismatchDescription: '',
+    },
+    servers: {
+      // EN: 🖥️ Server Registry
+      title: '',
+      // EN: The database service is not mounted, so there is no registry to read. Every other server-scoped command is unavailable for the same reason.
+      registryUnavailable: '',
+      // EN: No server has registered yet. A row is written at mount, so an empty registry means no S³ install has finished starting against this database.
+      empty: '',
+      // EN: **{registered}** registered, **{live}** live.\n\nRegistered is what the `--server` selectors count — a stale row is still a server the community owns. Live means a heartbeat inside the freshness window.
+      summary: '',
+      // EN: _none_
+      noneRegistered: '',
+      // EN: _unnamed_
+      unnamed: '',
+      // EN: **← this server**
+      thisServer: '',
+      // EN: 🟢 live
+      stateLive: '',
+      // EN: ⚪ stale
+      stateStale: '',
+      // EN: {state} · last seen {age} ago
+      lastSeenLine: '',
+      // EN: Suite `{version}`
+      suiteVersionLine: '',
+      // EN: `{host}:{queryPort}` · RCON `{rconPort}`
+      addressLine: '',
+      // EN: Clock skew `{skew}ms` against the database
+      clockSkewLine: '',
+      // EN: Options: `{options}`
+      optionsLine: '',
+      // EN: ⚠️ Configuration Divergence
+      configHeading: '',
+      // EN: • {disagreement} — resolved community-wide to `{server}`’s value, the lowest registered. Every server reads that one, including on the switch path.
+      configResolvedLine: '',
+      // EN: • {disagreement} — the housekeeping writes that read it are declining until these agree. Nothing is deleted while this stands.
+      configRefuseLine: '',
+      // EN: • {disagreement} — allowed to differ. Each server applies its own to its own rounds before anything shared is written.
+      configDifferLine: '',
+      // EN: S³ Server Registry — a version or option mismatch above is a real disagreement, not a display artefact
+      footer: '',
+      // EN: ⛔ Ambiguous Server
+      ambiguousTitle: '',
+      // EN: `{token}` matches more than one registered server, so nothing was done. Name one of these instead:\n\n{candidates}
+      ambiguousDescription: '',
+      // EN: ⛔ No Such Server
+      notFoundTitle: '',
+      // EN: Nothing is registered under `{token}`. Registered servers:\n\n{candidates}
+      notFoundDescription: '',
+      // EN: ℹ️ Usage
+      aliasUsageTitle: '',
+      // EN: `!s3 servers alias <server> <newAlias>`\n\n`<server>` is an existing alias or a numeric server id. The new alias is lowercased and stripped to letters, digits, `-` and `_`; it must be at least two edits away from every other alias, so `main` and `mains` cannot both exist.
+      aliasUsage: '',
+      // EN: ✅ Alias Set
+      aliasSetTitle: '',
+      // EN: Server `{serverID}` was {previous} and now answers to `{alias}`.
+      aliasSet: '',
+      // EN: ⛔ Alias Refused
+      aliasRefusedTitle: '',
+      // EN: Nothing was changed: {reason}
+      aliasRefused: '',
+      // EN: ℹ️ Usage
+      forgetUsageTitle: '',
+      // EN: `!s3 servers forget <server>`\n\nRemoves a retired server from the registry. Only works on a server that has stopped heartbeating — forgetting a running one deletes the row it is about to write again.
+      forgetUsage: '',
+      // EN: ✅ Server Forgotten
+      forgottenTitle: '',
+      // EN: {server} has been removed from the registry. Its historical rows are untouched; only the registration is gone.
+      forgotten: '',
+      // EN: ⛔ Not Forgotten
+      forgetRefusedTitle: '',
+      // EN: Nothing was removed: {reason}
+      forgetRefused: '',
+      // EN: That is this server. A process cannot deregister itself — it would write the row straight back on its next heartbeat. Run the command from another server, or stop this one first.
+      forgetSelf: '',
+      // EN: ℹ️ Usage
+      unknownSubTitle: '',
+      // EN: `{sub}` is not a `!s3 servers` subcommand. Use `!s3 servers` to list the registry, `!s3 servers alias <server> <newAlias>` to rename one, or `!s3 servers forget <server>` to retire one.
+      unknownSub: '',
     },
     status: {
       // EN: 📋 Services
@@ -658,8 +792,58 @@ export const MESSAGES = {
       noDeprecatedTablesOr: '',
       // EN: 🧹 Deprecated Objects Found ({totalDeprecated})
       deprecatedObjectsFound: '',
-      // EN: Usage: `!s3 migrate <pending|status|force [--dry-run]|preview|verify|purge-deprecated>`
+      // EN: 🗂️ Nothing to Adopt
+      adoptStateNothingTitle: '',
+      // EN: This server declares `serverID: 1`, so the legacy singleton rows are already its own and there is nothing to move. Adoption exists for an install that has always run a non-1 `server.id` and still keeps its state in the row numbered 1.
+      adoptStateNoopBody: '',
+      // EN: No singleton table holds an `id = 1` row that could be moved to `serverID: {serverID}`.
+      adoptStateNothingBody: '',
+      // EN: no `id = 1` row to adopt
+      adoptStateNoLegacyRow: '',
+      // EN: (no other columns)
+      adoptStateNoOtherColumns: '',
+      // EN: 🗂️ Adoptable Singleton Rows ({count})
+      adoptStateFound: '',
+      // EN: **`{table}`** — move `id = 1` → `id = {serverID}`
+      adoptStateWillMove: '',
+      // EN:   • keeping: {fields}
+      adoptStateKeepingRow: '',
+      // EN:   • **replacing** this server’s current row: {fields}
+      adoptStateReplacingRow: '',
+      // EN:   • `{table}` skipped — {reason}
+      adoptStateSkipped: '',
+      // EN: Read the replaced rows above first. Type `!s3 migrate adopt-state --confirm` to move them to `serverID: {serverID}`. This is a one-time upgrade action and there is no undo from Discord.
+      adoptStateTypeToConfirm: '',
+      // EN: 🗂️ Adoption Complete — {count} row(s)
+      adoptStateDoneTitle: '',
+      // EN: The legacy singleton rows now belong to `serverID: {serverID}`. Restart this server so every plugin re-reads them: S³’s own round state was refreshed in place, but TeamBalancer holds its win streak in memory and would write the pre-adoption value back at the next round end.
+      adoptStateDoneBody: '',
+      // EN: 🗂️ Adoption Failed
+      adoptStateFailedTitle: '',
+      // EN: Nothing was moved — the whole adoption runs in one transaction. {message}
+      adoptStateFailedBody: '',
+      // EN: Usage: `!s3 migrate <pending|status|force [--dry-run]|preview|ddl [plugin]|verify|purge-deprecated|adopt-state [--confirm]>`
       usageS3MigratePending: '',
+      // EN: 🧾 Hand-Apply DDL — {dialect}
+      ddlTitle: '',
+      // EN: 🧾 Hand-Apply DDL — {dialect} ({i}/{count})
+      ddlTitlePaged: '',
+      // EN: Run this as a database user that holds the missing grant, then `!s3 migrate force` to record the versions. Generated from the live schema, so anything already present is left out.
+      ddlIntro: '',
+      // EN: **Notes:**
+      ddlNotesHeading: '',
+      // EN: ✅ Nothing to Hand-Apply
+      ddlNothingToApply: '',
+      // EN: Every object the pending migrations declare is already present. If a version is still recorded as behind, `!s3 migrate force` will bring it up to date without any DDL.
+      ddlNothingToApplyBody: '',
+      // EN: `{pluginName}` has no pending migrations, or everything it declares is already present.
+      ddlNothingToApplyScoped: '',
+      // EN: ❌ DDL Generation Failed
+      ddlGenerationFailed: '',
+      // EN: Could not render the hand-apply SQL: {message}
+      ddlGenerationFailedBody: '',
+      // EN: \n⚠️ This database is shared by {count} registered servers. Confirming migrates the schema for all of them at once, not just this one.
+      sharedSchemaWarning: '',
       // EN: Token: `{token}`
       tokenLine: '',
       // EN: 📋 Schema Status — Pending Migrations
@@ -744,6 +928,26 @@ export const MESSAGES = {
       toRestoreABackup: '',
       // EN: \nGet the filename from `!s3 backup list`.
       getTheFilenameFrom: '',
+      // EN: 📍 This server's files only
+      thisServerOnlyHeader: '',
+      // EN: Every server keeps its own `backups/` directory, so this is what {server} holds. A file listed here can only be restored on the server that listed it — add `--server <name>` to see another one's.
+      thisServerOnlyBody: '',
+      // EN: 🌐 This affects every server
+      affectsHeader: '',
+      // EN: A restore cannot be narrowed to one server. The file holds the whole community's rows and the database is shared, so this rolls back: {servers}.
+      affectsBody: '',
+      // EN: ⚠️ This is not atomic
+      partialHeader: '',
+      // EN: A JSON restore writes table by table and commits as it goes, rather than all at once, so a failure partway through leaves the database part old and part new. There is no automatic undo. Take a fresh backup first if the current state is worth keeping.
+      partialBody: '',
+      // EN: {failed} table(s) did not restore: {tables}. The other {ok} were written and the database is now part old and part new. Do not treat this as a completed rollback — check those tables before bringing servers back up.
+      partialLanded: '',
+      // EN: ⚠️ Database Partly Restored
+      databaseRestoredPartly: '',
+      // EN: ⛔ Another server is live
+      fileCopyBlockedHeader: '',
+      // EN: This is a `.sqlite` file copy, and {servers} currently has the same database file open. Overwriting it underneath a running process corrupts it rather than rolling it back, so the restore will be refused. Stop the other server(s) first, or use a `.json` backup, which writes through the database instead of around it.
+      fileCopyBlockedBody: '',
       // EN: ❌ Backup Not Found
       backupNotFound: '',
       // EN: No backup named `{filename}` exists. Use `!s3 backup list` to see available backups.
@@ -842,10 +1046,72 @@ export const MESSAGES = {
       noAttachment: '',
       // EN: {reason}. The full export is on the server at `backups/{filename}`.
       reasonTheFullExport: '',
+      // EN: 🎯 Server scope
+      exportScope: '',
+      // EN: This server only (id `{serverID}`). Rows found for: {contained}. Global tables — ratings, schema versions — are community-wide and are in the file whatever the scope. Re-run with `--all-servers` for a full community backup.
+      exportScopeServer: '',
+      // EN: Every registered server. Rows found for: {contained}.
+      exportScopeCommunity: '',
+      // EN: no server-scoped rows
+      exportScopeNoScopedRows: '',
+      // EN: not in this registry
+      serverNotRegistered: '',
       // EN: ✅ Export Complete ({tier})
       exportCompleteTier: '',
       // EN: Discord rejected the upload ({message}). The full export is on the server at `backups/{filename}`.
       discordRejectedTheUpload: '',
+      // EN: `--all-servers` and `--remap-server` ask for opposite things: one restores every row to the server it names, the other folds every row onto this server. Re-run with whichever you meant.
+      importFlagsConflict: '',
+      // EN: No model answers to `{table}`, so its {rows} row(s) were NOT written. Either a plugin that owns this table is not loaded in this process, or the model was renamed.
+      importNoModelForTable: '',
+      // EN: 🎯 Server scope
+      importScopeHeader: '',
+      // EN: This server only (id `{serverID}`). Rows belonging to another server are skipped; rows carrying no server at all are adopted by this one. Add `--all-servers` to restore every row to the server it names, or `--remap-server` to claim every row for this server.
+      importScopeOwn: '',
+      // EN: Every server. Each row is written back to the server it names — including servers that are not registered here, whose rows no query on this install will ever return.
+      importScopeAll: '',
+      // EN: Remapped onto this server (id `{serverID}`). Every row that named another server is being claimed for this one, merging their histories. This cannot be undone by re-importing.
+      importScopeRemap: '',
+      // EN: 🕰️ Rows with no server
+      importLegacyHeader: '',
+      // EN: {n} row(s) carry no server id and will be adopted by this server (id `{serverID}`). That is every backup taken before this suite was multi-server — filtering them out instead would import nothing from the most likely file anyone restores.
+      importLegacyRule: '',
+      // EN: ♻️ Rows that will be replaced
+      importOverwriteHeader: '',
+      // EN: None. Every row in this file is new to this database.
+      importOverwriteNone: '',
+      // EN: {n} existing row(s) share a primary key with this file and will be REPLACED. They currently belong to: {servers}.
+      importOverwriteLine: '',
+      // EN: no server in particular — these rows are on community-wide tables
+      importOverwriteUnattributed: '',
+      // EN: ⏭️ Rows left alone
+      importSkippedHeader: '',
+      // EN: {n} row(s) belong to {servers} and will not be written. Re-run with `--all-servers` to restore them to that server, or `--remap-server` to claim them for this one.
+      importSkippedLine: '',
+      // EN: 🌐 Rows written to other servers
+      importForeignHeader: '',
+      // EN: {n} row(s) will be written back to {servers}. If a server named here is not registered on this database, its rows will sit in the tables with nothing to read them.
+      importForeignLine: '',
+      // EN: ❓ Tables with no model
+      importUnknownHeader: '',
+      // EN: {tables} — nothing in this process answers to these names, so their rows will NOT be written. Either a plugin that owns them is not loaded here, or a model was renamed.
+      importUnknownLine: '',
+      // EN: {n} adopted
+      importTagAdopted: '',
+      // EN: {n} remapped
+      importTagRemapped: '',
+      // EN: {n} to other servers
+      importTagForeign: '',
+      // EN: {n} skipped
+      importTagSkipped: '',
+      // EN: {n} replaced
+      importTagOverwritten: '',
+      // EN: replacements not countable
+      importTagOverwriteUnknown: '',
+      // EN: ⚠️ Confirm — this writes rows for other servers
+      importWidenedTitle: '',
+      // EN: Nothing has been written. This import reaches past this server's own rows, so it takes a second confirmation: read the scope and replacement counts below, then run the same command again to write.
+      importWidenedBody: '',
       // EN: ⚠️ No Staged Import
       noStagedImport: '',
       // EN: No import has been staged. First attach a `.s3backup.json` file: `!s3 db import` (with attachment).
@@ -866,8 +1132,28 @@ export const MESSAGES = {
       importPreviewNothingHas: '',
       // EN: ❌ Import Parse Failed
       importParseFailed: '',
-      // EN: Usage: `!s3 db <status|export [--logs|--all] | import [--confirm] [--dry-run]>`
+      // EN: Usage: `!s3 db <status|orphans|export [--logs|--all] | import [--confirm] [--dry-run]>`
       usageS3DbStatus: '',
+      // EN: `!s3 db orphans` — tables the suite no longer uses
+      s3DbOrphansTables: '',
+      // EN: Orphan Scan Failed
+      orphanScanFailed: '',
+      // EN: Could not list tables: {message}
+      couldNotListTables: '',
+      // EN: No Orphan Tables
+      noOrphanTables: '',
+      // EN: Every table carrying one of the suite's prefixes is backed by a model this install uses.
+      everyTableCarryingAn: '',
+      // EN: Orphan Tables ({count})
+      orphanTables: '',
+      // EN: These tables carry one of the suite's prefixes, but no plugin on this install reads or writes them. Most are here on purpose: a table whose primary key changed was replaced rather than altered, because neither SQLite nor the deployed MySQL grant can alter one in place.
+      theseTablesCarryA: '',
+      // EN: S³ never drops a table. If you have the DROP grant and have taken a backup, these are safe to remove by hand; if you do not, leaving them costs nothing but the space.
+      s3NeverDropsA: '',
+      // EN: {count} rows
+      nRows: '',
+      // EN: row count unavailable
+      rowsUnreadable: '',
       // EN: `!s3 db status` — Connector type, schema version status per plugin
       s3DbStatusConnector: '',
       // EN: `!s3 db export` — Export essential (historical) tables as JSON
@@ -916,6 +1202,8 @@ export const MESSAGES = {
       importUnknownTableSkipped: '',
       // EN: Table "{table}" is not a known model — skipped.
       importUnknownTableSkippedStream: '',
+      // EN: Table "{table}" is never restored — its rows describe processes that are no longer running.
+      importNotRestorable: '',
     },
     onDiscordMessage: {
       // EN: ⚠️ Error: !s3 {sub}
@@ -974,6 +1262,8 @@ export const MESSAGES = {
       s3LocksGlobalAnd: '',
       // EN: `!s3 config` — Server configuration values
       s3ConfigServerConfiguration: '',
+      // EN: `!s3 servers` — Every server registered against this database, with suite version, clock skew and community options
+      s3ServersRegistry: '',
       // EN: 📊 Reports
       reports: '',
       // EN: `!s3 switches [range]` — Team-switch leaderboard, all players (Legacy pre-split Balancer moves fold into Full)
@@ -1020,6 +1310,8 @@ export const MESSAGES = {
       s3MigrateForceDry: '',
       // EN: `!s3 migrate preview` — Preview pending migration descriptions/touches
       s3MigratePreviewPreview: '',
+      // EN: `!s3 migrate ddl [plugin]` — Emit hand-apply SQL for a restricted grant
+      s3MigrateDdlEmit: '',
       // EN: `!s3 migrate verify` — Run on-demand schema drift check
       s3MigrateVerifyRun: '',
       // EN: `!s3 migrate purge-deprecated` — Clean up deprecated tables/columns
@@ -1030,6 +1322,10 @@ export const MESSAGES = {
       s3BackupListList: '',
       // EN: `!s3 backup restore <filename>` — Restore from file backup (auto-detects format)
       s3BackupRestoreFilename: '',
+      // EN: `!s3 servers alias <server> <newAlias>` — Rename a registered server
+      s3ServersAlias: '',
+      // EN: `!s3 servers forget <server>` — Deregister a retired server
+      s3ServersForget: '',
       // EN: 🧪 Diagnostic
       diagnostic: '',
       // EN: `!s3 diag` — Run all service checks (mounts, phase, factions, players, locks)
@@ -1160,19 +1456,21 @@ export const MESSAGES = {
       statusLocked: '',
       // EN: Player not found or multiple matches.
       playerNotFoundMultiple: '',
-      // EN: Cleared restrictions for {player} (seed tokens kept).
+      // EN: Cleared restrictions for {player} (seed tokens kept). {scope}
       clearedRestrictionsSeedTokens: '',
+      // EN: Tokens are community-wide; scramble locks are per-server and only server {serverID} was touched.
+      clearScopeNote: '',
       // EN: Clear failed: {message}
       clearFailed: '',
-      // EN: Restrictions cleared — {toppedUp} topped up, {locksCleared} scramble locks lifted. Seed tokens kept. Use !switch wipe confirm to delete all rows.
+      // EN: Restrictions cleared — {toppedUp} topped up community-wide, {locksCleared} scramble locks lifted on server {serverID}. Seed tokens kept. Use !switch wipe confirm to delete all rows.
       restrictionsClearedToppedUp: '',
       // EN: Clear all failed: {message}
       clearAllFailed: '',
-      // EN: Wipe DELETES every cooldown row, including earned seed tokens. This cannot be undone.
+      // EN: Wipe DELETES every cooldown row on every server sharing this database, including earned seed tokens. This cannot be undone.
       wipeDeletesEveryCooldown: '',
       // EN: Type !switch wipe confirm to proceed, or !switch clearall to lift restrictions without deleting anything.
       typeSwitchWipeConfirm: '',
-      // EN: Wiped {deleted} cooldown rows — every player is back to a clean default.
+      // EN: Wiped {deleted} cooldown rows and {stateDeleted} per-server rows — every player on every server is back to a clean default.
       wipedCooldownRowsEvery: '',
       // EN: Wipe failed: {message}
       wipeFailed: '',
@@ -1208,19 +1506,23 @@ export const MESSAGES = {
       usageSwitchClearSteamid: '',
       // EN: Player not found or multiple matches.
       playerNotFoundMultiple: '',
-      // EN: ✅ Cleared restrictions for **{player}** ({detail}). Seed tokens kept.
+      // EN: ✅ Cleared restrictions for **{player}** ({detail}). Seed tokens kept.\n{scope}
       clearedRestrictionsSeedTokens: '',
+      // EN: *Tokens are community-wide; scramble locks are per-server and only server {serverID} was touched.*
+      clearScopeNote: '',
       // EN: ❌ Clear failed: {message}
       clearFailed: '',
-      // EN: ✅ Restrictions cleared — **{toppedUp}** topped up to {maxSwitchTokens}, **{locksCleared}** scramble locks lifted. Earned seed tokens kept; use `!switch wipe confirm` to delete every row.
+      // EN: ✅ Restrictions cleared — **{toppedUp}** topped up to {maxSwitchTokens} **community-wide**, **{locksCleared}** scramble locks lifted on **server {serverID}** only. Earned seed tokens kept; use `!switch wipe confirm` to delete every row.
       restrictionsClearedToppedUp: '',
       // EN: ❌ Clear all failed: {message}
       clearAllFailed: '',
-      // EN: ⚠️ `!switch wipe` **deletes every cooldown row**, including earned seed tokens. This cannot be undone.\n
+      // EN: ⚠️ `!switch wipe` **deletes every cooldown row on every server sharing this database**, including earned seed tokens. This cannot be undone.\n
       switchWipeDeletesEvery: '',
+      // EN: Servers affected: **{servers}**.\n
+      wipeSpansServers: '',
       // EN: Run `!switch wipe confirm` to proceed, or `!switch clearall` to lift restrictions without deleting anything.
       runSwitchWipeConfirm: '',
-      // EN: 🗑️ Wiped **{deleted}** cooldown rows — every player is back to a clean default.
+      // EN: 🗑️ Wiped **{deleted}** cooldown rows and **{stateDeleted}** per-server rows — every player on every server is back to a clean default.
       wipedCooldownRowsEvery: '',
       // EN: ❌ Wipe failed: {message}
       wipeFailed: '',
@@ -1554,6 +1856,8 @@ export const MESSAGES = {
       modeRounds: '',
     },
     backfill: {
+      // EN: ⛔ This server shares its reporting channel with {servers}, so its history contains their rounds as well as ours — and a backfill would write theirs into this server's stats. Give each server its own reporting channel and run it again.
+      sharedChannel: '',
       // EN: ❌ No reporting channel configured — there is nothing to read.
       noReportingChannel: '',
       // EN: 🔍 Reading round summaries from the last {days} days...
@@ -2428,6 +2732,10 @@ export const MESSAGES = {
       eloBackupPlayers: '',
       // EN: Backup
       backup: '',
+      // EN: No pending restore. Attach the backup file to `!elo restore` again — the confirmation may have expired, or another admin may have already finished it.
+      noPendingRestoreConfirmation: '',
+      // EN: ⚠️ This will overwrite every rating in the community with the {value} ratings in this file. Nothing has changed yet.
+      restoreWillOverwrite: '',
       // EN: Please attach a backup JSON file with the !elo restore command.
       pleaseAttachBackupJson: '',
       // EN: Invalid backup format: missing players array.

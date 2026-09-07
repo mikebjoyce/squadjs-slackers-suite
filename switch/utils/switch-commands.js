@@ -26,11 +26,32 @@
  * All other dependencies are accessed via plugin.* (the live plugin
  * instance passed to register()).
  *
+ * ─── ROUTING (v2.6.0, multi-server) ──────────────────────────────
+ *
+ * The in-game half needs no routing. A chat message reaches exactly
+ * the process running that server, so !switch is unambiguous by
+ * construction.
+ *
+ * The Discord half does not have that luxury: every server's process
+ * sees every !switch typed in the admin channel. onDiscordMessage
+ * calls plugin.routeDiscordCommand?.() before dispatching, and the
+ * optional chaining is deliberate — it is what lets an operator run
+ * this against an older S³ and get silence rather than a crash.
+ * Silence is the wrong answer, which is why the plugin's S³ floor is
+ * a hard 1.8.0 and checked at mount; the gate here is not the
+ * defence, the floor is.
+ *
+ * Admin output that changes state names the server it changed.
+ * !switch clearall reports the id it cleared, because "restrictions
+ * cleared" with two servers live and no id is a sentence an admin
+ * cannot act on.
+ *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
  * - onChatMessage handles the massive switch(subCommand) dispatch
  *   for all in-game commands (public + admin).
  * - onDiscordMessage handles Discord !switch admin commands.
+ *   It dispatches behind the routing gate described above.
  * - _handleStatsCommand scrapes historical round summary embeds.
  * - safeDiscordReply is a guarded wrapper around message.reply().
  *
@@ -42,6 +63,96 @@
 
 import { setTimeout as delay } from "timers/promises";
 import SwitchExplain from '../utils/switch-explain.js';
+
+/**
+ * Which server answers `!switch <verb>`.
+ *
+ * Three of these are not what the verb name suggests, and each was read out
+ * of the function it dispatches to rather than guessed from the word:
+ *
+ * `clear <player>` raises a token balance that is community-wide and lifts a
+ * scramble lock that is not, in one call. A command is classified by the
+ * **widest** thing it touches, so this is a community mutation even though
+ * half of what it does is local.
+ *
+ * `clearall` tops every row in the table up to THIS process's
+ * `maxSwitchTokens`. One server's configured cap, applied to the whole
+ * community's balances.
+ *
+ * `wipe` is `destroy({ where: {} })` over the cooldown and lock tables. On a
+ * shared database that is every token balance in the community, typed in one
+ * server's admin channel.
+ *
+ * `check` goes the other way. It reads a community-wide balance AND this
+ * server's own scramble lock, so it stays a server read and broadcasts: each
+ * server's answer is accurate about its own lock, and a single responder
+ * would report one server's lock as though it were everyone's.
+ *
+ * `explain` renders seven embeds out of this process's options and live
+ * config, so it is genuinely per-server and genuinely too large to
+ * broadcast. It asks for a target instead.
+ *
+ * @param {string|null} sub
+ * @returns {{scope: string, selectorRequired: boolean}}
+ *
+ * The scope values are literal strings rather than the COMMAND_SCOPE
+ * constants because this file cannot import an S³ util — the suite ships
+ * flattened, and no single specifier resolves both here and at the target.
+ * `test-discord-routing.js` asserts every value this returns is one
+ * COMMAND_SCOPE declares, which is what importing them would have bought.
+ */
+export function scopeForSwitchCommand(sub) {
+  switch (String(sub ?? '').toLowerCase()) {
+    case 'status':
+    case 'stats':
+    case 'check':
+      return { scope: 'server-read', selectorRequired: false };
+
+    case 'explain':
+      return { scope: 'server-read', selectorRequired: true };
+
+    case 'timelimit':
+    case 'backfill':
+      return { scope: 'server-mutating', selectorRequired: false };
+
+    case 'clear':
+    case 'clearall':
+    case 'wipe':
+      return { scope: 'community-mutating', selectorRequired: false };
+
+    default:
+      return { scope: 'community-read', selectorRequired: false };
+  }
+}
+
+/**
+ * The registered servers, named, for a confirmation that has to say what it
+ * is about to destroy.
+ *
+ * Registered rather than live, deliberately. A stopped server's players still
+ * have token balances in the table `!switch wipe` deletes, and omitting it
+ * because the process happens to be down would understate the blast radius at
+ * exactly the moment an admin is deciding whether to type the confirm word.
+ *
+ * Returns null when the registry is unavailable or empty rather than an empty
+ * string, so the caller can fall back to the generic warning instead of
+ * printing a sentence that names nothing.
+ *
+ * @param {object} plugin
+ * @returns {Promise<string|null>} e.g. "main (id 1), event (id 2)"
+ */
+async function describeRegisteredServers(plugin) {
+  try {
+    const rows = (await plugin._s3db?.getRegisteredServers?.()) || [];
+    if (rows.length === 0) return null;
+    return rows
+      .map((r) => (r.alias ? `${r.alias} (id ${r.serverID})` : `id ${r.serverID}`))
+      .join(', ');
+  } catch (err) {
+    plugin.verbose(1, `[Admin] Could not read the server registry: ${err.message}`);
+    return null;
+  }
+}
 
 const SwitchCommands = {
   /**
@@ -333,6 +444,11 @@ const SwitchCommands = {
                   const isLiberal = plugin.isLiberalMode();
                   const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
                   const cooldownData = PlayerCooldowns ? await PlayerCooldowns.findByPk(eosID) : null;
+                  // The wallet above is the community’s; the lock is this
+                  // server's. A player locked by a scramble somewhere else is
+                  // not locked here, and this line is what makes the check
+                  // agree with _checkSwitchEligibility about that.
+                  const serverState = await plugin._readServerState(eosID);
                   const now = Date.now();
 
                   const effectiveCap = isLiberal ? plugin.options.liberalSwitchMaxUnbalancedSlots : null;
@@ -380,9 +496,9 @@ const SwitchCommands = {
 
                   let scrambleOK = true;
                   let scrambleMsg = plugin.localize('switch.labels.notActive');
-                  if (cooldownData && cooldownData.scrambleLockdownExpiry && new Date(cooldownData.scrambleLockdownExpiry).getTime() > now) {
+                  if (serverState && serverState.scrambleLockdownExpiry && new Date(serverState.scrambleLockdownExpiry).getTime() > now) {
                     scrambleOK = false;
-                    const remaining = Math.ceil((new Date(cooldownData.scrambleLockdownExpiry).getTime() - now) / 60000);
+                    const remaining = Math.ceil((new Date(serverState.scrambleLockdownExpiry).getTime() - now) / 60000);
                     scrambleMsg = plugin.localize('switch.labels.minutesRemaining', { remaining });
                   }
 
@@ -451,8 +567,13 @@ const SwitchCommands = {
                 // how `clearall` stayed broken on a live MySQL server for so
                 // long: the admin saw silence and assumed success.
                 try {
-                  await plugin.adminClearPlayer(result.eosID);
-                  plugin.warn(eosID, plugin.localize('switch.warn.clearedRestrictionsSeedTokens', { player: result.playerName || result.steamID }));
+                  const summary = await plugin.adminClearPlayer(result.eosID);
+                  // Two widths in one command: the top-up is on the shared
+                  // wallet and the lock clear is on this server, and an admin
+                  // who reads “cleared” without that distinction will assume the
+                  // player is unlocked everywhere.
+                  const scope = plugin.localize('switch.warn.clearScopeNote', { serverID: summary?.serverID ?? plugin._serverID() });
+                  plugin.warn(eosID, plugin.localize('switch.warn.clearedRestrictionsSeedTokens', { player: result.playerName || result.steamID, scope }));
                 } catch (err) {
                   plugin.verbose(1, `[Admin] clear failed for ${result.playerName || result.eosID}: ${err.message}`);
                   plugin.warn(eosID, plugin.localize('switch.warn.clearFailed', { message: err.message }));
@@ -466,8 +587,8 @@ const SwitchCommands = {
               }
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
               try {
-                const { toppedUp, locksCleared } = await plugin.adminClearAllRestrictions();
-                plugin.warn(eosID, plugin.localize('switch.warn.restrictionsClearedToppedUp', { toppedUp, locksCleared }));
+                const { toppedUp, locksCleared, serverID } = await plugin.adminClearAllRestrictions();
+                plugin.warn(eosID, plugin.localize('switch.warn.restrictionsClearedToppedUp', { toppedUp, locksCleared, serverID }));
               } catch (err) {
                 plugin.verbose(1, `[Admin] clearall failed: ${err.message}`);
                 plugin.warn(eosID, plugin.localize('switch.warn.clearAllFailed', { message: err.message }));
@@ -485,15 +606,22 @@ const SwitchCommands = {
                 // `clearall`, which deletes nothing — so the confirm word is
                 // what separates "lift everyone's locks" from "take everyone's
                 // seed bonus away" when an admin types the wrong one in a hurry.
+                //
+                // The table is community-wide, so the confirmation names the
+                // registered servers it is about to empty. A confirm word that
+                // does not say what it confirms is the same guard it was on a
+                // single-server install, protecting a much larger thing.
                 if ((commandSplit[1] || '').toLowerCase() !== 'confirm') {
+                  const servers = await describeRegisteredServers(plugin);
                   plugin.warn(eosID,
                     plugin.localize('switch.warn.wipeDeletesEveryCooldown') +
+                    (servers ? plugin.localize('switch.warn.wipeSpansServers', { servers }) : '') +
                     plugin.localize('switch.warn.typeSwitchWipeConfirm'));
                   return;
                 }
                 try {
-                  const deleted = await plugin.adminWipeAll();
-                  plugin.warn(eosID, plugin.localize('switch.warn.wipedCooldownRowsEvery', { deleted }));
+                  const { deleted, stateDeleted } = await plugin.adminWipeAll();
+                  plugin.warn(eosID, plugin.localize('switch.warn.wipedCooldownRowsEvery', { deleted, stateDeleted }));
                 } catch (err) {
                   plugin.verbose(1, `[Admin] wipe failed: ${err.message}`);
                   plugin.warn(eosID, plugin.localize('switch.warn.wipeFailed', { message: err.message }));
@@ -705,7 +833,22 @@ const SwitchCommands = {
                   if (PlayerCooldowns) {
                     await plugin._withDb(async (t) => {
                       // §3.3 of switch-token-system-spec: load → regen → spend → upsert
-                      let row = await PlayerCooldowns.findByPk(eosID, { transaction: t });
+                      //
+                      // Locked for the rest of the transaction because the wallet is
+                      // community-wide and the sequence above is a read-modify-write:
+                      // with two servers on one database, both can read a balance of 1,
+                      // both can spend it, and the player gets two switches for one
+                      // token. The upsert cannot catch that on its own — it writes an
+                      // absolute balance, not a decrement, so the second write simply
+                      // overwrites the first with the same number.
+                      //
+                      // A no-op on SQLite, which has no row locks and omits the clause
+                      // rather than rejecting it (verified on both engines: the MySQL
+                      // SELECT carries FOR UPDATE, the SQLite one does not). _withDb
+                      // runs this through withTransactionWithRetry, which now treats an
+                      // InnoDB deadlock as retryable — taking a lock is what makes one
+                      // reachable.
+                      let row = await PlayerCooldowns.findByPk(eosID, { lock: t.LOCK.UPDATE, transaction: t });
                       if (!row) {
                         row = { eosID, steamID, playerName, tokenBalance: plugin.options.maxSwitchTokens, tokenRegenAnchor: null };
                       }
@@ -1011,6 +1154,30 @@ const SwitchCommands = {
       const reportChan = plugin.channel;
       if (!reportChan) {
         await message.channel.send(plugin.localize('switch.backfill.noReportingChannel'));
+        return;
+      }
+
+      // ── Shared history is unattributable ────────────────────────
+      // This walks the reporting channel and writes what it parses into a
+      // server-scoped table under THIS server's id. On a channel two
+      // servers post to, that stamps the neighbour's rounds as ours:
+      // nothing throws, the counts look plausible, and the contamination
+      // is permanent because there is no marker afterwards saying which
+      // rows were guessed.
+      //
+      // Filtering on the embed footer label was the obvious alternative
+      // and is wrong twice over. It cannot reach history posted before
+      // labelling existed, which is exactly the history a backfill is
+      // for, and it would have the plugin parsing its own rendered output
+      // as data — broken by the first footer change or the first
+      // non-English locale.
+      //
+      // So it refuses and says why. Inert on a single-server install,
+      // where nobody else declares the channel.
+      const sharers = await plugin.channelSharers?.('switchReporting', plugin.options.channelID);
+      if (sharers && sharers.length > 0) {
+        const names = sharers.map((s) => (s.alias ? `${s.alias} (id ${s.serverID})` : `server ${s.serverID}`)).join(', ');
+        await message.channel.send(plugin.localize('switch.backfill.sharedChannel', { servers: names }));
         return;
       }
 
@@ -1326,11 +1493,35 @@ const SwitchCommands = {
       if (adminChanId && message.channel.id !== adminChanId) return;
 
       const content = message.content.trim();
-      const args = content.split(' ');
-      const command = args[0].toLowerCase();
-      const subCommand = args[1] ? args[1].toLowerCase() : null;
+      const rawArgs = content.split(' ');
+      const command = rawArgs[0].toLowerCase();
 
       if (command !== '!switch') return;
+
+      // ── Routing gate ────────────────────────────────────────────
+      // After the channel gate above and before the verb dispatch below.
+      // The stripping matters more here than anywhere else in the suite:
+      // several verbs treat every remaining token as a player name, so a
+      // `--server main` left in the list would be searched for as a player.
+      const { scope, selectorRequired } = scopeForSwitchCommand(rawArgs[1]);
+      const verdict = (await plugin.routeDiscordCommand?.({
+        scope,
+        selectorRequired,
+        args: rawArgs,
+        messageID: message.id,
+        command: `!switch ${rawArgs[1] || ''}`.trim()
+      })) ?? { routing: 'act', args: rawArgs };
+
+      if (verdict.routing === 'drop') return;
+      if (verdict.routing === 'refuse') {
+        await message.channel.send({
+          embeds: [plugin.buildRoutingRefusalEmbed(verdict)]
+        });
+        return;
+      }
+
+      const args = verdict.args;
+      const subCommand = args[1] ? args[1].toLowerCase() : null;
 
       if (subCommand === 'status') {
         const embed = await plugin._buildSwitchDiagEmbed();
@@ -1414,32 +1605,40 @@ const SwitchCommands = {
           const detail = summary
             ? plugin.localize('switch.labels.clearDetail', { tokensBefore: summary.tokensBefore, tokensAfter: summary.tokensAfter, lockNote: summary.lockCleared ? plugin.localize('switch.labels.scrambleLockLifted') : '' })
             : plugin.localize('switch.labels.clearDetailNoRow');
-          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.clearedRestrictionsSeedTokens', { player: result.playerName || result.steamID, detail }));
+          const scope = plugin.localize('switch.discord.clearScopeNote', { serverID: summary?.serverID ?? plugin._serverID() });
+          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.clearedRestrictionsSeedTokens', { player: result.playerName || result.steamID, detail, scope }));
         } catch (err) {
           plugin.verbose(1, `[Admin] clear failed for ${result.playerName || result.eosID}: ${err.message}`);
           await plugin.safeDiscordReply(message, plugin.localize('switch.discord.clearFailed', { message: err.message }));
         }
       } else if (subCommand === 'clearall') {
         try {
-          const { toppedUp, locksCleared } = await plugin.adminClearAllRestrictions();
+          const { toppedUp, locksCleared, serverID } = await plugin.adminClearAllRestrictions();
+          // maxSwitchTokens is already the community-resolved cap by the time
+          // it is read here — _applyCommunityOptions() overwrites this.options
+          // from the registry on every heartbeat — so the number in the reply
+          // is the one every server topped up to, not this one’s config.
           await plugin.safeDiscordReply(message,
-            plugin.localize('switch.discord.restrictionsClearedToppedUp', { toppedUp, maxSwitchTokens: plugin.options.maxSwitchTokens, locksCleared })
+            plugin.localize('switch.discord.restrictionsClearedToppedUp', { toppedUp, maxSwitchTokens: plugin.options.maxSwitchTokens, locksCleared, serverID })
           );
         } catch (err) {
           plugin.verbose(1, `[Admin] clearall failed: ${err.message}`);
           await plugin.safeDiscordReply(message, plugin.localize('switch.discord.clearAllFailed', { message: err.message }));
         }
       } else if (subCommand === 'wipe') {
-        // See the in-game `wipe` case — same guard, same reason.
+        // See the in-game `wipe` case — same guard, same reason, same list of
+        // registered servers.
         if ((args[2] || '').toLowerCase() !== 'confirm') {
+          const servers = await describeRegisteredServers(plugin);
           await plugin.safeDiscordReply(message,
             plugin.localize('switch.discord.switchWipeDeletesEvery') +
+            (servers ? plugin.localize('switch.discord.wipeSpansServers', { servers }) : '') +
             plugin.localize('switch.discord.runSwitchWipeConfirm'));
           return;
         }
         try {
-          const deleted = await plugin.adminWipeAll();
-          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.wipedCooldownRowsEvery', { deleted }));
+          const { deleted, stateDeleted } = await plugin.adminWipeAll();
+          await plugin.safeDiscordReply(message, plugin.localize('switch.discord.wipedCooldownRowsEvery', { deleted, stateDeleted }));
         } catch (err) {
           plugin.verbose(1, `[Admin] wipe failed: ${err.message}`);
           await plugin.safeDiscordReply(message, plugin.localize('switch.discord.wipeFailed', { message: err.message }));

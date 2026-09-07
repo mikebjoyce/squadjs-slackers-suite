@@ -44,6 +44,12 @@ import SwitchDB from '../utils/switch-db.js';
 import { buildAssembly, importFromAssembly, cleanAssembly } from '../../s3/testing/plugin-assembly.js';
 
 const TABLE = 'SwitchPlugin_PlayerCooldowns';
+// The scramble writes two tables since the cooldown split: identity on the
+// community-wide row, the lock itself on this server’s row. Both halves are
+// asserted, because a scramble that writes one of them is not a partial
+// success — it is either a lock nobody has a wallet for or a wallet that
+// quietly did not get locked.
+const STATE_TABLE = 'SwitchPlugin_PlayerServerState';
 const ASSEMBLY = buildAssembly('.tmp-switch-scramble');
 const Switch = await importFromAssembly(ASSEMBLY, 'switch.js');
 
@@ -119,7 +125,7 @@ async function buildPlugin({ players, queued = [], minPlayers = 0, joinSeconds =
   });
   plugin._switchQueue = { t1: queued.map((eosID) => ({ eosID })), t2: [] };
 
-  return { plugin, db, seq, model: db.getModel(TABLE) };
+  return { plugin, db, seq, model: db.getModel(TABLE), stateModel: db.getModel(STATE_TABLE) };
 }
 
 const P = (eosID, name) => ({ eosID, name, steamID: `steam-${eosID}`, teamID: '1' });
@@ -131,7 +137,7 @@ console.log('');
 // ── The regression this file exists for ────────────────────────────
 await runTest('rows created by a scramble carry lastActiveTimestamp', async () => {
   const players = [P('eos-a', 'Alpha'), P('eos-b', 'Bravo'), P('eos-c', 'Charlie')];
-  const { plugin, model, seq } = await buildPlugin({ players });
+  const { plugin, model, stateModel, seq } = await buildPlugin({ players });
 
   await plugin.onScrambleExecuted({ affectedPlayers: players, failedPlayers: [] });
 
@@ -142,7 +148,14 @@ await runTest('rows created by a scramble carry lastActiveTimestamp', async () =
       row.lastActiveTimestamp instanceof Date,
       `${row.eosID}: lastActiveTimestamp is ${row.lastActiveTimestamp} — cleanup() never prunes NULL, so this row would be immortal, and Switch v5 asserts it is not NULL`
     );
+  }
+
+  const state = await stateModel.findAll();
+  assert.strictEqual(state.length, 3, 'a per-server state row should exist per player');
+  for (const row of state) {
     assert.ok(row.scrambleLockdownExpiry instanceof Date, `${row.eosID}: lockdown expiry not written`);
+    assert.strictEqual(row.serverID, 1, `${row.eosID}: locked under the wrong server`);
+    assert.ok(row.lastActiveTimestamp instanceof Date, `${row.eosID}: the per-server row needs its own stamp for _pruneServerState()`);
   }
   await seq.close();
 });
@@ -167,7 +180,7 @@ await runTest('the written timestamp reads back as a usable Date', async () => {
 // ── updateOnDuplicate must not clobber a tracked value ─────────────
 await runTest('an existing row keeps its own lastActiveTimestamp', async () => {
   const players = [P('eos-a', 'Alpha'), P('eos-b', 'Bravo')];
-  const { plugin, model, seq } = await buildPlugin({ players });
+  const { plugin, model, stateModel, seq } = await buildPlugin({ players });
 
   // Alpha has been around: a real last-seen time the join/leave handlers own.
   const known = new Date('2026-01-02T03:04:05.000Z');
@@ -180,7 +193,8 @@ await runTest('an existing row keeps its own lastActiveTimestamp', async () => {
     new Date(alpha.lastActiveTimestamp).getTime(), known.getTime(),
     'the scramble overwrote a tracked last-seen time — updateOnDuplicate should not list this column'
   );
-  assert.ok(alpha.scrambleLockdownExpiry instanceof Date, 'existing row should still get the lockdown');
+  const alphaState = await stateModel.findOne({ where: { serverID: 1, eosID: 'eos-a' } });
+  assert.ok(alphaState?.scrambleLockdownExpiry instanceof Date, 'existing row should still get the lockdown');
 
   const bravo = await model.findByPk('eos-b');
   assert.ok(bravo.lastActiveTimestamp instanceof Date, 'newly created row still needs its stamp');
@@ -190,11 +204,12 @@ await runTest('an existing row keeps its own lastActiveTimestamp', async () => {
 // ── Exemptions still work, and still do not write NULL rows ────────
 await runTest('queued players are exempt and get no row at all', async () => {
   const players = [P('eos-a', 'Alpha'), P('eos-b', 'Bravo')];
-  const { plugin, model, seq } = await buildPlugin({ players, queued: ['eos-b'] });
+  const { plugin, model, stateModel, seq } = await buildPlugin({ players, queued: ['eos-b'] });
 
   await plugin.onScrambleExecuted({ affectedPlayers: players, failedPlayers: [] });
 
   assert.strictEqual(await model.count(), 1, 'only the non-queued player should be locked');
+  assert.strictEqual(await stateModel.count(), 1, 'the exempt player should have no per-server row either');
   const row = await model.findByPk('eos-a');
   assert.ok(row, 'the non-exempt player should have a row');
   assert.ok(row.lastActiveTimestamp instanceof Date, 'stamp missing on the surviving row');
@@ -205,7 +220,7 @@ await runTest('queued players are exempt and get no row at all', async () => {
 // The same question drift detection asks on every mount.
 await runTest('no NULL lastActiveTimestamp remains after a scramble', async () => {
   const players = Array.from({ length: 25 }, (_, i) => P(`eos-${i}`, `P${i}`));
-  const { plugin, model, seq } = await buildPlugin({ players });
+  const { plugin, model, stateModel, seq } = await buildPlugin({ players });
 
   await plugin.onScrambleExecuted({ affectedPlayers: players, failedPlayers: [] });
 
@@ -214,6 +229,103 @@ await runTest('no NULL lastActiveTimestamp remains after a scramble', async () =
   // 25 players crosses the chunkSize=10 boundary, so this also covers the
   // multi-chunk path rather than only the single-INSERT case.
   assert.strictEqual(await model.count(), 25, 'chunked writes lost rows');
+  // Both tables are sliced by the same loop. A slice offset applied to one
+  // and not the other is arithmetic that still runs and still says nothing,
+  // so the count on the second table is the only thing that would catch it.
+  assert.strictEqual(await stateModel.count(), 25, 'chunked writes lost per-server rows');
+  await seq.close();
+});
+
+// ── A second scramble extends the lock rather than colliding ───────
+// Two scrambles in one evening, or a re-scramble after a failed move, hit a
+// (serverID, eosID) that already exists. Without the expiry in the new
+// table's updateOnDuplicate list that is a duplicate-key error rather than an
+// extended lockdown — and the catch around the write reports it as a failed
+// scramble, so the lock silently stops being applied from the second one on.
+await runTest('a second scramble extends the lock instead of failing on the key', async () => {
+  const players = [P('eos-a', 'Alpha'), P('eos-b', 'Bravo')];
+  const { plugin, model, stateModel, seq } = await buildPlugin({ players });
+
+  await plugin.onScrambleExecuted({ affectedPlayers: players, failedPlayers: [] });
+  const first = await stateModel.findOne({ where: { serverID: 1, eosID: 'eos-a' } });
+  assert.ok(first?.scrambleLockdownExpiry instanceof Date, 'the first scramble did not lock');
+
+  // Wind the first expiry back so the second one is unambiguously later.
+  const stale = new Date(Date.now() - 60 * 60 * 1000);
+  await stateModel.update({ scrambleLockdownExpiry: stale }, { where: { serverID: 1 } });
+
+  await plugin.onScrambleExecuted({ affectedPlayers: players, failedPlayers: [] });
+
+  assert.strictEqual(await stateModel.count(), 2, 'the second scramble should update rows, not add or lose them');
+  const second = await stateModel.findOne({ where: { serverID: 1, eosID: 'eos-a' } });
+  assert.ok(
+    new Date(second.scrambleLockdownExpiry).getTime() > stale.getTime(),
+    'the second scramble did not extend the lockdown — the expiry is missing from updateOnDuplicate'
+  );
+  assert.strictEqual(await model.count(), 2, 'the identity table should still hold one row per player');
+  await seq.close();
+});
+
+// ── The pair is written under one transaction ────────────────────
+// There is no CLS in this repo, so the handle has to be passed explicitly to
+// both writes, and this asserts the handle rather than an effect of it. The
+// effect is not observable here: SQLite backs an in-memory database with one
+// connection, so a statement issued with no handle still runs inside whatever
+// transaction that connection has open and still rolls back with it. On MySQL
+// and Postgres the pool hands it a different connection and it commits on its
+// own — a lock row that survives the rollback of the wallet it belongs to.
+// An assertion that cannot fail on the engine the test runs on is worse than
+// no assertion, so this compares the two handles directly.
+await runTest('both halves of the lockdown write share one transaction handle', async () => {
+  const players = [P('eos-a', 'Alpha'), P('eos-b', 'Bravo')];
+  const { plugin, model, stateModel, db, seq } = await buildPlugin({ players });
+
+  plugin._withDb = async (fn) => db.sequelize.transaction(async (t) => fn(t));
+
+  const seen = [];
+  const spy = (target, label) => {
+    const real = target.bulkCreate.bind(target);
+    target.bulkCreate = async (rows, opts = {}) => {
+      seen.push({ label, transaction: opts.transaction });
+      return real(rows, opts);
+    };
+  };
+  spy(model, 'cooldowns');
+  spy(stateModel, 'state');
+
+  await plugin.onScrambleExecuted({ affectedPlayers: players, failedPlayers: [] });
+
+  assert.deepEqual(seen.map((s) => s.label), ['cooldowns', 'state'], 'both tables should be written once');
+  for (const s of seen) {
+    assert.ok(s.transaction, `the ${s.label} write got no transaction handle — S³ runs no CLS, so it executed outside the transaction`);
+  }
+  assert.strictEqual(seen[0].transaction, seen[1].transaction, 'the two writes ran under different transactions');
+  await seq.close();
+});
+
+// ── A mid-chunk failure takes the earlier chunks with it ─────────
+// The loop commits nothing per chunk, so a failure on chunk two must undo
+// chunk one on both tables. Without that, a scramble that dies halfway
+// locks the first ten players and nobody else, which is worse than not
+// locking anyone: the ten cannot switch and the rest can.
+await runTest('a failure part-way through the chunks rolls back the earlier ones', async () => {
+  const players = Array.from({ length: 25 }, (_, i) => P(`eos-${i}`, `P${i}`));
+  const { plugin, model, stateModel, db, seq } = await buildPlugin({ players });
+
+  plugin._withDb = async (fn) => db.sequelize.transaction(async (t) => fn(t));
+
+  let calls = 0;
+  const real = model.bulkCreate.bind(model);
+  model.bulkCreate = async (rows, opts) => {
+    calls += 1;
+    if (calls === 2) throw new Error('engine says no');
+    return real(rows, opts);
+  };
+
+  await plugin.onScrambleExecuted({ affectedPlayers: players, failedPlayers: [] });
+
+  assert.strictEqual(await model.count(), 0, 'the first chunk of identity rows survived a failed scramble');
+  assert.strictEqual(await stateModel.count(), 0, 'the first chunk of lock rows survived a failed scramble');
   await seq.close();
 });
 
@@ -224,11 +336,12 @@ await runTest('no NULL lastActiveTimestamp remains after a scramble', async () =
 // post-round gap."
 await runTest('an EloDiff scramble writes no lockdown rows at all', async () => {
   const players = [P('eos-a', 'Alpha'), P('eos-b', 'Bravo'), P('eos-c', 'Charlie')];
-  const { plugin, model, seq } = await buildPlugin({ players });
+  const { plugin, model, stateModel, seq } = await buildPlugin({ players });
 
   await plugin.onScrambleExecuted({ affectedPlayers: players, failedPlayers: [], scrambleType: 'EloDiff' });
 
   assert.strictEqual(await model.count(), 0, 'EloDiff scramble should never write a lockdown row');
+  assert.strictEqual(await stateModel.count(), 0, 'EloDiff scramble should never write a per-server row either');
   await seq.close();
 });
 

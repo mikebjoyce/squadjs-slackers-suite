@@ -74,6 +74,37 @@
  *     scramble; EloTracker captures a team-balance snapshot for Discord
  *     reporting.
  *
+ * ─── MULTI-SERVER (v2.2.0) ───────────────────────────────────────
+ *
+ * Ratings are community-wide: one player, one rating, however many of
+ * the community's servers they play on. Elo_PlayerStats carries no
+ * serverID and is not meant to — a rating is a fact about a player,
+ * not about where they earned it. The per-round tables beneath it are
+ * per-server, because a round happens on a server.
+ *
+ * That split is the whole design, and it has one consequence worth
+ * stating plainly: a round ending on each server at once is two
+ * processes doing a read-modify-write against the same rating row.
+ * Both increment paths in elo-database.js take a row lock for that
+ * reason, and the bulk path orders its locked read by eosID so two
+ * overlapping rosters queue rather than deadlock. Without the lock
+ * the counters end short, with nothing reporting it.
+ *
+ * minRoundsForLeaderboard is compared across the registry rather than
+ * trusted per process. It reads like a display threshold and is not:
+ * pruneStaleEntries() uses it as the discriminator between its two
+ * retention tiers, in _onS3Ready(), so a disagreement means one
+ * server deleting rows the other considers live. The prune is gated
+ * on communityOptionRefusal() for exactly that reason and does not
+ * run while the registry disagrees.
+ *
+ * Requires S³ 1.8.0, checked at mount. Against an older S³ the
+ * Discord surface degrades two different ways: the routing and
+ * confirmation calls are optional-chained and silently never run,
+ * while recordCommunityOptions() and communityOptionRefusal() are
+ * plain calls inside _onS3Ready() and throw partway through it.
+ * Checking the version first is what turns those into one refusal.
+ *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
  * - eloCache (Map<eosID, { mu, sigma, roundsPlayed, wins, losses }>)
@@ -150,11 +181,11 @@ import Logger from '../../core/logger.js';
 import EloDatabase from '../utils/elo-database.js';
 import EloSessionManager from '../utils/elo-session-manager.js';
 import EloCalculator from '../utils/elo-calculator.js';
-import { EloDiscord } from '../utils/elo-discord.js';
+import { EloDiscord, ELO_RESET_CONFIRM_MS } from '../utils/elo-discord.js';
 import EloCommands from '../utils/elo-commands.js';
 
 export default class EloTracker extends S3PluginBase {
-  static version = '2.1.7';
+  static version = '2.2.0';
 
   static get description() {
     return 'A SquadJS plugin that tracks player participation across rounds, computes individual ELO ratings using a TrueSkill-based algorithm, and persists all data via Sequelize-compatible databases (SQLite, MySQL, PostgreSQL, etc.).';
@@ -239,6 +270,10 @@ export default class EloTracker extends S3PluginBase {
     this.listeners.onRoundEnded = this.onRoundEnded.bind(this);
     this.listeners.onTeamBalancerScramble = this.onTeamBalancerScramble.bind(this);
     EloDiscord.registerDiscordCommands(this);
+    // EloDiscord is a module singleton and cannot import the label module
+    // itself — see S3PluginBase.applyServerLabel(). Read at send time, not
+    // captured, so a label published later still lands.
+    EloDiscord.applyServerLabel = (payload) => this.applyServerLabel(payload);
     this.listeners.onDiscordMessage = this.onDiscordMessage.bind(this);
     EloCommands.register(this);
     this.listeners.onEloCommand = this.onEloCommand.bind(this);
@@ -258,7 +293,20 @@ export default class EloTracker extends S3PluginBase {
     // fuzzy hit would be scored as an exact-name match (tier 1) and the ranking
     // would collapse back to the arbitrary-winner bug it was written to fix.
     // A mount-time failure is much cheaper than a lookup that quietly lies.
-    const required = '1.2.4';
+    //
+    // 1.8.0 — the multi-server surface, and the failure modes are not
+    // uniform. recordCommunityOptions() and communityOptionRefusal() are
+    // plain calls inside _onS3Ready(), so an older S³ throws a TypeError
+    // partway through mount, with a stack that names the base class rather
+    // than the version. Everything else is optional-chained and fails
+    // quietly instead: the routing gate never runs, so on a shared database
+    // every process answers every !elo command; !elo reset arms with no
+    // token, so a confirm is taken by whichever process reads it first; and
+    // leaderboardMinRounds() falls back to this process's own
+    // minRoundsForLeaderboard, so the same command returns a different list
+    // depending on which server replied. None of those log an error.
+    // Checking the version first is what makes them one refusal.
+    const required = '1.8.0';
     const actual = this._s3?.version;
     if (!this._s3VersionAtLeast(required)) {
       throw new Error(
@@ -266,6 +314,55 @@ export default class EloTracker extends S3PluginBase {
       );
     }
     Logger.verbose('EloTracker', 2, `[S3] Version check passed: S³ v${actual} >= required v${required}`);
+  }
+
+  /**
+   * Take the armed `!elo reset` back out, by token where there is one.
+   *
+   * The flag and the store are armed together and cleared together. The
+   * flag is what a single-server install has always used and what the bare
+   * `!elo reset confirm` still reads; the store is what makes a token
+   * confirm find the process that minted it rather than an arbitrary one.
+   *
+   * @param {string|null} token
+   * @returns {boolean} Whether this process held the armed reset
+   * @private
+   */
+  _takeEloReset(token) {
+    if (token && this.isMultiServer?.()) {
+      const taken = this.takeConfirmation('eloReset', token);
+      if (taken.status !== 'ok') return false;
+      this._resetConfirmPending = null;
+      return true;
+    }
+
+    if (!this._resetConfirmPending) return false;
+    const stale = Date.now() - this._resetConfirmPending.timestamp > ELO_RESET_CONFIRM_MS;
+    this._resetConfirmPending = null;
+    this.cancelConfirmations?.('eloReset');
+    return !stale;
+  }
+
+  /**
+   * The rounds a player needs before they appear on the leaderboard.
+   *
+   * `Elo_PlayerStats` is one table for the whole community, so every read
+   * of it is a community read and has to use a community threshold. Two
+   * servers configured 10 and 25 otherwise return two different top tens
+   * for the same command in the same channel, decided by whichever process
+   * answered first.
+   *
+   * Every read site goes through here rather than through `this.options`,
+   * including the in-game ones: a player on one server and a player on the
+   * other are looking at the same ratings and should be told the same thing
+   * about them.
+   *
+   * @returns {number}
+   */
+  leaderboardMinRounds() {
+    return this.strictestCommunityOption?.(
+      'minRoundsForLeaderboard', 'minRoundsForLeaderboard', this.options.minRoundsForLeaderboard
+    ) ?? this.options.minRoundsForLeaderboard;
   }
 
   async _onS3Ready() {
@@ -289,10 +386,19 @@ export default class EloTracker extends S3PluginBase {
     // explicit `tableName` options below are redundant but harmless. They MUST
     // NOT be removed — existing databases already have the plural table names,
     // and removing `tableName` would cause Sequelize to look for the singular form.
-    this.defineModel('Elo_PluginState', {
-      id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: false, defaultValue: 1 }
-    }, { timestamps: false, tableName: 'Elo_PluginStates', exportTier: 'ephemeral' });
-
+    // Elo_PluginState is deliberately no longer defined. The table holds
+    // exactly one row, `{ id: 1 }`, and has no other column: re-confirmed
+    // against the newest production export before it was dropped, rather
+    // than assumed from the schema. Nothing reads it — the findOrCreate in
+    // elo-database.js that kept it alive was described in its own comment as
+    // being there "for backwards-compatible checks" that no longer exist.
+    //
+    // The table itself is not dropped, and on the restricted grant it could
+    // not be: DROP is not on it. v1 still creates it, because v1 is recorded
+    // in production and what a recorded migration creates is a contract.
+    // What changes is that the suite stops carrying a model for it, so it
+    // stops appearing in exports, in drift verification and in the roster.
+    // `!s3 db orphans` is where it shows up now.
     this.defineModel('Elo_PlayerStats', {
       eosID: { type: this.s3db?.getDataTypes().STRING, primaryKey: true, allowNull: false },
       steamID: { type: this.s3db?.getDataTypes().STRING, allowNull: true },
@@ -304,10 +410,25 @@ export default class EloTracker extends S3PluginBase {
       losses: { type: this.s3db?.getDataTypes().INTEGER, defaultValue: 0 },
       roundsPlayed: { type: this.s3db?.getDataTypes().INTEGER, defaultValue: 0 },
       lastSeen: { type: this.s3db?.getDataTypes().BIGINT, allowNull: true }
-    }, { tableName: 'Elo_PlayerStats', timestamps: false, charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci', exportTier: 'historical' });
+    }, {
+      tableName: 'Elo_PlayerStats',
+      timestamps: false,
+      charset: 'utf8mb4',
+      collate: 'utf8mb4_unicode_ci',
+      exportTier: 'historical',
+      // One rating per player across the community. A player is as good as they
+      // are; which server they earned it on is a property of the round, and the
+      // round tables carry that.
+      scopeKind: 'global'
+    });
 
     this.defineModel('Elo_RoundHistory', {
       id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
+      // Nullable, and it stays nullable through this phase. A NOT NULL
+      // serverID would make an un-upgraded process’s INSERT fail outright,
+      // and it would reject the pre-upgrade rows the backfill deliberately
+      // leaves NULL when it cannot attribute them.
+      serverID: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true },
       matchId: { type: this.s3db?.getDataTypes().STRING(20), allowNull: true },
       layerName: { type: this.s3db?.getDataTypes().STRING, allowNull: true },
       winningTeamID: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true },
@@ -315,10 +436,17 @@ export default class EloTracker extends S3PluginBase {
       roundDuration: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true },
       endedAt: { type: this.s3db?.getDataTypes().BIGINT, allowNull: true },
       playerCount: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true }
-    }, { timestamps: false, tableName: 'Elo_RoundHistories', exportTier: 'historical' });
+    }, {
+      timestamps: false,
+      tableName: 'Elo_RoundHistories',
+      exportTier: 'historical',
+      // One row per round played on one server.
+      scopeKind: 'server-column'
+    });
 
     this.defineModel('Elo_RoundPlayers', {
       id: { type: this.s3db?.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
+      serverID: { type: this.s3db?.getDataTypes().INTEGER, allowNull: true },
       matchId: { type: this.s3db?.getDataTypes().STRING(20), allowNull: true },
       roundStartTime: { type: this.s3db?.getDataTypes().BIGINT, allowNull: true },
       roundHistoryId: { type: this.s3db?.getDataTypes().INTEGER, allowNull: false },
@@ -335,7 +463,17 @@ export default class EloTracker extends S3PluginBase {
       scaledDeltaSigma: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false },
       muAfter: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false },
       sigmaAfter: { type: this.s3db?.getDataTypes().FLOAT, allowNull: false }
-    }, { timestamps: false, tableName: 'Elo_RoundPlayers', charset: 'utf8mb4', collate: 'utf8mb4_unicode_ci', exportTier: 'historical' });
+    }, {
+      timestamps: false,
+      tableName: 'Elo_RoundPlayers',
+      charset: 'utf8mb4',
+      collate: 'utf8mb4_unicode_ci',
+      exportTier: 'historical',
+      // One row per player per round, and the round belongs to a server. The
+      // rating these deltas feed into is community-wide; the deltas themselves
+      // are evidence of what happened where.
+      scopeKind: 'server-column'
+    });
 
     // Inject S³ DBService into EloDatabase delegate
     if (this.s3db?.isReady() && this.db) {
@@ -350,9 +488,13 @@ export default class EloTracker extends S3PluginBase {
     if (this.s3db?.isReady() && this.s3db.migrationEngine) {
       // These are MODEL names (keys in db.models), not table names.
       // verifyLiveSchema() follows model.tableName to find the real DB table.
-      // E.g. model 'Elo_PluginState' → model.tableName === 'Elo_PluginStates'.
-      this.registerExpectedVersion('elo-tracker', 2, {
-        models: ['Elo_PluginState', 'Elo_PlayerStats', 'Elo_RoundHistory', 'Elo_RoundPlayers']
+      // E.g. model 'Elo_RoundHistory' → model.tableName === 'Elo_RoundHistories'.
+      //
+      // Three, not four. Elo_PluginState is gone from the list because the
+      // model is gone; a model listed here that nothing defines would fail
+      // live-schema verification on every mount.
+      this.registerExpectedVersion('elo-tracker', 3, {
+        models: ['Elo_PlayerStats', 'Elo_RoundHistory', 'Elo_RoundPlayers']
       });
 
       this.registerMigrations('elo-tracker', [
@@ -389,6 +531,12 @@ export default class EloTracker extends S3PluginBase {
             if (!(await qi.tableExists('Elo_RoundHistories'))) {
               await qi.createTable('Elo_RoundHistories', {
                 id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+                // v1 is the baseline for new installs and carries every column
+                // the current code expects, including ones later deltas add — the
+                // convention TeamBalancer’s v1 states in full. It costs a fresh
+                // install one ALTER it would otherwise need on a grant that has
+                // none. v3 below is guarded, so it is a no-op here.
+                serverID: { type: qi.DataTypes.INTEGER, allowNull: true },
                 layerName: { type: qi.DataTypes.STRING, allowNull: true },
                 winningTeamID: { type: qi.DataTypes.INTEGER, allowNull: true },
                 ticketDiff: { type: qi.DataTypes.INTEGER, allowNull: true },
@@ -401,6 +549,7 @@ export default class EloTracker extends S3PluginBase {
             if (!(await qi.tableExists('Elo_RoundPlayers'))) {
               await qi.createTable('Elo_RoundPlayers', {
                 id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+                serverID: { type: qi.DataTypes.INTEGER, allowNull: true },
                 matchId: { type: qi.DataTypes.STRING(20), allowNull: true },
                 roundStartTime: { type: qi.DataTypes.BIGINT, allowNull: true },
                 roundHistoryId: { type: qi.DataTypes.INTEGER, allowNull: false },
@@ -453,11 +602,66 @@ export default class EloTracker extends S3PluginBase {
               }
             }
           }
+        },
+        {
+          version: 3,
+          description: 'Add serverID to Elo_RoundHistories and Elo_RoundPlayers for multi-server scoping',
+          // Table names, not model names: the model is Elo_RoundHistory and
+          // the table is Elo_RoundHistories, and a touches entry naming the
+          // model names a table that does not exist — verification then
+          // re-runs a migration that already succeeded, on every mount,
+          // forever.
+          //
+          // No touches.data { notNull }. Deferred until every write path is
+          // proven to stamp the column, because a data post-condition is
+          // re-checked on every mount and one unstamped insert is a
+          // rollback-and-re-gate loop.
+          touches: {
+            columns: {
+              Elo_RoundHistories: ['serverID'],
+              Elo_RoundPlayers: ['serverID']
+            }
+          },
+          up: async (qi) => {
+            const serverID = this.s3db?.getServerID?.() ?? null;
+            for (const table of ['Elo_RoundHistories', 'Elo_RoundPlayers']) {
+              if (!(await qi.tableExists(table))) continue;
+              const info = await qi.describeTable(table);
+              if (!info.serverID) {
+                await qi.addColumn(table, 'serverID', { type: qi.DataTypes.INTEGER, allowNull: true });
+              }
+              // Outside the guard and matched on IS NULL — a hand-migrated
+              // database arrives with the column present and every row NULL.
+              await this.s3db.backfillServerID(qi, table, serverID);
+            }
+          },
+          down: async (qi) => {
+            for (const table of ['Elo_RoundHistories', 'Elo_RoundPlayers']) {
+              if (!(await qi.tableExists(table))) continue;
+              const info = await qi.describeTable(table);
+              if (info.serverID) await qi.removeColumn(table, 'serverID');
+            }
+          }
         }
       ]);
 
       // Apply pending migrations
       await this.verifyAndRunMigrations('elo-tracker');
+
+      // Bare CREATE INDEX after the migration commits, never addIndex():
+      // Sequelize emits ALTER TABLE ... ADD INDEX for addIndex on MySQL and
+      // the live grant has no ALTER. Named for the table rather than
+      // idx_serverID, because Postgres scopes index names to the schema and
+      // nine tables would otherwise all want the same one. Non-fatal: a
+      // missing index costs query time, never correctness, and it is
+      // re-attempted on the next mount.
+      for (const table of ['Elo_RoundHistories', 'Elo_RoundPlayers']) {
+        try {
+          await this.s3db.ensureIndexes(table, [{ name: `${table}_serverID`, fields: ['serverID'] }]);
+        } catch (err) {
+          Logger.verbose('EloTracker', 1, `Could not ensure ${table} serverID index: ${err.message}`);
+        }
+      }
     } else {
       Logger.verbose('EloTracker', 1, 'S³ DB or migrationEngine not available — skipping migration registration.');
     }
@@ -465,9 +669,38 @@ export default class EloTracker extends S3PluginBase {
     // Initialize DB models (tables created by MigrationEngine above; initDB will find them)
     await this.db.initDB();
 
+    // Recorded before the prune below reads the comparison, and recorded
+    // whether or not this plugin is the one that diverges: a server that says
+    // nothing contributes no candidate, and a community where only one server
+    // has spoken would look unanimous.
+    await this.recordCommunityOptions({
+      minRoundsForLeaderboard: this.options.minRoundsForLeaderboard,
+      minPlayersForElo: this.options.minPlayersForElo,
+      minParticipationRatio: this.options.minParticipationRatio
+    });
+
     // --- Prune stale player entries ---
-    const { tier1, tier2 } = await this.db.pruneStaleEntries(this.options.minRoundsForLeaderboard);
-    Logger.verbose('EloTracker', 1, `[mount] Pruned stale entries — Tier 1 (provisional): ${tier1}, Tier 2 (calibrated): ${tier2}`);
+    //
+    // minRoundsForLeaderboard reads like a display cutoff and is used as one,
+    // and it is also the discriminator in both tiers of this delete: rows unseen
+    // 30 days go when roundsPlayed is below it, rows unseen 90 days go when it is
+    // at or above. Against one shared rating table that makes a player
+    // provisional to a server configured 25 and calibrated to one configured 10,
+    // so which retention clock applies to them depends on which server restarted
+    // last. Nothing in the schema records which.
+    //
+    // A logged skip and not a mount failure. This runs inside mount(), so
+    // refusing outright would take the plugin — and a live game's Elo tracking —
+    // down over two admins disagreeing about a leaderboard threshold, which is
+    // the outcome warning-at-mount exists to avoid. Nothing is deleted, the
+    // plugin comes up, and the next boot after the values agree prunes normally.
+    const refusal = this.communityOptionRefusal('minRoundsForLeaderboard');
+    if (refusal) {
+      Logger.verbose('EloTracker', 1, `[mount] Stale-entry prune declined — ${refusal}. No rating rows were deleted.`);
+    } else {
+      const { tier1, tier2 } = await this.db.pruneStaleEntries(this.options.minRoundsForLeaderboard);
+      Logger.verbose('EloTracker', 1, `[mount] Pruned stale entries — Tier 1 (provisional): ${tier1}, Tier 2 (calibrated): ${tier2}`);
+    }
 
     // Restart Recovery — delegated to S³ GameStateService
     const gs = this._s3?.gameState;

@@ -64,6 +64,7 @@ import SwitchExplain from '../utils/switch-explain.js';
 import { buildAssembly, importFromAssembly, cleanAssembly } from '../../s3/testing/plugin-assembly.js';
 
 const TABLE = 'SwitchPlugin_PlayerCooldowns';
+const STATE_TABLE = 'SwitchPlugin_PlayerServerState';
 const ENDMATCHES = 'SwitchPlugin_Endmatches';
 const ASSEMBLY = buildAssembly('.tmp-switch-admin-mutations');
 const Switch = await importFromAssembly(ASSEMBLY, 'switch.js');
@@ -227,13 +228,19 @@ async function buildPlugin({
   db.migrationEngine.confirmToken('__force__');
   await db.migrationEngine.runMigrations('switch');
 
-  return { plugin, db, seq, model: db.getModel(TABLE), endmatches: db.getModel(ENDMATCHES) };
+  return {
+    plugin, db, seq,
+    model: db.getModel(TABLE),
+    stateModel: db.getModel(STATE_TABLE),
+    endmatches: db.getModel(ENDMATCHES)
+  };
 }
 
 // Rows, not tables: the MySQL scratch database is shared across cases and its
 // schema must outlive any one of them.
-async function teardown({ db, seq, model, endmatches }) {
+async function teardown({ db, seq, model, stateModel, endmatches }) {
   try { await model?.destroy({ where: {} }); } catch { /* best effort */ }
+  try { await stateModel?.destroy({ where: {} }); } catch { /* best effort */ }
   try { await endmatches?.destroy({ where: {} }); } catch { /* best effort */ }
   try { await db.unmount(); } catch { /* best effort */ }
   try { await seq.close(); } catch { /* best effort */ }
@@ -263,6 +270,45 @@ const row = (over = {}) => ({
   ...over
 });
 
+// The four columns the split moved to SwitchPlugin_PlayerServerState.
+const MOVED = [
+  'scrambleLockdownExpiry', 'seedPresenceStart', 'lastSeedBonusRoundID', 'seedBonusTokensEarned'
+];
+
+/**
+ * Seed a player from one literal, into whichever tables it belongs in.
+ *
+ * The cases here describe players, not rows, and they described them in one
+ * object before the split. Keeping that shape and splitting it here means a
+ * case still reads as "this player has three tokens and a live lock" rather
+ * than as two inserts an editor has to keep in step — and it is the fixture,
+ * not the subject: the production paths write the two tables themselves and
+ * are asserted doing it.
+ *
+ * Server 1 throughout, which is what DBService resolves to with no `server.id`
+ * configured. A case that needs another server writes it directly.
+ */
+async function plant(ctx, defs) {
+  const list = Array.isArray(defs) ? defs : [defs];
+  const wallets = [];
+  const sides = [];
+  for (const def of list) {
+    const wallet = { ...def };
+    const side = {
+      serverID: 1,
+      eosID: def.eosID,
+      lastActiveTimestamp: def.lastActiveTimestamp ?? new Date()
+    };
+    for (const col of MOVED) {
+      if (col in wallet) { side[col] = wallet[col]; delete wallet[col]; }
+    }
+    wallets.push(wallet);
+    sides.push(side);
+  }
+  await ctx.model.bulkCreate(wallets);
+  await ctx.stateModel.bulkCreate(sides);
+}
+
 console.log('');
 console.log('🧪 Switch Admin Mutations & Live State — real engines');
 console.log('');
@@ -275,12 +321,18 @@ await probeMysql();
 await onEachEngine('wipe deletes every row and returns the count', async (dialect) => {
   const ctx = await buildPlugin({ dialect });
   try {
-    await ctx.model.bulkCreate([
+    await plant(ctx, [
       row({ eosID: 'a' }), row({ eosID: 'b' }), row({ eosID: 'c', tokenBalance: 3 })
     ]);
-    const deleted = await ctx.plugin.adminWipeAll();
+    // Both counts, because a wipe that empties the wallets and leaves the
+    // per-server rows behind leaves locks and seed clocks with nothing to
+    // belong to — and the next read resurrects them against a player the
+    // plugin now treats as brand new.
+    const { deleted, stateDeleted } = await ctx.plugin.adminWipeAll();
     assert.strictEqual(deleted, 3, 'wipe should report the rows it deleted');
+    assert.strictEqual(stateDeleted, 3, 'wipe should report the per-server rows it deleted');
     assert.strictEqual(await ctx.model.count(), 0, 'table should be empty after a wipe');
+    assert.strictEqual(await ctx.stateModel.count(), 0, 'per-server table should be empty after a wipe');
   } finally {
     await teardown(ctx);
   }
@@ -307,7 +359,7 @@ await runTest('wipe succeeds as a MySQL user with no DDL grants [mysql]', async 
       dialect: 'mysql',
       sequelizeOpts: { ...MYSQL_ROOT, database: dbName }
     });
-    await bootstrap.model.bulkCreate([row({ eosID: 'a' }), row({ eosID: 'b' })]);
+    await plant(bootstrap, [row({ eosID: 'a' }), row({ eosID: 'b' })]);
     // Leave the tables in place for the restricted user.
     try { await bootstrap.db.unmount(); } catch { /* best effort */ }
     try { await bootstrap.seq.close(); } catch { /* best effort */ }
@@ -336,9 +388,11 @@ await runTest('wipe succeeds as a MySQL user with no DDL grants [mysql]', async 
         'the restricted user was able to TRUNCATE — the grant setup is wrong and this test proves nothing'
       );
 
-      const deleted = await restricted.plugin.adminWipeAll();
+      const { deleted, stateDeleted } = await restricted.plugin.adminWipeAll();
       assert.strictEqual(deleted, 2, 'DML-only wipe should have deleted both rows');
+      assert.strictEqual(stateDeleted, 2, 'DML-only wipe should have deleted both per-server rows');
       assert.strictEqual(await restricted.model.count(), 0, 'rows survived the wipe');
+      assert.strictEqual(await restricted.stateModel.count(), 0, 'per-server rows survived the wipe');
     } finally {
       try { await restricted.db.unmount(); } catch { /* best effort */ }
       try { await restricted.seq.close(); } catch { /* best effort */ }
@@ -383,7 +437,7 @@ await onEachEngine('a failing admin mutation throws instead of returning quietly
 await onEachEngine('clearall tops players up without capping seed holders', async (dialect) => {
   const ctx = await buildPlugin({ dialect });
   try {
-    await ctx.model.bulkCreate([
+    await plant(ctx, [
       row({ eosID: 'broke', tokenBalance: 0, tokenRegenAnchor: new Date() }),
       row({ eosID: 'partial', tokenBalance: 1, tokenRegenAnchor: new Date() }),
       row({ eosID: 'full', tokenBalance: 2 }),
@@ -402,7 +456,12 @@ await onEachEngine('clearall tops players up without capping seed holders', asyn
       seeder.tokenBalance, 3,
       'clearall confiscated an earned seed token — top-up must be Math.max(current, max), not an assignment'
     );
-    assert.strictEqual(seeder.seedBonusTokensEarned, 1, 'seed accrual bookkeeping should be untouched');
+    const seederSide = await ctx.stateModel.findOne({ where: { serverID: 1, eosID: 'seeder' } });
+    assert.strictEqual(seederSide.seedBonusTokensEarned, 1, 'seed accrual bookkeeping should be untouched');
+
+    // The top-up crosses every server, the lock clear does not, and the
+    // return value has to say which server the second number is about.
+    assert.strictEqual(result.serverID, 1, 'clearall should name the server whose locks it lifted');
 
     assert.strictEqual(await ctx.model.count(), 4, 'clearall must not delete rows — that is what wipe is for');
   } finally {
@@ -413,7 +472,7 @@ await onEachEngine('clearall tops players up without capping seed holders', asyn
 await onEachEngine('clear on one player never lowers a seed-boosted balance', async (dialect) => {
   const ctx = await buildPlugin({ dialect });
   try {
-    await ctx.model.create(row({
+    await plant(ctx, row({
       eosID: 'seeder',
       tokenBalance: 3,
       seedBonusTokensEarned: 1,
@@ -429,11 +488,28 @@ await onEachEngine('clear on one player never lowers a seed-boosted balance', as
 
     const after = await ctx.model.findByPk('seeder');
     assert.strictEqual(after.tokenBalance, 3);
-    assert.strictEqual(after.scrambleLockdownExpiry, null, 'the scramble lock should be gone');
     assert.strictEqual(after.tokenRegenAnchor, null, 'no regen cycle runs at or above the cap');
     assert.ok(after.lastActiveTimestamp instanceof Date, 'clear must keep the retention clock non-NULL');
-    assert.strictEqual(after.seedBonusTokensEarned, 1, 'in-progress seed accrual should survive a clear');
-    assert.ok(after.seedPresenceStart instanceof Date, 'clear should not cancel a live seed session');
+
+    const side = await ctx.stateModel.findOne({ where: { serverID: 1, eosID: 'seeder' } });
+    assert.strictEqual(side.scrambleLockdownExpiry, null, 'the scramble lock should be gone');
+    assert.strictEqual(side.seedBonusTokensEarned, 1, 'in-progress seed accrual should survive a clear');
+    assert.ok(side.seedPresenceStart instanceof Date, 'clear should not cancel a live seed session');
+    assert.strictEqual(summary.serverID, 1, 'clear should name the server whose lock it lifted');
+
+    // checkPlayer() is what every reply renders from, and it has to hand back
+    // one player rather than a wallet and a lock the caller has to join. The
+    // list of which fields were the local half is part of that contract: the
+    // replies use it to say what they changed and where.
+    const merged = await ctx.plugin.checkPlayer('seeder');
+    assert.strictEqual(merged.tokenBalance, 3, 'checkPlayer lost the community-wide balance');
+    assert.strictEqual(merged.seedBonusTokensEarned, 1, 'checkPlayer lost the per-server seed count');
+    assert.strictEqual(merged._serverID, 1, 'checkPlayer should say which server it merged');
+    assert.deepStrictEqual(
+      merged._serverScoped,
+      ['scrambleLockdownExpiry', 'seedPresenceStart', 'lastSeedBonusRoundID', 'seedBonusTokensEarned'],
+      'checkPlayer must name the server-scoped half, or a reply cannot say which is which'
+    );
   } finally {
     await teardown(ctx);
   }
@@ -476,23 +552,36 @@ await onEachEngine('clearall leaves no row locked, at any balance', async (diale
   const ctx = await buildPlugin({ dialect });
   const lock = () => new Date(Date.now() + HOUR);
   try {
-    await ctx.model.bulkCreate([
+    await plant(ctx, [
       row({ eosID: 'b0', tokenBalance: 0, scrambleLockdownExpiry: lock() }),
       row({ eosID: 'b1', tokenBalance: 1, scrambleLockdownExpiry: lock() }),
       row({ eosID: 'b2', tokenBalance: 2, scrambleLockdownExpiry: lock() }),
       row({ eosID: 'b3', tokenBalance: 3, seedBonusTokensEarned: 1, scrambleLockdownExpiry: lock() }),
       row({ eosID: 'b9', tokenBalance: 9, scrambleLockdownExpiry: lock() })
     ]);
+    // Another server holds a lock on b0 as well. It must survive: this admin
+    // was asked about their own server, and clearing everybody's locks
+    // everywhere is a decision nobody typed.
+    await ctx.stateModel.create({ serverID: 2, eosID: 'b0', scrambleLockdownExpiry: lock(), lastActiveTimestamp: new Date() });
 
     const result = await ctx.plugin.adminClearAllRestrictions();
 
-    const stillLocked = await ctx.model.count({ where: { scrambleLockdownExpiry: { [Sequelize.Op.ne]: null } } });
+    const stillLocked = await ctx.stateModel.count({
+      where: { serverID: 1, scrambleLockdownExpiry: { [Sequelize.Op.ne]: null } }
+    });
     assert.strictEqual(
       stillLocked, 0,
-      `${stillLocked} row(s) fell between clearall's two arms and kept their lock`
+      `${stillLocked} row(s) on this server kept their lock through a clearall`
+    );
+    assert.strictEqual(
+      await ctx.stateModel.count({ where: { serverID: 2, scrambleLockdownExpiry: { [Sequelize.Op.ne]: null } } }), 1,
+      'clearall lifted another server\u2019s lock — the lock statement is not scoped'
     );
     assert.strictEqual(result.toppedUp, 2, 'b0 and b1 are the only rows below the cap');
-    assert.strictEqual(result.locksCleared, 3, 'b2, b3 and b9 keep their balances and lose their locks');
+    assert.strictEqual(
+      result.locksCleared, 5,
+      'every lock on this server is cleared now that the statement no longer partitions on the balance'
+    );
 
     // And the surplus survived the sweep.
     assert.strictEqual((await ctx.model.findByPk('b3')).tokenBalance, 3);
@@ -517,9 +606,10 @@ await runTest("clearall lifts the lock on a NULL-balance row (hand-applied schem
   try {
     await ctx.seq.query(`ALTER TABLE \`${TABLE}\` MODIFY \`tokenBalance\` INT NULL;`);
     await ctx.seq.query(
-      `INSERT INTO \`${TABLE}\` (\`eosID\`, \`playerName\`, \`tokenBalance\`, \`seedBonusTokensEarned\`, \`scrambleLockdownExpiry\`, \`lastActiveTimestamp\`)
-       VALUES ('weird', 'Weird', NULL, 0, DATE_ADD(NOW(), INTERVAL 1 HOUR), NOW());`
+      `INSERT INTO \`${TABLE}\` (\`eosID\`, \`playerName\`, \`tokenBalance\`, \`lastActiveTimestamp\`)
+       VALUES ('weird', 'Weird', NULL, NOW());`
     );
+    await ctx.stateModel.create({ serverID: 1, eosID: 'weird', scrambleLockdownExpiry: new Date(Date.now() + HOUR), lastActiveTimestamp: new Date() });
 
     // Pre-flight: `tokenBalance < 2` really is UNKNOWN here, so a pass below
     // means the NULL arm did the work rather than the < arm having matched.
@@ -534,13 +624,20 @@ await runTest("clearall lifts the lock on a NULL-balance row (hand-applied schem
     await ctx.plugin.adminClearAllRestrictions();
 
     const [[after]] = await ctx.seq.query(
-      `SELECT \`tokenBalance\`, \`scrambleLockdownExpiry\` FROM \`${TABLE}\` WHERE \`eosID\` = 'weird';`
+      `SELECT \`tokenBalance\` FROM \`${TABLE}\` WHERE \`eosID\` = 'weird';`
     );
     assert.strictEqual(
-      after.scrambleLockdownExpiry, null,
-      'the lock survived clearall — without the explicit NULL arm this row matches neither UPDATE'
+      Number(after.tokenBalance), 2,
+      'the NULL row was not topped up — without the explicit NULL arm it matches neither UPDATE'
     );
-    assert.strictEqual(Number(after.tokenBalance), 2, 'the NULL arm should also top the row up');
+
+    // The lock is a separate statement on a separate table since the split,
+    // and it no longer partitions on the balance at all — which is what
+    // retires this row as a silent-failure case rather than only defending
+    // it. Asserted anyway, because "cannot fail any more" is a claim that
+    // has to be checked rather than assumed.
+    const side = await ctx.stateModel.findOne({ where: { serverID: 1, eosID: 'weird' } });
+    assert.strictEqual(side.scrambleLockdownExpiry, null, 'the lock survived clearall');
   } finally {
     // Restore the declared shape for the cases that follow on this database.
     try { await ctx.seq.query(`DELETE FROM \`${TABLE}\`;`); } catch { /* best effort */ }
@@ -622,6 +719,51 @@ await onEachEngine('normalized rows become eligible for the tier-1 prune', async
   }
 });
 
+await onEachEngine('the prune declines while the community disagrees about the retention window', async (dialect) => {
+  const ctx = await buildPlugin({ dialect });
+  try {
+    // Prunable on tier 1: full, unlocked, seed-free, and unseen for a month.
+    await ctx.model.create(row({
+      eosID: 'ghost',
+      lastActiveTimestamp: new Date(Date.now() - 30 * 24 * HOUR)
+    }));
+
+    // Two registered servers, two retention windows, one shared table. There is
+    // no value here that is obviously right to resolve to — a retention window
+    // is policy, not a safety limit — so without the gate whichever process ran
+    // cleanup() last would decide how long everybody's rows live.
+    await ctx.db.ServersModel.bulkCreate([
+      { serverID: 1, alias: 'main', communityOptions: JSON.stringify({ pruneInactivePlayerDays: 3 }) },
+      { serverID: 2, alias: 'event', communityOptions: JSON.stringify({ pruneInactivePlayerDays: 30 }) }
+    ]);
+    await ctx.db.getCommunityOptionSummary();
+
+    await ctx.plugin.cleanup();
+    assert.strictEqual(
+      await ctx.model.count(), 1,
+      'the prune deleted a row the whole community shares while the community disagreed about how long it lives'
+    );
+
+    // The neighbour is reconfigured to agree, and the same row goes.
+    await ctx.db.ServersModel.update(
+      { communityOptions: JSON.stringify({ pruneInactivePlayerDays: 3 }) },
+      { where: { serverID: 2 } }
+    );
+    await ctx.db.getCommunityOptionSummary();
+
+    await ctx.plugin.cleanup();
+    assert.strictEqual(
+      await ctx.model.count(), 0,
+      'the servers agree and the prune still declined — the gate is refusing on something other than the disagreement'
+    );
+  } finally {
+    // The MySQL scratch database is shared across cases, so the registry rows
+    // have to go with the cooldown rows or the next case inherits a community.
+    try { await ctx.db.ServersModel.destroy({ where: {} }); } catch { /* best effort */ }
+    await teardown(ctx);
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════
 // 5. _sweepStaleSeedState — the "Seed Accruing: 75" ghosts
 // ═══════════════════════════════════════════════════════════════════
@@ -629,7 +771,7 @@ await onEachEngine('normalized rows become eligible for the tier-1 prune', async
 await onEachEngine('a new round clears last round\'s seed presence', async (dialect) => {
   const ctx = await buildPlugin({ dialect, currentMatchId: 'round-current' });
   try {
-    await ctx.model.bulkCreate([
+    await plant(ctx, [
       // Ten hours stale, from a round that ended long ago — 85 rows on live
       // looked exactly like this and were all being counted as "accruing".
       row({
@@ -656,19 +798,39 @@ await onEachEngine('a new round clears last round\'s seed presence', async (dial
       })
     ]);
 
+    // A second server is mid-seed-round with the same stale-looking row. The
+    // sweep runs on every process, so an unscoped one would have each server
+    // wiping its neighbours' accrual at its own NEW_GAME — and the neighbour
+    // would only find out when nobody got a token.
+    await ctx.stateModel.create({
+      serverID: 2, eosID: 'stale',
+      seedPresenceStart: new Date(Date.now() - 10 * HOUR),
+      seedBonusTokensEarned: 1,
+      lastSeedBonusRoundID: 'round-old',
+      lastActiveTimestamp: new Date()
+    });
+
     await ctx.plugin._sweepStaleSeedState();
 
-    const stale = await ctx.model.findByPk('stale');
+    const side = async (eosID, serverID = 1) => ctx.stateModel.findOne({ where: { serverID, eosID } });
+
+    const stale = await side('stale');
     assert.strictEqual(stale.seedPresenceStart, null, 'stale presence survived the round change');
     assert.strictEqual(stale.seedBonusTokensEarned, 0, 'stale per-round accrual survived the round change');
 
-    const nullRound = await ctx.model.findByPk('null-round');
+    const otherServer = await side('stale', 2);
+    assert.ok(
+      otherServer.seedPresenceStart instanceof Date,
+      'the sweep reached another server\u2019s row — it must be scoped to this server'
+    );
+
+    const nullRound = await side('null-round');
     assert.strictEqual(
       nullRound.seedPresenceStart, null,
       'the NULL lastSeedBonusRoundID arm was not spelled out — != NULL is UNKNOWN, so this row was skipped'
     );
 
-    const live = await ctx.model.findByPk('live');
+    const live = await side('live');
     assert.ok(live.seedPresenceStart instanceof Date, 'the sweep ate the current round\'s accrual');
     assert.strictEqual(live.seedBonusTokensEarned, 1, 'the sweep reset the current round\'s earned count');
 
@@ -693,7 +855,7 @@ const CONNECTED = [
 await onEachEngine('a player at full tokens is not reported as blocked', async (dialect) => {
   const ctx = await buildPlugin({ dialect, connected: CONNECTED });
   try {
-    await ctx.model.bulkCreate([
+    await plant(ctx, [
       row({ eosID: 'online-full', tokenBalance: 2 }),
       row({ eosID: 'seeder', tokenBalance: 3, seedBonusTokensEarned: 1 }),
       // Genuinely blocked: no tokens and nothing regenerating yet.
@@ -701,6 +863,13 @@ await onEachEngine('a player at full tokens is not reported as blocked', async (
       // Genuinely blocked: scramble lock still in force.
       row({ eosID: 'locked', tokenBalance: 2, scrambleLockdownExpiry: new Date(Date.now() + HOUR) })
     ]);
+    // Locked on another server only. The panel reports this server, so this
+    // player is not restricted here and must not appear.
+    await ctx.stateModel.create({
+      serverID: 2, eosID: 'online-full',
+      scrambleLockdownExpiry: new Date(Date.now() + HOUR),
+      lastActiveTimestamp: new Date()
+    });
 
     const state = await ctx.plugin.getLiveRestrictionState();
 
@@ -721,7 +890,7 @@ await onEachEngine('an expired scramble lock does not count as blocked', async (
   const ctx = await buildPlugin({ dialect, connected: CONNECTED });
   try {
     // 74 of 378 live rows carried a lockdown expiry; every one had expired.
-    await ctx.model.create(row({ eosID: 'past', scrambleLockdownExpiry: new Date(Date.now() - HOUR) }));
+    await plant(ctx, row({ eosID: 'past', scrambleLockdownExpiry: new Date(Date.now() - HOUR) }));
     const state = await ctx.plugin.getLiveRestrictionState();
     assert.strictEqual(state.scrambleLocked, 0, 'an expired lock is not a lock');
     assert.strictEqual(state.blocked.length, 0, 'an expired lock should not block anyone');
@@ -733,7 +902,7 @@ await onEachEngine('an expired scramble lock does not count as blocked', async (
 await onEachEngine('seed accrual is only counted for connected players', async (dialect) => {
   const ctx = await buildPlugin({ dialect, connected: CONNECTED });
   try {
-    await ctx.model.bulkCreate([
+    await plant(ctx, [
       row({ eosID: 'online-seeder', seedPresenceStart: new Date(Date.now() - 5 * 60000) }),
       // Disconnected ten hours ago with presence still set. Eighty-five rows
       // on live looked like this and the panel reported all of them.
@@ -778,6 +947,78 @@ await onEachEngine('lazy regeneration is applied for display without writing', a
 });
 
 // ═══════════════════════════════════════════════════════════════════
+// 6b. _checkSwitchEligibility — the shipped gate, on a real engine
+// ═══════════════════════════════════════════════════════════════════
+//
+// test-eligibility-check.js drives mock-harness.js’s hand-copy of this gate,
+// which reads the lock off the wallet row. The shipped gate reads it off the
+// per-server row, so that file passed the split without noticing it and
+// would keep passing if this stopped working entirely. These run the real
+// method against SQLite and MySQL.
+
+await onEachEngine('a lock on this server denies the switch', async (dialect) => {
+  const ctx = await buildPlugin({ dialect, connected: CONNECTED });
+  try {
+    await plant(ctx, row({ eosID: 'locked', tokenBalance: 2, scrambleLockdownExpiry: new Date(Date.now() + HOUR) }));
+
+    const result = await ctx.plugin._checkSwitchEligibility({ eosID: 'locked' });
+    assert.strictEqual(result.eligible, false, 'a scramble-locked player was allowed to switch');
+    assert.strictEqual(
+      result.reason, 'scramble_lock',
+      `denied for ${result.reason} rather than the lock — the gate is not reading the per-server row`
+    );
+    assert.ok(result.remaining > 0, 'the deny message has no time left to quote');
+  } finally {
+    await teardown(ctx);
+  }
+});
+
+await onEachEngine('a lock on another server does not deny the switch here', async (dialect) => {
+  const ctx = await buildPlugin({ dialect, connected: CONNECTED });
+  try {
+    // The whole point of the split. Before it, one scramble locked the
+    // player out of every server sharing the database.
+    //
+    // The wallet is created directly and no row is laid down for server 1:
+    // this is a player whose whole history is on the other server, which is
+    // what makes the case deterministic. Given a row on both, an unscoped
+    // read could return either one and whether the scoping bug shows up
+    // would come down to which row the engine happened to hand back.
+    await ctx.model.create({
+      eosID: 'elsewhere', playerName: 'Elsewhere', tokenBalance: 2,
+      tokenRegenAnchor: null, lastActiveTimestamp: new Date()
+    });
+    await ctx.stateModel.create({
+      serverID: 2, eosID: 'elsewhere',
+      scrambleLockdownExpiry: new Date(Date.now() + HOUR),
+      lastActiveTimestamp: new Date()
+    });
+
+    const result = await ctx.plugin._checkSwitchEligibility({ eosID: 'elsewhere' });
+    // Not asserting eligible: the fixture’s join/match clocks put this
+    // player outside the switch window, which is a different refusal and
+    // not the one under test.
+    assert.notStrictEqual(
+      result.reason, 'scramble_lock',
+      'another server\u2019s scramble locked this player out here',
+    );
+  } finally {
+    await teardown(ctx);
+  }
+});
+
+await onEachEngine('an expired lock on this server does not deny the switch', async (dialect) => {
+  const ctx = await buildPlugin({ dialect, connected: CONNECTED });
+  try {
+    await plant(ctx, row({ eosID: 'past', tokenBalance: 2, scrambleLockdownExpiry: new Date(Date.now() - HOUR) }));
+    const result = await ctx.plugin._checkSwitchEligibility({ eosID: 'past' });
+    assert.notStrictEqual(result.reason, 'scramble_lock', 'an expired lock is not a lock');
+  } finally {
+    await teardown(ctx);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
 // 7. Match-end queue
 // ═══════════════════════════════════════════════════════════════════
 
@@ -795,6 +1036,36 @@ await onEachEngine('the same player cannot be queued for match end twice', async
     await teardown(ctx);
   }
 });
+
+await onEachEngine('a queued match-end switch records the server that queued it', async (dialect) => {
+  const ctx = await buildPlugin({ dialect, connected: CONNECTED });
+  try {
+    const mine = ctx.plugin._serverID();
+    assert.strictEqual(await ctx.plugin.addPlayerToMatchendSwitches(CONNECTED[0]), true);
+
+    const [row] = await ctx.endmatches.findAll();
+    assert.ok(row, 'nothing was queued, so the stamp was never exercised');
+    assert.strictEqual(
+      row.serverID, mine,
+      `the queued switch is stamped ${row.serverID} rather than ${mine}`
+    );
+  } finally {
+    await teardown(ctx);
+  }
+});
+
+/*
+ * Why this one is worth a case of its own rather than being folded into the
+ * dedupe test above.
+ *
+ * This table is not a log. It is a work queue, and the boot path used to
+ * drain it with a findAll() carrying no where clause at all — every row it
+ * found was a switch it performed. With two servers sharing the database,
+ * a restart on one drained the other's queue and moved players who were not
+ * even connected to it. Populating the column was the half that had to land
+ * first, because the read cannot filter on something that is not there; the
+ * filter itself is the case below.
+ */
 
 // Every case in this file sets _matchendWarnDelayMs so it does not sit through
 // the warning. Production does not set it, so production takes the OTHER arm —
@@ -814,14 +1085,51 @@ await runTest('the production warn-delay branch resolves', async () => {
   assert.strictEqual(chosen, 15000, 'the unset path does not fall back to the class default');
 });
 
+await onEachEngine('the match-end drain leaves the other server\u2019s queue alone', async (dialect) => {
+  const ctx = await buildPlugin({ dialect, connected: CONNECTED });
+  try {
+    const mine = ctx.plugin._serverID();
+    await ctx.endmatches.bulkCreate([
+      { serverID: mine, name: 'OnlineFull', steamID: 'steam-2', eosID: 'online-full' },
+      // Queued on the neighbour. Its eosID is one of this server's connected
+      // players on purpose: eosIDs are community-wide, so an unscoped drain
+      // resolves this row against the local roster and moves a player who
+      // never asked for it here.
+      { serverID: mine + 1, name: 'OnlineSeeder', steamID: 'steam-1', eosID: 'online-seeder' }
+    ]);
+
+    const switched = [];
+    ctx.plugin._taggedSwitchPlayer = async (eosID) => { switched.push(eosID); return true; };
+    await ctx.plugin.doSwitchMatchend();
+
+    assert.deepStrictEqual(
+      switched, ['online-full'],
+      `the drain switched ${JSON.stringify(switched)} \u2014 a request queued on another server was performed here`
+    );
+
+    const left = await ctx.endmatches.findAll();
+    assert.strictEqual(
+      left.length, 1,
+      'the neighbour\u2019s queued switch was deleted by this server, so it will never happen at all'
+    );
+    assert.strictEqual(left[0].serverID, mine + 1, 'the wrong row survived the drain');
+  } finally {
+    await teardown(ctx);
+  }
+});
+
 await onEachEngine('a failed match-end switch still consumes its request', async (dialect) => {
   const ctx = await buildPlugin({ dialect, connected: CONNECTED });
   try {
+    // Stamped, because the drain filters on it now. A row with a NULL
+    // serverID is not a fixture shortcut any more — it is a row from before
+    // the column existed, and the migration's backfill is what claims those.
+    const mine = ctx.plugin._serverID();
     await ctx.endmatches.bulkCreate([
-      { name: 'OnlineFull', steamID: 'steam-2', eosID: 'online-full' },
+      { serverID: mine, name: 'OnlineFull', steamID: 'steam-2', eosID: 'online-full' },
       // No eosID and not on the roster: unresolvable, the shape a stale row
       // left by a restart takes.
-      { name: 'Gone', steamID: 'steam-gone', eosID: null }
+      { serverID: mine, name: 'Gone', steamID: 'steam-gone', eosID: null }
     ]);
 
     let calls = 0;
@@ -912,7 +1220,7 @@ await onEachEngine('clearall through chat reports its counts and deletes nothing
   const ctx = await buildPlugin({ dialect });
   const warns = withWarnCapture(ctx.plugin);
   try {
-    await ctx.model.bulkCreate([
+    await plant(ctx, [
       row({ eosID: 'drained', tokenBalance: 0 }),
       row({ eosID: 'locked', scrambleLockdownExpiry: new Date(Date.now() + HOUR) }),
       row({ eosID: 'seeder', tokenBalance: 3, seedBonusTokensEarned: 1 })

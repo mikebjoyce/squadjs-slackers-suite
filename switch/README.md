@@ -1,4 +1,4 @@
-# Switch Plugin v2.5.7
+# Switch Plugin v2.6.0
 
 **Team-change management with database persistence, TeamBalancer integration, and S³-aware player tracking.**
 
@@ -60,9 +60,7 @@ S³ is a **required** supporting plugin that provides centralised shared state a
 
 Switch will fail to mount if S³ is absent — there is no fallback path.
 
-**Requires S³ ≥1.4.0.** The seed-bonus grant path uses accessors that landed in
-1.4.0; on an older S³ they are `undefined` and the UPDATE throws mid-grant rather
-than failing at mount where it would be diagnosable — hence the hard floor.
+**Requires S³ ≥1.8.0.** Switch records and resolves community-wide options at mount, and those are plain calls, so an older S³ throws partway through mount with a stack that names the base class rather than the version. The Discord routing gate is optional-chained and doesn't throw at all: it just never runs, so on a shared database every process answers every `!switch` command. Earlier floors were 1.4.0, for the seed-bonus accessors, and 1.6.0, for the migration-reapply flag. Both sit below this one.
 
 **Setup**: Install S³ in `config.json` before Switch. It must appear in the plugins array before Switch so it is mounted first. No manual configuration beyond installation is needed.
 
@@ -194,6 +192,8 @@ squad-server/
 
 When `explainChannelID` is set, the full explain embed sequence plus a 7-day reliability stats embed is auto-posted to that channel on mount, editing the previous message rather than posting a new one. It refreshes on SquadJS startup only — reload SquadJS to regenerate it.
 
+**Running more than one server?** Give each one its own `explainChannelID`. Both arrangements work — each server tracks its own message ids and never deletes another server's, so a shared channel ends up holding one labelled set per server rather than a mess — but a shared channel means a player scrolls past one server's rules to reach the other's, and the numbers genuinely differ wherever the two are configured differently. A channel each is the clearer read. Where they do share one, the server name appears in the first embed's title and in every embed's footer, so the sets stay tellable apart.
+
 ---
 
 ## Handshake Integration
@@ -210,6 +210,7 @@ The Switch plugin exposes a public API for external consumers (such as SmartAssi
 
 ### Version Compatibility
 
+- `static version = '2.6.0'` — Multi-server support. Cooldown, settings, endmatch and seed tables carry a server id; token balances stay community-wide, so a player's bucket follows them between servers. `!switch` commands take a `--server` selector once a second server registers, and `maxSwitchTokens` plus the cooldown pair resolve to one community-wide value instead of each server's own. Requires S³ >= 1.8.0.
 - `static version = '2.5.7'` — Migration v3's cooldown-table reset no longer runs when the migration is being re-applied to repair schema drift, so restoring lost columns preserves token balances, seed-bonus progress and scramble lockdowns instead of wiping them. Requires S³ >= 1.6.0, which is what supplies the flag it checks.
 - `static version = '2.5.6'` — Admin commands split into `clear`/`clearall` (lift restrictions, never confiscate seed tokens) and `wipe confirm` (delete rows, and it will not run without the confirm word); `clearall` no longer uses TRUNCATE, which the live MySQL account has no privilege for and which was failing silently. Per-round seed state is retired at NEW_GAME rather than only for players who happen to be connected at round end, the presence clock stops on disconnect, and fully-regenerated balances are written back so the 30-minute row prune can see them. `!switch status` reports who is actually blocked instead of listing players at full tokens.
 - `static version = '2.5.5'` — Verify migration data effects; stop swallowing unhandled rejections
@@ -281,6 +282,10 @@ Two grants exist:
   leaves early keeps anything the periodic grant already gave them, but receives no
   consolation.
 
+#### Upgrade note: seed progress resets once
+
+Per-round seed state is stamped with the round it belongs to, and that round key changed format in this release. The first seed round that begins after the upgrade therefore finds every stored key stale, and the per-round block resets for everyone at once: the presence clock restarts and the per-round earned counter goes back to zero. Tokens already in a player’s wallet are untouched, and the wallet ceiling still binds, so nobody ends up above `maxSwitchTokens + seedTokenBonusAmount`. What is lost is at most the presence credit accrued in the round that was live when you upgraded — state that never survives a seeding session anyway. There is no backfill migration because there is nothing worth backfilling. Expect it once, and do not diagnose it as a bug.
+
 ### Queue Timeout Switch (v2.2.0)
 
 | Option | Description | Default |
@@ -327,7 +332,7 @@ The Switch plugin supports splitting Discord traffic across two channels. Round 
 |--------|-------------|---------|
 | `discordChannelID` | Discord channel ID for automated reports (round summaries, scramble lockdown notifications). | `""` |
 | `adminCommandChannelID` | Discord channel ID for admin !switch commands. If not set, all traffic goes through `discordChannelID` (single-channel mode). | `""` |
-| `explainChannelID` | Discord channel ID for the explain messages with 7-day stats. When set, the full explain embed sequence plus reliability stats are posted (or edited in place) on mount. Regenerated on SquadJS startup only, not on a timer. | `""` |
+| `explainChannelID` | Discord channel ID for the explain messages with 7-day stats. When set, the full explain embed sequence plus reliability stats are posted (or edited in place) on mount. Regenerated on SquadJS startup only, not on a timer. Running more than one server against this database? See below. | `""` |
 
 ### v2.0.0 Features
 
@@ -374,6 +379,26 @@ node switch/tools/generate-behaviour-doc.cjs --help
 The default config (`behaviour-config.json`) mirrors the plugin's own default values. Create a copy, tweak the numbers, and re-run to preview how the documentation (and thus the player-facing rules) would change.
 
 ---
+
+## Running two or more servers
+
+Several Squad servers can share one database. When they do, one of this plugin's tables is community-wide and the rest are per-server, and the split is deliberate.
+
+| Table | Scope | What that means |
+|-------|-------|-----------------|
+| `SwitchPlugin_PlayerCooldowns` | **community-wide** | One token balance per player across every server. Spend a token on one, arrive at the next with it already spent |
+| `SwitchPlugin_PlayerServerState` | per server | Scramble locks are local, because the scramble that set one was |
+| `SwitchPlugin_Endmatches` | per server | End-of-match windows follow their own server's round |
+| `SwitchPlugin_RoundStats` | per server | Round stats are attributed to the server that played the round |
+| `SwitchPlugin_ServerSettings` | per server | `timelimit` and the explain-message id are each server's own |
+
+The shared balance is the whole point rather than a side effect: a token bucket a player could refill by hopping servers is not a limit. It also means `maxSwitchTokens` and the cooldown pair stop being local settings. Every process reads one community value resolved from the registry, and the **lowest** registered value wins, so setting a higher cap on one server does not raise it there. Configure them the same on every server, or configure them on one and let the others inherit; what you cannot do is get two different caps.
+
+`!s3 servers` reports what each server has registered and which values the community disagrees about.
+
+Two admin commands reach further than their names suggest. `!switch clearall` tops up every balance in the community, not just this server's players, and `!switch wipe confirm` deletes every balance in the community. `wipe` names the registered servers it is about to empty before it does anything; `clearall` has no confirmation because it only ever adds tokens back. The inactive-player prune declines while `pruneInactivePlayerDays` disagrees between servers, since it deletes rows every server shares and there is no value that is obviously the right one to pick.
+
+Everything here is inert on a single-server install.
 
 ## Author
 

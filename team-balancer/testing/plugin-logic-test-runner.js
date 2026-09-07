@@ -544,6 +544,37 @@ async function runPluginLogicTests() {
   await tb.onRoundEnded({ winner: { team: 2, tickets: 700 }, loser: { tickets: 0 } });
   assert(tb.winStreakCount === 1, 'Regression: Invasion defender dominant (700 >= 650).');
 
+  // --- Phase 3.9: Every stored round report names its server ---
+  console.log('\n[Phase 3.9: Round reports carry serverID]');
+
+  // TB_RoundReport is shared under multi-server and insertRoundReport() is
+  // its only writer, so the stamp is taken from the connector at the insert
+  // rather than from the `data` object a round-end handler assembles. Every
+  // round driven above has already gone through that path, so this reads back
+  // what those rounds actually stored rather than writing a row of its own —
+  // a row this file created would keep passing after the writer stopped
+  // stamping.
+  //
+  // The table is also the unconditioned round universe every later report
+  // joins against, so an unattributed row here is not one missing line in one
+  // embed; it is a round that silently belongs to nobody.
+  const reportModel = tb.s3db?.getModel?.('TB_RoundReport');
+  if (reportModel) {
+    const expected = tb.s3db.getServerID();
+    const stored = await reportModel.findAll();
+    assert(stored.length > 0, 'Round reports were stored at all (otherwise the stamp is untested).');
+    assert(
+      stored.every((r) => r.serverID === expected),
+      `Every stored round report carries serverID ${expected} (found: ${[...new Set(stored.map((r) => String(r.serverID)))].join(
+)}).`
+    );
+  } else {
+    // Loud rather than skipped: this harness carries a real DBService
+    // precisely so schema-shaped claims can be made, and a missing model
+    // means the mount changed, not that the claim stopped mattering.
+    assert(false, 'TB_RoundReport model is registered (the round-report stamp cannot be checked without it).');
+  }
+
   // --- Final Report ---
   console.log(`\n🏁 All logic tests completed. Result: ${passCount}/${testCount} passed.`);
   if (passCount !== testCount) {

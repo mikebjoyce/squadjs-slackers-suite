@@ -26,7 +26,7 @@ import { localize as lookupMessage } from '../utils/s3-i18n.js';
 import { Sequelize, DataTypes } from 'sequelize';
 
 import DBService from '../utils/db-service.js';
-import { buildSwitchesEmbed, buildKarmaEmbed, guildAttachmentLimit } from '../utils/s3-commands.js';
+import { buildSwitchesEmbed, buildKarmaEmbed, buildServersEmbed, guildAttachmentLimit } from '../utils/s3-commands.js';
 
 let passed = 0;
 let failed = 0;
@@ -66,16 +66,25 @@ async function run() {
  * Mounts a fresh in-memory SQLite DBService with the S3PlayerEvents and
  * TB_RoundReport schemas mirrored from production (logging-service.js /
  * team-balancer.js), matching the fixture test-s3-switch-reports.js uses.
+ *
+ * Both carry serverID, because every report query filters on it now. The
+ * defaultValue is the same stand-in that fixture uses for the write paths that
+ * stamp the column in production, and it is what keeps the seeds below silent
+ * about servers. The scoping itself is asserted there, not here.
  */
+/** The server this fixture mounts as, and the one its seeded rows belong to. */
+const SERVER = 1;
+
 async function fixture(fn) {
   const seq = new Sequelize({ dialect: 'sqlite', storage: ':memory:', logging: false });
-  const db = new DBService({ sequelize: seq });
+  const db = new DBService({ sequelize: seq, serverID: SERVER });
   await db.mount();
 
   const eventsModel = db.defineModel(
     'S3PlayerEvents',
     {
       id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+      serverID: { type: DataTypes.INTEGER, allowNull: true, defaultValue: SERVER },
       matchId: { type: DataTypes.STRING, allowNull: true },
       roundStartTime: { type: DataTypes.BIGINT, allowNull: true },
       ts: { type: DataTypes.BIGINT, allowNull: false },
@@ -99,6 +108,7 @@ async function fixture(fn) {
     'TB_RoundReport',
     {
       id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+      serverID: { type: DataTypes.INTEGER, allowNull: true, defaultValue: SERVER },
       matchId: { type: DataTypes.STRING(20), allowNull: true },
       roundStartTime: { type: DataTypes.BIGINT, allowNull: true },
       ts: { type: DataTypes.BIGINT, allowNull: false },
@@ -213,5 +223,107 @@ test('guildAttachmentLimit never over-estimates an unboosted or unknown guild', 
   assert.equal(guildAttachmentLimit(undefined), 10 * MiB, 'a DM or uncached guild must fall back to the floor');
   assert.equal(guildAttachmentLimit({}), 10 * MiB, 'a guild with no tier must fall back to the floor');
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// buildServersEmbed — the registry an operator reads before targeting anything
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * A mounted DBService with nothing in it but the core tables. The registry is
+ * one of those, so no extra models are needed — unlike the switch-report
+ * fixture above, which has to mirror two consumer schemas.
+ */
+async function registryFixture(fn) {
+  const seq = new Sequelize({ dialect: 'sqlite', storage: ':memory:', logging: false });
+  const db = new DBService({ sequelize: seq, serverID: 1, verboseLogger: () => {} });
+  await db.mount();
+  try {
+    return await fn(db);
+  } finally {
+    try { await db.unmount(); } catch { /* best effort */ }
+    try { await seq.close(); } catch { /* best effort */ }
+  }
+}
+
+/** Write a registry row directly — registerServer() is covered elsewhere. */
+async function seedServer(db, row) {
+  const now = await db.dbNow();
+  await db.ServersModel.create({
+    serverID: row.serverID,
+    alias: row.alias ?? null,
+    serverName: row.serverName ?? null,
+    host: '10.0.0.1',
+    queryPort: 27165,
+    rconPort: 21114 + row.serverID,
+    suiteVersion: row.suiteVersion ?? '1.7.0',
+    firstSeenAt: now,
+    lastSeenAt: row.stale ? now - 60 * 60 * 1000 : now,
+    clockSkewMs: row.clockSkewMs ?? 0,
+    communityOptions: row.communityOptions ?? null
+  });
+}
+
+test('buildServersEmbed: reports registered and live separately, and marks the server being asked', () =>
+  registryFixture(async (db) => {
+    await seedServer(db, { serverID: 1, alias: 'main', serverName: 'Main Server', clockSkewMs: 4 });
+    await seedServer(db, { serverID: 2, alias: 'event', serverName: 'Event Server', stale: true, suiteVersion: '1.6.0' });
+
+    const embed = await buildServersEmbed(plugin(db));
+    assert.equal(embed.fields.length, 2);
+
+    assert.match(embed.description, /2/, 'the registered count is what the --server selectors use');
+    assert.match(embed.description, /1/, 'a stale row is still registered, so the two numbers must both appear');
+
+    const [mine, theirs] = embed.fields;
+    assert.match(mine.name, /`main`/);
+    assert.match(mine.name, /this server/, 'the row you are typing at has to be identifiable at a glance');
+    assert.match(mine.value, /live/);
+    assert.match(mine.value, /1\.7\.0/);
+
+    assert.match(theirs.name, /`event`/);
+    assert.doesNotMatch(theirs.name, /this server/);
+    assert.match(theirs.value, /stale/);
+    assert.match(
+      theirs.value, /1\.6\.0/,
+      'a version disagreement is only useful if it is visible in the command an operator already runs'
+    );
+  }));
+
+test('buildServersEmbed: surfaces clock skew and the community options behind each row', () =>
+  registryFixture(async (db) => {
+    await seedServer(db, {
+      serverID: 1,
+      alias: 'main',
+      clockSkewMs: -1500,
+      communityOptions: JSON.stringify({ maxSwitchTokens: 5, pruneInactivePlayerDays: 90 })
+    });
+
+    const embed = await buildServersEmbed(plugin(db));
+    const [row] = embed.fields;
+
+    assert.match(row.value, /-1500/, 'the skew is logged on the host whose clock is wrong, which is the wrong place to read it');
+    assert.match(row.value, /maxSwitchTokens=5/);
+    assert.match(row.value, /pruneInactivePlayerDays=90/);
+  }));
+
+test('buildServersEmbed: a row with no options and an unparseable one both still render', () =>
+  registryFixture(async (db) => {
+    await seedServer(db, { serverID: 1, alias: 'main', communityOptions: null });
+    await seedServer(db, { serverID: 2, alias: 'event', communityOptions: 'not json' });
+
+    const embed = await buildServersEmbed(plugin(db));
+    assert.equal(
+      embed.fields.length, 2,
+      'a restore can put anything in a TEXT column; a bad blob costs one line, not the whole command'
+    );
+    for (const field of embed.fields) assert.doesNotMatch(field.value, /Options:/);
+  }));
+
+test('buildServersEmbed: an empty registry says so rather than rendering a blank list', () =>
+  registryFixture(async (db) => {
+    const embed = await buildServersEmbed(plugin(db));
+    assert.equal(embed.fields, undefined);
+    assert.match(embed.description, /No server has registered/);
+  }));
 
 await run();

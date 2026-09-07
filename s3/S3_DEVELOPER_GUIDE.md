@@ -381,6 +381,7 @@ Reads and parses the Squad server's `ServerConfig/` directory, provides typed ac
 | `isLoadedSuccessfully()` | `boolean` | Config parsed without errors |
 | `getConfigPath()` | `string` | Path to ServerConfig directory |
 | `getConfig()` | `object\|null` | Raw config key/value pairs |
+| `getServerName()` | `string\|null` | Server.cfg `ServerName`. Available at mount, before RCON fills `server.serverName` |
 | `getAllowTeamChanges()` | `boolean` | |
 | `getMaxPlayers()` | `number` | |
 | `getNumReservedSlots()` | `number` | |
@@ -745,18 +746,34 @@ Use this checklist when integrating a new consumer plugin with S³ or reviewing 
 - [ ] DB access uses `this._withDb()` or `this._getModel()`
 - [ ] Service access via base class getters (`this.gameState`, `this.players`, etc.)
 
-### 6.7 — Discarded / Legacy (Do Not Use)
+### 6.7 — Multi-Server Scoping
+
+Skip none of these on the grounds that you only run one server. Every item is inert with one server registered, and each one is silent rather than loud when it is wrong.
+
+- [ ] Every model declares `scopeKind` at `defineModel()` — `'server-column'`, `'server-key'` or `'global'`. There is no default worth guessing
+- [ ] A `server-column` model has a `serverID` column, and every write stamps it
+- [ ] Every read of a scoped table carries the scope in its `where` clause (see 7.13)
+- [ ] A `server-key` singleton keys on the server id itself and has no `serverID` column, so a scope check written against the columns reads it as community-wide
+- [ ] Index names are prefixed with the table name — MySQL folds table names on some installs but never index names, so two tables sharing a bare index name collide
+- [ ] Discord handlers call `routeDiscordCommand()` between the channel check and the verb dispatch, with the right `COMMAND_SCOPE` (see 8.2.2)
+- [ ] Mutations arm through `armConfirmation()` and execute through `takeConfirmation()`, so the process that minted a token is the process that acts on it (see 8.2.3)
+- [ ] Any option that steers a shared table is listed in `COMMUNITY_OPTION_GROUPS` and read through the accessor for its kind (see 8.2.4)
+- [ ] Read-modify-write against a community-wide row takes a row lock, and a locked read over several rows is ordered so two overlapping sets queue rather than deadlock
+- [ ] The plugin's S³ version floor is checked at mount. Against an older S³ the multi-server calls do not fail loudly: `getServerID` resolves to null or 1, so rows are stamped for nobody or for everybody
+
+### 6.8 — Discarded / Legacy (Do Not Use)
 
 - [ ] ❌ `this.roundStartTime` — use `gameState.getRoundStartTime()`
 - [ ] ❌ `this.matchId` — use `gameState.getMatchId()`
 - [ ] ❌ Self-managed clan cache — use `clans` service
 - [ ] ❌ `this._s3?.services?.anything` — use flat getters
 
-### 6.8 — Documentation
+### 6.9 — Documentation
 
 - [ ] Plugin top comment includes an `S³ INTEGRATION` section
 - [ ] JSDoc accurately describes guard logic (not stale — verify actual code matches the doc)
 - [ ] README mentions S³ integration (if applicable)
+- [ ] Plugin top comment says which of its tables are per-server and which are the community's, and what an older S³ would do to them
 
 ---
 
@@ -1049,6 +1066,29 @@ embed.addField('Layer', gs.getLayerDisplayName());   // "Sumari Bala Seed v1"
 
 `_layerNamesMatch()` is punctuation-insensitive (`Fool's Road RAAS v1` == `FoolsRoad_RAAS_v1` — both are real production values), alias-aware, and tolerant of a map-name word the classname drops (`Sumari Bala Seed v1` == `Sumari_Seed_v1`). It is deliberately **not** tolerant past the gamemode token, so `Yehorivka_RAAS_v2` and `Yehorivka_AAS_v2` stay distinct — a same-map gamemode switch read as "no change" once left the layer stale for an entire round.
 
+### 7.13 — Reading a Scoped Table Without a Scope Predicate
+
+```js
+// ✗ WRONG — every server's rows, on a database that has more than one
+const rows = await this._getModel('SwitchPlugin_PlayerCooldowns').findAll({
+  where: { tokenBalance: { [Op.lt]: 1 } }
+});
+
+// ✓ RIGHT — the declaration, turned into a predicate
+const scope = this.s3db.scopePredicateFor('SwitchPlugin_PlayerCooldowns');
+const rows = await this._getModel('SwitchPlugin_PlayerCooldowns').findAll({
+  where: { ...(scope ? { [scope.column]: scope.value } : {}), tokenBalance: { [Op.lt]: 1 } }
+});
+```
+
+**The rule: a read of a scoped model needs a predicate, and the predicate comes from the declaration rather than from the query author.** Every model says what it is scoped by once, at `defineModel()`, through `scopeKind` (see 10.2.2). `DBService.scopePredicateFor(name)` is the single place that declaration becomes a `{column, value}`, and it **throws** for a model that declared nothing rather than guessing.
+
+Going through it instead of writing `where: { serverID: this.serverID }` by hand buys three things. It returns `null` for a `global` model, so the same call site is correct for a table that is deliberately community-wide. It handles `server-key`, where there is no `serverID` column because the primary key *is* the server id — hand-written attribute checks get those backwards, and the two tables holding live round state are both of that kind. And it is one place to change when a model's scope changes, which has already happened once per table in this suite.
+
+This is the anti-pattern with the least visible symptom in the guide. On a single-server database the wrong query and the right query return identical rows forever, every test passes, and the defect appears only on the day a second server registers — at which point it presents as another server's data appearing in this server's reports, which reads as a data-integrity bug rather than as a missing `WHERE`.
+
+Writes have the same rule and a sharper failure. An unscoped `destroy({ where: {} })` on a shared table is every server's rows, and `!switch wipe` is exactly that operation, which is why it is classified `community-mutating` and names the registered servers in its confirmation.
+
 ---
 
 ## §8 — S³ Plugin Base Class Guide
@@ -1088,10 +1128,19 @@ embed.addField('Layer', gs.getLayerDisplayName());   // "Sumari Bala Seed v1"
 |--------|---------|
 | `localize(key, vars?)` | Look up a message in the configured language. Unknown key returns the key; missing translation falls back to English. Never throws. |
 | `lang` | The language S³ is configured with, or `en` before S³ is discovered. Read-only — plugins never set it. |
+| `applyServerLabel(payload)` | Appends this server's short name to the footer of every embed in a Discord payload. A no-op on a single-server install, where S³ publishes no label. |
 
 Every string a player or admin reads goes through `localize()`. Values written
 to the database (round-report columns, JSON report fields) stay in English —
 they are data, not display. See `s3/LOCALIZATION.md`.
+
+`applyServerLabel()` is already applied by `S3DiscordPluginBase`, so a plugin
+sending through that base class needs to do nothing. A plugin that sends
+through its own helper object instead hands the function down at
+construction — `EloDiscord.applyServerLabel = (payload) =>
+this.applyServerLabel(payload);` — because a `utils/` helper cannot import the
+label module by any specifier that resolves both in this repository and in the
+flattened layout `install.cjs` produces.
 
 **DB convenience** (call from `_onS3Ready()`):
 
@@ -1133,6 +1182,100 @@ Options:
 ```
 
 After each RCON attempt, the method calls `players.refreshNow(source)` to force a fresh player-list read before checking whether the move landed — verification queries S³'s player registry, not SquadJS's `server.players` cache, eliminating stale-cache false failures.
+
+### 8.2.1 — Multi-Server Helpers
+
+Several installs of the suite can share one database and one Discord server. These inherited methods are what make a plugin behave correctly when they do, and **every one of them is inert while only one server is registered** — so a consumer calls them unconditionally and never counts servers itself.
+
+They live on the base class for the same reason `applyServerLabel()` does: `install.cjs` flattens `s3/utils/` and `<plugin>/utils/` into one directory, and no import specifier written in a consumer's `utils/` file resolves both in this repository and at the target. A plugin that sends through its own helper object hands the function down at construction rather than importing it.
+
+| Method | Purpose |
+|--------|---------|
+| `isMultiServer()` | Whether more than one server is **registered**. Registered, not live: a server that is down still owns its rows and still answers to its selector. |
+| `serverDescriptor()` | How to name this server to an admin — the label, else the alias, else `#<id>`. `null` on a single-server install, and that null is what makes the callers below no-ops. |
+| `routeDiscordCommand(opts)` | The routing gate. Decides act / drop / refuse for one Discord command, and strips the `--server` selector. See 8.2.2. |
+| `buildRoutingRefusalEmbed(verdict)` | Renders a `refuse` verdict as an embed, localized through this plugin's `localize()`. |
+| `applyServerLabel(payload)` | Server label in the **footer** of every embed in a payload. For reads. |
+| `titleWithServer(title)` | Server in the **title**, ahead of the text. For mutations — see 8.2.3. Returns the title unchanged when there is one server. |
+| `serverFileTag()` | A filename-safe `-slug` for this server, `''` when there is one. Two commands answer with a file rather than an embed, so the filename is the only place the answer can say where it came from. |
+| `recordChannelBinding(name, id)` | Declare which Discord channel this server uses for a named purpose. Stored in the shared `communityOptions` blob. |
+| `channelSharers(name, id)` | The other registered servers pointing that same purpose at that same channel. Empty on a single-server install, which is what makes every shared-channel guard inert there. |
+
+A command whose output would be wrong or misleading when two servers write into one channel checks `channelSharers()` and refuses rather than filtering: `!switch backfill` does this, because a backfill reads the channel's whole history and cannot tell which server's rounds it is looking at.
+
+### 8.2.2 — Command Scopes
+
+`routeDiscordCommand()` needs to be told what sort of command it is guarding, because the answer differs. The scopes are `COMMAND_SCOPE` values from `s3/utils/s3-discord-routing.js`:
+
+| Scope | What it means | Gate behaviour |
+|-------|---------------|----------------|
+| `server-read` | Reads one server's data | Broadcast: every server answers, each taking its own scoped claim. Pass `selectorRequired: true` where one reply per server would flood the channel. |
+| `server-mutating` | Changes one server's live state | A selector is required. Exactly one process acts. |
+| `community-read` | Reads data the whole community shares | Exactly one process answers. |
+| `community-mutating` | Changes data the whole community shares | Exactly one process acts, and the confirmation says so. |
+| `token-confirm` | The second half of a two-step confirmation | **No claim is taken** — the token is the routing, and only the process holding it can act on it. See `claimConfirmReply()`. |
+
+The verdict is `act`, `drop` (another server owns this, say nothing) or `refuse` (the operator has to say which server they meant). A refusal carries a reason and, where it helps, the candidate servers.
+
+**There is no sticky target and no `!s3 all`.** An earlier design had both, and neither survived contact with what the gate actually needs to guarantee. A remembered target makes the meaning of a command depend on scrollback nobody re-reads, so the same text typed twice does two different things and the second one is a surprise. A broadcast verb is worse: it is a single keystroke that turns a server mutation into every server's mutation, sitting next to the selector that was supposed to prevent exactly that. Every command therefore says which server it means, every time, or is answered by whichever process claims it. A reader arriving from the superseded design should not go looking for either.
+
+`routeDiscordCommand()` returns unchanged when one server is registered, so every routing decision above is inert on a single-server install and no consumer needs to branch on it.
+
+### 8.2.3 — Two-Step Confirmations
+
+A command that moves live players or wipes shared data arms, prints a token, and executes when a later message carries that token back. On a single-server install the token is skipped entirely and the confirm stays the bare word it has always been.
+
+| Method | Purpose |
+|--------|---------|
+| `armConfirmation({kind, payload, command, ttlMs, radius})` | Arm an action and get back `{armed, token, lines, refusal}`. `lines` are ready to append to the plugin's own prompt. |
+| `takeConfirmation(kind, token?)` | Execute-side lookup. With a token it finds that entry; without one it takes the newest of that kind, which is what the in-game and single-server paths want. |
+| `cancelConfirmations(kind)` | Drop every armed action of a kind. What a `cancel` verb does. |
+| `hasConfirmation(kind)` | Whether anything of that kind is armed and still inside its window. |
+| `PENDING` | The reasons a take can fail: `ok`, `unknown`, `expired`, `none`. Four answers because an admin's next move differs between them. |
+| `claimConfirmReply(messageID, matched)` | Whether this process should reply to a token confirm it did or did not match. |
+
+**Radius.** `radius: 'server'` (the default) confirms against this server's live round — the map, the phase, the player count — so an admin about to scramble sees what they are about to scramble. If that context cannot be read the arm is **refused**, because a mutation confirmed against nothing is a mutation confirmed against the wrong server.
+
+`radius: 'community'` is for commands that touch every server's data, such as an Elo reset. It names the registered server count instead and does not read the round at all: one server's round is not what the command touches, and an unreadable round is no reason to refuse a community-wide wipe.
+
+**Which process replies.** A token confirm takes no claim in the gate, so every process sees it and looks the token up. The one that holds it claims `discord:<messageID>` and replies. A process that does not hold it waits a short grace period and then attempts the same claim, staying silent if it loses — so a token nobody holds is still answered exactly once, and a token that is held costs the common case nothing.
+
+```js
+// Arming
+const arm = this.armConfirmation({ kind: 'scramble', payload: args, command: '!scramble', ttlMs: this.options.scrambleConfirmationTimeout * 1000 });
+if (arm.refusal) return message.reply(arm.refusal);
+lines.push(...arm.lines);            // empty on a single-server install
+
+// Confirming
+const taken = this.takeConfirmation('scramble', token);
+if (token && !(await this.claimConfirmReply(message.id, taken.status === this.PENDING.OK))) return;
+if (taken.status !== this.PENDING.OK) return message.reply(/* localized for taken.status */);
+```
+
+### 8.2.4 — Community-Affecting Options
+
+Every process in a community runs the same suite version, which is checked at mount and refused on. Nothing checks that they run the same *configuration*, and once a table is shared several ordinary plugin options stop being local policy. `maxSwitchTokens` used to describe one server's token bucket; it now describes a bucket every server reads and writes.
+
+The list of which options those are lives in `s3/utils/community-options.js` as `COMMUNITY_OPTION_GROUPS`, not in the plugins that declare them, because "is this option community-affecting" is a property of the schema layout that S³ owns. **A plugin author adding an option that writes a shared table adds it there.** Splitting the list across plugins is how one of them gets forgotten.
+
+Groups rather than keys, because two of these only mean anything together: `switchCooldownMinutes` and `switchCooldownHours` resolve as a pair, since taking the lowest of each separately invents an interval nobody configured.
+
+| Kind | What the plugin does about it | Accessor |
+|------|-------------------------------|----------|
+| `RESOLVED` | Read the community's value instead of your own config. Lowest registered value wins. | `resolvedCommunityOption(group, key, fallback)` |
+| `MUST_AGREE` | Decline the write while they disagree, and say so. | `communityOptionRefusal(group)` |
+| `MUST_AGREE`, on a **read** | Answer with the strictest registered value, because a read has to answer. | `strictestCommunityOption(group, key, fallback)` |
+| `MAY_DIFFER` | Nothing. Reported by `!s3 servers`, never enforced. | none |
+
+The kind is chosen by blast radius, and the third row is the one that catches people. A write that would apply one server's retention window to everybody's rows should decline; a read cannot, because answering out of `this.options` makes the same command in the same channel return a different list depending on which process won the claim — a wrong answer with nothing visibly wrong about it. So reads take the strictest candidate, which is the same number on every process and never shows a player a placement one of the community's own servers would call unearned.
+
+`communityOptionRefusal()` is only ever non-null for a `MUST_AGREE` group. Naming a `MAY_DIFFER` one returns null rather than quietly starting to enforce agreement on something two admins are entitled to disagree about.
+
+**Record post-validation values, not what the operator typed.** Each plugin calls `recordCommunityOptions(values)` with the keys it owns. Switch clamps a non-positive `maxSwitchTokens` to 1 at mount, so recording the raw config value would report agreement where there is none and disagreement where there is none. A row missing a key contributes no candidate for it, which is what makes a community where only one server runs Switch resolve to that server's values rather than to nothing.
+
+**Resolution runs over registered rows, not live ones** — the opposite of the version check, deliberately. A stopped server is not running an old schema against the database, so its version is irrelevant; its configuration still describes what this community's policy is, and it is coming back. Resolving over live rows would also make the cap in force flap every time a neighbour restarted.
+
+How a disagreement surfaces: `!s3 servers` reports all three kinds with a line each, and a `MUST_AGREE` write declines at the point of writing. There is no generic mount-time config comparison — the registry embed is the report and the refusal is the enforcement. Where a must-agree write happens to run *during* mount, as EloTracker’s stale-entry prune does, decline with a log line rather than by failing the mount: two admins disagreeing about a leaderboard threshold is not a reason to take Elo tracking down on a live game.
 
 ### 8.3 — S3DiscordPluginBase API
 
@@ -1286,7 +1429,7 @@ Every migration **must** declare which tables, columns, seed rows, and data post
 - **Post-migration verification** — after each migration commits, `_verifyMigrationResult()` confirms every declared table/column/row actually exists in the live database, and that every declared data post-condition holds. Silent failures (e.g. `ADD COLUMN` that fails silently because the MySQL user lacks `ALTER` privileges) are caught immediately.
 - **Ongoing drift detection** — on every S³ mount, the engine aggregates all `touches.rows` via `getExpectedRows()` and all `touches.data` via `getExpectedData()`, then re-checks both. This catches data loss across connector swaps, DB restores, or manual edits.
 
-**Four sub-fields:**
+**Five sub-fields:**
 
 | Field | Format | Purpose |
 |-------|--------|---------|
@@ -1294,6 +1437,7 @@ Every migration **must** declare which tables, columns, seed rows, and data post
 | `columns` | `Record<string, string[]>` — table name → column names added to *existing* tables | Post-migration verifier checks `describeTable()` for each column |
 | `rows` | `Record<string, Array<{key: string, value: string}>>` — table name → seed row matchers. Each entry: `{ key: '<columnName>', value: '<expectedValue>' }` tells the verifier to find a row where `key` column equals `value` | Verified after migration commits, and on every S³ mount via drift detection |
 | `data` | `Record<string, Array<{column: string, notNull: true}>>` — table name → post-conditions on column *values* | Verified after migration commits, and on every S³ mount via drift detection. See [§9.1.3](#913--data-post-conditions-touchesdata) |
+| `abandoned` | `string[]` — tables this migration names that no model backs, on purpose | Exempts them from the backup-coverage check below. Only correct for a table the suite replaced rather than altered |
 
 **Examples:**
 
@@ -1351,6 +1495,21 @@ eight `dblog_*` tables. When `creates` counted towards the backup scope, mountin
 on a server holding ~900MB of stats exported all of it into memory and the
 process was OOM-killed (exit 137) before any SQL ran. `test-migration-backup.js`
 asserts each category's behaviour.
+
+Neither does a table that is not in the database yet. A model resolves whether
+or not its table exists, so a rename that repoints a model at the table the
+same run creates would otherwise put an empty table in scope, get an incomplete
+envelope back, and abort a migration that had nothing to lose.
+
+The mirror image of that is `abandoned`. A table named in `columns` or `rows`
+that no mounted plugin models normally aborts the run — that is the signature
+of a plugin installed but not mounted, whose tables the migration is about to
+change with nothing exporting them. A Class B rename produces the same shape
+for the opposite reason: the model moved to the replacement table and the old
+one was left standing, while the migration that seeds it stays registered
+forever because a recorded version is a contract. Declaring `abandoned` says
+which of the two this is. Do not reach for it to quiet a warning about a table
+that still has an owner.
 
 A migration whose declaration resolves to no data-bearing table — `creates` only,
 or `touches: {}` — takes no JSON backup at all. Setting `backup: false` states
@@ -1450,7 +1609,7 @@ The `qi` (QueryInterface) object passed to each migration function provides thes
 | `bulkUpdate(table, values, where?, opts?)` | `(string, object, object?, object?) => Promise` | Set-wide UPDATE (backfills) |
 | `bulkDelete(table, where?, opts?)` | `(string, object?, object?) => Promise` | Set-wide DELETE |
 | `rawQuery(sql, replacements?)` | `(string, object?) => Promise<*>` | Execute raw SQL |
-| `modelForTable(table)` | `(string) => object\|null` | Resolve a model by **table** name — catches the cases `db.getModel()` misses, where model name ≠ table name (`Elo_PluginState` → `Elo_PluginStates`) |
+| `modelForTable(table)` | `(string) => object\|null` | Resolve a model by **table** name — catches the cases `db.getModel()` misses, where model name ≠ table name (`Elo_RoundHistory` → `Elo_RoundHistories`). Not used for `touches` verification: that reads the named table directly, because a model whose `tableName` was repointed would otherwise send the check at a different table |
 | `sequelize` | property | Direct Sequelize access |
 | `db` | property | DBService instance |
 | `transaction` | property | Active Sequelize transaction |
@@ -1494,6 +1653,12 @@ Each `qi` method above is already bound to the migration's transaction, so pass 
 - The `verifyAndRunMigrations()` single-call pattern checks schema versions first, runs only pending migrations, and returns the result
 
 **Post-migration verification:** After each migration's `up()` commits, the engine calls `_verifyMigrationResult()` with a fresh (non-transactional) `qi` to check that every table, column, and row declared in the migration's `touches` actually exists in the live database, and that every `touches.data` post-condition holds. This catches silent failures — such as `ADD COLUMN` that appears to succeed but doesn't take effect because the MySQL user lacks `ALTER` privileges, or a backfill that matched no rows — before the next migration runs. Verification failures produce a composite error listing everything that is missing or unpopulated, and the migration batch is aborted without recording the version.
+
+**Upgrading several servers that share one database: stop all of them first.** There is no rolling upgrade. A migration that adds a column runs once, from whichever process reaches it first, and the moment it commits, the other processes are running code that does not know the column exists. While the column stays nullable their inserts still succeed and simply leave it NULL — rows nothing can later attribute to a server. Once a follow-up migration makes it `NOT NULL`, their inserts fail outright, and the plugin that was writing them logs a rejected write on every event until it is restarted. The supported sequence is stop every process, migrate, then start them again.
+
+**On a grant that can `CREATE` but not `ALTER`, adding a non-null column is three steps, not one.** `ADD COLUMN … NOT NULL` against a populated table is rejected: the engine has no value for the existing rows. So the column is added nullable, the rows are backfilled, and only then is it tightened — which is two hand-applied `ALTER` statements with a backfill between them, in two separate migrations. `!s3 migrate ddl` emits the statements for the pending migration only, so run it again after each step rather than expecting one paste to cover all three.
+
+**Do not declare a `touches.data { notNull }` post-condition in the same migration that adds the column.** `touches.data` is re-checked on every mount, forever, not once at migration time. A predicate that is true when it is written but that some write path can still violate turns the first violating row into a permanent rollback-and-re-gate loop: the plugin re-runs the migration, verification fails again, and it gates itself off on every boot. Ship the column nullable, prove every write path stamps it, and add the predicate in a later version.
 
 ### 9.5 — S³ Schema Versions Table
 
@@ -1689,6 +1854,9 @@ All commands in the configured `channelID` Discord channel:
 | `!s3 players` | Population overview embed + one embed per team, broken down by squad with squad leaders marked (👑), squad locks, per-player locks, and an "Unassigned" (not in a squad) bucket |
 | `!s3 clans` | Active clan groups, plus a second embed explaining every exclusion (size bounds, `ignoreList`, unnormalizable tag) and every Damerau-Levenshtein merge and recruit-suffix strip |
 | `!s3 locks` | Global lock + per-player locks |
+| `!s3 servers` | Every server registered against this database — alias, id, name, live/stale with the age of the last heartbeat, suite version, address, measured clock skew against the database clock, and the community-affecting option values behind that row. Registered and live are both reported because they answer different questions: the count is what the `--server` selectors use, and a stale row is still a server the community owns |
+| `!s3 servers alias <server> <newAlias>` | Rename a registered server. `<server>` is an existing alias or a numeric id. The new alias is lowercased and stripped to `[a-z0-9_-]`, must be unique, and must be at least two edits from every *other* alias — the row being renamed is exempt from its own check, or `main` could never become `mains` |
+| `!s3 servers forget <server>` | Deregister a retired server. Refused while the row is still heartbeating, and refused outright for the server running the command. Historical rows are untouched; only the registration goes |
 | `!s3 config` | Server config values |
 | `!s3 switches [range]` | Team-switch leaderboard across all players (Legacy pre-split Balancer moves fold into Full — both are full scrambles, just from before Full/Micro were tracked separately) |
 | `!s3 switches <ident> [range]` | One player's switch breakdown, grouped into Balancer/Scrambles vs. Manual/Switch |
@@ -1698,23 +1866,30 @@ All commands in the configured `channelID` Discord channel:
 | `!s3 unwatch` | Stop all active watches |
 | `!s3 diag` | Consolidated diagnostic — mounts, phase, factions, players, locks in one pass |
 | `!s3 help` | Command reference |
-| `!s3 db export [--logs\|--all]` | Stream the export to `backups/`, then attach it to the reply if the gzipped file fits the guild's own upload limit (10 MB unboosted, 50 MB at boost tier 2, 100 MB at tier 3 — read from `guild.premiumTier`, falling back to the 10 MB floor when the tier is unknown). If it doesn't fit, or the upload fails anyway, the file stays on disk. Either way the summary embed names it |
+| `!s3 db export [--logs\|--all] [--all-servers]` | Stream the export to `backups/`, then attach it to the reply if the gzipped file fits the guild's own upload limit (10 MB unboosted, 50 MB at boost tier 2, 100 MB at tier 3 — read from `guild.premiumTier`, falling back to the 10 MB floor when the tier is unknown). If it doesn't fit, or the upload fails anyway, the file stays on disk. Either way the summary embed names it |
 | `!s3 db export --to-file [--all]` | Same export, no attachment attempt |
-| `!s3 db import [--confirm] [--dry-run]` | Import from attached JSON (two-step) |
+| `!s3 db import [--confirm] [--dry-run] [--all-servers\|--remap-server]` | Import from attached JSON (two-step). Writes this server's rows and adopts rows carrying no server at all; a sibling's rows are skipped unless widened. See §10.2.2 |
 | `!s3 db status` | Connector name, pending-migration state, and schema version per registered plugin |
-| `!s3 backup list` | List backups in the backup directory |
-| `!s3 backup create` | Take a backup now |
-| `!s3 backup restore [--confirm] <filename>` | Restore from backup file (auto-detects SQLite vs JSON) |
+| `!s3 db orphans` | Tables carrying a suite prefix that no registered model points at, with row counts. Read-only — S³ never drops a table. Most are deliberate: a table whose primary key changed was replaced rather than altered, because neither SQLite nor a restricted MySQL grant can alter one in place |
+| `!s3 backup list` | List backups in **this server's** backup directory. Every process keeps its own, so on a multi-server install this broadcasts and each server answers for its own disk |
+| `!s3 backup create` | Take a backup now, on the server named by `--server`. The file holds every server's rows; the disk it lands on is one server's |
+| `!s3 backup restore [--confirm] <filename>` | Restore from a backup file on the server named by `--server` (auto-detects SQLite vs JSON). Community-wide in effect — see §10.4 |
 | `!s3 confirm <token>` | Confirm a pending migration using the token from the startup prompt |
 | `!s3 migrate pending` | List pending migrations |
 | `!s3 migrate status` | Schema version per plugin, with how far behind each is |
 | `!s3 migrate preview` | Pending migration descriptions and their `touches` |
 | `!s3 migrate force [--dry-run]` | Run pending migrations, bypassing the confirmation token |
 | `!s3 migrate verify` | Re-run drift detection against the live database now (see §9.8) |
+| `!s3 migrate ddl [plugin]` | Emit the exact DDL for the pending migrations, rendered for the connected dialect. For a database user that can CREATE but not ALTER, this is the only way to apply a column-adding migration: run the output by hand as a user that holds the grant, then `!s3 migrate force` to record the versions. Only genuinely missing objects are emitted, so it is safe to re-run. |
 | `!s3 migrate purge-deprecated [--confirm]` | Scan for, and optionally drop, `_deprecated_*` tables and columns |
+| `!s3 migrate adopt-state [--confirm]` | Move the legacy `id = 1` row of each per-server singleton table onto this server’s declared `serverID`. Only for an install that has always run a non-1 `server.id` and wrote its round state and win streak to the singleton before the key meant anything; a server declaring `serverID: 1` is told there is nothing to adopt. Without `--confirm` it prints the row it would keep and the row it would replace, field by field. |
 
 `!s3 migrate`, `!s3 backup` and `!s3 db` with no subcommand each reply with their
-usage line rather than performing a default action.
+usage line rather than performing a default action. `!s3 servers` is the
+exception: with no subcommand it lists the registry, because listing is what an
+operator wants often enough that a usage line would be an obstacle rather than a
+guard. An *unrecognised* subcommand still gets the usage line — a typo must never
+fall through to a default action.
 
 ### 10.2 — Export/Import System
 
@@ -1753,9 +1928,9 @@ table names. Several deliberately differ (model `S3GameStateEvents` → table
 
 | Tier | Flag | Models included |
 |------|------|-----------------|
-| Historical | (default) | `S3SchemaVersions`, `Elo_PlayerStats`, `Elo_RoundHistory`, `Elo_RoundPlayers`, `SA_AssignmentLog`, `TB_RoundReport`, `SwitchPlugin_Settings`, `SwitchPlugin_RoundStats` |
+| Historical | (default) | `S3SchemaVersions`, `S3Servers`, `Elo_PlayerStats`, `Elo_RoundHistory`, `Elo_RoundPlayers`, `SA_AssignmentLog`, `TB_RoundReport`, `SwitchPlugin_Settings`, `SwitchPlugin_RoundStats` |
 | Logging | `--logs` | Above + `S3PlayerEvents`, `S3GameStateEvents`, `S3PlayerSnapshots` |
-| All | `--all` | Above + all auto-recoverable state: `S3GameState`, `S3_PlayerSession`, `S3PlayerReconnect`, `SwitchPlugin_PlayerCooldowns`, `SwitchPlugin_Endmatches`, `Elo_PluginState`, `TeamBalancerState` |
+| All | `--all` | Above + all auto-recoverable state: `S3GameState`, `S3Locks`, `S3_PlayerSession`, `S3PlayerReconnect`, `SwitchPlugin_PlayerCooldowns`, `SwitchPlugin_PlayerServerState`, `SwitchPlugin_Endmatches`, `TeamBalancerState` |
 
 The table above is the *current* classification, and it is enforced rather than
 descriptive: `TIER_SETS` in `s3-export-import.js` retains it as the expected
@@ -1766,6 +1941,19 @@ a one-word change that quietly alters what lands in every operator's backup.
 
 `--all` still returns every registered model unconditionally, so it is a superset
 of the tier logic rather than a path around it.
+
+**A tier is not a promise that a restore writes the table.** `S3Locks` is
+`ephemeral`, so its rows are in an `--all` backup — a snapshot should be able to
+say which process held the migration lock when it was taken — but the importer
+passes the table over rather than writing those rows back. Every process that
+held a lock at backup time is gone by restore time, and `acquireLock()` steals a
+row only once its `expiresAt` has passed, so a restored migration lock would
+stall every process's migration until a deadline set on a different day went by.
+The list lives in `IMPORT_SKIPPED_MODELS` (`s3-export-import.js`), separate from
+the tier sets because it answers a separate question. Both importers honour it,
+and a skipped table is reported as `status: 'skipped'` — not as an error, and
+not as `ok` with zero rows, which would read as a table that happened to be
+empty.
 
 **Export format:**
 
@@ -1842,6 +2030,34 @@ Two implementation details are load-bearing and easy to undo by accident:
 - FK checks disabled during the transaction
 - Per-table try-catch (a failed table does not roll back others)
 
+### 10.2.2 — Which Server's Rows
+
+Every model declares its scope once, at `defineModel()`: a discriminator column, a primary key that *is* the server id, or global. Export and import both turn that one declaration into a query through `DBService.scopePredicateFor()`, and a model that declares nothing is refused rather than guessed at. An attribute check would get the second kind wrong in the worst possible direction — `S3_GameState` and `TeamBalancerState` have no `serverID` column because their key is the server id, so "does it have a serverID column?" answers *global* for the two tables holding live round state.
+
+**Export.** `!s3 db export` writes this server's rows; `--all-servers` writes everyone's. On an install with one registered server the scope is not applied at all, because the only rows it would remove are ones whose `serverID` is still NULL, and quietly shrinking the backup on a single-server install is the worse trade. The envelope records what it holds: `serverID`, `scope`, and `containedServerIDs` (capped at 64 — past that the field is a fingerprint, not a list, and `containedServerIDsTruncated` says so).
+
+**Import.** Each row gets one of five outcomes, and the confirmation states which, per table, before anything is written:
+
+| Outcome | When |
+|---|---|
+| **write** | The row names this server |
+| **adopt** | The row names no server at all — every backup taken before the suite was multi-server. Adopted by the importing server, whatever the flags say |
+| **skip** | The row names a different server. This is the default |
+| **remap** | `--remap-server`: the row is claimed for this server |
+| **write back** | `--all-servers`: the row is written to the server it names |
+
+Adoption is not optional because the alternative is worse than it looks. Filtering on "serverID matches me" imports **zero rows** from every pre-multi-server backup while reporting a tick per table — and that backup is the most likely thing anyone ever restores.
+
+**A multi-server dump restored into a single-server install** is the case worth reading twice, because the two widening flags fail in opposite directions and neither is an error:
+
+- **Default (neither flag).** The other servers' rows are skipped. The summary names the servers whose rows were left behind, so the count you get is smaller than the file and you can see why.
+- **`--remap-server`.** Every row is claimed for this server. Two servers' histories are **merged** — sessions, switches, Elo events and round reports from both now read as one server's. There is no undo short of restoring an older backup; re-importing does not separate them again.
+- **`--all-servers`.** Every row is written back to the server it names, including ids this database has no `S3_Servers` row for. Those rows are not lost and not visible: nothing queries them until that server registers, at which point they reappear as its history.
+
+The two flags are opposite intentions rather than degrees of one, so passing both is refused rather than resolved. Both take a second `--confirm`: the first renders the plan and writes nothing.
+
+**Overwrite counting.** `model.upsert()` matches on the primary key, and for the tables keyed on an autoincrement `id` that key says nothing about ownership — an envelope from a pre-multi-server database can silently replace a sibling's rows. Before the transaction opens, the importer probes each table in chunks of 200 and reports both how many existing rows will be replaced **and which servers they currently belong to**. A table whose probe fails reports the count as unknown, never as zero: zero reads as "nothing of yours is at risk".
+
 ### 10.3 — Plugin-Level Exports
 
 | Plugin | Export Command | Format | Target |
@@ -1858,6 +2074,12 @@ The `!s3 backup restore` command auto-detects whether a backup file is:
 - **JSON export** (`.json` extension) — restores via the connector-agnostic import pipeline
 
 Both backup formats are always produced during pre-migration backup when SQLite mode is active.
+
+**Backups are community-wide, in both formats, and a file copy has no scoped form.** A `.sqlite` backup is the database file — every server's rows, by construction, with no filter available at any point. A `.json` backup is written community-wide on purpose: the pre-migration backup is its first caller, a shared schema migrates for everyone at once, and a backup holding one server's rows would be no use to the restore that needs it. Restore matches: `!s3 backup restore` writes every server's rows back where they belong, which is the opposite default to `!s3 db import` and for the opposite reason — an import takes a file an operator chose, a restore puts back a file this suite wrote.
+
+**A `.sqlite` restore is refused while another server process is live.** It is `fs.copyFileSync()` over the database file, and a sibling holds that same file open with its own page cache and write-ahead log. Replacing it underneath a running process does not roll that process back; it leaves it reading pages that no longer belong to the file it opened, and the damage surfaces minutes later as unreadable rows rather than as an error anyone connects to this command. Stop the other servers and the refusal lifts itself once their heartbeats lapse, or restore from a `.json` backup, which writes through the database instead of around it.
+
+**A `.json` restore is not atomic.** The streaming importer commits per chunk and isolates each table, so a failure partway through leaves the database part old and part new, and the result that comes back is a success object with error entries inside it rather than an exception. The confirmation says so before you agree, and a run with any failed table reports as **partly restored** — amber, naming the tables that did not land — rather than as a green tick. Making it atomic means restoring into staging tables and swapping, which is a larger piece of work than the honesty is.
 
 ---
 
@@ -1899,7 +2121,7 @@ node s3/testing/test-game-state-service.js
 | `test-s3-discord-plugin-base.js` | Discord channel setup, `sendDiscordMessage()` |
 | `test-i18n.js` | Catalogue parity, call-site keys and vars, language resolution |
 | `test-i18n-render.js` | Renders every embed builder through a pseudo-locale; fails on prose that never reached the catalogue |
-| `test-identifier-case.js` | Static scan: no source compares a `showAllTables()` result by equality — MySQL with `lower_case_table_names=1` folds table names, and an exact match reads a live table as missing |
+| `test-identifier-case.js` | Static scan: every file that asks a database what tables it holds is inside the scanned directories, and none of them compares a `showAllTables()` result by equality — MySQL with `lower_case_table_names=1` folds table names, and an exact match reads a live table as missing |
 | `test-s3-export-import.js` | Three-tier export/import, JSON format, validation |
 | `test-s3-commands.js` | All `!s3` command paths, embed builders |
 | `test-command-standardization.js` | Elo lookup helper, Switch help fallback |
@@ -1910,6 +2132,9 @@ node s3/testing/test-game-state-service.js
 | `test-join-pipeline.js` | Player join sequence with handshake active |
 | `test-player-session-persistence.js` | Session recovery on mount |
 | `test-dialect-portability.js` | Raw SQL against **real** SQLite/MySQL/Postgres engines — see 11.4 |
+| `test-export-scope.js` | `DBService.scopePredicateFor()` and the two exporters, against all three engines. That each scope kind resolves to the clause it declared — the declared column, the primary key for a `server-key` model, nothing for a global one — and that an undeclared model throws rather than answering; that a declared column the table does not have yet is not a predicate, which is the ordinary state between a classification landing and its migration; that a scoped export holds only this server's rows while global tables stay community-wide; and that the streaming exporter's keyset cursor cannot cancel the scope when both name the same column |
+| `test-import-scope.js` | `!s3 db import`'s row policy against all three engines. That a sibling's rows are skipped by default and the skip names the server they belong to; that a row carrying no server id is ADOPTED rather than skipped, which is the difference between a pre-multi-server backup restoring and one reporting success having written nothing; that `--all-servers` and `--remap-server` do opposite things and are refused together; that the overwrite probe counts rows as they will be WRITTEN, so a remap is followed rather than the envelope; and that the foreign-key suppression does not outlive the import, checked on a pool of exactly one connection so the session read back is the session that was changed |
+| `test-db-orphans.js` | `!s3 db orphans` driven through the shipped handler against all three engines. That a live model's table is never listed — the case MySQL decides, since `lower_case_table_names=1` hands back a folded name and a comparison that does not fold reports the entire schema as orphaned; that a real abandoned table is found, counted and shown with what replaced it; that a table outside the suite's prefixes is never named, because the list is what an operator with the DROP grant acts on; and that the raw `COUNT(*)` is quoted per dialect |
 | `test-migration-bulk-types.js` | `qi.bulkInsert`/`bulkUpdate` value typing and NULL backfills, real engines — see 11.4 |
 | `test-stderr-diagnostics.js` | Migration failures and drift reach fd 2, not stdout — see 9.9 |
 | `test-migration-permissions.js` | Migration DDL at four permission tiers, per dialect (Docker-gated) — see 11.4 |
@@ -1921,6 +2146,14 @@ node s3/testing/test-game-state-service.js
 | `test-migration-partial-retry.js` | A migration whose `up()` commits real DDL/DML but fails post-commit `touches` verification is safely retryable — `addColumn`/`bulkInsert` don't crash on a raw duplicate-column/duplicate-key error, real engines |
 | `test-migration-data-assertions.js` | Migrations' data effects are asserted, not assumed — see `TASK_MIGRATION_DATA_ASSERTIONS.md` |
 | `test-drift-recovery-matrix.js` | Drift recovery across every DB state a server can be in — brand new, behind, drifted, behind *and* drifted, multi-plugin — on SQLite, MySQL and Postgres |
+| `test-multi-process-locking.js` | The migration lock across **real child processes** on one SQLite file: the body runs once, the loser re-checks and comes up clean, the lock is released rather than left to expire, and drift found while another process holds the lock does not roll `S3_SchemaVersions` back |
+| `test-two-process-isolation.js` | Two **real child processes** against one **MySQL** database, which is the arrangement every other multi-server suite here simulates with two objects in one process. Each server reads back its own `S3_GameState` row and win streak; two rounds starting in the same millisecond get different `matchId`s; reconnect memory and scramble lockdowns stay per-server while the token bucket stays community-wide; a scoped export carries the exporting server's rows and the community-wide ones and none of its sibling's; two processes migrating at once run the body once between them; a released lock is acquirable immediately rather than after a TTL; one Discord message is claimed by exactly one process; reaping an expired claim leaves a held migration lock alone; a connector named for the community rather than its dialect still takes a real lock; fifty round-ends split across the two processes against one community-wide Elo row land as fifty increments rather than twenty-five; and a process on a different suite version than a live sibling refuses, then stops refusing once that sibling's row goes stale |
+| `test-server-identity.js` | How the server id every server-scoped row carries is resolved — override over SquadJS `id` over the single-server default — and that an unusable one is refused at mount rather than truncated or substituted, against the real plugin classes in their shipped layout |
+| `test-server-registry.js` | The `S3_Servers` claim at mount: a first boot creates the row, a moved server reclaims a stale one, and a second live process under the same id is refused without a byte being written. Covers the first-boot race, where the primary key decides and the loser reads back, and the consumer-plugin gate that a refusal opens. Also the two-step confirmations built on the registry — that a single-server install mints no token, changes no title and tags no filename; that an unreadable round refuses a server-radius arm while a community-radius arm proceeds without reading one; that a token finds only its own kind and is not displaced by a later arm; and that a rejection reaches the channel once rather than once per process |
+| `test-singleton-scoping.js` | `S3_GameState` and `TeamBalancerState`, whose primary key **is** the server id. Both models refuse an id-less create, which on SQLite would otherwise mint a server identity out of the rowid; all four boot orders of a new server and an incumbent declaring 1 or non-1 leave the incumbent’s round state and win streak intact; nothing renumbers a legacy row implicitly; and `!s3 migrate adopt-state` previews without writing, then moves both singletons under `--confirm` |
+| `test-multi-server-scoping.js` | The three tables whose primary key had to change, so each is a new table beside an abandoned one. Switch v9’s copy is checked by row count **and** by content on SQLite, MySQL and Postgres; re-applying it copies nothing twice and puts no old value back over a newer one; `key` is proved safe quoted and rejected unquoted on MySQL alone; two servers’ rows coexist and each server reads its own; a backup taken **before** the rename restores into the new table under the importing server’s id while one that names its servers keeps them; and reconnect memory survives being read, which it did not when the database branch went untested |
+| `test-discord-routing.js` | Which server answers a Discord command when several share one Discord server. Selector parsing — including the whole-flag match that keeps `--all-servers` and `--remap-server` intact beside a real `--server` in one line — the zero-delta guarantee that one registered server takes no claim and refuses nothing, the bare-versus-scoped claim keys that make a community reply arrive once and a per-server read arrive once each, refusals that reach the channel once rather than once per process, a claim that fails **open** on a database error and `lost` only on a duplicate key, a reaper that works off each row's own expiry and so cannot delete a live migration lock, and that every scope the four surfaces' tables can return is a `COMMAND_SCOPE` value |
+| `test-community-options.js` | D15's three levers over the `communityOptions` blob: which plugin options resolve to one community value (lowest registered wins, and the cooldown pair resolves as a pair rather than key by key), which refuse the write while the servers disagree, and which are reported and deliberately not enforced. Covers the recording side too — post-validation, merged across plugins, and self-cleaning when a plugin is uninstalled |
 | `test-migrate-flag-safety.js` | A destructive command whose safety flag is misspelled — `[--dry-run]`, brackets and all, as copied from a usage line — refuses instead of taking its destructive default, and a dry run leaves no trace, including an armed confirmation gate |
 | `test-command-routing.js` | `!s3` subcommand dispatch and argument parsing |
 | `test-inspection-embeds.js` | Inspection/embed builders render without throwing on sparse data |
@@ -1976,7 +2209,7 @@ class TestPlugin extends S3PluginBase {
 
 ### 11.4 — Testing Raw SQL: Mocks Are Not Enough
 
-Mocks cannot model dialect behaviour — that is a property of the engine, not of the code. Identifier folding, collation, and `ESCAPE` parsing simply do not exist in a hand-written mock, so a mock suite will report green while the statement is broken on a real database. Every defect in `docs/TASK_POSTGRES_PORTABILITY.md` passed the mock suite for its entire lifetime, and one of them (`ESCAPE '\\'` in EloTracker's name search) was broken on **SQLite** — the primary deployment target — the whole time.
+Mocks cannot model dialect behaviour — that is a property of the engine, not of the code. Identifier folding, collation, and `ESCAPE` parsing simply do not exist in a hand-written mock, so a mock suite will report green while the statement is broken on a real database. Every defect found during the Postgres portability pass passed the mock suite for its entire lifetime, and one of them (`ESCAPE '\\'` in EloTracker's name search) was broken on **SQLite** — the primary deployment target — the whole time.
 
 **If you touch raw SQL, run it against a real engine.** `s3/testing/test-dialect-portability.js` is set up for this: SQLite runs in-memory with no setup, and MySQL/Postgres skip gracefully when unreachable.
 
@@ -2026,7 +2259,23 @@ The practical fallout of the `create-only` tier is the §11.5 `Model.sync()`/`qi
 These are failure modes with no symptom at runtime — the code logs success and the data quietly goes missing.
 
 - **Always use `defineModel()`, never `sequelize.define()` directly.** Only `defineModel()` registers the model into `dbService.models`, which is what `getModelNames()` returns, which is what the exporter enumerates. A raw-defined model works perfectly for reads and writes and is invisible to *every* export tier, including `--all`. Four tables were missing from production backups for months for exactly this reason.
-- **`defineModel()` injects `freezeTableName: true`.** The **model** name becomes the table name unless you pass an explicit `tableName`. Model `S3GameStateEvents` reaching table `S3_GameStateEvents` only works because `tableName` says so.
+- **`defineModel()` injects `freezeTableName: true`.** The **model** name becomes the table name unless you pass an explicit `tableName`. Model `S3GameStateEvents` reaching table `S3_GameStateEvents` only works because `tableName` says so. **Eleven models in this suite have a model name and a table name that are different strings, and the two are not interchangeable: `models:` in a migration registration takes the model name, `touches`/`creates` take the table name.** Writing either one in the other's place fails silently — a migration that `touches` a model name guards on a table that does not exist, so it either always runs or never does.
+
+| Model name | Table name | Scope |
+|---|---|---|
+| `Elo_RoundHistory` | `Elo_RoundHistories` | `server-column` |
+| `S3GameState` | `S3_GameState` | `server-key` |
+| `S3GameStateEvents` | `S3_GameStateEvents` | `server-column` |
+| `S3Locks` | `S3_Locks` | `global` |
+| `S3PlayerEvents` | `S3_PlayerEvents` | `server-column` |
+| `S3PlayerReconnect` | `S3_ServerReconnects` | `server-column` |
+| `S3PlayerSnapshots` | `S3_PlayerSnapshots` | `server-column` |
+| `S3SchemaVersions` | `S3_SchemaVersions` | `global` |
+| `S3Servers` | `S3_Servers` | `global` |
+| `S3_PlayerSession` | `S3_ServerSessions` | `server-column` |
+| `SwitchPlugin_Settings` | `SwitchPlugin_ServerSettings` | `server-column` |
+
+  The bottom three are the Phase-4 renames, where a primary key had to change and neither SQLite nor a grant without `ALTER` can alter one in place. The model name stayed put on purpose: it is what the export envelope and the import loop key on, so moving it would have orphaned every existing backup. The table moved because the DDL had to. Both halves are load-bearing and they point in opposite directions.
 - **Declare `exportTier` on every model you define.** Classification lives at the definition site, not in `s3-export-import.js` — see 10.2. A model that declares nothing is exported at the default tier and warns by name at mount; an invalid tier throws immediately. The tier sets that remain in `s3-export-import.js` are the *expected classification fixture*, not the allowlist: `s3/testing/test-export-model-registration.js` asserts each model's declared tier equals its entry there, so adding a model means editing both, which is intended. Those sets hold **model names**, not table names — a table name written there matches nothing.
 - **`Model.sync()` emits no DDL for an existing table without `alter`.** A newly added column then exists in the model and nowhere in the database. On a live server with no DDL grants the operator applies schema by hand, so a migration's *data* step must not be nested inside an `addColumn` guard — otherwise the data step is skipped on exactly the servers where the column already exists.
 - **`Model.sync()` and `qi.addIndex()` both index a table via `ALTER TABLE ... ADD INDEX` — even a table they just created.** A MySQL grant with `CREATE`/`INDEX` but no `ALTER` (the `create-only` tier — see 11.4) accepts the `CREATE TABLE` and then throws on the first index, aborting model initialization before later tables are even attempted. This is not the same trap as the bullet above: that one is about existing tables missing a *column*; this one breaks on the very first mount of a brand-new table. Confirmed empirically 2026-08-28 against LoggingService (`s3/utils/logging-service.js`): create tables with `qi.createTable()`, then create each index with a bare `CREATE INDEX ... ON ...` statement (never `ALTER TABLE`/`addIndex()`) — `_ensureIndexes()` in that file is the reference pattern. Regression cover: `s3/testing/test-migration-permissions.js`'s `create-only` tier.
@@ -2041,7 +2290,7 @@ A change that touches Sequelize, raw SQL, a model, a migration, or an export tie
 3. Both Docker engines up; dialect suites report `mysql reachable` and `0 skipped`.
 4. The affected data read **back out of MySQL**, not only SQLite.
 5. Table and column names resolved from a live `dbService` and confirmed to exist — the live MySQL user cannot create what is missing.
-6. Ranking, query, and lifecycle changes replayed against the real exports in `docs/dataDump/`.
+6. Ranking, query, and lifecycle changes replayed against a real production export rather than a fixture, so the shape of the data is the deployed one.
 7. Deployed to a test server via `install.cjs` and the effect confirmed **in the database itself**, not in a log line claiming success. The `dev-harness` plugin drives the server for this — see [§11.7](#117--the-dev-harness-driving-a-real-server).
 
 ### 11.7 — The Dev Harness: Driving a Real Server
@@ -2136,6 +2385,8 @@ S³ must appear **before** consumer plugins:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `database` | connector | `'sqlite'` | Sequelize connector |
+| `overrideServerID` | number | `null` | Overrides the SquadJS server `id` for S³ only. The escape hatch for two installs that both ship `"id": 1` and cannot be renumbered without disturbing rows other plugins wrote. Refused at mount if it is not a whole number of 1 or more, or is wider than 11 characters — round keys are written as `<serverID>-<8 characters>` into a 20-character column |
+| `forceServerClaim` | boolean | `false` | Claim this server id even when another process appears to be live under it. The escape hatch for a false positive: a legitimate port change plus a restart inside the two-minute freshness window is indistinguishable from a second install writing under the same id, and without this the suite refuses to come up until the window passes. Turn it back off once the server is up — while it is set, nothing stops two communities interleaving their data |
 | `discordClient` | connector | `'discord'` | Discord connector (null to disable) |
 | `channelID` | string | `''` | Admin channel for `!s3` commands |
 | `configPath` | string | `'./SquadGame/ServerConfig/'` | Server.cfg directory |

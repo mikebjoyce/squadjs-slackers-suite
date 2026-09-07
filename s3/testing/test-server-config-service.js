@@ -179,6 +179,56 @@ MaxPlayers=100
   teardown();
 });
 
+await runTest('reads ServerName, which is the only name available at mount', async () => {
+  setup();
+
+  // The real shape: the name, then the browser pitch behind pipes. Parsed
+  // whole — trimming it is a rendering decision and belongs where it is read.
+  const serverContent = `ServerName="Northern Lights #1 | Teamwork Oriented | Beginner Friendly | discord.gg/northernlightsgaming"
+MaxPlayers=100
+`;
+  createConfigFiles(serverContent, '');
+
+  const service = new ServerConfigService({ configPath: TEST_DIR });
+  await service.mount();
+
+  assert.equal(service.getServerName(), 'Northern Lights #1 | Teamwork Oriented | Beginner Friendly | discord.gg/northernlightsgaming');
+
+  await service.unmount();
+  teardown();
+});
+
+await runTest('a numeric ServerName comes back as a string', async () => {
+  setup();
+
+  // parseConfigFile() coerces anything numeric-looking, and "1945" is a legal
+  // Squad name. A Number here reaches a 255-char column and a .slice() call.
+  createConfigFiles('ServerName=1945\n', '');
+
+  const service = new ServerConfigService({ configPath: TEST_DIR });
+  await service.mount();
+
+  assert.equal(service.getServerName(), '1945');
+
+  await service.unmount();
+  teardown();
+});
+
+await runTest('a missing ServerName is null rather than a made-up default', async () => {
+  setup();
+  createConfigFiles('MaxPlayers=100\n', '');
+
+  const service = new ServerConfigService({ configPath: TEST_DIR });
+  await service.mount();
+
+  // A default name would be written to the registry and shown beside another
+  // server's real one, which is worse than showing no name at all.
+  assert.equal(service.getServerName(), null);
+
+  await service.unmount();
+  teardown();
+});
+
 await runTest('getConfig returns all values in a flat object', async () => {
   setup();
 

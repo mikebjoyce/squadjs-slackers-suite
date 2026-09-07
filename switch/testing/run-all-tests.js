@@ -47,6 +47,10 @@ const testFiles = [
   'test-seed-bonus.js',
   'test-token-queue-integration.js',
   'test-dialect-literals.js',
+  // Two Switch instances configured with different token caps against one
+  // community bucket — the only failure in the multi-server work that reaches
+  // players rather than admins, and the one that writes nothing to any log.
+  'test-community-token-cap.js',
   // Builds a flattened assembly via install.cjs so a real Switch instance can
   // be constructed — slower than the mock-harness suites, and the only one
   // that runs an event handler end to end into a real database.

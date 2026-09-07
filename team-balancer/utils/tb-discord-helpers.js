@@ -343,7 +343,13 @@ export const DiscordHelpers = {
 
     const embed = {
       color: isSimulated ? 0x9b59b6 : 0x2ecc71,
-      title: isSimulated ? tb.localize('teamBalancer.embeds.dryRunScramblePlan') : tb.localize('teamBalancer.embeds.scrambleExecutionPlan'),
+      // Server in the title rather than only the footer, per the mutation
+      // rule: this is the embed an admin reads to decide whether the
+      // teams about to be rebuilt are the ones they meant.
+      title: (() => {
+        const base = isSimulated ? tb.localize('teamBalancer.embeds.dryRunScramblePlan') : tb.localize('teamBalancer.embeds.scrambleExecutionPlan');
+        return tb.titleWithServer?.(base) ?? base;
+      })(),
       description: tb.localize('teamBalancer.embeds.totalPlayersAffectedCalculation', { value: swapPlan.length, value2: swapPlan.calculationTime || tb.localize('teamBalancer.labels.notAvailable') }),
       fields: [
         { 
@@ -624,7 +630,7 @@ export const DiscordHelpers = {
   buildScrambleTriggeredEmbed(tb, reason, teamName, count, delay) {
     const embed = {
       color: 0xf39c12,
-      title: tb.localize('teamBalancer.embeds.scrambleTriggered'),
+      title: tb.titleWithServer?.(tb.localize('teamBalancer.embeds.scrambleTriggered')) ?? tb.localize('teamBalancer.embeds.scrambleTriggered'),
       description: tb.localize('teamBalancer.embeds.reasonLine', { reason }),
       fields: [
         { name: tb.localize('teamBalancer.embeds.dominantTeam'), value: teamName || tb.localize('teamBalancer.labels.notAvailable'), inline: true },
@@ -642,7 +648,7 @@ export const DiscordHelpers = {
 
     const embed = {
       color: failedToMove > 0 ? 0xf39c12 : 0x2ecc71,
-      title: tb.localize('teamBalancer.embeds.scrambleCompleted'),
+      title: tb.titleWithServer?.(tb.localize('teamBalancer.embeds.scrambleCompleted')) ?? tb.localize('teamBalancer.embeds.scrambleCompleted'),
       fields: [
         { name: tb.localize('teamBalancer.embeds.totalMoves'), value: `${totalMoves}`, inline: true },
         { name: tb.localize('teamBalancer.embeds.movedSuccessfully'), value: `${movedSuccessfully}`, inline: true },
@@ -677,7 +683,7 @@ export const DiscordHelpers = {
 
     const embed = {
       color: 0xe74c3c,
-      title: tb.localize('teamBalancer.embeds.scrambleFailed'),
+      title: tb.titleWithServer?.(tb.localize('teamBalancer.embeds.scrambleFailed')) ?? tb.localize('teamBalancer.embeds.scrambleFailed'),
       description: tb.localize('teamBalancer.embeds.reasonLine', { reason }),
       fields: [
         { name: tb.localize('teamBalancer.embeds.calculationTime'), value: `${duration}ms`, inline: true },
@@ -732,6 +738,14 @@ export const DiscordHelpers = {
         delete payload.embed;
       }
     }
+
+    // Which server this came from, when there is more than one. `this` is
+    // DiscordHelpers, and TeamBalancer sets the function on it at mount —
+    // this file cannot import it, because the module lives in `s3/utils/` in
+    // the source tree and beside this one in the layout install.cjs
+    // produces. Absent, on a single-server install, or before mount: no
+    // label.
+    payload = this.applyServerLabel?.(payload) ?? payload;
 
     const executeSend = async (data, isRetry = false) => {
       try {

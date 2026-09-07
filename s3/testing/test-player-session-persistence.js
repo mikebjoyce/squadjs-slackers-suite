@@ -3,7 +3,7 @@
  * ║     CATEGORY 2 — PLAYER SESSION PERSISTENCE TEST              ║
  * ╚═══════════════════════════════════════════════════════════════╝
  *
- * Verifies S3_PlayerSessions lifecycle:
+ * Verifies the session lifecycle S3_ServerSessions exists to support:
  *   1. Player join → session row created with joinTime
  *   2. Player disconnect → session updated with disconnectTime
  *   3. Player reconnect → getJoinTime() returns original join time
@@ -21,7 +21,15 @@ import assert from 'node:assert/strict';
 import { Sequelize, DataTypes } from 'sequelize';
 
 // ---------------------------------------------------------------------------
-// Minimal session model matching S3_PlayerSessions schema
+// A session model in the SHAPE of S3_ServerSessions, not a copy of it.
+//
+// It carries columns the real table has never had (teamID, disconnectTime,
+// reconnectCount) and DATE where the real one stores BIGINT, because what is
+// under test here is the lifecycle logic — reconnect preserves sessionStart,
+// inactivity expires a session, players stay independent — rather than the
+// schema. It also keys on eosID alone, where the real table keys on
+// (serverID, eosID); the composite key is covered against the real models in
+// test-multi-server-scoping.js, which is where a schema claim belongs.
 // ---------------------------------------------------------------------------
 
 const SESSION_SCHEMA = {
@@ -35,7 +43,7 @@ const SESSION_SCHEMA = {
   reconnectCount: { type: DataTypes.INTEGER, defaultValue: 0 }
 };
 
-const SESSION_OPTIONS = { tableName: 'S3_PlayerSessions', timestamps: false };
+const SESSION_OPTIONS = { tableName: 'S3_ServerSessions_mock', timestamps: false };
 
 // ---------------------------------------------------------------------------
 // SessionManager — mirrors PlayersService session logic
@@ -43,7 +51,7 @@ const SESSION_OPTIONS = { tableName: 'S3_PlayerSessions', timestamps: false };
 
 class SessionManager {
   constructor(sequelize, expiryMs = 30 * 60 * 1000) {
-    this.model = sequelize.define('S3_PlayerSessions', SESSION_SCHEMA, SESSION_OPTIONS);
+    this.model = sequelize.define('S3_ServerSessions_mock', SESSION_SCHEMA, SESSION_OPTIONS);
     this.expiryMs = expiryMs;
     this._cache = new Map(); // eosID -> cached sessionStart
   }

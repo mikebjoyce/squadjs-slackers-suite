@@ -51,9 +51,14 @@ await fs.mkdir(path.join(SANDBOX, 'utils'), { recursive: true });
 for (const utilFile of [
   's3-stderr.js',
   's3-common.js',
+  'community-options.js',
   's3-i18n.js',
   's3-locale-en.js',
-  's3-locale-pt.js'
+  's3-locale-pt.js',
+  's3-discord-routing.js',
+  's3-server-label.js',
+  's3-pending-actions.js',
+  's3-live-context.js'
 ]) {
   await fs.copyFile(
     path.join(HERE, '..', 'utils', utilFile),

@@ -109,16 +109,23 @@ Consumer plugins discover S³ at runtime and access services through flat getter
 
 ## S³ Version Compatibility
 
-S³ is currently **v1.7.0**. Each consumer plugin declares its own floor — they are
-not all the same, so pinning S³ to the lowest one will stop the others mounting:
+S³ is currently **v1.8.0**, and as of that release every consumer requires it:
 
 | Consumer | Requires S³ ≥ | Why |
 |---|---|---|
-| SmartAssign | 1.0.0 | Baseline service container |
-| DBLog *(core upgrade)* | 1.0.0 | Baseline service container |
-| EloTracker | 1.2.4 | |
-| Switch | 1.6.0 | Migration v3's cooldown-table truncate is guarded on `qi.isReapply`, which only 1.6.0 and later set; on an older engine a drift repair wipes token balances instead of preserving them |
-| TeamBalancer | 1.7.0 | Territory Control branches on `gameState.getGamemodeKey()`, added in 1.7.0; on an older S³ the TC thresholds would be configured but silently inert |
+| SmartAssign | 1.8.0 | |
+| DBLog *(core upgrade)* | 1.8.0 | |
+| EloTracker | 1.8.0 | |
+| Switch | 1.8.0 | |
+| TeamBalancer | 1.8.0 | |
+
+The floors used to differ, and they were levelled by the multi-server release rather
+than by tidying. Each consumer now calls the base class's routing gate and
+confirmation helpers, and those call sites are optional-chained — so an older S³ does
+not throw, it degrades in the direction that looks fine. The gate never runs, every
+process answers every command on a shared database, and confirmations arm without the
+token that decides which process owns them. Nothing logs an error. The floor is the
+only place that is visible, which is why it is a hard one.
 
 Each plugin enforces its floor at runtime via `_checkS3Version()`, which throws on
 mismatch. There is no silent degradation — an incompatible S³ means the consumer
@@ -229,15 +236,55 @@ tables (`S3_PlayerEvents`, `S3_GameStateEvents`, `S3_PlayerSnapshots`); each con
 plugin writes its own history table alongside that (SmartAssign's `SA_AssignmentLog`,
 TeamBalancer's `TB_RoundReport`, EloTracker's round history).
 
-This isn't just bookkeeping — S³'s `!s3 switches` and `!s3 karma` Discord commands read
-directly from S³'s tables, and TeamBalancer's own games-played/round-outcome accounting
-reads from `TB_RoundReport`. Turning either toggle off independently is handled
+These tables are read back, not just written. S³'s `!s3 switches` and `!s3 karma` Discord
+commands read directly from S³'s tables, and TeamBalancer's own games-played/round-outcome
+accounting reads from `TB_RoundReport`. Turning either toggle off independently is handled
 gracefully — both commands detect the gap and say so instead of showing a false zero.
 
 If you don't want the DB writes on a given plugin — smaller database, or you only want
 the JSONL/file output — set `enableDatabaseLogging: false` on that plugin's config
 block. JSONL/file logging is a separate set of options per plugin (e.g. SmartAssign's
 `enableEventLogging` + `logPath`, S³'s `enableFileLogging`) and is unaffected either way.
+
+## Running two or more Squad servers
+
+**Status: experimental.** The scoping, migrations, routing and confirmations are covered by automated tests across SQLite, MySQL 8 and PostgreSQL 16, and a further suite runs two real processes against one MySQL database to cover what a single process cannot: isolation between servers, the migration and Discord-claim races, and a shared Elo row incremented from both sides at once. What has never been run is two live games. Both test processes also share a host, so real clock skew and real database latency are untested too. Take a backup you have verified you can restore before pointing a second server at production data.
+
+Two or more Squad servers can share one database and one Discord server. Rows that belong to a particular server carry that server's id; rows that describe a *player* carry none, so a player's Elo rating and switch-token balance follow them between your servers while round history, win streaks and assignment logs stay attributed to the server that produced them.
+
+### Setup
+
+1. **Point both installs at the same database connector.** Same host, same database, same credentials. Nothing else is shared.
+
+2. **Give each install a distinct server id.** S³ takes it from SquadJS's own `server.id`, which is usually enough. Where two installs both ship `"id": 1` and renumbering one would disturb rows other plugins have already written, set `overrideServerID` on the S³ plugin instead — it overrides the id for S³ alone. `db-log` takes an option of the same name.
+
+   ```json
+   { "plugin": "SlackersSquadServices", "enabled": true, "overrideServerID": 2 }
+   ```
+
+   The id has to stay constant for the life of that server. Changing it does not rename a server, it retires one and introduces another.
+
+3. **Run the same suite version everywhere.** This is enforced: a process that finds a live sibling on a different version refuses to mount its server-scoped plugins rather than writing against a schema it does not know about.
+
+4. **Start the first server and let it migrate**, then start the second. The first process to boot runs the migrations for everybody.
+
+5. **Name your servers** with `!s3 servers alias <server> <alias>`. The default alias is the first word of the server name, which is wrong for a community that numbers its servers: "Northern Lights #1" and "#2" both want `northern`, and anything that keeps both numbers is one edit from its sibling. Pick two that differ at a glance — `main` and `event`, `seed` and `full` — and never a numbered pair. The alias is what you type after `--server`, sometimes into a command that moves live players.
+
+6. **Run NTP on both hosts**, and check `!s3 servers` for clock skew if anything behaves oddly.
+
+### What changes in Discord
+
+Commands that change one server's state require a `--server` selector and echo what is happening on that server before they act, so an admin sees *78 players, 22m into the round* rather than only the id they typed. Commands that read one server's data are answered by each server about itself. Commands that touch shared data are answered once and say how many servers they affect.
+
+There is no sticky target and no verb that acts on all servers at once, so a command means the same thing every time it is typed.
+
+All of it is inert while one server is registered. A single-server install sees no selectors, no tokens and no change in behaviour.
+
+### Reading further
+
+[**s3/MULTI_SERVER.md**](s3/MULTI_SERVER.md) is the operator runbook: upgrade order and why it is one at a time, what a rollback recovers and what it strands, which plugin options stop being local policy once a database is shared, every confirmation prompt and what each one actually touches, retiring a server, and what to hand a DBA when your database user cannot run `ALTER`.
+
+Each plugin README says which of its own tables are per-server and which are community-wide, which is the part that decides what your players experience.
 
 ## Contributing
 

@@ -1157,15 +1157,23 @@ describe('i18n render — S³ switches and karma embeds', () => {
   const NOW = Date.now();
   const DAY = 24 * 60 * 60 * 1000;
 
+  // The two tables carry serverID because every report query filters on it
+  // now, and the defaultValue stands in for the write paths that stamp it in
+  // production. Scoping is asserted in test-s3-switch-reports.js; here the
+  // column only has to exist, or every builder below dies in the query rather
+  // than rendering the prose this file is checking.
+  const SERVER = 1;
+
   async function fixture(fn) {
     const seq = new Sequelize({ dialect: 'sqlite', storage: ':memory:', logging: false });
-    const db = new DBService({ sequelize: seq });
+    const db = new DBService({ sequelize: seq, serverID: SERVER });
     await db.mount();
 
     const eventsModel = db.defineModel(
       'S3PlayerEvents',
       {
         id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+        serverID: { type: DataTypes.INTEGER, allowNull: true, defaultValue: SERVER },
         matchId: { type: DataTypes.STRING, allowNull: true },
         roundStartTime: { type: DataTypes.BIGINT, allowNull: true },
         ts: { type: DataTypes.BIGINT, allowNull: false },
@@ -1189,6 +1197,7 @@ describe('i18n render — S³ switches and karma embeds', () => {
       'TB_RoundReport',
       {
         id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+        serverID: { type: DataTypes.INTEGER, allowNull: true, defaultValue: SERVER },
         matchId: { type: DataTypes.STRING(20), allowNull: true },
         roundStartTime: { type: DataTypes.BIGINT, allowNull: true },
         ts: { type: DataTypes.BIGINT, allowNull: false },
@@ -1643,8 +1652,14 @@ describe('i18n render — !switch check status card', () => {
       _regenTokens: () => {},
       _getModel: (name) =>
         name === 'SwitchPlugin_PlayerCooldowns'
-          ? { findByPk: async () => ({ tokenBalance, tokenRegenAnchor: null, scrambleLockdownExpiry: null }) }
+          ? { findByPk: async () => ({ tokenBalance, tokenRegenAnchor: null }) }
           : null,
+      // The wallet above is the community’s; the scramble lock is this
+      // server’s and comes off a separate row, so the card needs both stubs.
+      // No lock: these cases are about the rendering, and a locked card is a
+      // single early-return line rather than the grid being padded here.
+      _readServerState: async () => ({ scrambleLockdownExpiry: null }),
+      _serverID: () => 1,
       _findQueueEntry: () => (queued ? { subQueue: 'q', entry: { queuedAt: Date.now() } } : null),
       _switchQueue: { q: [{ eosID: 'p1' }] },
       _getRemainingQueueMs: () => 90000,

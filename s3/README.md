@@ -1,4 +1,4 @@
-# SlackersSquadServices (S³) Plugin v1.7.0
+# SlackersSquadServices (S³) Plugin v1.8.0
 
 **Centralised service container for shared state across SquadJS plugins**
 
@@ -161,11 +161,61 @@ The `!s3` admin command surface is organised across:
 | `!s3 backup list` | `s3-backup.js` | List existing backups |
 | `!s3 backup create` | `s3-backup.js` | Take a backup now |
 | `!s3 backup restore` | `s3-backup.js` | Auto-detects format (JSON or file-copy) |
-| `!s3 migrate` | `s3-migration-discord.js` | `pending`, `status`, `preview`, `force [--dry-run]`, `verify`, `purge-deprecated` |
+| `!s3 migrate` | `s3-migration-discord.js` | `pending`, `status`, `preview`, `ddl [plugin]`, `force [--dry-run]`, `verify`, `purge-deprecated`, `adopt-state [--confirm]` |
 | `!s3 confirm <token>` | `s3-commands.js` | Confirms a pending destructive operation |
+| `!s3 servers` | `s3-commands.js` | The server registry: version, clock skew, community options. See [Several servers, one database](#several-servers-one-database) |
+| `!s3 servers alias <server> <alias>` | `s3-commands.js` | Rename a registered server |
+| `!s3 servers forget <server>` | `s3-commands.js` | Retire a stopped server from the registry |
 
 Bare `!s3 db`, `!s3 backup` and `!s3 migrate` reply with a usage line rather than
 doing anything. The full table, with every flag, is in `S3_DEVELOPER_GUIDE.md` §10.1.
+
+## Several servers, one database
+
+Two or more Squad servers can share one database and one Discord server. Every row that belongs to a particular server carries that server's id; rows that describe a *player* rather than a server stay shared, so a player's Elo and token balance follow them between your servers.
+
+Running it is covered in [MULTI_SERVER.md](MULTI_SERVER.md) — upgrade order, rollback, clocks, aliases, confirmations, and what to hand a DBA who holds the `ALTER` grant you don't. What follows is what the options and commands are.
+
+### Declaring which server this is
+
+S³ takes its id from SquadJS's own `server.id`. Set `overrideServerID` where two installs both ship `"id": 1` and renumbering one would disturb rows other plugins have already written; it overrides the id for S³ alone. `db-log` takes an option of the same name.
+
+**The id must stay constant for the life of that server.** The registry tracks a server by that declaration and by nothing else, so changing it does not rename a server, it retires one and introduces another. The old id keeps every row it ever wrote and the new one starts empty. Nothing renumbers implicitly, on boot order or row age or an empty registry, because the deciding fact is operator knowledge and it is in no table.
+
+Two processes claiming one id is refused at mount rather than resolved, so the two installs cannot interleave their rows. `forceServerClaim` overrides that refusal for the one case where it is a false positive: a port change plus a restart inside the two-minute freshness window is indistinguishable from a genuine collision. Turn it back off once the server is up.
+
+The one install shape that needs a migration here is a pre-existing single-server install whose `server.id` is **not** 1. `S3_GameState` and `TeamBalancerState` are per-server singletons whose primary key *is* the server id, so an install that has always run `server.id: 3` still holds its round state and win streak in a row numbered 1, written before any of this existed. `!s3 migrate adopt-state` moves those rows onto the declared id. It prints the row it would replace field by field and requires `--confirm` after you have read it. An install declaring id 1, which is every stock config, never needs it and the command says so rather than reporting a successful no-op.
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `!s3 servers` | Every server registered against this database, with suite version, clock skew, and the community options each one declares |
+| `!s3 servers alias <server> <newAlias>` | Rename a registered server. Lowercased and stripped to letters, digits, `-` and `_`; must be at least two edits from every other alias, so `main` and `mains` cannot both exist |
+| `!s3 servers forget <server>` | Remove a retired server from the registry. Refuses on a server that is still heartbeating, and on the one you are typing at |
+
+A retired server's row keeps the community in multi-server mode until it is forgotten: selectors stay required and reads keep broadcasting for a server nobody is running.
+
+### `--server` and command scope
+
+Every command carries its own scope, and the scope decides whether a selector is needed. `--server <alias|id>` names the target; the suite never remembers one between commands, and there is no verb that targets all servers at once.
+
+| Scope | Behaviour |
+|-------|-----------|
+| Reads one server's data | Every server answers, each about itself. Some ask for a selector instead, where one reply per server would flood the channel |
+| Changes one server's live state | A selector is required. Exactly one process acts |
+| Reads shared data | Exactly one process answers |
+| Changes shared data | Exactly one process acts, and the confirmation says how many servers it affects |
+
+**All of this is inert while one server is registered.** The routing gate returns unchanged below two servers, so a single-server install sees no selectors, no tokens and no behaviour change.
+
+### Every process must run the same version
+
+This is enforced. A process that finds a live sibling on a different suite version refuses to mount its server-scoped plugins and says so. A mixed pair writes against a schema one of them does not know about, and a community-wide command answered by the older process runs a superseded handler; neither failure announces itself, so mount time is the only moment either can be caught.
+
+The refusal does not retry, and a stopped server's row stays fresh for up to two minutes. Upgrading therefore means stopping every process, waiting out that window, starting one and watching its migration finish, then starting the rest. [MULTI_SERVER.md](MULTI_SERVER.md) has the full order.
+
+Configuration is not checked the same way, because several ordinary plugin options stop being local policy once a table is shared. `!s3 servers` reports which ones the community disagrees about. Some resolve to one value automatically, some make a write decline until they agree, and some are allowed to differ.
 
 ## Per-Player Locking
 
@@ -222,6 +272,9 @@ current number.
 
 | Option | Required | Type | Default | Description |
 |--------|----------|------|---------|-------------|
+| `language` | no | string | `"en"` | Language for all S³ messages. Available: `en`, `pt`. An unknown code falls back to `en` with a warning |
+| `overrideServerID` | no | number | `null` | Declare this server's id for S³ instead of taking SquadJS's `server.id`. See [Several servers, one database](#several-servers-one-database) |
+| `forceServerClaim` | no | boolean | `false` | Claim this server id even when another process appears live under it. The escape hatch for a false positive, not a setting to leave on |
 | `database` | yes | sequelize | `"sqlite"` | Sequelize connector name |
 | `discordClient` | yes | discord | `"discord"` | Discord connector name |
 | `channelID` | yes | string | `""` | Discord channel ID for logs |

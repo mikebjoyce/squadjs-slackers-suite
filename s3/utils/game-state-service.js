@@ -31,6 +31,39 @@
  *          handleLayerInfoUpdated(), handleServerInfoUpdated(),
  *          handleUpdatedPlayerInfo()
  *
+ * ─── SCOPING (multi-server) ─────────────────────────────────────
+ *
+ * S3_GameState is a per-server singleton and its PRIMARY KEY is the
+ * server id, so it holds one row per server and no serverID column
+ * exists. That is declared as scopeKind: 'server-key', and the
+ * declaration is load-bearing rather than decorative: a scope check
+ * written as "does this model have a serverID attribute" reads this
+ * table as community-wide and exports every server's live round
+ * state. TeamBalancerState has the same shape for the same reason.
+ *
+ * Because the key IS the id, becoming per-server cost this table no
+ * DDL at all. The price is that an insert omitting id is dangerous
+ * on SQLite, where the column is the rowid alias and the insert
+ * silently mints the next integer — a row that then reads as some
+ * other server's round state. The column is declared NOT NULL to
+ * make Sequelize refuse that statement; MySQL and Postgres already
+ * rejected it.
+ *
+ * matchId carries the server too, minted as
+ * <serverID>-<base-36 epoch seconds>. Without the prefix two
+ * servers whose rounds start in the same second mint the same key,
+ * and seven tables across four plugins carry that key. Scoping
+ * those tables by serverID makes the collision non-destructive, but
+ * a query joining on the key alone would still cross servers.
+ *
+ * Treat matchId as opaque. Four shapes coexist in production — null,
+ * a legacy epoch-millisecond form, the unprefixed base-36 form and
+ * the prefixed one — so never parse it, never reconstruct it, and
+ * never scope a read by joining on it. Scope by serverID, which
+ * every server-scoped table carries. Equality comparison against a
+ * stored key is fine and is what the seed-bonus and scramble-arm
+ * guards do.
+ *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
  * (No local imports — service is dependency-injected with parent,
@@ -40,6 +73,13 @@
  *
  * - Implicit dependency: serverConfig must be mounted before gameState
  *   so ENDGAME timers can read real vote durations from VoteConfig.cfg.
+ * - The server id is read through this.parent?.serverID at mint time
+ *   rather than cached at construction. A null means no S³ parent
+ *   resolved one, which is tests and the dev harness; live it cannot
+ *   happen, because the id is settled before any service is built and
+ *   a bad one refuses the mount. The unprefixed matchId is the honest
+ *   answer in that case, and inventing an id is the one thing this
+ *   design does not allow.
  * - Persists phase, resolving, timestamps, layer info, roundStartTime,
  *   and matchId to the S3_GameState database table for crash recovery.
  * - Recovered rounds older than maxRecoveredRoundAgeMs (default 2 hours)
@@ -347,7 +387,7 @@ export default class GameStateService {
     // and start a fresh session mid-round, losing continuity.
     if (this.phase === 'LIVE' && this.roundStartTime === null) {
       this.roundStartTime = Date.now();
-      this.matchId = Math.floor(this.roundStartTime / 1000).toString(36).slice(-8);
+      this.matchId = this._mintMatchId();
       await this._persistState();
       this.verboseLogger(2, `[GameState] Mounted mid-round — backfilled roundStartTime: ${new Date(this.roundStartTime).toISOString()}`);
     }
@@ -572,10 +612,56 @@ export default class GameStateService {
   }
 
   /**
-   * Get the current round's matchId hash (base-36 encoded timestamp).
-   * Derived from roundStartTime using the same formula across all consumers:
-   *   Math.floor(roundStartTime / 1000).toString(36).slice(-8)
-   * Returns null if no round has started yet.
+   * Mint the round key for the round that is starting.
+   *
+   * Three call sites set `this.matchId`, all of them after assigning
+   * `roundStartTime`: the mid-round mount backfill, `handleNewGame()`, and the
+   * transition that invalidates a recovered round as too old. They were three
+   * copies of one expression, which is the shape where a change reaches two of
+   * them and the third goes on minting the old format for months.
+   *
+   * THE PREFIX. Without it two servers whose rounds start in the same second
+   * mint the same key, and `Elo_RoundPlayers`, `Elo_RoundHistories`,
+   * `TB_RoundReport`, `SwitchPlugin_RoundStats`, `S3_PlayerEvents`,
+   * `S3_GameStateEvents` and `S3_PlayerSnapshots` all carry it. Scoping those
+   * tables by `serverID` makes the collision non-destructive, but any query
+   * written to join on the key alone would still cross servers.
+   *
+   * THE FALLBACK. A null id means no S³ parent resolved one — a service built
+   * standalone, which is tests and the dev harness. Live it cannot happen: the
+   * id is settled before any service is constructed, and a bad one refuses the
+   * mount rather than reaching here. The unprefixed form is the honest answer
+   * there and it is a shape the column already holds; inventing an id would be
+   * the one thing this design does not allow.
+   *
+   * @returns {string} e.g. `2-mn4b1x`, or `mn4b1x` with no id resolved
+   * @private
+   */
+  _mintMatchId() {
+    const suffix = Math.floor(this.roundStartTime / 1000).toString(36).slice(-8);
+    const serverID = this.parent?.serverID ?? null;
+    return serverID === null ? suffix : `${serverID}-${suffix}`;
+  }
+
+  /**
+   * The current round's key, or null before a round has started.
+   *
+   * OPAQUE. Treat it as a string that is equal to itself and to nothing else.
+   * It is minted as `<serverID>-<base-36 epoch seconds>` and the derivation is
+   * an implementation detail of `_mintMatchId()`, not a contract: nothing may
+   * parse it, split it, or reconstruct it from a timestamp.
+   *
+   * FOUR SHAPES COEXIST, and every consumer already has to survive all of
+   * them. Production carries `NULL`, a legacy 13-digit epoch-millisecond form
+   * that predates the base-36 one, the unprefixed base-36 form, and now the
+   * prefixed one. Over half of the historical Elo round rows have no key at
+   * all. So: never assume it is non-null, and never scope a read by joining on
+   * it — a join written that way silently drops every row that predates it.
+   * Scope by `serverID`, which every server-scoped table carries.
+   *
+   * Comparing a stored key against this one for equality is fine and is what
+   * the seed-bonus and scramble-arm guards do. They all discard or reset on a
+   * mismatch, so the one-time format change costs a single round of state.
    */
   getMatchId() {
     return this.matchId;
@@ -913,7 +999,7 @@ export default class GameStateService {
     // S³ owns roundStartTime — use our own process clock as the single source of truth.
     // server.matchStartTime is not reliable across restarts (new Date per process lifetime).
     this.roundStartTime = Date.now();
-    this.matchId = Math.floor(this.roundStartTime / 1000).toString(36).slice(-8);
+    this.matchId = this._mintMatchId();
 
     // ── LAYER RESOLUTION ON NEW_GAME ──────────────────────────────────
     // BUG HISTORY (2026-07-21): server.currentLayer was routinely null after
@@ -1420,9 +1506,22 @@ export default class GameStateService {
     // invisible to the exporter.
     const modelFactory = defineModel || sequelize.define.bind(sequelize);
 
-    this.GameStateModel = modelFactory('S3GameState', {
+    // Hoisted out of the modelFactory() call so the migration registration
+    // below can create the table from the same definition. Two copies of a
+    // schema drift apart; one that is used twice cannot.
+    const gameStateSchema = {
       id: {
         type: DataTypes.INTEGER,
+        // The server id, not a row counter — see the scopeKind note below.
+        // Declared NOT NULL for what it stops rather than for the constraint:
+        // on SQLite this column is the rowid alias, so an insert that omits
+        // `id` silently mints the next integer, and under per-server scoping
+        // that row reads as another server’s round state. MySQL and Postgres
+        // already reject the same statement. This makes Sequelize refuse it
+        // client-side on every engine, and it costs no migration: the emitted
+        // DDL is byte-identical on SQLite, where a primary key is NOT NULL
+        // whether or not you say so, and gains a redundant NOT NULL elsewhere.
+        allowNull: false,
         primaryKey: true
       },
       phase: {
@@ -1463,12 +1562,20 @@ export default class GameStateService {
         type: DataTypes.STRING,
         allowNull: true
       }
-    }, {
+    };
+
+    this.GameStateModel = modelFactory('S3GameState', gameStateSchema, {
       tableName: 'S3_GameState',
       timestamps: false,
       // A single row of live round bookkeeping, rewritten on every phase change
       // and rebuilt from the server on the next map roll.
-      exportTier: 'ephemeral'
+      exportTier: 'ephemeral',
+      // The primary key is the server id — this is a per-server singleton, one
+      // row per server, and `id` carries the scope so no column has to. That is
+      // why becoming per-server costs no DDL here, and it is also why a scope
+      // test written as "does this model have a serverID attribute" would read
+      // this table as community-wide and export every server's round state.
+      scopeKind: 'server-key'
     });
 
     if (dbService?.executeWithRetry) {
@@ -1478,12 +1585,56 @@ export default class GameStateService {
     } else {
       await this.GameStateModel.sync();
     }
+
+    // ── Migration group ────────────────────────────────────────────
+    // S3_GameState was created by sync() alone and belonged to no registered
+    // group, so it had no recorded version and drift verification never covered
+    // it. Every other S³-owned table is under a group; this one being outside
+    // meant a column added to it later would have nothing to record that it had
+    // been added, and nothing to notice if it went missing.
+    //
+    // `models:` takes MODEL names and `touches` takes TABLE names — this model
+    // is one of the nine in the repo where they differ (S3GameState →
+    // S3_GameState), so writing the model spelling in `touches` would describe a
+    // table that does not exist and leave verification re-running a migration
+    // that already succeeded.
+    if (dbService?.migrationEngine) {
+      dbService.migrationEngine.registerMigrations('s3-gamestate', [
+        {
+          version: 1,
+          description: 'S3_GameState table (bootstrap — sync() runs unconditionally at mount)',
+          // Nothing here can lose a row: createTable is CREATE TABLE IF NOT
+          // EXISTS and the sync() above has already run. A pre-migration backup
+          // would read the whole table for no possible benefit.
+          backup: false,
+          touches: {
+            creates: ['S3_GameState'],
+            columns: {
+              S3_GameState: [
+                'id', 'phase', 'resolving', 'lastPhaseChangeAt', 'lastNewGameAt',
+                'lastRoundEndedAt', 'lastLayerName', 'lastGamemode', 'roundStartTime', 'matchId'
+              ]
+            }
+          },
+          up: async (qi) => {
+            // Idempotent: the table is normally already there from sync() above.
+            // Running it through qi anyway is what lets verification see it on
+            // the same connection it reads from.
+            await qi.createTable('S3_GameState', gameStateSchema);
+          }
+        }
+      ]);
+    }
+
+    dbService?.registerExpectedVersion?.('s3-gamestate', 1, {
+      models: ['S3GameState']
+    });
   }
 
   async _recoverPersistedState() {
     if (!this.GameStateModel) return;
 
-    const row = await this.GameStateModel.findByPk(1);
+    const row = await this.GameStateModel.findByPk(this._stateRowID());
     if (!row) {
       this._recoveredStateActive = false;
       await this._persistState();
@@ -1812,7 +1963,7 @@ export default class GameStateService {
     // roundStartTime is still valid and should be preserved.
     if (this.roundStartTime === null || reason.includes('recovered_round_too_old')) {
       this.roundStartTime = Date.now();
-      this.matchId = Math.floor(this.roundStartTime / 1000).toString(36).slice(-8);
+      this.matchId = this._mintMatchId();
     }
     // ── CLEAR STALE LAYER CACHES ON RECOVERY INVALIDATION ────────────
     // BUG HISTORY (2026-07-21): When _transitionRecoveredStateToLive
@@ -1884,7 +2035,7 @@ export default class GameStateService {
 
     const write = async () => {
       await this.GameStateModel.upsert({
-        id: 1,
+        id: this._stateRowID(),
         phase: this.phase,
         resolving: this.resolving,
         lastPhaseChangeAt: this.lastPhaseChangeAt,
@@ -1916,6 +2067,25 @@ export default class GameStateService {
   _getDbService() {
     // Flat access via S³ plugin getters
     return this.parent?.db || null;
+  }
+
+  /**
+   * The primary key of this server’s row in S3_GameState.
+   *
+   * `id` **is** the server id. The table is a per-server singleton that
+   * carries its scope in the key instead of in a column, so addressing the
+   * right row and naming the right server are the same act — which is why
+   * this file has no literal 1 left on a read or a write path.
+   *
+   * Safe on the hot path: DBService settles the id at construction, before
+   * anything mounts, and getServerID() is a property read rather than a
+   * query. The fallback is DBService’s own DEFAULT_SERVER_ID, restated here
+   * for the harness case of a service mounted with no DB connector at all;
+   * importing the constant would give this file its first local import for
+   * the sake of one integer.
+   */
+  _stateRowID() {
+    return this._getDbService()?.getServerID?.() ?? 1;
   }
 
   _getSequelize(dbService = this._getDbService()) {

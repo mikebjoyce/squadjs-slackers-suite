@@ -52,9 +52,29 @@
  *   intervals are registered.
  * - Reconnect memory is DB-backed when DBService is available, with
  *   in-memory fallback and periodic pruning.
- * - Session tracking: S3_PlayerSessions table persists per-player
+ * - Session tracking: S3_ServerSessions table persists per-player
  *   sessionStart time across SquadJS restarts. joinTime is hydrated from
  *   this table after initial sync. Sessions expire after 30 min of inactivity.
+ * - Both persisted tables are keyed (serverID, eosID) and scoped
+ *   server-column. A player is on ONE server at a time, so the bare
+ *   eosID key these two replaced was wrong rather than merely narrow
+ *   under two servers: the second server to see a player overwrote
+ *   the first server's row, and the first then read back the second's
+ *   team and session start as its own. The tables carrying the old
+ *   key are abandoned in place rather than dropped, because neither
+ *   ALTER nor DROP is on the restricted grant and both tables are
+ *   ephemeral by declaration — they repopulate from live play. See
+ *   the block comment above the builders for why nothing is copied
+ *   across, and !s3 db orphans for what is left behind.
+ * - A composite key means findByPk() is unavailable on these two
+ *   models. Every read is findOne({ where: { serverID, eosID } }),
+ *   which is the property that stops a site from forgetting its
+ *   server scope and still returning rows.
+ * - The legacy builders are frozen copies of the pre-rename shape.
+ *   Migrations v1 and v2 are recorded in production and cannot be
+ *   edited into creating a different table than the one they made, so
+ *   those copies must not be refactored to share code with the live
+ *   builders above them.
  *
  */
 
@@ -108,16 +128,36 @@ function normalizeIsLeader(raw, fallback = false) {
 
 /* ────────────────────────── BOOTSTRAP DDL ──────────────────────────
  *
- * S3_PlayerReconnects and S3_PlayerSessions are infrastructure tables created
+ * S3_ServerReconnects and S3_ServerSessions are infrastructure tables created
  * by raw DDL at mount (rather than by model sync) so they exist before any
  * query runs. The DDL is emitted from these builders, in one place, because it
- * runs from FOUR call sites — the two bootstrap paths in _initSessionPersistence
- * / _initReconnectPersistence, and the two migration up() bodies that re-run it
- * through the migration engine's query interface.
+ * runs from THREE call sites — the two bootstrap paths in
+ * _initSessionPersistence / _initReconnectPersistence, and migration v3, which
+ * re-runs it through the migration engine's query interface.
+ *
+ * These two tables replace S3_PlayerReconnects and S3_PlayerSessions, whose
+ * primary key was a bare eosID. A player is on ONE server at a time, so under
+ * two servers that key is wrong rather than merely narrow: the second server
+ * to see a player overwrites the first server's row, and the first server then
+ * reads back the second's team and session start as if they were its own.
+ *
+ * The key becomes (serverID, eosID), and a primary key cannot be altered in
+ * place: SQLite has no statement that reaches it at all, and the restricted
+ * MySQL grant has no ALTER. So the shape below is a NEW table under a new
+ * name, and the old one is abandoned where it stands rather than dropped —
+ * DROP is not on that grant either. Nothing is copied across: both tables are
+ * declared ephemeral at their model definitions and the code's own words for
+ * them are "rebuilt from live play on the next tick" and "repopulated from
+ * live play". `!s3 db orphans` lists what is left behind.
+ *
+ * The legacy builders below them are frozen copies of the pre-rename shape.
+ * They exist only for migrations v1 and v2, which are recorded in production
+ * and therefore cannot be edited to create a different table than the one they
+ * have already created.
  *
  * Every identifier is quoted. Unquoted, Postgres folds them to lower case and
- * creates `s3_playerreconnects(eosid, updatedat, …)`, while the Sequelize models
- * below declare `tableName: 'S3_PlayerReconnects'` and are quoted by Sequelize —
+ * creates `s3_serverreconnects(eosid, updatedat, …)`, while the Sequelize models
+ * below declare `tableName: 'S3_ServerReconnects'` and are quoted by Sequelize —
  * so the models address a table that does not exist and every read and write
  * against them fails. SQLite ignores identifier case and MySQL column names are
  * case-insensitive, which is why the unquoted form worked for years.
@@ -131,6 +171,42 @@ function normalizeIsLeader(raw, fallback = false) {
  */
 function reconnectsTableDDL(q) {
   return `
+      CREATE TABLE IF NOT EXISTS ${q('S3_ServerReconnects')} (
+        ${q('serverID')} INTEGER NOT NULL,
+        ${q('eosID')} VARCHAR(64) NOT NULL,
+        ${q('steamID')} VARCHAR(64) NULL,
+        ${q('playerName')} VARCHAR(255) NULL,
+        ${q('lastTeamID')} INTEGER NULL,
+        ${q('lastSeenAt')} BIGINT NULL,
+        ${q('updatedAt')} BIGINT NOT NULL,
+        PRIMARY KEY (${q('serverID')}, ${q('eosID')})
+      );
+    `;
+}
+
+function sessionsTableDDL(q) {
+  return `
+      CREATE TABLE IF NOT EXISTS ${q('S3_ServerSessions')} (
+        ${q('serverID')} INTEGER NOT NULL,
+        ${q('eosID')} VARCHAR(64) NOT NULL,
+        ${q('steamID')} VARCHAR(64) NULL,
+        ${q('playerName')} VARCHAR(255) NULL,
+        ${q('sessionStart')} BIGINT NOT NULL,
+        ${q('lastActivity')} BIGINT NOT NULL,
+        PRIMARY KEY (${q('serverID')}, ${q('eosID')})
+      );
+    `;
+}
+
+/*
+ * Frozen. Migrations v1 and v2 are recorded in production, so what they
+ * create is a contract: they go on creating the single-server tables they
+ * always created, and v3 creates the replacements beside them. Editing these
+ * to emit the new shape would make v1 declare a table it does not create,
+ * and drift verification re-checks `touches.creates` on every mount.
+ */
+function legacyReconnectsTableDDL(q) {
+  return `
       CREATE TABLE IF NOT EXISTS ${q('S3_PlayerReconnects')} (
         ${q('eosID')} VARCHAR(64) PRIMARY KEY,
         ${q('steamID')} VARCHAR(64) NULL,
@@ -142,7 +218,7 @@ function reconnectsTableDDL(q) {
     `;
 }
 
-function sessionsTableDDL(q) {
+function legacySessionsTableDDL(q) {
   return `
       CREATE TABLE IF NOT EXISTS ${q('S3_PlayerSessions')} (
         ${q('eosID')} VARCHAR(64) PRIMARY KEY,
@@ -444,7 +520,7 @@ export default class PlayersService {
    * use !switch without being gated by a stale connection window.
    *
    * Mutates the registry state directly (not the getPlayer() copy) and fire-and-forget
-   * upserts S3_PlayerSessions so a future SquadJS restart doesn't resurrect the old time.
+   * upserts S3_ServerSessions so a future SquadJS restart doesn't resurrect the old time.
    *
    * @param {string} eosIDOrSteamID - Player EOS ID or Steam ID
    * @returns {boolean} true if the player was found and joinTime was reset
@@ -763,6 +839,9 @@ export default class PlayersService {
     if (!key) return false;
 
     const record = {
+      // Half the primary key. Taken from the connector rather than from
+      // `payload`, so a caller cannot write into another server's row.
+      serverID: this._serverID(),
       eosID: key,
       steamID: payload.steamID || null,
       playerName: payload.playerName || null,
@@ -789,9 +868,21 @@ export default class PlayersService {
 
     const dbService = this._getDbService();
     if (this.reconnectModel) {
-      const row = await dbService?.executeWithRetry
-        ? dbService.executeWithRetry(async () => this.reconnectModel.findByPk(key))
-        : this.reconnectModel.findByPk(key);
+      // findOne, not findByPk: the key is (serverID, eosID) now and findByPk
+      // takes a single value.
+      //
+      // The await is on the whole expression, which it was not before. The
+      // previous form was `await dbService?.executeWithRetry ? A : B`, and
+      // `await` binds tighter than `?:` — so it awaited the *function
+      // reference*, used that as the condition, and assigned the unawaited
+      // promise to `row`. A promise is truthy, so the row always looked
+      // present; every field then read as undefined, the staleness check
+      // said yes, and the branch below DELETED the real row and returned
+      // null. Persisted reconnect memory has therefore never worked when a
+      // database was attached, and it destroyed the row it was asked for.
+      // Nothing caught it because the unit tests run with no reconnectModel
+      // and answer from the in-memory map.
+      const row = await this._findReconnectRow(dbService, key);
       if (row) {
         const normalized = this._normalizeReconnectRow(row);
         if (this._isReconnectStale(normalized)) {
@@ -817,7 +908,11 @@ export default class PlayersService {
     const dbService = this._getDbService();
     if (this.reconnectModel && dbService?.executeWithRetry) {
       await dbService.executeWithRetry(async () => {
-        await this.reconnectModel.destroy({ where: {} });
+        // Scoped. An unqualified destroy here is a `DELETE FROM` with no
+        // WHERE clause, which under two servers throws away the other's
+        // reconnect memory as well — silently, and at the exact moment it is
+        // most likely to be needed.
+        await this.reconnectModel.destroy({ where: { serverID: this._serverID() } });
       });
     }
 
@@ -841,9 +936,10 @@ export default class PlayersService {
 
     const dbService = this._getDbService();
     if (this.reconnectModel) {
-      const row = await dbService?.executeWithRetry
-        ? dbService.executeWithRetry(async () => this.reconnectModel.findByPk(key))
-        : this.reconnectModel.findByPk(key);
+      // Same composite-key lookup and the same await fix as getReconnect().
+      // The consequence differed only in degree: this path did not delete
+      // the row, it just never found one.
+      const row = await this._findReconnectRow(dbService, key);
       if (row) {
         const normalized = this._normalizeReconnectRow(row);
         if (this._isReconnectStale(normalized)) {
@@ -1045,7 +1141,7 @@ export default class PlayersService {
 
       // ── Session recovery ──
       // After initial sync populates the registry with all current server players,
-      // hydrate their joinTime from S3_PlayerSessions (survives SquadJS restarts).
+      // hydrate their joinTime from S3_ServerSessions (survives SquadJS restarts).
       // Fire-and-forget — errors are logged internally.
       this._recoverSessionTimes().catch((err) => {
         this.verboseLogger(1, `[Players] Session recovery error: ${err.message}`);
@@ -1652,7 +1748,7 @@ export default class PlayersService {
       this.verboseLogger(1, `[Players] NEW player: ${playerName} (eosID=${joined.eosID}, steamID=${joined.steamID}, teamID=${joined.teamID}, source=${source})`);
 
       // ── Session row creation (Bug 2 fix) ──
-      // Ensure every player in the registry has a S3_PlayerSessions row.
+      // Ensure every player in the registry has a S3_ServerSessions row.
       // Previously, only _recoverSessionTimes() (post-initial-sync) wrote
       // session rows. Players joining after initial sync never got a row,
       // which broke _bulkUpdateSessionActivity (uses UPDATE, not UPSERT)
@@ -1834,12 +1930,25 @@ export default class PlayersService {
     return updatedAt < (now - this.reconnectMaxAgeMs);
   }
 
+  /**
+   * One reconnect row for this server, through the retry wrapper when the
+   * DBService offers one. Extracted because getReconnect() and
+   * peekReconnect() had the same three lines and the same defect in them.
+   */
+  async _findReconnectRow(dbService, eosID) {
+    const where = { serverID: this._serverID(), eosID };
+    if (typeof dbService?.executeWithRetry === 'function') {
+      return dbService.executeWithRetry(async () => this.reconnectModel.findOne({ where }));
+    }
+    return this.reconnectModel.findOne({ where });
+  }
+
   async _deleteReconnectRow(eosID) {
     const dbService = this._getDbService();
     if (!this.reconnectModel || !dbService?.executeWithRetry) return;
 
     await dbService.executeWithRetry(async () => {
-      await this.reconnectModel.destroy({ where: { eosID } });
+      await this.reconnectModel.destroy({ where: { serverID: this._serverID(), eosID } });
     });
   }
 
@@ -1856,12 +1965,20 @@ export default class PlayersService {
     this._lastReconnectPruneAt = now;
     const cutoff = now - this.reconnectMaxAgeMs;
 
+    // Deliberately NOT scoped to this server, unlike every other statement
+    // in this file. This is an age prune, and `updatedAt` means the same
+    // thing on every server's rows: a row older than the cutoff is expired
+    // for whoever wrote it. Scoping it would make each server responsible
+    // for its own garbage, so a server that is switched off leaves rows
+    // behind that nothing ever collects. Deleting a neighbour’s expired row
+    // is not a cross-server read — it is the same decision they would make.
+
     const connector = dbService.getConnector?.();
     if (connector && typeof connector.query === 'function') {
       try {
         await dbService.executeWithRetry(async () => {
           await connector.query(
-            `DELETE FROM ${dbService.quoteIdentifier('S3_PlayerReconnects')} ` +
+            `DELETE FROM ${dbService.quoteIdentifier('S3_ServerReconnects')} ` +
             `WHERE ${dbService.quoteIdentifier('updatedAt')} < :cutoff`,
             { replacements: { cutoff } }
           );
@@ -1893,9 +2010,9 @@ export default class PlayersService {
   }
 
   // ---------------------------------------------------------------------------
-  // Session tracking — S3_PlayerSessions table
+  // Session tracking — S3_ServerSessions table
   //
-  // The S3_PlayerSessions table persists per-player sessionStart timestamps
+  // The S3_ServerSessions table persists per-player sessionStart timestamps
   // across SquadJS restarts. This allows consumer plugins (Switch, EloTracker)
   // to answer "how long has this player been on the server?" even after a
   // restart, preventing the time-based switch window from falsely resetting.
@@ -1914,9 +2031,9 @@ export default class PlayersService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Initialize the S3_PlayerSessions model definition (the v2 table migration is
-   * registered and run in _initReconnectPersistence() alongside v1, so both
-   * "s3-players" migrations are applied in a single call — avoiding duplicate logs).
+   * Initialize the S3_ServerSessions model definition (every "s3-players"
+   * migration is registered and run in _initReconnectPersistence(), so all
+   * three are applied in a single call — avoiding duplicate logs).
    */
   async _initSessionPersistence() {
     const dbService = this._getDbService();
@@ -1925,7 +2042,7 @@ export default class PlayersService {
     const connector = dbService.getConnector?.();
     if (!connector) return;
 
-    // Bootstrap DDL — ensures S3_PlayerSessions exists unconditionally at mount.
+    // Bootstrap DDL — ensures S3_ServerSessions exists unconditionally at mount.
     // Infrastructure table, not a migration — no confirmation needed.
     const q = (id) => dbService.quoteIdentifier(id);
     await connector.query(sessionsTableDDL(q));
@@ -1933,10 +2050,18 @@ export default class PlayersService {
     // Clean up stale session rows (>24h inactive). These are never used for
     // session recovery — _recoverSessionTimes() treats anything >30min as stale.
     // Mount-time cleanup is sufficient; no periodic timer needed.
+    //
+    // Not scoped to this server, on the same reasoning as the reconnect
+    // prune below: `lastActivity` means the same thing on every server's
+    // rows, so a row past the cutoff is expired for whoever wrote it.
+    // Scoping it would make each server responsible for its own garbage,
+    // and a server that is switched off would leave rows nothing ever
+    // collects. Every read of this table IS scoped — an age prune is the
+    // one thing here that is a fact about a row rather than about a server.
     try {
       const cutoff = Date.now() - 24 * 60 * 60 * 1000;
       await connector.query(
-        `DELETE FROM ${q('S3_PlayerSessions')} WHERE ${q('lastActivity')} < :cutoff`,
+        `DELETE FROM ${q('S3_ServerSessions')} WHERE ${q('lastActivity')} < :cutoff`,
         { replacements: { cutoff } }
       );
       this.verboseLogger(3, `[Players] Session cleanup: removed rows with lastActivity < ${new Date(cutoff).toISOString()}`);
@@ -1947,6 +2072,14 @@ export default class PlayersService {
     this.sessionModel = dbService.defineModel?.(
       'S3_PlayerSession',
       {
+        // Half of the primary key. A session belongs to one server, and the
+        // pre-rename table keyed on eosID alone — so a player joining server
+        // B overwrote their server-A session start and A read back B's.
+        serverID: {
+          type: dbService.getDataTypes().INTEGER,
+          primaryKey: true,
+          allowNull: false
+        },
         eosID: {
           type: dbService.getDataTypes().STRING,
           primaryKey: true
@@ -1969,17 +2102,26 @@ export default class PlayersService {
         }
       },
       {
-        tableName: 'S3_PlayerSessions',
+        // The MODEL name stays S3_PlayerSession while the table is renamed.
+        // Both halves are load-bearing and they point in opposite directions:
+        // the table name is what the DDL and `touches` say, the model name is
+        // what the export envelope and the import loop say.
+        tableName: 'S3_ServerSessions',
         timestamps: false,
         // Session start times are rebuilt from live play on the next tick, and
         // stale rows are pruned by the cleanup above.
-        exportTier: 'ephemeral'
+        exportTier: 'ephemeral',
+        // A session is on one server. The replacement table keys on
+        // (serverID, eosID); a composite key is still server-column, because
+        // what matters here is how a query narrows to one server and that is a
+        // predicate on the column either way.
+        scopeKind: 'server-column'
       }
     ) || null;
   }
 
   /**
-   * Recover session times from S3_PlayerSessions after initial sync.
+   * Recover session times from S3_ServerSessions after initial sync.
    * Called once after _initialSyncComplete is set to true.
    *
    * For each player in the registry:
@@ -2010,15 +2152,17 @@ export default class PlayersService {
           this.sessionModel?.sequelize?.Sequelize?.Op ||
           dbService.getConnector?.()?.constructor?.Sequelize?.Op ||
           null;
+        const serverID = this._serverID();
         if (Op) {
           return await this.sessionModel.findAll({
-            where: { eosID: { [Op.in]: eosIDs } }
+            where: { serverID, eosID: { [Op.in]: eosIDs } }
           });
         }
-        // Fallback: fetch one by one if Op not available.
+        // Fallback: fetch one by one if Op not available. findOne rather
+        // than findByPk — the key is (serverID, eosID).
         const results = [];
         for (const eosID of eosIDs) {
-          const row = await this.sessionModel.findByPk(eosID);
+          const row = await this.sessionModel.findOne({ where: { serverID, eosID } });
           if (row) results.push(row);
         }
         return results;
@@ -2059,6 +2203,7 @@ export default class PlayersService {
           // Session is stale (inactive > sessionExpiryMs) — start fresh.
           state.joinTime = now;
           upsertOps.push({
+            serverID: this._serverID(),
             eosID: state.eosID,
             steamID: state.steamID || null,
             playerName: state.name || null,
@@ -2070,6 +2215,7 @@ export default class PlayersService {
       } else {
         // No DB row — first time seeing this player. Write new session.
         upsertOps.push({
+          serverID: this._serverID(),
           eosID: state.eosID,
           steamID: state.steamID || null,
           playerName: state.name || null,
@@ -2107,6 +2253,10 @@ export default class PlayersService {
 
     await dbService.executeWithRetry(async () => {
       await this.sessionModel.upsert({
+        // Without this the upsert writes a NULL half of the primary key and
+        // the insert fails outright — which is the failure worth having,
+        // since the alternative shape silently collided across servers.
+        serverID: this._serverID(),
         eosID,
         steamID: steamID || null,
         playerName: playerName || null,
@@ -2137,11 +2287,12 @@ export default class PlayersService {
         dbService.getConnector?.()?.constructor?.Sequelize?.Op ||
         null;
 
+      const serverID = this._serverID();
       if (Op) {
         await dbService.executeWithRetry(async () => {
           await this.sessionModel.update(
             { lastActivity: now },
-            { where: { eosID: { [Op.in]: eosIDs } } }
+            { where: { serverID, eosID: { [Op.in]: eosIDs } } }
           );
         });
       } else {
@@ -2150,7 +2301,7 @@ export default class PlayersService {
           for (const p of players) {
             await this.sessionModel.update(
               { lastActivity: now },
-              { where: { eosID: p.eosID } }
+              { where: { serverID, eosID: p.eosID } }
             );
           }
         });
@@ -2283,7 +2434,7 @@ export default class PlayersService {
           up: async (qi) => {
             // Run through qi so verification sees the table on the same connection.
             // Idempotent — safe if bootstrap DDL already created it.
-            await qi.rawQuery(reconnectsTableDDL((id) => dbService.quoteIdentifier(id)));
+            await qi.rawQuery(legacyReconnectsTableDDL((id) => dbService.quoteIdentifier(id)));
           }
         },
         {
@@ -2298,6 +2449,34 @@ export default class PlayersService {
           up: async (qi) => {
             // Run through qi so verification sees the table on the same connection.
             // Idempotent — safe if bootstrap DDL already created it.
+            await qi.rawQuery(legacySessionsTableDDL((id) => dbService.quoteIdentifier(id)));
+          }
+        },
+        {
+          version: 3,
+          description: 'S3_ServerReconnects and S3_ServerSessions (per-server replacements; the old tables are abandoned in place)',
+          // Both spellings appear in this one object, deliberately.
+          // registerExpectedVersion below takes MODEL names and keeps
+          // S3PlayerReconnect / S3_PlayerSession, because the models are not
+          // renamed and an export envelope is keyed by model name — which is
+          // what makes a pre-rename backup restore into the new tables.
+          // `touches` takes TABLE names and must name the new ones, because
+          // that is what this migration actually creates.
+          touches: {
+            creates: ['S3_ServerReconnects', 'S3_ServerSessions'],
+            columns: {
+              S3_ServerReconnects: ['serverID', 'eosID', 'steamID', 'playerName', 'lastTeamID', 'lastSeenAt', 'updatedAt'],
+              S3_ServerSessions: ['serverID', 'eosID', 'steamID', 'playerName', 'sessionStart', 'lastActivity']
+            }
+          },
+          up: async (qi) => {
+            // Nothing is copied from the old tables. Both are ephemeral by
+            // declaration and by behaviour: sessions are rebuilt on the next
+            // tick and reconnect rows expire on their own within minutes, so
+            // a copy would move data that is stale before the migration
+            // finishes — and it would have to invent a serverID for rows
+            // that were written when there was only one server to be.
+            await qi.rawQuery(reconnectsTableDDL((id) => dbService.quoteIdentifier(id)));
             await qi.rawQuery(sessionsTableDDL((id) => dbService.quoteIdentifier(id)));
           }
         }
@@ -2307,16 +2486,32 @@ export default class PlayersService {
     // ── Register expected version ──────────────────────────────────
     // Makes s3-players visible in !s3 migrate status / pending.
     // Safe to call unconditionally — overwrites same value on re-mount.
-    dbService.registerExpectedVersion('s3-players', 2, {
+    // The model names do NOT change with the tables. They are the export
+    // envelope's keys and what test-export-model-registration.js asserts on,
+    // and keeping them stable is what makes a backup taken before the rename
+    // restore into the renamed tables afterwards.
+    dbService.registerExpectedVersion('s3-players', 3, {
       models: ['S3PlayerReconnect', 'S3_PlayerSession']
     });
 
     // ── Define Sequelize model ─────────────────────────────────────
     // Runs AFTER bootstrap DDL so the table exists before defineModel.
-    // tableName updated to S3_PlayerReconnects for consistency with other S³ tables.
+    // The MODEL name stays S3PlayerReconnect while the table becomes
+    // S3_ServerReconnects — see the note on registerExpectedVersion above for
+    // why the two are allowed to disagree and why the model name is the one
+    // that must not move.
     this.reconnectModel = dbService.defineModel?.(
       'S3PlayerReconnect',
       {
+        // Half of the primary key — see the session model above. Which team
+        // a player was on when they dropped is a fact about one server, and
+        // restoring server A's team on server B is worse than not restoring
+        // anything.
+        serverID: {
+          type: dbService.getDataTypes().INTEGER,
+          primaryKey: true,
+          allowNull: false
+        },
         eosID: {
           type: dbService.getDataTypes().STRING,
           primaryKey: true
@@ -2343,13 +2538,26 @@ export default class PlayersService {
         }
       },
       {
-        tableName: 'S3_PlayerReconnects',
+        tableName: 'S3_ServerReconnects',
         timestamps: false,
         // Reconnect memory — repopulated from live play, and entries expire on
         // their own.
-        exportTier: 'ephemeral'
+        exportTier: 'ephemeral',
+        // Which team a player was on when they dropped, on one server. Carrying
+        // it across servers would put someone back on a team that does not
+        // correspond to anything they were doing.
+        scopeKind: 'server-column'
       }
     ) || null;
+  }
+
+  /**
+   * Which server these rows belong to. Read from the connector at every use
+   * rather than cached, because a service can outlive a reconnect and the
+   * registry is the only thing that knows the answer.
+   */
+  _serverID() {
+    return this._getDbService()?.getServerID?.() ?? null;
   }
 
   _normalizeReconnectRow(row) {

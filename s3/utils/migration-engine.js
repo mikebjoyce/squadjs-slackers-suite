@@ -22,6 +22,29 @@
  * - The engine NEVER auto-triggers migrations on startup — that is
  *   gated behind the Discord confirmation flow (!s3 confirm <token>).
  *
+ * ─── MULTI-PROCESS ──────────────────────────────────────────────
+ *
+ * Several Squad servers can share one database, which means several
+ * copies of this engine can reach the same schema at the same time.
+ * runMigrations() takes a cross-process lock keyed per plugin before
+ * it writes anything, and fails the run rather than proceeding if it
+ * cannot get one. Two processes applying the same migration is not a
+ * duplicate of harmless work; it is two CREATE TABLE statements, two
+ * ALTERs, and a SchemaVersion row that no longer describes the
+ * database.
+ *
+ * The lock is a row in S3_Locks rather than a native primitive. MySQL
+ * GET_LOCK and Postgres pg_try_advisory_lock are both scoped to the
+ * connection that took them, and everything here runs through a pool,
+ * so the release could land on a different connection than the
+ * acquire. A row works identically on all three dialects and is
+ * visible to an operator looking at the database.
+ *
+ * The pending list is read before the lock and re-read under it. In
+ * between, the other process may have finished the very migrations
+ * this one was going to run, and the second read is what turns that
+ * into a no-op instead of a repeat.
+ *
  * ─── METHODS ────────────────────────────────────────────────────
  *
  *   registerMigrations(pluginName, migrations)
@@ -30,6 +53,11 @@
  *   async runMigrations(pluginName, options = {})
  *     Applies pending migrations for a plugin. Returns { applied, skipped }.
  *     Each migration runs in its own transaction.
+ *
+ *   async markBootstrapApplied(pluginName)
+ *     Records a group as applied WITHOUT running it, for the tables DBService
+ *     creates unconditionally at mount. Confirmation-free by construction:
+ *     the DDL has already happened.
  *
  *   async rollbackMigrations(pluginName, targetVersion)
  *     Reverses migrations down to a target version.
@@ -74,32 +102,17 @@ import crypto from 'node:crypto';
 import SequelizeLib from 'sequelize';
 import { createBackup } from './s3-backup.js';
 import { exportToFile as jsonExportToFile } from './s3-export-import.js';
-import { stderrError } from './s3-stderr.js';
+import { stderrError, stderrWarn } from './s3-stderr.js';
 
 /**
- * Count rows whose `column` is SQL NULL, through the model so the comparison is
- * typed and dialect-agnostic.
+ * `err.code` on the error thrown when the migration lock could not be taken.
  *
- * Op.is is spelled out rather than relying on `{ column: null }` shorthand. The
- * shorthand does render as IS NULL today, but the same assumption made at the
- * raw-query layer is exactly what produced the SQLite `= NULL` bug this whole
- * mechanism exists to catch, so the intent is stated rather than inferred.
- *
- * Exported for the drift path in db-service.js, which asks the identical
- * question on every mount and must not answer it a second, subtly different way.
- *
- * @param {Object} model - Sequelize model owning the column
- * @param {string} column - Column (attribute) name to test
- * @param {Object|null} [transaction=null] - Transaction, or null for committed state
- * @returns {Promise<number>} count of rows with NULL in that column
+ * This is the one migration failure a caller may legitimately recover from
+ * without operator involvement: another process holds the lock, so the work may
+ * simply have been done by someone else. Every other failure means the schema
+ * is in an unknown state.
  */
-export async function countNullColumn(model, column, transaction = null) {
-  const Op = model.sequelize?.constructor?.Op || SequelizeLib.Op;
-  return model.count({
-    where: { [column]: { [Op.is]: null } },
-    transaction: transaction || null
-  });
-}
+export const MIGRATION_LOCK_UNAVAILABLE = 'S3_MIGRATION_LOCK_UNAVAILABLE';
 
 /**
  * Recognize a database permission-denied error and produce operator-facing
@@ -496,18 +509,37 @@ function createQueryInterface(sequelize, db, transaction, { isReapply = false } 
  * holding ~900MB of stats, and the pre-migration backup loaded every row of
  * them into memory and OOM-killed the SquadJS process (exit 137) on mount.
  *
- * Returns null if no pending migration declares any backup-worthy `touches`
- * metadata, so callers fall back to a full-db backup (original behaviour).
- * Returns an empty array if such touches exist but no table maps to a
- * registered model.
+ * `models` is null if no pending migration declares any backup-worthy `touches`
+ * metadata, so callers fall back to a full-db backup (original behaviour), and
+ * an empty array if such touches exist but no table maps to a registered model.
+ *
+ * `unbacked` names the declared tables that resolved to no model, that no
+ * pending migration creates, and that no migration declares `abandoned` —
+ * s3-players, for one, lists the columns of the very table its migration
+ * creates, and a table this run creates cannot lose data whatever else is
+ * declared about it. `abandoned` covers the other exemption: a table whose
+ * primary key had to change was replaced rather than altered, so the model
+ * moved to the new table and the old one has none by design. The migration
+ * that names it is a recorded contract and keeps running forever, so without
+ * a way to say so, every such rename would abort every upgrade after it.
+ * Those are the
+ * silent half: a name the exporter is never even asked for leaves no trace in
+ * the envelope, so the backup file reads `status: "ok"` on every line it does
+ * contain while the table the migration is about to change is simply absent.
+ * The caller decides what to do about it — it is only a real gap if the table
+ * exists in this database, which a fresh install's does not.
  *
  * @param {object} dbService - DBService instance
  * @param {Array<object>} pending - Pending migration objects (with `touches`)
- * @returns {string[]|null} Deduplicated model names, or null if no touches
+ * @returns {{models: string[]|null, unbacked: string[]}}
  */
 function _resolveBackupModels(dbService, pending) {
   /** @type {Set<string>} */
   const tableNames = new Set();
+  /** @type {Set<string>} Tables a pending migration declares it creates. */
+  const createdNames = new Set();
+  /** @type {Set<string>} Tables declared deliberately model-less. */
+  const abandonedNames = new Set();
   // True if any pending migration declared `touches` at all — including a
   // creates-only declaration. Without this, a pure-create migration would
   // resolve to zero tables and fall through to the `tier: 'all'` full-database
@@ -517,7 +549,19 @@ function _resolveBackupModels(dbService, pending) {
   for (const m of pending) {
     if (!m.touches) continue;
     sawTouches = true;
-    // NOTE: touches.creates is intentionally skipped — see the docblock above.
+    // NOTE: touches.creates is intentionally skipped for the backup scope —
+    // see the docblock above. It is still collected, because a table this same
+    // run creates cannot lose data whatever else is declared about it, so it
+    // must not be reported as an unbacked gap either.
+    if (Array.isArray(m.touches.creates)) {
+      for (const t of m.touches.creates) createdNames.add(t);
+    }
+    // Declared model-less on purpose. Collected from every pending migration,
+    // not only the one that names the table in columns/rows, because the
+    // declaration is a fact about the table rather than about one version.
+    if (Array.isArray(m.touches.abandoned)) {
+      for (const t of m.touches.abandoned) abandonedNames.add(t);
+    }
     // Tables whose columns are altered (keys of touches.columns)
     if (m.touches.columns && typeof m.touches.columns === 'object') {
       for (const t of Object.keys(m.touches.columns)) tableNames.add(t);
@@ -528,21 +572,30 @@ function _resolveBackupModels(dbService, pending) {
     }
   }
 
-  if (!sawTouches) return null;
-  if (tableNames.size === 0) return [];
+  if (!sawTouches) return { models: null, unbacked: [] };
+  if (tableNames.size === 0) return { models: [], unbacked: [] };
 
   // Resolve table names → registered model names via the same lookup the
   // query interface uses for bulk operations.
   const modelNames = [];
+  const resolved = new Set();
   const allModelNames = dbService.getModelNames?.() || [];
   for (const name of allModelNames) {
     const model = dbService.getModel(name);
-    if (model && tableNames.has(model.tableName || model.name)) {
+    const table = model && (model.tableName || model.name);
+    if (table && tableNames.has(table)) {
       modelNames.push(name);
+      resolved.add(table);
     }
   }
 
-  return modelNames;
+  // Exact comparison, matching the resolution above rather than being kinder
+  // than it. A declared `Big_Log` against a model whose tableName is `big_log`
+  // is not exported either, so reporting it as backed would describe a file
+  // that does not contain it.
+  const unbacked = [...tableNames].filter((t) => !resolved.has(t) && !createdNames.has(t) && !abandonedNames.has(t));
+
+  return { models: modelNames, unbacked };
 }
 
 export default class MigrationEngine {
@@ -588,7 +641,7 @@ export default class MigrationEngine {
    * Register a sequence of migrations for a plugin.
    * @param {string} pluginName  - Unique plugin identifier (e.g. 'smart-assign', 's3-core')
    * @param {Array}  migrations  - Array of migration objects:
-   *   [{ version: number, description: string, up: async (qi) => void, down?: async (qi) => void, backup?: boolean, touches?: { creates?: string[], columns?: Record<string, string[]>, rows?: Record<string, string[]> } }]
+   *   [{ version: number, description: string, up: async (qi) => void, down?: async (qi) => void, backup?: boolean, touches?: { creates?: string[], columns?: Record<string, string[]>, rows?: Record<string, string[]>, abandoned?: string[] } }]
    *
    * Validates:
    *   - No duplicate version numbers
@@ -662,6 +715,18 @@ export default class MigrationEngine {
           if (!Array.isArray(m.touches.creates) || !m.touches.creates.every(t => typeof t === 'string')) {
             throw new Error(
               `Migration v${m.version} in "${pluginName}": touches.creates must be an array of table name strings.`
+            );
+          }
+        }
+        // Tables this migration names that no model backs, on purpose. The
+        // only legitimate reason is a table the suite replaced rather than
+        // altered, so this is deliberately not inferred: an unmodelled table
+        // is normally the signature of a plugin that is installed but not
+        // mounted, and that must keep aborting the run.
+        if (m.touches.abandoned !== undefined) {
+          if (!Array.isArray(m.touches.abandoned) || !m.touches.abandoned.every(t => typeof t === 'string')) {
+            throw new Error(
+              `Migration v${m.version} in "${pluginName}": touches.abandoned must be an array of table name strings.`
             );
           }
         }
@@ -835,6 +900,50 @@ export default class MigrationEngine {
   }
 
   /**
+   * Record a group as applied without running it.
+   *
+   * For bootstrap groups only — the tables DBService creates unconditionally
+   * during `mount()` because something needs them before the migration path
+   * can open at all (`S3_Locks` is what serialises migrations; `S3_Servers` is
+   * read by guards that run before the gate). Their DDL has already succeeded
+   * by the time this is called, so there is nothing left to apply.
+   *
+   * They still need a registered group, because a table in no group has no
+   * recorded version and `verifyLiveSchema()`'s drift check never looks at it.
+   * But registering an expected version without ever recording it applied
+   * leaves the group permanently behind: `verifySchemaVersions()` reports
+   * pending forever, every consumer plugin's `verifyAndRunMigrations()` sees
+   * drift, and operators are prompted at every boot to confirm a migration
+   * whose work is already done.
+   *
+   * This closes that loop. It deliberately bypasses the confirmation gate,
+   * which is not a hole in it: the gate exists so no schema changes under an
+   * operator without their say-so, and this method changes no schema. It
+   * writes one bookkeeping row describing DDL that has already committed.
+   *
+   * The caller must only reach this once the tables really exist. If a create
+   * failed, leave the group behind on purpose — the ordinary confirm-and-run
+   * path is then the recovery route, and it will retry the create.
+   *
+   * @param {string} pluginName - The bootstrap group
+   * @returns {Promise<{recorded: number|null}>} The version written, or null if already at or ahead of it
+   */
+  async markBootstrapApplied(pluginName) {
+    const migrations = this._migrations.get(pluginName);
+    if (!migrations || migrations.length === 0) return { recorded: null };
+
+    const target = migrations[migrations.length - 1];
+    const applied = await this._getAppliedVersion(pluginName);
+    if (applied >= target.version) return { recorded: null };
+
+    // The real up() is hashed, not a stand-in, so the row is indistinguishable
+    // from one a normal run would have written — the hash column is read as a
+    // drift-recovery sentinel, and a bootstrap row must not look like one.
+    await this._recordVersion(pluginName, target.version, target.up, undefined);
+    this.verboseLogger(3, `[MigrationEngine] "${pluginName}" recorded at v${target.version} (bootstrap — DDL ran at mount).`);
+    return { recorded: target.version };
+  }
+  /**
    * Apply pending migrations for a plugin.
    * Each migration runs in its own transaction — a failure at v3 does
    * not roll back v2.
@@ -852,8 +961,11 @@ export default class MigrationEngine {
       return { applied: 0, skipped: 0 };
     }
 
-    const appliedVersion = await this._getAppliedVersion(pluginName);
-    const pending = this._getPendingMigrations(pluginName, appliedVersion);
+    // Reassigned once the lock is held — see the re-check below. Read here as
+    // well because the dry-run and confirmation gates both answer before any
+    // lock is taken, and neither should acquire one to say "nothing to do".
+    let appliedVersion = await this._getAppliedVersion(pluginName);
+    let pending = this._getPendingMigrations(pluginName, appliedVersion);
 
     if (pending.length === 0) {
       this.verboseLogger(3, `[MigrationEngine] "${pluginName}" is up to date (v${appliedVersion}).`);
@@ -895,16 +1007,79 @@ export default class MigrationEngine {
     }
 
     // Concurrency guard — prevent double-apply across processes.
-    // SQLite is already serialized by _s3_mutex (acquireAdvisoryLock returns true immediately).
-    // Postgres/MySQL use native advisory locks to serialize per-pluginName.
+    //
+    // One implementation on all three dialects: a row in S3_Locks keyed by
+    // lockKey. The native primitives this used to call — GET_LOCK on MySQL,
+    // pg_try_advisory_lock on Postgres — are scoped to the CONNECTION that
+    // called them, and every statement here goes through a pool, so acquire
+    // and release landed on the same session only by luck. SQLite took no
+    // cross-process lock at all: _s3_mutex serialises this process only, which
+    // is exactly the guarantee that stops being enough with a second SquadJS
+    // pointed at the same database. See acquireAdvisoryLock() in db-service.js.
+    //
+    // Failing to lock is fatal here on purpose — running a migration
+    // unserialised is worse than not running it, and the operator gets a
+    // message naming the reason.
     const lockKey = `s3_migrate_${pluginName}`;
     let locked = false;
     try {
-      locked = await this.dbService.acquireAdvisoryLock(lockKey, 30000);
+      // No timeout literal here: the sizing argument belongs next to the
+      // measurement it comes from, in LOCK_TTL_MS/LOCK_WAIT_MS.
+      locked = await this.dbService.acquireAdvisoryLock(lockKey);
       if (!locked) {
-        throw new Error(
-          `Could not acquire migration lock for "${pluginName}" — another migration may be in progress.`
+        // Tagged, not just worded. The caller has to tell "another process is
+        // migrating this" apart from every other migration failure in order to
+        // decide whether re-checking can let it come up clean, and matching on
+        // the message text would break the first time anyone rewords it.
+        //
+        // The two reasons a lock is refused read identically from here, and one
+        // of them is not a race at all: a user without CREATE cannot have an
+        // S3_Locks table, so every acquire fails closed forever. Reporting that
+        // as "another migration is in progress" sends the operator looking for a
+        // second server that does not exist, instead of at their GRANTs.
+        const lockingAvailable = this.dbService.isLockingAvailable?.() !== false;
+        let lockMessage = lockingAvailable
+          ? `Could not acquire migration lock for "${pluginName}" — another migration is in progress ` +
+            'and did not finish within the wait window.'
+          : `Could not acquire migration lock for "${pluginName}" — the S3_Locks table could not be created, ` +
+            'so migrations cannot be serialised and are refused rather than run unprotected.';
+
+        // Run the locking outage through the same classifier a failed migration
+        // uses. A grant too small to create S3_Locks is too small to migrate
+        // anyway, so the operator's real problem is the privilege, and it should
+        // read the same here as it would have three statements later.
+        if (!lockingAvailable) {
+          const hint = describePermissionError(this.dbService.getLocksInitError?.());
+          if (hint) lockMessage += `\n\nThis looks like a database-permissions problem: ${hint}`;
+        }
+
+        const lockErr = new Error(lockMessage);
+        lockErr.code = MIGRATION_LOCK_UNAVAILABLE;
+        throw lockErr;
+      }
+
+      // Re-check under the lock. The pending list above was read BEFORE the
+      // wait, and the whole point of waiting is that the other process was
+      // changing the answer. A loser that skips this re-applies every migration
+      // the winner just finished: idempotent `up()` bodies make that survivable
+      // rather than harmless, since a one-time destructive step is guarded only
+      // by `isReapply`, and the redundant backup and DDL are real work on a live
+      // server.
+      //
+      // Coming up clean here is the specified behaviour on every dialect —
+      // wait, re-check, and if the winner completed, report success having done
+      // nothing. It is reported as skipped rather than applied because this
+      // process applied nothing; the schema is nonetheless at the version the
+      // caller asked for, which is what `applied: 0` with no error means.
+      appliedVersion = await this._getAppliedVersion(pluginName);
+      pending = this._getPendingMigrations(pluginName, appliedVersion);
+      if (pending.length === 0) {
+        this.verboseLogger(
+          2,
+          `[MigrationEngine] "${pluginName}" was migrated by another process while this one waited for the lock ` +
+          `— now at v${appliedVersion}, nothing left to do.`
         );
+        return { applied: 0, skipped: 0 };
       }
 
       // Pre-migration backup — produce BOTH formats for portability.
@@ -926,8 +1101,53 @@ export default class MigrationEngine {
       let jsonExportResult = null;
 
       // Determine backup scope from pending migrations' touches declarations
-      const backupModels = _resolveBackupModels(this.dbService, pending);
+      const { models: backupModels, unbacked } = _resolveBackupModels(this.dbService, pending);
       const allBackupFalse = pending.length > 0 && pending.every((m) => m.backup === false);
+
+      // A model whose table is not in the database yet holds nothing to lose,
+      // and asking the exporter for it produces an incomplete envelope that
+      // the check below discards — aborting a migration whose only fault is
+      // that it has not run.
+      //
+      // Not hypothetical. A table whose primary key changed had to be replaced
+      // rather than altered, so its model now points at a table the same run
+      // creates, while `touches` names that new table because that is what the
+      // migration builds. The declaration resolves, the model exists, and the
+      // table does not — which is precisely the state in which there is
+      // nothing to back up.
+      //
+      // Presence is read once from the live table list, through hasTable() so
+      // that MySQL folding table names does not empty the scope. A list that
+      // cannot be read leaves the scope alone: the same refusal to guess that
+      // the unbacked check makes below, pointing the same way — toward backing
+      // up more rather than less.
+      let backupScope = backupModels;
+      if (Array.isArray(backupModels) && backupModels.length > 0) {
+        try {
+          const live = await this.dbService.sequelize.getQueryInterface().showAllTables();
+          const absent = [];
+          backupScope = backupModels.filter((name) => {
+            const table = this.dbService.getModel(name)?.tableName || name;
+            if (hasTable(live, table)) return true;
+            absent.push(`${name} (${table})`);
+            return false;
+          });
+          if (absent.length > 0) {
+            this.verboseLogger(
+              2,
+              `[MigrationEngine] Backup scope for "${pluginName}" excludes ${absent.join(', ')} — ` +
+              'the table does not exist yet, so there is nothing in it to back up.'
+            );
+          }
+        } catch (err) {
+          this.verboseLogger(
+            1,
+            `[MigrationEngine] Could not list tables to scope the backup: ${err.message}. ` +
+            'Backing up every model the pending migration(s) declare.'
+          );
+          backupScope = backupModels;
+        }
+      }
 
       // Tier 1: SQLite file copy (fast, binary-identical) — always full-db
       if (this.dbPath) {
@@ -950,28 +1170,29 @@ export default class MigrationEngine {
         // no column changes, no backfills — nothing that can lose data).
         this.verboseLogger(2, `[MigrationEngine] JSON backup skipped — all ${pending.length} pending migration(s) for "${pluginName}" opted out (backup: false).`);
         jsonExportResult = { filename: 'skipped', sizeBytes: 0 };
-      } else if (backupModels && backupModels.length === 0) {
+      } else if (backupScope && backupScope.length === 0) {
         // Pending migrations declared `touches`, but none of it is data-bearing
         // — the only declarations were `creates` (a table a migration creates
         // cannot lose data: either it does not exist, or the idempotent guard
         // means the migration skips it), or the named tables map to no
-        // registered model (which a full backup could not export either).
-        // Skipping here is what keeps a pure-create migration from falling
+        // registered model (which a full backup could not export either), or
+        // every model they map to points at a table this database does not have
+        // yet. Skipping here is what keeps a pure-create migration from falling
         // through to the `tier: 'all'` full-database export.
-        this.verboseLogger(2, `[MigrationEngine] JSON backup skipped — pending migration(s) for "${pluginName}" touch no data-bearing tables (creates only).`);
+        this.verboseLogger(2, `[MigrationEngine] JSON backup skipped — pending migration(s) for "${pluginName}" touch no data-bearing table that exists in this database.`);
         jsonExportResult = { filename: 'skipped', sizeBytes: 0 };
-      } else if (backupModels && backupModels.length > 0) {
+      } else if (backupScope && backupScope.length > 0) {
         // Scoped backup — only the models backing tables this migration
         // actually touches. Prevents OOM on large datasets (e.g. years of
         // wound/death stats in a logging table that a createTable migration
         // will never modify).
         try {
           jsonExportResult = await jsonExportToFile(this.dbService, this.backupDir, {
-            models: backupModels,
+            models: backupScope,
             retention: this.backupRetention
           });
           if (jsonExportResult) {
-            this.verboseLogger(2, `[MigrationEngine] JSON backup created (scoped to ${backupModels.length} model(s)): ${jsonExportResult.filename} (${jsonExportResult.sizeBytes} bytes).`);
+            this.verboseLogger(2, `[MigrationEngine] JSON backup created (scoped to ${backupScope.length} model(s)): ${jsonExportResult.filename} (${jsonExportResult.sizeBytes} bytes).`);
           }
         } catch (err) {
           this.verboseLogger(1, `[MigrationEngine] JSON backup failed: ${err.message}`);
@@ -994,6 +1215,106 @@ export default class MigrationEngine {
         }
       }
 
+      // A table named in `touches.columns` or `touches.rows` that no mounted
+      // plugin registers a model for is the silent half of the same problem.
+      // It is not merely missing from the export — it is never asked for, so
+      // `filterByTier()` never sees it, the coverage stamp below has nothing to
+      // report, and the branch above happily calls a run that exported nothing
+      // "touches no data-bearing tables". That is the shape of an installed but
+      // unmounted plugin, and it is how the archived production exports lost
+      // db-log's eight tables while recording db-log as migrated in the same
+      // file.
+      //
+      // Only a gap if the table is really there. On a fresh install, or when a
+      // migration names a table a later one creates, there is nothing to lose
+      // and nothing to abort over.
+      //
+      // Not applied when every pending migration set `backup: false`: that is an
+      // explicit declaration that this run cannot lose data, and it claims no
+      // backup to be wrong about.
+      if (unbacked.length > 0 && !allBackupFalse) {
+        let present = [];
+        try {
+          const live = await this.dbService.sequelize.getQueryInterface().showAllTables();
+          present = unbacked.filter((t) => hasTable(live, t));
+        } catch (err) {
+          // Cannot prove it either way. Treat as present — the whole point is
+          // to refuse to guess about what the backup contains.
+          this.verboseLogger(1, `[MigrationEngine] Could not list tables to check backup coverage: ${err.message}. Assuming the unbacked table(s) exist.`);
+          present = [...unbacked];
+        }
+        if (present.length > 0) {
+          this.verboseLogger(
+            1,
+            `[MigrationEngine] The pre-migration backup for "${pluginName}" cannot cover ${present.join(', ')} — ` +
+            'the migration changes those tables and no mounted plugin registers a model for them, so nothing exports them.'
+          );
+          stderrWarn(
+            'MigrationEngine',
+            `The pre-migration backup for "${pluginName}" cannot cover every table the migration changes.`,
+            `No mounted plugin registers a model for: ${present.join(', ')}. Mount the plugin that owns them, or take a full backup by hand, before migrating.`
+          );
+          jsonExportResult = null;
+        }
+      }
+
+      // A model the export was asked for that left no trace in the envelope is
+      // not a backup gap the operator can see: `results` reports per model, and
+      // a name that no `defineModel()` ever registered is dropped before the
+      // export starts — so it appears in neither `tables` nor `results`, and
+      // every remaining line reads `status: 'ok'`. The safety argument for
+      // running a migration is that this file can undo it, and a file silently
+      // missing a table the migration is about to change cannot.
+      //
+      // Deliberately narrow. A table the exporter TRIED and could not read is
+      // reported separately below and does not block, because the commonest
+      // cause of it is the drift this migration run exists to repair: a model
+      // whose declared column is missing from the live table fails every read
+      // until the repair lands.
+      //
+      // Discarding rather than throwing, because a SQLite file copy is the whole
+      // database and is a complete backup on its own. The abort below fires only
+      // when this was the only one.
+      if (jsonExportResult && jsonExportResult.filename !== 'skipped' && jsonExportResult.complete === false) {
+        const gaps = (jsonExportResult.incomplete || [])
+          .map((g) => `${g.model} (${g.reason})`)
+          .join(', ');
+        this.verboseLogger(
+          1,
+          `[MigrationEngine] JSON backup for "${pluginName}" is incomplete and will not be counted as a backup — ` +
+          `missing: ${gaps}.`
+        );
+        stderrWarn(
+          'MigrationEngine',
+          `The pre-migration JSON backup for "${pluginName}" did not cover everything it was asked for.`,
+          `Missing: ${gaps}`
+        );
+        jsonExportResult = null;
+      }
+
+      // Loud but not fatal — see above.
+      if (jsonExportResult && jsonExportResult.failedTables?.length) {
+        const failed = jsonExportResult.failedTables.map((g) => `${g.model} (${g.reason})`).join(', ');
+        this.verboseLogger(
+          1,
+          `[MigrationEngine] The pre-migration backup for "${pluginName}" could not read: ${failed}. ` +
+          'If this run is a drift repair, that is expected — the table cannot be read until it is repaired.'
+        );
+      }
+
+      // Informational, and only ever present on a full-database fallback export.
+      // Names tables the process could not have exported because nothing
+      // registered a model for them — the gap an "ok on every line" envelope has
+      // no other way to report.
+      if (jsonExportResult && jsonExportResult.unexportedTables?.length) {
+        this.verboseLogger(
+          1,
+          `[MigrationEngine] The pre-migration backup does not cover ${jsonExportResult.unexportedTables.length} ` +
+          `table(s) in this database, because no mounted plugin registers a model for them: ` +
+          `${jsonExportResult.unexportedTables.join(', ')}.`
+        );
+      }
+
       if (!fileCopyResult && !jsonExportResult) {
         const msg = `[MigrationEngine] Backup FAILED for "${pluginName}" — aborting migration. Both file copy and JSON export failed. Check disk space, permissions, and DB connectivity.`;
         this.verboseLogger(1, msg);
@@ -1008,7 +1329,17 @@ export default class MigrationEngine {
       // Drift recovery re-runs migrations that were already applied once. Tell
       // up() which situation it is in so a destructive one-time step can be
       // skipped on the repair pass — see the isReapply docs on the qi object.
-      const isReapply = this._driftReapply.has(pluginName);
+      //
+      // Two sources, because _driftReapply is per-PROCESS and the version row it
+      // describes is shared by every process on the database. Process A can
+      // detect the drift and roll the row back while process B is the one that
+      // actually re-applies, and B's engine has an empty set — so B would run
+      // the migration as a first-time apply and repeat a one-time destructive
+      // step. The recorded hash is the same decision, written where both can
+      // see it.
+      const isReapply =
+        this._driftReapply.has(pluginName) ||
+        ((await this.dbService.isDriftReapplyRecorded?.(pluginName)) === true);
       for (const migration of pending) {
         try {
           // Step 1: Run up() inside a transaction
@@ -1080,6 +1411,183 @@ export default class MigrationEngine {
    */
   getMigrations(pluginName) {
     return [...(this._migrations.get(pluginName) || [])];
+  }
+
+  /**
+   * The exact DDL an operator has to run by hand, for the connected dialect.
+   *
+   * ─── WHY THIS EXISTS ───
+   *
+   * The live MySQL grant is CREATE without ALTER, so every `ADD COLUMN` in
+   * every future migration is un-runnable by the plugin on the deployment this
+   * repo is actually written for. That is the normal path here, not an
+   * exception. What the operator got until now was "migration failed" plus a
+   * driver error, leaving them to reconstruct the statement from the model
+   * definition — for a column whose type they cannot see without reading the
+   * source.
+   *
+   * ─── WHY IT IS GENERATED AND NOT WRITTEN ───
+   *
+   * Every statement comes out of Sequelize's own query generator, the same
+   * object that would have produced the statement the migration tried to run.
+   * A hand-written template would be a second source of truth for column types,
+   * quoting and dialect syntax, and would start drifting from the models the
+   * first time anyone changed one. Generated this way it cannot: the SQL an
+   * operator pastes is the SQL the engine would have issued.
+   *
+   * ─── ONE DELIBERATE DEPARTURE ───
+   *
+   * Indexes are emitted as bare `CREATE INDEX`, NOT via the generator's
+   * `addIndexQuery()`. Verified 2026-09-05: on MySQL that method renders
+   * `ALTER TABLE ... ADD INDEX`, which is precisely the grant the operator is
+   * working around — so following the generator there would hand them a script
+   * that fails on the engine it was generated for. SQLite and Postgres render
+   * `CREATE INDEX` either way, so the bare form is correct on all three.
+   *
+   * Only genuinely missing objects are emitted: tables absent from
+   * `showAllTables()`, columns absent from `describeTable()`, indexes absent
+   * from `showIndex()`. Table comparison is case-insensitive because production
+   * MySQL runs with `lower_case_table_names=1`.
+   *
+   * @param {{pluginName?: string}} [opts] - restrict to one migration group.
+   * @returns {Promise<{dialect: string, statements: Array<{pluginName: string, version: number, table: string, kind: string, sql: string}>, notes: string[]}>}
+   */
+  async buildHandApplyDdl({ pluginName = null } = {}) {
+    const db = this.dbService;
+    const out = { dialect: db.getDialect?.() || 'unknown', statements: [], notes: [] };
+
+    const connector = db.getConnector?.();
+    if (!connector) {
+      out.notes.push('No database connector — nothing to generate.');
+      return out;
+    }
+    const qi = connector.getQueryInterface();
+    const qg = qi.queryGenerator || qi.QueryGenerator;
+    if (!qg) {
+      out.notes.push('This Sequelize build exposes no query generator, so DDL cannot be rendered.');
+      return out;
+    }
+    const q = (id) => db.quoteIdentifier(id);
+
+    const status = await db.verifySchemaVersions();
+    let pending = status.pending || [];
+    if (pluginName) pending = pending.filter((p) => p.pluginName === pluginName);
+    if (pending.length === 0) return out;
+
+    let liveTables = new Set();
+    try {
+      const rows = await qi.showAllTables();
+      liveTables = new Set(rows.map((r) => String(r?.tableName ?? r).toLowerCase()));
+    } catch (err) {
+      out.notes.push(`Could not list tables (${err.message}) — every table is treated as already present, so only column statements are emitted.`);
+    }
+
+    const describeCache = new Map();
+    const columnsOf = async (table) => {
+      const key = table.toLowerCase();
+      if (describeCache.has(key)) return describeCache.get(key);
+      let cols = new Set();
+      try {
+        const desc = await qi.describeTable(table);
+        cols = new Set(Object.keys(desc || {}).map((c) => c.toLowerCase()));
+      } catch { /* absent or unreadable — the caller decides what that means */ }
+      describeCache.set(key, cols);
+      return cols;
+    };
+
+    const indexCache = new Map();
+    const indexesOf = async (table) => {
+      const key = table.toLowerCase();
+      if (indexCache.has(key)) return indexCache.get(key);
+      let names = new Set();
+      try {
+        const rows = await qi.showIndex(table);
+        names = new Set(rows.map((r) => r.name));
+      } catch { /* same */ }
+      indexCache.set(key, names);
+      return names;
+    };
+
+    const seen = new Set();
+    const push = (statement) => {
+      if (seen.has(statement.sql)) return;
+      seen.add(statement.sql);
+      out.statements.push(statement);
+    };
+
+    const emitIndexes = async (model, table, context, existing) => {
+      for (const index of model.options?.indexes || []) {
+        if (!index?.name || !Array.isArray(index.fields)) continue;
+        if (existing.has(index.name)) continue;
+        push({
+          ...context,
+          table,
+          kind: 'index',
+          sql: `CREATE INDEX ${q(index.name)} ON ${q(table)} (${index.fields.map(q).join(', ')});`
+        });
+      }
+    };
+
+    for (const target of pending) {
+      const registered = (this._migrations.get(target.pluginName) || [])
+        .filter((m) => m.version > target.currentVersion)
+        .sort((a, b) => a.version - b.version);
+
+      for (const migration of registered) {
+        const context = { pluginName: target.pluginName, version: migration.version };
+        const touches = migration.touches;
+        if (!touches) {
+          out.notes.push(
+            `${target.pluginName} v${migration.version} declares no \`touches\`, so its DDL cannot be derived — ` +
+            'it has to be applied by running the migration itself.'
+          );
+          continue;
+        }
+
+        // ── tables the migration creates ──
+        for (const table of touches.creates || []) {
+          if (liveTables.has(String(table).toLowerCase())) continue;
+          const model = db.getModelForTable(table);
+          if (!model) {
+            out.notes.push(`No registered model resolves to table \`${table}\` — its CREATE TABLE cannot be rendered.`);
+            continue;
+          }
+          const attributes = qg.attributesToSQL(model.rawAttributes, { context: 'createTable', table });
+          push({ ...context, table, kind: 'table', sql: qg.createTableQuery(table, attributes, {}) });
+          // A new table's indexes are always missing, by definition.
+          await emitIndexes(model, table, context, new Set());
+        }
+
+        // ── columns added to tables that already exist ──
+        for (const [table, columns] of Object.entries(touches.columns || {})) {
+          if (!liveTables.has(String(table).toLowerCase())) continue; // covered by the CREATE above
+          const model = db.getModelForTable(table);
+          if (!model) {
+            out.notes.push(`No registered model resolves to table \`${table}\` — its ADD COLUMN statements cannot be rendered.`);
+            continue;
+          }
+          const present = await columnsOf(table);
+          for (const column of columns || []) {
+            if (present.has(String(column).toLowerCase())) continue;
+            const attribute = model.rawAttributes?.[column];
+            if (!attribute) {
+              out.notes.push(
+                `\`${table}.${column}\` is declared in \`touches\` but is not an attribute of model ` +
+                `\`${model.name}\` — check whether \`touches\` was written in model names rather than table names.`
+              );
+              continue;
+            }
+            const normalized = typeof qi.normalizeAttribute === 'function'
+              ? qi.normalizeAttribute(attribute)
+              : attribute;
+            push({ ...context, table, kind: 'column', sql: qg.addColumnQuery(table, column, normalized) });
+          }
+          await emitIndexes(model, table, context, await indexesOf(table));
+        }
+      }
+    }
+
+    return out;
   }
 
   /**
@@ -1239,8 +1747,8 @@ export default class MigrationEngine {
    * - Checks showAllTables() for each entry in touches.creates.
    * - Checks describeTable() for every table named in touches.columns, whether
    *   or not that table is also in touches.creates.
-   * - Checks touches.rows exist, via the owning model.
-   * - Checks touches.data post-conditions hold, via a per-column count().
+   * - Checks touches.rows exist, by reading the named table directly.
+   * - Checks touches.data post-conditions hold, by counting nulls in it.
    * - Collects all failures and throws one composite error.
    *
    * @param {{ touches?: { creates?: string[], columns?: Record<string, string[]>, rows?: Object, data?: Object } }} migration
@@ -1250,6 +1758,7 @@ export default class MigrationEngine {
   async _verifyMigrationResult(migration, qi) {
     if (!migration.touches) return;
 
+    const q = (id) => this.dbService.quoteIdentifier(id);
     const failures = [];
 
     // ── Verify touches.creates ───────────────────────────────
@@ -1294,23 +1803,33 @@ export default class MigrationEngine {
     }
 
     // ── Verify touches.rows ──────────────────────────────────
-    // For each declared row, query the model to confirm the row exists.
-    // Uses model-based lookup (dialect-agnostic) with null transaction so
-    // the query sees committed state.
+    // A table name is resolved to a table, not to a model. `touches` is keyed
+    // by TABLE name everywhere it is documented, but this used to look the
+    // name up in the model registry and query whatever table that model
+    // currently points at — which stops being the same table the moment a
+    // model is repointed. switch v2 and v4 both write to SwitchPlugin_Settings
+    // and the model of that name now backs SwitchPlugin_ServerSettings, so on
+    // a fresh install their verification ran its SELECT against a table that
+    // v9 had not created yet and failed two migrations that had done exactly
+    // what they said. Reading the table by name cannot drift that way.
+    //
+    // Every identifier is quoted, which is also what makes `key` usable as a
+    // column name here: unquoted it is reserved on MySQL alone.
     if (migration.touches.rows) {
       for (const [tableName, rowDefs] of Object.entries(migration.touches.rows)) {
         if (missingTables.has(tableName)) continue;
-        const model = qi.modelForTable(tableName);
-        if (!model) {
-          failures.push(`Row verification: model "${tableName}" not found in registry`);
-          continue;
-        }
         for (const { key, value } of rowDefs) {
-          const row = await model.findOne({
-            where: { [key]: value },
-            transaction: qi.transaction
-          });
-          if (!row) {
+          let rows;
+          try {
+            rows = await qi.rawQuery(
+              `SELECT ${q(key)} FROM ${q(tableName)} WHERE ${q(key)} = :value`,
+              { value }
+            );
+          } catch (err) {
+            failures.push(`Row verification: cannot read "${tableName}": ${err.message}`);
+            continue;
+          }
+          if (!rows || rows.length === 0) {
             failures.push(`Row "${key}=${value}" not found in "${tableName}" after migration`);
           }
         }
@@ -1327,15 +1846,16 @@ export default class MigrationEngine {
       for (const [tableName, dataDefs] of Object.entries(migration.touches.data)) {
         if (dataDefs.length === 0) continue; // explicit "no invariant here"
         if (missingTables.has(tableName)) continue;
-        const model = qi.modelForTable(tableName);
-        if (!model) {
-          failures.push(`Data verification: model "${tableName}" not found in registry`);
-          continue;
-        }
         for (const def of dataDefs) {
           let offenders;
           try {
-            offenders = await countNullColumn(model, def.column, qi.transaction);
+            // Same reasoning as touches.rows above: count the nulls in the
+            // table the migration named, not in whatever table a model of
+            // that name happens to back.
+            const counted = await qi.rawQuery(
+              `SELECT COUNT(*) AS ${q('n')} FROM ${q(tableName)} WHERE ${q(def.column)} IS NULL`
+            );
+            offenders = Number(counted?.[0]?.n ?? 0);
           } catch (err) {
             failures.push(`Data verification failed for "${tableName}.${def.column}": ${err.message}`);
             continue;

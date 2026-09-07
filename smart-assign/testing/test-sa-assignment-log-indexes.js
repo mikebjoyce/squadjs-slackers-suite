@@ -50,7 +50,12 @@ import { buildAssembly, importFromAssembly, cleanAssembly } from '../../s3/testi
 import { makeMockServer, makeS3Db } from '../../s3/testing/mock-s3.js';
 import DBService from '../../s3/utils/db-service.js';
 
-const EXPECTED_INDEXES = ['idx_sa_al_matchId', 'idx_sa_al_eventType', 'idx_sa_al_ts'];
+// The fourth is named for its table where the first three are not. Postgres
+// scopes index names to the schema rather than the table, so every Class A
+// table wanting an idx_serverID would be one name nine times — the older
+// three predate that constraint and are left alone rather than renamed,
+// which would drop and recreate an index on every deployed database.
+const EXPECTED_INDEXES = ['idx_sa_al_matchId', 'idx_sa_al_eventType', 'idx_sa_al_ts', 'SA_AssignmentLog_serverID'];
 
 const results = [];
 async function test(name, fn) {
@@ -76,7 +81,7 @@ async function runSuite(label, dbFactory, selfHealDbFactory = dbFactory) {
       return plugin;
     }
 
-    await test(`[${label}] mounting creates all three SA_AssignmentLog indexes`, async () => {
+    await test(`[${label}] mounting creates every SA_AssignmentLog index`, async () => {
       const server = makeMockServer({ players: [], s3: { db } });
       const plugin = await mount(server);
       try {
@@ -120,6 +125,35 @@ async function runSuite(label, dbFactory, selfHealDbFactory = dbFactory) {
         }
       } finally {
         db.ensureIndexes = originalEnsureIndexes;
+      }
+    });
+
+    await test(`[${label}] the assignment writer stamps the row with this server`, async () => {
+      // SA_AssignmentLog is shared under multi-server and _saLogAssignmentEvent
+      // is its only writer, so the stamp is applied there rather than by the
+      // handlers that build the event. Driven through the shipped method: a
+      // test that inserted its own row would keep passing after the writer
+      // stopped stamping, which is the whole failure this is here to catch.
+      const server = makeMockServer({ players: [], s3: { db } });
+      const plugin = new SmartAssign(server, { discordClient: null, enableDatabaseLogging: true }, {});
+      await plugin.prepareToMount();
+      await plugin.mount();
+      try {
+        const mine = db.getServerID();
+        await plugin._saLogAssignmentEvent({
+          matchId: '1-stamped', eventType: 'MOVE_SUCCESS', eosID: 'eos_sa_stamp',
+          targetTeamID: 1, reason: 'test', attempt: 1, method: 'rcon'
+        });
+
+        const rows = await db.getModel('SA_AssignmentLog').findAll({ where: { eosID: 'eos_sa_stamp' } });
+        assert.equal(rows.length, 1, 'the writer stored nothing, so the stamp was never exercised');
+        assert.equal(
+          rows[0].serverID, mine,
+          `the row is stamped ${rows[0].serverID} rather than ${mine} — an unstamped row is one no per-server query will return`
+        );
+        await db.getModel('SA_AssignmentLog').destroy({ where: { eosID: 'eos_sa_stamp' } });
+      } finally {
+        await plugin.unmount();
       }
     });
 

@@ -384,6 +384,22 @@ function storedRow(over = {}) {
   };
 }
 
+/**
+ * A stored row that belongs to the server under test.
+ *
+ * storedRow() is the shape _computeRoundStatsRow() produces, and that shape
+ * carries no serverID — recordRoundStats() and backfillRoundStats() are what
+ * stamp it, which is exactly what the writer cases below assert. Fixtures that
+ * insert through the model bypass both writers, so they stamp it here instead:
+ * every read of this table is scoped now, and a row with a NULL serverID is one
+ * no report can ever see.
+ *
+ * `over` still wins, so a case that wants the neighbour's row says so.
+ */
+function ownRow(ctx, over = {}) {
+  return { serverID: ctx.plugin._serverID(), ...storedRow(over) };
+}
+
 const MINUTE = 60 * 1000;
 
 console.log('');
@@ -728,10 +744,10 @@ await onEachEngine('totals sum the window and leave liberal rounds out of the nu
   try {
     const now = Date.now();
     await ctx.model.bulkCreate([
-      storedRow({ roundEndedAt: new Date(now - 10 * MINUTE), success: 5, denied: 2, denialCooldown: 2, instant: 5, toT1: 5, maxQueueSize: 3 }),
-      storedRow({ roundEndedAt: new Date(now - 5 * MINUTE), success: 3, denied: 1, denialTimeWindow: 1, instant: 3, toT2: 3, maxQueueSize: 9 }),
+      ownRow(ctx, { roundEndedAt: new Date(now - 10 * MINUTE), success: 5, denied: 2, denialCooldown: 2, instant: 5, toT1: 5, maxQueueSize: 3 }),
+      ownRow(ctx, { roundEndedAt: new Date(now - 5 * MINUTE), success: 3, denied: 1, denialTimeWindow: 1, instant: 3, toT2: 3, maxQueueSize: 9 }),
       // Liberal: counted as excluded, contributes nothing.
-      storedRow({ roundEndedAt: new Date(now - 1 * MINUTE), liberalMode: true, success: 100, denied: 100, maxQueueSize: 99 })
+      ownRow(ctx, { roundEndedAt: new Date(now - 1 * MINUTE), liberalMode: true, success: 100, denied: 100, maxQueueSize: 99 })
     ]);
 
     const totals = await ctx.plugin.getRoundStatsTotals(new Date(now - 60 * MINUTE));
@@ -751,13 +767,35 @@ await onEachEngine('totals sum the window and leave liberal rounds out of the nu
   }
 });
 
+await onEachEngine('totals are this server\u2019s rounds, not the community\u2019s', async (dialect) => {
+  const ctx = await buildPlugin({ dialect });
+  try {
+    const now = Date.now();
+    const mine = ctx.plugin._serverID();
+    await ctx.model.bulkCreate([
+      ownRow(ctx, { roundEndedAt: new Date(now - 10 * MINUTE), success: 4, maxQueueSize: 3 }),
+      // The server next door, in the same window. Nothing about this row is
+      // malformed — it is a perfectly good round that belongs to somebody
+      // else, which is why an unscoped sum reports a number that looks fine.
+      { ...ownRow(ctx, { roundEndedAt: new Date(now - 5 * MINUTE), success: 40, maxQueueSize: 30 }), serverID: mine + 1 }
+    ]);
+
+    const totals = await ctx.plugin.getRoundStatsTotals(new Date(now - 60 * MINUTE));
+    assert.strictEqual(totals.rounds, 1, 'the neighbour\u2019s round was counted in this server\u2019s totals');
+    assert.strictEqual(totals.success, 4, 'the neighbour\u2019s switches were added to this server\u2019s');
+    assert.strictEqual(totals.maxQueueSize, 3, 'the reported peak queue was reached on another server');
+  } finally {
+    await teardown(ctx);
+  }
+});
+
 await onEachEngine('rounds outside the window are not counted', async (dialect) => {
   const ctx = await buildPlugin({ dialect });
   try {
     const now = Date.now();
     await ctx.model.bulkCreate([
-      storedRow({ roundEndedAt: new Date(now - 2 * MINUTE), success: 4 }),
-      storedRow({ roundEndedAt: new Date(now - 200 * MINUTE), success: 99 })
+      ownRow(ctx, { roundEndedAt: new Date(now - 2 * MINUTE), success: 4 }),
+      ownRow(ctx, { roundEndedAt: new Date(now - 200 * MINUTE), success: 99 })
     ]);
     const totals = await ctx.plugin.getRoundStatsTotals(new Date(now - 60 * MINUTE));
     assert.strictEqual(totals.standardRounds, 1, 'only the in-window round');
@@ -773,11 +811,11 @@ await onEachEngine('a mean with no median is reported as missing, an absent mean
     const now = Date.now();
     await ctx.model.bulkCreate([
       // Current format: both values present.
-      storedRow({ roundEndedAt: new Date(now - 3 * MINUTE), meanQueueMs: 20000, medianQueueMs: 15000 }),
+      ownRow(ctx, { roundEndedAt: new Date(now - 3 * MINUTE), meanQueueMs: 20000, medianQueueMs: 15000 }),
       // Recovered from a pre-median embed: a mean and nothing else.
-      storedRow({ roundEndedAt: new Date(now - 2 * MINUTE), source: 'scraped', meanQueueMs: 40000, medianQueueMs: null }),
+      ownRow(ctx, { roundEndedAt: new Date(now - 2 * MINUTE), source: 'scraped', meanQueueMs: 40000, medianQueueMs: null }),
       // Nobody queued: contributes to neither average.
-      storedRow({ roundEndedAt: new Date(now - 1 * MINUTE), meanQueueMs: null, medianQueueMs: null })
+      ownRow(ctx, { roundEndedAt: new Date(now - 1 * MINUTE), meanQueueMs: null, medianQueueMs: null })
     ]);
 
     // Rows come back newest-first, so compare the set rather than the order —
@@ -797,7 +835,7 @@ await onEachEngine('queue entries are totalled across successes and non-successe
   const ctx = await buildPlugin({ dialect });
   try {
     const now = Date.now();
-    await ctx.model.create(storedRow({
+    await ctx.model.create(ownRow(ctx, {
       roundEndedAt: new Date(now - MINUTE),
       queueNormal: 1, queueTeamTrade: 2, queueJoinSwap: 3, queueTimeoutSwitch: 4,
       outcomeExpired: 5, outcomeDC: 6, outcomeCancelled: 7, outcomeRemoved: 8
@@ -867,6 +905,66 @@ await runTest('an embed with no stats field is dropped, not stored as an empty r
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// 1b. Which server the round belongs to
+// ═══════════════════════════════════════════════════════════════════
+
+await onEachEngine('both round-stats writers stamp the server, and the caller cannot set it', async (dialect) => {
+  const ctx = await buildPlugin({ dialect });
+  try {
+    const mine = ctx.plugin._serverID();
+
+    // _computeRoundStatsRow() builds an aggregate and has no business
+    // knowing which server it ran on, so the row handed in carries no
+    // serverID at all — and one that does carry a wrong one is overruled.
+    await ctx.plugin.recordRoundStats(storedRow({ roundEndedAt: new Date() }));
+    await ctx.plugin.backfillRoundStats([
+      storedRow({ roundEndedAt: new Date(Date.now() - 40 * MINUTE), source: 'scraped', serverID: mine + 99 })
+    ]);
+
+    const written = await ctx.model.findAll();
+    assert.strictEqual(written.length, 2, 'both writers should have stored a row');
+    for (const row of written) {
+      assert.strictEqual(
+        row.serverID, mine,
+        `a stored round carries serverID=${row.serverID}, expected ${mine} — an unstamped round is one no per-server report can ever claim`
+      );
+    }
+  } finally {
+    await teardown(ctx);
+  }
+});
+
+await onEachEngine('a neighbour round at the same second does not suppress this one', async (dialect) => {
+  const ctx = await buildPlugin({ dialect });
+  try {
+    const mine = ctx.plugin._serverID();
+    const at = new Date(Date.now() - 30 * MINUTE);
+
+    // The other server got there first, to the second. Rounds on two
+    // servers end seconds apart as a matter of course, so this is the
+    // ordinary case rather than a contrived one — and before the dedupe
+    // probe was scoped, it read the neighbour's row, called this round a
+    // duplicate and dropped it. That is a lost round on a live server, and
+    // it is silent: the backfill reports a skip, which is what a genuine
+    // re-run reports too.
+    await ctx.model.create({ ...ownRow(ctx, { roundEndedAt: at, source: 'scraped' }), serverID: mine + 1 });
+
+    const result = await ctx.plugin.backfillRoundStats([storedRow({ roundEndedAt: at, source: 'scraped' })]);
+    assert.deepStrictEqual(
+      result, { inserted: 1, skipped: 0 },
+      'the neighbour\u2019s round was mistaken for this one'
+    );
+
+    // And the same probe still does its actual job within one server.
+    const again = await ctx.plugin.backfillRoundStats([storedRow({ roundEndedAt: at, source: 'scraped' })]);
+    assert.deepStrictEqual(again, { inserted: 0, skipped: 1 }, 'scoping the probe must not stop it deduping');
+    assert.strictEqual(await ctx.model.count({ where: { serverID: mine } }), 1);
+  } finally {
+    await teardown(ctx);
+  }
+});
+
 await onEachEngine('running the backfill twice does not double-count', async (dialect) => {
   const ctx = await buildPlugin({ dialect });
   try {
@@ -894,9 +992,9 @@ await onEachEngine('the live cut-off is the oldest live round, ignoring recovere
     await ctx.model.bulkCreate([
       // Older, but recovered — the backfill's own output must not become its
       // own stop line, or a second run would refuse to extend the history.
-      storedRow({ roundEndedAt: new Date(now - 100 * MINUTE), source: 'scraped' }),
-      storedRow({ roundEndedAt: new Date(now - 40 * MINUTE), source: 'live' }),
-      storedRow({ roundEndedAt: new Date(now - 10 * MINUTE), source: 'live' })
+      ownRow(ctx, { roundEndedAt: new Date(now - 100 * MINUTE), source: 'scraped' }),
+      ownRow(ctx, { roundEndedAt: new Date(now - 40 * MINUTE), source: 'live' }),
+      ownRow(ctx, { roundEndedAt: new Date(now - 10 * MINUTE), source: 'live' })
     ]);
 
     const cutoff = await ctx.plugin.getEarliestLiveRoundStat();
@@ -908,10 +1006,34 @@ await onEachEngine('the live cut-off is the oldest live round, ignoring recovere
   }
 });
 
+await onEachEngine('the cut-off is this server\u2019s own live history', async (dialect) => {
+  const ctx = await buildPlugin({ dialect });
+  try {
+    const now = Date.now();
+    const mine = ctx.plugin._serverID();
+
+    // A server that has been running longer, or was installed first. Its
+    // oldest live round is not this server's stop line: taking it moves the
+    // backfill's boundary into a period this server has no live rows for, and
+    // the archive between the two is then never scraped at all.
+    await ctx.model.bulkCreate([
+      { ...ownRow(ctx, { roundEndedAt: new Date(now - 300 * MINUTE), source: 'live' }), serverID: mine + 1 },
+      ownRow(ctx, { roundEndedAt: new Date(now - 40 * MINUTE), source: 'live' })
+    ]);
+
+    const cutoff = await ctx.plugin.getEarliestLiveRoundStat();
+    assert.ok(cutoff, 'this server has a live round, so it has a cut-off');
+    const drift = Math.abs(cutoff.getTime() - (now - 40 * MINUTE));
+    assert.ok(drift < 2000, `the cut-off came from the neighbour\u2019s history, off by ${drift}ms`);
+  } finally {
+    await teardown(ctx);
+  }
+});
+
 await onEachEngine('with nothing recorded live there is no cut-off', async (dialect) => {
   const ctx = await buildPlugin({ dialect });
   try {
-    await ctx.model.create(storedRow({ source: 'scraped' }));
+    await ctx.model.create(ownRow(ctx, { source: 'scraped' }));
     assert.strictEqual(await ctx.plugin.getEarliestLiveRoundStat(), null,
       'a first backfill must be free to read the whole archive');
   } finally {

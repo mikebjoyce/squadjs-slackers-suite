@@ -486,17 +486,64 @@ test('the JSONL mirror carries durationMs and the reason', async () => {
 // 8. The table shape is unchanged — the no-DDL-grants guarantee
 // ---------------------------------------------------------------------------
 
-test('S3_GameStateEvents still has exactly its original columns', async () => {
+test('S3_GameStateEvents has exactly the columns a migration put there', async () => {
   await withServices({}, async ({ seq }) => {
     const described = await seq.getQueryInterface().describeTable('S3_GameStateEvents');
     assert.deepEqual(
       Object.keys(described).sort(),
-      ['eventType', 'gamemode', 'id', 'layerName', 'matchId', 'newPhase', 'oldPhase', 'resolving', 'ts'],
+      ['eventType', 'gamemode', 'id', 'layerName', 'matchId', 'newPhase', 'oldPhase', 'resolving', 'serverID', 'ts'],
       'a column was added or removed. The live MySQL user has no DDL grants and ' +
       'sync() emits nothing for an existing table, so a new column exists in the ' +
       'model and nowhere else — every game-state write then fails silently. ' +
-      'If a column is genuinely needed, it needs a hand-applied migration first.'
+      'If a column is genuinely needed, it needs a hand-applied migration first. ' +
+      'serverID is the one that has been through that: s3-logging v2 adds it, ' +
+      '`!s3 migrate ddl` renders the ALTER for a grant that cannot run it, and ' +
+      'it is nullable so an un-upgraded process writing to the same database ' +
+      'still inserts. That is the bar for the next column, not a precedent ' +
+      'for adding one to the model alone.'
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8b. Every row this service writes says which server wrote it
+// ---------------------------------------------------------------------------
+
+/*
+ * All three tables are shared under multi-server, and all three are written
+ * from event handlers that know nothing about server identity — which is why
+ * the stamp is applied at the insert rather than passed down. Driven through
+ * the shipped public methods rather than the models, because a test that
+ * creates rows itself would keep passing after the writers stopped stamping.
+ *
+ * The interesting failure is silent rather than loud. An unstamped row is
+ * accepted — the column is nullable by design, so that an un-upgraded process
+ * sharing the database can still insert — and it simply never appears in any
+ * per-server report again.
+ */
+
+test('all three logging writers stamp the row with this server', async () => {
+  await withServices({}, async ({ db, gameState, logging, seq }) => {
+    await gameState.handleNewGame({ layer: 'Sumari_AAS_v1' });
+    const mine = db.getServerID();
+    assert.ok(Number.isInteger(mine), 'the connector must resolve a server id for any of this to mean anything');
+
+    await logging.logPlayerEvent('TEAM_CHANGE', { eosID: 'eos_stamp', steamID: '7656', name: 'Stamped', teamID: 1 }, { oldTeamID: 2, newTeamID: 1 });
+    await logging.logGameStateEvent('PHASE_CHANGE', 'STAGING', 'LIVE');
+    await logging.snapshot('1-abcdefgh', 'ROUND_END', [{ eosID: 'eos_stamp', teamID: 1, name: 'Stamped' }]);
+    await settle();
+
+    const qi = seq.getQueryInterface();
+    for (const table of ['S3_PlayerEvents', 'S3_GameStateEvents', 'S3_PlayerSnapshots']) {
+      const [rows] = await seq.query(`SELECT ${qi.quoteIdentifier("serverID")} AS s FROM ${qi.quoteIdentifier(table)}`);
+      assert.ok(rows.length > 0, `${table} got no row at all, so the stamp was never exercised`);
+      for (const row of rows) {
+        assert.equal(
+          Number(row.s), mine,
+          `${table} has a row stamped ${row.s} rather than ${mine} — a row no per-server report will ever claim`
+        );
+      }
+    }
   });
 });
 
@@ -599,17 +646,19 @@ test('[mysql] the budget deadline reason survives the round trip', async () => {
   );
 });
 
-test('[mysql] S3_GameStateEvents has exactly its original columns', async () => {
+test('[mysql] S3_GameStateEvents has exactly the columns a migration put there', async () => {
   if (!mysqlReachable) return SKIP;
 
   await withServices({ engine: 'mysql' }, async ({ seq }) => {
     const described = await seq.getQueryInterface().describeTable('S3_GameStateEvents');
     assert.deepEqual(
       Object.keys(described).sort(),
-      ['eventType', 'gamemode', 'id', 'layerName', 'matchId', 'newPhase', 'oldPhase', 'resolving', 'ts'],
+      ['eventType', 'gamemode', 'id', 'layerName', 'matchId', 'newPhase', 'oldPhase', 'resolving', 'serverID', 'ts'],
       'RESOLVING_CLEARED must need no DDL on MySQL. durationMs goes to the JSONL ' +
       'mirror precisely so this list does not grow — the live MySQL user cannot ' +
-      'add a column, and sync() emits nothing for an existing table.'
+      'add a column, and sync() emits nothing for an existing table. serverID is ' +
+      'the exception that proves it: it could not be smuggled into the model, so ' +
+      'it went through a migration with a hand-apply route instead.'
     );
   });
 });

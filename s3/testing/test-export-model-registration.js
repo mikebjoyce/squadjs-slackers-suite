@@ -41,6 +41,10 @@
  *      consumer plugins cannot be mounted here (they import SquadJS's
  *      base-plugin.js, absent from this repo), so this one case reads the
  *      source. It is the only place their declarations are checked at all.
+ *   8. Every table a core mount creates appears in schema-health.js’s expected
+ *      list. That tool reports anything it was not told about as an orphan, so
+ *      a new table with no entry there turns a correct database into a
+ *      failing report.
  *
  * ─── WHY THE TABLE-NAME ASSERTION MATTERS ────────────────────────
  *
@@ -414,6 +418,35 @@ test('every S³-owned registered model belongs to exactly one tier', async () =>
     );
   }));
 
+test('the schema health tool knows every table S³ core registers', async () =>
+  withMountedServices('sqlite', ({ db }) => {
+    // schema-health.js reports any S³-prefixed table it was not told about as
+    // an unexpected orphan, so a table added without an entry there turns a
+    // healthy database into a failing report. Its own header records the last
+    // time that list drifted: six failures and four warnings against a database
+    // that was entirely correct. The list is prose in a tool nothing else
+    // reads, which is why it needs a test rather than a convention.
+    const source = fs.readFileSync(path.join(REPO_ROOT, 's3', 'tools', 'schema-health.js'), 'utf8');
+    const known = new Set([...source.matchAll(/^\s*table:\s*'([^']+)'/gm)].map((m) => m[1].toLowerCase()));
+
+    assert.ok(known.size > 15, `only ${known.size} tables parsed out of schema-health.js — the extraction is wrong, not the list`);
+
+    // Only S³ core is mounted here; the consumer plugins carry their own
+    // entries and cannot be mounted in this process.
+    const missing = db.getModelNames()
+      .map((name) => db.getModel(name)?.tableName)
+      .filter(Boolean)
+      .filter((table) => !known.has(String(table).toLowerCase()));
+
+    assert.deepEqual(
+      [...new Set(missing)].sort(),
+      [],
+      'these tables are created by a core mount but are absent from EXPECTED_TABLES in\n' +
+      '  s3/tools/schema-health.js, so the tool reports each of them as an unexpected\n' +
+      '  S³-prefixed orphan on a database that is in fact correct'
+    );
+  }));
+
 test('tier sets use model names, not table names', () => {
   // The original defect in one assertion: every underscored *table* name whose
   // model name differs must NOT appear in any tier set.
@@ -431,22 +464,64 @@ test('tier sets use model names, not table names', () => {
   }
 });
 
+test('the three renamed tables kept their model names', async () => {
+  // Three tables were replaced rather than altered — a primary key cannot be
+  // changed in place on SQLite or on the deployed MySQL grant — and each
+  // replacement was pointed at by `tableName` while the MODEL name stayed put.
+  //
+  // That is what makes a pre-upgrade backup restorable. The export envelope is
+  // keyed by model name, and the importer looks each key up with getModel():
+  // rename the model and an envelope taken before the upgrade carries three
+  // keys nothing answers to, so an operator restoring the most likely backup
+  // there is gets their sessions, reconnects and Switch settings omitted
+  // inside a result that otherwise reads as a success.
+  //
+  // Pinned here rather than left to the roster assertion because the roster
+  // says only that the set drifted, and the fix for a drift is usually to
+  // update the list. For these three it is not.
+  const RENAMED = {
+    S3_PlayerSession: 'S3_ServerSessions',
+    S3PlayerReconnect: 'S3_ServerReconnects',
+    SwitchPlugin_Settings: 'SwitchPlugin_ServerSettings'
+  };
+
+  const union = new Set();
+  for (const set of Object.values(TIER_SETS)) for (const n of set) union.add(n);
+
+  for (const [model, table] of Object.entries(RENAMED)) {
+    assert.ok(
+      union.has(model),
+      `model "${model}" is no longer classified. Its table was renamed to "${table}"; ` +
+      'the model name is what a pre-upgrade export envelope is keyed by and must not move.'
+    );
+  }
+});
+
 test('the production model roster is fully accounted for', () => {
   // Ground truth: the 13 models a real production export emitted on 2026-08-19,
   // plus the 4 that were invisible, plus SwitchPlugin_RoundStats, which
-  // postdates that export. If a future change adds a model without assigning
-  // it a tier, this list and the tier sets fall out of step.
+  // postdates that export, plus S3Locks and S3Servers, both of which postdate
+  // it too, plus SwitchPlugin_PlayerServerState, which does as well. If a
+  // future change adds a model without assigning it a tier, this list and the
+  // tier sets fall out of step.
+  //
+  // Elo_PluginState left the roster in the other direction: the table is
+  // still there and still holds its one row, but nothing defines a model for
+  // it any more, so it is no longer part of any export. The table outliving
+  // the model is the normal shape for this suite — the deployed grant has
+  // no DROP.
   const PRODUCTION_ROSTER = [
-    'S3SchemaVersions', 'S3PlayerEvents', 'S3GameStateEvents', 'S3PlayerSnapshots',
+    'S3SchemaVersions', 'S3Locks', 'S3Servers', 'S3PlayerEvents', 'S3GameStateEvents', 'S3PlayerSnapshots',
     'S3GameState', 'S3PlayerReconnect', 'S3_PlayerSession',
-    'SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_Endmatches', 'SwitchPlugin_Settings',
+    'SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_PlayerServerState',
+    'SwitchPlugin_Endmatches', 'SwitchPlugin_Settings',
     'SwitchPlugin_RoundStats',
     'TeamBalancerState', 'TB_RoundReport',
-    'Elo_PluginState', 'Elo_PlayerStats', 'Elo_RoundHistory', 'Elo_RoundPlayers',
+    'Elo_PlayerStats', 'Elo_RoundHistory', 'Elo_RoundPlayers',
     'SA_AssignmentLog'
   ];
 
-  assert.equal(PRODUCTION_ROSTER.length, 18, 'roster drifted');
+  assert.equal(PRODUCTION_ROSTER.length, 20, 'roster drifted');
 
   const union = new Set();
   for (const set of Object.values(TIER_SETS)) for (const n of set) union.add(n);
@@ -495,6 +570,35 @@ for (const { name: dialect } of DIALECTS) {
         [],
         `these models rely on the default-tier fallback instead of declaring a tier, ` +
         `which makes the mount-time warning noisy and therefore ignorable: ${undeclared.join(', ')}`
+      );
+    }));
+
+  test(`[${dialect}] every model the real services register declares a scopeKind`, async () =>
+    withMountedServices(dialect, ({ db }) => {
+      const unscoped = db.getUnscopedModelNames();
+      assert.deepEqual(
+        unscoped,
+        [],
+        `these models declared no scopeKind, so isServerScoped() throws for them and every ` +
+        `scope-aware path — export filtering, import attribution, the read-path audit — has to ` +
+        `stop rather than guess: ${unscoped.join(', ')}`
+      );
+    }));
+
+  test(`[${dialect}] isServerScoped refuses an undeclared model rather than defaulting`, async () =>
+    withMountedServices(dialect, ({ db }) => {
+      db.defineModel('ScopelessProbe', { id: { type: db.getDataTypes().INTEGER, primaryKey: true } },
+        { tableName: 'ScopelessProbe', timestamps: false, exportTier: 'ephemeral' });
+
+      assert.equal(db.getModelScopeKind('ScopelessProbe'), null);
+      assert.throws(
+        () => db.isServerScoped('ScopelessProbe'),
+        /declared no scopeKind/,
+        'a default here would be a silent wrong answer on a destructive path'
+      );
+      assert.ok(
+        db.getUnscopedModelNames().includes('ScopelessProbe'),
+        'and it has to be reportable, not merely un-answerable'
       );
     }));
 
@@ -649,7 +753,7 @@ const PLUGIN_DIRS = ['s3', 'elo-tracker', 'team-balancer', 'smart-assign', 'swit
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /** Every model in the repo. A change to this number is a deliberate act. */
-const EXPECTED_DEFINITION_SITES = 18;
+const EXPECTED_DEFINITION_SITES = 20;
 
 function collectSourceFiles() {
   const files = [];
@@ -756,6 +860,90 @@ test('every defineModel() call site in the repo declares an exportTier', () => {
     [],
     `these models declare no exportTier, so they fall back to the "${DEFAULT_EXPORT_TIER}" ` +
     `tier and warn on every mount:\n  ${offenders.join('\n  ')}`
+  );
+});
+
+
+/**
+ * How each model's rows divide between the servers sharing one database.
+ *
+ * A second source for the declarations at the `defineModel()` call sites, kept
+ * here for the same reason the tier fixture is kept in `s3-export-import.js`:
+ * moving a table between kinds should take two edits. The consequences differ
+ * from a tier's but are no smaller — reclassify a server-scoped table as global
+ * and an export starts carrying a sibling's rows, reclassify a global one as
+ * server-scoped and half the community's data stops appearing in it.
+ *
+ * `core-plugins/` is out of scan range, so db-log's eight models are covered by
+ * the mounted-service assertions rather than by this fixture.
+ */
+const SCOPE_SETS = {
+  global: new Set([
+    'S3SchemaVersions',
+    'S3Locks',
+    'S3Servers',
+    'SwitchPlugin_PlayerCooldowns',
+    'Elo_PlayerStats'
+  ]),
+  'server-key': new Set([
+    'S3GameState',
+    'TeamBalancerState'
+  ]),
+  'server-column': new Set([
+    'S3PlayerEvents',
+    'S3GameStateEvents',
+    'S3PlayerSnapshots',
+    'S3_PlayerSession',
+    'S3PlayerReconnect',
+    'SwitchPlugin_PlayerServerState',
+    'SwitchPlugin_Endmatches',
+    'SwitchPlugin_Settings',
+    'SwitchPlugin_RoundStats',
+    'TB_RoundReport',
+    'Elo_RoundHistory',
+    'Elo_RoundPlayers',
+    'SA_AssignmentLog'
+  ])
+};
+
+test('every defineModel() call site in the repo declares a scopeKind', () => {
+  const offenders = [];
+  const misclassified = [];
+
+  for (const file of collectSourceFiles()) {
+    const source = fs.readFileSync(file, 'utf8');
+    for (const { model, args } of findModelDefinitions(source)) {
+      const declared = args.match(/\bscopeKind\s*:\s*(['"])([^'"]+)\1/)?.[2];
+
+      if (!declared) {
+        offenders.push(`${path.relative(REPO_ROOT, file)} → ${model}`);
+        continue;
+      }
+
+      const expected = Object.entries(SCOPE_SETS).find(([, set]) => set.has(model))?.[0];
+      if (expected && declared !== expected) {
+        misclassified.push(
+          `${path.relative(REPO_ROOT, file)} → ${model} declares "${declared}", fixture says "${expected}"`
+        );
+      }
+      if (!expected) {
+        misclassified.push(`${path.relative(REPO_ROOT, file)} → ${model} appears in no scope fixture`);
+      }
+    }
+  }
+
+  assert.deepEqual(
+    misclassified,
+    [],
+    `declared scope kinds disagree with the fixture above. If the move is intended, ` +
+    `change both:\n  ${misclassified.join('\n  ')}`
+  );
+  assert.deepEqual(
+    offenders,
+    [],
+    `these models declare no scopeKind, so nothing can tell whether their rows belong to one ` +
+    `server or to the community, and anything that has to know refuses rather than ` +
+    `guessing:\n  ${offenders.join('\n  ')}`
   );
 });
 

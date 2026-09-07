@@ -497,6 +497,93 @@ await fs.rm(DATA, { recursive: true, force: true });
   await plugin.unmount();
 }
 
+// ── two instances, one host ──────────────────────────────────────────────────
+//
+// Driving a multi-server test means running two SquadJS processes and telling
+// a named one to roll its round. The harness never ships in the installer's
+// plugin list, so a second copy is a second file drop rather than a second
+// install target — but two instances on one host share a working directory,
+// and `dataDir` resolves against it. Whether the isolation actually holds is
+// the question these two cases answer, in both directions.
+{
+  const alpha = new MockServer();
+  const bravo = new MockServer();
+  const alphaData = path.join(DATA, 'srv-alpha');
+  const bravoData = path.join(DATA, 'srv-bravo');
+  const a = build(alpha, { dataDir: alphaData });
+  const b = build(bravo, { dataDir: bravoData });
+  await a.mount();
+  await b.mount();
+
+  const tmp = path.join(alphaData, 'inbox', '.roll.tmp');
+  await fs.writeFile(tmp, JSON.stringify({ token: 'secret-token', command: 'AdminChangeLayer Narva_RAAS_v1' }), 'utf8');
+  await fs.rename(tmp, path.join(alphaData, 'inbox', 'roll.json'));
+
+  const deadline = Date.now() + 3000;
+  let out = null;
+  while (Date.now() < deadline && !out) {
+    try { out = JSON.parse(await fs.readFile(path.join(alphaData, 'outbox', 'roll.json'), 'utf8')); }
+    catch { await wait(25); }
+  }
+  // Long enough that a second scan would have run on the other instance too.
+  await wait(150);
+
+  await test('two instances with their own dataDir each answer only their own inbox', async () => {
+    assert.ok(out, 'no result file appeared for the instance the request was addressed to');
+    assert.equal(out.ok, true);
+    assert.deepEqual(alpha.rcon.executed, ['AdminChangeLayer Narva_RAAS_v1']);
+    assert.deepEqual(bravo.rcon.executed, [],
+      'a request dropped for one server reached the other one');
+    assert.equal(
+      await fs.readFile(path.join(bravoData, 'outbox', 'roll.json'), 'utf8').then(() => true, () => false),
+      false,
+      'the second instance wrote a result for a request it was never sent'
+    );
+  });
+
+  await test('each instance keeps its own tape', async () => {
+    alpha.emit('NEW_GAME', { layer: { name: 'Narva_RAAS_v1' } });
+    await wait(80);
+    const alphaTape = await fs.readFile(path.join(alphaData, 'tape.jsonl'), 'utf8');
+    assert.match(alphaTape, /NEW_GAME/);
+    const bravoTape = await fs.readFile(path.join(bravoData, 'tape.jsonl'), 'utf8').catch(() => '');
+    assert.doesNotMatch(bravoTape, /NEW_GAME/,
+      "one server's round roll was recorded on the other server's timeline");
+  });
+
+  await a.unmount();
+  await b.unmount();
+}
+
+{
+  // And the configuration that does NOT work, asserted rather than warned
+  // about. Two instances pointed at one dataDir share an inbox, and the claim
+  // is a rename: whichever scan lands first executes the command and the other
+  // never sees it. That is fine for a single server and useless for a
+  // multi-server test, where the whole point is telling a NAMED server to act.
+  const alpha = new MockServer();
+  const bravo = new MockServer();
+  const shared = path.join(DATA, 'srv-shared');
+  const a = build(alpha, { dataDir: shared });
+  const b = build(bravo, { dataDir: shared });
+  await a.mount();
+  await b.mount();
+
+  const tmp = path.join(shared, 'inbox', '.roll.tmp');
+  await fs.writeFile(tmp, JSON.stringify({ token: 'secret-token', command: 'AdminBroadcast hello' }), 'utf8');
+  await fs.rename(tmp, path.join(shared, 'inbox', 'roll.json'));
+  await wait(400);
+
+  await test('a shared dataDir executes the command once, on an unpredictable instance', async () => {
+    const total = alpha.rcon.executed.length + bravo.rcon.executed.length;
+    assert.equal(total, 1,
+      total === 0 ? 'neither instance claimed the request' : 'both instances executed the same request');
+  });
+
+  await a.unmount();
+  await b.unmount();
+}
+
 await fs.rm(SANDBOX, { recursive: true, force: true });
 
 console.log(results.join('\n'));

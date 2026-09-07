@@ -149,6 +149,73 @@ async function main() {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
+  await runTest('a backup that silently skipped a scoped table aborts the migration', async () => {
+    // The failure this guards is silent by construction. `filterByTier()` drops
+    // a model name it does not recognise, so it lands in neither `tables` nor
+    // `results` — every remaining line of the envelope says `status: "ok"` and
+    // the table the migration is about to change is simply not in the backup.
+    // An in-memory database has no file path, so the JSON tier is the only
+    // backup there is: the same position a MySQL server is in.
+    const tmp = tmpDir();
+    const { db, engine } = await dbWithEngine(tmp);
+
+    // A table with rows and no registered model — the shape of an installed but
+    // unmounted plugin, which is how the archived production exports lost
+    // db-log's eight tables while reporting ok on every line.
+    await db.sequelize.query('CREATE TABLE orphan_log (id INTEGER PRIMARY KEY, payload TEXT)');
+    await db.sequelize.query("INSERT INTO orphan_log (payload) VALUES ('one')");
+
+    let ran = false;
+    engine.registerMigrations('incomplete-backup', [{
+      version: 1,
+      description: 'alters a column on a table no model covers',
+      touches: { columns: { orphan_log: ['payload'] } },
+      up: async () => { ran = true; },
+      down: async () => {}
+    }]);
+    engine.confirmToken('__auto__');
+
+    await assert.rejects(
+      () => engine.runMigrations('incomplete-backup'),
+      /Backup FAILED/,
+      'an export silently missing the very table the migration changes is not a backup'
+    );
+    assert.equal(ran, false, 'no schema change may run once the backup is refused');
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  await runTest('a scoped table that does not exist is not a backup failure', async () => {
+    // The other half of the rule above. A table named in `touches` that no
+    // model covers AND that is not in the database holds nothing to lose, so
+    // the run must not be blamed on the backup. It still fails — a column
+    // declaration on a table nothing creates is a broken declaration — but it
+    // has to fail as the verification error that says so, after the engine has
+    // tried, rather than as "Backup FAILED" before it ever got there.
+    const tmp = tmpDir();
+    const { engine } = await dbWithEngine(tmp);
+
+    engine.registerMigrations('absent-table', [{
+      version: 1,
+      description: 'alters a column on a table that is not there',
+      touches: { columns: { never_created: ['payload'] } },
+      up: async () => {},
+      down: async () => {}
+    }]);
+    engine.confirmToken('__auto__');
+
+    await assert.rejects(
+      () => engine.runMigrations('absent-table'),
+      (err) => {
+        assert.ok(
+          !/Backup FAILED/.test(err.message),
+          `a table with nothing in it must not be reported as a backup gap — got: ${err.message}`
+        );
+        return true;
+      }
+    );
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
   await runTest('an empty touches declaration takes no backup', async () => {
     // registerMigrations rejects a migration with no `touches` at all, so
     // `touches: {}` is how an author says "this changes nothing". Nothing to
@@ -201,7 +268,18 @@ async function main() {
 
     // One row per line is what lets importFromStreamFile read a file far larger
     // than the heap. If pretty-printing ever creeps back in, that breaks.
-    const rowLines = raw.split('\n').filter(l => l.startsWith('{"id"'));
+    //
+    // Scoped to BigLog's own array rather than to every line that looks like a
+    // row. An --all export carries whatever else the database holds, and more
+    // than one S3-owned table leads with an `id` column — S3_SchemaVersions
+    // does, and it has a row in it from the moment DBService records its own
+    // bootstrap group. Counting by shape made this assertion depend on which
+    // other tables happened to be non-empty.
+    const lines = raw.split('\n');
+    const opensAt = lines.findIndex((l) => l.trim() === '"BigLog": [');
+    assert.ok(opensAt !== -1, 'the BigLog array must be in the file');
+    const closesAt = lines.findIndex((l, i) => i > opensAt && /^\s*],?$/.test(l));
+    const rowLines = lines.slice(opensAt + 1, closesAt).filter((l) => l.trim() !== '');
     assert.equal(rowLines.length, 25, 'each row must occupy exactly one line');
 
     assert.ok(!fs.existsSync(`${r.path}.partial`), 'the .partial staging file must be renamed away');

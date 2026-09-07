@@ -1,6 +1,6 @@
 /**
  * ─────────────────────────────────────────────────────────────────
- *  PLAYER-FACING TRANSLATION TEMPLATE — 319 strings
+ *  PLAYER-FACING TRANSLATION TEMPLATE — 320 strings
  * ─────────────────────────────────────────────────────────────────
  *
  *  GENERATED FILE — do not edit in place.
@@ -40,7 +40,7 @@
  *  Every string here can be read by any player, whether or not they asked to
  *  be: broadcasts the whole server sees at once, AdminWarn popups a single
  *  player reads mid-round, and the public Discord replies anyone in the
- *  channel gets from !elo stats or the leaderboard. 319 strings —
+ *  channel gets from !elo stats or the leaderboard. 320 strings —
  *  the smallest tier, and the only one where an untranslated string lands in
  *  front of someone who never chose the server's language.
  *
@@ -144,6 +144,8 @@ export const MESSAGES = {
       onlyAdminsCanCheck: '',
       // EN: [Switch] Unable to check eligibility.
       switchUnableCheckEligibility: '',
+      // EN: Servers affected: {servers}.
+      wipeSpansServers: '',
       // EN: [Switch Queue] Queue is currently disabled.
       switchQueueQueueCurrently: '',
       // EN: [Switch Queue] Removed — you left the queue.

@@ -11,6 +11,46 @@
  * Extracted from switch.js during the refactor to keep the main
  * plugin focused on orchestration.
  *
+ * ─── SCOPING (v2.6.0) ────────────────────────────────────────────
+ *
+ * Five models, and they do not all answer the same question about
+ * "which server". Each declares its answer at defineModel() via
+ * scopeKind, which is what S³'s export and import paths read;
+ * nothing here decides scope by convention.
+ *
+ *   SwitchPlugin_PlayerCooldowns   global        one row per player
+ *   SwitchPlugin_PlayerServerState server-column one row per player
+ *                                                per server
+ *   SwitchPlugin_Endmatches        server-column
+ *   SwitchPlugin_Settings          server-column (table:
+ *                                  SwitchPlugin_ServerSettings)
+ *   SwitchPlugin_RoundStats        server-column
+ *
+ * The split between the first two is the load-bearing decision.
+ * A token balance is a fact about a player; a scramble lock and a
+ * seed clock are facts about a player ON a server. Four columns
+ * moved out of PlayerCooldowns for that reason and the table went
+ * community-wide behind them, so one player carries one balance
+ * across the community and a scramble on one server locks nobody
+ * on the other. See the comments at each declaration — the four
+ * columns are gone from the model and deliberately left in the
+ * table, because DROP COLUMN needs a grant the live MySQL user
+ * lacks and is the one migration step a rollback cannot undo.
+ *
+ * PlayerServerState and Endmatches carry composite primary keys
+ * leading with serverID, which makes findByPk() unavailable on
+ * them by construction. Every read is findOne({ where: { serverID,
+ * eosID } }). That is the point rather than a wart: a call site
+ * that forgets its server scope does not compile into a working
+ * query.
+ *
+ * Settings keeps model name SwitchPlugin_Settings over table
+ * SwitchPlugin_ServerSettings. Model names are what the export
+ * registry and the version fixtures key on, so renaming the model
+ * would have been the larger change, and the table name is what an
+ * operator reads in a schema dump: ServerSettings says at a glance
+ * that a row belongs to one server, which Settings did not.
+ *
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * SwitchDB (default)
@@ -18,11 +58,14 @@
  *   Must be called during _onS3Ready() after S³ DB is confirmed ready.
  *   Adds to plugin: timeLimitEnabled, _loadTimeLimitSetting,
  *   _saveTimeLimitSetting, _loadExplainMessageId,
- *   _saveExplainMessageId, cleanup, checkPlayer,
+ *   _saveExplainMessageId, normalizeRegeneratedTokens, cleanup,
+ *   _pruneServerState, checkPlayer, getLiveRestrictionState,
+ *   adminClearPlayer, adminClearAllRestrictions, adminWipeAll,
  *   recordRoundStats, getRoundStatsTotals, backfillRoundStats,
  *   getEarliestLiveRoundStat.
  *   Also calls defineModel(), registerExpectedVersion(),
- *   registerMigrations(), and verifyAndRunMigrations() on the plugin.
+ *   registerMigrations() and verifyAndRunMigrations() on the plugin,
+ *   plus _s3db.ensureIndexes() once the migrations commit.
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
@@ -42,6 +85,24 @@
  *   pruneInactivePlayerDays. Connected players and seed mode are
  *   both excluded. See the cleanup() docblock for why the tier-1
  *   token comparison must stay an equality.
+ * - cleanup() prunes the community-wide table and _pruneServerState()
+ *   prunes this server's half. They cannot be one pass: a player can
+ *   stay active on server A forever while never returning to server
+ *   B, and nothing in the community row's lifecycle expresses that,
+ *   so the B-side row would be immortal under a single retention
+ *   rule. Each half carries its own lastActiveTimestamp for exactly
+ *   this reason, and the two columns mean different things.
+ * - Indexes go in through ensureIndexes() as bare CREATE INDEX after
+ *   the migration commits, not inside createTable(). Sequelize
+ *   renders an index declared in a create as a follow-up ALTER TABLE
+ *   on MySQL, which is the one statement a create-only grant cannot
+ *   run. Every index name is prefixed with its table: Postgres
+ *   scopes index names to the schema rather than the table, so nine
+ *   indexes all named idx_serverID would be one name nine times.
+ * - Migrations here run once for the community, not once per server.
+ *   Whichever process gets there first applies them under S³'s
+ *   migration lock and the others wait; nothing in this file may
+ *   assume it is the process that migrated.
  *
  * Author:
  * Discord: `real_slacker`
@@ -84,11 +145,7 @@ const SwitchDB = {
         type: plugin._s3db.getDataTypes().DATE,
         allowNull: true
       },
-      scrambleLockdownExpiry: {
-        type: plugin._s3db.getDataTypes().DATE,
-        allowNull: true
-      },
-      // v2.3.0: Token bucket fields
+      // v2.6.0: Token bucket fields
       tokenBalance: {
         type: plugin._s3db.getDataTypes().INTEGER,
         allowNull: false,
@@ -98,20 +155,30 @@ const SwitchDB = {
         type: plugin._s3db.getDataTypes().DATE,
         allowNull: true
       },
-      // v2.3.0 Stage 2: Seed bonus token tracking
-      seedPresenceStart: {
-        type: plugin._s3db.getDataTypes().DATE,
-        allowNull: true
-      },
-      lastSeedBonusRoundID: {
-        type: plugin._s3db.getDataTypes().STRING,
-        allowNull: true
-      },
-      seedBonusTokensEarned: {
-        type: plugin._s3db.getDataTypes().INTEGER,
-        allowNull: false,
-        defaultValue: 0
-      },
+      // v2.6.0: four columns used to live here and now live on
+      // SwitchPlugin_PlayerServerState — scrambleLockdownExpiry above, and
+      // seedPresenceStart, lastSeedBonusRoundID and seedBonusTokensEarned
+      // here. A scramble happens on a server; a seed round is a server’s
+      // round and its matchId names that server’s round; the per-round bonus
+      // counter counts against it. None of the four can hold one answer for a
+      // community, which is what kept this table from going community-wide.
+      //
+      // They are gone from the MODEL, not from the TABLE, and the difference
+      // is deliberate. Dropping them needs the ALTER grant the live MySQL user
+      // does not have, and a DROP COLUMN is the one migration step a rollback
+      // cannot undo. Left in place they cost four unread columns; removed from
+      // the model they cost nothing and buy noise: a call site this split
+      // missed now throws on the where, the attributes list or the update
+      // rather than reading a value frozen at whatever the last single-server
+      // process wrote. Sequelize ignores table columns a model does not
+      // declare, and all four are writable-optional — three nullable and one
+      // NOT NULL DEFAULT 0 — so leaving every one of them unwritten forever
+      // breaks no constraint on any engine.
+      //
+      // Migrations v1 and v3, which created them, are untouched. A migration
+      // body describes what a database went through, not what the code wants
+      // now, and rewriting one that has already run on production is the worse
+      // trade — the same rule the TeamBalancerState default was left under.
       // v2.5.0: Last activity timestamp, the retention clock for cleanup().
       // Written on join (onS3PlayerJoined), on leave (onS3PlayerLeft) and on every
       // token spend — none of them gated on seed mode. The leave write is what makes
@@ -140,13 +207,95 @@ const SwitchDB = {
         allowNull: true
       }
       // Cooldowns expire on their own and are re-established by live play.
-    }, { timestamps: false, exportTier: 'ephemeral' });
+    }, {
+      timestamps: false,
+      exportTier: 'ephemeral',
+      // Community-wide, and deliberately so: a player who spends tokens on one
+      // server and finds a fresh bucket on another reads as a bug to an admin
+      // looking at one Discord. The four irreducibly per-server columns moved to
+      // SwitchPlugin_PlayerServerState rather than dragging this one per-server
+      // with them — see the note where they used to be declared.
+      scopeKind: 'global'
+    });
+
+    // The per-server half of the split. One row per player per server, and
+    // the whole reason SwitchPlugin_PlayerCooldowns could become
+    // community-wide: a token balance is a fact about a player, a scramble
+    // lock and a seed clock are facts about a player ON a server.
+    //
+    // Composite primary key, which makes findByPk() unavailable on this model
+    // — every read is findOne({ where: { serverID, eosID } }). That is not a
+    // wart to work around: it is the reason a site that forgets its server
+    // scope does not compile into a working query.
+    plugin.defineModel('SwitchPlugin_PlayerServerState', {
+      serverID: {
+        type: plugin._s3db.getDataTypes().INTEGER,
+        primaryKey: true,
+        allowNull: false
+      },
+      eosID: {
+        type: plugin._s3db.getDataTypes().STRING,
+        primaryKey: true,
+        allowNull: false
+      },
+      scrambleLockdownExpiry: {
+        type: plugin._s3db.getDataTypes().DATE,
+        allowNull: true
+      },
+      seedPresenceStart: {
+        type: plugin._s3db.getDataTypes().DATE,
+        allowNull: true
+      },
+      lastSeedBonusRoundID: {
+        type: plugin._s3db.getDataTypes().STRING,
+        allowNull: true
+      },
+      seedBonusTokensEarned: {
+        type: plugin._s3db.getDataTypes().INTEGER,
+        allowNull: false,
+        defaultValue: 0
+      },
+      // "Last seen on THIS server", which is a different fact from the
+      // community-wide column of the same name on PlayerCooldowns, and the
+      // reason this table can be pruned at all. A player can stay active on
+      // server A forever while never returning to server B; nothing in the
+      // global row’s lifecycle can express that, so the B-side row would
+      // otherwise be immortal.
+      //
+      // Nullable, and NOT declared as a notNull post-condition in the
+      // migration that creates it. The community-wide column of the same name
+      // carries exactly that declaration and its comment records the cost: a
+      // predicate re-checked on every mount turns any future row-creating path
+      // that forgets the column into a rollback-and-re-gate loop. Prove every
+      // creating path stamps it first; the predicate can follow later.
+      lastActiveTimestamp: {
+        type: plugin._s3db.getDataTypes().DATE,
+        allowNull: true
+      }
+    }, {
+      timestamps: false,
+      // Every column is either a countdown that expires on its own or a clock
+      // that the next round restarts. A lost row reads as "no lock, no seed
+      // progress" — the same thing an absent PlayerCooldowns row reads as.
+      exportTier: 'ephemeral',
+      // Composite key, so 'server-column' rather than 'server-key': what
+      // decides the kind is how a query narrows to one server, and a predicate
+      // on serverID is a predicate either way.
+      scopeKind: 'server-column'
+    });
 
     plugin.defineModel('SwitchPlugin_Endmatches', {
       id: {
         type: plugin._s3db.getDataTypes().INTEGER,
         primaryKey: true,
         autoIncrement: true
+      },
+      // Nullable through this phase. NOT NULL would reject the pre-upgrade
+      // rows the backfill leaves unattributed on purpose, and it would make
+      // an un-upgraded process’s INSERT fail outright.
+      serverID: {
+        type: plugin._s3db.getDataTypes().INTEGER,
+        allowNull: true
       },
       name: {
         type: plugin._s3db.getDataTypes().STRING
@@ -162,10 +311,36 @@ const SwitchDB = {
         defaultValue: plugin._s3db.getDataTypes().NOW
       }
       // End-of-match switch requests, consumed at the next round end.
-    }, { timestamps: false, exportTier: 'ephemeral' });
+    }, {
+      timestamps: false,
+      exportTier: 'ephemeral',
+      // A request to switch teams at the end of one server's current round.
+      scopeKind: 'server-column'
+    });
 
     // Settings key-value table for runtime toggles
     plugin.defineModel('SwitchPlugin_Settings', {
+      // Half of the primary key. The pre-rename table keyed on `key` alone,
+      // so two servers sharing a database had one timeLimitEnabled between
+      // them and one explainMessageId pointing at a message about whichever
+      // server wrote last — a toggle flipped on one server flipped on both.
+      serverID: {
+        type: plugin._s3db.getDataTypes().INTEGER,
+        primaryKey: true,
+        allowNull: false
+      },
+      // The column is called `key`, which is reserved in MySQL, and it stays
+      // called `key`. Every access here goes through Sequelize, which quotes
+      // identifiers unconditionally, so the name is safe as long as nothing
+      // writes raw SQL against it — and the migration below, which does, is
+      // careful to quote it. Renaming was considered and rejected: the column
+      // already exists and a rename turns a one-statement copy into a
+      // column-mapping migration for no behavioural gain.
+      //
+      // S3_Locks.lockKey is decided the other way and that is not an
+      // inconsistency. That table is new and raw SQL against it is the normal
+      // access path, so there the hazard is structural rather than incidental.
+      // Do not reconcile the two; one of them will break.
       key: {
         type: plugin._s3db.getDataTypes().STRING,
         primaryKey: true,
@@ -178,7 +353,21 @@ const SwitchDB = {
       // Operator-configured runtime toggles. NOT auto-recoverable — if lost, an
       // admin has to re-enter them by hand — so this is historical, unlike the
       // other two Switch tables.
-    }, { timestamps: false, freezeTableName: true, exportTier: 'historical' });
+    }, {
+      // The MODEL name stays SwitchPlugin_Settings; only the table moves.
+      // Keeping it stable is what lets a backup taken before this rename
+      // restore into the new table, because the export envelope is keyed by
+      // model name and the import loop resolves that name to whatever table
+      // the model currently declares.
+      tableName: 'SwitchPlugin_ServerSettings',
+      timestamps: false,
+      freezeTableName: true,
+      exportTier: 'historical',
+      // Runtime toggles are set per server — one server can have the time limit
+      // on while another has it off, and the explain message id points at a
+      // message about one server's rules.
+      scopeKind: 'server-column'
+    });
 
     // One row per completed round — the aggregate the round-summary embed
     // prints, kept as numbers instead of re-read out of Discord prose later.
@@ -198,6 +387,12 @@ const SwitchDB = {
       // and losing the layer label is not a reason to lose the counts.
       matchId: {
         type: plugin._s3db.getDataTypes().STRING,
+        allowNull: true
+      },
+      // Present from the CREATE rather than added later — see the v6
+      // migration below for why this table alone gets that.
+      serverID: {
+        type: plugin._s3db.getDataTypes().INTEGER,
         allowNull: true
       },
       layerName: {
@@ -271,12 +466,34 @@ const SwitchDB = {
         type: plugin._s3db.getDataTypes().INTEGER,
         allowNull: true
       }
-    }, { timestamps: false, exportTier: 'historical' });
+    }, {
+      timestamps: false,
+      exportTier: 'historical',
+      // One row per completed round, and rounds happen on a server.
+      scopeKind: 'server-column'
+    });
 
     // ── Migration Registration ─────────────────────────────────
 
-    plugin.registerExpectedVersion('switch', 6, {
-      models: ['SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_Endmatches', 'SwitchPlugin_Settings', 'SwitchPlugin_RoundStats']
+    // Indexed on eosID alone, which the composite primary key cannot serve:
+    // the key leads with serverID, and the cross-server questions this split
+    // creates — "does any server still hold a lock for this player" in
+    // cleanup(), "what does this player look like everywhere" in the admin
+    // commands — all arrive with an eosID and no server.
+    const playerServerStateIndexes = [
+      { name: 'SwitchPlugin_PlayerServerState_eosID', fields: ['eosID'] }
+    ];
+
+    // Named for their tables rather than idx_serverID: Postgres scopes index
+    // names to the schema, not the table, so every Class A table wanting an
+    // idx_serverID would be one name nine times.
+    const serverIdIndexes = {
+      SwitchPlugin_Endmatches: [{ name: 'SwitchPlugin_Endmatches_serverID', fields: ['serverID'] }],
+      SwitchPlugin_RoundStats: [{ name: 'SwitchPlugin_RoundStats_serverID', fields: ['serverID'] }]
+    };
+
+    plugin.registerExpectedVersion('switch', 9, {
+      models: ['SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_PlayerServerState', 'SwitchPlugin_Endmatches', 'SwitchPlugin_Settings', 'SwitchPlugin_RoundStats']
     });
     plugin.registerMigrations('switch', [
       {
@@ -302,6 +519,10 @@ const SwitchDB = {
           if (!(await qi.tableExists('SwitchPlugin_Endmatches'))) {
             await qi.createTable('SwitchPlugin_Endmatches', {
               id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+              // Baseline carries every column the current code expects, so a
+              // fresh install gets serverID from the CREATE and needs no
+              // ALTER. v8 guards on describeTable, so it no-ops here.
+              serverID: { type: qi.DataTypes.INTEGER, allowNull: true },
               name: { type: qi.DataTypes.STRING },
               steamID: { type: qi.DataTypes.STRING },
               eosID: { type: qi.DataTypes.STRING },
@@ -437,34 +658,54 @@ const SwitchDB = {
         // touches.rows enables the migration engine's post-commit verifier and
         // ongoing drift detection (on every mount) to confirm the row exists.
         //
-        // The up() uses model-based access (qi.db.getModel) rather than raw SQL
-        // or qi.bulkInsert because Sequelize handles dialect-correct identifier
-        // quoting (backticks for MySQL, double quotes for Postgres).
+        // This migration used to reach the table through its model, and it
+        // no longer can. v9 repoints the SwitchPlugin_Settings MODEL at the
+        // new SwitchPlugin_ServerSettings table, so on a fresh install
+        // `qi.db.getModel(...)` here would seed a table that v9 has not
+        // created yet — a migration reading through a key shape that a later
+        // migration in its own group changes. It is pinned to the table it
+        // was written against instead, by name, and stays that way forever:
+        // the row it seeds is what v9 copies across.
+        //
+        // `key` is quoted at every mention. Unquoted it parses on SQLite and
+        // Postgres and fails on MySQL alone with ER_PARSE_ERROR, which is the
+        // worst possible distribution — the suite would stay green and
+        // production would not.
         touches: {
           rows: {
             SwitchPlugin_Settings: [{ key: 'key', value: 'explainMessageId' }]
-          }
+          },
+          // No model points at this table any more — v9 moved the model to
+          // SwitchPlugin_ServerSettings, and the old table stayed because the
+          // deployed grant has no DROP. Without this declaration the backup
+          // coverage check reads that as an unmounted plugin and aborts every
+          // upgrade that has v4 pending, forever. Nothing is lost by not
+          // backing it up: this migration only inserts a row that is missing,
+          // and v9 has already copied what was there.
+          abandoned: ['SwitchPlugin_Settings']
         },
         up: async (qi) => {
           if (await qi.tableExists('SwitchPlugin_Settings')) {
-            const SettingsModel = qi.db.getModel('SwitchPlugin_Settings');
-            if (SettingsModel) {
-              const row = await SettingsModel.findByPk('explainMessageId', { transaction: qi.transaction });
-              if (!row) {
-                await SettingsModel.create(
-                  { key: 'explainMessageId', value: '' },
-                  { transaction: qi.transaction }
-                );
-              }
+            const q = (id) => qi.db.quoteIdentifier(id);
+            const rows = await qi.rawQuery(
+              `SELECT ${q('key')} FROM ${q('SwitchPlugin_Settings')} WHERE ${q('key')} = :key`,
+              { key: 'explainMessageId' }
+            );
+            if (!rows || rows.length === 0) {
+              await qi.rawQuery(
+                `INSERT INTO ${q('SwitchPlugin_Settings')} (${q('key')}, ${q('value')}) VALUES (:key, :value)`,
+                { key: 'explainMessageId', value: '' }
+              );
             }
           }
         },
         down: async (qi) => {
-          // Dialect-safe model access — avoids qi.bulkDelete which produces
-          // dialect-inconsistent WHERE clauses on some connectors.
-          const SettingsModel = qi.db.getModel('SwitchPlugin_Settings');
-          if (SettingsModel) {
-            await SettingsModel.destroy({ where: { key: 'explainMessageId' }, transaction: qi.transaction });
+          if (await qi.tableExists('SwitchPlugin_Settings')) {
+            const q = (id) => qi.db.quoteIdentifier(id);
+            await qi.rawQuery(
+              `DELETE FROM ${q('SwitchPlugin_Settings')} WHERE ${q('key')} = :key`,
+              { key: 'explainMessageId' }
+            );
           }
         }
       },
@@ -549,12 +790,28 @@ const SwitchDB = {
         // round, so a busy server writes a few thousand a year and the range
         // filter is a trivial scan on every engine the suite supports.
         touches: {
-          creates: ['SwitchPlugin_RoundStats']
+          creates: ['SwitchPlugin_RoundStats'],
+          // The ninth Class A declaration. The other eight arrive by
+          // ADD COLUMN and this one at CREATE, but verification re-checks a
+          // declared column on every mount regardless of how it got there,
+          // so leaving it undeclared would be the one table where a dropped
+          // or hand-rebuilt serverID goes unnoticed.
+          columns: { SwitchPlugin_RoundStats: ['serverID'] }
         },
         up: async (qi) => {
           if (!(await qi.tableExists('SwitchPlugin_RoundStats'))) {
             await qi.createTable('SwitchPlugin_RoundStats', {
               id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+              // The one Class A table that gets its serverID at CREATE rather
+              // than by a hand-applied ALTER, and the reason is that v6 has
+              // never been deployed: the newest production export records
+              // switch at v5 and contains no such table. Re-checked against
+              // S3_SchemaVersions in that export rather than inherited from
+              // the plan — if v6 had shipped, this would be a ninth ALTER.
+              // A table with no rows anywhere has no backfill and no
+              // compatibility surface, so this costs nothing and saves the
+              // one DDL step a grant without ALTER cannot take.
+              serverID: { type: qi.DataTypes.INTEGER, allowNull: true },
               matchId: { type: qi.DataTypes.STRING, allowNull: true },
               layerName: { type: qi.DataTypes.STRING, allowNull: true },
               gameMode: { type: qi.DataTypes.STRING, allowNull: true },
@@ -590,6 +847,145 @@ const SwitchDB = {
         down: async (qi) => {
           await qi.dropTable('SwitchPlugin_RoundStats');
         }
+      },
+      {
+        version: 7,
+        description: 'Create SwitchPlugin_PlayerServerState for per-server switch state',
+        // Creates only. The four columns it takes over are left standing on
+        // SwitchPlugin_PlayerCooldowns rather than dropped: DROP COLUMN needs
+        // the ALTER grant the live MySQL user does not have, and it is the one
+        // step down() could not put back.
+        //
+        // No touches.data on lastActiveTimestamp, deliberately, and v5 on the
+        // other table is why — a notNull post-condition is re-checked on every
+        // mount forever, so it is only safe once every creating path is proven
+        // to stamp the column. This migration adds a table with several new
+        // creating paths in the same release. The predicate can come later; a
+        // rollback-and-re-gate loop on a live server cannot be taken back.
+        //
+        // The index is not created here. Sequelize emits ALTER TABLE for
+        // addIndex on MySQL, so it goes in as a bare CREATE INDEX after the
+        // migration commits — see ensureIndexes() below.
+        touches: {
+          creates: ['SwitchPlugin_PlayerServerState']
+        },
+        up: async (qi) => {
+          if (!(await qi.tableExists('SwitchPlugin_PlayerServerState'))) {
+            await qi.createTable('SwitchPlugin_PlayerServerState', {
+              serverID: { type: qi.DataTypes.INTEGER, primaryKey: true, allowNull: false },
+              eosID: { type: qi.DataTypes.STRING, primaryKey: true, allowNull: false },
+              scrambleLockdownExpiry: { type: qi.DataTypes.DATE, allowNull: true },
+              seedPresenceStart: { type: qi.DataTypes.DATE, allowNull: true },
+              lastSeedBonusRoundID: { type: qi.DataTypes.STRING, allowNull: true },
+              seedBonusTokensEarned: { type: qi.DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+              lastActiveTimestamp: { type: qi.DataTypes.DATE, allowNull: true }
+            });
+          }
+        },
+        down: async (qi) => {
+          await qi.dropTable('SwitchPlugin_PlayerServerState');
+        }
+      },
+      {
+        version: 8,
+        description: 'Add serverID to SwitchPlugin_Endmatches for multi-server scoping',
+        // SwitchPlugin_RoundStats is NOT here. It gets its serverID inside
+        // v6's createTable because v6 has never been deployed — see the
+        // comment there. Endmatches has, so it needs the ALTER even though
+        // the production export records it at zero rows: the table exists,
+        // and a column is not optional just because nothing is in it.
+        //
+        // No touches.data { notNull }. Deferred until every write path is
+        // proven to stamp the column, because a data post-condition is
+        // re-checked on every mount forever and one unstamped insert puts
+        // Switch into a rollback-and-re-gate loop — the failure mode v5 on
+        // the other table documents at length.
+        touches: {
+          columns: { SwitchPlugin_Endmatches: ['serverID'] }
+        },
+        up: async (qi) => {
+          if (!(await qi.tableExists('SwitchPlugin_Endmatches'))) return;
+          const columns = await qi.describeTable('SwitchPlugin_Endmatches');
+          if (!columns.serverID) {
+            await qi.addColumn('SwitchPlugin_Endmatches', 'serverID', {
+              type: qi.DataTypes.INTEGER,
+              allowNull: true
+            });
+          }
+          // Outside the guard and matched on IS NULL, for the reason v5
+          // records: a hand-migrated database arrives here with the column
+          // present and every row NULL, and a guarded backfill is a silent
+          // no-op on exactly that database.
+          await plugin._s3db.backfillServerID(qi, 'SwitchPlugin_Endmatches', plugin._s3db?.getServerID?.() ?? null);
+        },
+        down: async (qi) => {
+          if (!(await qi.tableExists('SwitchPlugin_Endmatches'))) return;
+          const columns = await qi.describeTable('SwitchPlugin_Endmatches');
+          if (columns.serverID) await qi.removeColumn('SwitchPlugin_Endmatches', 'serverID');
+        }
+      },
+      {
+        version: 9,
+        description: 'Create SwitchPlugin_ServerSettings and copy this install\u2019s settings onto its own serverID',
+        // The two spellings sit three lines apart here, which is the trap
+        // this class of migration exists to fall into. registerExpectedVersion
+        // above keeps the MODEL name SwitchPlugin_Settings — unchanged, because
+        // the export envelope is keyed by model name — while `touches` names
+        // the new TABLE, because that is what is created.
+        //
+        // A primary key cannot be altered in place on either engine that
+        // matters: SQLite has no statement that reaches one, and the
+        // restricted MySQL grant has no ALTER. So this is a new table beside
+        // the old, and the old is abandoned rather than dropped — DROP is not
+        // on that grant either. `!s3 db orphans` lists what is left.
+        touches: {
+          creates: ['SwitchPlugin_ServerSettings'],
+          columns: {
+            SwitchPlugin_ServerSettings: ['serverID', 'key', 'value']
+          }
+        },
+        up: async (qi) => {
+          const q = (id) => qi.db.quoteIdentifier(id);
+
+          if (!(await qi.tableExists('SwitchPlugin_ServerSettings'))) {
+            await qi.createTable('SwitchPlugin_ServerSettings', {
+              serverID: { type: qi.DataTypes.INTEGER, primaryKey: true, allowNull: false },
+              key: { type: qi.DataTypes.STRING, primaryKey: true, allowNull: false },
+              value: { type: qi.DataTypes.STRING, allowNull: false }
+            });
+          }
+
+          // The only Class B table carrying data an admin would otherwise
+          // re-enter by hand: a time-limit toggle and the id of the explain
+          // message the plugin edits in place. Two rows in production, and
+          // both matter more than their size suggests — losing the second
+          // orphans a live Discord message the plugin can no longer find.
+          //
+          // Every identifier is quoted, and `key` above all. Unquoted, this
+          // statement parses on SQLite and Postgres and fails on MySQL alone
+          // with ER_PARSE_ERROR: the suite would be green and the one engine
+          // in production would be the one that broke.
+          //
+          // NOT EXISTS rather than a bare INSERT ... SELECT, so re-running
+          // the migration on a database that already took it copies nothing
+          // a second time and does not collide on (serverID, key). It also
+          // means an operator who has since changed a setting on the new
+          // table does not have the old value put back over it.
+          const serverID = plugin._s3db?.getServerID?.() ?? null;
+          if (serverID !== null && (await qi.tableExists('SwitchPlugin_Settings'))) {
+            await qi.rawQuery(
+              `INSERT INTO ${q('SwitchPlugin_ServerSettings')} (${q('serverID')}, ${q('key')}, ${q('value')}) ` +
+              `SELECT :serverID, ${q('old')}.${q('key')}, ${q('old')}.${q('value')} ` +
+              `FROM ${q('SwitchPlugin_Settings')} ${q('old')} ` +
+              `WHERE NOT EXISTS (SELECT 1 FROM ${q('SwitchPlugin_ServerSettings')} ${q('cur')} ` +
+              `WHERE ${q('cur')}.${q('serverID')} = :serverID AND ${q('cur')}.${q('key')} = ${q('old')}.${q('key')})`,
+              { serverID }
+            );
+          }
+        },
+        down: async (qi) => {
+          await qi.dropTable('SwitchPlugin_ServerSettings');
+        }
       }
     ]);
 
@@ -610,10 +1006,31 @@ const SwitchDB = {
       plugin.verbose(3, '[S3] Switch migrations not run this pass — schema current, awaiting confirmation, or DB unavailable.');
     }
 
+    // Self-healing, and outside the migration for the reason v7 records: a
+    // plain CREATE INDEX is safe under a CREATE-only grant, the migration
+    // engine's addIndex() is not. Runs on every mount after the migration
+    // transaction commits, so a database that took v7 before this line
+    // existed gets its index without a version bump. Non-fatal: a missing
+    // index costs query time, never correctness.
+    try {
+      await plugin._s3db.ensureIndexes('SwitchPlugin_PlayerServerState', playerServerStateIndexes);
+    } catch (err) {
+      plugin.verbose(1, `[S3] Could not ensure SwitchPlugin_PlayerServerState indexes: ${err.message}`);
+    }
+
+    for (const [table, decl] of Object.entries(serverIdIndexes)) {
+      try {
+        await plugin._s3db.ensureIndexes(table, decl);
+      } catch (err) {
+        plugin.verbose(1, `[S3] Could not ensure ${table} serverID index: ${err.message}`);
+      }
+    }
+
     // ── Attach Methods ─────────────────────────────────────────
 
     /**
-     * Loads the timeLimitEnabled setting from SwitchPlugin_Settings.
+     * Loads this server’s timeLimitEnabled setting from
+     * SwitchPlugin_ServerSettings.
      * Falls back to true (safe default) if the table, row, or DB is unavailable.
      */
     plugin._loadTimeLimitSetting = async function () {
@@ -624,7 +1041,12 @@ const SwitchDB = {
           plugin.timeLimitEnabled = true;
           return;
         }
-        const row = await Settings.findByPk('timeLimitEnabled');
+        // findOne, not findByPk: the key is (serverID, key) and findByPk
+        // takes one value. Unfixed it throws rather than returning a
+        // neighbour’s row, which is the better failure — but only if it is
+        // expected, and this call sits inside a catch that logs at level 1
+        // and falls back to the default.
+        const row = await Settings.findOne({ where: { serverID: plugin._serverID(), key: 'timeLimitEnabled' } });
         plugin.timeLimitEnabled = row ? row.value === 'true' : true;
         plugin.verbose(2, `[Switch] Time limit ${plugin.timeLimitEnabled ? 'enabled' : 'disabled'} (loaded from DB).`);
       } catch (err) {
@@ -644,7 +1066,7 @@ const SwitchDB = {
       }
       await plugin._withDb(async (t) => {
         await Settings.upsert(
-          { key: 'timeLimitEnabled', value: String(enabled) },
+          { serverID: plugin._serverID(), key: 'timeLimitEnabled', value: String(enabled) },
           { transaction: t }
         );
       });
@@ -669,7 +1091,7 @@ const SwitchDB = {
           plugin._cachedExplainMessageData = null;
           return;
         }
-        const row = await Settings.findByPk('explainMessageId');
+        const row = await Settings.findOne({ where: { serverID: plugin._serverID(), key: 'explainMessageId' } });
         if (row && row.value) {
           try {
             const parsed = JSON.parse(row.value);
@@ -710,7 +1132,7 @@ const SwitchDB = {
       const value = JSON.stringify({ channelID, messageIDs });
       await plugin._withDb(async (t) => {
         await Settings.upsert(
-          { key: 'explainMessageId', value },
+          { serverID: plugin._serverID(), key: 'explainMessageId', value },
           { transaction: t }
         );
       });
@@ -855,6 +1277,19 @@ const SwitchDB = {
       // doing even for an operator who has pruning switched off entirely.
       await plugin.normalizeRegeneratedTokens();
 
+      // The prune is a deletion predicate against a table the community shares,
+      // so it refuses while the servers disagree about how long a row lives.
+      // Unlike the token cap above there is no value that is obviously right to
+      // resolve to: a retention window is policy, not a safety limit, and the
+      // shortest one configured anywhere would silently become the one everybody
+      // gets. Refusing costs only housekeeping — rows are kept, not lost — which
+      // is what makes refusal affordable here and not on the switch path.
+      const refusal = plugin.communityOptionRefusal('pruneInactivePlayerDays');
+      if (refusal) {
+        plugin.verbose(1, `[Cleanup] Prune declined — ${refusal}. Nothing was deleted.`);
+        return;
+      }
+
       const retentionDays = plugin.options.pruneInactivePlayerDays ?? 0;
       if (retentionDays <= 0) {
         plugin.verbose(2, '[Cleanup] Skipped — pruneInactivePlayerDays is 0 (pruning disabled).');
@@ -885,16 +1320,62 @@ const SwitchDB = {
         return;
       }
 
+      const ServerState = plugin._getServerStateModel();
+
       try {
         await plugin._withDb(async (t) => {
-          const where = {
-            [Op.and]: [
-              {
+          // Two of this predicate’s conjuncts used to read columns that have
+          // moved: a live scramble lock protected a row from deletion, and
+          // "the row carries nothing" meant no seed state. Both are now facts
+          // about a set of per-server rows rather than about the row being
+          // deleted, so they arrive as eosID exclusions instead of as column
+          // predicates on the row itself.
+          //
+          // This read is deliberately NOT scoped to this server. A player who
+          // is lockdown-protected on server B must keep their community-wide
+          // token balance when server A prunes; scoping it here would delete
+          // the shared row out from under a lock this process cannot see. That
+          // is the silent, irreversible failure this rework exists to stop, and
+          // it is invisible to any fixture with one server in it.
+          let protectedEosIDs = [];
+          let seedStatefulEosIDs = [];
+          if (ServerState) {
+            const held = await ServerState.findAll({
+              where: {
                 [Op.or]: [
-                  { scrambleLockdownExpiry: null },
-                  { scrambleLockdownExpiry: { [Op.lt]: now } }
+                  { scrambleLockdownExpiry: { [Op.gte]: now } },
+                  { seedPresenceStart: { [Op.ne]: null } },
+                  { seedBonusTokensEarned: { [Op.ne]: 0 } }
                 ]
               },
+              attributes: ['eosID', 'scrambleLockdownExpiry', 'seedPresenceStart', 'seedBonusTokensEarned'],
+              transaction: t
+            });
+            protectedEosIDs = [...new Set(held
+              .filter((r) => r.scrambleLockdownExpiry != null
+                && new Date(r.scrambleLockdownExpiry).getTime() >= now.getTime())
+              .map((r) => r.eosID))];
+            seedStatefulEosIDs = [...new Set(held
+              .filter((r) => r.seedPresenceStart != null || (r.seedBonusTokensEarned ?? 0) !== 0)
+              .map((r) => r.eosID))];
+          }
+
+          // Tier 1 is "the row carries nothing". Its seed half is now an
+          // exclusion, and it is appended only when the exclusion set is
+          // non-empty: Sequelize renders an empty Op.notIn as `NOT IN (NULL)`,
+          // which is UNKNOWN for every row on all three engines and would
+          // silently disable tier 1 entirely on the common case of nobody
+          // holding seed state anywhere.
+          const tierOne = {
+            tokenBalance: maxTokens,
+            lastActiveTimestamp: { [Op.lt]: emptyRowCutoff }
+          };
+          if (seedStatefulEosIDs.length > 0) {
+            tierOne.eosID = { [Op.notIn]: seedStatefulEosIDs };
+          }
+
+          const where = {
+            [Op.and]: [
               // NULL is spelled out rather than left to three-valued logic —
               // `lastActiveTimestamp < cutoff` is UNKNOWN against NULL and would
               // silently exclude the row anyway, but stating it keeps the intent
@@ -902,13 +1383,7 @@ const SwitchDB = {
               { lastActiveTimestamp: { [Op.ne]: null } },
               {
                 [Op.or]: [
-                  {
-                    // Tier 1: the row carries nothing
-                    tokenBalance: maxTokens,
-                    seedPresenceStart: null,
-                    seedBonusTokensEarned: 0,
-                    lastActiveTimestamp: { [Op.lt]: emptyRowCutoff }
-                  },
+                  tierOne,
                   {
                     // Tier 2: abandoned, whatever it holds
                     lastActiveTimestamp: { [Op.lt]: staleCutoff }
@@ -918,21 +1393,124 @@ const SwitchDB = {
             ]
           };
 
+          // Applies to both tiers, exactly as the column predicate it replaces
+          // did: an abandoned row still holding a live lock somewhere is kept.
+          if (protectedEosIDs.length > 0) {
+            where[Op.and].push({ eosID: { [Op.notIn]: protectedEosIDs } });
+          }
           if (connectedEosIDs.length > 0) {
             where[Op.and].push({ eosID: { [Op.notIn]: connectedEosIDs } });
           }
 
-          const deleted = await PlayerCooldowns.destroy({ where, transaction: t });
+          // Resolved to a list first rather than trusting destroy()’s count.
+          // The per-server rows have to go with the global one, and destroy()
+          // does not say which rows it took — so the alternative is a second
+          // DELETE carrying its own copy of this predicate, which is two
+          // spellings of one rule on a path whose failure mode is silent
+          // deletion of the wrong player.
+          const doomed = await PlayerCooldowns.findAll({
+            where, attributes: ['eosID'], raw: true, transaction: t
+          });
+          const doomedEosIDs = doomed.map((r) => r.eosID);
+          if (doomedEosIDs.length === 0) return;
+
+          const deleted = await PlayerCooldowns.destroy({
+            where: { eosID: { [Op.in]: doomedEosIDs } }, transaction: t
+          });
+
+          // Every server’s rows, not this server’s. The community-wide row is
+          // gone; a surviving per-server row is state for a player nobody
+          // tracks any more, and the next process to read it would resurrect a
+          // lock or a seed clock with no wallet behind it.
+          let sideDeleted = 0;
+          if (ServerState) {
+            sideDeleted = await ServerState.destroy({
+              where: { eosID: { [Op.in]: doomedEosIDs } }, transaction: t
+            });
+          }
+
           if (deleted > 0) {
             // Logged at verbose(1) deliberately: the first pass after the v5
             // backfill prunes the entire long tail at once and looks alarming
             // without a number attached to it.
-            plugin.verbose(1, `[Cleanup] Pruned ${deleted} cooldown rows (empty >30m, or unseen >${retentionDays}d).`);
+            plugin.verbose(1, `[Cleanup] Pruned ${deleted} cooldown rows and ${sideDeleted} per-server rows (empty >30m, or unseen >${retentionDays}d).`);
           }
         });
       } catch (err) {
         plugin.verbose(1, `Cleanup error: ${err.message}`);
       }
+
+      await plugin._pruneServerState({
+        now, emptyRowCutoff, staleCutoff, connectedEosIDs, retentionDays
+      });
+    };
+
+    /**
+     * The per-server table's own prune, on the same two clocks as cleanup().
+     *
+     * Not reachable from the global row’s lifecycle, which is why it exists.
+     * A player who plays server A every day keeps their community-wide row
+     * alive forever, and their server B row — untouched since whenever they
+     * last played there — rides along with it. Only a prune that asks "when
+     * was this player last seen HERE" can ever retire it.
+     *
+     * Scoped to this server. Another server’s rows are that server’s to
+     * retire, against its own roster: this process cannot tell whether a
+     * player it is about to prune is standing on server B right now.
+     *
+     * Called only from cleanup(), after it, and therefore behind the same
+     * seed-mode skip, the same community-option refusal and the same
+     * retention-disabled guard. A retention window is policy and it is the
+     * community’s, not this table’s.
+     *
+     * @returns {Promise<number>} rows deleted
+     */
+    plugin._pruneServerState = async function ({ now, emptyRowCutoff, staleCutoff, connectedEosIDs, retentionDays }) {
+      const ServerState = plugin._getServerStateModel();
+      if (!ServerState) return 0;
+
+      const serverID = plugin._serverID();
+      let deleted = 0;
+      try {
+        await plugin._withDb(async (t) => {
+          const where = {
+            [Op.and]: [
+              { serverID },
+              {
+                [Op.or]: [
+                  { scrambleLockdownExpiry: null },
+                  { scrambleLockdownExpiry: { [Op.lt]: now } }
+                ]
+              },
+              { lastActiveTimestamp: { [Op.ne]: null } },
+              {
+                [Op.or]: [
+                  {
+                    // Tier 1: the row carries nothing for this server
+                    seedPresenceStart: null,
+                    seedBonusTokensEarned: 0,
+                    lastActiveTimestamp: { [Op.lt]: emptyRowCutoff }
+                  },
+                  {
+                    // Tier 2: not seen here in the retention window
+                    lastActiveTimestamp: { [Op.lt]: staleCutoff }
+                  }
+                ]
+              }
+            ]
+          };
+          if (connectedEosIDs.length > 0) {
+            where[Op.and].push({ eosID: { [Op.notIn]: connectedEosIDs } });
+          }
+          deleted = await ServerState.destroy({ where, transaction: t });
+        });
+        if (deleted > 0) {
+          plugin.verbose(1, `[Cleanup] Pruned ${deleted} per-server state rows on server ${serverID} (empty >30m, or unseen here >${retentionDays}d).`);
+        }
+      } catch (err) {
+        plugin.verbose(1, `[Cleanup] Per-server state prune failed: ${err.message}`);
+      }
+      return deleted;
     };
 
     /**
@@ -947,14 +1525,46 @@ const SwitchDB = {
      * always have. Op.iLike cannot simply be used unconditionally — it is a
      * syntax error on both other engines.
      *
+     * Returns a plain object, not a model instance, because after the split
+     * one player is two rows: the community-wide wallet and this server’s
+     * lock and seed clock. Every caller only reads fields off it — none save
+     * through it — so merging is honest where handing back an instance with
+     * four extra properties bolted on would not be. `_serverScoped` names the
+     * half that is this server only, so a reply can say which is which
+     * instead of presenting a community fact and a local one as one row.
+     *
      * @param {string} ident — eosID or partial player name
      * @returns {object|null|string} record, null if not found, 'multiple' if ambiguous
      */
     plugin.checkPlayer = async function (ident) {
       const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
       if (!PlayerCooldowns) return null;
-      let record = await PlayerCooldowns.findByPk(ident);
-      if (record) return record;
+
+      const ServerState = plugin._getServerStateModel();
+      const serverID = plugin._serverID();
+
+      // Read through the model rather than raw: SQLite hands back DATE
+      // columns as strings under `raw: true`, and two of the callers compare
+      // scrambleLockdownExpiry against a Date with `>`.
+      const merge = async (row) => {
+        const base = row.get({ plain: true });
+        let side = null;
+        if (ServerState) {
+          side = await ServerState.findOne({ where: { serverID, eosID: base.eosID } });
+        }
+        return {
+          ...base,
+          scrambleLockdownExpiry: side?.scrambleLockdownExpiry ?? null,
+          seedPresenceStart: side?.seedPresenceStart ?? null,
+          lastSeedBonusRoundID: side?.lastSeedBonusRoundID ?? null,
+          seedBonusTokensEarned: side?.seedBonusTokensEarned ?? 0,
+          _serverID: serverID,
+          _serverScoped: ['scrambleLockdownExpiry', 'seedPresenceStart', 'lastSeedBonusRoundID', 'seedBonusTokensEarned']
+        };
+      };
+
+      const record = await PlayerCooldowns.findByPk(ident);
+      if (record) return merge(record);
 
       const likeOp = plugin._s3db?.caseInsensitiveLikeOp?.() || Op.like;
       const records = await PlayerCooldowns.findAll({
@@ -965,7 +1575,7 @@ const SwitchDB = {
 
       if (records.length === 0) return null;
       if (records.length > 1) return 'multiple';
-      return records[0];
+      return merge(records[0]);
     };
 
     /**
@@ -1006,9 +1616,29 @@ const SwitchDB = {
       const rows = await PlayerCooldowns.findAll({
         attributes: [
           'eosID', 'steamID', 'playerName', 'tokenBalance', 'tokenRegenAnchor',
-          'scrambleLockdownExpiry', 'seedPresenceStart', 'lastActiveTimestamp'
+          'lastActiveTimestamp'
         ]
       });
+
+      // The lock and the seed clock are this server’s answer, so the second
+      // read is scoped and the numbers below stay the ones an admin standing
+      // on this server would expect. Token counts are not scoped and cannot
+      // be: there is one wallet, and it is the community’s.
+      //
+      // Joined in JS rather than through an association. The tables have no
+      // declared relation — SwitchPlugin_PlayerServerState is keyed
+      // (serverID, eosID) and the join would need a literal on one side — and
+      // this function already loads the whole cooldown table by design, for
+      // the reason its docblock gives. A second bounded read costs one query.
+      const ServerState = plugin._getServerStateModel();
+      const serverStateByEosID = new Map();
+      if (ServerState) {
+        const stateRows = await ServerState.findAll({
+          where: { serverID: plugin._serverID() },
+          attributes: ['eosID', 'scrambleLockdownExpiry', 'seedPresenceStart']
+        });
+        for (const s of stateRows) serverStateByEosID.set(s.eosID, s);
+      }
 
       // Seed accrual is only real for someone who is on the server — the clock
       // is compared against NOW, so an offline row's "accruing" is fiction.
@@ -1028,14 +1658,15 @@ const SwitchDB = {
         const live = { tokenBalance: r.tokenBalance, tokenRegenAnchor: r.tokenRegenAnchor };
         plugin._regenTokens(live);
 
-        const lockExpiry = r.scrambleLockdownExpiry ? new Date(r.scrambleLockdownExpiry) : null;
+        const side = serverStateByEosID.get(r.eosID) || null;
+        const lockExpiry = side?.scrambleLockdownExpiry ? new Date(side.scrambleLockdownExpiry) : null;
         const lockActive = lockExpiry != null && lockExpiry.getTime() > now.getTime();
         const noTokens = live.tokenBalance < 1;
 
         if (lockActive) scrambleLocked++;
         if (noTokens) outOfTokens++;
         if (live.tokenBalance < maxTokens) belowCap++;
-        if (r.seedPresenceStart && connected.has(r.eosID) && live.tokenBalance < ceiling) seedAccruing++;
+        if (side?.seedPresenceStart && connected.has(r.eosID) && live.tokenBalance < ceiling) seedAccruing++;
 
         if (lockActive || noTokens) {
           blocked.push({
@@ -1125,6 +1756,8 @@ const SwitchDB = {
       const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
       if (!PlayerCooldowns) throw new Error('SwitchPlugin_PlayerCooldowns model not available — DB may not be ready.');
 
+      const ServerState = plugin._getServerStateModel();
+      const serverID = plugin._serverID();
       const maxTokens = plugin.options.maxSwitchTokens;
       let summary = null;
 
@@ -1137,7 +1770,6 @@ const SwitchDB = {
 
         const before = row.tokenBalance != null ? row.tokenBalance : maxTokens;
         const after = Math.max(before, maxTokens);
-        const lockCleared = row.scrambleLockdownExpiry != null;
 
         await PlayerCooldowns.update(
           {
@@ -1145,13 +1777,29 @@ const SwitchDB = {
             // null, not now(): no regen cycle is running at or above the cap, and
             // _regenTokens() re-anchors in memory the moment it reads the row.
             tokenRegenAnchor: null,
-            scrambleLockdownExpiry: null,
             lastActiveTimestamp: new Date()
           },
           { where: { eosID }, transaction: t }
         );
 
-        summary = { tokensBefore: before, tokensAfter: after, lockCleared };
+        // The lock is this server’s, and clearing it here rather than
+        // everywhere is the point: an admin lifting a restriction on their own
+        // server has not been asked about anyone else’s scramble. Same
+        // transaction, explicit handle — no CLS in this repo, so an omitted
+        // one runs outside and the surrounding rollback would not take it back.
+        let lockCleared = false;
+        if (ServerState) {
+          const side = await ServerState.findOne({ where: { serverID, eosID }, transaction: t });
+          lockCleared = side?.scrambleLockdownExpiry != null;
+          if (lockCleared) {
+            await ServerState.update(
+              { scrambleLockdownExpiry: null, lastActiveTimestamp: new Date() },
+              { where: { serverID, eosID }, transaction: t }
+            );
+          }
+        }
+
+        summary = { tokensBefore: before, tokensAfter: after, lockCleared, serverID };
       });
 
       // Without this a stale joinTime keeps gating !switch even with a full
@@ -1167,24 +1815,40 @@ const SwitchDB = {
     };
 
     /**
-     * Lifts switch restrictions for every tracked player, server-wide.
+     * Lifts switch restrictions for every tracked player.
+     *
+     * Two halves of different widths since the split, and the caller has to
+     * say so: the top-up writes a table the whole community shares, while the
+     * lock clear is this server’s rows only. An admin who lifts restrictions
+     * here has handed every server’s players their tokens back, which is not
+     * what "server-wide" used to mean and is not optional — there is one
+     * wallet per player and it has no server in it.
      *
      * Deliberately two statements rather than one. A single UPDATE setting
      * tokenBalance = maxTokens would lower every seed-bonus holder to the
      * ordinary cap — the exact bug this release fixes. Splitting on the cap
-     * lets rows above it keep their surplus while still losing their lock.
+     * lets rows above it keep their surplus.
      *
      * SQL GREATEST() would express it in one statement, but SQLite spells that
      * MAX(a, b) while MySQL and Postgres spell it GREATEST(a, b), so a single
      * statement would need raw dialect-specific SQL. Two ORM updates are worth
      * more than one clever one here.
      *
-     * @returns {Promise<{toppedUp: number, locksCleared: number}>}
+     * The lock statement no longer partitions on the token balance. It used
+     * to, only so the two statements could not both fire on one row; they are
+     * on different tables now and cannot collide, so every lock on this server
+     * is cleared whatever the wallet says. That also retires a silent-failure
+     * mode the old partition carried — a NULL balance matched neither arm and
+     * kept its lock through a `clearall` that reported success.
+     *
+     * @returns {Promise<{toppedUp: number, locksCleared: number, serverID: number}>}
      */
     plugin.adminClearAllRestrictions = async function () {
       const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
       if (!PlayerCooldowns) throw new Error('SwitchPlugin_PlayerCooldowns model not available — DB may not be ready.');
 
+      const ServerState = plugin._getServerStateModel();
+      const serverID = plugin._serverID();
       const maxTokens = plugin.options.maxSwitchTokens;
       let toppedUp = 0;
       let locksCleared = 0;
@@ -1205,8 +1869,7 @@ const SwitchDB = {
         const [belowCount] = await PlayerCooldowns.update(
           {
             tokenBalance: maxTokens,
-            tokenRegenAnchor: null,
-            scrambleLockdownExpiry: null
+            tokenRegenAnchor: null
           },
           {
             where: {
@@ -1220,22 +1883,24 @@ const SwitchDB = {
         );
         toppedUp = belowCount;
 
-        // At or above the cap: drop the lock only, leaving any seed surplus intact.
-        const [lockCount] = await PlayerCooldowns.update(
-          { scrambleLockdownExpiry: null },
-          {
-            where: {
-              tokenBalance: { [Op.gte]: maxTokens },
-              scrambleLockdownExpiry: { [Op.ne]: null }
-            },
-            transaction: t
-          }
-        );
-        locksCleared = lockCount;
+        // This server’s locks, unconditionally — see the docblock.
+        if (ServerState) {
+          const [lockCount] = await ServerState.update(
+            { scrambleLockdownExpiry: null },
+            {
+              where: {
+                serverID,
+                scrambleLockdownExpiry: { [Op.ne]: null }
+              },
+              transaction: t
+            }
+          );
+          locksCleared = lockCount;
+        }
       });
 
-      plugin.verbose(1, `[Admin] Cleared restrictions: ${toppedUp} players topped up to ${maxTokens}, ${locksCleared} scramble locks lifted.`);
-      return { toppedUp, locksCleared };
+      plugin.verbose(1, `[Admin] Cleared restrictions: ${toppedUp} players topped up to ${maxTokens} community-wide, ${locksCleared} scramble locks lifted on server ${serverID}.`);
+      return { toppedUp, locksCleared, serverID };
     };
 
     /**
@@ -1254,13 +1919,22 @@ const SwitchDB = {
       const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
       if (!PlayerCooldowns) throw new Error('SwitchPlugin_PlayerCooldowns model not available — DB may not be ready.');
 
+      const ServerState = plugin._getServerStateModel();
       let deleted = 0;
+      let stateDeleted = 0;
       await adminTx(async (t) => {
         deleted = await PlayerCooldowns.destroy({ where: {}, transaction: t });
+        // Every server’s rows, not this server’s. Leaving another server’s
+        // locks standing after their wallets are gone is not a partial wipe,
+        // it is a lock with nothing behind it — and the caller has already
+        // named every registered server in its confirmation.
+        if (ServerState) {
+          stateDeleted = await ServerState.destroy({ where: {}, transaction: t });
+        }
       });
 
-      plugin.verbose(1, `[Admin] Wiped ${deleted} cooldown rows.`);
-      return deleted;
+      plugin.verbose(1, `[Admin] Wiped ${deleted} cooldown rows and ${stateDeleted} per-server state rows.`);
+      return { deleted, stateDeleted };
     };
 
 
@@ -1281,7 +1955,9 @@ const SwitchDB = {
       const RoundStats = plugin._getModel('SwitchPlugin_RoundStats');
       if (!RoundStats || !row) return false;
       const written = await plugin._withDb(async (t) => {
-        await RoundStats.create(row, { transaction: t });
+        // Spread last: _computeRoundStatsRow() builds an aggregate, and which
+        // server produced it is not part of that computation.
+        await RoundStats.create({ ...row, serverID: plugin._serverID() }, { transaction: t });
         return true;
       });
       return written === true;
@@ -1302,6 +1978,12 @@ const SwitchDB = {
      * absurd window gets the most recent MAX_ROWS rounds rather than an
      * out-of-memory crash, and truncated is set so the embed can say so.
      *
+     * This server's rounds only. The table is server-column scoped and the
+     * insert stamps it, so an unscoped read here would sum two servers'
+     * rounds into one total and the embed would render it without a hint
+     * that it had — the numbers stay plausible, which is what makes it
+     * worth a predicate rather than a note.
+     *
      * @param {Date} fromDate — inclusive lower bound on roundEndedAt
      * @param {Date} [toDate] — inclusive upper bound; defaults to now
      * @returns {Promise<object|null>} totals, or null if the DB is unavailable
@@ -1312,7 +1994,10 @@ const SwitchDB = {
 
       const MAX_ROWS = 20000;
       const rows = await plugin._withDb(async (t) => RoundStats.findAll({
-        where: { roundEndedAt: { [Op.between]: [fromDate, toDate || new Date()] } },
+        where: {
+          serverID: plugin._serverID(),
+          roundEndedAt: { [Op.between]: [fromDate, toDate || new Date()] }
+        },
         order: [['roundEndedAt', 'DESC']],
         limit: MAX_ROWS,
         transaction: t
@@ -1386,13 +2071,19 @@ const SwitchDB = {
      * same round. Refusing to scrape anything at or after this point is what
      * keeps the overlap from being counted twice.
      *
+     * Scoped, and it decides what gets written rather than what gets shown.
+     * The stop line belongs to this server's own live recording: reading the
+     * neighbour's earliest row would move it, and a backfill that stops too
+     * early leaves a gap nothing fills, while one that stops too late
+     * double-counts rounds the dedupe cannot match.
+     *
      * @returns {Promise<Date|null>} null when nothing was recorded live yet
      */
     plugin.getEarliestLiveRoundStat = async function () {
       const RoundStats = plugin._getModel('SwitchPlugin_RoundStats');
       if (!RoundStats) return null;
       const row = await plugin._withDb(async (t) => RoundStats.findOne({
-        where: { source: 'live' },
+        where: { serverID: plugin._serverID(), source: 'live' },
         order: [['roundEndedAt', 'ASC']],
         attributes: ['roundEndedAt'],
         transaction: t
@@ -1426,9 +2117,16 @@ const SwitchDB = {
       const lo = new Date(Math.min(...times) - 1000);
       const hi = new Date(Math.max(...times) + 1000);
 
+      const serverID = plugin._serverID();
       const result = await plugin._withDb(async (t) => {
+        // The dedupe read is scoped as well as the insert, and it has to be:
+        // rounds on two servers end seconds apart all the time, and an
+        // unscoped probe would read the other server's row, call this round a
+        // duplicate, and drop it. That is a write bug wearing a read’s
+        // clothing, which is why it is fixed here rather than deferred to the
+        // read-path pass.
         const existing = await RoundStats.findAll({
-          where: { roundEndedAt: { [Op.between]: [lo, hi] } },
+          where: { serverID, roundEndedAt: { [Op.between]: [lo, hi] } },
           attributes: ['roundEndedAt'],
           transaction: t
         });
@@ -1438,7 +2136,7 @@ const SwitchDB = {
           seen.add(sec - 1); seen.add(sec); seen.add(sec + 1);
         }
         const fresh = rows.filter((r) => !seen.has(Math.floor(new Date(r.roundEndedAt).getTime() / 1000)));
-        if (fresh.length) await RoundStats.bulkCreate(fresh, { transaction: t });
+        if (fresh.length) await RoundStats.bulkCreate(fresh.map((r) => ({ ...r, serverID })), { transaction: t });
         return { inserted: fresh.length, skipped: rows.length - fresh.length };
       });
 

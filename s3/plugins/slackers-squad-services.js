@@ -43,6 +43,7 @@
  *     get clans()                 — Returns this.services.clans.
  *     get players()               — Returns this.services.players.
  *     get logging()               — Returns this.services.logging.
+ *     get serverID()              — Returns the id stamped onto server-scoped rows.
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
@@ -112,6 +113,25 @@
  *   direct access.
  * - Flat getters are backed by this.services — they return null
  *   before prepareToMount() runs and valid instances afterward.
+ * - Server identity is resolved in prepareToMount(), BEFORE any
+ *   service is constructed, because the id is part of what several of
+ *   them write and cannot be settled afterwards. The refusal still
+ *   happens in mount(): an unusable id is recorded here and stops the
+ *   mount there, so a bad configuration fails in one legible place
+ *   rather than as a null appearing in rows.
+ * - With no id configured, resolveServerID() falls back and says so
+ *   at verbose level 1. That fallback is safe for one server and is
+ *   the single most dangerous thing to ignore before pointing a
+ *   second one at the same database: two servers both falling back
+ *   share one identity and interleave their rows.
+ * - The registry row is claimed at mount through registerServer(),
+ *   kept alive by a heartbeat, and reported by !s3 servers. A claim
+ *   on an id another LIVE process holds writes nothing and refuses,
+ *   rather than overwriting a running server's registration.
+ * - Everything about scope, locking, clocks and version lockstep
+ *   lives in DBService — see its SERVER IDENTITY AND SCOPE header.
+ *   This plugin owns the identity decision and the mount refusal;
+ *   it does not own the rules.
  *
  * ─── COMMANDS ────────────────────────────────────────────────────
  *
@@ -125,15 +145,21 @@
  *   !s3 players              → Full player list with teamID, clan tag, locks.
  *   !s3 clans                → Detected clan groups.
  *   !s3 locks                → Global lock + per-player locks + priority table.
+ *   !s3 servers              → The server registry: who else writes to this database, with
+ *                              each row’s suite version, clock skew and community options.
+ *   !s3 servers alias ...    → Rename a registered server.
+ *   !s3 servers forget ...   → Deregister one that has stopped heartbeating.
  *   !s3 config               → Server config values.
  *   !s3 switches [ident] [range]  → Team-switch leaderboard, or one player's breakdown by source.
  *   !s3 switches export [range] [period] [--json]  → All-players switch/round counts per period, as a file attachment.
  *   !s3 karma <ident> [range]     → Win-rate of a player's own switches (excludes balancer/SmartAssign) vs. round outcome.
  *   !s3 db status            → Connector type, schema version status per plugin.
+ *   !s3 db orphans           → Tables in the database that no live model claims —
+ *                              what a rename or a removed plugin left behind.
  *   !s3 db export [--logs|--all] [--to-file]  → Export tables as JSON.
  *   !s3 db import [--confirm] [--dry-run]       → Import from backup.
  *   !s3 diag                 → Consolidated read-only health check.
- *   !s3 migrate <pending|status|force [--dry-run]|preview|verify|purge-deprecated>  → Schema migration management.
+ *   !s3 migrate <pending|status|force [--dry-run]|preview|ddl [plugin]|verify|purge-deprecated>  → Schema migration management.
  *   !s3 confirm <token>                 → Confirm and run pending migrations from startup prompt.
  *   !s3 backup <create|list|restore <filename>>  → Database backup management.
  *   !s3 help                 → Command reference.
@@ -156,9 +182,34 @@ import ServerConfigService from '../utils/server-config-service.js';
 import LoggingService from '../utils/logging-service.js';
 import crypto from 'node:crypto';
 import { registerS3DiscordCommands } from '../utils/s3-discord.js';
-import { configureStderrDiagnostics, flushStderrDiagnostics, stderrError } from '../utils/s3-stderr.js';
+import { configureStderrDiagnostics, flushStderrDiagnostics, stderrError, stderrWarn } from '../utils/s3-stderr.js';
+import { MIGRATION_LOCK_UNAVAILABLE } from '../utils/migration-engine.js';
+import { serverLabels, publishServerLabel } from '../utils/s3-server-label.js';
 import { buildMigrationEmbed } from '../utils/s3-migration-discord.js';
 import { localize as lookupMessage, DEFAULT_LANGUAGE } from '../utils/s3-i18n.js';
+
+/**
+ * How often the registry heartbeat may stamp, at most.
+ *
+ * UPDATED_PLAYER_INFORMATION fires about every thirty seconds on the deployed
+ * fork, and the throttle exists so that a server configured to poll harder
+ * does not turn a liveness signal into a write loop. It has to stay well
+ * inside SERVER_FRESHNESS_MS (two minutes) or a live server reads as stale
+ * between its own beats — the ratio, not either number alone, is what makes
+ * the freshness window mean anything.
+ */
+const S3_HEARTBEAT_INTERVAL_MS = 45 * 1000;
+
+/**
+ * How often expired lock rows are cleared.
+ *
+ * Nothing depends on this being prompt. An expired row blocks nobody: the
+ * migration path steals a row whose TTL has passed, and a Discord message key
+ * is a snowflake that is never contended twice. This is housekeeping so the
+ * table does not accumulate a day of admin traffic, and five minutes is
+ * frequent enough for that and infrequent enough to be invisible.
+ */
+const S3_LOCK_REAP_INTERVAL_MS = 5 * 60 * 1000;
 export default class SlackersSquadServices extends BasePlugin {
   static get description() {
     return "Shared Slacker's Squad Services plugin wiring gameState, factions, clans, db, and players modules.";
@@ -168,7 +219,7 @@ export default class SlackersSquadServices extends BasePlugin {
     return false;
   }
 
-  static get version() { return '1.7.0'; }
+  static get version() { return '1.8.0'; }
 
   static get optionsSpecification() {
     return {
@@ -178,6 +229,26 @@ export default class SlackersSquadServices extends BasePlugin {
         required: false,
         description: 'Language for all S³ plugin messages. Available: en, pt. Unknown codes fall back to en with a warning.',
         default: 'en'
+      },
+      // Escape hatch for two installs that both ship `"id": 1`. Changing the
+      // SquadJS-side id is the better fix where it is available, but it
+      // renumbers rows other plugins have already written, so this overrides
+      // the id for S³ alone. Mirrors db-log's option of the same name.
+      overrideServerID: {
+        required: false,
+        description: 'An overridden server ID, for multi-server setups sharing one database.',
+        default: null
+      },
+      forceServerClaim: {
+        required: false,
+        description:
+          'Claim this server id even when another process appears to be live under it. ' +
+          'The escape hatch for a false positive: a legitimate port change plus a restart inside ' +
+          'the two-minute freshness window looks exactly like a second server writing under the ' +
+          'same id, and without this the suite refuses to come up until the window passes. Turn ' +
+          'it back off once the server is up — left on, it disables the check that stops two ' +
+          'communities interleaving their data.',
+        default: false
       },
       database: {
         required: true,
@@ -315,9 +386,34 @@ export default class SlackersSquadServices extends BasePlugin {
       logging: null
     };
 
+    // Resolved in prepareToMount(), because the services built there need it.
+    // A bad value is held rather than thrown so that mount() can be the single
+    // place S³ refuses — a throw out of prepareToMount() takes the whole
+    // SquadJS boot down before any plugin has a logger the operator will read.
+    this._serverID = null;
+    // The verdict registerServer() returned, kept so !s3 can report it.
+    this._serverRegistration = null;
+    // The version-lockstep comparison’s result, kept for tests and diagnostics. Null
+    // until the claim has run; the refusal itself lives in
+    // _serverIdentityBlocked, which is the one gate the plugins read.
+    this._versionLockstep = null;
+    // Set to an operator-facing sentence when a live process is already
+    // claiming this id. Consumer plugins read it through S3PluginBase and
+    // refuse to mount; S³ itself stays up so the operator can diagnose.
+    this._serverIdentityBlocked = null;
+    this._serverIDError = null;
+
     this._s3DiscordCleanup = null;
     this._migrationDiscordCleanup = null;
     this._migrationPromptTimer = null; // Delay timer used by _scheduleMigrationPrompt()
+
+    // Throttles for _registryTick(). Zero rather than null so the first
+    // player-info tick after mount stamps immediately — a process that has
+    // just registered is exactly the one whose row other servers most need
+    // to see, and waiting 45 seconds for the first beat would leave it
+    // reading as stale to a command typed in the meantime.
+    this._lastRegistryHeartbeatAt = 0;
+    this._lastLockReapAt = 0;
 
     // Deferred ready promise — consumer plugins await this._s3.ready() to ensure
     // all services, Discord registration, and migration check have completed.
@@ -336,6 +432,10 @@ export default class SlackersSquadServices extends BasePlugin {
   // Flat accessors — consumers use this._s3?.gameState (not this._s3?.services?.gameState)
   // Each returns the underlying service instance (may be null before mount completes).
   get version()       { return SlackersSquadServices.version; }
+  get serverID()      { return this._serverID; }
+  get serverIdentityBlocked() { return this._serverIdentityBlocked; }
+  get serverRegistration()    { return this._serverRegistration; }
+  get versionLockstep()       { return this._versionLockstep; }
   get gameState()     { return this.services.gameState; }
   get serverConfig()  { return this.services.serverConfig; }
   get db()            { return this.services.db; }
@@ -376,9 +476,33 @@ export default class SlackersSquadServices extends BasePlugin {
     // 'off' default and never reached the error file. Caught on a live server.
     this._configureStderrDiagnostics();
 
+    // Server identity, before any service is built — the id is part of what
+    // several of them write, so it cannot be settled later. Resolved here and
+    // not in mount() for that reason; the refusal still happens in mount().
+    try {
+      const resolved = DBService.resolveServerID({
+        overrideServerID: this.options.overrideServerID,
+        server: this.server
+      });
+      this._serverID = resolved.serverID;
+      if (resolved.fallback) {
+        this.verbose(
+          1,
+          `[S3] No server id configured — using ${resolved.serverID}. Set "id" in your SquadJS server config, ` +
+          'or overrideServerID on this plugin, before pointing a second server at this database: two servers ' +
+          'both falling back here would share one identity and interleave their rows.'
+        );
+      } else {
+        this.verbose(1, `[S3] Server id ${resolved.serverID}, from ${resolved.source}.`);
+      }
+    } catch (err) {
+      this._serverIDError = err;
+    }
+
     this.services.db = new DBService({
       parent: this,
       server: this.server,
+      serverID: this._serverID,
       sequelize: this.options.database,
       connectors: this.connectors,
       databaseOption: this.options.database,
@@ -496,12 +620,26 @@ export default class SlackersSquadServices extends BasePlugin {
     // Belt and braces — prepareToMount() has normally already done this.
     this._configureStderrDiagnostics();
 
+    // Refuse here rather than repairing. An unusable server id is a
+    // configuration mistake whose only silent outcomes are bad ones: a
+    // truncated key merges two servers' rounds, and a substituted id claims
+    // rows that belong to someone else.
+    if (this._serverIDError) {
+      this.verbose(1, this._serverIDError.message);
+      stderrError('S3Mount', 'S³ cannot mount: the configured server id is unusable.', this._serverIDError);
+      throw this._serverIDError;
+    }
+
     if (this.services.serverConfig) {
       await this._mountService('serverConfig', () => this.services.serverConfig.mount());
     }
 
     if (this.services.db) {
       await this._mountService('db', () => this.services.db.mount());
+      // Before any service that writes server-scoped rows. A live collision
+      // means somebody else's rows are already under this id, and every write
+      // after this point would add to them.
+      await this._claimServerIdentity();
     }
 
     if (this.services.gameState) {
@@ -667,7 +805,358 @@ export default class SlackersSquadServices extends BasePlugin {
     this.server.removeListener('PLAYER_CONNECTED', this.listeners.handlePlayerConnected);
   }
 
+  /**
+   * Claim this process's row in the server registry and act on the verdict.
+   *
+   * The interesting case is the one that refuses. Two SquadJS installs pointed
+   * at one database with the stock `"id": 1` do not fail — they interleave,
+   * quietly, and the damage is only visible much later in rounds attributed to
+   * the wrong community. So a fingerprint that disagrees with a row somebody
+   * else stamped in the last two minutes stops the server-scoped plugins from
+   * mounting at all.
+   *
+   * S³ itself stays up. The operator needs `!s3` to see what happened, and a
+   * process that exits leaves them reading a log for the reason.
+   *
+   * A stale row is the opposite case and must not refuse: it is what a port
+   * change or a moved server looks like, and taking a live game offline for a
+   * config edit is a worse outcome than the one being prevented.
+   *
+   * @private
+   */
+  async _claimServerIdentity() {
+    // Server.cfg's copy of the name, for the boot where RCON has not answered
+    // yet — which is most of them, since serverConfig mounts before db and
+    // `updateServerInformation()` runs on its own schedule. Without it the
+    // registry row is created nameless and stays that way until something
+    // else updates it, so every `!s3 servers` listing and every ambiguous
+    // `--server` refusal shows an id where a name would settle the question.
+    const configName = this.services.serverConfig?.getServerName?.() ?? null;
+
+    const verdict = await this.services.db.registerServer({
+      server: this.server,
+      suiteVersion: this.version,
+      fallbackServerName: configName,
+      force: this.options.forceServerClaim === true
+    });
+
+    this._serverRegistration = verdict;
+
+    switch (verdict.status) {
+      case 'created':
+      case 'refreshed':
+      case 'reclaimed':
+        // Naming happens after the claim, never inside it. registerServer()
+        // leaves alias null so a unique index cannot abort the insert, which
+        // means an unnamed row is the normal state for one instant and this is
+        // what ends it. A failure here costs the --server token, not the mount.
+        await this.services.db.claimDefaultAlias({
+          serverName: this.server?.serverName || configName
+        });
+        break;
+    }
+
+    switch (verdict.status) {
+      case 'created':
+        break;
+
+      case 'refreshed':
+        this.verbose(3, `[S3] Server ${verdict.serverID} re-registered; fingerprint unchanged.`);
+        break;
+
+      case 'reclaimed': {
+        const fields = verdict.differences.join(', ');
+        if (verdict.forced) {
+          this.verbose(
+            1,
+            `[S3] forceServerClaim is set: took server ${verdict.serverID} from a process that stamped it ` +
+            `less than two minutes ago (${fields} differ). Turn the option back off — while it is set, ` +
+            'nothing stops a second install writing under this id.'
+          );
+        } else {
+          this.verbose(
+            1,
+            `[S3] Server ${verdict.serverID} was last seen with a different ${fields}. The row was stale, ` +
+            'so this looks like a moved server or a changed port; the registry has been updated.'
+          );
+        }
+        break;
+      }
+
+      case 'collision': {
+        const fields = verdict.differences.join(', ');
+        const age = Math.round((Date.now() - (verdict.lastSeenAt || Date.now())) / 1000);
+        this._serverIdentityBlocked =
+          `another process is live under server id ${verdict.serverID} with a different ${fields} ` +
+          `(last seen ${age}s ago)`;
+
+        this.verbose(
+          1,
+          `[S3] Refusing to claim server id ${verdict.serverID}: another process stamped it ${age}s ago ` +
+          `with a different ${fields}. Give each install its own overrideServerID, or set ` +
+          'forceServerClaim if this is a port change rather than a second server.'
+        );
+        stderrError(
+          'S3ServerIdentity',
+          `Server id ${verdict.serverID} is claimed by another live process — server-scoped plugins will not mount.`,
+          `${fields} differ; the other row was stamped ${age}s ago.`
+        );
+        this._postServerCollisionEmbed(verdict, age);
+        break;
+      }
+
+      case 'unavailable':
+      default:
+        this.verbose(
+          1,
+          `[S3] Server registry unavailable (${verdict.reason}). Nothing can tell whether a second ` +
+          'install shares this database, so the multi-server guards are inert.'
+        );
+        break;
+    }
+
+    // Version lockstep, gated on the claim having succeeded. A collision
+    // has already blocked the mount for a more specific reason, and replacing
+    // it with this one would send an operator after the wrong problem.
+    if (!this._serverIdentityBlocked) {
+      await this._checkVersionLockstep();
+    }
+
+    // Establish the baseline the heartbeat compares against. Without it the
+    // first round roll would absorb whatever the count is by then — and a
+    // server that joins during the round this process booted into would never
+    // be announced, which is the case the heartbeat re-read exists for.
+    await this.services.db.refreshRegisteredServerCount();
+
+    // And the label the senders read, before the first embed goes out rather
+    // than at the first heartbeat thirty seconds later. A boot that answers a
+    // command in its first half-minute would otherwise answer it unlabelled.
+    await this._publishServerLabel();
+  }
+
+  /**
+   * Refuse to bring the server-scoped plugins up beside a process running a
+   * different suite version.
+   *
+   * This reuses the fingerprint-collision path exactly — same registry table,
+   * same `serverIdentityBlocked` gate, same operator-facing shape — because it
+   * is the same decision: something about the shared database is not what this
+   * process assumes, and writing anyway is worse than not coming up. It is one
+   * comparison and one message.
+   *
+   * Runs only when the identity claim itself succeeded. A collision has already
+   * blocked the mount with a more specific reason, and overwriting it with this
+   * one would send an operator after the wrong problem.
+   */
+  async _checkVersionLockstep() {
+    const result = await this.services.db.checkVersionLockstep(this.version);
+    this._versionLockstep = result;
+    if (result.ok) return;
+
+    const named = result.mismatches
+      .map((row) => `${row.alias || `server ${row.serverID}`} on ${row.suiteVersion}`)
+      .join(', ');
+
+    this._serverIdentityBlocked =
+      `this install is on ${result.version} and ${named} is live on this database — every process in a ` +
+      'community must run the same suite version';
+
+    this.verbose(
+      1,
+      `[S3] Refusing to mount: this install is on ${result.version}, ${named}. A mixed pair writes ` +
+      'against a schema one of them does not know about, and a community-wide command answered by the ' +
+      'older process runs a superseded handler. Stop every process, upgrade them all, then start them.'
+    );
+    stderrError(
+      'S3VersionLockstep',
+      `Suite version mismatch — server-scoped plugins will not mount.`,
+      `This install is on ${result.version}; ${named}.`
+    );
+    this._postVersionMismatchEmbed(result, named);
+  }
+
+  _postVersionMismatchEmbed(result, named) {
+    const discordClient = this.options.discordClient;
+    const channelID = this.options.channelID;
+    if (!discordClient || !channelID) return;
+
+    discordClient.channels.fetch(channelID).then((channel) => {
+      if (!channel) return;
+      channel.send({
+        embeds: [{
+          color: 0xe74c3c,
+          title: this.localize('slackersSquadServices.serverRegistry.versionMismatchTitle'),
+          description: this.localize('slackersSquadServices.serverRegistry.versionMismatchDescription', {
+            version: result.version,
+            others: named
+          }),
+          timestamp: new Date().toISOString(),
+          footer: { text: this.localize('slackersSquadServices.serverRegistry.collisionFooter') }
+        }]
+      }).catch(() => {});
+    }).catch(() => {});
+  }
+
+  /**
+   * Post the collision to the admin channel.
+   *
+   * Best-effort and deliberately silent on failure — the refusal has already
+   * happened and is already in the log. Mirrors the drift-alert embed rather
+   * than inventing a second shape for the same kind of news.
+   *
+   * @private
+   */
+  _postServerCollisionEmbed(verdict, ageSeconds) {
+    const discordClient = this.options.discordClient;
+    const channelID = this.options.channelID;
+    if (!discordClient || !channelID) return;
+
+    discordClient.channels.fetch(channelID).then((channel) => {
+      if (!channel) return;
+      channel.send({
+        embeds: [{
+          color: 0xe74c3c,
+          title: this.localize('slackersSquadServices.serverRegistry.collisionTitle'),
+          description: this.localize('slackersSquadServices.serverRegistry.collisionDescription', {
+            serverID: verdict.serverID,
+            fields: verdict.differences.join(', '),
+            age: ageSeconds
+          }),
+          timestamp: new Date().toISOString(),
+          footer: { text: this.localize('slackersSquadServices.serverRegistry.collisionFooter') }
+        }]
+      }).catch(() => {});
+    }).catch(() => {});
+  }
+  /**
+   * Stamp the registry, re-read the count, and clear expired lock rows.
+   *
+   * ─── WHY THIS EVENT ───
+   *
+   * The round roll was the only heartbeat until Phase 6, and the reasoning
+   * for it stands: it is evidence the server is genuinely running, which a
+   * `setInterval` is not — a timer keeps stamping the row of a process that
+   * has stopped doing everything else. UPDATED_PLAYER_INFORMATION is the same
+   * kind of evidence at a usable rate. It fires only when RCON answered, and
+   * it fires about every thirty seconds instead of about every hour.
+   *
+   * The rate is what the freshness window needs. A two-minute window against
+   * an hourly stamp means every server in the community reads as stale for
+   * most of every round, which makes "is that server answering" unanswerable
+   * and would have the version check comparing against nobody.
+   *
+   * It also carries the registered count, because `heartbeatServer()` refreshes
+   * it on the same call — deliberately, so the two cannot come apart. A server
+   * that joins mid-round changes what every admin command in the channel has to
+   * say, and noticing that at the next map roll is noticing it far too late.
+   *
+   * ─── THE REAPER ───
+   *
+   * `S3_Locks` holds two populations with lifetimes orders of magnitude apart,
+   * and the reaper deletes on each row's own `expiresAt` rather than on an age
+   * threshold. That is the whole reason it is safe to run here: a reaper tuned
+   * to the seconds-long Discord claims would happily delete a migration lock
+   * that is still ten minutes from expiring and legitimately held.
+   *
+   * Both are throttled against the local clock, which is the right clock for a
+   * "how often do I do this" question — only the lock expiries themselves cross
+   * machines, and those are minted from the database.
+   *
+   * @private
+   */
+  async _registryTick() {
+    const db = this.services.db;
+    if (!db || !db.isReady()) return;
+
+    const now = Date.now();
+
+    if (now - this._lastRegistryHeartbeatAt >= S3_HEARTBEAT_INTERVAL_MS) {
+      this._lastRegistryHeartbeatAt = now;
+      await db.heartbeatServer();
+      // On the same tick as the count it depends on. A server joining
+      // mid-round is the moment every embed in the channel starts needing to
+      // say which one it came from, and picking that up at the next map roll
+      // is picking it up an hour late.
+      await this._publishServerLabel();
+    }
+
+    if (now - this._lastLockReapAt >= S3_LOCK_REAP_INTERVAL_MS) {
+      this._lastLockReapAt = now;
+      await db.reapExpiredLocks();
+    }
+  }
+
+  /**
+   * Resolve this process's embed label and hand it to the senders.
+   *
+   * ─── WHY IT IS RESOLVED HERE ───
+   *
+   * Every Discord embed in the suite goes out through one of four senders,
+   * and three of them are free functions taking `(channel, content)` — no
+   * plugin, no language, no server id, no database. They cannot work out
+   * what to say, and they must not: they run on every message and a lookup
+   * there would be a query per embed.
+   *
+   * So the string is resolved on the heartbeat, where the registry has just
+   * been read anyway, and published to a module the senders read from.
+   * One `localize()` call, which is also what keeps the label to one line in
+   * one translation template — `make-locale-templates.mjs` classifies a key
+   * by where it is localized, so four call sites in four plugins would be
+   * four verdicts about a string every one of them puts the same way.
+   *
+   * The verdict it does reach is player-facing, which is right: the footer
+   * rides on every embed the suite sends, and some of those are public `!elo`
+   * replies rather than staff channels.
+   *
+   * ─── WHY IT CAN BE NULL ───
+   *
+   * A single-server install publishes nothing, and the decoration becomes a
+   * no-op at the sender rather than a branch. That is the zero-delta
+   * guarantee, held in one place instead of asserted across 138 embeds.
+   *
+   * A registered name that is not distinct also publishes nothing — see
+   * `serverLabels()`. The alias is the fallback there, because it is unique
+   * by construction and a label that could mean either of two servers is
+   * worse than no label at all.
+   *
+   * @private
+   */
+  async _publishServerLabel() {
+    const db = this.services.db;
+
+    try {
+      if (!db?.isReady?.() || db.getKnownServerCount() === 1) {
+        publishServerLabel(null);
+        return;
+      }
+
+      const rows = await db.getRegisteredServers();
+      if (rows.length < 2) {
+        publishServerLabel(null);
+        return;
+      }
+
+      const mine = rows.find((row) => row.serverID === db.getServerID());
+      const alias = serverLabels(rows).get(db.getServerID()) || mine?.alias || null;
+
+      publishServerLabel(
+        alias ? this.localize('s3ServerLabel.footer', { alias }) : null
+      );
+    } catch (err) {
+      // A label is decoration. Losing it must not cost the heartbeat that
+      // was the point of this tick, and an unlabelled embed is legible.
+      this.verbose(2, `[S3] Could not resolve the server label: ${err.message}`);
+    }
+  }
+
   async handleNewGame(data) {
+    // The round roll still stamps, unconditionally and ahead of the throttle.
+    // _registryTick() is the cadence now (see it for why this event is not
+    // enough on its own), but a roll is the one moment a report boundary and
+    // the registry ought to agree exactly, and it costs one write an hour.
+    this._lastRegistryHeartbeatAt = Date.now();
+    if (this.services.db) await this.services.db.heartbeatServer();
+
     if (this.services.gameState?.handleNewGame) {
       await this.services.gameState.handleNewGame(data);
     }
@@ -702,6 +1191,8 @@ export default class SlackersSquadServices extends BasePlugin {
   async handleUpdatedPlayerInfo(data) {
     const playerCount = this.server?.players?.length ?? 0;
     this.verbose(3, `[S3] UPDATED_PLAYER_INFORMATION tick: ${playerCount} players`);
+
+    await this._registryTick();
 
     if (this.services.gameState?.handleUpdatedPlayerInfo) {
       await this.services.gameState.handleUpdatedPlayerInfo(data);
@@ -817,20 +1308,118 @@ export default class SlackersSquadServices extends BasePlugin {
       if (me) {
         me.confirmToken('__auto__');
       }
+      const lostTheLock = [];
+      let hardFailure = false;
       for (const p of pending) {
         try {
           if (!me) {
             this.verbose(1, `[S3 Migration] MigrationEngine not available — cannot migrate "${p.pluginName}".`);
+            hardFailure = true;
             continue;
           }
           const result = await me.runMigrations(p.pluginName);
           this.verbose(2, `[S3 Migration] "${p.pluginName}": ${result.applied} applied, ${result.skipped} skipped.`);
         } catch (err) {
-          this.verbose(1, `[S3 Migration] Auto-migration failed for "${p.pluginName}": ${err.message}`);
+          if (err?.code === MIGRATION_LOCK_UNAVAILABLE) {
+            lostTheLock.push(p.pluginName);
+            this.verbose(1, `[S3 Migration] Another process is migrating "${p.pluginName}" — will re-check rather than assume.`);
+          } else {
+            hardFailure = true;
+            this.verbose(1, `[S3 Migration] Auto-migration failed for "${p.pluginName}": ${err.message}`);
+          }
         }
       }
-      db._resolveMigrationGate(true);
+
+      // ─── The losing process's behaviour, identical on all three dialects ───
+      //
+      // Wait, re-check, come up clean if the winner completed the work. The
+      // waiting already happened inside acquireAdvisoryLock(), which polls for
+      // the whole wait window rather than returning at the first refusal — so
+      // by the time a lock error reaches here, the holder was still alive and
+      // inside its TTL for the full duration. What is left is the re-check, and
+      // that has to read the SHARED version record, because the whole point is
+      // that the work may have been done by a process this one cannot see.
+      //
+      // This used to fall straight through to _resolveMigrationGate(true),
+      // which clears _pendingMigrations and unblocks every consumer plugin. A
+      // process that knows it did not migrate must not mount plugins against a
+      // schema another process is halfway through changing, so a failure that
+      // survives the re-check now fails CLOSED: the gate stays shut, consumers
+      // stay blocked in waitForMigrations(), and the prompt is re-scheduled.
+      if (lostTheLock.length === 0 && !hardFailure) {
+        db._resolveMigrationGate(true);
+        return;
+      }
+
+      let stillPending = [];
+      try {
+        const recheck = await db.verifySchemaVersions();
+        stillPending = recheck.pending || [];
+      } catch (err) {
+        // Cannot tell whether the winner finished. Fail closed — this is the
+        // direction where being wrong is recoverable.
+        this.verbose(1, `[S3 Migration] Could not re-check schema versions after a lock conflict: ${err.message}`);
+        stillPending = pending;
+      }
+
+      if (stillPending.length === 0 && !hardFailure) {
+        this.verbose(
+          1,
+          `[S3 Migration] Another process applied ${lostTheLock.join(', ')} while this one waited — schema is up to date, coming up clean.`
+        );
+        db._resolveMigrationGate(true);
+        return;
+      }
+
+      db._pendingMigrations = stillPending;
+      const names = stillPending.map((p) => p.pluginName).join(', ') || lostTheLock.join(', ');
+      this.verbose(
+        1,
+        `[S3 Migration] ${stillPending.length} migration(s) still pending after auto-migration (${names}). ` +
+        'Consumer plugins stay blocked rather than mounting against a schema that is mid-change.'
+      );
+      stderrWarn(
+        'S3Migration',
+        'Auto-migration did not complete and the schema is not at its expected version. Consumer plugins are blocked until it is.',
+        names
+      );
+      this._scheduleMigrationPrompt();
       return;
+    }
+
+    // ─── One prompt per community, not one per process ───────────────
+    //
+    // Every process reaches this point with the same pending set, so on a
+    // two-server install the admin channel gets two embeds carrying two
+    // tokens for one schema change. The migration itself was already safe —
+    // `runMigrations()` takes the advisory lock and a loser waits and
+    // re-checks — so this is not a correctness fix. It is a legibility one,
+    // and the failure it prevents is an admin confirming the token that
+    // scrolled past rather than the one on screen.
+    //
+    // Keyed on the pending set rather than on a message id, because there is
+    // no message yet — this claim is what decides who gets to make one. The
+    // claim's TTL and the token's expiry are both five minutes, so a prompt
+    // that goes unanswered frees the key at the same moment its token dies
+    // and the next boot is free to ask again.
+    //
+    // A loser does not mint a token. Minting one would arm an idempotency
+    // guard on a prompt that reached nobody, and `confirmToken()` rejects
+    // anything the engine did not mint, so the winner's token reaches the
+    // winner by construction. The loser stays blocked, which is where a
+    // process facing an unapplied migration belongs.
+    const promptKey = `migrate-prompt:${pending.map((p) => `${p.pluginName}@${p.expectedVersion}`).sort().join(',')}`;
+    const sharedSchema = (db.getKnownServerCount?.() ?? 1) > 1;
+    if (sharedSchema) {
+      const claim = await db.claimDiscordMessage(promptKey);
+      if (claim?.claimed !== true) {
+        this.verbose(
+          1,
+          `[S3 Migration] Another server already posted the prompt for ${pending.length} pending migration(s) — ` +
+          'staying blocked rather than posting a second token for the same schema change.'
+        );
+        return;
+      }
     }
 
     // Generate a confirmation token and post embed to Discord admin channel.
@@ -847,6 +1436,14 @@ export default class SlackersSquadServices extends BasePlugin {
     // The embed already includes generic instructions from buildMigrationEmbed().
     // Append the token-specific line so the admin knows which token to use.
     const embed = buildMigrationEmbed(this, pending, 'pending', null);
+    // Said before the token, not after it. An admin who reads only as far as
+    // the thing they have to type has still read that this changes the schema
+    // every server shares, and they may well be thinking about only one.
+    if (sharedSchema) {
+      embed.description += '\n' + this.localize('slackersSquadServices.migrate.sharedSchemaWarning', {
+        count: String(db.getKnownServerCount?.() ?? '?')
+      });
+    }
     embed.description += '\n' + this.localize('slackersSquadServices.migrate.tokenLine', { token });
 
     this.verbose(1, `[S3 Migration] ${pending.length} plugin(s) have pending schema migrations. Generated token: ${token}`);

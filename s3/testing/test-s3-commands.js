@@ -83,6 +83,127 @@ async function main() {
     assert.equal(typeof cmds.buildServicesEmbed, 'function');
   });
 
+// ── !s3 servers ───────────────────────────────────────────────────
+  // The listing itself is covered by test-s3-commands-embeds.js. What is only
+  // reachable through the handler is the refusal shape: an ambiguous or unknown
+  // token, a rejected rename, and forgetting the server you are typing at. Each
+  // of those is a path where the wrong answer targets the wrong live game.
+
+  async function serversFixture(fn) {
+    const seq = new Sequelize({ dialect: 'sqlite', storage: ':memory:', logging: false, define: { freezeTableName: true } });
+    const db = new DBService({ sequelize: seq, serverID: 1, verboseLogger: () => {} });
+    await db.mount();
+
+    const captured = [];
+    const { handlers } = cmds.createCommandHandlers({
+      sendDiscordMessage: async (_c, payload) => { captured.push(payload); },
+      watchManager: null,
+      stagedImportRef: { current: null }
+    });
+
+    const plugin = {
+      services: { db },
+      verbose: () => {},
+      localize: (key, vars) => lookupMessage(key, vars)
+    };
+
+    const now = await db.dbNow();
+    const seed = (serverID, alias, stale) => db.ServersModel.create({
+      serverID, alias, serverName: `Server ${serverID}`,
+      host: '10.0.0.1', queryPort: 27165, rconPort: 21114 + serverID,
+      suiteVersion: '1.7.0', firstSeenAt: now,
+      lastSeenAt: stale ? now - 60 * 60 * 1000 : now,
+      clockSkewMs: 0, communityOptions: null
+    });
+
+    const run = async (...args) => {
+      captured.length = 0;
+      await handlers.get('servers')(plugin, mockMessage(), ['servers', ...args]);
+      return captured.at(-1).embeds[0];
+    };
+
+    try {
+      return await fn({ db, seed, run });
+    } finally {
+      try { await db.unmount(); } catch { /* best effort */ }
+      try { await seq.close(); } catch { /* best effort */ }
+    }
+  }
+
+  await runTest('!s3 servers alias renames a server and reports the previous name', () =>
+    serversFixture(async ({ db, seed, run }) => {
+      await seed(1, 'main', false);
+      await seed(2, 'event', true);
+
+      const embed = await run('alias', 'event', 'Weekend');
+      assert.match(embed.title, /Alias Set/);
+      assert.match(embed.description, /event/, 'the reply has to say what the name was, not only what it is');
+      assert.match(embed.description, /weekend/, 'the stored alias is the normalised form, and that is what --server will take');
+
+      const rows = await db.getRegisteredServers();
+      assert.equal(rows.find((r) => r.serverID === 2).alias, 'weekend');
+    }));
+
+  await runTest('!s3 servers alias refuses a name a keystroke from another, and changes nothing', () =>
+    serversFixture(async ({ db, seed, run }) => {
+      await seed(1, 'main', false);
+      await seed(2, 'event', true);
+
+      const embed = await run('alias', '2', 'mains');
+      assert.match(embed.title, /Refused/);
+      assert.match(embed.description, /one edit away/);
+
+      const rows = await db.getRegisteredServers();
+      assert.equal(rows.find((r) => r.serverID === 2).alias, 'event', 'a refused rename must not half-apply');
+    }));
+
+  await runTest('!s3 servers on an unknown token lists what does exist', () =>
+    serversFixture(async ({ seed, run }) => {
+      await seed(1, 'main', false);
+
+      const embed = await run('alias', 'nosuch', 'whatever');
+      assert.match(embed.title, /No Such Server/);
+      assert.match(embed.description, /main/, 'being told "no" without being told the alternatives is a dead end');
+    }));
+
+  await runTest('!s3 servers forget refuses the server it is typed at', () =>
+    serversFixture(async ({ db, seed, run }) => {
+      await seed(1, 'main', false);
+
+      const embed = await run('forget', 'main');
+      assert.match(embed.title, /Not Forgotten/);
+      assert.match(embed.description, /cannot deregister itself/);
+      assert.equal(await db.getRegisteredServerCount(), 1);
+    }));
+
+  await runTest('!s3 servers forget removes a retired server', () =>
+    serversFixture(async ({ db, seed, run }) => {
+      await seed(1, 'main', false);
+      await seed(2, 'event', true);
+
+      const embed = await run('forget', 'event');
+      assert.match(embed.title, /Forgotten/);
+      assert.deepEqual((await db.getRegisteredServers()).map((r) => r.serverID), [1]);
+    }));
+
+  await runTest('!s3 servers with a mistyped subcommand replies with usage, never a default action', () =>
+    serversFixture(async ({ seed, run }) => {
+      await seed(1, 'main', false);
+
+      const embed = await run('forgt', 'main');
+      assert.match(embed.title, /Usage/);
+      assert.match(embed.description, /forgt/, 'the operator has to be able to see what they typed');
+    }));
+
+  await runTest('!s3 servers alias with a missing argument replies with usage', () =>
+    serversFixture(async ({ seed, run }) => {
+      await seed(1, 'main', false);
+
+      const embed = await run('alias', 'main');
+      assert.match(embed.title, /Usage/);
+      assert.match(embed.description, /newAlias/);
+    }));
+
   // ── !s3 db import staging step ────────────────────────────────────
   // The dev-harness cannot reach this branch: its message stub carries no
   // `attachments`, and it passes `stagedImportRef: { current: null }` precisely

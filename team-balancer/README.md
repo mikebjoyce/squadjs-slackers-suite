@@ -1,4 +1,4 @@
-# Team Balancer Plugin v4.1.0
+# Team Balancer Plugin v4.2.0
 
 **SquadJS Plugin for Fair Match Enforcement**
 
@@ -70,7 +70,7 @@ Prevents players from changing teams immediately after a scramble. When TeamBala
 
 S³ is the centralised service container for shared state across Slacker's Squad plugins. TeamBalancer uses it as the primary data source for player state, squad data, faction names, clan grouping, game-mode detection (including ignored modes), and game-state metadata.
 
-**Requires S³ ≥1.7.0.** Territory Control support branches on `gameState.getGamemodeKey()`, which S³ 1.7.0 is the first release to expose. TeamBalancer fails to mount below that rather than starting up with `tcDominantThreshold` and `tcSingleRoundScrambleThreshold` configured but silently inert.
+**Requires S³ ≥1.8.0.** Every multi-server call TeamBalancer makes is optional-chained, so an older S³ doesn't throw, it degrades quietly: the routing gate never runs, a scramble confirmation arms with no token, and `TeamBalancerState` falls back to row id 1, which puts two servers on one win streak and one scramble lockdown. The previous floor was 1.7.0, for Territory Control support branching on `gameState.getGamemodeKey()`; below that the TC thresholds are configured but silently inert.
 
 **Why this matters**: Rather than maintaining its own duplicate caches, TeamBalancer reads ground-truth data from S³ — player/squad snapshots via `players.getAllPlayers()` / `players.getSquads()`, faction names via `factions.getTeamName()`, game-mode/layer detection via `gameState.getGamemode()` / `gameState.getLayerName()`, ignored-mode checks via `gameState.isIgnoredMode()`, and clan grouping via `clans.extractClanGroups()`. During scrambles, S³'s global-lock mechanism (`players.lockGlobal()` / `players.unlockGlobal()`) prevents concurrent scrambles from conflicting.
 
@@ -372,6 +372,21 @@ TimeBeforeVote=45
 **Seed rounds run on a shorter clock.** The window between a Seed round ending and the next map loading can be far shorter than the timings above, which is why the seed auto-scramble has its own `seedScrambleAnnouncementDelay` (default 5s, minimum 3s) instead of the global 25s/30s value. This matters because a countdown that has not fired by the time `NEW_GAME` arrives is discarded outright — teams are freshly assigned at that point, so firing into the new round would scramble the wrong one. Too long a seed delay therefore does not merely delay the scramble, it cancels it. If your seed rounds still end without a scramble, lower this value further.
 
 ---
+
+## Running two or more servers
+
+Several Squad servers can share one database. Both of this plugin's tables are per-server, so nothing balances across servers and nothing needs to.
+
+| Table | Scope | What that means |
+|-------|-------|-----------------|
+| `TB_RoundReport` | per server | Round reports belong to the server that played the round |
+| `TeamBalancerState` | per server | Win streaks and scramble bookkeeping are each server's own |
+
+`TeamBalancerState` is a per-server singleton whose primary key **is** the server id, so it has no `serverID` column. That matters for one upgrade case: an existing install that has always run `server.id: 3` holds its win streak in a row numbered 1, written before any of this existed. `!s3 migrate adopt-state` moves it onto the declared id, and prints the row it would replace before requiring `--confirm`. An install running id 1, which is every stock config, never needs it.
+
+The clan grouping and Elo inputs this plugin reads are S³'s and EloTracker's, and those follow their own scoping — a player's rating is community-wide, so a player who plays on both your servers is balanced against the same rating on each.
+
+Everything here is inert on a single-server install.
 
 ## Author
 

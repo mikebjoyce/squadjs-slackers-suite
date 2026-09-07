@@ -1366,6 +1366,173 @@ await runTest('recovery still invalidates on a real layer divergence', async () 
   assert.equal(service._recoveredStateActive, false);
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// The round key carries the server
+//
+// Two servers whose rounds start in the same second used to mint the same
+// key, and seven tables carry it. Scoping those tables by serverID makes the
+// collision non-destructive, but a report joining on the key alone still
+// crosses servers, and "the rounds started in the same second" is a coin
+// flip on a community that restarts its servers together.
+//
+// Three call sites mint it. They were three copies of one expression, which
+// is the shape where a change reaches two of them and the third goes on
+// producing the old format unnoticed — so each is driven here through its own
+// path rather than through the one that is easy to reach.
+// ═══════════════════════════════════════════════════════════════════
+
+/** The mock DBService these paths need, matching the ones used above. */
+function persistenceFor(sequelize) {
+  return {
+    getConnector: () => sequelize,
+    getDataTypes: () => sequelize.constructor.DataTypes,
+    executeWithRetry: (fn) => fn(),
+    quoteIdentifier: (name) => `"${String(name).replace(/"/g, '""')}"`,
+    registerExpectedVersion: () => {}
+  };
+}
+
+/** An S³ stand-in holding the one thing the minter reads. */
+function parentWith(serverID, dbService) {
+  const parent = { serverID, services: { db: dbService } };
+  parent.db = parent.services.db;
+  return parent;
+}
+
+const PREFIXED = /^\d+-[0-9a-z]{1,8}$/;
+
+await runTest('the round key minted at NEW_GAME carries the server id', async () => {
+  const sequelize = new MockSequelize();
+  const service = new GameStateService({
+    parent: parentWith(2, persistenceFor(sequelize)),
+    server: new MockServer()
+  });
+
+  await service.mount();
+  await service.handleNewGame({ layer: 'Mutaha_RAAS_v3' });
+
+  assert.match(
+    service.getMatchId(), PREFIXED,
+    `the ordinary round key must carry the server id, got ${service.getMatchId()}`
+  );
+  assert.ok(service.getMatchId().startsWith('2-'), 'the prefix must be this server’s id, not another’s');
+  await service.unmount();
+});
+
+await runTest('two servers starting a round in the same second mint different keys', async () => {
+  const realNow = Date.now;
+  const frozen = realNow();
+  const keys = [];
+  try {
+    Date.now = () => frozen;
+    for (const serverID of [1, 2]) {
+      const sequelize = new MockSequelize();
+      const service = new GameStateService({
+        parent: parentWith(serverID, persistenceFor(sequelize)),
+        server: new MockServer()
+      });
+      await service.mount();
+      await service.handleNewGame({ layer: 'Mutaha_RAAS_v3' });
+      keys.push(service.getMatchId());
+      await service.unmount();
+    }
+  } finally {
+    Date.now = realNow;
+  }
+
+  assert.notEqual(
+    keys[0], keys[1],
+    `the same second on two servers produced one key: ${keys[0]}`
+  );
+  assert.equal(
+    keys[0].split('-')[1], keys[1].split('-')[1],
+    'the suffixes must be identical — otherwise the collision this guards against was never reproduced and the test proves nothing'
+  );
+});
+
+await runTest('the mid-round mount backfill mints a prefixed key too', async () => {
+  const sequelize = new MockSequelize();
+  // A process starting while a round is already live: the phase survived, the
+  // round clock did not, and mount() is the earliest moment S³ can label it.
+  sequelize._rows.set(1, {
+    id: 1,
+    phase: 'LIVE',
+    resolving: false,
+    lastPhaseChangeAt: Date.now(),
+    lastNewGameAt: null,
+    lastRoundEndedAt: null,
+    lastLayerName: 'Mutaha_RAAS_v3',
+    lastGamemode: 'RAAS',
+    roundStartTime: null,
+    matchId: null
+  });
+
+  const service = new GameStateService({
+    parent: parentWith(3, persistenceFor(sequelize)),
+    server: new MockServer()
+  });
+  await service.mount();
+
+  assert.match(
+    service.getMatchId(), PREFIXED,
+    `the mount backfill minted an unprefixed key: ${service.getMatchId()}`
+  );
+  await service.unmount();
+});
+
+await runTest('the too-old-recovery transition mints a prefixed key too', async () => {
+  const sequelize = new MockSequelize();
+  // A recovered round older than the horizon is not resumed, it is replaced —
+  // and the replacement needs a key of its own.
+  sequelize._rows.set(1, {
+    id: 1,
+    phase: 'STAGING',
+    resolving: true,
+    lastPhaseChangeAt: Date.now(),
+    lastNewGameAt: Date.now() - 7205000,
+    lastRoundEndedAt: null,
+    lastLayerName: 'Mutaha_RAAS_v3',
+    lastGamemode: 'RAAS',
+    roundStartTime: null,
+    matchId: null
+  });
+
+  const service = new GameStateService({
+    parent: parentWith(4, persistenceFor(sequelize)),
+    server: new MockServer(),
+    stagingDurationMs: 600000,
+    maxRecoveredRoundAgeMs: 7200000
+  });
+  await service.mount();
+
+  assert.equal(service.getPhase(), 'LIVE', 'the round should have been invalidated rather than resumed');
+  assert.match(
+    service.getMatchId(), PREFIXED,
+    `the recovery transition minted an unprefixed key: ${service.getMatchId()}`
+  );
+  await service.unmount();
+});
+
+await runTest('no id resolved means no prefix, not an invented one', async () => {
+  const sequelize = new MockSequelize();
+  // Standalone — tests and the dev harness. Live this cannot happen: the id is
+  // settled before any service is built, and a bad one refuses the mount. The
+  // unprefixed form is a shape the column already holds; minting `1-` here
+  // would be inventing an identity, which is the one thing nothing may do.
+  const service = new GameStateService({
+    parent: parentWith(undefined, persistenceFor(sequelize)),
+    server: new MockServer()
+  });
+  await service.mount();
+  await service.handleNewGame({ layer: 'Mutaha_RAAS_v3' });
+
+  assert.match(
+    service.getMatchId(), /^[0-9a-z]{1,8}$/,
+    `an unresolved id must fall back to the bare suffix, got ${service.getMatchId()}`
+  );
+  await service.unmount();
+});
+
 if (!process.exitCode) {
   console.log('\nAll game-state-service tests passed.');
 }
