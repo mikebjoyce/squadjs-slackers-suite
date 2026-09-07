@@ -29,9 +29,17 @@ import BasePlugin from './base-plugin.js';
  *     "token":    "<must equal options.token>",
  *     "commands": ["AdminChangeLayer Gorodok_RAAS_v1"],   // or "command": "..."
  *     "discord":  ["gamestate"],  // capture !s3 embeds without sending them
+ *     "readback": { "limit": 10 },// read what Discord actually stored
  *     "snapshot": true,          // include a state snapshot in the result
  *     "note":     "why you ran this"
  *   }
+ *
+ * `discord` and `readback` answer opposite questions and are easy to
+ * confuse. `discord` captures the payload a handler *built*, with the
+ * sender stubbed, so nothing is posted. `readback` asks Discord what it
+ * *stored*, which is the only way to see a loss that happens at or after
+ * `channel.send` — the capture path never gets that far. Use `discord`
+ * to test what the code produces and `readback` to test what survived.
  *
  * A request with no commands and `snapshot: true` is a pure read — it
  * touches RCON not at all.
@@ -202,6 +210,16 @@ export default class DevRconHarness extends BasePlugin {
         required: false,
         description: 'Permitted !s3 subcommands for the "discord" request field. Handlers are invoked with a capturing sender, so the embed is written to the result file and never sent to Discord. Mutating subcommands are omitted: they need a watchManager/stagedImportRef that a stub context cannot supply.',
         default: ['status', 'services', 'gamestate', 'factions', 'players']
+      },
+      allowReadback: {
+        required: false,
+        description: 'Allow the "readback" request field to read recent messages from the S³ admin channel. Off by default: reading a channel returns what people said in it, which is a wider permission than posting to it. Only S³\'s configured channel is reachable.',
+        default: false
+      },
+      readbackMaxMessages: {
+        required: false,
+        description: 'Ceiling on how many messages one readback may fetch, whatever the request asks for. Discord itself caps a single fetch at 100.',
+        default: 50
       },
       s3CommandsModule: {
         required: false,
@@ -434,17 +452,23 @@ export default class DevRconHarness extends BasePlugin {
     }
 
     const discord = await this.runDiscordCommands(request);
+    // After the commands, so one request can send and then read back what
+    // landed. The delay between the two is Discord's, not ours, so a readback
+    // in the same request may miss a message still in flight — for that, send
+    // in one request and read back in the next.
+    const readback = await this.runReadback(request);
 
     const payload = {
       id: name,
       note: request.note ?? null,
       receivedAt,
       completedAt: new Date().toISOString(),
-      ok: results.every((r) => r.ok) && discord.every((d) => d.ok),
+      ok: results.every((r) => r.ok) && discord.every((d) => d.ok) && (readback === null || readback.ok),
       results
     };
 
     if (discord.length) payload.discord = discord;
+    if (readback !== null) payload.readback = readback;
     if (request.snapshot !== false) payload.snapshot = this.buildSnapshot();
     return payload;
   }
@@ -541,6 +565,89 @@ export default class DevRconHarness extends BasePlugin {
     }
 
     return out;
+  }
+
+  // ─── Discord readback ──────────────────────────────────────────────────────
+
+  /**
+   * Read back what Discord actually stored, as opposed to what we handed it.
+   *
+   * ─── WHY THIS EXISTS ───
+   *
+   * `discord` (above) captures the payload by stubbing the sender, so it proves
+   * what a handler *built* and nothing whatsoever about what arrived. That gap
+   * is not academic: a multi-embed reply was observed rendering three embeds
+   * from one server and one embed from another, and the capture path could not
+   * tell the two apart because it never reaches `channel.send`.
+   *
+   * This closes the loop from the far side. Anything visible here survived
+   * serialisation, the API call, and Discord's own validation — so a payload
+   * that leaves as three embeds and reads back as one localises the loss to the
+   * send, while three-and-three moves the question to the viewing client.
+   *
+   * ─── WHY IT IS OFF BY DEFAULT ───
+   *
+   * Reading a channel returns whatever people said in it, which is a different
+   * and larger permission than posting a status embed. `allowReadback` keeps it
+   * shut unless a test server's operator opens it deliberately.
+   *
+   * Only the S³ admin channel is reachable, and only via S³'s own client: the
+   * channel is not a request field, so a request cannot aim this at some other
+   * channel the bot happens to be in.
+   */
+  async runReadback(request) {
+    if (request.readback === undefined || request.readback === false) return null;
+
+    if (!this.options.allowReadback) {
+      return { ok: false, error: 'Readback is disabled (options.allowReadback is false).' };
+    }
+
+    const spec = typeof request.readback === 'object' && request.readback !== null ? request.readback : {};
+    const requested = Number.isFinite(spec.limit) ? Math.floor(spec.limit) : 10;
+    const limit = Math.max(1, Math.min(requested, this.options.readbackMaxMessages));
+
+    const s3 = this.findS3();
+    if (!s3) return { ok: false, error: 'S³ plugin not found on this server.' };
+
+    const client = s3.options?.discordClient;
+    const channelID = s3.options?.channelID;
+    if (!client || !channelID) {
+      return { ok: false, error: 'S³ has no discordClient/channelID configured; nothing to read back.' };
+    }
+
+    try {
+      const channel = await client.channels.fetch(channelID);
+      const fetched = await channel.messages.fetch({ limit });
+
+      // fetch() returns newest-first; oldest-first reads like the channel does.
+      const messages = [...fetched.values()].reverse().map((m) => ({
+        id: m.id,
+        createdAt: m.createdAt instanceof Date ? m.createdAt.toISOString() : null,
+        author: m.author ? `${m.author.username}${m.author.bot ? ' [bot]' : ''}` : null,
+        authorID: m.author?.id ?? null,
+        content: typeof m.content === 'string' && m.content.length > MAX_CAPTURED_STRING
+          ? `${m.content.slice(0, MAX_CAPTURED_STRING)}…[truncated]`
+          : (m.content ?? ''),
+        // The count is the whole point of this call — it is the number the
+        // capture path cannot produce.
+        embedCount: Array.isArray(m.embeds) ? m.embeds.length : 0,
+        embeds: (m.embeds ?? []).map((e) => ({
+          title: e.title ?? null,
+          description: typeof e.description === 'string'
+            ? `${e.description.slice(0, 200)}${e.description.length > 200 ? '…' : ''}`
+            : null,
+          color: e.color ?? null,
+          fieldCount: Array.isArray(e.fields) ? e.fields.length : 0,
+          footer: e.footer?.text ?? null,
+          timestamp: e.timestamp ?? null
+        })),
+        attachmentCount: m.attachments?.size ?? 0
+      }));
+
+      return { ok: true, channelID, requested: limit, returned: messages.length, messages };
+    } catch (err) {
+      return { ok: false, error: `Readback failed: ${err.message}` };
+    }
   }
 
   s3CommandsUrl() {
