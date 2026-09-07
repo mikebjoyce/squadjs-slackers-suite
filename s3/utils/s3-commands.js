@@ -3140,12 +3140,23 @@ export function createCommandHandlers(context) {
         ? ['', plugin.localize('slackersSquadServices.migrate.ddlNotesHeading'), ...generated.notes.map((n) => `• ${n}`)]
         : [];
 
+      // An incomplete script fails exactly like no script at all — same denial,
+      // on an object it never named — so the warning goes above the SQL rather
+      // than into the notes at the end, where it would be read after pasting.
+      const incompleteCount = generated.incomplete?.length || 0;
+      const incompleteLines = incompleteCount > 0
+        ? [plugin.localize('slackersSquadServices.migrate.ddlIncomplete', { count: incompleteCount }), '']
+        : [];
+
       if (generated.statements.length === 0) {
         await sendDiscordMessage(message.channel, {
           embeds: [{
-            color: 0x2ecc71,
+            // Green would read as "you are done" on the one path where the
+            // generator produced nothing AND could not render something.
+            color: incompleteCount > 0 ? 0xf39c12 : 0x2ecc71,
             title: plugin.localize('slackersSquadServices.migrate.ddlNothingToApply'),
             description: [
+              ...incompleteLines,
               onlyPlugin
                 ? plugin.localize('slackersSquadServices.migrate.ddlNothingToApplyScoped', { pluginName: onlyPlugin })
                 : plugin.localize('slackersSquadServices.migrate.ddlNothingToApplyBody'),
@@ -3173,17 +3184,18 @@ export function createCommandHandlers(context) {
       }
 
       const intro = plugin.localize('slackersSquadServices.migrate.ddlIntro');
+      const preamble = [...incompleteLines, intro].join('\n');
       // Fence overhead is "```sql\n" + "\n```"; the slack below covers the
-      // intro, the blank line after it, and the paging suffix in the title.
-      const budget = Math.max(4096 - intro.length - 64, 500);
+      // preamble, the blank line after it, and the paging suffix in the title.
+      const budget = Math.max(4096 - preamble.length - 64, 500);
       const chunks = chunkLines(sqlLines, budget);
 
       const embeds = chunks.map((chunk, i) => ({
-        color: 0x3498db,
+        color: incompleteCount > 0 ? 0xf39c12 : 0x3498db,
         title: chunks.length > 1
           ? plugin.localize('slackersSquadServices.migrate.ddlTitlePaged', { dialect: generated.dialect, i: i + 1, count: chunks.length })
           : plugin.localize('slackersSquadServices.migrate.ddlTitle', { dialect: generated.dialect }),
-        description: (i === 0 ? intro + '\n' : '') + '```sql\n' + chunk.join('\n') + '\n```',
+        description: (i === 0 ? preamble + '\n' : '') + '```sql\n' + chunk.join('\n') + '\n```',
         timestamp: new Date().toISOString()
       }));
 

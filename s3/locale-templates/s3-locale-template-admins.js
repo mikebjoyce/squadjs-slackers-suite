@@ -1,6 +1,6 @@
 /**
  * ─────────────────────────────────────────────────────────────────
- *  ADMIN-FACING TRANSLATION TEMPLATE — 1310 strings
+ *  ADMIN-FACING TRANSLATION TEMPLATE — 1311 strings
  * ─────────────────────────────────────────────────────────────────
  *
  *  GENERATED FILE — do not edit in place.
@@ -39,7 +39,7 @@
  *
  *  Strings only your staff can reach: replies to admin-gated commands, the
  *  scramble and diagnostic reports in your staff channel, and the admin half
- *  of !elo. 1310 strings — the bulk of what an admin reads day to day,
+ *  of !elo. 1311 strings — the bulk of what an admin reads day to day,
  *  but read by a handful of people who opted into running the thing, so a
  *  missed one costs far less than a missed broadcast.
  *
@@ -832,6 +832,8 @@ export const MESSAGES = {
       ddlIntro: '',
       // EN: **Notes:**
       ddlNotesHeading: '',
+      // EN: ⚠️ **Incomplete — this script alone will not unblock the migration.** {count} object(s) could not be rendered from the current models and have to be applied by hand as well. Applying only what is below and re-running `!s3 migrate force` will fail again, on an object this script does not name. See the notes on the last page.
+      ddlIncomplete: '',
       // EN: ✅ Nothing to Hand-Apply
       ddlNothingToApply: '',
       // EN: Every object the pending migrations declare is already present. If a version is still recorded as behind, `!s3 migrate force` will bring it up to date without any DDL.

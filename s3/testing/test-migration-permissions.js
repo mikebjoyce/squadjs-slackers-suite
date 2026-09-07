@@ -990,6 +990,118 @@ async function runHandApplyDdlTest(harness) {
 }
 
 /**
+ * A column a migration adds that the CURRENT model no longer declares.
+ *
+ * This is the gap the other hand-apply tests structurally cannot see: their
+ * fixtures put every touched column on the model, so `rawAttributes` always has
+ * a type to render. Real chains diverge from their models. Switch v3 adds
+ * `seedPresenceStart` to `SwitchPlugin_PlayerCooldowns`, v7 supersedes it with
+ * `SwitchPlugin_PlayerServerState`, and no *up* ever drops the column — so a
+ * live v9 table carries a column no model declares, whose type exists only
+ * inside the migration body.
+ *
+ * Found on a live create-only MySQL grant 2026-09-07. The generated script
+ * applied cleanly, `migrate force` was re-run, and it failed with the identical
+ * ALTER denial on a column the script never mentioned. The operator's only
+ * signal was a note phrased as a `touches`-authoring suspicion, sitting under a
+ * heading that says anything already present is left out — which reads as
+ * completeness.
+ *
+ * So this asserts the generator OWNS UP. It does not assert the column is
+ * rendered: it cannot be, without reading the migration body. Rendering it is a
+ * separate change, and when that lands this test should flip to asserting the
+ * statement rather than the confession.
+ */
+async function runHandApplyIncompleteTest(harness) {
+  const { engine, dbService } = harness;
+
+  // The model is the FINISHED shape and deliberately omits `supersededCol`,
+  // exactly as SwitchPlugin_PlayerCooldowns omits seedPresenceStart today.
+  dbService.defineModel('HandApplyLegacy', {
+    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    name: { type: DataTypes.STRING, allowNull: false }
+  }, {
+    tableName: 'HandApplyLegacy',
+    timestamps: false,
+    exportTier: 'ephemeral'
+  });
+
+  engine.registerMigrations('test-handapply-legacy', [
+    {
+      version: 1,
+      description: 'Create HandApplyLegacy',
+      backup: false,
+      touches: { creates: ['HandApplyLegacy'], columns: { HandApplyLegacy: ['id', 'name'] } },
+      up: async (q) => {
+        await q.createTable('HandApplyLegacy', {
+          id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+          name: { type: DataTypes.STRING, allowNull: false }
+        });
+      }
+    },
+    {
+      version: 2,
+      description: 'Add supersededCol — a column the model does not carry',
+      backup: false,
+      touches: { columns: { HandApplyLegacy: ['supersededCol'] } },
+      // Stands in for the denied ALTER. What matters downstream is the state it
+      // leaves: the table exists, the column does not, and v2 reads as pending.
+      up: async () => {
+        throw new Error("ALTER command denied to user 'fixture'@'localhost' for table 'HandApplyLegacy'");
+      }
+    }
+  ]);
+  dbService.registerExpectedVersion('test-handapply-legacy', 2, { models: ['HandApplyLegacy'] });
+
+  engine.confirmToken('__auto__');
+  let failure = null;
+  try {
+    await engine.runMigrations('test-handapply-legacy');
+  } catch (err) {
+    failure = err;
+  }
+  assert.ok(failure, 'v2 must fail, or this fixture no longer reproduces the denied ALTER');
+
+  const status = await dbService.verifySchemaVersions();
+  assert.ok(
+    status.pending.some((x) => x.pluginName === 'test-handapply-legacy'),
+    'test-handapply-legacy must still read as pending after the failure'
+  );
+
+  const generated = await engine.buildHandApplyDdl({ pluginName: 'test-handapply-legacy' });
+  const rendered = JSON.stringify(generated.statements.map((x) => x.sql));
+
+  assert.ok(
+    !generated.statements.some((x) => /supersededCol/i.test(x.sql)),
+    `the column is not on the model, so it cannot be rendered — got ${rendered}`
+  );
+
+  assert.ok(
+    Array.isArray(generated.incomplete) && generated.incomplete.length > 0,
+    'a script that cannot render a needed column must report itself incomplete'
+  );
+  const gap = generated.incomplete.find((x) => x.column === 'supersededCol');
+  assert.ok(
+    gap,
+    `the gap must name the column an operator has to add by hand — got ${JSON.stringify(generated.incomplete)}`
+  );
+  assert.equal(gap.table, 'HandApplyLegacy', 'the gap must name the table the column belongs to');
+  assert.equal(gap.pluginName, 'test-handapply-legacy', 'the gap must name the plugin whose migration needs it');
+  assert.equal(gap.version, 2, 'the gap must name the migration version that will still fail');
+
+  // The note has to predict the consequence, not just describe the symptom —
+  // an operator who reads "will still fail" stops and escalates instead of
+  // spending a diagnostic cycle rediscovering it.
+  const note = generated.notes.find((n) => n.includes('supersededCol'));
+  assert.ok(note, `a note must name the unrenderable column — got ${JSON.stringify(generated.notes)}`);
+  assert.match(
+    note,
+    /still fail/i,
+    `the note must say the migration still fails after applying the script — got: ${note}`
+  );
+}
+
+/**
  * The other half of the generator: a table that does not exist yet, so the
  * CREATE TABLE branch renders and runs rather than being skipped as present.
  * SQLite carries this one because it needs no Docker and the branch under test
@@ -1232,6 +1344,17 @@ async function registerTests() {
     const harness = await createFixture('sqlite', 'admin');
     try {
       await runHandApplyDdlCreateTest(harness);
+    } finally {
+      await harness.teardown();
+    }
+  });
+
+  // SQLite because the branch is dialect-independent: what varies by dialect is
+  // the rendering, and the point here is that nothing renders at all.
+  test('sqlite admin: hand-apply DDL reports itself incomplete for a column the model no longer carries', async () => {
+    const harness = await createFixture('sqlite', 'admin');
+    try {
+      await runHandApplyIncompleteTest(harness);
     } finally {
       await harness.teardown();
     }

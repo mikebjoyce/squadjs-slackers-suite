@@ -441,6 +441,7 @@ export const MESSAGES = {
       "ddlTitlePaged": "🧾 Hand-Apply DDL — {dialect} ({i}/{count})",
       "ddlIntro": "Run this as a database user that holds the missing grant, then `!s3 migrate force` to record the versions. Generated from the live schema, so anything already present is left out.",
       "ddlNotesHeading": "**Notes:**",
+      "ddlIncomplete": "⚠️ **Incomplete — this script alone will not unblock the migration.** {count} object(s) could not be rendered from the current models and have to be applied by hand as well. Applying only what is below and re-running `!s3 migrate force` will fail again, on an object this script does not name. See the notes on the last page.",
       "ddlNothingToApply": "✅ Nothing to Hand-Apply",
       "ddlNothingToApplyBody": "Every object the pending migrations declare is already present. If a version is still recorded as behind, `!s3 migrate force` will bring it up to date without any DDL.",
       "ddlNothingToApplyScoped": "`{pluginName}` has no pending migrations, or everything it declares is already present.",

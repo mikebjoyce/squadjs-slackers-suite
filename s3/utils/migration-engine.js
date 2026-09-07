@@ -1449,12 +1449,39 @@ export default class MigrationEngine {
    * from `showIndex()`. Table comparison is case-insensitive because production
    * MySQL runs with `lower_case_table_names=1`.
    *
+   * ─── WHEN THE SCRIPT CANNOT BE COMPLETE ───
+   *
+   * Rendering from `rawAttributes` means only what the *current* models declare
+   * can be rendered, and migrations replay *historical* schema states. Those
+   * diverge whenever a migration adds a column that a later one supersedes:
+   * Switch v3 adds `seedPresenceStart`, `lastSeedBonusRoundID` and
+   * `seedBonusTokensEarned` to `SwitchPlugin_PlayerCooldowns`, v7 supersedes
+   * them with `SwitchPlugin_PlayerServerState`, and no *up* ever drops them, so
+   * a real v9 table still carries columns no model declares. Their type exists
+   * only inside the migration body, which this cannot read.
+   *
+   * Every such gap is recorded in `incomplete`. That flag is load-bearing and
+   * must be surfaced to the operator, because the failure it predicts is
+   * indistinguishable from the one they started with: they apply the script,
+   * re-run `migrate force`, and get the identical denial on a column the script
+   * never mentioned. Verified on a live create-only MySQL grant 2026-09-07 —
+   * the script applied cleanly and the migration failed anyway. A partial
+   * script presented as a complete one costs an operator a whole diagnostic
+   * cycle, so `notes` states the consequence before the cause.
+   *
    * @param {{pluginName?: string}} [opts] - restrict to one migration group.
-   * @returns {Promise<{dialect: string, statements: Array<{pluginName: string, version: number, table: string, kind: string, sql: string}>, notes: string[]}>}
+   * @returns {Promise<{dialect: string, statements: Array<{pluginName: string, version: number, table: string, kind: string, sql: string}>, notes: string[], incomplete: Array<{pluginName: string, version: number|null, table: string|null, column: string|null}>}>}
    */
   async buildHandApplyDdl({ pluginName = null } = {}) {
     const db = this.dbService;
-    const out = { dialect: db.getDialect?.() || 'unknown', statements: [], notes: [] };
+    const out = { dialect: db.getDialect?.() || 'unknown', statements: [], notes: [], incomplete: [] };
+
+    // A gap the operator has to close by hand. `notes` gets the prose; the
+    // structured entry is what the renderer counts to decide whether to warn.
+    const markIncomplete = ({ pluginName: p = null, version = null, table = null, column = null }, note) => {
+      out.incomplete.push({ pluginName: p, version, table, column });
+      out.notes.push(note);
+    };
 
     const connector = db.getConnector?.();
     if (!connector) {
@@ -1479,7 +1506,10 @@ export default class MigrationEngine {
       const rows = await qi.showAllTables();
       liveTables = new Set(rows.map((r) => String(r?.tableName ?? r).toLowerCase()));
     } catch (err) {
-      out.notes.push(`Could not list tables (${err.message}) — every table is treated as already present, so only column statements are emitted.`);
+      markIncomplete(
+        {},
+        `Could not list tables (${err.message}) — every table is treated as already present, so only column statements are emitted.`
+      );
     }
 
     const describeCache = new Map();
@@ -1537,7 +1567,8 @@ export default class MigrationEngine {
         const context = { pluginName: target.pluginName, version: migration.version };
         const touches = migration.touches;
         if (!touches) {
-          out.notes.push(
+          markIncomplete(
+            { pluginName: target.pluginName, version: migration.version },
             `${target.pluginName} v${migration.version} declares no \`touches\`, so its DDL cannot be derived — ` +
             'it has to be applied by running the migration itself.'
           );
@@ -1549,7 +1580,10 @@ export default class MigrationEngine {
           if (liveTables.has(String(table).toLowerCase())) continue;
           const model = db.getModelForTable(table);
           if (!model) {
-            out.notes.push(`No registered model resolves to table \`${table}\` — its CREATE TABLE cannot be rendered.`);
+            markIncomplete(
+              { pluginName: target.pluginName, version: migration.version, table },
+              `No registered model resolves to table \`${table}\` — its CREATE TABLE cannot be rendered.`
+            );
             continue;
           }
           const attributes = qg.attributesToSQL(model.rawAttributes, { context: 'createTable', table });
@@ -1563,7 +1597,10 @@ export default class MigrationEngine {
           if (!liveTables.has(String(table).toLowerCase())) continue; // covered by the CREATE above
           const model = db.getModelForTable(table);
           if (!model) {
-            out.notes.push(`No registered model resolves to table \`${table}\` — its ADD COLUMN statements cannot be rendered.`);
+            markIncomplete(
+              { pluginName: target.pluginName, version: migration.version, table },
+              `No registered model resolves to table \`${table}\` — its ADD COLUMN statements cannot be rendered.`
+            );
             continue;
           }
           const present = await columnsOf(table);
@@ -1571,9 +1608,13 @@ export default class MigrationEngine {
             if (present.has(String(column).toLowerCase())) continue;
             const attribute = model.rawAttributes?.[column];
             if (!attribute) {
-              out.notes.push(
-                `\`${table}.${column}\` is declared in \`touches\` but is not an attribute of model ` +
-                `\`${model.name}\` — check whether \`touches\` was written in model names rather than table names.`
+              markIncomplete(
+                { pluginName: target.pluginName, version: migration.version, table, column },
+                `\`${table}.${column}\` is missing from the database and cannot be rendered, so ${target.pluginName} ` +
+                `v${migration.version} will still fail on it after this script is applied. Model \`${model.name}\` ` +
+                'does not declare the column, and its type exists only inside the migration body. Either a later ' +
+                'migration superseded it and the model dropped it while the column itself was never dropped, or ' +
+                '`touches` names a model where it should name a table. Add the column by hand before re-running.'
               );
               continue;
             }
