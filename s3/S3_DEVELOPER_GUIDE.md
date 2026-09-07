@@ -1681,7 +1681,15 @@ node tools/schema-version.mjs migrate --plugin smart-assign  # Single plugin onl
 node tools/schema-version.mjs check --db-path ./custom.sqlite  # Custom DB path
 ```
 
-The tool uses the same `DBService` + `MigrationEngine` infrastructure as the live S³ plugin, bootstrapping a Sequelize connection directly to the database file. It mirrors the migration manifest that each consumer plugin registers at runtime.
+The tool uses the same `DBService` + `MigrationEngine` infrastructure as the live S³ plugin, bootstrapping a Sequelize connection directly to the database file. It does not keep its own copy of what each plugin registers — it drives every plugin's real registration path and reads back the result, so a version bump or a new migration is picked up with no edit to the tool.
+
+It used to keep a copy, and that is worth knowing about because the failure was silent. The copy was maintained by hand, and by the time anyone ran it it was four versions behind across three plugins, had lost `switch`, `s3-players` and `db-log` entirely, and carried a `smart-assign` v2 that did something different from the real v2 under the same version number — which `migrate` would have recorded as applied while the real v2 never ran. `test-schema-version-cli.js` now asserts the tool reaches every plugin that registers a version, because a plugin missing from its report reads exactly like a plugin with nothing to do.
+
+Three limits worth knowing before reaching for it:
+
+- **SQLite only.** The dialect is fixed at the connection. A community on MySQL or Postgres migrates through `!s3 migrate`.
+- **`check` and `pending` are not read-only against the database.** Mounting `DBService` bootstraps `S3_Locks` and `S3_Servers` unconditionally — the lock table is what every other migration serialises on — so on a database that has never run multi-server S³ they are created and `s3-core` v1 is recorded. Take a copy first if that matters.
+- **`--force` is a real authorization, not just prompt suppression.** It hands the engine the same token `!s3 migrate force` does. There is no way to migrate through this tool without granting it.
 
 ### 9.7 — Offline Schema Health Checker
 
@@ -2144,6 +2152,7 @@ node s3/testing/test-game-state-service.js
 | `test-migration-pipeline.js` | End-to-end migration run: ordering, backup, version bump |
 | `test-migration-conformance.js` | Migration definitions match the expected shape/contract |
 | `test-migration-partial-retry.js` | A migration whose `up()` commits real DDL/DML but fails post-commit `touches` verification is safely retryable — `addColumn`/`bulkInsert` don't crash on a raw duplicate-column/duplicate-key error, real engines |
+| `test-schema-version-cli.js` | The offline CLI reaches every plugin that registers a schema version, and `migrate --force` actually migrates — spawns the real tool against throwaway SQLite |
 | `test-migration-data-assertions.js` | Migrations' data effects are asserted, not assumed — see `TASK_MIGRATION_DATA_ASSERTIONS.md` |
 | `test-drift-recovery-matrix.js` | Drift recovery across every DB state a server can be in — brand new, behind, drifted, behind *and* drifted, multi-plugin — on SQLite, MySQL and Postgres |
 | `test-multi-process-locking.js` | The migration lock across **real child processes** on one SQLite file: the body runs once, the loser re-checks and comes up clean, the lock is released rather than left to expire, and drift found while another process holds the lock does not roll `S3_SchemaVersions` back |

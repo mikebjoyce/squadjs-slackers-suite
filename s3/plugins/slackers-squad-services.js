@@ -181,7 +181,7 @@ import PlayersService from '../utils/players-service.js';
 import ServerConfigService from '../utils/server-config-service.js';
 import LoggingService from '../utils/logging-service.js';
 import crypto from 'node:crypto';
-import { registerS3DiscordCommands } from '../utils/s3-discord.js';
+import { registerS3DiscordCommands, sendDiscordMessage } from '../utils/s3-discord.js';
 import { configureStderrDiagnostics, flushStderrDiagnostics, stderrError, stderrWarn } from '../utils/s3-stderr.js';
 import { MIGRATION_LOCK_UNAVAILABLE } from '../utils/migration-engine.js';
 import { serverLabels, publishServerLabel } from '../utils/s3-server-label.js';
@@ -1455,12 +1455,34 @@ export default class SlackersSquadServices extends BasePlugin {
       try {
         const channel = await discordClient.channels.fetch(channelID);
         if (channel) {
-          await channel.send({ embeds: [embed] });
-          this.verbose(1, `[S3 Migration] Token embed posted to Discord — ${pending.length} plugin(s) pending.`);
+          // Through sendDiscordMessage(), not channel.send() directly. This was
+          // the one embed in the suite that bypassed the shared sender, and it
+          // is the embed that can least afford to: it carries the confirmation
+          // token, and the token exists nowhere else an operator can reach.
+          // When it fails, someone running autoMigrate:false — the whole
+          // audience for a gated migration — is left with no way to proceed.
+          //
+          // The helper adds three things this needs. It retries once on a 429,
+          // which a boot-time burst can provoke. It falls back to the older
+          // single-embed payload shape on "Cannot send an empty message",
+          // which is the error this actually failed with in the field. And it
+          // applies the server label, so that on a shared database two servers
+          // prompting at once produce two tokens an operator can tell apart —
+          // without it they are two identical embeds with different tokens.
+          const sent = await sendDiscordMessage(
+            channel, { embeds: [embed] }, 'S3 Migration', (...a) => this.verbose(...a)
+          );
+          if (sent) {
+            this.verbose(1, `[S3 Migration] Token embed posted to Discord — ${pending.length} plugin(s) pending.`);
+          } else {
+            // sendDiscordMessage() reports the reason itself and returns false
+            // rather than throwing, so say what to do about it.
+            this.verbose(1, `[S3 Migration] Token embed could not be posted. Token: ${token} — use !s3 confirm ${token} in the admin channel, or !s3 migrate force, or set autoMigrate: true in S³ config.`);
+          }
         }
       } catch (err) {
-        this.verbose(1, `[S3 Migration] Failed to post token embed: ${err.message}`);
-        this.verbose(1, `[S3 Migration] Use !s3 migrate force or set autoMigrate: true in S³ config to run migrations.`);
+        this.verbose(1, `[S3 Migration] Failed to reach the admin channel: ${err.message}`);
+        this.verbose(1, `[S3 Migration] Token: ${token} — use !s3 confirm ${token}, or !s3 migrate force, or set autoMigrate: true in S³ config.`);
       }
     } else {
       this.verbose(1, `[S3 Migration] Cannot prompt — Discord not configured. ${pending.length} plugin(s) pending. Use !s3 migrate force or autoMigrate: true.`);

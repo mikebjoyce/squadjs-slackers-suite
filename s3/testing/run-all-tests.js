@@ -155,6 +155,13 @@ const CATEGORY_TESTS = {
     // raw duplicate-column/duplicate-key driver error. SQLite always runs,
     // MySQL self-skips when unreachable, same shape as the dialect suites above.
     'test-migration-partial-retry.js',
+    // The offline CLI had no test and drifted until it could not run: it kept a
+    // hand-maintained copy of every plugin's version and migrations, which fell
+    // four versions behind across three plugins and lost three others entirely.
+    // It now harvests the real registrations, and this asserts it reaches all of
+    // them — a plugin missing from its report reads like a plugin with nothing
+    // to do. Spawns the real tool; builds an assembly, so it is not instant.
+    'test-schema-version-cli.js',
     // Runs the real install.cjs into throwaway directories and asserts the
     // target layout — including that dev-harness/ can never be deployed.
     'test-install-layout.js',

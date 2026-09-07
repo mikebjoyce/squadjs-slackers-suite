@@ -311,6 +311,32 @@ export default class DBLog extends S3PluginBase {
     this._registerMigrations();
     await this.verifyAndRunMigrations(PLUGIN_NAME);
 
+    // Do not touch our tables until the migrations that create them have run.
+    //
+    // verifyAndRunMigrations() returns null for three different outcomes and its
+    // own docblock says so: DB unavailable, schema already current, and
+    // pending-but-unconfirmed. The last is an ordinary first boot with
+    // autoMigrate off — S³ posts the Discord prompt and waits for an operator.
+    // Reading null as "ready" and upserting anyway turns that wait into a full
+    // ERROR with a stack trace ("no such table: DBLog_Servers"), mirrored to
+    // stderr, at exactly the moment an operator is being asked to confirm.
+    // The base class is explicit that the way to tell the cases apart is to ask
+    // verifySchemaVersions() rather than infer from the return value.
+    //
+    // This plugin exists so that database trouble degrades to a logged skip
+    // rather than an unhandled failure. A schema that is not ready yet gets the
+    // same treatment: say so once, mount nothing, and let the restart after the
+    // operator confirms bring us up properly.
+    const versions = await this.s3db.verifySchemaVersions();
+    if ((versions?.pending ?? []).some((p) => p.pluginName === PLUGIN_NAME)) {
+      this.verbose(
+        1,
+        `[DBLog] Migrations for "${PLUGIN_NAME}" are not applied yet — not logging until they are. ` +
+          'Confirm them (!s3 migrate force, or !s3 confirm <token>), then restart.'
+      );
+      return;
+    }
+
     const serverId = this._serverId;
 
     await this._withDb(async (t) => {
