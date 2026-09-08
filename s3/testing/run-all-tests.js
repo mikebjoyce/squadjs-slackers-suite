@@ -194,6 +194,8 @@ const CATEGORY_TESTS = {
     'test-request-team-change-eosid.js',
     'test-migration-pipeline.js',
     'test-migrate-flag-safety.js',
+    'test-migration-prompt-identity.js',
+    'test-migration-batch-isolation.js',
     'test-command-routing.js'
   ],
   4: [

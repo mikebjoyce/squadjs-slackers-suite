@@ -478,8 +478,11 @@ export const MESSAGES = {
       "migrationEngineNotAvailable": "❌ Migration Engine Not Available",
       "theDatabaseServiceOr": "The database service or migration engine has not been initialised.",
       "invalidOrExpiredToken": "❌ Invalid or Expired Token",
+      "onServerPrefix": "On **{identity}**: ",
       "theTokenDidNot": "The token did not match the latest migration prompt, or the 5-minute window expired. ",
       "checkS3MigrateStatus2": "Check `!s3 migrate status` for pending migrations and use `!s3 migrate force` to bypass the confirmation flow.",
+      "tokenNotIssuedHereTitle": "↪️ Token Not Issued Here",
+      "tokenNotIssuedHereBody": "**{identity}** did not issue token `{token}`. If a migration prompt from another server is in this channel, use the token from that message; otherwise run `!s3 migrate status` here.",
       "noPendingMigrations": "✅ No Pending Migrations",
       "tokenAcceptedButNo": "Token accepted, but no migrations are pending. All plugin schema versions are up to date."
     },
@@ -716,6 +719,7 @@ export const MESSAGES = {
       "sMigrationCancelled": "⏹️ S³ Migration Cancelled",
       "sMigrationAutoCancelled": "⏰ S³ Migration Auto-Cancelled",
       "versionNew": "(new)",
+      "promptFromServer": "🖥️ Migration prompt from **{identity}** — the confirmation token below is accepted only by this server.",
       "lineWithPending": "  {pluginName}: {fromVer} → v{toVer} ({behind} pending)",
       "line": "  {pluginName}: {fromVer} → v{toVer}",
       "typeConfirmToRun": "Type `!s3 confirm <token>` to run migrations.",
@@ -726,6 +730,9 @@ export const MESSAGES = {
       "appliedSkipped": "Applied: **{totalApplied}** | Skipped: **{totalSkipped}**",
       "unknownError": "Unknown error",
       "errorLine": "**Error:** {errorMsg}",
+      "failureLine": "• **{pluginName}** — {errorMsg}",
+      "partialProgress": "**{succeeded}** of **{total}** plugins migrated. The rest stay pending and can be retried once the cause is fixed.",
+      "batchAborted": "The remaining plugins were not attempted — migrations cannot be serialised on this database, so every one of them would have failed for the same reason.",
       "deferredUntilRestart": "Migrations have been deferred. The pending state will persist until the next restart or `!s3 migrate force`."
     },
     "sourceGroups": {

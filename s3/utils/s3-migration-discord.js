@@ -24,15 +24,55 @@
  *
  */
 
+import { serverLabels } from './s3-server-label.js';
+
+/**
+ * A short, operator-facing name for the server this process runs — for embeds
+ * whose meaning depends on which of several processes posted them, above all
+ * the migration prompt, whose token exactly one process will accept.
+ *
+ * The registry id is always in the string. On a loopback test rig two installs
+ * share a host:port, and the id is the only part guaranteed to differ; the
+ * Run 1 collision was two visually identical prompts differing only by token.
+ * A distinct label or alias goes in front when the registry has one — an
+ * operator matches "slackers-2" faster than a bare number — and host:port is
+ * appended when the SquadJS server object carries it, as a third anchor.
+ *
+ * @param {object} db - DBService, for getServerID()/getRegisteredServers().
+ * @param {object} [server] - The SquadJS server, for options.host/queryPort.
+ * @returns {Promise<string>}
+ */
+async function formatServerIdentity(db, server = null) {
+  const id = db?.getServerID?.() ?? '?';
+  let name = null;
+  try {
+    if (db?.isReady?.() && typeof db.getRegisteredServers === 'function') {
+      const rows = await db.getRegisteredServers();
+      const mine = rows.find((r) => r.serverID === id) ?? null;
+      name = serverLabels(rows).get(id) || mine?.alias || null;
+    }
+  } catch {
+    // A name is a nicety; the id carries the load.
+  }
+  const host = server?.options?.host;
+  const port = server?.options?.queryPort;
+  const hostPart = host ? ` · ${host}${port ? `:${port}` : ''}` : '';
+  return name ? `${name} (server ${id}${hostPart})` : `server ${id}${hostPart}`;
+}
+
 /**
  * Build a migration status embed from pending data.
  * @param {object} plugin - Plugin instance, for localize().
  * @param {Array<{pluginName: string, currentVersion: number, expectedVersion: number, behind: number}>} pending
  * @param {string} [status='pending'] - 'pending', 'running', 'complete', 'failed', 'cancelled', 'timeout'
  * @param {Object} [result] - Optional result from runMigrations()
+ * @param {string} [identity] - Operator-facing server name from formatServerIdentity().
+ *        When set on a 'pending' prompt it becomes the first line, so two
+ *        processes prompting against one shared database post embeds an
+ *        operator can tell apart before reading as far as the token.
  * @returns {Object} Discord embed object
  */
-function buildMigrationEmbed(plugin, pending, status = 'pending', result = null) {
+function buildMigrationEmbed(plugin, pending, status = 'pending', result = null, identity = null) {
   const statusConfig = {
     pending:   { color: 0xf39c12, title: plugin.localize('slackersSquadServices.migration.sMigrationRequired'),      emoji: '⏳' },
     running:   { color: 0x3498db, title: plugin.localize('slackersSquadServices.migration.sMigrationInProgress'),    emoji: '🔄' },
@@ -59,11 +99,20 @@ function buildMigrationEmbed(plugin, pending, status = 'pending', result = null)
     });
   });
 
-  const description = [
-    '```',
-    ...migrationLines,
-    '```'
-  ];
+  const description = [];
+
+  // First line, ahead of the schema list: on a shared database two processes
+  // prompt with two different tokens, and the footer label they carry
+  // suppresses itself in exactly that first-boot state (only one server
+  // registered yet). Naming the server here does not depend on that label.
+  if (identity && status === 'pending') {
+    description.push(
+      plugin.localize('slackersSquadServices.migration.promptFromServer', { identity }),
+      ''
+    );
+  }
+
+  description.push('```', ...migrationLines, '```');
 
   if (status === 'pending') {
     description.push(
@@ -109,4 +158,4 @@ function buildMigrationEmbed(plugin, pending, status = 'pending', result = null)
   };
 }
 
-export { buildMigrationEmbed };
+export { buildMigrationEmbed, formatServerIdentity };

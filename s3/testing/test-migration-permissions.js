@@ -1102,6 +1102,94 @@ async function runHandApplyIncompleteTest(harness) {
 }
 
 /**
+ * The same shape as the test above, with the one difference that closes it: the
+ * migration declares the type of the column its own model no longer carries.
+ *
+ * This is the case an ALTER-less deployment actually lives in. Switch v3 adds
+ * three seed-bonus columns, v7 supersedes them, the model drops them and the
+ * table keeps them — so on a restricted grant the generator used to hand the
+ * operator a script that was missing exactly the columns the migration would
+ * then fail on, and say so in a note. `touches.columnTypes` gives it the type,
+ * and the script becomes complete instead of merely honest.
+ *
+ * Asserted against a rendered ALTER rather than against `incomplete` being
+ * empty, because "reported no gap" and "produced the statement" are different
+ * claims and only the second one is worth anything to an operator pasting SQL.
+ */
+async function runHandApplyDeclaredTypeTest(harness) {
+  const { engine, dbService } = harness;
+
+  dbService.defineModel('HandApplyDeclared', {
+    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    name: { type: DataTypes.STRING, allowNull: false }
+  }, {
+    tableName: 'HandApplyDeclared',
+    timestamps: false,
+    exportTier: 'ephemeral'
+  });
+
+  engine.registerMigrations('test-handapply-declared', [
+    {
+      version: 1,
+      description: 'Create HandApplyDeclared',
+      backup: false,
+      touches: { creates: ['HandApplyDeclared'], columns: { HandApplyDeclared: ['id', 'name'] } },
+      up: async (q) => {
+        await q.createTable('HandApplyDeclared', {
+          id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+          name: { type: DataTypes.STRING, allowNull: false }
+        });
+      }
+    },
+    {
+      version: 2,
+      description: 'Add supersededCol — not on the model, but the migration declares its type',
+      backup: false,
+      touches: {
+        columns: { HandApplyDeclared: ['supersededCol'] },
+        columnTypes: { HandApplyDeclared: { supersededCol: { type: DataTypes.STRING, allowNull: true } } }
+      },
+      up: async () => {
+        throw new Error("ALTER command denied to user 'fixture'@'localhost' for table 'HandApplyDeclared'");
+      }
+    }
+  ]);
+  dbService.registerExpectedVersion('test-handapply-declared', 2, { models: ['HandApplyDeclared'] });
+
+  engine.confirmToken('__auto__');
+  let failure = null;
+  try {
+    await engine.runMigrations('test-handapply-declared');
+  } catch (err) {
+    failure = err;
+  }
+  assert.ok(failure, 'v2 must fail, or this fixture no longer reproduces the denied ALTER');
+
+  const generated = await engine.buildHandApplyDdl({ pluginName: 'test-handapply-declared' });
+  const rendered = JSON.stringify(generated.statements.map((x) => x.sql));
+
+  const statement = generated.statements.find((x) => x.kind === 'column' && /supersededCol/i.test(x.sql));
+  assert.ok(
+    statement,
+    `the migration declares the type, so the column must render as DDL — got ${rendered}`
+  );
+  assert.match(
+    statement.sql,
+    /alter\s+table/i,
+    `the rendered statement must be the ADD COLUMN an operator can paste — got: ${statement.sql}`
+  );
+
+  assert.ok(
+    !generated.incomplete.some((x) => x.column === 'supersededCol'),
+    `a column the migration declares must not be reported as a gap — got ${JSON.stringify(generated.incomplete)}`
+  );
+  assert.ok(
+    !generated.notes.some((n) => n.includes('supersededCol')),
+    `no note should tell the operator to hand-write a column that rendered — got ${JSON.stringify(generated.notes)}`
+  );
+}
+
+/**
  * The other half of the generator: a table that does not exist yet, so the
  * CREATE TABLE branch renders and runs rather than being skipped as present.
  * SQLite carries this one because it needs no Docker and the branch under test
@@ -1355,6 +1443,15 @@ async function registerTests() {
     const harness = await createFixture('sqlite', 'admin');
     try {
       await runHandApplyIncompleteTest(harness);
+    } finally {
+      await harness.teardown();
+    }
+  });
+
+  test('sqlite admin: hand-apply DDL renders a column the model dropped but the migration declares', async () => {
+    const harness = await createFixture('sqlite', 'admin');
+    try {
+      await runHandApplyDeclaredTypeTest(harness);
     } finally {
       await harness.teardown();
     }

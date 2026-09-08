@@ -185,7 +185,7 @@ import { registerS3DiscordCommands, sendDiscordMessage } from '../utils/s3-disco
 import { configureStderrDiagnostics, flushStderrDiagnostics, stderrError, stderrWarn } from '../utils/s3-stderr.js';
 import { MIGRATION_LOCK_UNAVAILABLE } from '../utils/migration-engine.js';
 import { serverLabels, publishServerLabel } from '../utils/s3-server-label.js';
-import { buildMigrationEmbed } from '../utils/s3-migration-discord.js';
+import { buildMigrationEmbed, formatServerIdentity } from '../utils/s3-migration-discord.js';
 import { localize as lookupMessage, DEFAULT_LANGUAGE } from '../utils/s3-i18n.js';
 
 /**
@@ -1435,7 +1435,14 @@ export default class SlackersSquadServices extends BasePlugin {
     // Build token embed using the existing buildMigrationEmbed helper.
     // The embed already includes generic instructions from buildMigrationEmbed().
     // Append the token-specific line so the admin knows which token to use.
-    const embed = buildMigrationEmbed(this, pending, 'pending', null);
+    //
+    // The identity line is unconditional — not gated on getKnownServerCount()
+    // the way the footer label is. On a first shared-database boot both
+    // processes still read the count as 1, skip the claim election above, and
+    // post; the label they would carry is null in that exact window. A token
+    // only one process accepts has to say which process asked regardless.
+    const identity = await formatServerIdentity(db, this.server);
+    const embed = buildMigrationEmbed(this, pending, 'pending', null, identity);
     // Said before the token, not after it. An admin who reads only as far as
     // the thing they have to type has still read that this changes the schema
     // every server shares, and they may well be thinking about only one.

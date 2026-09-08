@@ -578,6 +578,28 @@ const SwitchDB = {
               'lastSeedBonusRoundID',
               'seedBonusTokensEarned'
             ]
+          },
+          // The last three are the v2.6.0 split's leftovers: gone from the
+          // model, still in the table, because dropping them needs an ALTER
+          // grant the live MySQL user does not have (see the model comment
+          // above). `rawAttributes` therefore cannot supply their type, and
+          // without it `!s3 migrate ddl` can only tell an operator on a
+          // restricted grant that three columns are missing from the script
+          // and must be written by hand — on the one deployment that needs
+          // the script most. Declared here so the generated DDL is complete.
+          //
+          // These mirror the addColumn() calls in `up` below and must keep
+          // mirroring them; `qi.DataTypes` is `_s3db.getDataTypes()`, so both
+          // sides name the same objects. The two are held together by
+          // `test-migration-conformance.js`, which fails any column named in
+          // `touches.columns` that neither the model nor `columnTypes`
+          // declares.
+          columnTypes: {
+            SwitchPlugin_PlayerCooldowns: {
+              seedPresenceStart: { type: plugin._s3db.getDataTypes().DATE, allowNull: true },
+              lastSeedBonusRoundID: { type: plugin._s3db.getDataTypes().STRING, allowNull: true },
+              seedBonusTokensEarned: { type: plugin._s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 }
+            }
           }
         },
         up: async (qi) => {

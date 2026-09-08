@@ -1,6 +1,6 @@
 /**
  * ─────────────────────────────────────────────────────────────────
- *  ADMIN-FACING TRANSLATION TEMPLATE — 1311 strings
+ *  ADMIN-FACING TRANSLATION TEMPLATE — 1318 strings
  * ─────────────────────────────────────────────────────────────────
  *
  *  GENERATED FILE — do not edit in place.
@@ -39,7 +39,7 @@
  *
  *  Strings only your staff can reach: replies to admin-gated commands, the
  *  scramble and diagnostic reports in your staff channel, and the admin half
- *  of !elo. 1311 strings — the bulk of what an admin reads day to day,
+ *  of !elo. 1318 strings — the bulk of what an admin reads day to day,
  *  but read by a handful of people who opted into running the thing, so a
  *  missed one costs far less than a missed broadcast.
  *
@@ -904,10 +904,16 @@ export const MESSAGES = {
       theDatabaseServiceOr: '',
       // EN: ❌ Invalid or Expired Token
       invalidOrExpiredToken: '',
+      // EN: On **{identity}**:
+      onServerPrefix: '',
       // EN: The token did not match the latest migration prompt, or the 5-minute window expired.
       theTokenDidNot: '',
       // EN: Check `!s3 migrate status` for pending migrations and use `!s3 migrate force` to bypass the confirmation flow.
       checkS3MigrateStatus2: '',
+      // EN: ↪️ Token Not Issued Here
+      tokenNotIssuedHereTitle: '',
+      // EN: **{identity}** did not issue token `{token}`. If a migration prompt from another server is in this channel, use the token from that message; otherwise run `!s3 migrate status` here.
+      tokenNotIssuedHereBody: '',
       // EN: ✅ No Pending Migrations
       noPendingMigrations: '',
       // EN: Token accepted, but no migrations are pending. All plugin schema versions are up to date.
@@ -1362,6 +1368,8 @@ export const MESSAGES = {
       sMigrationAutoCancelled: '',
       // EN: (new)
       versionNew: '',
+      // EN: 🖥️ Migration prompt from **{identity}** — the confirmation token below is accepted only by this server.
+      promptFromServer: '',
       // EN:   {pluginName}: {fromVer} → v{toVer} ({behind} pending)
       lineWithPending: '',
       // EN:   {pluginName}: {fromVer} → v{toVer}
@@ -1382,6 +1390,12 @@ export const MESSAGES = {
       unknownError: '',
       // EN: **Error:** {errorMsg}
       errorLine: '',
+      // EN: • **{pluginName}** — {errorMsg}
+      failureLine: '',
+      // EN: **{succeeded}** of **{total}** plugins migrated. The rest stay pending and can be retried once the cause is fixed.
+      partialProgress: '',
+      // EN: The remaining plugins were not attempted — migrations cannot be serialised on this database, so every one of them would have failed for the same reason.
+      batchAborted: '',
       // EN: Migrations have been deferred. The pending state will persist until the next restart or `!s3 migrate force`.
       deferredUntilRestart: '',
     },

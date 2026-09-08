@@ -1429,12 +1429,13 @@ Every migration **must** declare which tables, columns, seed rows, and data post
 - **Post-migration verification** — after each migration commits, `_verifyMigrationResult()` confirms every declared table/column/row actually exists in the live database, and that every declared data post-condition holds. Silent failures (e.g. `ADD COLUMN` that fails silently because the MySQL user lacks `ALTER` privileges) are caught immediately.
 - **Ongoing drift detection** — on every S³ mount, the engine aggregates all `touches.rows` via `getExpectedRows()` and all `touches.data` via `getExpectedData()`, then re-checks both. This catches data loss across connector swaps, DB restores, or manual edits.
 
-**Five sub-fields:**
+**Six sub-fields:**
 
 | Field | Format | Purpose |
 |-------|--------|---------|
 | `creates` | `string[]` — table names that this migration creates | Post-migration verifier checks `showAllTables()` |
 | `columns` | `Record<string, string[]>` — table name → column names added to *existing* tables | Post-migration verifier checks `describeTable()` for each column |
+| `columnTypes` | `Record<string, Record<string, attribute>>` — table name → column name → the Sequelize attribute (`{ type, allowNull, defaultValue }`, or a bare DataType) | Only needed for a column no model declares. Lets `buildHandApplyDdl()` render it. See [§9.1.4](#914--declaring-types-for-superseded-columns-touchescolumntypes) |
 | `rows` | `Record<string, Array<{key: string, value: string}>>` — table name → seed row matchers. Each entry: `{ key: '<columnName>', value: '<expectedValue>' }` tells the verifier to find a row where `key` column equals `value` | Verified after migration commits, and on every S³ mount via drift detection |
 | `data` | `Record<string, Array<{column: string, notNull: true}>>` — table name → post-conditions on column *values* | Verified after migration commits, and on every S³ mount via drift detection. See [§9.1.3](#913--data-post-conditions-touchesdata) |
 | `abandoned` | `string[]` — tables this migration names that no model backs, on purpose | Exempts them from the backup-coverage check below. Only correct for a table the suite replaced rather than altered |
@@ -1589,6 +1590,45 @@ An empty array asserts nothing and contributes nothing to drift detection. It ex
 That check is a source scan, so it is honest about its limits: it sees `qi.*` calls only. A migration that reaches a model through `qi.db.getModel()` and calls `.update()` on it is invisible to it. It catches the shape that actually shipped broken, not every possible one.
 
 **Tests:** `s3/testing/test-migration-data-assertions.js` covers registration validation, the post-commit failure, the hand-migrated state, the drift path, and the rollback — on SQLite, MySQL and Postgres. It includes a control case asserting that the *same* no-op backfill passes silently when nothing is declared, so the mechanism cannot pass vacuously.
+
+#### 9.1.4 — Declaring Types for Superseded Columns (`touches.columnTypes`)
+
+`!s3 migrate ddl` renders a hand-apply script for a deployment whose database user cannot run the migration itself — typically one holding `CREATE` but not `ALTER`. Every statement comes out of Sequelize's own query generator, reading column types from the model's `rawAttributes`, so the SQL an operator pastes is the SQL the engine would have issued.
+
+That works for as long as the model still declares the column. It stops working in one specific and entirely ordinary case: **a migration adds a column that a later migration supersedes, the model drops it, and the column itself is never dropped from the table.** Dropping a column needs the same `ALTER` grant the operator is working around, and `DROP COLUMN` is the one migration step a rollback cannot undo — so leaving it in place is usually correct. But the type then exists only inside the migration body, which the generator cannot read.
+
+Before `columnTypes`, the generator could only mark such a column `incomplete` and warn. That warning is honest, but it lands on precisely the deployment that needs the script most: the operator applies it, re-runs `migrate force`, and gets the identical denial on a column the script never mentioned.
+
+Declare the type on the migration that adds it:
+
+```js
+{
+  version: 3,
+  description: 'Add token bucket + seed bonus columns',
+  touches: {
+    columns: {
+      SwitchPlugin_PlayerCooldowns: ['tokenBalance', 'seedPresenceStart']
+    },
+    // Only for columns the model no longer carries. `tokenBalance` is still on
+    // the model and needs no entry; `seedPresenceStart` was superseded in v2.6.0
+    // and removed from the model while staying in the table.
+    columnTypes: {
+      SwitchPlugin_PlayerCooldowns: {
+        seedPresenceStart: { type: plugin._s3db.getDataTypes().DATE, allowNull: true }
+      }
+    }
+  },
+  up: async (qi) => { /* addColumn() with the same definitions */ }
+}
+```
+
+`qi.DataTypes` and `_s3db.getDataTypes()` resolve to the same object, so a declaration and the `up()` body it mirrors name the same types.
+
+**The model always wins.** `columnTypes` is read only when `rawAttributes` has nothing, so it can never override a live model or drift ahead of one. A column that is still modelled needs no entry.
+
+**Why declared rather than recovered.** Capturing the types by running `up()` against a recording query interface was considered and rejected. Migration bodies in this suite already reach past `qi` — `backfillServerID()` consults `detectPriorInterleaving()` on the live `DBService` — so simulation would issue real queries, and it would turn a command documented as read-only into a way to execute arbitrary migration code against a production database. A declaration cannot do that, and it sits in the same object as the body it describes.
+
+**Enforcement:** `s3/testing/test-migration-conformance.js` fails any migration naming a column in `touches.columns` that neither the model nor `columnTypes` declares, across every registered plugin and all three dialects. Because it is a static check over the whole chain rather than a check on what is currently pending, it reaches historical migrations too — which is where this class of gap lives. `s3/testing/test-migration-permissions.js` covers both outcomes directly: a declared column renders as a pasteable `ALTER TABLE`, an undeclared one still reports itself incomplete.
 
 ### 9.2 — Query Interface (qi) API
 
@@ -2165,6 +2205,8 @@ node s3/testing/test-game-state-service.js
 | `test-discord-routing.js` | Which server answers a Discord command when several share one Discord server. Selector parsing — including the whole-flag match that keeps `--all-servers` and `--remap-server` intact beside a real `--server` in one line — the zero-delta guarantee that one registered server takes no claim and refuses nothing, the bare-versus-scoped claim keys that make a community reply arrive once and a per-server read arrive once each, refusals that reach the channel once rather than once per process, a claim that fails **open** on a database error and `lost` only on a duplicate key, a reaper that works off each row's own expiry and so cannot delete a live migration lock, and that every scope the four surfaces' tables can return is a `COMMAND_SCOPE` value |
 | `test-community-options.js` | D15's three levers over the `communityOptions` blob: which plugin options resolve to one community value (lowest registered wins, and the cooldown pair resolves as a pair rather than key by key), which refuse the write while the servers disagree, and which are reported and deliberately not enforced. Covers the recording side too — post-validation, merged across plugins, and self-cleaning when a plugin is uninstalled |
 | `test-migrate-flag-safety.js` | A destructive command whose safety flag is misspelled — `[--dry-run]`, brackets and all, as copied from a usage line — refuses instead of taking its destructive default, and a dry run leaves no trace, including an armed confirmation gate |
+| `test-migration-batch-isolation.js` | One plugin's failed migration does not abandon the rest of the batch, on both operator paths — `!s3 migrate force` and `!s3 confirm <token>`. Asserts the **recorded schema version per plugin**, not the reply embed, since the embed reported success during the flag-safety incident. Covers two independent failures both being named, the verdict staying red while the plugins that could migrate did, a lock lost to a live process being isolated, and the one deliberate exception — locking unavailable at the service level stops the batch rather than reporting one missing grant once per plugin |
+| `test-migration-prompt-identity.js` | Which server a migration prompt came from, when several share one database and one Discord channel. The identity is the prompt's first line and is unconditional — not gated on the multi-server footer label, which goes silent in the exact first-shared-boot window where two processes race to post. The registry id is always rendered because it is the only field two loopback installs cannot share. On the reply side: a `!s3 confirm` for a token this process did not mint, while it still holds a live token of its own, answers grey and claims only that it did not issue this one; a process holding no live token answers red and names itself. Four-way mutation-verified — branch selection and body text are pinned separately |
 | `test-command-routing.js` | `!s3` subcommand dispatch and argument parsing |
 | `test-inspection-embeds.js` | Inspection/embed builders render without throwing on sparse data |
 | `test-sa-per-player-lock.js` | Per-player lock acquisition/release under contention |

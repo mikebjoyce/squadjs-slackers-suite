@@ -641,7 +641,7 @@ export default class MigrationEngine {
    * Register a sequence of migrations for a plugin.
    * @param {string} pluginName  - Unique plugin identifier (e.g. 'smart-assign', 's3-core')
    * @param {Array}  migrations  - Array of migration objects:
-   *   [{ version: number, description: string, up: async (qi) => void, down?: async (qi) => void, backup?: boolean, touches?: { creates?: string[], columns?: Record<string, string[]>, rows?: Record<string, string[]>, abandoned?: string[] } }]
+   *   [{ version: number, description: string, up: async (qi) => void, down?: async (qi) => void, backup?: boolean, touches?: { creates?: string[], columns?: Record<string, string[]>, columnTypes?: Record<string, Record<string, object>>, rows?: Record<string, string[]>, abandoned?: string[] } }]
    *
    * Validates:
    *   - No duplicate version numbers
@@ -741,6 +741,51 @@ export default class MigrationEngine {
               throw new Error(
                 `Migration v${m.version} in "${pluginName}": touches.columns["${tableName}"] must be an array of column name strings.`
               );
+            }
+          }
+        }
+        // ── touches.columnTypes validation ────────────────────────────
+        // The type of a column that `touches.columns` names but no model
+        // declares. Needed only for a column a later migration superseded and
+        // removed from the model while leaving it in the table, which is the
+        // ordinary outcome wherever DROP COLUMN is unavailable or unwanted.
+        //
+        // Without it, buildHandApplyDdl() has nowhere to read the type from —
+        // `rawAttributes` renders only what the CURRENT models declare, and
+        // migrations replay HISTORICAL schema states — so it can only mark the
+        // column incomplete and tell the operator to write the DDL by hand.
+        //
+        // Declared rather than recovered by simulating up(). Running a
+        // migration body to capture its addColumn() calls would execute
+        // whatever else that body does, and the bodies in this suite already
+        // reach past `qi`: backfillServerID() consults detectPriorInterleaving()
+        // on the live DBService. `!s3 migrate ddl` is a read-only command, and
+        // a read-only command must not become a way to run arbitrary migration
+        // code against production.
+        if (m.touches.columnTypes !== undefined) {
+          if (typeof m.touches.columnTypes !== 'object' || m.touches.columnTypes === null || Array.isArray(m.touches.columnTypes)) {
+            throw new Error(
+              `Migration v${m.version} in "${pluginName}": touches.columnTypes must be a Record<string, Record<string, attribute>>.`
+            );
+          }
+          for (const [tableName, cols] of Object.entries(m.touches.columnTypes)) {
+            if (typeof cols !== 'object' || cols === null || Array.isArray(cols)) {
+              throw new Error(
+                `Migration v${m.version} in "${pluginName}": touches.columnTypes["${tableName}"] must be a Record<string, attribute>.`
+              );
+            }
+            for (const [columnName, attribute] of Object.entries(cols)) {
+              // A bare DataType is as valid as { type }, which is what
+              // addColumn() itself accepts, so only the absence of both is
+              // an error.
+              const usable = attribute !== null && attribute !== undefined &&
+                (typeof attribute !== 'object' || attribute.type !== undefined || attribute.key !== undefined);
+              if (!usable) {
+                throw new Error(
+                  `Migration v${m.version} in "${pluginName}": touches.columnTypes["${tableName}"]["${columnName}"] ` +
+                  'must be a Sequelize DataType or an attribute object carrying one.'
+                );
+              }
             }
           }
         }
@@ -1457,10 +1502,21 @@ export default class MigrationEngine {
    * Switch v3 adds `seedPresenceStart`, `lastSeedBonusRoundID` and
    * `seedBonusTokensEarned` to `SwitchPlugin_PlayerCooldowns`, v7 supersedes
    * them with `SwitchPlugin_PlayerServerState`, and no *up* ever drops them, so
-   * a real v9 table still carries columns no model declares. Their type exists
-   * only inside the migration body, which this cannot read.
+   * a real v9 table still carries columns no model declares.
    *
-   * Every such gap is recorded in `incomplete`. That flag is load-bearing and
+   * A migration closes that itself by declaring the type in
+   * `touches.columnTypes`, which is read here when the model has nothing. The
+   * alternative — simulating `up()` with a recording query interface to capture
+   * its `addColumn()` calls — was rejected: bodies in this suite already reach
+   * past `qi` (`backfillServerID()` consults `detectPriorInterleaving()` on the
+   * live DBService), so simulation would run real queries, and it would turn a
+   * command documented as read-only into a way to execute arbitrary migration
+   * code against production. A declaration cannot do that, and it sits in the
+   * same object as the body it describes.
+   *
+   * Every gap that remains — no `touches` at all, an unresolvable model, a
+   * column neither the model nor the migration declares, an unlistable table —
+   * is recorded in `incomplete`. That flag is load-bearing and
    * must be surfaced to the operator, because the failure it predicts is
    * indistinguishable from the one they started with: they apply the script,
    * re-run `migrate force`, and get the identical denial on a column the script
@@ -1606,15 +1662,23 @@ export default class MigrationEngine {
           const present = await columnsOf(table);
           for (const column of columns || []) {
             if (present.has(String(column).toLowerCase())) continue;
-            const attribute = model.rawAttributes?.[column];
+            // The model first, because it is the source that cannot drift.
+            // `touches.columnTypes` is the declared fallback for a column the
+            // model no longer carries — superseded by a later migration and
+            // removed from the model while the column itself stayed in the
+            // table. Reading it here is what lets the script be complete for
+            // that case instead of merely honest about being incomplete.
+            const attribute = model.rawAttributes?.[column]
+              ?? migration.touches?.columnTypes?.[table]?.[column];
             if (!attribute) {
               markIncomplete(
                 { pluginName: target.pluginName, version: migration.version, table, column },
                 `\`${table}.${column}\` is missing from the database and cannot be rendered, so ${target.pluginName} ` +
                 `v${migration.version} will still fail on it after this script is applied. Model \`${model.name}\` ` +
-                'does not declare the column, and its type exists only inside the migration body. Either a later ' +
-                'migration superseded it and the model dropped it while the column itself was never dropped, or ' +
-                '`touches` names a model where it should name a table. Add the column by hand before re-running.'
+                'does not declare the column and the migration does not declare its type either. Either a later ' +
+                'migration superseded it and the model dropped it while the column itself was never dropped — in ' +
+                `which case declare it in that migration's \`touches.columnTypes\` — or \`touches\` names a model ` +
+                'where it should name a table. Add the column by hand before re-running.'
               );
               continue;
             }

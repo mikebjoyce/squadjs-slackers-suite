@@ -96,7 +96,7 @@
  * s3-server-label.js     — how a server names itself in an answer
  *
  */
-import { buildMigrationEmbed } from './s3-migration-discord.js';
+import { buildMigrationEmbed, formatServerIdentity } from './s3-migration-discord.js';
 import { canBackup, listBackups, restoreBackup } from './s3-backup.js';
 import {
   importFromJSON,
@@ -117,6 +117,10 @@ import DBService from './db-service.js';
 // disagreement. A second copy here is how the embed and the mount warning end
 // up describing the same divergence in two different vocabularies.
 import { OPTION_KIND, parseCommunityOptions, describeDisagreement } from './community-options.js';
+// The tag on a refused advisory lock. Matching on the message text instead is
+// how "another process is migrating this" and "this grant cannot lock at all"
+// end up being told apart by a string that someone will reword.
+import { MIGRATION_LOCK_UNAVAILABLE } from './migration-engine.js';
 import {
   parseRange,
   looksLikeRangeToken,
@@ -1721,6 +1725,103 @@ async function rejectStrayFlags(plugin, message, sendDiscordMessage, args, known
   return true;
 }
 
+/**
+ * Apply every pending plugin's migrations, isolating one plugin's failure from
+ * the rest of the batch.
+ *
+ * Both Discord migration paths used to stop at the first rejection, which reads
+ * like caution and is not. Schema versions are recorded PER PLUGIN, each
+ * migration takes an advisory lock keyed on its own plugin name, and each runs
+ * in its own transaction — so a failure in one plugin carries no information
+ * about any other, and abandoning the rest protects nothing. What it does do is
+ * leave them pending behind a neighbour they have nothing to do with, with the
+ * registration order deciding which ones ever get a turn. That is not
+ * hypothetical here: a live database whose user cannot ALTER refuses the same
+ * column-adding migration on every attempt, so one such plugin permanently
+ * blocks every plugin registered after it.
+ *
+ * The autoMigrate path already behaves this way and already draws the same
+ * distinction between a lock it lost and a migration that failed — see the loop
+ * in slackers-squad-services.js. This is the same shape for the operator-driven
+ * paths.
+ *
+ * The one failure that still stops the batch is locking being unavailable at the
+ * SERVICE level. acquireAdvisoryLock() fails closed permanently when S3_Locks
+ * could not be created, so every remaining plugin is certain to fail for that
+ * one reason; continuing would report a single problem N times and bury it.
+ * A lock merely lost to another process is NOT that — it is per-plugin and
+ * transient, so it is recorded and the batch carries on.
+ *
+ * @param {object} me - The MigrationEngine.
+ * @param {object} db - DBService, for isLockingAvailable().
+ * @param {Array<{pluginName: string}>} pending
+ * @param {{dryRun?: boolean}} [options]
+ * @returns {Promise<{totalApplied: number, totalSkipped: number,
+ *   failures: Array<{pluginName: string, message: string, lostLock: boolean}>,
+ *   attempted: number, aborted: boolean}>}
+ */
+async function runMigrationBatch(me, db, pending, options = {}) {
+  const { dryRun = false } = options;
+  let totalApplied = 0;
+  let totalSkipped = 0;
+  let attempted = 0;
+  const failures = [];
+  let aborted = false;
+
+  for (const p of pending) {
+    attempted++;
+    try {
+      const result = await me.runMigrations(p.pluginName, { dryRun });
+      totalApplied += result.applied || 0;
+      totalSkipped += result.skipped || 0;
+    } catch (err) {
+      failures.push({
+        pluginName: p.pluginName,
+        message: err?.message || String(err),
+        lostLock: err?.code === MIGRATION_LOCK_UNAVAILABLE
+      });
+      // Read the service, not the message text: "another process holds it" and
+      // "this connection can never hold one" arrive as the same error code.
+      if (db?.isLockingAvailable?.() === false) {
+        aborted = true;
+        break;
+      }
+    }
+  }
+
+  return { totalApplied, totalSkipped, failures, attempted, aborted };
+}
+
+/**
+ * Compose the `error` text for a failed migration batch: which plugins failed
+ * and why, whether the rest were attempted, and how much of the batch got
+ * through. Named per plugin because with isolation the batch can now fail in
+ * more than one place at once, and "**Error:** <one message>" no longer says
+ * which plugin produced it.
+ */
+function describeBatchFailures(plugin, batch, pending) {
+  const parts = batch.failures.map((f) =>
+    plugin.localize('slackersSquadServices.migration.failureLine', {
+      pluginName: f.pluginName,
+      errorMsg: f.message
+    })
+  );
+
+  if (batch.aborted && batch.attempted < pending.length) {
+    parts.push('', plugin.localize('slackersSquadServices.migration.batchAborted'));
+  }
+
+  const succeeded = batch.attempted - batch.failures.length;
+  if (succeeded > 0) {
+    parts.push('', plugin.localize('slackersSquadServices.migration.partialProgress', {
+      succeeded,
+      total: pending.length
+    }));
+  }
+
+  return parts.join('\n');
+}
+
 // Generic to any embed's 4096-char description limit — distinct from
 // pushLineField()'s 1024-char per-field chunking used elsewhere in this file.
 function chunkLines(lines, maxLen) {
@@ -2882,22 +2983,9 @@ export function createCommandHandlers(context) {
         me.confirmToken('__force__');
       }
 
-      let totalApplied = 0;
-      let totalSkipped = 0;
-      let hadError = false;
-      let lastError = null;
-
-      for (const p of pending) {
-        try {
-          const result = await me.runMigrations(p.pluginName, { dryRun: isDryRun });
-          totalApplied += result.applied || 0;
-          totalSkipped += result.skipped || 0;
-        } catch (err) {
-          hadError = true;
-          lastError = err.message;
-          break;
-        }
-      }
+      const batch = await runMigrationBatch(me, db, pending, { dryRun: isDryRun });
+      const { totalApplied, totalSkipped } = batch;
+      const hadError = batch.failures.length > 0;
 
       if (isDryRun) {
         // Build enriched dry-run output from registered migration metadata
@@ -2947,10 +3035,14 @@ export function createCommandHandlers(context) {
         }, 'S3', (...a) => plugin.verbose(...a));
         return;
       }
+      // Still `!hadError`, and deliberately so under isolation: a partly-applied
+      // batch has not reached the schema the consumers expect, so the gate must
+      // stay shut and the pending list must survive. What changed is only that
+      // the plugins which CAN migrate no longer wait for the one that cannot.
       db._resolveMigrationGate(!hadError);
 
       if (hadError) {
-        const failEmbed = buildMigrationEmbed(plugin, pending, 'failed', { error: lastError, totalApplied, totalSkipped });
+        const failEmbed = buildMigrationEmbed(plugin, pending, 'failed', { error: describeBatchFailures(plugin, batch, pending), totalApplied, totalSkipped });
         await sendDiscordMessage(message.channel, { embeds: [failEmbed] }, 'S3', (...a) => plugin.verbose(...a));
       } else {
         const doneEmbed = buildMigrationEmbed(plugin, pending, 'complete', { totalApplied, totalSkipped });
@@ -3578,14 +3670,39 @@ export function createCommandHandlers(context) {
     // Validate token (handles expiry internally)
     const accepted = me.confirmToken(token);
     if (!accepted) {
+      // On a shared database every process running this plugin receives the
+      // command, and only the one that minted the token accepts it. The rest
+      // land here. confirmToken() leaves `_confirmToken` set on a plain
+      // mismatch and only nulls it on expiry, so a non-null value here means
+      // this process is still holding a live token that simply is not the one
+      // typed — most likely the operator meant another server's prompt, which
+      // is not this process's error to report in red. A null value means this
+      // process has no live token at all: expired, already spent, or never
+      // minted here — that is the genuine "invalid or expired" case.
+      //
+      // This branch is only reached while `_confirmed` is still false. Once a
+      // process has confirmed by any route (a matching token, `!s3 migrate
+      // force`, autoMigrate), confirmToken() short-circuits to true for any
+      // input and the command takes the `accepted` path below instead.
+      const identity = await formatServerIdentity(plugin.services.db, plugin.server);
+      const holdsLiveToken = me._confirmToken !== null;
       await sendDiscordMessage(message.channel, {
-        embeds: [{
-          color: 0xe74c3c,
-          title: plugin.localize('slackersSquadServices.confirm.invalidOrExpiredToken'),
-          description: plugin.localize('slackersSquadServices.confirm.theTokenDidNot') +
-            plugin.localize('slackersSquadServices.confirm.checkS3MigrateStatus2'),
-          timestamp: new Date().toISOString()
-        }]
+        embeds: [holdsLiveToken
+          ? {
+              color: 0x95a5a6,
+              title: plugin.localize('slackersSquadServices.confirm.tokenNotIssuedHereTitle'),
+              description: plugin.localize('slackersSquadServices.confirm.tokenNotIssuedHereBody', { identity, token }),
+              timestamp: new Date().toISOString()
+            }
+          : {
+              color: 0xe74c3c,
+              title: plugin.localize('slackersSquadServices.confirm.invalidOrExpiredToken'),
+              description: plugin.localize('slackersSquadServices.confirm.onServerPrefix', { identity }) +
+                plugin.localize('slackersSquadServices.confirm.theTokenDidNot') +
+                plugin.localize('slackersSquadServices.confirm.checkS3MigrateStatus2'),
+              timestamp: new Date().toISOString()
+            }
+        ]
       }, 'S3', (...a) => plugin.verbose(...a));
       return;
     }
@@ -3609,27 +3726,14 @@ export function createCommandHandlers(context) {
     const runningEmbed = buildMigrationEmbed(plugin, pending, 'running');
     await sendDiscordMessage(message.channel, { embeds: [runningEmbed] }, 'S3', (...a) => plugin.verbose(...a));
 
-    let totalApplied = 0;
-    let totalSkipped = 0;
-    let hadError = false;
-    let lastError = null;
-
-    for (const p of pending) {
-      try {
-        const result = await me.runMigrations(p.pluginName);
-        totalApplied += result.applied || 0;
-        totalSkipped += result.skipped || 0;
-      } catch (err) {
-        hadError = true;
-        lastError = err.message;
-        break;
-      }
-    }
+    const batch = await runMigrationBatch(me, db, pending);
+    const { totalApplied, totalSkipped } = batch;
+    const hadError = batch.failures.length > 0;
 
     db._resolveMigrationGate(!hadError);
 
     if (hadError) {
-      const failEmbed = buildMigrationEmbed(plugin, pending, 'failed', { error: lastError, totalApplied, totalSkipped });
+      const failEmbed = buildMigrationEmbed(plugin, pending, 'failed', { error: describeBatchFailures(plugin, batch, pending), totalApplied, totalSkipped });
       await sendDiscordMessage(message.channel, { embeds: [failEmbed] }, 'S3', (...a) => plugin.verbose(...a));
     } else {
       const doneEmbed = buildMigrationEmbed(plugin, pending, 'complete', { totalApplied, totalSkipped });

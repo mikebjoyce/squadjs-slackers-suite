@@ -813,6 +813,52 @@ for (const adapter of ADAPTERS) {
       }
     });
 
+    // The test above can only reach the NEWEST migration, because that is the
+    // only one it can stage as pending. The gap this closes is historical: a
+    // migration from the middle of the chain that adds a column a later one
+    // supersedes and removes from the model. Nothing renders it — the model no
+    // longer declares the type and the migration body is not readable — so an
+    // operator on a grant without ALTER is told to hand-write DDL for a column
+    // whose type the codebase does in fact know. Switch v3's three seed-bonus
+    // columns are exactly that, and they are invisible to a pending-only check
+    // because Switch is at v9.
+    //
+    // Asserted statically over every registered migration rather than by
+    // running any of them, which is what makes it reach the whole chain.
+    test(`[${dialect}] ${adapter.label}: every declared column has a type someone declares`, async () => {
+      if (!reachability.get(dialect)) return SKIP;
+      const ctx = await openDb(dialect);
+      try {
+        const all = await registerSchema(ctx.db, adapter);
+
+        for (const migration of all) {
+          const creates = new Set((migration.touches?.creates || []).map((t) => String(t).toLowerCase()));
+          for (const [table, columns] of Object.entries(migration.touches?.columns || {})) {
+            // A table this migration creates carries its columns in the CREATE,
+            // which renders from the model wholesale — a different path, with
+            // its own `incomplete` note asserted above.
+            if (creates.has(String(table).toLowerCase())) continue;
+            const model = ctx.db.getModelForTable(table);
+            if (!model) continue; // the unresolvable-model path, covered above
+            for (const column of columns || []) {
+              const fromModel = model.rawAttributes?.[column];
+              const fromMigration = migration.touches?.columnTypes?.[table]?.[column];
+              assert.ok(
+                fromModel || fromMigration,
+                `${adapter.pluginName} v${migration.version} declares ${table}.${column}, but model ` +
+                `\`${model.name}\` does not carry it and the migration declares no touches.columnTypes ` +
+                'for it. buildHandApplyDdl() has no type to render, so on a grant without ALTER this ' +
+                'column is reported as un-renderable and the operator has to write the DDL by hand. ' +
+                'Either the model should declare it, or the migration should declare its type.'
+              );
+            }
+          }
+        }
+      } finally {
+        await closeDb(ctx);
+      }
+    });
+
     // ---- idempotence ----
     test(`[${dialect}] ${adapter.label}: a second run is a no-op`, async () => {
       if (!reachability.get(dialect)) return SKIP;
