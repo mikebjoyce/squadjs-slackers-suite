@@ -1372,6 +1372,26 @@ export function describeServerIDs(rows, ids, unknownLabel = null) {
 }
 
 /**
+ * Render one community-option value for the per-server options line.
+ *
+ * Almost every value is a scalar and wants `key=value`. The exception is
+ * `channels`, written by recordChannelBinding() into the same blob — it is an
+ * object one level deep (`{ switchReporting: '123' }`), and `${v}` on it prints
+ * the literal `[object Object]` in an operator-facing embed. Spell a one-level
+ * object out as `[switchReporting=123]`; fall back to compact JSON for anything
+ * unexpectedly deeper rather than guess at a layout.
+ */
+function formatCommunityOptionValue(value) {
+  if (value === null || typeof value !== 'object') return String(value);
+  const entries = Object.entries(value);
+  if (entries.length === 0) return '(none)';
+  if (entries.every(([, v]) => v === null || typeof v !== 'object')) {
+    return `[${entries.map(([k, v]) => `${k}=${v}`).join(', ')}]`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
  * The server registry — who else writes to this database.
  *
  * Everything that can silently disagree between servers is surfaced here rather
@@ -1453,7 +1473,7 @@ export async function buildServersEmbed(plugin) {
     const options = parseCommunityOptions(row.communityOptions);
     if (options && Object.keys(options).length > 0) {
       lines.push(plugin.localize('slackersSquadServices.servers.optionsLine', {
-        options: Object.entries(options).map(([k, v]) => `${k}=${v}`).join(', ')
+        options: Object.entries(options).map(([k, v]) => `${k}=${formatCommunityOptionValue(v)}`).join(', ')
       }));
     }
 

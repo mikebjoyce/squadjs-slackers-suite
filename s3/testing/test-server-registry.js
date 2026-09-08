@@ -394,6 +394,90 @@ test('two processes for the SAME server racing at boot both come up', async () =
   }
 });
 
+test('two Squad servers on one host are still distinguished, because their ports cannot collide', async () => {
+  // The obvious worry about loopback is two servers on one box, and it is the
+  // case that does not arise: two Squad servers on one host cannot both bind
+  // 27165/21114, so an operator who left both ids at the stock 1 still gets
+  // caught here on the ports even though `host` is identical on both sides.
+  const storage = sharedStorage();
+  const first = await processFor(storage, 1);
+  const second = await processFor(storage, 1);
+  try {
+    await first.db.registerServer({ server: fakeServer({ host: '127.0.0.1', queryPort: 27165, rconPort: 21114 }) });
+
+    const verdict = await second.db.registerServer({
+      server: fakeServer({ host: '127.0.0.1', queryPort: 27175, rconPort: 21124 })
+    });
+
+    assert.equal(verdict.status, 'collision');
+    assert.deepEqual(verdict.differences, ['queryPort', 'rconPort']);
+  } finally {
+    await first.sequelize.close();
+    await second.sequelize.close();
+  }
+});
+
+test('two loopback servers on different machines are the one shape the fingerprint cannot see', async () => {
+  // KNOWN GAP, pinned deliberately rather than fixed. Everything the
+  // fingerprint reads describes how a process reaches *its own* server, and on
+  // two machines that each run SquadJS beside their game server the honest
+  // answer to all three fields is the same answer: 127.0.0.1, and the stock
+  // ports. Two genuinely different servers therefore produce byte-identical
+  // fingerprints, `fingerprintDifferences()` returns [], and the second
+  // process refreshes the incumbent's row and takes the identity in silence.
+  //
+  // This is not the same as the case above it, and not fixable by comparing
+  // harder: the values genuinely agree. Separating it needs a field that
+  // describes the *machine* rather than the route to the server — a hostname
+  // column is the obvious candidate — and that is a schema change on
+  // S3_Servers, which is a column add, which needs a hand-applied ALTER
+  // wherever the deployment's database user holds CREATE but not ALTER.
+  //
+  // It was left open on the judgement that the exposure does not include the
+  // shape production actually runs: a routable host with non-default ports
+  // differs on at least one field, and two servers on one box differ on their
+  // ports (above). What remains is two machines, each on loopback, each on the
+  // stock ports, both left at `id: 1`, against one database.
+  //
+  // Reverse this test the day the discriminator is added — it asserts today's
+  // behaviour, not the desired behaviour, and it is the only test here that does.
+  const storage = sharedStorage();
+  const desktop = await processFor(storage, 1);
+  const laptop = await processFor(storage, 1);
+  try {
+    const loopback = { host: '127.0.0.1', queryPort: 27165, rconPort: 21114 };
+    await desktop.db.registerServer({ server: fakeServer({ ...loopback, serverName: "Slacker's Test Server" }) });
+
+    const verdict = await laptop.db.registerServer({
+      server: fakeServer({ ...loopback, serverName: "Slacker's Test Server 2" })
+    });
+
+    assert.deepEqual(
+      DBService.fingerprintDifferences(
+        DBService.serverFingerprint(fakeServer(loopback)),
+        DBService.serverFingerprint(fakeServer(loopback))
+      ),
+      [],
+      'the premise of the gap: two different servers, nothing to compare that disagrees'
+    );
+    assert.equal(
+      verdict.status, 'refreshed',
+      'today the second machine is admitted; when a machine-level discriminator exists this becomes a collision'
+    );
+
+    const rows = await laptop.db.getRegisteredServers();
+    assert.equal(rows.length, 1, 'one id, one row — the second server has no row of its own');
+    const [row] = rows;
+    assert.equal(
+      row.serverName, "Slacker's Test Server 2",
+      'and the incumbent\'s name is gone: this is the silent identity takeover the fingerprint exists to prevent'
+    );
+  } finally {
+    await desktop.sequelize.close();
+    await laptop.sequelize.close();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Absence is not a difference
 // ---------------------------------------------------------------------------

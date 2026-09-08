@@ -306,6 +306,29 @@ test('buildServersEmbed: surfaces clock skew and the community options behind ea
     assert.match(row.value, /pruneInactivePlayerDays=90/);
   }));
 
+test('buildServersEmbed: a nested option value renders legibly, not as [object Object]', () =>
+  registryFixture(async (db) => {
+    // recordChannelBinding() rides its data in the same blob as the scalar
+    // options, one level down under `channels`. `${k}=${v}` over that prints
+    // the literal "channels=[object Object]" in the embed an operator reads.
+    await seedServer(db, {
+      serverID: 1,
+      alias: 'main',
+      communityOptions: JSON.stringify({
+        maxSwitchTokens: 3,
+        channels: { switchReporting: '123456789', eloReport: '987654321' }
+      })
+    });
+
+    const embed = await buildServersEmbed(plugin(db));
+    const [row] = embed.fields;
+
+    assert.doesNotMatch(row.value, /\[object Object\]/, 'a nested value must not reach the operator as [object Object]');
+    assert.match(row.value, /maxSwitchTokens=3/, 'the scalar options still render as before');
+    assert.match(row.value, /switchReporting=123456789/, 'the nested channel binding is spelled out, not collapsed');
+    assert.match(row.value, /eloReport=987654321/);
+  }));
+
 test('buildServersEmbed: a row with no options and an unparseable one both still render', () =>
   registryFixture(async (db) => {
     await seedServer(db, { serverID: 1, alias: 'main', communityOptions: null });

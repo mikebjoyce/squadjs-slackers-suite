@@ -648,6 +648,32 @@ export default class EloTracker extends S3PluginBase {
       // Apply pending migrations
       await this.verifyAndRunMigrations('elo-tracker');
 
+      // Do not touch our tables until the migrations that create them have run.
+      //
+      // verifyAndRunMigrations() returns null both when the schema is already
+      // current and when migrations are pending but unconfirmed — an ordinary
+      // first boot with autoMigrate off, where S³ has posted the token prompt
+      // and is waiting on an operator. The return value cannot tell those apart;
+      // its own docblock says to ask verifySchemaVersions() instead, which is
+      // what db-log now does. Reading null as "ready" and pruning anyway turns
+      // the wait into `[DB] Error pruning stale entries: ... Elo_PlayerStats ...`
+      // — an ERROR line logged at exactly the moment the operator is being asked
+      // to confirm, which is the noise that trains an operator to ignore the log.
+      //
+      // So: say it once, mount nothing, and let the restart after the operator
+      // confirms bring us up properly. The event handlers all gate on
+      // this.ready, which stays false, so leaving early leaves nothing bound.
+      const versions = await this.s3db.verifySchemaVersions();
+      if ((versions?.pending ?? []).some((p) => p.pluginName === 'elo-tracker')) {
+        Logger.verbose(
+          'EloTracker',
+          1,
+          '[mount] Migrations for "elo-tracker" are not applied yet — not mounting until they are. ' +
+            'Confirm them (!s3 migrate force, or !s3 confirm <token>), then restart.'
+        );
+        return;
+      }
+
       // Bare CREATE INDEX after the migration commits, never addIndex():
       // Sequelize emits ALTER TABLE ... ADD INDEX for addIndex on MySQL and
       // the live grant has no ALTER. Named for the table rather than
