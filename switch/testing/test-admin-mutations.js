@@ -690,6 +690,111 @@ await onEachEngine('completed regeneration is written back to the row', async (d
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// 4b. The null-anchor lockout — raising maxSwitchTokens used to strand
+//     a player at zero tokens with no way back.
+//
+// Every path that writes a NULL anchor pairs it with an AT-cap balance,
+// which is safe. Raise maxSwitchTokens and those rows become BELOW-cap
+// with a NULL anchor, and _regenTokens() then measures elapsed time
+// against a null anchor it reads as `now` — zero, on every read, forever.
+// _spendToken()'s anchor stamp is gated on `balance === maxTokens - 1`,
+// which a spend from the old cap does not satisfy, so nothing rescues it.
+// The row drains to 0 and the player can never switch again;
+// normalizeRegeneratedTokens() cannot see it either, because Op.lt
+// against NULL is UNKNOWN.
+//
+// Reproduced live on a two-server rig 2026-09-08: a row left at
+// {1, NULL} by the round-end writeback under maxSwitchTokens=1 became
+// {0, NULL} after a single !switch once the cap was restored to 2.
+// ═══════════════════════════════════════════════════════════════════
+
+await onEachEngine('a below-cap row with no anchor starts its clock instead of stalling', async (dialect) => {
+  const ctx = await buildPlugin({ dialect });
+  try {
+    // The state a cap increase leaves behind: written at cap 1, read at cap 2.
+    const stranded = { tokenBalance: 1, tokenRegenAnchor: null };
+    ctx.plugin._regenTokens(stranded);
+
+    assert.ok(stranded.tokenRegenAnchor instanceof Date,
+      'a below-cap row with a null anchor got no regen clock — it can never regenerate');
+    assert.strictEqual(stranded.tokenBalance, 1,
+      'starting the clock must not grant a token; the player waits a full interval');
+  } finally {
+    await teardown(ctx);
+  }
+});
+
+await onEachEngine('spending from a stranded row leaves a usable anchor', async (dialect) => {
+  const ctx = await buildPlugin({ dialect });
+  const interval = 1.75 * HOUR;
+  try {
+    const stranded = { tokenBalance: 1, tokenRegenAnchor: null };
+    ctx.plugin._spendToken(stranded);
+
+    assert.strictEqual(stranded.tokenBalance, 0, 'the spend did not decrement');
+    assert.ok(stranded.tokenRegenAnchor instanceof Date,
+      'spending from below cap left a null anchor — this is the lockout: 0 tokens and no clock');
+
+    // The whole point: it must actually come back.
+    const later = {
+      tokenBalance: stranded.tokenBalance,
+      tokenRegenAnchor: new Date(stranded.tokenRegenAnchor.getTime() - interval - 60000)
+    };
+    ctx.plugin._regenTokens(later);
+    assert.strictEqual(later.tokenBalance, 1,
+      'a full interval elapsed and the row did not regenerate');
+  } finally {
+    await teardown(ctx);
+  }
+});
+
+await onEachEngine('the sweep repairs stranded rows already on disk without granting tokens', async (dialect) => {
+  const ctx = await buildPlugin({ dialect });
+  const interval = 1.75 * HOUR;
+  try {
+    await ctx.model.bulkCreate([
+      // Drained and clockless: cannot spend, so _regenTokens() alone can never
+      // persist a fix for it. This is the row that needs the DB repair.
+      row({ eosID: 'locked-out', tokenBalance: 0, tokenRegenAnchor: null }),
+      // Below cap, clockless, still has a token left.
+      row({ eosID: 'stalled', tokenBalance: 1, tokenRegenAnchor: null }),
+      // At cap with a null anchor — the ordinary resting state. Must NOT be touched.
+      row({ eosID: 'resting', tokenBalance: 2, tokenRegenAnchor: null }),
+      // Above cap on seed surplus, null anchor. Must NOT be touched.
+      row({ eosID: 'seeder', tokenBalance: 3, tokenRegenAnchor: null, seedBonusTokensEarned: 1 }),
+      // Mid-cycle with a real anchor — the repair must not reset its progress.
+      row({ eosID: 'midway', tokenBalance: 1, tokenRegenAnchor: new Date(Date.now() - interval / 2) })
+    ]);
+
+    await ctx.plugin.normalizeRegeneratedTokens();
+
+    for (const id of ['locked-out', 'stalled']) {
+      const after = await ctx.model.findByPk(id);
+      assert.ok(after.tokenRegenAnchor instanceof Date,
+        `${id} was left without a regen clock and stays stranded`);
+    }
+    assert.strictEqual((await ctx.model.findByPk('locked-out')).tokenBalance, 0,
+      'the repair granted a token it had not earned — that is the exploit tier 1 guards against');
+    assert.strictEqual((await ctx.model.findByPk('stalled')).tokenBalance, 1,
+      'the repair granted a token it had not earned');
+
+    assert.strictEqual((await ctx.model.findByPk('resting')).tokenRegenAnchor, null,
+      'an at-cap row was given a pointless regen clock');
+    assert.strictEqual((await ctx.model.findByPk('seeder')).tokenBalance, 3,
+      'the repair pulled a seed holder down to the cap');
+    assert.strictEqual((await ctx.model.findByPk('seeder')).tokenRegenAnchor, null,
+      'an above-cap row was given a regen clock');
+
+    const midway = await ctx.model.findByPk('midway');
+    assert.strictEqual(midway.tokenBalance, 1, 'a mid-cycle row was granted a token');
+    assert.ok(Math.abs(midway.tokenRegenAnchor.getTime() - (Date.now() - interval / 2)) < 60000,
+      'the repair reset a mid-cycle anchor and threw away partial progress');
+  } finally {
+    await teardown(ctx);
+  }
+});
+
 await onEachEngine('normalized rows become eligible for the tier-1 prune', async (dialect) => {
   const ctx = await buildPlugin({ dialect });
   const interval = 1.75 * HOUR;

@@ -1031,6 +1031,23 @@ export default class Switch extends S3DiscordPluginBase {
 
         const room = Math.max(0, maxTokens - balance);
         if (room > 0) {
+            // A below-cap row with no anchor has no regen clock at all: the
+            // fallback above reads a null anchor as `now`, so elapsedMs is 0 on
+            // this read and on every future one, and nothing below ever assigns
+            // an anchor. The row stops regenerating permanently — and once the
+            // balance reaches 0 the player cannot switch again, because
+            // normalizeRegeneratedTokens() cannot see the row either (Op.lt
+            // against NULL is UNKNOWN). Reachable whenever maxSwitchTokens rises
+            // above the cap a row was last written at: every null-anchor write
+            // pairs it with an AT-cap balance, which a later cap increase turns
+            // into a below-cap one.
+            //
+            // Starting the clock here grants nothing — the player still waits a
+            // full interval from first observation, which is the least generous
+            // reading and preserves the "cannot prove it ever started
+            // regenerating" guarantee normalizeRegeneratedTokens() relies on.
+            if (!row.tokenRegenAnchor) row.tokenRegenAnchor = new Date(now);
+
             const elapsedMs = now - anchor;
             if (elapsedMs > 0) {
                 const wholeIntervals = Math.floor(elapsedMs / intervalMs);

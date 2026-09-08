@@ -1240,10 +1240,29 @@ const SwitchDB = {
      * single digit, and this keeps the whole thing inside the ORM instead of
      * hand-rolling dialect-specific date arithmetic in raw SQL.
      *
-     * Rows below the cap with a NULL anchor are deliberately not matched —
-     * `Op.lt` against NULL is UNKNOWN, and such a row cannot prove it ever
-     * started regenerating. None exist in the production export; if one ever
-     * appears it ages out through tier 2 rather than being silently topped up.
+     * Rows below the cap with a NULL anchor are still not TOPPED UP, for the
+     * original reason: `Op.lt` against NULL is UNKNOWN, and such a row cannot
+     * prove it ever started regenerating, so granting it tokens would be the
+     * same exploit tier 1 guards against. What the first pass below does
+     * instead is start their clock.
+     *
+     * That pass exists because the original reasoning here — "if one ever
+     * appears it ages out through tier 2" — only holds for a row nobody is
+     * using. Tier 2 retires rows at the retention horizon, which an ACTIVE
+     * player's row never reaches, so an active player stays stranded forever
+     * while an inactive one heals. And the row is not merely un-normalized: it
+     * cannot regenerate at all, because _regenTokens() reads a null anchor as
+     * `now` and so measures zero elapsed time on every read. Once such a row
+     * reaches 0 the player can never switch again.
+     *
+     * These rows are reachable whenever maxSwitchTokens RISES above the cap a
+     * row was last written at: every null-anchor write (new rows, the admin
+     * clears, and this function's own writeback) pairs NULL with an AT-cap
+     * balance, which is safe until the cap moves under it. switch.js's
+     * _regenTokens() now stamps an anchor when it observes this state, which
+     * stops new ones being created on the spend path; this pass repairs rows
+     * already on disk, including the 0-balance ones that can no longer spend
+     * and so would never reach that code with anything to persist.
      *
      * @returns {Promise<number>} rows normalized
      */
@@ -1261,9 +1280,26 @@ const SwitchDB = {
 
       const now = Date.now();
       let normalized = 0;
+      let clocksStarted = 0;
 
       try {
         await plugin._withDb(async (t) => {
+          // Repair pass, before the deficit loop so a row cannot be both
+          // started and normalized in one sweep: give stranded rows an anchor
+          // so ordinary regeneration can take over. No balance is granted —
+          // they wait a full interval from now, as if they had just spent.
+          const [started] = await PlayerCooldowns.update(
+            { tokenRegenAnchor: new Date(now) },
+            {
+              where: {
+                tokenBalance: { [Op.lt]: maxTokens },
+                tokenRegenAnchor: null
+              },
+              transaction: t
+            }
+          );
+          clocksStarted = started;
+
           for (let deficit = 1; deficit <= maxTokens; deficit++) {
             const [count] = await PlayerCooldowns.update(
               { tokenBalance: maxTokens, tokenRegenAnchor: null },
@@ -1281,6 +1317,12 @@ const SwitchDB = {
 
         if (normalized > 0) {
           plugin.verbose(1, `[Cleanup] Normalized ${normalized} fully-regenerated rows back to ${maxTokens} tokens.`);
+        }
+        if (clocksStarted > 0) {
+          // Worth a line of its own: a non-zero count here means rows existed
+          // that could not regenerate, which points at maxSwitchTokens having
+          // been raised at some point.
+          plugin.verbose(1, `[Cleanup] Started the regen clock on ${clocksStarted} below-cap row(s) that had no anchor.`);
         }
       } catch (err) {
         // Non-fatal: without this the prune simply keeps more rows than it needs to.
