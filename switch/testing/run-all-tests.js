@@ -78,7 +78,13 @@ const testFiles = [
   // test-token-messaging.js Test 29 builds its own lastSwitchTimestamp and
   // re-implements the legacy branch inline, so it asserted against its own
   // simulation and never once touched the shipped code path.
-  'test-legacy-cooldown-display.js'
+  'test-legacy-cooldown-display.js',
+  // Server labels on the Discord admin surface. `status`, `stats` and `check`
+  // broadcast, so every registered server answers the same typed message —
+  // without a label the replies are indistinguishable, which is a correctness
+  // problem for the admin reading them rather than a cosmetic one. Also pins
+  // the three single-responder sites that are deliberately left bare.
+  'test-discord-server-labels.js'
 ];
 
 console.log('═'.repeat(50));

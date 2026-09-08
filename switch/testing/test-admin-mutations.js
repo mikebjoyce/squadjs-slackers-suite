@@ -749,6 +749,46 @@ await onEachEngine('spending from a stranded row leaves a usable anchor', async 
   }
 });
 
+await onEachEngine('the stamped anchor survives to disk on a real model instance', async (dialect) => {
+  const ctx = await buildPlugin({ dialect });
+  try {
+    // The cases above operate on plain object literals, which is what the READ
+    // paths hand _regenTokens() (switch-commands.js:484) — deliberately, so a
+    // display cannot write back. That means they prove the anchor is set in
+    // memory and prove nothing about it reaching the database.
+    //
+    // The spend path is different: switch-commands.js:859 loads a real Sequelize
+    // instance under FOR UPDATE and 865-868 upserts tokenBalance and
+    // tokenRegenAnchor together. This pins that half — assigning to an instance
+    // attribute marks it dirty, so the stamp is included in the write. Without
+    // it the whole fix would rest on the round-end repair pass, and a spend
+    // would keep minting stranded rows between rounds.
+    await ctx.model.create(row({ eosID: 'spender', tokenBalance: 1, tokenRegenAnchor: null }));
+
+    const instance = await ctx.model.findByPk('spender');
+    ctx.plugin._spendToken(instance);
+    await ctx.model.upsert({
+      eosID: 'spender',
+      tokenBalance: instance.tokenBalance,
+      tokenRegenAnchor: instance.tokenRegenAnchor,
+      lastActiveTimestamp: new Date()
+    });
+
+    const onDisk = await ctx.model.findByPk('spender');
+    assert.strictEqual(onDisk.tokenBalance, 0, 'the spend did not persist');
+    assert.ok(onDisk.tokenRegenAnchor instanceof Date,
+      'the anchor was stamped in memory but never reached the database — the row is stranded on disk');
+
+    // And it must be a usable clock, not a placeholder: rewind it one interval
+    // and the row has to regenerate off what was actually stored.
+    const stored = { tokenBalance: onDisk.tokenBalance, tokenRegenAnchor: new Date(onDisk.tokenRegenAnchor.getTime() - 1.75 * HOUR - 60000) };
+    ctx.plugin._regenTokens(stored);
+    assert.strictEqual(stored.tokenBalance, 1, 'the persisted anchor did not drive regeneration');
+  } finally {
+    await teardown(ctx);
+  }
+});
+
 await onEachEngine('the sweep repairs stranded rows already on disk without granting tokens', async (dialect) => {
   const ctx = await buildPlugin({ dialect });
   const interval = 1.75 * HOUR;

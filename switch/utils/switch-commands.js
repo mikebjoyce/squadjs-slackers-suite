@@ -164,10 +164,33 @@ const SwitchCommands = {
   register(plugin) {
     // ── Discord reply helper ───────────────────────────────────
 
+    // A plain-text answer has no embed, so applyServerLabel() has nothing to
+    // write a footer into and leaves it exactly as it found it. That gap is
+    // not cosmetic: `status`, `stats` and `check` are broadcast reads, so
+    // every registered server answers the one message, and two identical
+    // unlabelled lines in a shared admin channel cannot be told apart at all.
+    // A reply quoting the command does not help either — both quote the same
+    // command. serverDescriptor() is null on a single-server install and the
+    // optional call tolerates an older S³, so this is inert in both cases and
+    // callers never count servers themselves.
+    plugin.labelText = function (text) {
+      const who = plugin.serverDescriptor?.();
+      return who ? `**[${who}]** ${text}` : text;
+    };
+
+    // The same job for an embed payload, where the label belongs in the footer
+    // rather than in front of the text. Optional-chained for the reason the
+    // routing gate below is: an unlabelled embed is a worse answer than a
+    // labelled one but a much better one than a crashed admin command, and
+    // this file is a `utils/` helper that cannot import the S³ base itself.
+    plugin.labelEmbeds = function (payload) {
+      return plugin.applyServerLabel?.(payload) ?? payload;
+    };
+
     plugin.safeDiscordReply = async function (message, content) {
       if (!message || !content) return;
       try {
-        await message.reply(content);
+        await message.reply(plugin.labelText(content));
       } catch (err) {
         plugin.verbose(1, `Discord reply failed: ${err.message}`);
       }
@@ -1156,12 +1179,12 @@ const SwitchCommands = {
       const afterDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
       if (typeof plugin.backfillRoundStats !== 'function') {
-        await message.channel.send(plugin.localize('switch.handleStatsCommand.statsDbUnavailable'));
+        await message.channel.send(plugin.labelText(plugin.localize('switch.handleStatsCommand.statsDbUnavailable')));
         return;
       }
       const reportChan = plugin.channel;
       if (!reportChan) {
-        await message.channel.send(plugin.localize('switch.backfill.noReportingChannel'));
+        await message.channel.send(plugin.labelText(plugin.localize('switch.backfill.noReportingChannel')));
         return;
       }
 
@@ -1185,7 +1208,7 @@ const SwitchCommands = {
       const sharers = await plugin.channelSharers?.('switchReporting', plugin.options.channelID);
       if (sharers && sharers.length > 0) {
         const names = sharers.map((s) => (s.alias ? `${s.alias} (id ${s.serverID})` : `server ${s.serverID}`)).join(', ');
-        await message.channel.send(plugin.localize('switch.backfill.sharedChannel', { servers: names }));
+        await message.channel.send(plugin.labelText(plugin.localize('switch.backfill.sharedChannel', { servers: names })));
         return;
       }
 
@@ -1202,7 +1225,7 @@ const SwitchCommands = {
       const liveFrom = await plugin.getEarliestLiveRoundStat();
       const stopAt = liveFrom || new Date();
 
-      await message.channel.send(plugin.localize('switch.backfill.starting', { days }));
+      await message.channel.send(plugin.labelText(plugin.localize('switch.backfill.starting', { days })));
 
       const rows = [];
       let scanned = 0;
@@ -1233,18 +1256,18 @@ const SwitchCommands = {
         }
       } catch (err) {
         plugin.verbose(1, `[Backfill] Scrape failed: ${err.message}`);
-        await message.channel.send(plugin.localize('switch.backfill.failed', { message: err.message }));
+        await message.channel.send(plugin.labelText(plugin.localize('switch.backfill.failed', { message: err.message })));
         return;
       }
 
       if (!rows.length) {
-        await message.channel.send(plugin.localize('switch.backfill.nothingFound', { days }));
+        await message.channel.send(plugin.labelText(plugin.localize('switch.backfill.nothingFound', { days })));
         return;
       }
 
       const { inserted, skipped } = await plugin.backfillRoundStats(rows);
       plugin.verbose(1, `[Backfill] ${scanned} summaries scanned, ${inserted} inserted, ${skipped} already present.`);
-      await message.channel.send(plugin.localize('switch.backfill.done', { scanned, inserted, skipped }));
+      await message.channel.send(plugin.labelText(plugin.localize('switch.backfill.done', { scanned, inserted, skipped })));
     };
 
     /**
@@ -1341,7 +1364,7 @@ const SwitchCommands = {
       // now come from SwitchPlugin_RoundStats, written at round end.
       const totals = await plugin.getRoundStatsTotals(afterDate);
       if (!totals) {
-        await message.channel.send(plugin.localize('switch.handleStatsCommand.statsDbUnavailable'));
+        await message.channel.send(plugin.labelText(plugin.localize('switch.handleStatsCommand.statsDbUnavailable')));
         return;
       }
 
@@ -1480,7 +1503,7 @@ const SwitchCommands = {
         footer: { text: plugin.localize('switch.handleStatsCommand.switchVVersion', { version: plugin.constructor.version }) }
       };
 
-      await message.channel.send({ embeds: [embed] });
+      await message.channel.send(plugin.labelEmbeds({ embeds: [embed] }));
     };
 
     // ── Discord admin command handler ───────────────────────────
@@ -1533,7 +1556,7 @@ const SwitchCommands = {
 
       if (subCommand === 'status') {
         const embed = await plugin._buildSwitchDiagEmbed();
-        await message.channel.send({ embeds: [embed] });
+        await message.channel.send(plugin.labelEmbeds({ embeds: [embed] }));
       } else if (subCommand === 'check') {
         const ident = args.slice(2).join(' ');
         if (!ident) {
@@ -1595,7 +1618,7 @@ const SwitchCommands = {
             desc += `⏱️ **Last Active:** <t:${Math.floor(new Date(result.lastActiveTimestamp).getTime() / 1000)}:f>\n`;
           }
 
-          await message.channel.send({ embeds: [{ title: plugin.localize('switch.onDiscordMessage.playerStatus'), description: desc, color: 0x3498db }] });
+          await message.channel.send(plugin.labelEmbeds({ embeds: [{ title: plugin.localize('switch.onDiscordMessage.playerStatus'), description: desc, color: 0x3498db }] }));
         }
       } else if (subCommand === 'clear') {
         const ident = args.slice(2).join(' ');
@@ -1682,7 +1705,7 @@ const SwitchCommands = {
             // Stats embed is optional — silently skip on failure
           }
           for (const embed of embeds) {
-            await message.channel.send({ embeds: [embed] });
+            await message.channel.send(plugin.labelEmbeds({ embeds: [embed] }));
             // Small delay between sends to avoid Discord rate limits
             // and give messages time to render as separate entries.
             await new Promise(r => setTimeout(r, 250));
