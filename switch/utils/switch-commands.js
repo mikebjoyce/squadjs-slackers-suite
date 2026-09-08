@@ -404,14 +404,26 @@ const SwitchCommands = {
                     const locked = result.scrambleLockdownExpiry && result.scrambleLockdownExpiry > now;
                     const showTokenMessaging = plugin.options.maxSwitchTokens > 1;
 
+                    // Both branches read the same token bucket, and only the
+                    // wording is gated on showTokenMessaging — the same shape as
+                    // the self-check path below. The legacy branch used to derive
+                    // cooldown from lastSwitchTimestamp, which no write site has
+                    // populated since switch migration v3, so at maxSwitchTokens
+                    // <= 1 this reply reported "Cooldown: No" for every player
+                    // including one _checkSwitchEligibility() was actively
+                    // refusing. Enforcement is token-based at every value of
+                    // maxSwitchTokens (switch.js:1256-1274); a display that reads
+                    // anything else describes a rule the plugin does not apply.
+                    const row = {
+                      tokenBalance: result.tokenBalance != null ? result.tokenBalance : plugin.options.maxSwitchTokens,
+                      tokenRegenAnchor: result.tokenRegenAnchor
+                    };
+                    plugin._regenTokens(row);
+                    const onCooldown = row.tokenBalance < 1;
+
                     let cooldownMsg;
                     if (showTokenMessaging) {
-                      const row = {
-                        tokenBalance: result.tokenBalance != null ? result.tokenBalance : plugin.options.maxSwitchTokens,
-                        tokenRegenAnchor: result.tokenRegenAnchor
-                      };
-                      plugin._regenTokens(row);
-                      if (row.tokenBalance < 1) {
+                      if (onCooldown) {
                         const cooldownDuration = plugin.options.switchCooldownMinutes > 0
                           ? plugin.options.switchCooldownMinutes * 60 * 1000
                           : plugin.options.switchCooldownHours * 60 * 60 * 1000;
@@ -423,12 +435,8 @@ const SwitchCommands = {
                       }
                       plugin.verbose(1, `[Check] Admin check result: player=${result.playerName || result.steamID}, locked=${locked}, tokenBalance=${row.tokenBalance}`);
                     } else {
-                      const cooldownDuration = plugin.options.switchCooldownMinutes > 0
-                        ? plugin.options.switchCooldownMinutes * 60 * 1000
-                        : plugin.options.switchCooldownHours * 60 * 60 * 1000;
-                      const cooldown = result.lastSwitchTimestamp && (new Date(result.lastSwitchTimestamp.getTime() + cooldownDuration) > now);
-                      cooldownMsg = plugin.localize('switch.labels.cooldownState', { state: plugin.localize(cooldown ? 'switch.labels.yes' : 'switch.labels.no') });
-                      plugin.verbose(1, `[Check] Admin check result: player=${result.playerName || result.steamID}, locked=${locked}, cooldown=${cooldown}`);
+                      cooldownMsg = plugin.localize('switch.labels.cooldownState', { state: plugin.localize(onCooldown ? 'switch.labels.yes' : 'switch.labels.no') });
+                      plugin.verbose(1, `[Check] Admin check result: player=${result.playerName || result.steamID}, locked=${locked}, cooldown=${onCooldown}`);
                     }
 
                     plugin.warn(eosID, plugin.localize('switch.warn.statusLocked', { player: result.playerName || result.steamID, locked: plugin.localize(locked ? 'switch.labels.yes' : 'switch.labels.no'), cooldownMsg }));

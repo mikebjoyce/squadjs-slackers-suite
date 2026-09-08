@@ -71,7 +71,14 @@ const testFiles = [
   // stored round are both built from, and the backfill's dedupe — which
   // only fails on MySQL, where DATETIME drops the milliseconds the dedupe
   // used to match on.
-  'test-round-stats.js'
+  'test-round-stats.js',
+  // The admin `!switch check` reply, driven through the real onChatMessage so
+  // the assertion cannot pass against a re-implementation of the branch. The
+  // display bug it pins survived a green suite for exactly that reason:
+  // test-token-messaging.js Test 29 builds its own lastSwitchTimestamp and
+  // re-implements the legacy branch inline, so it asserted against its own
+  // simulation and never once touched the shipped code path.
+  'test-legacy-cooldown-display.js'
 ];
 
 console.log('═'.repeat(50));

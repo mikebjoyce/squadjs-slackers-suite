@@ -137,6 +137,12 @@ const SwitchDB = {
         type: plugin._s3db.getDataTypes().STRING,
         allowNull: true
       },
+      // OBSOLETE since migration v3, retained for expand-contract safety —
+      // never dropped, and no write site has populated it since. Every row
+      // created from v3 onward carries null here permanently. tokenBalance
+      // and tokenRegenAnchor are the live cooldown state; anything reading
+      // this column to decide whether a player is on cooldown is reading a
+      // rule the plugin does not enforce (see switch.js:1292-1304).
       lastSwitchTimestamp: {
         type: plugin._s3db.getDataTypes().DATE,
         allowNull: true

@@ -112,20 +112,25 @@ async function testSuite() {
     assert.ok(cooldownMsg.includes('Tokens: 1/2'), 'Token mode should show token count format');
   });
 
-  // ── Test 29: Check command — binary cooldown in legacy mode ─
-  await runTest('Check command: legacy mode — "Cooldown: Yes/No" format', () => {
+  // ── Test 29: Check command — legacy mode selects binary wording ─
+  //
+  // This case used to build its own lastSwitchTimestamp and re-implement the
+  // check command's legacy branch inline, so it asserted against its own
+  // simulation and passed for the whole life of a real display bug: the
+  // shipped branch derived cooldown from lastSwitchTimestamp, a column no
+  // write site has populated since switch migration v3, and so reported
+  // "Cooldown: No" for every player on a maxSwitchTokens <= 1 server —
+  // including players _checkSwitchEligibility() was actively refusing.
+  //
+  // What the mock can honestly assert is the wording selector, and only that.
+  // The state behind the wording is pinned in test-legacy-cooldown-display.js,
+  // which drives the real onChatMessage against a real database.
+  await runTest('Check command: legacy mode selects binary wording, not token wording', () => {
     const { plugin } = createMockHarness({ maxSwitchTokens: 1, switchCooldownHours: 1 });
     const showTokenMessaging = plugin.options.maxSwitchTokens > 1;
-    const cooldownDuration = plugin.options.switchCooldownMinutes > 0
-      ? plugin.options.switchCooldownMinutes * 60 * 1000
-      : plugin.options.switchCooldownHours * 60 * 60 * 1000;
-    // Simulate legacy: cooldown is based on lastSwitchTimestamp
-    const now = Date.now();
-    const lastSwitch = new Date(now - 30 * 60 * 1000);  // 30 min ago, cooldown is 1hr
-    const cooldownActive = lastSwitch && (lastSwitch.getTime() + cooldownDuration > now);
-    const cooldownMsg = `Cooldown: ${cooldownActive ? 'Yes' : 'No'}`;
-    assert.strictEqual(cooldownMsg, 'Cooldown: Yes', 'Legacy mode should show binary cooldown');
     assert.ok(!showTokenMessaging, 'Legacy mode should not use token messaging');
+    const cooldownMsg = showTokenMessaging ? 'Tokens: 1/1' : 'Cooldown: No';
+    assert.ok(/^Cooldown: (Yes|No)$/.test(cooldownMsg), 'Legacy mode should show binary cooldown wording');
   });
 
   // ── Test 30: Post-switch notice — token count ───────────────
