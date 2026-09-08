@@ -2127,6 +2127,7 @@ node s3/testing/test-game-state-service.js
 | `test-s3-plugin-base-lifecycle.js` | S3PluginBase discovery, mount/unmount hooks |
 | `test-s3-plugin-base-db.js` | Base class DB: model definition, migration flow |
 | `test-s3-discord-plugin-base.js` | Discord channel setup, `sendDiscordMessage()` |
+| `test-discord-legacy-embeds.js` | `sendDiscordMessage()` against a discord.js too old for an `embeds` array — every embed still delivered, not just the first |
 | `test-i18n.js` | Catalogue parity, call-site keys and vars, language resolution |
 | `test-i18n-render.js` | Renders every embed builder through a pseudo-locale; fails on prose that never reached the catalogue |
 | `test-identifier-case.js` | Static scan: every file that asks a database what tables it holds is inside the scanned directories, and none of them compares a `showAllTables()` result by equality — MySQL with `lower_case_table_names=1` folds table names, and an exact match reads a live table as missing |

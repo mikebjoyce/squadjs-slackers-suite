@@ -17,8 +17,9 @@
  *   a cleanup function to call during unmount().
  *
  * sendDiscordMessage(channel, content, tag, verbose) (function)
- *   Resilient Discord message sender (rate-limit, v12 fallback,
- *   empty-message guard). Exported so the shipped send path can be
+ *   Resilient Discord message sender (rate-limit retry, empty-message
+ *   guard, and one-embed-per-message delivery on a discord.js too old
+ *   for an embeds array). Exported so the shipped send path can be
  *   exercised directly; inside the suite only this file calls it.
  *
  * Internal:
@@ -68,8 +69,32 @@ import { routeDiscordCommand, buildRoutingRefusalEmbed, ROUTING } from './s3-dis
 import { applyServerLabel } from './s3-server-label.js';
 
 /**
+ * Sticky once discovered: this discord.js only understands the singular
+ * `embed` key, so every multi-embed payload has to be sent one at a time.
+ *
+ * ─── WHY THIS IS DISCOVERED, NOT CONFIGURED ───
+ *
+ * SquadJS 4.1.0 pins discord.js 12.5.3; forks and manual bumps run v13 and
+ * v14. The suite is installed into whichever of those the host already has,
+ * so the only honest way to know is to try the modern shape and read the
+ * refusal. The flag exists so the process pays that failed round trip once
+ * rather than on every embed it ever sends.
+ *
+ * ─── WHAT THIS REPLACED, AND WHY IT MATTERED ───
+ *
+ * The v12 fallback used to retry as `{ embed: data.embeds[0] }` — the first
+ * embed, the others dropped — and then return `true`. On a v12 host every
+ * multi-embed reply silently lost all but its first embed and logged nothing.
+ * `!s3 players` posted its overview and quietly discarded both team rosters,
+ * which is how this was found: the same command answered from a v14 host and
+ * a v12 host side by side, three embeds against one.
+ */
+let legacyEmbedMode = false;
+
+/**
  * Send a Discord message with embed(s). Resilient: normalises embed→embeds,
- * handles 429 rate-limit with one automatic retry, falls back to v12 embed shape.
+ * handles 429 rate-limit with one automatic retry, and falls back to one
+ * embed per message on a discord.js too old to accept an embeds array.
  * @param {object} channel - Discord.js channel object
  * @param {object} content - { embeds: [...], content?: string }
  * @param {string} [pluginTag='S3'] - Tag for verbose logging
@@ -101,7 +126,9 @@ export async function sendDiscordMessage(channel, content, pluginTag = 'S3', ver
   // single-server install, because S³ publishes nothing there.
   payload = applyServerLabel(payload);
 
-  const executeSend = async (data, isRetry = false) => {
+  // One message, with the 429 retry. Everything above this decides *what* to
+  // send; this only decides how hard to try.
+  const sendOnce = async (data, isRetry = false) => {
     try {
       await channel.send(data);
       return true;
@@ -115,22 +142,56 @@ export async function sendDiscordMessage(channel, content, pluginTag = 'S3', ver
 
         verboseLogger(1, `[${pluginTag} Discord] 429 Rate Limit hit. Waiting ${waitTime}ms before retry.`);
         await new Promise((resolve) => setTimeout(resolve, waitTime));
-        return executeSend(data, true);
-      }
-
-      if (err.message === 'Cannot send an empty message' && data.embeds?.length > 0) {
-        const legacyData = { ...data, embed: data.embeds[0] };
-        delete legacyData.embeds;
-        return executeSend(legacyData, isRetry);
+        return sendOnce(data, true);
       }
 
       throw err;
     }
   };
 
+  // One embed per message, because that is all discord.js v12 will take.
+  // Content and files ride on the first so a reply that pairs text with an
+  // embed still reads as one thing; the rest follow in order.
+  const sendOnePerMessage = async (data) => {
+    const embeds = data.embeds ?? [];
+    const rest = { ...data };
+    delete rest.embeds;
+    delete rest.embed;
+
+    if (embeds.length === 0) return sendOnce(rest);
+
+    let allSent = true;
+    for (let i = 0; i < embeds.length; i++) {
+      const part = i === 0 ? { ...rest, embed: embeds[i] } : { embed: embeds[i] };
+      try {
+        await sendOnce(part);
+      } catch (err) {
+        // Keep going. Losing embed 2 is no reason to also lose embed 3, and
+        // the whole point of this path is that embeds stop disappearing.
+        allSent = false;
+        verboseLogger(1, `[${pluginTag} Discord] Embed ${i + 1}/${embeds.length} failed: ${err.message}`);
+      }
+    }
+    return allSent;
+  };
+
   try {
-    await executeSend(payload);
-    return true;
+    if (legacyEmbedMode && Array.isArray(payload.embeds)) return await sendOnePerMessage(payload);
+
+    try {
+      return await sendOnce(payload);
+    } catch (err) {
+      // The v12 tell. It has no `embeds` key, so an embeds-only payload looks
+      // empty to it and the API says so. Discovered rather than version-
+      // sniffed, so this keeps working on whatever the host pinned.
+      const looksLegacy = err.message === 'Cannot send an empty message'
+        && Array.isArray(payload.embeds) && payload.embeds.length > 0;
+      if (!looksLegacy) throw err;
+
+      legacyEmbedMode = true;
+      verboseLogger(1, `[${pluginTag} Discord] discord.js rejected an embeds array; switching to one embed per message for the rest of this process.`);
+      return await sendOnePerMessage(payload);
+    }
   } catch (err) {
     verboseLogger(1, `[${pluginTag} Discord] Send failed: ${err.message}`);
     return false;

@@ -29,7 +29,7 @@ import BasePlugin from './base-plugin.js';
  *     "token":    "<must equal options.token>",
  *     "commands": ["AdminChangeLayer Gorodok_RAAS_v1"],   // or "command": "..."
  *     "discord":  ["gamestate"],  // capture !s3 embeds without sending them
- *     "readback": { "limit": 10 },// read what Discord actually stored
+ *     "readback": { "limit": 25 },// read what Discord actually stored
  *     "snapshot": true,          // include a state snapshot in the result
  *     "note":     "why you ran this"
  *   }
@@ -40,6 +40,21 @@ import BasePlugin from './base-plugin.js';
  * *stored*, which is the only way to see a loss that happens at or after
  * `channel.send` — the capture path never gets that far. Use `discord`
  * to test what the code produces and `readback` to test what survived.
+ *
+ * `readback` accepts any of these, because all of them are things a
+ * person reasonably writes and the earlier version silently ignored
+ * three of the four:
+ *
+ *   "readback": true            → DEFAULT_READBACK_LIMIT messages
+ *   "readback": 25              → 25
+ *   "readback": "25"            → 25
+ *   "readback": { "limit": 25 } → 25
+ *
+ * The result reports `asked` (what the request named) and `limit` (what
+ * was used) as separate fields, plus a `notes` array naming any
+ * substitution, clamp, or short read. If those two disagree, the reason
+ * is in `notes` — a readback never quietly returns a different number of
+ * messages than it was asked for. `readbackMaxMessages` is the ceiling.
  *
  * A request with no commands and `snapshot: true` is a pure read — it
  * touches RCON not at all.
@@ -82,6 +97,9 @@ import BasePlugin from './base-plugin.js';
  */
 /** Largest single string value kept verbatim in a captured payload. */
 const MAX_CAPTURED_STRING = 8000;
+
+/** Messages a readback fetches when the request names no limit. */
+const DEFAULT_READBACK_LIMIT = 10;
 
 /**
  * Reduce a Discord payload to something safe to serialize into a result file.
@@ -602,9 +620,33 @@ export default class DevRconHarness extends BasePlugin {
       return { ok: false, error: 'Readback is disabled (options.allowReadback is false).' };
     }
 
+    // `readback: 25` and `readback: { limit: 25 }` are both obvious things to
+    // write, and either can arrive as a string from a hand-edited request file.
+    // The first version accepted only the object form with a real number and
+    // let everything else fall through to the default — so a request asking for
+    // 25 got 10 and was told nothing. Take every shape, and say so when the
+    // number asked for is not the number used.
     const spec = typeof request.readback === 'object' && request.readback !== null ? request.readback : {};
-    const requested = Number.isFinite(spec.limit) ? Math.floor(spec.limit) : 10;
-    const limit = Math.max(1, Math.min(requested, this.options.readbackMaxMessages));
+    const raw = (typeof request.readback === 'number' || typeof request.readback === 'string')
+      ? request.readback
+      : spec.limit;
+
+    const notes = [];
+    const asked = (raw === undefined || raw === null || raw === '') ? null : Number(raw);
+
+    let limit;
+    if (asked === null) {
+      limit = DEFAULT_READBACK_LIMIT;
+    } else if (!Number.isFinite(asked)) {
+      limit = DEFAULT_READBACK_LIMIT;
+      notes.push(`limit ${JSON.stringify(raw)} is not a number; read ${limit} instead.`);
+    } else {
+      const floored = Math.floor(asked);
+      limit = Math.max(1, Math.min(floored, this.options.readbackMaxMessages));
+      if (limit !== floored) {
+        notes.push(`limit ${floored} clamped to ${limit} (readbackMaxMessages is ${this.options.readbackMaxMessages}, floor is 1).`);
+      }
+    }
 
     const s3 = this.findS3();
     if (!s3) return { ok: false, error: 'S³ plugin not found on this server.' };
@@ -644,7 +686,22 @@ export default class DevRconHarness extends BasePlugin {
         attachmentCount: m.attachments?.size ?? 0
       }));
 
-      return { ok: true, channelID, requested: limit, returned: messages.length, messages };
+      // `asked` and `limit` are reported separately on purpose: the first
+      // version returned the clamped value under the name "requested", which
+      // made a discarded limit invisible in the result file.
+      if (messages.length < limit) {
+        notes.push(`Channel returned ${messages.length} of the ${limit} asked for; there are no older messages, or the bot cannot see them.`);
+      }
+
+      return {
+        ok: true,
+        channelID,
+        asked: asked === null ? null : (Number.isFinite(asked) ? Math.floor(asked) : raw),
+        limit,
+        returned: messages.length,
+        notes,
+        messages
+      };
     } catch (err) {
       return { ok: false, error: `Readback failed: ${err.message}` };
     }
