@@ -2974,12 +2974,16 @@ export function createCommandHandlers(context) {
         // explicitly typing !s3 migrate force IS the confirmation.
         //
         // Deliberately not reached on a dry run. confirmToken() latches
-        // `_confirmed` and nothing clears it, and confirmToken() short-circuits
-        // to true whenever that latch is set — so arming the engine here would
-        // leave a *preview* having permanently authorised the next migration,
-        // by any route, with any token. A dry run must have no side effects at
-        // all, and runMigrations() returns above the confirmation gate anyway,
-        // so it never needed the token.
+        // `_confirmed` and nothing clears it, and runMigrations() gates on that
+        // latch alone — so arming the engine here would leave a *preview*
+        // having permanently authorised the next migration. A dry run must have
+        // no side effects at all, and runMigrations() returns above the
+        // confirmation gate anyway, so it never needed the token.
+        //
+        // The latch no longer also makes `!s3 confirm <anything>` succeed —
+        // confirmToken() short-circuits on `_confirmed` for the arming tokens
+        // only — but that narrows the blast radius of arming here rather than
+        // removing it, and a preview still must not arm.
         me.confirmToken('__force__');
       }
 
@@ -3672,18 +3676,20 @@ export function createCommandHandlers(context) {
     if (!accepted) {
       // On a shared database every process running this plugin receives the
       // command, and only the one that minted the token accepts it. The rest
-      // land here. confirmToken() leaves `_confirmToken` set on a plain
-      // mismatch and only nulls it on expiry, so a non-null value here means
-      // this process is still holding a live token that simply is not the one
-      // typed — most likely the operator meant another server's prompt, which
-      // is not this process's error to report in red. A null value means this
-      // process has no live token at all: expired, already spent, or never
-      // minted here — that is the genuine "invalid or expired" case.
+      // land here.
       //
-      // This branch is only reached while `_confirmed` is still false. Once a
-      // process has confirmed by any route (a matching token, `!s3 migrate
-      // force`, autoMigrate), confirmToken() short-circuits to true for any
-      // input and the command takes the `accepted` path below instead.
+      // `_confirmToken` is left set after a plain mismatch and cleared three
+      // ways: on expiry, on a successful match, and by an arming token
+      // (`__force__` / `__auto__`). So a non-null value here means this process
+      // is still holding a live token that simply is not the one typed — most
+      // likely the operator meant another server's prompt, which is not this
+      // process's error to report in red. A null value means this process has
+      // no live token to be confused about: it expired, it was already spent,
+      // or the engine was armed by `!s3 migrate force` — which clears the token
+      // but does not make a later wrong `!s3 confirm` correct, since
+      // confirmToken() only short-circuits an armed engine for the arming
+      // tokens, not for operator input. That is the genuine "invalid or
+      // expired" case, and the one the red branch names.
       const identity = await formatServerIdentity(plugin.services.db, plugin.server);
       const holdsLiveToken = me._confirmToken !== null;
       await sendDiscordMessage(message.channel, {

@@ -911,12 +911,37 @@ export default class MigrationEngine {
    * '__force__' (!s3 migrate force), or a plain string token from a Discord prompt.
    * Synchronous — no async operations required.
    *
+   * This method serves two callers that want different things from it, and the
+   * difference matters. `__auto__`/`__force__` ARM the engine: the caller has
+   * already established the authority and is switching the gate on. A plain
+   * token VALIDATES operator input: the caller is asking whether this exact
+   * string is the one this process minted. Answering the second question with
+   * the first one's logic is how a token no process on this machine ever issued
+   * gets accepted.
+   *
    * @param {string} token - The token to validate.
    * @returns {boolean} True if the token was accepted and migrations are now authorized.
    */
   confirmToken(token) {
-    // Already confirmed — idempotent
-    if (this._confirmed) return true;
+    const isArmingToken = token === '__auto__' || token === '__force__';
+
+    // Idempotent for the ARMING tokens, and only for those. `_confirmed` is a
+    // latch that has to outlive a single call — runMigrations() reads it once
+    // per plugin, so a batch re-arming an already-armed engine must succeed.
+    //
+    // It deliberately does NOT extend to an operator's plain token. This used
+    // to short-circuit on `_confirmed` alone, which meant that after anything
+    // armed this engine — a `!s3 migrate force`, autoMigrate at boot — a
+    // subsequent `!s3 confirm <anything>` was accepted, matched against
+    // nothing, and re-entered the migration batch. On a shared database where
+    // several processes post prompts into one channel, typing a stale or
+    // wrong token after a force is an ordinary mistake rather than a contrived
+    // one, and the reply said the migration had been confirmed.
+    //
+    // The expiry timer in slackers-squad-services.js already draws this same
+    // line (`me._confirmToken === token && !me._confirmed`): being armed is
+    // not the same fact as a token being valid.
+    if (this._confirmed && isArmingToken) return true;
 
     // Check token expiry first
     if (this._confirmToken && this._tokenExpiresAt && Date.now() > this._tokenExpiresAt) {
@@ -926,7 +951,7 @@ export default class MigrationEngine {
     }
 
     // Special tokens always work
-    if (token === '__auto__' || token === '__force__') {
+    if (isArmingToken) {
       this._confirmed = true;
       this._confirmToken = null;
       this._tokenExpiresAt = null;

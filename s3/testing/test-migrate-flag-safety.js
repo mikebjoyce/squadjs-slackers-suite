@@ -174,10 +174,17 @@ test('a correctly spelled --dry-run still previews and still writes nothing', as
 });
 
 test('a dry run leaves the engine unarmed', async () => {
-  // confirmToken() latches `_confirmed` and short-circuits to true forever
-  // after. Arming it from the dry-run path meant a *preview* authorised the
-  // next migration by any route — including `!s3 confirm <anything>`, which
-  // would then be accepted despite matching no token.
+  // confirmToken() latches `_confirmed` and nothing clears it, and
+  // runMigrations() gates on that latch alone. Arming it from the dry-run path
+  // meant a *preview* permanently authorised the next migration.
+  //
+  // The "including `!s3 confirm <anything>`" half of this is no longer true:
+  // confirmToken() short-circuits on the latch for the arming tokens only, so
+  // a plain token is matched whatever the latch says (migration-engine.js).
+  // The assertion below therefore now passes for a second, independent reason
+  // — the engine is unarmed AND a bogus plain token is refused on its own
+  // merits — which is why it is not the coverage for that fix; see
+  // test-migration-batch-isolation.js.
   const { engine } = await runCommand(['migrate', 'force', '--dry-run']);
   assert.equal(engine._confirmed, false, 'a dry run armed the migration engine');
   assert.equal(engine.confirmToken('not-a-real-token'), false,

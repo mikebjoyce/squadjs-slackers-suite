@@ -101,7 +101,10 @@ async function run() {
  * Stand up a DBService + MigrationEngine with one pending migration per named
  * plugin, then run `!s3 <argv...>` through the real command handler.
  *
- * @param {string[]} argv - e.g. ['migrate', 'force'] or ['confirm', 'tok'].
+ * @param {string[]|string[][]} argv - One command, e.g. ['migrate', 'force'],
+ *   or a sequence of them run in order against the SAME engine — which is the
+ *   only way to reach anything that depends on what a previous command left
+ *   behind, an armed confirmation latch above all.
  * @param {Array<{name: string, fail?: 'throw'|'lock'}>} specs - One entry per
  *   plugin, in registration order. `fail: 'throw'` makes its up() reject the
  *   way a refused ALTER does; `fail: 'lock'` makes only that plugin's advisory
@@ -109,9 +112,12 @@ async function run() {
  * @param {{lockingBroken?: boolean, mintToken?: string}} [opts] -
  *   `lockingBroken` drops S3_Locks entirely, so locking is unavailable at the
  *   service level and every plugin would fail identically.
- * @returns {Promise<{ran: string[], versions: object, embeds: object[], engine: object}>}
- *   `ran` names the plugins whose up() actually executed; `versions` is the
- *   recorded schema version per plugin, read back after the command.
+ * @returns {Promise<{ran: string[], versions: object, embeds: object[],
+ *   embedsPerCommand: object[][], engine: object}>}
+ *   `ran` names the plugins whose up() actually executed, in order and with
+ *   repeats, so a second command re-running a migration is visible; `versions`
+ *   is the recorded schema version per plugin, read back at the end; `embeds`
+ *   is the last command's embeds and `embedsPerCommand` is all of them.
  */
 async function runBatch(argv, specs, opts = {}) {
   const { lockingBroken = false, mintToken = null } = opts;
@@ -173,7 +179,7 @@ async function runBatch(argv, specs, opts = {}) {
     engine._tokenExpiresAt = Date.now() + 60_000;
   }
 
-  const captured = [];
+  let captured = [];
   const { handlers } = cmds.createCommandHandlers({
     sendDiscordMessage: async (_c, payload) => { captured.push(payload); },
     watchManager: null,
@@ -194,7 +200,13 @@ async function runBatch(argv, specs, opts = {}) {
     localize: (key, vars) => lookupMessage(key, vars)
   };
 
-  await handlers.get(argv[0])(plugin, message, argv);
+  const commands = Array.isArray(argv[0]) ? argv : [argv];
+  const embedsPerCommand = [];
+  for (const command of commands) {
+    captured = [];
+    await handlers.get(command[0])(plugin, message, command);
+    embedsPerCommand.push(captured.map((p) => p?.embeds?.[0]).filter(Boolean));
+  }
 
   // Read the recorded versions back through the engine — this is the ground
   // truth the embed cannot fake.
@@ -203,12 +215,12 @@ async function runBatch(argv, specs, opts = {}) {
     versions[spec.name] = await engine._getAppliedVersion(spec.name);
   }
 
-  const embeds = captured.map((p) => p?.embeds?.[0]).filter(Boolean);
+  const embeds = embedsPerCommand.at(-1) ?? [];
 
   try { await sequelize.close(); } catch { /* ignore */ }
   try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
 
-  return { ran, versions, embeds, engine };
+  return { ran, versions, embeds, embedsPerCommand, engine };
 }
 
 /**
@@ -431,6 +443,90 @@ test('`!s3 confirm <token>`: the failure detail survives the confirm path', asyn
     succeeded: 1, total: 2
   });
   assert.ok(desc.includes(progress), `expected the partial-progress line, got: ${desc}`);
+});
+
+
+// ---------------------------------------------------------------------------
+// The confirmation latch: being ARMED is not the same fact as a token being
+// VALID, and confirmToken() used to conflate them
+// ---------------------------------------------------------------------------
+
+test('a wrong token after `migrate force` is refused, not waved through by the latch', async () => {
+  // The defect. `confirmToken()` short-circuited to true whenever `_confirmed`
+  // was set, and `!s3 migrate force` sets it — so on that process every
+  // subsequent `!s3 confirm <anything>` was accepted without being matched
+  // against anything, and re-entered the migration batch. On a shared database
+  // with several processes posting prompts into one channel, typing a stale
+  // token after a force is an ordinary mistake.
+  //
+  // `alpha` fails on purpose, and that is what makes the harm reachable. After
+  // a CLEAN force there is nothing pending, so a bogus token lands on the
+  // handler's "no pending migrations" early return and never reaches the batch
+  // at all — the refusal would be untested and the re-run assertion below could
+  // not fire. A batch that left something pending is the case where an
+  // accepted-but-unmatched token actually re-executes migration code.
+  const { ran, embedsPerCommand } = await runBatch([
+    ['migrate', 'force'],
+    ['confirm', 'not-a-real-token']
+  ], [
+    { name: 'alpha', fail: 'throw' },
+    { name: 'bravo' }
+  ]);
+
+  // Each up() ran exactly once. A third entry means the bogus token re-entered
+  // the batch and re-executed a real migration body — survivable here only
+  // because this fixture's up() is idempotent, which a live one is not obliged
+  // to be.
+  assert.deepEqual(ran, ['alpha', 'bravo'], 'a bogus token re-ran a pending migration');
+
+  // And the operator is told, rather than shown a success embed for a
+  // migration their token had nothing to do with.
+  const title = embedsPerCommand[1].map((e) => e.title).join(' ');
+  assert.match(title, /Invalid or Expired Token/i,
+    `expected a refusal for the bogus token, got: ${title}`);
+});
+
+test('the latch still survives the batch it was armed for', async () => {
+  // The half that must NOT change. `_confirmed` is read once per plugin by
+  // runMigrations(), so narrowing the short-circuit must not make the second
+  // plugin in a batch fail its own confirmation gate.
+  const { ran, versions } = await runBatch(['migrate', 'force'], [
+    { name: 'alpha' },
+    { name: 'bravo' },
+    { name: 'charlie' }
+  ]);
+
+  assert.deepEqual(ran, ['alpha', 'bravo', 'charlie'], 'the latch did not outlive the first plugin');
+  assert.equal(versions.charlie, 1, 'the last plugin in the batch was never authorised');
+});
+
+test('re-arming an already-armed engine is still idempotent', async () => {
+  // Several call sites arm unconditionally without checking first — the
+  // autoMigrate path and a dozen test harnesses among them. An arming token
+  // must keep answering true on an engine that is already armed.
+  const engine = new MigrationEngine({
+    dbService: { verboseLogger: () => {} }, verboseLogger: () => {}
+  });
+
+  assert.equal(engine.confirmToken('__force__'), true);
+  assert.equal(engine.confirmToken('__force__'), true, '__force__ was refused on an armed engine');
+  assert.equal(engine.confirmToken('__auto__'), true, '__auto__ was refused on an armed engine');
+});
+
+test('a spent token is not accepted a second time', async () => {
+  // A plain token is consumed on the match that authorises it — `_confirmToken`
+  // is nulled — so replaying the same message must not authorise anything
+  // again. Under the old short-circuit it did, because by then the engine was
+  // armed and the token was never looked at.
+  const engine = new MigrationEngine({
+    dbService: { verboseLogger: () => {} }, verboseLogger: () => {}
+  });
+  engine._confirmToken = 'a1b2c3d4';
+  engine._tokenExpiresAt = Date.now() + 60_000;
+
+  assert.equal(engine.confirmToken('a1b2c3d4'), true, 'a live token was refused');
+  assert.equal(engine.confirmToken('a1b2c3d4'), false, 'a spent token was accepted again');
+  assert.equal(engine._confirmed, true, 'the first confirmation did not latch');
 });
 
 
