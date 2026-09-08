@@ -12,11 +12,12 @@
  * ─── EXPORTS ─────────────────────────────────────────────────────
  *
  * SERVER_LABEL_MAX_LENGTH — Cap on a rendered label.
+ * SERVER_TITLE_SEPARATOR — What divides the server from an embed title.
  * serverLabels(rows, opts) — Map of serverID to label, or to null.
  * serverDisplayName(row, opts) — One row's label, or null.
  * publishServerLabel(label) — Set what this process labels with. S³ only.
  * readServerLabel() — The published label, or null.
- * applyServerLabel(payload, label) — Label a payload's embeds.
+ * applyServerLabel(payload, label) — Label a payload's embeds, at the top.
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
@@ -241,8 +242,15 @@ export function serverDisplayName(row, opts) {
  */
 let publishedLabel = null;
 
-/** What separates the label from a footer that already said something. */
-const FOOTER_SEPARATOR = ' • ';
+/**
+ * What separates the server from the rest of an embed title.
+ *
+ * Exported because `S3PluginBase.titleWithServer()` builds that title and
+ * `labelOne()` below has to recognise it. One constant rather than two
+ * matching string literals in two files: if they drift, the recognition
+ * silently fails and a mutation reply names its server twice.
+ */
+export const SERVER_TITLE_SEPARATOR = ' — ';
 
 /**
  * Publish this process's label. Called by S³ only.
@@ -263,25 +271,33 @@ export function readServerLabel() {
 }
 
 /**
- * Append the label to every embed in a Discord payload.
+ * Put the label at the top of every embed in a Discord payload.
  *
- * ─── WHY APPEND RATHER THAN DEFAULT ───
+ * ─── WHY THE AUTHOR SLOT, NOT THE FOOTER ───
  *
- * The base class already had `footer = footer || {…}`, which fills a
- * footer in only when there is none — so the embeds that carry the most
- * information, the ones that already say something in their footer, are
- * exactly the ones that would go unlabelled. This appends.
+ * This labelled the footer first, and the footer is where a label goes to
+ * be missed. `status`, `stats` and `check` broadcast — every registered
+ * server answers the same typed command — so an admin reads two embeds
+ * that are identical for their whole height and differ in the last line,
+ * below the fields, in the smallest text Discord renders. Telling them
+ * apart meant scrolling to the bottom of each and comparing. The answer
+ * to "which server is this" has to be readable before the content it
+ * qualifies, not after it.
+ *
+ * The author slot is the only thing above the title, and it is free: no
+ * embed in the suite sets one, so nothing is displaced by taking it. The
+ * footer is left exactly as the caller wrote it, which keeps the version
+ * stamps ("Switch v2.6.0") that were sharing it.
  *
  * ─── WHY BOTH SHAPES ───
  *
  * Embeds here are plain object literals; there is no `EmbedBuilder` and
- * no `setFooter` in the suite. Most call sites write `embeds: [ … ]`,
- * a minority write the singular `embed`, and the base class's existing
- * footer logic only ever inspected the singular one.
+ * no `setAuthor` in the suite. Most call sites write `embeds: [ … ]` and
+ * a minority write the singular `embed`.
  *
  * Nothing is mutated: a caller's embed literal may be reused, and the
- * senders retry on a 429 by re-sending the same payload, so appending in
- * place would stack the label up once per attempt.
+ * senders retry on a 429 by re-sending the same payload, so writing in
+ * place would relabel a payload once per attempt.
  *
  * @param {object} payload - { embeds: [...] } or { embed: {...} }
  * @param {string|null} [label] - Defaults to the published label
@@ -300,23 +316,28 @@ export function applyServerLabel(payload, label = readServerLabel()) {
   return payload;
 }
 
-/** One embed, with the label appended to whatever its footer already said. */
+/** One embed, with the label in the author line above its title. */
 function labelOne(embed, label) {
   if (!embed || typeof embed !== 'object') return embed;
 
-  const existing = typeof embed.footer?.text === 'string' ? embed.footer.text.trim() : '';
-  // A payload that has already been through here is left alone. The senders
-  // re-send the same object on a rate-limit retry, and s3-discord.js re-wraps
-  // it again for the v12 fallback shape.
-  if (existing === label || existing.endsWith(`${FOOTER_SEPARATOR}${label}`)) return embed;
+  // Already said, and said louder. `titleWithServer()` puts the server at the
+  // front of a mutation's title, which renders directly under this line — so
+  // adding the author line too would print the server name twice, stacked.
+  // The two always agree on the text when it matters: serverDescriptor()
+  // prefers the published label and falls back to the alias only when there
+  // is no published label, which is the case this function already returned
+  // early on.
+  const title = typeof embed.title === 'string' ? embed.title.trim() : '';
+  if (title === label || title.startsWith(`${label}${SERVER_TITLE_SEPARATOR}`)) return embed;
 
-  return {
-    ...embed,
-    footer: {
-      ...(embed.footer || {}),
-      text: existing === '' ? label : `${existing}${FOOTER_SEPARATOR}${label}`
-    }
-  };
+  // An author the embed set for itself is left alone, and so is one this
+  // function already wrote. The senders re-send the same object on a
+  // rate-limit retry, and s3-discord.js re-wraps it again for the v12
+  // fallback shape; overwriting a caller's author would be a silent loss
+  // rather than a decoration.
+  if (embed.author && typeof embed.author === 'object' && embed.author.name) return embed;
+
+  return { ...embed, author: { ...(embed.author || {}), name: label } };
 }
 
 

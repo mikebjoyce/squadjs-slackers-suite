@@ -207,12 +207,18 @@ function messageID() {
 // The selector grammar
 // ---------------------------------------------------------------------------
 
-test('all four selector spellings yield the token and leave nothing behind', () => {
+test('every selector spelling yields the token and leaves nothing behind', () => {
   for (const argv of [
     ['status', '--server', 'main'],
     ['status', '-s', 'main'],
     ['status', '--server=main'],
-    ['status', '-s=main']
+    ['status', '-s=main'],
+    // `--s` is the abbreviation an operator guesses once `--server` is known.
+    // It used to fall through as a positional argument, so `check slacker --s 2`
+    // looked up a player called `--s`, answered from every server, and reported
+    // nothing wrong — the one outcome worse than refusing.
+    ['status', '--s', 'main'],
+    ['status', '--s=main']
   ]) {
     const parsed = parseServerSelector(argv);
     assert.equal(parsed.token, 'main', `token not read from ${argv.join(' ')}`);
@@ -220,6 +226,16 @@ test('all four selector spellings yield the token and leave nothing behind', () 
     assert.equal(parsed.missingValue, false);
     assert.deepEqual(parsed.args, ['status'], `residue left behind by ${argv.join(' ')}`);
   }
+});
+
+test('`--s` does not swallow a neighbouring flag that merely starts with it', () => {
+  // The whole-flag match is what keeps `--s` from behaving like a prefix. If it
+  // ever became one, `--simulate` and `--skip-elo` would both parse as
+  // selectors and eat the token after them.
+  const parsed = parseServerSelector(['scramble', '--simulate', '--skip-elo', '--s', '2']);
+  assert.equal(parsed.token, '2');
+  assert.deepEqual(parsed.args, ['scramble', '--simulate', '--skip-elo'],
+    'a flag beginning with `--s` was taken for the selector');
 });
 
 test('`--all-servers` and `--server` survive each other in one command line', () => {

@@ -1128,7 +1128,7 @@ Writes have the same rule and a sharper failure. An unscoped `destroy({ where: {
 |--------|---------|
 | `localize(key, vars?)` | Look up a message in the configured language. Unknown key returns the key; missing translation falls back to English. Never throws. |
 | `lang` | The language S³ is configured with, or `en` before S³ is discovered. Read-only — plugins never set it. |
-| `applyServerLabel(payload)` | Appends this server's short name to the footer of every embed in a Discord payload. A no-op on a single-server install, where S³ publishes no label. |
+| `applyServerLabel(payload)` | Puts this server's short name in the author line, above the title, of every embed in a Discord payload. A no-op on a single-server install, where S³ publishes no label. |
 
 Every string a player or admin reads goes through `localize()`. Values written
 to the database (round-report columns, JSON report fields) stay in English —
@@ -1195,8 +1195,8 @@ They live on the base class for the same reason `applyServerLabel()` does: `inst
 | `serverDescriptor()` | How to name this server to an admin — the label, else the alias, else `#<id>`. `null` on a single-server install, and that null is what makes the callers below no-ops. |
 | `routeDiscordCommand(opts)` | The routing gate. Decides act / drop / refuse for one Discord command, and strips the `--server` selector. See 8.2.2. |
 | `buildRoutingRefusalEmbed(verdict)` | Renders a `refuse` verdict as an embed, localized through this plugin's `localize()`. |
-| `applyServerLabel(payload)` | Server label in the **footer** of every embed in a payload. For reads. |
-| `titleWithServer(title)` | Server in the **title**, ahead of the text. For mutations — see 8.2.3. Returns the title unchanged when there is one server. |
+| `applyServerLabel(payload)` | Server label in the **author line** of every embed in a payload, which renders above the title. For reads. Skips any embed whose title already leads with the server, so it never doubles up on `titleWithServer()`. |
+| `titleWithServer(title)` | Server in the **title**, ahead of the text. For mutations — see 8.2.3. Louder than the author line, and it suppresses it. Returns the title unchanged when there is one server. |
 | `serverFileTag()` | A filename-safe `-slug` for this server, `''` when there is one. Two commands answer with a file rather than an embed, so the filename is the only place the answer can say where it came from. |
 | `recordChannelBinding(name, id)` | Declare which Discord channel this server uses for a named purpose. Stored in the shared `communityOptions` blob. |
 | `channelSharers(name, id)` | The other registered servers pointing that same purpose at that same channel. Empty on a single-server install, which is what makes every shared-channel guard inert there. |

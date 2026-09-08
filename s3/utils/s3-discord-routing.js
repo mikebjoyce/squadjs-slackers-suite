@@ -18,8 +18,8 @@
  *
  * COMMAND_SCOPE            — The scope tags a handler may carry.
  * ROUTING                  — The verdicts this gate returns.
- * parseServerSelector(args) — Strip `--server <x>` / `-s <x>` out of an
- *                            argument list, leaving it otherwise intact.
+ * parseServerSelector(args) — Strip `--server <x>` / `--s <x>` / `-s <x>`
+ *                            out of an argument list, leaving it intact.
  * routeDiscordCommand(opts) — The gate. Returns a verdict.
  * buildRoutingRefusalEmbed(verdict, localize) — Render a refusal.
  * describeCandidates(rows) — Compact registry listing for a refusal.
@@ -115,9 +115,10 @@ export const REFUSAL = Object.freeze({
 /**
  * The selector, and the two shapes it is deliberately NOT.
  *
- * `--server <x>`, `--server=<x>`, `-s <x>` and `-s=<x>` are the whole
- * grammar, and the match is on the whole flag rather than on the word
- * `server` inside it. That is not fussiness. The export flags this gate
+ * `--server`, `--s` and `-s` are the whole grammar, each accepted with
+ * its value as the next token or after an `=`, and the match is on the
+ * whole flag rather than on the word `server` inside it. That is not
+ * fussiness. The export flags this gate
  * exists to make safe — `--all-servers`, `--remap-server` — both carry
  * the word, so a parser that looked for it, which is the forgiving way
  * to write this and would also accept a typo'd `--servers`, takes
@@ -129,8 +130,15 @@ export const REFUSAL = Object.freeze({
  * There is no `@alias` form. Discord's mention autocomplete fires on `@`
  * and makes it unpleasant to type.
  */
-const LONG_FLAG = '--server';
-const SHORT_FLAG = '-s';
+/**
+ * `--s` is here because operators type it. The abbreviation is the obvious
+ * guess once `--server` is known, and it used to parse as a positional
+ * argument — so `!switch check slacker --s 2` looked up a player called
+ * `--s`, answered from every server, and reported nothing wrong. A flag
+ * that is silently a name is the worst of the three outcomes; refusing
+ * would at least have been visible.
+ */
+const SELECTOR_FLAGS = new Set(['--server', '--s', '-s']);
 
 /**
  * Pull the selector out of an argument list.
@@ -161,7 +169,7 @@ export function parseServerSelector(args) {
     const eq = arg.indexOf('=');
     const head = eq === -1 ? lower : lower.slice(0, eq);
 
-    if (head !== LONG_FLAG && head !== SHORT_FLAG) {
+    if (!SELECTOR_FLAGS.has(head)) {
       out.push(input[i]);
       continue;
     }

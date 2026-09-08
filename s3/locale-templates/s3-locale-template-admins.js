@@ -124,7 +124,7 @@ export const MESSAGES = {
     routing: {
       // EN: ⛔ Which Server?
       selectorRequiredTitle: '',
-      // EN: `{command}` acts on one server, and this database has more than one registered — so it has to be told which:\n\n{candidates}\n\nAdd `--server <alias>` (or `-s <alias>`) and send it again. Nothing was done.\n\nThere is deliberately no remembered target. A channel that quietly holds a server gives a correct-looking answer about the wrong one, and the scrollback contains nothing that explains why.
+      // EN: `{command}` acts on one server, and this database has more than one registered — so it has to be told which:\n\n{candidates}\n\nAdd `--server <alias>` and send it again — `--s <alias>` and `-s <alias>` are the same flag. Nothing was done.\n\nThere is deliberately no remembered target. A channel that quietly holds a server gives a correct-looking answer about the wrong one, and the scrollback contains nothing that explains why.
       selectorRequiredDescription: '',
       // EN: ⛔ That Server Is Not Answering
       unreachableTitle: '',
@@ -132,7 +132,7 @@ export const MESSAGES = {
       unreachableDescription: '',
       // EN: ⛔ Which Server?
       selectorMissingValueTitle: '',
-      // EN: `--server` was given with nothing after it, so nothing was done. Name one of these:\n\n{candidates}
+      // EN: A server flag was given with nothing after it, so nothing was done. Name one of these:\n\n{candidates}
       selectorMissingValueDescription: '',
     },
     serverRegistry: {

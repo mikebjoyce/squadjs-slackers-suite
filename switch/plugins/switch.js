@@ -2992,15 +2992,22 @@ export default class Switch extends S3DiscordPluginBase {
             // one channel, two of every heading, and the numbers differ
             // wherever the two servers are configured differently.
             //
-            // The footer on all of them, and the server in the TITLE of the
+            // The label on all of them, and the server in the TITLE of the
             // first, which is the one a reader scrolls to. Both are no-ops on
             // a single-server install, where the set is unchanged.
+            //
+            // The title is built BEFORE applyServerLabel(), not after: the
+            // label lands in the author line above the title, and it steps
+            // aside for a title that already names the server. It can only
+            // see a title that exists by the time it runs, so titling second
+            // would give the first embed both, the server name stacked above
+            // itself.
             const messageIDs = [];
             for (const [index, embed] of embeds.entries()) {
-                const labelled = this.applyServerLabel({ embeds: [embed] }).embeds[0];
-                if (index === 0 && labelled.title) {
-                    labelled.title = this.titleWithServer(labelled.title);
-                }
+                const titled = index === 0 && embed.title
+                    ? { ...embed, title: this.titleWithServer(embed.title) }
+                    : embed;
+                const labelled = this.applyServerLabel({ embeds: [titled] }).embeds[0];
                 const sent = await channel.send({ embeds: [labelled] });
                 messageIDs.push(sent.id);
                 // Small delay between sends to avoid Discord rate limits

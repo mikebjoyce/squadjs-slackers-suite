@@ -70,11 +70,11 @@ export const MESSAGES = {
     },
     "routing": {
       "selectorRequiredTitle": "\u26d4 Which Server?",
-      "selectorRequiredDescription": "`{command}` acts on one server, and this database has more than one registered \u2014 so it has to be told which:\n\n{candidates}\n\nAdd `--server <alias>` (or `-s <alias>`) and send it again. Nothing was done.\n\nThere is deliberately no remembered target. A channel that quietly holds a server gives a correct-looking answer about the wrong one, and the scrollback contains nothing that explains why.",
+      "selectorRequiredDescription": "`{command}` acts on one server, and this database has more than one registered \u2014 so it has to be told which:\n\n{candidates}\n\nAdd `--server <alias>` and send it again — `--s <alias>` and `-s <alias>` are the same flag. Nothing was done.\n\nThere is deliberately no remembered target. A channel that quietly holds a server gives a correct-looking answer about the wrong one, and the scrollback contains nothing that explains why.",
       "unreachableTitle": "\u26d4 That Server Is Not Answering",
       "unreachableDescription": "`{token}` names a registered server, but no process has written a heartbeat for it recently \u2014 so nothing would have run and nothing was done.\n\n{candidates}\n\nStart that server's SquadJS, or target one that is live. The registration is left alone: a stopped server is still a server the community owns, and `!s3 servers forget` is the command that removes one.",
       "selectorMissingValueTitle": "\u26d4 Which Server?",
-      "selectorMissingValueDescription": "`--server` was given with nothing after it, so nothing was done. Name one of these:\n\n{candidates}"
+      "selectorMissingValueDescription": "A server flag was given with nothing after it, so nothing was done. Name one of these:\n\n{candidates}"
     },
     "serverRegistry": {
       "collisionTitle": "⛔ Server Identity Collision",

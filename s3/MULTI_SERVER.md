@@ -24,6 +24,16 @@ A community that numbers its servers is the case the default can't handle. "Nort
 
 So pick them yourself with `!s3 servers alias`. Short, distinct at a glance, and derived from something about the server rather than its position in a list. `main` and `event`. `seed` and `full`. Never a numbered pair.
 
+## Naming a server in a command
+
+`--server <alias>` names one server. `--s <alias>` and `-s <alias>` are the same flag, and all three also take their value after an `=`, so `--server=main`, `--s=main` and `-s=main` work too. That is the whole grammar. It is stripped before the command sees its arguments, so it can go anywhere on the line: `!switch check slacker -s main` and `!switch -s main check slacker` are the same command.
+
+There is no way to say "all servers" and no memory of the last one you named. Both are deliberate. A remembered target turns a typo into a silent assumption about a server you last mentioned some minutes ago, and the sticky value is invisible at the moment it matters — the one where you are about to change something.
+
+A command that changes something on one server requires the selector and refuses without it, naming the servers it would have accepted. A command that only reads is answered by every server, each for itself, and that is why `!switch status` in a two-server community posts two replies. They are not duplicates: each is that server's own answer, and the point of the pair is that you can see where the two differ. Name a server when you want one of them.
+
+The exception is `!switch explain`, which is seven embeds per server and is required to name one. `!elo` reads a single community-wide rating table, so nothing there has a per-server answer to give.
+
 ## Upgrading a community
 
 Every process must run the same suite version. This is enforced, not recommended: a process that finds a live sibling on a different version refuses to mount its server-scoped plugins and says so on stderr and in Discord. A mixed pair writes against a schema one of them doesn't know about, and a community-wide command answered by the older process runs a superseded handler. Neither failure announces itself, so mount time is the only moment either can be caught.

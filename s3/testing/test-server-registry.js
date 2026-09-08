@@ -1025,26 +1025,46 @@ test('one registered server has nothing to be compared against', () => {
 // Label delivery
 // ---------------------------------------------------------------------------
 
-test('the label joins whatever the footer already said', () => {
+test('the label goes above the title and leaves the footer alone', () => {
   publishServerLabel('Northern Lights #1');
   try {
-    // The embeds that carry the most information are the ones that already
-    // use their footer, and the base class's old `footer || {...}` default
-    // meant those were exactly the ones that would have gone unlabelled.
-    const joined = applyServerLabel({
+    // The author slot renders above the title, which is the whole reason it
+    // is used: broadcast reads are identical for their whole height, and a
+    // label in the footer is read after the content it qualifies.
+    const labelled = applyServerLabel({
       embeds: [{ title: 'Scramble', footer: { text: 'Round 42' } }]
     });
-    assert.equal(joined.embeds[0].footer.text, 'Round 42 • Northern Lights #1');
+    assert.equal(labelled.embeds[0].author.name, 'Northern Lights #1');
 
-    // A footerless embed gets the label alone, not a separator with nothing
-    // in front of it.
-    const bare = applyServerLabel({ embeds: [{ title: 'Scramble' }] });
-    assert.equal(bare.embeds[0].footer.text, 'Northern Lights #1');
+    // Whatever the footer was already saying is still saying it. Version
+    // stamps live there — "Switch v2.6.0" — and used to share the line.
+    assert.equal(labelled.embeds[0].footer.text, 'Round 42');
 
-    // Most call sites write the array, a minority write the singular, and the
-    // base class's own footer logic only ever looked at the singular one.
+    // Most call sites write the array, a minority write the singular.
     const singular = applyServerLabel({ embed: { title: 'Scramble' } });
-    assert.equal(singular.embed.footer.text, 'Northern Lights #1');
+    assert.equal(singular.embed.author.name, 'Northern Lights #1');
+  } finally {
+    publishServerLabel(null);
+  }
+});
+
+test('a title that already names the server suppresses the author line', () => {
+  publishServerLabel('Northern Lights #1');
+  try {
+    // titleWithServer() puts the server at the front of a mutation's title,
+    // and that title renders directly under the author line. Both would
+    // print the server name twice, stacked.
+    const mutation = applyServerLabel({
+      embeds: [{ title: 'Northern Lights #1 — Scramble Completed' }]
+    });
+    assert.equal(mutation.embeds[0].author, undefined);
+
+    // A title that merely starts with the same words is not the same shape —
+    // the separator is what makes it a titleWithServer() title.
+    const coincidence = applyServerLabel({
+      embeds: [{ title: 'Northern Lights #1 Scramble Completed' }]
+    });
+    assert.equal(coincidence.embeds[0].author.name, 'Northern Lights #1');
   } finally {
     publishServerLabel(null);
   }
@@ -1058,17 +1078,16 @@ test('a payload does not collect a second label on the way out', () => {
     // rebuilds it in the v12 singular shape and sends that.
     const once = applyServerLabel({ embeds: [{ footer: { text: 'Round 42' } }] });
     const twice = applyServerLabel(once);
-    assert.equal(twice.embeds[0].footer.text, 'Round 42 • Northern Lights #1');
+    assert.equal(twice.embeds[0].author.name, 'Northern Lights #1');
+    assert.equal(twice.embeds[0].footer.text, 'Round 42');
 
     const rewrapped = applyServerLabel({ embed: once.embeds[0] });
-    assert.equal(rewrapped.embed.footer.text, 'Round 42 • Northern Lights #1');
+    assert.equal(rewrapped.embed.author.name, 'Northern Lights #1');
 
-    // And an embed whose footer was only ever the label.
-    const labelOnly = applyServerLabel({ embeds: [{}] });
-    assert.equal(
-      applyServerLabel(labelOnly).embeds[0].footer.text,
-      'Northern Lights #1'
-    );
+    // An author the caller set for itself is a loss if it is overwritten, so
+    // it is left alone rather than relabelled.
+    const owned = applyServerLabel({ embeds: [{ author: { name: 'Elo' } }] });
+    assert.equal(owned.embeds[0].author.name, 'Elo');
   } finally {
     publishServerLabel(null);
   }
@@ -1083,7 +1102,7 @@ test('the caller keeps the embed it wrote', () => {
     const payload = { embeds: [embed] };
     const labelled = applyServerLabel(payload);
 
-    assert.equal(embed.footer.text, 'Round 42', 'the original is untouched');
+    assert.equal(embed.author, undefined, 'the original is untouched');
     assert.notEqual(labelled.embeds[0], embed);
     assert.notEqual(labelled, payload);
   } finally {
@@ -1102,7 +1121,7 @@ test('a single-server install publishes nothing and is handed back its payload',
   assert.equal(applyServerLabel(payload), payload);
 
   // An empty string is the same instruction as null — a locale that renders
-  // the footer key to nothing must stop the labelling, not print a bullet.
+  // the label to nothing must stop the labelling, not print an empty line.
   publishServerLabel('   ');
   assert.equal(readServerLabel(), null);
   assert.equal(applyServerLabel(payload), payload);
@@ -1133,18 +1152,18 @@ test('every sender labels its embeds, in the layout the suite ships in', async (
 
     const s3Channel = captor();
     await sendDiscordMessage(s3Channel, { embeds: [{ title: 'Servers' }] });
-    assert.equal(s3Channel.sent.embeds[0].footer.text, 'Northern Lights #1');
+    assert.equal(s3Channel.sent.embeds[0].author.name, 'Northern Lights #1');
 
     const eloChannel = captor();
     await EloDiscord.sendDiscordMessage(eloChannel, { embeds: [{ title: 'Round' }] });
-    assert.equal(eloChannel.sent.embeds[0].footer.text, 'Northern Lights #1');
+    assert.equal(eloChannel.sent.embeds[0].author.name, 'Northern Lights #1');
 
     const tbChannel = captor();
     await DiscordHelpers.sendDiscordMessage(tbChannel, { embeds: [{ title: 'Scramble' }] });
-    assert.equal(tbChannel.sent.embeds[0].footer.text, 'Northern Lights #1');
+    assert.equal(tbChannel.sent.embeds[0].author.name, 'Northern Lights #1');
 
     // The base class fills a footer in before this runs, so its embeds prove
-    // the joining rather than the bare case the other three cover.
+    // that the label no longer competes for that line.
     const baseChannel = captor();
     await S3DiscordPluginBase.prototype.sendDiscordMessage.call(
       {
@@ -1155,10 +1174,8 @@ test('every sender labels its embeds, in the layout the suite ships in', async (
       },
       { embed: { title: 'Status' } }
     );
-    assert.equal(
-      baseChannel.sent.embeds[0].footer.text,
-      'Slackers Suite • Northern Lights #1'
-    );
+    assert.equal(baseChannel.sent.embeds[0].author.name, 'Northern Lights #1');
+    assert.equal(baseChannel.sent.embeds[0].footer.text, 'Slackers Suite');
   } finally {
     label.publishServerLabel(null);
   }

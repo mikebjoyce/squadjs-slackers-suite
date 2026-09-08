@@ -21,10 +21,11 @@
  *
  * This pins the fix:
  *
- *   - embeds go out through applyServerLabel(), which appends the label to
- *     the footer rather than replacing it (the embeds carrying the most
- *     information are the ones that already have a footer);
- *   - plain-text answers have no footer to write into, so they go through
+ *   - embeds go out through applyServerLabel(), which writes the label into
+ *     the author line above the title — the footer is where a label goes to
+ *     be missed, since two broadcast answers are identical for their whole
+ *     height and differ only below the fields;
+ *   - plain-text answers have no embed to decorate, so they go through
  *     plugin.labelText(), which prefixes the server descriptor;
  *   - both are inert on a single-server install, which is what lets every
  *     call site invoke them unconditionally and never count servers;
@@ -177,6 +178,7 @@ function discordMessage(content) {
   };
 }
 
+const authors = (sent) => sent.flatMap((p) => (p.embeds || []).map((e) => e.author?.name ?? ''));
 const footers = (sent) => sent.flatMap((p) => (p.embeds || []).map((e) => e.footer?.text ?? ''));
 
 console.log('\n🧪 Switch Discord Server Labels — broadcast disambiguation\n');
@@ -192,8 +194,8 @@ await runTest('the status embed is labelled when more than one server is registe
     await ctx.plugin.onDiscordMessage(message);
 
     assert.equal(sent.length, 1, 'status should answer with exactly one payload');
-    const text = footers(sent)[0];
-    assert.ok(text.includes(LABEL), `the status footer should name the server, got: ${JSON.stringify(text)}`);
+    const text = authors(sent)[0];
+    assert.ok(text.includes(LABEL), `the status author line should name the server, got: ${JSON.stringify(text)}`);
   } finally {
     await teardown(ctx);
   }
@@ -207,44 +209,62 @@ await runTest('the status embed is untouched on a single-server install', async 
 
     assert.equal(sent.length, 1);
     // Not merely "no LABEL" — a single-server install must render exactly what
-    // it rendered before any of this existed, footer included.
-    assert.ok(!footers(sent)[0].includes(LABEL), 'a lone server should add no label at all');
+    // it rendered before any of this existed, author line and footer included.
+    assert.ok(!authors(sent)[0].includes(LABEL), 'a lone server should add no label at all');
+    assert.ok(!footers(sent)[0].includes(LABEL), 'and nothing in the footer either');
   } finally {
     await teardown(ctx);
   }
 });
 
-await runTest('an embed with no footer of its own gets the label as its footer', async () => {
+await runTest('the label lands in the author line, above the title', async () => {
   const ctx = await buildPlugin({ multiServer: true });
   try {
-    // The status diagnostic embed carries no footer, so there is nothing to
-    // append to and the label has to create one. Asserted separately from the
-    // appending case below because these are different branches of labelOne().
+    // The status diagnostic embed is the case this whole suite exists for:
+    // two of them arrive together, identical down to the last field, and the
+    // author line is the first thing above the title that can tell them apart.
     const { sent, message } = discordMessage('!switch status');
     await ctx.plugin.onDiscordMessage(message);
 
-    assert.equal(footers(sent)[0], LABEL,
-      'a footerless embed should end up with the label and nothing else');
+    assert.equal(authors(sent)[0], LABEL,
+      'the author line should be the label and nothing else');
   } finally {
     await teardown(ctx);
   }
 });
 
-await runTest('the label is appended to an existing footer, not written over it', async () => {
+await runTest('an existing footer is left exactly as the caller wrote it', async () => {
   const ctx = await buildPlugin({ multiServer: true });
   try {
-    // The embeds carrying the most information are exactly the ones that
-    // already say something in their footer — the round summary's version
-    // string, the stats embed's. An earlier `footer = footer || {…}` default
-    // left precisely those unlabelled; replacing would instead drop what they
-    // said. Neither is acceptable, so this pins appending.
+    // The footer used to be where the label went, so the embeds that already
+    // said something there — the round summary's version string, the stats
+    // embed's — had the label joined onto it. Now the two do not compete: the
+    // version stamp keeps its line and the label has its own.
     const labelled = ctx.plugin.applyServerLabel({
-      embeds: [{ footer: { text: 'Switch v2.6.0' } }]
+      embeds: [{ title: 'Diagnostics', footer: { text: 'Switch v2.6.0' } }]
     });
 
-    const text = labelled.embeds[0].footer.text;
-    assert.ok(text.includes('Switch v2.6.0'), `the original footer should survive, got: ${JSON.stringify(text)}`);
-    assert.ok(text.includes(LABEL), `and the label should be there too, got: ${JSON.stringify(text)}`);
+    assert.equal(labelled.embeds[0].footer.text, 'Switch v2.6.0',
+      'the version stamp should be untouched');
+    assert.equal(labelled.embeds[0].author.name, LABEL,
+      'and the label should be in the author line instead');
+  } finally {
+    await teardown(ctx);
+  }
+});
+
+await runTest('a title that already names the server suppresses the author line', async () => {
+  const ctx = await buildPlugin({ multiServer: true });
+  try {
+    // titleWithServer() puts the server at the front of a mutation's title,
+    // which renders directly beneath the author line. Labelling both prints
+    // the server name twice, stacked, on exactly the replies that matter most.
+    const labelled = ctx.plugin.applyServerLabel({
+      embeds: [{ title: `${LABEL} — Switches Cleared` }]
+    });
+
+    assert.equal(labelled.embeds[0].author, undefined,
+      'a title that already leads with the server should not get an author line too');
   } finally {
     await teardown(ctx);
   }
@@ -259,20 +279,20 @@ await runTest('re-labelling an already-labelled payload does not stack the label
     const once = ctx.plugin.applyServerLabel({ embeds: [{ footer: { text: 'Round 42' } }] });
     const twice = ctx.plugin.applyServerLabel(once);
 
-    const text = twice.embeds[0].footer.text;
+    const text = twice.embeds[0].author.name;
     // Asserted present before asserted-once: "appears zero times" also satisfies
     // indexOf === lastIndexOf, so without this the case passes on a harness that
     // never published a label at all.
     assert.ok(text.includes(LABEL), `the label should be applied at least once, got: ${JSON.stringify(text)}`);
     assert.equal(text.indexOf(LABEL), text.lastIndexOf(LABEL), `the label should appear once, got: ${JSON.stringify(text)}`);
-    assert.ok(text.includes('Round 42'), 'and the original footer should survive');
+    assert.equal(twice.embeds[0].footer.text, 'Round 42', 'and the original footer should survive');
   } finally {
     await teardown(ctx);
   }
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 2. Plain-text answers, which have no footer to write into
+// 2. Plain-text answers, which have no embed to decorate
 // ═══════════════════════════════════════════════════════════════════
 
 await runTest('labelText prefixes a plain-text answer when the community has several servers', async () => {
@@ -337,7 +357,7 @@ await runTest('the help embed is not labelled, because only one server ever answ
     // `help` is community-read: exactly one process claims the message key and
     // replies. Labelling it would name a server the reader never had to
     // disambiguate, on text that is identical from every server anyway.
-    assert.ok(!footers(sent)[0].includes(LABEL), 'a single-responder reply should stay bare');
+    assert.ok(!authors(sent)[0].includes(LABEL), 'a single-responder reply should stay bare');
   } finally {
     await teardown(ctx);
   }

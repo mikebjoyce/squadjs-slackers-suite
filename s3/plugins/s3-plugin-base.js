@@ -108,7 +108,11 @@ import {
   routeDiscordCommand as routeCommand,
   buildRoutingRefusalEmbed as buildRefusalEmbed
 } from '../utils/s3-discord-routing.js';
-import { applyServerLabel as labelPayload, readServerLabel } from '../utils/s3-server-label.js';
+import {
+  applyServerLabel as labelPayload,
+  readServerLabel,
+  SERVER_TITLE_SEPARATOR
+} from '../utils/s3-server-label.js';
 import { PendingActions, PENDING } from '../utils/s3-pending-actions.js';
 
 /**
@@ -851,10 +855,15 @@ export default class S3PluginBase extends BasePlugin {
   /**
    * Put the server in an embed title, where a mutation cannot be misread.
    *
-   * The footer every embed gets (§ the label module) is right for a read
-   * and too quiet for a scramble: a reply confirming that something was
-   * DONE to a live game has to name the game in the line the eye lands on.
-   * A no-op on a single-server install.
+   * The author line every embed gets (§ the label module) is right for a
+   * read and still too quiet for a scramble: a reply confirming that
+   * something was DONE to a live game has to name the game in the same
+   * type size as the thing that was done. A no-op on a single-server
+   * install.
+   *
+   * A title built here suppresses the author line rather than stacking
+   * under it — `labelOne()` recognises this exact shape, which is why the
+   * separator is imported rather than written out again.
    *
    * @param {string} title
    * @returns {string}
@@ -865,7 +874,7 @@ export default class S3PluginBase extends BasePlugin {
     if (!server) return text;
     // Server first. A title is truncated from the right by Discord and by
     // every narrow client, and the half that must survive is which server.
-    return text === '' ? server : `${server} — ${text}`;
+    return text === '' ? server : `${server}${SERVER_TITLE_SEPARATOR}${text}`;
   }
 
   /**
