@@ -10,7 +10,7 @@ This document is the operational half. What the scoping rules are and how export
 
 ## Declaring which server this is
 
-S³ takes its id from SquadJS's own `server.id`, which is usually what you want. Where two installs both ship `"id": 1` and renumbering one of them would disturb rows other plugins have already written, set `overrideServerID` on the S³ plugin instead. It overrides the id for S³ alone, and db-log takes an option of the same name.
+S³ takes its id from SquadJS's own `server.id`, which is usually what you want. Where two installs both ship `"id": 1` and renumbering one of them would disturb rows other plugins have already written, set `overrideServerID` on the S³ plugin instead. It overrides the id for S³ alone, and every other plugin, including db-log, reads that resolved id rather than declaring an option of its own.
 
 The id has to stay the same for the life of that server. The registry tracks a server by that declaration, so changing it doesn't rename a server, it retires one and introduces another: the old id keeps every row it ever wrote, and the new one starts empty.
 

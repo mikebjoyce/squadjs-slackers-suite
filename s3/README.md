@@ -178,7 +178,7 @@ Running it is covered in [MULTI_SERVER.md](MULTI_SERVER.md) — upgrade order, r
 
 ### Declaring which server this is
 
-S³ takes its id from SquadJS's own `server.id`. Set `overrideServerID` where two installs both ship `"id": 1` and renumbering one would disturb rows other plugins have already written; it overrides the id for S³ alone. `db-log` takes an option of the same name.
+S³ takes its id from SquadJS's own `server.id`. Set `overrideServerID` where two installs both ship `"id": 1` and renumbering one would disturb rows other plugins have already written; it overrides the id for S³ alone. Every other plugin, including `db-log`, reads S³'s resolved id rather than declaring an option of its own.
 
 **The id must stay constant for the life of that server.** The registry tracks a server by that declaration and by nothing else, so changing it does not rename a server, it retires one and introduces another. The old id keeps every row it ever wrote and the new one starts empty. Nothing renumbers implicitly, on boot order or row age or an empty registry, because the deciding fact is operator knowledge and it is in no table.
 

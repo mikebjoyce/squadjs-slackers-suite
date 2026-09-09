@@ -97,7 +97,7 @@ S³ **must** be mounted before any consumer plugin. In your SquadJS `config.json
 }
 ```
 
-`DBLog` is optional — include it only if you want the S³ build of SquadJS's core `db-log.js` (see [Installation](#installation)). It takes no options beyond core's `overrideServerID`, and unlike core it needs no `database` key, because it logs through S³'s connection. If you are switching over from core's version, you can leave your existing entry exactly as it is: SquadJS ignores config keys a plugin doesn't declare, and S³ already opens the `database` connector your old entry was naming.
+`DBLog` is optional — include it only if you want the S³ build of SquadJS's core `db-log.js` (see [Installation](#installation)). It takes no options of its own — its server id comes from S³, the same one every other plugin uses, rather than a separate setting of its own — and unlike core it needs no `database` key, because it logs through S³'s connection. If you are switching over from core's version, you can leave your existing entry exactly as it is: SquadJS ignores config keys a plugin doesn't declare, and S³ already opens the `database` connector your old entry was naming.
 
 Internally, S³ services mount in this order to satisfy dependency chains:
 
@@ -226,7 +226,7 @@ squad-server/
    - [Switch](switch/README.md#configuration-options) — [Behaviour Reference](switch/SWITCH_BEHAVIOUR.md)
    - [EloTracker](elo-tracker/README.md#configuration-options)
    - [TeamBalancer](team-balancer/README.md#configuration-options)
-   - **DBLog (core upgrade)** — one option, `overrideServerID`, same as core's. No config changes needed if you already run core's `db-log.js`; see the [top-of-file docblock](core-plugins/db-log.js) for what differs behind the same config
+   - **DBLog (core upgrade)** — no options of its own; its server id comes from S³. No config changes needed if you already run core's `db-log.js`; see the [top-of-file docblock](core-plugins/db-log.js) for what differs behind the same config
 
 ### Logging
 
@@ -256,7 +256,7 @@ Two or more Squad servers can share one database and one Discord server. Rows th
 
 1. **Point both installs at the same database connector.** Same host, same database, same credentials. Nothing else is shared.
 
-2. **Give each install a distinct server id.** S³ takes it from SquadJS's own `server.id`, which is usually enough. Where two installs both ship `"id": 1` and renumbering one would disturb rows other plugins have already written, set `overrideServerID` on the S³ plugin instead — it overrides the id for S³ alone. `db-log` takes an option of the same name.
+2. **Give each install a distinct server id.** S³ takes it from SquadJS's own `server.id`, which is usually enough. Where two installs both ship `"id": 1` and renumbering one would disturb rows other plugins have already written, set `overrideServerID` on the S³ plugin instead — it overrides the id for S³ alone. Every other plugin, including `db-log`, reads S³'s resolved id rather than declaring an option of its own, so this is the only place to set it.
 
    ```json
    { "plugin": "SlackersSquadServices", "enabled": true, "overrideServerID": 2 }

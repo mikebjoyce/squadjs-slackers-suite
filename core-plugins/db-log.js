@@ -246,13 +246,7 @@ export default class DBLog extends S3PluginBase {
   }
 
   static get optionsSpecification() {
-    return {
-      overrideServerID: {
-        required: false,
-        description: 'An overridden server ID, for multi-server setups sharing one database.',
-        default: null
-      }
-    };
+    return {};
   }
 
   constructor(server, options, connectors) {
@@ -270,21 +264,16 @@ export default class DBLog extends S3PluginBase {
     this.listeners.onPlayerRevived = this.onPlayerRevived.bind(this);
   }
 
-  /** Resolves the server id to attach to every row — a plain property read, not a DB call. */
-  get _serverId() {
-    return this.options.overrideServerID || this.server.id;
-  }
-
   _checkS3Version() {
     // 1.8.0 — every model this plugin defines declares a `scopeKind`, and an S³
     // older than 1.8.0 has no `scopePredicateFor()` to turn one into a query.
     // This plugin's own reads and writes are safe either way: it stamps rows
-    // from `overrideServerID` or `server.id` and filters on that column
-    // explicitly at every call site. What breaks is the work S³ does on its
-    // behalf — the declarations are accepted and ignored, so an export carries
-    // every server's rows while reporting itself as this server's, and an
-    // import writes a sibling's rows in without noticing whose they were.
-    // Nothing throws, which is why this is checked at mount.
+    // from `this.serverID` (S³'s resolved id, inherited from S3PluginBase) and
+    // filters on that column explicitly at every call site. What breaks is the
+    // work S³ does on its behalf — the declarations are accepted and ignored,
+    // so an export carries every server's rows while reporting itself as this
+    // server's, and an import writes a sibling's rows in without noticing whose
+    // they were. Nothing throws, which is why this is checked at mount.
     const required = '1.8.0';
     const actual = this._s3?.version;
     if (!this._s3VersionAtLeast(required)) {
@@ -337,7 +326,7 @@ export default class DBLog extends S3PluginBase {
       return;
     }
 
-    const serverId = this._serverId;
+    const serverId = this.serverID;
 
     await this._withDb(async (t) => {
       await this._getModel(MODEL.SERVER).upsert(
@@ -688,7 +677,7 @@ export default class DBLog extends S3PluginBase {
   // ═══════════════════════════════════════════════════════════════
 
   async onTickRate(info) {
-    const serverId = this._serverId;
+    const serverId = this.serverID;
     await this._withDb(async (t) => {
       await this._getModel(MODEL.TICKRATE).create({
         server: serverId,
@@ -700,7 +689,7 @@ export default class DBLog extends S3PluginBase {
   }
 
   async onUpdatedA2SInformation(info) {
-    const serverId = this._serverId;
+    const serverId = this.serverID;
     await this._withDb(async (t) => {
       await this._getModel(MODEL.PLAYERCOUNT).create({
         server: serverId,
@@ -723,7 +712,7 @@ export default class DBLog extends S3PluginBase {
    * nothing in the logs to indicate it had happened.
    */
   async onNewGame(info) {
-    const serverId = this._serverId;
+    const serverId = this.serverID;
 
     await this._withDb(async (t) => {
       await this._getModel(MODEL.MATCH).update(
@@ -761,7 +750,7 @@ export default class DBLog extends S3PluginBase {
     await this.ensurePlayer(info.attacker);
     await this.ensurePlayer(info.victim);
 
-    const serverId = this._serverId;
+    const serverId = this.serverID;
     await this._withDb(async (t) => {
       await this._getModel(MODEL.WOUND).create({
         server: serverId,
@@ -786,7 +775,7 @@ export default class DBLog extends S3PluginBase {
     await this.ensurePlayer(info.attacker);
     await this.ensurePlayer(info.victim);
 
-    const serverId = this._serverId;
+    const serverId = this.serverID;
     await this._withDb(async (t) => {
       await this._getModel(MODEL.DEATH).create({
         server: serverId,
@@ -813,7 +802,7 @@ export default class DBLog extends S3PluginBase {
     await this.ensurePlayer(info.victim);
     await this.ensurePlayer(info.reviver);
 
-    const serverId = this._serverId;
+    const serverId = this.serverID;
     await this._withDb(async (t) => {
       await this._getModel(MODEL.REVIVE).create({
         server: serverId,
