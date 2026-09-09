@@ -571,6 +571,7 @@ export default class Switch extends S3DiscordPluginBase {
         this.server.on('S3_PLAYER_LEFT', this.onS3PlayerLeft);
         this.server.on('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
         this.server.on('S3_PLAYERS_UPDATED', this._onSeedPresenceCheck);
+        this.server.on('S3_PLAYERS_UPDATED', this._onCommunityOptionsTick);
         if (this.options.discordClient) {
             this.options.discordClient.on('message', this.onDiscordMessage);
         }
@@ -979,17 +980,74 @@ export default class Switch extends S3DiscordPluginBase {
      * Always resolved against _configuredOptions, never against the current
      * this.options. Folding an override back into its own input would make a
      * later loss of resolution keep the last override forever.
+     *
+     * **When it runs.** At mount(), at every NEW_GAME, and on the S³ registry
+     * heartbeat via _onCommunityOptionsTick(). The heartbeat is the one that
+     * matters. resolvedCommunityOption() reads a cache that heartbeatServer()
+     * refreshes about every forty-five seconds, so the community's resolved
+     * values are never more than a tick old — but until the copy below runs,
+     * this.options still holds whatever was resolved last round. A server that
+     * is idle never rolls a round, so before this tick existed it could hold a
+     * cap the community had lowered hours earlier, indefinitely. That is not a
+     * display defect: adminClearPlayer() sets a balance with
+     * Math.max(before, maxSwitchTokens), so a stale cap writes tokens the
+     * community does not allow into a wallet every server shares.
+     *
+     * @returns {boolean} true if any resolved value moved.
      */
     _applyCommunityOptions() {
-        if (!this._configuredOptions) return;
+        if (!this._configuredOptions) return false;
         const configured = this._configuredOptions;
+
+        const before = {
+            maxSwitchTokens: this.options.maxSwitchTokens,
+            switchCooldownMinutes: this.options.switchCooldownMinutes,
+            switchCooldownHours: this.options.switchCooldownHours
+        };
+
         this.options.maxSwitchTokens =
             this.resolvedCommunityOption('maxSwitchTokens', 'maxSwitchTokens', configured.maxSwitchTokens);
         this.options.switchCooldownMinutes =
             this.resolvedCommunityOption('switchCooldown', 'switchCooldownMinutes', configured.switchCooldownMinutes);
         this.options.switchCooldownHours =
             this.resolvedCommunityOption('switchCooldown', 'switchCooldownHours', configured.switchCooldownHours);
+
+        const changed = Object.keys(before).filter((key) => before[key] !== this.options[key]);
+        if (changed.length) {
+            this.verbose(
+                1,
+                `[CommunityOptions] Resolved values moved: ${changed
+                    .map((key) => `${key} ${before[key]} -> ${this.options[key]}`)
+                    .join(', ')}.`
+            );
+        }
+        return changed.length > 0;
     }
+
+    /**
+     * Re-apply the community's resolved options on S³'s registry heartbeat.
+     *
+     * Rides S3_PLAYERS_UPDATED, which is the same event S³ throttles its own
+     * registry heartbeat off — so by the time this fires the summary cache
+     * behind resolvedCommunityOption() has just been refreshed, and this is
+     * only the copy into this.options.
+     *
+     * It gets its own listener rather than sharing _onSeedPresenceCheck's,
+     * because that handler returns immediately outside seed mode. Folding the
+     * refresh into it would leave the cap round-scoped for every normal round,
+     * which is precisely the bug.
+     *
+     * Synchronous and allocation-cheap: three reads off an in-memory summary
+     * and three assignments, roughly every thirty seconds. No throttle, because
+     * a throttle here could only make it staler than the cache it reads.
+     */
+    _onCommunityOptionsTick = () => {
+        try {
+            this._applyCommunityOptions();
+        } catch (err) {
+            this.verbose(1, `[CommunityOptions] Heartbeat refresh failed: ${err.message}`);
+        }
+    };
 
     /**
      * Lazy token regeneration — brings a player's token balance current
@@ -1743,11 +1801,9 @@ export default class Switch extends S3DiscordPluginBase {
     onNewGame = async () => {
         this.verbose(1, '[NEW_GAME] Round started — null-teamID window handled by S³ players service.');
 
-        // The registry snapshot behind this is refreshed on S³'s heartbeat, which
-        // is also the round roll. Whichever of the two handlers runs first, the
-        // resolved cap is at worst one round old — and a server joining or
-        // leaving the community mid-session is exactly the case a mount-time
-        // read alone would never notice.
+        // Redundant with _onCommunityOptionsTick(), and kept anyway: the roll is
+        // the one moment the cap in force and the round it is reported against
+        // must agree exactly, and this is three assignments off a cache.
         this._applyCommunityOptions();
 
         // Clear the queue — round transition invalidates all stored teamIDs
@@ -2263,6 +2319,7 @@ export default class Switch extends S3DiscordPluginBase {
         this.server.removeListener('S3_PLAYER_LEFT', this.onS3PlayerLeft);
         this.server.removeListener('S3_PLAYER_TEAM_CHANGED', this.onS3PlayerTeamChanged);
         this.server.removeListener('S3_PLAYERS_UPDATED', this._onSeedPresenceCheck);
+        this.server.removeListener('S3_PLAYERS_UPDATED', this._onCommunityOptionsTick);
         if (this.options.discordClient) this.options.discordClient.removeListener('message', this.onDiscordMessage);
         this._clearAllQueueEntries('Plugin unmount');
         this.verbose(1, 'Switch plugin was un-mounted.');

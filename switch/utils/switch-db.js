@@ -498,7 +498,7 @@ const SwitchDB = {
       SwitchPlugin_RoundStats: [{ name: 'SwitchPlugin_RoundStats_serverID', fields: ['serverID'] }]
     };
 
-    plugin.registerExpectedVersion('switch', 9, {
+    plugin.registerExpectedVersion('switch', 10, {
       models: ['SwitchPlugin_PlayerCooldowns', 'SwitchPlugin_PlayerServerState', 'SwitchPlugin_Endmatches', 'SwitchPlugin_Settings', 'SwitchPlugin_RoundStats']
     });
     plugin.registerMigrations('switch', [
@@ -818,27 +818,30 @@ const SwitchDB = {
         // round, so a busy server writes a few thousand a year and the range
         // filter is a trivial scan on every engine the suite supports.
         touches: {
-          creates: ['SwitchPlugin_RoundStats'],
-          // The ninth Class A declaration. The other eight arrive by
-          // ADD COLUMN and this one at CREATE, but verification re-checks a
-          // declared column on every mount regardless of how it got there,
-          // so leaving it undeclared would be the one table where a dropped
-          // or hand-rebuilt serverID goes unnoticed.
-          columns: { SwitchPlugin_RoundStats: ['serverID'] }
+          // serverID is deliberately NOT declared here. v10 owns it, and the
+          // ownership is what matters: detection does not need the
+          // declaration — verifyLiveSchema() compares the model's attributes
+          // against the live table, and filterDriftToApplied() treats an
+          // undeclared missing column as drift rather than ignoring it — but
+          // a repair re-runs the LOWEST-versioned migration that claims the
+          // column. Claimed here, a lost serverID would send the repair back
+          // to v6, whose createTable is guarded on the table not already
+          // existing and therefore restores nothing: a rollback that re-fires
+          // on every mount and never converges. Claimed by v10, the repair
+          // re-runs an ADD COLUMN that actually puts it back.
+          creates: ['SwitchPlugin_RoundStats']
         },
         up: async (qi) => {
           if (!(await qi.tableExists('SwitchPlugin_RoundStats'))) {
             await qi.createTable('SwitchPlugin_RoundStats', {
               id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-              // The one Class A table that gets its serverID at CREATE rather
-              // than by a hand-applied ALTER, and the reason is that v6 has
-              // never been deployed: the newest production export records
-              // switch at v5 and contains no such table. Re-checked against
-              // S3_SchemaVersions in that export rather than inherited from
-              // the plan — if v6 had shipped, this would be a ninth ALTER.
-              // A table with no rows anywhere has no backfill and no
-              // compatibility surface, so this costs nothing and saves the
-              // one DDL step a grant without ALTER cannot take.
+              // Present at CREATE so a fresh install needs no ALTER for this
+              // table, and NOT sufficient on its own: this line was added to
+              // an already-released v6, and a migration recorded as applied
+              // never runs again, so any install that took v6 before it has a
+              // 30-column table with no discriminator. v10 is what reaches
+              // those. Do not conclude from this line that the column is
+              // guaranteed present wherever v6 is recorded.
               serverID: { type: qi.DataTypes.INTEGER, allowNull: true },
               matchId: { type: qi.DataTypes.STRING, allowNull: true },
               layerName: { type: qi.DataTypes.STRING, allowNull: true },
@@ -917,11 +920,13 @@ const SwitchDB = {
       {
         version: 8,
         description: 'Add serverID to SwitchPlugin_Endmatches for multi-server scoping',
-        // SwitchPlugin_RoundStats is NOT here. It gets its serverID inside
-        // v6's createTable because v6 has never been deployed — see the
-        // comment there. Endmatches has, so it needs the ALTER even though
-        // the production export records it at zero rows: the table exists,
-        // and a column is not optional just because nothing is in it.
+        // SwitchPlugin_RoundStats is not here; v10 carries it. It was left
+        // out of this migration on the reading that v6 had never been
+        // deployed and so could simply create the column — true when this was
+        // written, and false by the time the branch was ready. Endmatches
+        // needs the ALTER regardless, even though the production export
+        // records it at zero rows: the table exists, and a column is not
+        // optional just because nothing is in it.
         //
         // No touches.data { notNull }. Deferred until every write path is
         // proven to stamp the column, because a data post-condition is
@@ -1013,6 +1018,50 @@ const SwitchDB = {
         },
         down: async (qi) => {
           await qi.dropTable('SwitchPlugin_ServerSettings');
+        }
+      },
+      {
+        version: 10,
+        description: 'Add serverID to SwitchPlugin_RoundStats for installs that took v6 before it carried the column',
+        // The migration that exists because a released migration was edited.
+        // v6 creates this table and now creates it WITH serverID, so on an
+        // install that has not reached v6 this is a guarded no-op. It is for
+        // the installs that already took v6 from the version that did not:
+        // the column never arrives, because nothing re-runs a recorded
+        // version, and no other migration on this branch touches the table.
+        //
+        // Not a cosmetic gap. The model declares serverID, so every read of
+        // SwitchPlugin_RoundStats fails with Unknown column; drift detection
+        // then sees the column missing on the next mount and the repair rolls
+        // switch back and re-runs — which is why the declaration moved to
+        // this migration, where re-running actually restores the column.
+        //
+        // Same shape as v8 and for the same reasons: the addColumn is guarded
+        // so a hand-applied ALTER is not attempted twice under a grant that
+        // would reject it, and the backfill sits OUTSIDE the guard matched on
+        // IS NULL, because a hand-migrated database arrives here with the
+        // column present and every row NULL and a guarded backfill is a
+        // silent no-op on exactly that database.
+        //
+        // No touches.data { notNull }, for the reason v8 records at length.
+        touches: {
+          columns: { SwitchPlugin_RoundStats: ['serverID'] }
+        },
+        up: async (qi) => {
+          if (!(await qi.tableExists('SwitchPlugin_RoundStats'))) return;
+          const columns = await qi.describeTable('SwitchPlugin_RoundStats');
+          if (!columns.serverID) {
+            await qi.addColumn('SwitchPlugin_RoundStats', 'serverID', {
+              type: qi.DataTypes.INTEGER,
+              allowNull: true
+            });
+          }
+          await plugin._s3db.backfillServerID(qi, 'SwitchPlugin_RoundStats', plugin._s3db?.getServerID?.() ?? null);
+        },
+        down: async (qi) => {
+          if (!(await qi.tableExists('SwitchPlugin_RoundStats'))) return;
+          const columns = await qi.describeTable('SwitchPlugin_RoundStats');
+          if (columns.serverID) await qi.removeColumn('SwitchPlugin_RoundStats', 'serverID');
         }
       }
     ]);

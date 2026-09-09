@@ -348,7 +348,13 @@ for (const { name: dialect } of DIALECTS) {
 
       stageVersions(ctx.db, 'switch', all);
       const upgrade = await applyPending(ctx.db, 'switch');
-      assert.equal(upgrade.applied, 1, `upgrade applied ${upgrade.applied}, expected v9 alone`);
+      // Counted from the registered list rather than written as a literal.
+      // "v9 alone" was true when v9 was the last switch migration and stopped
+      // being true the moment v10 landed, which failed this test for a reason
+      // that had nothing to do with what it checks. What matters is that the
+      // whole tail above v8 ran; the copy itself is asserted below.
+      const aboveV8 = all.filter((m) => m.version > 8).length;
+      assert.equal(upgrade.applied, aboveV8, `upgrade applied ${upgrade.applied}, expected the ${aboveV8} migration(s) above v8`);
 
       const after = await readSettings(ctx.db, 'SwitchPlugin_ServerSettings', THIS_SERVER);
       assert.equal(after.rows.length, before.rows.length, 'row count differs from the source table');
@@ -390,11 +396,63 @@ for (const { name: dialect } of DIALECTS) {
 
       await setRecordedVersion(ctx.db, 'switch', 8);
       const again = await applyPending(ctx.db, 'switch');
-      assert.equal(again.applied, 1, `re-run applied ${again.applied}`);
+      const aboveV8 = all.filter((m) => m.version > 8).length;
+      assert.equal(again.applied, aboveV8, `re-run applied ${again.applied}, expected ${aboveV8}`);
 
       const after = await readSettings(ctx.db, 'SwitchPlugin_ServerSettings', THIS_SERVER);
       assert.equal(after.rows.length, 2, `re-run left ${after.rows.length} rows, expected 2`);
       assert.equal(after.map.timeLimitEnabled, 'changed-after-migrating', 'the re-run put the old value back');
+    } finally {
+      await closeDb(ctx);
+    }
+  });
+
+  // The migration that a released migration's edit made necessary, and the
+  // shape of bug this case exists to catch generally: an install that already
+  // recorded a version never re-runs it, so amending that version's body
+  // reaches fresh installs only. v6 creates SwitchPlugin_RoundStats and was
+  // amended to create it WITH serverID; every install that took v6 before the
+  // amendment has the table without the column, and the model declares it, so
+  // every read of the table fails and the next mount reports drift.
+  //
+  // Staged by taking v6 as it now stands and dropping the column back off,
+  // which is what those installs actually have. Faithful and self-maintaining:
+  // pinning a copy of the released v6 here would be a second schema to keep in
+  // step with the first.
+  test(`[${dialect}] a server that took v6 before it carried serverID still gets the column`, async () => {
+    if (!reachability.get(dialect)) return SKIP;
+    const ctx = await openDb(dialect);
+    try {
+      const q = (id) => ctx.db.quoteIdentifier(id);
+      const all = await registerSwitch(ctx.db);
+      stageVersions(ctx.db, 'switch', all.filter((m) => m.version <= 6));
+      await applyPending(ctx.db, 'switch');
+
+      await exec(ctx.db, `ALTER TABLE ${q('SwitchPlugin_RoundStats')} DROP COLUMN ${q('serverID')}`);
+      const stale = await ctx.db.sequelize.getQueryInterface().describeTable('SwitchPlugin_RoundStats');
+      assert.ok(!stale.serverID, 'the staged pre-amendment table still has serverID');
+
+      stageVersions(ctx.db, 'switch', all);
+      await applyPending(ctx.db, 'switch');
+
+      const repaired = await ctx.db.sequelize.getQueryInterface().describeTable('SwitchPlugin_RoundStats');
+      assert.ok(repaired.serverID, 'serverID never arrived on SwitchPlugin_RoundStats');
+
+      // The column existing is not the whole claim: the model declares it, so
+      // a read has to work. This is the assertion that fails first and loudest
+      // on a live box — "Unknown column 'serverID' in 'field list'".
+      await select(ctx.db, `SELECT ${q('serverID')} FROM ${q('SwitchPlugin_RoundStats')}`);
+
+      // And the repair must own the column at the version that can restore it.
+      // Declared on v6, a later loss of serverID sends the repair back to v6,
+      // whose createTable is guarded on the table not existing and so restores
+      // nothing — a rollback that re-fires on every mount and never converges.
+      const owning = all.filter((m) => m.touches?.columns?.SwitchPlugin_RoundStats?.includes('serverID'));
+      assert.equal(owning.length, 1, `${owning.length} migrations claim RoundStats.serverID, expected 1`);
+      assert.ok(
+        owning[0].version > 6,
+        `v${owning[0].version} claims RoundStats.serverID; a version that only creates the table cannot restore it`
+      );
     } finally {
       await closeDb(ctx);
     }
