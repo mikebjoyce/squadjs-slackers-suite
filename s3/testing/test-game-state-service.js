@@ -1066,8 +1066,12 @@ await runTest('ENDGAME factionVoteTeam2 transitions to postVoting (waiting for N
   await service.mount();
   await service.handleRoundEnded();
 
-  // Fast-forward through all voting phases (scoreboard -> layerVote -> factionVoteTeam1 -> factionVoteTeam2)
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  // Fast-forward through all voting phases (scoreboard -> layerVote -> factionVoteTeam1 -> factionVoteTeam2).
+  // Polled, not slept: with every duration 0 the chain is four setTimeout(0)
+  // hops, which cost ~60ms at Windows' ~15.6ms timer granularity — against the
+  // fixed 50ms this used to wait, itself a timer expiring in the same
+  // neighbourhood. The two raced and the sleep occasionally won.
+  await waitForSubState(service, 'isEndgamePostVoting');
   // Is now in ENDGAME with postVoting sub-state (waiting for NEW_GAME)
   assert.equal(service.isEnding(), true);
   assert.equal(service.getEndgameSubState(), 'postVoting');
@@ -1085,8 +1089,8 @@ await runTest('postVoting transitions to STAGING via NEW_GAME and clears sub-sta
   await service.mount();
   await service.handleRoundEnded();
 
-  // Fast-forward through all voting phases into postVoting
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  // Fast-forward through all voting phases into postVoting (polled — see above)
+  await waitForSubState(service, 'isEndgamePostVoting');
   assert.equal(service.isEndgamePostVoting(), true);
 
   // NEW_GAME should clear the ENDGAME phase and sub-state

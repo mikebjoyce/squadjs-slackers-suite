@@ -1030,6 +1030,23 @@ export default class EloTracker extends S3PluginBase {
       return;
     }
 
+    // --- Round-start reconciliation ---
+    // The start time was read from S³ at NEW_GAME, in the window where S³ may
+    // not have stamped the new round yet; re-read it here, where it cannot
+    // still be settling, and correct the session if the two disagree. A
+    // disagreement means the round's duration and every participationRatio
+    // derived from it were about to be computed against the wrong round, so it
+    // is worth a line in the default log output rather than a silent fix.
+    const gsStart = this._s3?.gameState?.getRoundStartTime?.();
+    if (Number.isFinite(gsStart) && Number.isFinite(this.session.roundStartTime)
+        && Math.abs(gsStart - this.session.roundStartTime) > 1000) {
+      Logger.verbose('EloTracker', 1,
+        `[onRoundEnded] Round start disagreed with S³ by ${Math.round((gsStart - this.session.roundStartTime) / 1000)}s ` +
+        `(session ${new Date(this.session.roundStartTime).toISOString()}, S³ ${new Date(gsStart).toISOString()}). ` +
+        'Using S³ — duration and participation are computed from it.');
+      this.session.reconcileRoundStart(gsStart);
+    }
+
     // --- Session flush ---
     const participants = this.session.endRound(roundEndTime);
 

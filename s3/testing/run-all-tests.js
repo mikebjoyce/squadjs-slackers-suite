@@ -88,6 +88,10 @@ const CATEGORY_TESTS = {
     // files" and ran none of them, which is how the two endgame sub-state
     // cases in test-game-state-service.js could sit failing on a poll race.
     'test-game-state-service.js',
+    // What a consumer plugin reads when it pulls the round clock from its own
+    // NEW_GAME handler. Sits next to the service's own suite because the value
+    // is right in both and the ordering between them is what was wrong.
+    'test-round-clock-ordering.js',
     'test-players-service.js',
     'test-clans-service.js',
     'test-factions-service.js',

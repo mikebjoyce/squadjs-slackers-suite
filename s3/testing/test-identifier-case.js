@@ -66,7 +66,16 @@ const SCAN_DIRS = [
 const NOT_SCANNED = [
   'node_modules', '.git', 'docs', 'backups', 's3/backups', 'team-balancer/backups',
   's3/locale-templates', 'TeamBalancerScrambleReports',
-  'team-balancer/TeamBalancerScrambleReports'
+  'team-balancer/TeamBalancerScrambleReports',
+  // install.cjs output. Gitignored, absent from a clean checkout, and present on
+  // any machine that has assembled a build — which made this check fail locally
+  // and pass in a fresh clone, the worst way for a static scan to behave. Every
+  // file in there is a flattened copy of a file already inside SCAN_DIRS, so
+  // scanning it would re-report the same source under a second path. Note this
+  // is the default output directory only: `--output=<dir>` elsewhere is not
+  // covered, and would surface here as a new directory to name, which is the
+  // behaviour this list is for.
+  'out'
 ];
 
 let passed = 0;

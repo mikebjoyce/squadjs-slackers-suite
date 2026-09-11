@@ -260,6 +260,15 @@ function stagingDurationFromTable(modeKey) {
 }
 
 export default class GameStateService {
+  /**
+   * How long a stamp taken by stampNewGame() may sit unconsumed before the next
+   * stamp treats it as abandoned. Two calls for one NEW_GAME are milliseconds
+   * apart; anything at this distance is a handler that never arrived, and the
+   * round that follows must stamp rather than defer to it. Well under the
+   * shortest possible round, so it can never expire a live stamp.
+   */
+  static PENDING_STAMP_TTL_MS = 10000;
+
   constructor({
     parent = null,
     server,
@@ -323,6 +332,12 @@ export default class GameStateService {
     // Centralized round start time and matchId hash for cross-plugin consistency
     this.roundStartTime = null;
     this.matchId = null;
+
+    // True between stampNewGame() and the handleNewGame() that consumes it.
+    // Keeps a prepended stamp from being overwritten by the async handler that
+    // follows it — see stampNewGame(), which also explains the expiry.
+    this._pendingNewGameStamp = false;
+    this._pendingNewGameStampAt = 0;
 
     this.gameModeCached = null;
     this.layerNameCached = null;
@@ -604,7 +619,9 @@ export default class GameStateService {
 
   /**
    * Get the current round's start time (Unix epoch ms).
-   * Set synchronously in handleNewGame() before any await.
+   * Stamped synchronously by stampNewGame() at the instant NEW_GAME is
+   * observed, so a consumer pulling this from its own NEW_GAME handler reads
+   * the round that is starting rather than the one that just ended.
    * Returns null if no round has started yet.
    */
   getRoundStartTime() {
@@ -615,7 +632,7 @@ export default class GameStateService {
    * Mint the round key for the round that is starting.
    *
    * Three call sites set `this.matchId`, all of them after assigning
-   * `roundStartTime`: the mid-round mount backfill, `handleNewGame()`, and the
+   * `roundStartTime`: the mid-round mount backfill, `stampNewGame()`, and the
    * transition that invalidates a recovered round as too old. They were three
    * copies of one expression, which is the shape where a change reaches two of
    * them and the third goes on minting the old format for months.
@@ -980,8 +997,72 @@ export default class GameStateService {
     return this._ignoredGameModes ?? this.defaultIgnoredGameModes;
   }
 
+  /**
+   * Stamp the round clock, synchronously, at the instant NEW_GAME is observed.
+   *
+   * WHY THIS IS SEPARATE FROM handleNewGame(). Every consumer reads the round
+   * clock by pulling — `gs.getRoundStartTime()`, `gs.getMatchId()` — and some
+   * of them pull from their own NEW_GAME handler. `EventEmitter.emit()` runs
+   * listeners synchronously only until each one hits its first `await`, so the
+   * moment anything in S³'s listener awaits before the clock is stamped, every
+   * later listener reads the PREVIOUS round's values and nothing reports an
+   * error. That is not hypothetical: a registry heartbeat added ahead of this
+   * call made EloTracker compute each round's duration from the round before
+   * it, inflating it by a whole round (~40 min) and halving every rating delta
+   * through participationRatio, for as long as it took to notice.
+   *
+   * So the clock is stamped here, in a method that cannot yield, and S³ calls
+   * it as the first statement of a `prependListener`-bound handler — first
+   * writer, before any await, regardless of what order plugins mounted in.
+   * handleNewGame() then CONSUMES this stamp rather than re-stamping, because
+   * a re-stamp would move the round's start to "after the heartbeat" instead
+   * of "when the round started".
+   *
+   * Idempotent per event: calling it twice before handleNewGame() runs keeps
+   * the first stamp. Calling handleNewGame() cold (tests, the dev harness, any
+   * direct caller) stamps on the spot, so this is additive, not a new
+   * requirement on callers.
+   *
+   * The pending flag expires. Two calls for one event are milliseconds apart,
+   * so anything older is a stamp whose handler never arrived — S³ threw between
+   * the two, or the service was swapped out. Without the expiry that flag
+   * latches, and the NEXT round declines to stamp because it still believes a
+   * stamp is pending, which is this same bug with a rarer trigger.
+   *
+   * @param {Object} [data] - The NEW_GAME payload; unused today, taken so the
+   *                          signature matches handleNewGame() and a future
+   *                          stamp can read from it.
+   * @returns {number} The round start time in epoch ms.
+   */
+  stampNewGame(data) {
+    const stampIsPending = this._pendingNewGameStamp
+      && (Date.now() - this._pendingNewGameStampAt) < GameStateService.PENDING_STAMP_TTL_MS;
+    if (stampIsPending) return this.roundStartTime;
+
+    // S³ owns roundStartTime — use our own process clock as the single source of truth.
+    // server.matchStartTime is not reliable across restarts (new Date per process lifetime).
+    this.roundStartTime = Date.now();
+    this.matchId = this._mintMatchId();
+
+    // A new round invalidates the layer we know: whatever getLayerName() still
+    // returns belongs to the round that just ended, until something resolves
+    // this one. resolveLayerInfo() flips this back to true.
+    this._roundLayerTrusted = false;
+
+    this._pendingNewGameStamp = true;
+    this._pendingNewGameStampAt = this.roundStartTime;
+    return this.roundStartTime;
+  }
+
   async handleNewGame(data) {
-    const now = Date.now();
+    // Cold call (no prepended stamp): stamp now, still before any await.
+    this.stampNewGame(data);
+    this._pendingNewGameStamp = false;
+
+    // The phase transition is timed from the stamp, not from the moment this
+    // runs — the two are the same instant when S³ prepends, and when something
+    // awaited in between, the round's start is the one that is right.
+    const now = this.roundStartTime;
     const prevPhase = this.phase;
     this._recoveredStateActive = false;
     this._clearEndgameTimer();
@@ -990,16 +1071,6 @@ export default class GameStateService {
     this.resolving = true;
     this.lastNewGameAt = now;
     this.lastPhaseChangeAt = now;
-
-    // A new round invalidates the layer we know: whatever getLayerName() still
-    // returns belongs to the round that just ended, until something resolves
-    // this one. resolveLayerInfo() flips this back to true.
-    this._roundLayerTrusted = false;
-
-    // S³ owns roundStartTime — use our own process clock as the single source of truth.
-    // server.matchStartTime is not reliable across restarts (new Date per process lifetime).
-    this.roundStartTime = Date.now();
-    this.matchId = this._mintMatchId();
 
     // ── LAYER RESOLUTION ON NEW_GAME ──────────────────────────────────
     // BUG HISTORY (2026-07-21): server.currentLayer was routinely null after

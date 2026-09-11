@@ -786,7 +786,18 @@ export default class SlackersSquadServices extends BasePlugin {
   _bindServerEvents() {
     if (!this.server || typeof this.server.on !== 'function') return;
 
-    this.server.on('NEW_GAME', this.listeners.handleNewGame);
+    // PREPENDED, not appended. S³ owns the round clock and every consumer pulls
+    // it, so S³ has to be the first NEW_GAME listener to run — otherwise a
+    // consumer that mounted first reads the previous round's start time and
+    // matchId. Mount order already puts S³ first today (consumers wait on
+    // _awaitS3Ready()), which is exactly the kind of accident that holds until
+    // someone reorders a config. removeListener() is indifferent to which of
+    // the two added the handler, so unbinding is unchanged.
+    if (typeof this.server.prependListener === 'function') {
+      this.server.prependListener('NEW_GAME', this.listeners.handleNewGame);
+    } else {
+      this.server.on('NEW_GAME', this.listeners.handleNewGame);
+    }
     this.server.on('ROUND_ENDED', this.listeners.handleRoundEnded);
     this.server.on('UPDATED_LAYER_INFORMATION', this.listeners.handleLayerInfoUpdated);
     this.server.on('UPDATED_SERVER_INFORMATION', this.listeners.handleServerInfoUpdated);
@@ -1150,6 +1161,13 @@ export default class SlackersSquadServices extends BasePlugin {
   }
 
   async handleNewGame(data) {
+    // FIRST STATEMENT, AND IT MUST STAY FIRST. Consumers pull the round clock
+    // (`getRoundStartTime()`, `getMatchId()`) from their own NEW_GAME handlers,
+    // and emit() hands control to them the moment this method awaits anything.
+    // Anything that awaits above this line puts every consumer on the previous
+    // round's clock — silently. See GameStateService.stampNewGame().
+    this.services.gameState?.stampNewGame?.(data);
+
     // The round roll still stamps, unconditionally and ahead of the throttle.
     // _registryTick() is the cadence now (see it for why this event is not
     // enough on its own), but a roll is the one moment a report boundary and

@@ -67,6 +67,28 @@ export default class EloSessionManager {
   }
 
   /**
+   * Re-point the round's start time at S³'s value without touching the
+   * segments already recorded against it.
+   *
+   * The start time is read from S³ at NEW_GAME so every plugin reports the same
+   * round boundary. If that read ever comes back stale, nothing here would
+   * notice: the segments carry real join times, so only the denominator is
+   * wrong, and a wrong denominator shows up as a plausible-looking duration and
+   * a quietly halved participationRatio — which is a quietly halved rating
+   * change for everyone in the round. So the caller re-reads S³ at round end,
+   * when the value cannot still be settling, and corrects it here.
+   *
+   * Segments are deliberately left alone: their timestamps are this process's
+   * own observations and are not in question.
+   *
+   * @param {number} timestamp - S³'s round start time (epoch ms).
+   */
+  reconcileRoundStart(timestamp) {
+    if (!Number.isFinite(timestamp)) return;
+    this.roundStartTime = timestamp;
+  }
+
+  /**
    * Updates the session map based on the current player list.
    * Handles joins, team switches, and disconnects.
    * If a player is no longer in the snapshot, their segment is closed.

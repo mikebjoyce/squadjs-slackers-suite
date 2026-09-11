@@ -216,8 +216,9 @@ Tracks round phases (STAGING → LIVE → ENDGAME), infers gamemode/layer from s
 | `getLayerDisplayName()` | `string\|null` | The same layer as a human reads it (e.g. `'Sumari Bala Seed v1'`). Falls back to the canonical name |
 | `isLayerResolved()` | `boolean` | `false` while the two getters above are returning the `'Unknown'` placeholder — use it before trusting a negative `isIgnoredMode()` / `isSeedMode()` |
 | `refreshLayer(source?)` | `Promise<boolean>` | Forces `server.updateServerInformation()` (5s cap) and re-resolves, instead of waiting out SquadJS's ~30s poll |
-| `getRoundStartTime()` | `number\|null` | Epoch MS of round START or LIVE transition |
-| `getMatchId()` | `string\|null` | Layer hash + match counter |
+| `getRoundStartTime()` | `number\|null` | Epoch MS of round START or LIVE transition. Stamped synchronously when `NEW_GAME` arrives, so a read from a consumer's own `NEW_GAME` handler is this round — see §7.14 |
+| `getMatchId()` | `string\|null` | Layer hash + match counter. Minted alongside `roundStartTime`, same guarantee |
+| `stampNewGame(data)` | `number` | **S³ internal.** Stamps the round clock before anything can yield; called by S³'s `NEW_GAME` listener, not by consumers. See §7.14 |
 | `isIgnoredMode()` | `boolean` | Gamemode in ignored list (seed/training/event) |
 | `isSeedMode()` | `boolean` | Game mode contains `'Seed'` |
 | `isTrainingMode()` | `boolean` | Layer or game mode name contains `'Jensen'` |
@@ -1088,6 +1089,37 @@ Going through it instead of writing `where: { serverID: this.serverID }` by hand
 This is the anti-pattern with the least visible symptom in the guide. On a single-server database the wrong query and the right query return identical rows forever, every test passes, and the defect appears only on the day a second server registers — at which point it presents as another server's data appearing in this server's reports, which reads as a data-integrity bug rather than as a missing `WHERE`.
 
 Writes have the same rule and a sharper failure. An unscoped `destroy({ where: {} })` on a shared table is every server's rows, and `!switch wipe` is exactly that operation, which is why it is classified `community-mutating` and names the registered servers in its confirmation.
+
+---
+
+### 7.14 — Awaiting Anything Before the Round Clock Is Stamped
+
+```js
+// ✗ WRONG — every consumer that pulls the round clock at NEW_GAME now reads the PREVIOUS round
+async handleNewGame(data) {
+  await this.services.db.heartbeatServer();          // yields; emit() moves on to the next listener
+  await this.services.gameState.handleNewGame(data); // stamps roundStartTime — too late
+}
+
+// ✓ RIGHT — stamp first, in a call that cannot yield, then do the async work
+async handleNewGame(data) {
+  this.services.gameState?.stampNewGame?.(data);     // synchronous, no await above this line
+  await this.services.db.heartbeatServer();
+  await this.services.gameState.handleNewGame(data); // consumes the stamp rather than re-taking it
+}
+```
+
+**The rule: `roundStartTime` and `matchId` are stamped synchronously, at the instant `NEW_GAME` is observed, and S³ binds `NEW_GAME` with `prependListener` so it is the first listener to run.** Both halves are load-bearing, and neither is obvious from reading the handler.
+
+`EventEmitter.emit()` runs listeners synchronously only until each one hits its first `await`. The moment S³'s handler awaits anything, control returns to `emit()`, which immediately runs the next plugin's `NEW_GAME` handler — and several of them pull the round clock there (`gs.getRoundStartTime()`, `gs.getMatchId()`). Whatever has not been written yet reads as the round that just ended. Nothing throws, nothing logs, and the value looks entirely plausible.
+
+That is not hypothetical. A registry heartbeat — four DB round trips — was added above the `gameState` call, and EloTracker spent every round computing its duration from the previous round's start: durations inflated by a whole round (a 40-minute round reported as 1h44m), and every rating delta roughly halved, because `participationRatio` divides time-on-team by that duration. The Discord embeds looked normal throughout; what surfaced it was a human noticing the durations were too long.
+
+`prependListener` covers the other half. Mount order already puts S³ first, because consumers wait on `_awaitS3Ready()` — but that is an accident of how consumers are written, not a guarantee, and a consumer registered ahead of S³ reads the stale clock no matter how S³'s handler is ordered internally. Prepending makes S³ the first writer regardless.
+
+`stampNewGame()` is idempotent per event, and `handleNewGame()` consumes the stamp rather than re-taking `Date.now()`. Re-stamping would set the round's start to *after* the heartbeat instead of when the round started, which is a smaller version of the same bug. Calling `handleNewGame()` cold (tests, the dev harness) still stamps, so direct callers need no change.
+
+Covered by `test-round-clock-ordering.js`, which pins both halves: a consumer registered after S³, and one registered before it.
 
 ---
 
@@ -2158,6 +2190,7 @@ node s3/testing/test-game-state-service.js
 | File | What It Tests |
 |------|--------------|
 | `test-game-state-service.js` | Phase transitions, matchId/roundStartTime, stale recovery, ENDGAME timer chain |
+| `test-round-clock-ordering.js` | What a consumer reads when it pulls `roundStartTime`/`matchId` from its own `NEW_GAME` handler — see §7.14 |
 | `test-db-service.js` | Model registration, migration workflow, schema versioning |
 | `test-players-service.js` | Player tracking, reconnect detection, locks, team change attribution |
 | `test-clans-service.js` | Tag extraction, normalisation, grouping, clan team detection |
