@@ -30,6 +30,34 @@
  *   on ENDGAME event. Enables historical "what did the teams look
  *   like at this moment" queries.
  *
+ * ─── SCOPING (multi-server) ─────────────────────────────────────
+ *
+ * All three tables are server-column scoped: every row belongs to
+ * the server whose process wrote it, stamped from
+ * dbService.getServerID() at write time and declared to S³ as
+ * scopeKind: 'server-column' at defineModel(). A community sharing
+ * one database gets one table per event type with rows from every
+ * server in it, and a scoped export narrows on the column rather
+ * than on which process wrote the rows.
+ *
+ * Two details in the model definitions below are easy to undo by
+ * accident and both carry their reasoning at the declaration.
+ * serverID is absent from the three schema CONSTANTS and present
+ * only in the live schemas spread from them, because the constants
+ * are what s3-logging v1's touches.columns declares and v1 is a
+ * bootstrap for tables that already hold production rows — a
+ * serverID in that list fails v1 on the exact database v1 exists to
+ * adopt. And the serverID indexes are named for their tables rather
+ * than idx_serverID, because Postgres scopes index names to the
+ * schema rather than to the table.
+ *
+ * Model names are not table names here: S3PlayerEvents,
+ * S3GameStateEvents and S3PlayerSnapshots over S3_PlayerEvents,
+ * S3_GameStateEvents and S3_PlayerSnapshots. The export registry,
+ * scopePredicateFor() and the version fixtures all key on the MODEL
+ * name; a schema dump shows the table name. Reaching for the wrong
+ * one of the two is the mistake this note exists to prevent.
+ *
  * ─── FILE MIRROR ────────────────────────────────────────────────
  *
  * When enableFileLogging is true, every DB write is mirrored as a
@@ -65,6 +93,17 @@
  * - Exposes public logPlayerEvent/logGameStateEvent/snapshot methods
  *   so the SA migration (7.4i) can delegate calls without direct
  *   event subscription coupling.
+ * - serverID is stamped nullable and no notNull post-condition is
+ *   declared on it. A data post-condition is re-checked on every
+ *   mount forever, so one row-creating path that forgot the column
+ *   would put S³ core into a rollback-and-re-gate loop rather than
+ *   failing once. Rows written by a pre-upgrade process legitimately
+ *   carry null, and a scoped read treats those as nobody's rather
+ *   than as everybody's.
+ * - The serverID indexes are created separately from the columns and
+ *   gated on the column existing, because on a create-only grant the
+ *   column may not have arrived yet. Nothing here assumes the
+ *   migration that adds it was run by this process.
  *
  */
 
@@ -219,6 +258,13 @@ export default class LoggingService {
     try {
       await this.dbService.executeWithRetry(async () => {
         await this.PlayerEventsModel.create({
+          // Read per write rather than cached at mount. getServerID() is a
+          // field read, the cost is nothing, and a cached copy would be a
+          // second place for the id to be wrong. `?? null` because a row
+          // stamped with an id this process never resolved is worse than an
+          // honestly unattributed one — the column is nullable for exactly
+          // this.
+          serverID: this.dbService?.getServerID?.() ?? null,
           matchId,
           roundStartTime,
           ts: Date.now(),
@@ -300,6 +346,7 @@ export default class LoggingService {
     try {
       await this.dbService.executeWithRetry(async () => {
         await this.GameStateEventsModel.create({
+          serverID: this.dbService?.getServerID?.() ?? null,
           matchId,
           ts: Date.now(),
           eventType,
@@ -384,6 +431,7 @@ export default class LoggingService {
     try {
       await this.dbService.executeWithRetry(async () => {
         await this.PlayerSnapshotsModel.create({
+          serverID: this.dbService?.getServerID?.() ?? null,
           matchId,
           ts: Date.now(),
           trigger,
@@ -449,18 +497,44 @@ export default class LoggingService {
       t1: { type: DataTypes.INTEGER, allowNull: true },
       t2: { type: DataTypes.INTEGER, allowNull: true }
     };
+    // serverID is deliberately NOT in the three schema constants above.
+    // Those constants are what s3-logging v1's touches.columns declares, and
+    // v1 has not been applied on production — it is a bootstrap for tables
+    // that already hold 144k rows. Verification re-checks every declared
+    // column after v1 runs, so a serverID in that list would fail v1 on the
+    // exact database v1 exists to adopt, before v2 could ever add it.
+    //
+    // The live schemas below carry it, so a fresh install gets the column
+    // from the CREATE TABLE and needs no ALTER at all — which on a grant
+    // without ALTER is the difference between installing and not.
+    const SERVER_ID_COLUMN = { type: DataTypes.INTEGER, allowNull: true };
+    const playerEventsLive = { ...playerEventsSchema, serverID: SERVER_ID_COLUMN };
+
     const playerEventsIndexes = [
       { name: 'idx_s3_pe_matchId', fields: ['matchId'] },
       { name: 'idx_s3_pe_eosID', fields: ['eosID'] },
       { name: 'idx_s3_pe_eventType_matchId', fields: ['eventType', 'matchId'] },
       { name: 'idx_s3_pe_ts', fields: ['ts'] }
     ];
+    // Named for the table rather than idx_serverID, on all three. Postgres
+    // scopes index names to the schema, not to the table, so nine tables
+    // each carrying an index called idx_serverID is one name nine times.
+    const playerEventsServerIdIndex = [{ name: 'S3_PlayerEvents_serverID', fields: ['serverID'] }];
 
     // ── S3_PlayerEvents ──────────────────────────────────────────
     this.PlayerEventsModel = this.dbService.defineModel(
       'S3PlayerEvents',
-      playerEventsSchema,
-      { tableName: 'S3_PlayerEvents', timestamps: false, exportTier: 'logging', indexes: playerEventsIndexes }
+      playerEventsLive,
+      {
+        tableName: 'S3_PlayerEvents',
+        timestamps: false,
+        exportTier: 'logging',
+        // Forensic rows about one server's players on one server's rounds.
+        // The serverID column arrives with this group's scoping migration; the
+        // classification is declared here first so nothing has to infer it.
+        scopeKind: 'server-column',
+        indexes: playerEventsIndexes
+      }
     );
 
     const gameStateEventsSchema = {
@@ -474,17 +548,27 @@ export default class LoggingService {
       layerName: { type: DataTypes.STRING, allowNull: true },
       gamemode: { type: DataTypes.STRING, allowNull: true }
     };
+    const gameStateEventsLive = { ...gameStateEventsSchema, serverID: SERVER_ID_COLUMN };
+
     const gameStateEventsIndexes = [
       { name: 'idx_s3_gse_matchId', fields: ['matchId'] },
       { name: 'idx_s3_gse_eventType', fields: ['eventType'] },
       { name: 'idx_s3_gse_ts', fields: ['ts'] }
     ];
+    const gameStateEventsServerIdIndex = [{ name: 'S3_GameStateEvents_serverID', fields: ['serverID'] }];
 
     // ── S3_GameStateEvents ───────────────────────────────────────
     this.GameStateEventsModel = this.dbService.defineModel(
       'S3GameStateEvents',
-      gameStateEventsSchema,
-      { tableName: 'S3_GameStateEvents', timestamps: false, exportTier: 'logging', indexes: gameStateEventsIndexes }
+      gameStateEventsLive,
+      {
+        tableName: 'S3_GameStateEvents',
+        timestamps: false,
+        exportTier: 'logging',
+        // Phase transitions of one server's rounds.
+        scopeKind: 'server-column',
+        indexes: gameStateEventsIndexes
+      }
     );
 
     const playerSnapshotsSchema = {
@@ -496,28 +580,142 @@ export default class LoggingService {
       t1: { type: DataTypes.INTEGER, allowNull: true },
       t2: { type: DataTypes.INTEGER, allowNull: true }
     };
+    const playerSnapshotsLive = { ...playerSnapshotsSchema, serverID: SERVER_ID_COLUMN };
+
     const playerSnapshotsIndexes = [
       { name: 'idx_s3_ps_matchId_ts', fields: ['matchId', 'ts'] }
     ];
+    const playerSnapshotsServerIdIndex = [{ name: 'S3_PlayerSnapshots_serverID', fields: ['serverID'] }];
 
     // ── S3_PlayerSnapshots ───────────────────────────────────────
     this.PlayerSnapshotsModel = this.dbService.defineModel(
       'S3PlayerSnapshots',
-      playerSnapshotsSchema,
-      { tableName: 'S3_PlayerSnapshots', timestamps: false, exportTier: 'logging', indexes: playerSnapshotsIndexes }
+      playerSnapshotsLive,
+      {
+        tableName: 'S3_PlayerSnapshots',
+        timestamps: false,
+        exportTier: 'logging',
+        // A roster of who was on one server at one moment.
+        scopeKind: 'server-column',
+        indexes: playerSnapshotsIndexes
+      }
     );
 
     // Create tables (CREATE TABLE IF NOT EXISTS — needs only the CREATE grant).
     const qi = this.dbService.getConnector().getQueryInterface();
     await this.dbService.executeWithRetry(async () => {
-      await qi.createTable('S3_PlayerEvents', playerEventsSchema);
-      await qi.createTable('S3_GameStateEvents', gameStateEventsSchema);
-      await qi.createTable('S3_PlayerSnapshots', playerSnapshotsSchema);
+      await qi.createTable('S3_PlayerEvents', playerEventsLive);
+      await qi.createTable('S3_GameStateEvents', gameStateEventsLive);
+      await qi.createTable('S3_PlayerSnapshots', playerSnapshotsLive);
     });
 
     await this._ensureIndexes('S3_PlayerEvents', playerEventsIndexes);
     await this._ensureIndexes('S3_GameStateEvents', gameStateEventsIndexes);
     await this._ensureIndexes('S3_PlayerSnapshots', playerSnapshotsIndexes);
+
+    // The serverID indexes are gated on the column, and separately from the
+    // three calls above, because of when this method runs. Migrations for
+    // this group are driven by the core pending-loop in
+    // slackers-squad-services.js, which runs AFTER every service has
+    // mounted — so on the one mount where v2 adds the column, this line has
+    // already gone past. Ungated, it would emit a stderr warning about an
+    // unindexed table on the single mount where that is expected and
+    // temporary, and operators read those warnings. The next mount creates
+    // it, the same self-healing property _ensureIndexes already has.
+    for (const [table, decl] of [
+      ['S3_PlayerEvents', playerEventsServerIdIndex],
+      ['S3_GameStateEvents', gameStateEventsServerIdIndex],
+      ['S3_PlayerSnapshots', playerSnapshotsServerIdIndex]
+    ]) {
+      try {
+        const live = await qi.describeTable(table);
+        if (live.serverID) await this._ensureIndexes(table, decl);
+      } catch (err) {
+        this.verboseLogger(1, `[Logging] Could not check ${table} for a serverID index: ${err.message}`);
+      }
+    }
+
+    // ── Migration group ──────────────────────────────────────────
+    // These three were created by createTable() alone and belonged to no
+    // registered group, so they had no recorded version and drift verification
+    // never covered them — a column lost from S3_PlayerEvents would have gone
+    // unnoticed indefinitely, on the largest S³-owned logging table there is.
+    //
+    // `models:` takes MODEL names, `touches` takes TABLE names, and all three
+    // of these are among the nine in the repo where the two differ
+    // (S3PlayerEvents → S3_PlayerEvents). Writing the model spelling into
+    // `touches` names tables that do not exist, and verification then re-runs a
+    // migration that already succeeded, forever.
+    if (this.dbService?.migrationEngine) {
+      this.dbService.migrationEngine.registerMigrations('s3-logging', [
+        {
+          version: 1,
+          description: 'S3_PlayerEvents, S3_GameStateEvents and S3_PlayerSnapshots (bootstrap — DDL runs unconditionally at mount)',
+          // createTable is CREATE TABLE IF NOT EXISTS and has already run above,
+          // so there is no row this can lose. Backing up would mean reading the
+          // biggest logging tables in the database to protect against nothing.
+          backup: false,
+          touches: {
+            creates: ['S3_PlayerEvents', 'S3_GameStateEvents', 'S3_PlayerSnapshots'],
+            columns: {
+              S3_PlayerEvents: Object.keys(playerEventsSchema),
+              S3_GameStateEvents: Object.keys(gameStateEventsSchema),
+              S3_PlayerSnapshots: Object.keys(playerSnapshotsSchema)
+            }
+          },
+          up: async (qi) => {
+            // Idempotent, and run through qi so verification sees the tables on
+            // the connection it reads from.
+            await qi.createTable('S3_PlayerEvents', playerEventsSchema);
+            await qi.createTable('S3_GameStateEvents', gameStateEventsSchema);
+            await qi.createTable('S3_PlayerSnapshots', playerSnapshotsSchema);
+          }
+        },
+        {
+          version: 2,
+          description: 'Add serverID to the three logging tables for multi-server scoping',
+          // touches.columns only. No touches.data { notNull } on serverID,
+          // and not in a later migration either until every write path is
+          // proven to stamp it: a data post-condition is re-checked on every
+          // mount forever, so one unstamped insert puts the whole S³ core
+          // into a rollback-and-re-gate loop. The column ships nullable and
+          // stays nullable for this phase.
+          touches: {
+            columns: {
+              S3_PlayerEvents: ['serverID'],
+              S3_GameStateEvents: ['serverID'],
+              S3_PlayerSnapshots: ['serverID']
+            }
+          },
+          up: async (qi) => {
+            const serverID = this.dbService?.getServerID?.() ?? null;
+            for (const table of ['S3_PlayerEvents', 'S3_GameStateEvents', 'S3_PlayerSnapshots']) {
+              if (!(await qi.tableExists(table))) continue;
+              const columns = await qi.describeTable(table);
+              if (!columns.serverID) {
+                await qi.addColumn(table, 'serverID', { type: qi.DataTypes.INTEGER, allowNull: true });
+              }
+              // Outside the guard, and matched on IS NULL, for the reason
+              // switch v5 records: a hand-migrated database arrives here with
+              // the column present and every row NULL, and a guarded backfill
+              // is a silent no-op on exactly that database.
+              await this.dbService.backfillServerID(qi, table, serverID);
+            }
+          },
+          down: async (qi) => {
+            for (const table of ['S3_PlayerEvents', 'S3_GameStateEvents', 'S3_PlayerSnapshots']) {
+              if (!(await qi.tableExists(table))) continue;
+              const columns = await qi.describeTable(table);
+              if (columns.serverID) await qi.removeColumn(table, 'serverID');
+            }
+          }
+        }
+      ]);
+    }
+
+    this.dbService?.registerExpectedVersion?.('s3-logging', 2, {
+      models: ['S3PlayerEvents', 'S3GameStateEvents', 'S3PlayerSnapshots']
+    });
 
     if (this.enableFileLogging) {
       this.verboseLogger(3, `[Logging] File logging enabled — mirroring to ${this.logPath}`);

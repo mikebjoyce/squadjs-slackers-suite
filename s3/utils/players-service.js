@@ -52,9 +52,29 @@
  *   intervals are registered.
  * - Reconnect memory is DB-backed when DBService is available, with
  *   in-memory fallback and periodic pruning.
- * - Session tracking: S3_PlayerSessions table persists per-player
+ * - Session tracking: S3_ServerSessions table persists per-player
  *   sessionStart time across SquadJS restarts. joinTime is hydrated from
  *   this table after initial sync. Sessions expire after 30 min of inactivity.
+ * - Both persisted tables are keyed (serverID, eosID) and scoped
+ *   server-column. A player is on ONE server at a time, so the bare
+ *   eosID key these two replaced was wrong rather than merely narrow
+ *   under two servers: the second server to see a player overwrote
+ *   the first server's row, and the first then read back the second's
+ *   team and session start as its own. The tables carrying the old
+ *   key are abandoned in place rather than dropped, because neither
+ *   ALTER nor DROP is on the restricted grant and both tables are
+ *   ephemeral by declaration — they repopulate from live play. See
+ *   the block comment above the builders for why nothing is copied
+ *   across, and !s3 db orphans for what is left behind.
+ * - A composite key means findByPk() is unavailable on these two
+ *   models. Every read is findOne({ where: { serverID, eosID } }),
+ *   which is the property that stops a site from forgetting its
+ *   server scope and still returning rows.
+ * - The legacy builders are frozen copies of the pre-rename shape.
+ *   Migrations v1 and v2 are recorded in production and cannot be
+ *   edited into creating a different table than the one they made, so
+ *   those copies must not be refactored to share code with the live
+ *   builders above them.
  *
  */
 
@@ -108,16 +128,36 @@ function normalizeIsLeader(raw, fallback = false) {
 
 /* ────────────────────────── BOOTSTRAP DDL ──────────────────────────
  *
- * S3_PlayerReconnects and S3_PlayerSessions are infrastructure tables created
+ * S3_ServerReconnects and S3_ServerSessions are infrastructure tables created
  * by raw DDL at mount (rather than by model sync) so they exist before any
  * query runs. The DDL is emitted from these builders, in one place, because it
- * runs from FOUR call sites — the two bootstrap paths in _initSessionPersistence
- * / _initReconnectPersistence, and the two migration up() bodies that re-run it
- * through the migration engine's query interface.
+ * runs from THREE call sites — the two bootstrap paths in
+ * _initSessionPersistence / _initReconnectPersistence, and migration v3, which
+ * re-runs it through the migration engine's query interface.
+ *
+ * These two tables replace S3_PlayerReconnects and S3_PlayerSessions, whose
+ * primary key was a bare eosID. A player is on ONE server at a time, so under
+ * two servers that key is wrong rather than merely narrow: the second server
+ * to see a player overwrites the first server's row, and the first server then
+ * reads back the second's team and session start as if they were its own.
+ *
+ * The key becomes (serverID, eosID), and a primary key cannot be altered in
+ * place: SQLite has no statement that reaches it at all, and the restricted
+ * MySQL grant has no ALTER. So the shape below is a NEW table under a new
+ * name, and the old one is abandoned where it stands rather than dropped —
+ * DROP is not on that grant either. Nothing is copied across: both tables are
+ * declared ephemeral at their model definitions and the code's own words for
+ * them are "rebuilt from live play on the next tick" and "repopulated from
+ * live play". `!s3 db orphans` lists what is left behind.
+ *
+ * The legacy builders below them are frozen copies of the pre-rename shape.
+ * They exist only for migrations v1 and v2, which are recorded in production
+ * and therefore cannot be edited to create a different table than the one they
+ * have already created.
  *
  * Every identifier is quoted. Unquoted, Postgres folds them to lower case and
- * creates `s3_playerreconnects(eosid, updatedat, …)`, while the Sequelize models
- * below declare `tableName: 'S3_PlayerReconnects'` and are quoted by Sequelize —
+ * creates `s3_serverreconnects(eosid, updatedat, …)`, while the Sequelize models
+ * below declare `tableName: 'S3_ServerReconnects'` and are quoted by Sequelize —
  * so the models address a table that does not exist and every read and write
  * against them fails. SQLite ignores identifier case and MySQL column names are
  * case-insensitive, which is why the unquoted form worked for years.
@@ -131,6 +171,42 @@ function normalizeIsLeader(raw, fallback = false) {
  */
 function reconnectsTableDDL(q) {
   return `
+      CREATE TABLE IF NOT EXISTS ${q('S3_ServerReconnects')} (
+        ${q('serverID')} INTEGER NOT NULL,
+        ${q('eosID')} VARCHAR(64) NOT NULL,
+        ${q('steamID')} VARCHAR(64) NULL,
+        ${q('playerName')} VARCHAR(255) NULL,
+        ${q('lastTeamID')} INTEGER NULL,
+        ${q('lastSeenAt')} BIGINT NULL,
+        ${q('updatedAt')} BIGINT NOT NULL,
+        PRIMARY KEY (${q('serverID')}, ${q('eosID')})
+      );
+    `;
+}
+
+function sessionsTableDDL(q) {
+  return `
+      CREATE TABLE IF NOT EXISTS ${q('S3_ServerSessions')} (
+        ${q('serverID')} INTEGER NOT NULL,
+        ${q('eosID')} VARCHAR(64) NOT NULL,
+        ${q('steamID')} VARCHAR(64) NULL,
+        ${q('playerName')} VARCHAR(255) NULL,
+        ${q('sessionStart')} BIGINT NOT NULL,
+        ${q('lastActivity')} BIGINT NOT NULL,
+        PRIMARY KEY (${q('serverID')}, ${q('eosID')})
+      );
+    `;
+}
+
+/*
+ * Frozen. Migrations v1 and v2 are recorded in production, so what they
+ * create is a contract: they go on creating the single-server tables they
+ * always created, and v3 creates the replacements beside them. Editing these
+ * to emit the new shape would make v1 declare a table it does not create,
+ * and drift verification re-checks `touches.creates` on every mount.
+ */
+function legacyReconnectsTableDDL(q) {
+  return `
       CREATE TABLE IF NOT EXISTS ${q('S3_PlayerReconnects')} (
         ${q('eosID')} VARCHAR(64) PRIMARY KEY,
         ${q('steamID')} VARCHAR(64) NULL,
@@ -142,7 +218,7 @@ function reconnectsTableDDL(q) {
     `;
 }
 
-function sessionsTableDDL(q) {
+function legacySessionsTableDDL(q) {
   return `
       CREATE TABLE IF NOT EXISTS ${q('S3_PlayerSessions')} (
         ${q('eosID')} VARCHAR(64) PRIMARY KEY,
@@ -215,6 +291,9 @@ export default class PlayersService {
     this._onPlayerConnectedCallbacks = [];
     // Snapshot of the last fully-resolved team list. Used to build projections when teamIDs go null.
     this._lastStablePlayers = null;
+    // True between NEW_GAME and the next fully-resolved snapshot: the only span
+    // in which the projection is entitled to assume teams flipped 1↔2.
+    this._transitionSinceStable = false;
     // Active projection map when we detect the null-teamID window after NEW_GAME.
     this._projectedPlayers = null;
     // Snapshot of this.server.squads (raw SquadJS squad objects), refreshed each tick
@@ -229,6 +308,25 @@ export default class PlayersService {
     // Edge-triggers the mass-unresolved log so a round transition does not
     // reprint it on every tick.
     this._systemicUnresolved = false;
+    // Keys whose team has been OBSERVED on a real team since the current round
+    // began. Cleared at NEW_GAME, because at that instant every registry row
+    // still holds the team that player had in the round that just ended.
+    //
+    // BUG HISTORY (2026-09-05): without this, both consumers of the registry's
+    // team data trusted last round's values across the boundary. `areTeamsResolved()`
+    // answered "yes" from the stale rows on the first tick after NEW_GAME — so
+    // GameStateService cleared `resolving` before a single post-transition teamID
+    // had been looked at — and the tick diff below then read the whole roster's
+    // reassignment as N individual team changes. A 15-player round transition
+    // logged 15 TEAM_CHANGE events attributed to "Admin". The null-teamID
+    // projection was supposed to absorb that, but it only ever arms when RCON
+    // happens to serve a null mid-transition; that round it never did.
+    //
+    // Confirmation is about PROVENANCE, not timing: it answers "have I seen this
+    // player on a real team in THIS round", which is the question both callers
+    // were actually asking. That makes it correct regardless of the order the S³
+    // plugin delegates the tick in, which is what the null heuristic was not.
+    this._teamConfirmedKeys = new Set();
 
     this.PRIORITY = {
       TeamBalancer: 3,
@@ -327,6 +425,11 @@ export default class PlayersService {
     // quarantine a player on their first tick back without any grace.
     this._unresolvedSince.clear();
     this._stuckKeys.clear();
+    // Same reasoning: a remount re-runs initial sync, which re-observes every
+    // player and re-confirms them. Carrying confirmations across a remount would
+    // vouch for teams this process has not actually seen.
+    this._teamConfirmedKeys.clear();
+    this._transitionSinceStable = false;
     this.verboseLogger(2, '[Players] Unmounted.');
   }
 
@@ -444,7 +547,7 @@ export default class PlayersService {
    * use !switch without being gated by a stale connection window.
    *
    * Mutates the registry state directly (not the getPlayer() copy) and fire-and-forget
-   * upserts S3_PlayerSessions so a future SquadJS restart doesn't resurrect the old time.
+   * upserts S3_ServerSessions so a future SquadJS restart doesn't resurrect the old time.
    *
    * @param {string} eosIDOrSteamID - Player EOS ID or Steam ID
    * @returns {boolean} true if the player was found and joinTime was reset
@@ -511,6 +614,19 @@ export default class PlayersService {
       .filter((s) => s.players.length > 0);
   }
 
+  /**
+   * True when every tracked player has been seen on a real team IN THIS ROUND.
+   *
+   * The "in this round" half is load-bearing and is why `_teamConfirmedKeys`
+   * exists. GameStateService calls this to decide whether to clear `resolving`,
+   * and the S³ plugin delegates each UPDATED_PLAYER_INFORMATION tick
+   * gameState → factions → players — so this is answered against a registry that
+   * has NOT yet ingested the tick in flight. Reading `teamID` alone, the answer
+   * on the first tick after NEW_GAME came from rows still holding the previous
+   * round's teams, and `resolving` cleared before any post-transition team had
+   * been observed. Requiring confirmation makes a stale read merely stale ("as of
+   * last tick everyone was confirmed for this round") instead of wrong.
+   */
   areTeamsResolved() {
     const entries = [...this.registry.entries()];
     if (!entries.length) return false;
@@ -519,7 +635,32 @@ export default class PlayersService {
     // BUDGET_EXPIRED deadline rather than on PLAYERS_RESOLVED — for every round
     // that player stayed connected.
     if (!entries.some(([, p]) => this._isRealTeam(p?.teamID))) return false;
-    return entries.every(([key, p]) => this._isRealTeam(p?.teamID) || this._stuckKeys.has(key));
+    return entries.every(([key, p]) =>
+      (this._isRealTeam(p?.teamID) && this._teamConfirmedKeys.has(key)) || this._stuckKeys.has(key)
+    );
+  }
+
+  /**
+   * Drop every per-round team confirmation. Called by the S³ plugin on NEW_GAME.
+   *
+   * The registry deliberately keeps its rows across the boundary — reconnect
+   * memory, sessions and locks all depend on that — so the teams in it are the
+   * previous round's until each player is observed again. This is the moment
+   * that stops them being trusted. See `_teamConfirmedKeys`.
+   */
+  handleNewGame() {
+    const cleared = this._teamConfirmedKeys.size;
+    this._teamConfirmedKeys.clear();
+    // Arms the projection's 1↔2 flip for the next null window only. Cleared
+    // again the moment a fully-resolved snapshot is taken, so a null window
+    // later in the round projects teams as they stand instead of guessing a
+    // swap that never happened. See `_buildProjection`.
+    this._transitionSinceStable = true;
+    // Edge-triggered by NEW_GAME, so once per round rather than per tick.
+    this.verboseLogger(
+      2,
+      `[Players] NEW_GAME — cleared ${cleared} team confirmation(s); teams are unconfirmed until re-observed this round.`
+    );
   }
 
   /**
@@ -763,6 +904,9 @@ export default class PlayersService {
     if (!key) return false;
 
     const record = {
+      // Half the primary key. Taken from the connector rather than from
+      // `payload`, so a caller cannot write into another server's row.
+      serverID: this._serverID(),
       eosID: key,
       steamID: payload.steamID || null,
       playerName: payload.playerName || null,
@@ -789,9 +933,21 @@ export default class PlayersService {
 
     const dbService = this._getDbService();
     if (this.reconnectModel) {
-      const row = await dbService?.executeWithRetry
-        ? dbService.executeWithRetry(async () => this.reconnectModel.findByPk(key))
-        : this.reconnectModel.findByPk(key);
+      // findOne, not findByPk: the key is (serverID, eosID) now and findByPk
+      // takes a single value.
+      //
+      // The await is on the whole expression, which it was not before. The
+      // previous form was `await dbService?.executeWithRetry ? A : B`, and
+      // `await` binds tighter than `?:` — so it awaited the *function
+      // reference*, used that as the condition, and assigned the unawaited
+      // promise to `row`. A promise is truthy, so the row always looked
+      // present; every field then read as undefined, the staleness check
+      // said yes, and the branch below DELETED the real row and returned
+      // null. Persisted reconnect memory has therefore never worked when a
+      // database was attached, and it destroyed the row it was asked for.
+      // Nothing caught it because the unit tests run with no reconnectModel
+      // and answer from the in-memory map.
+      const row = await this._findReconnectRow(dbService, key);
       if (row) {
         const normalized = this._normalizeReconnectRow(row);
         if (this._isReconnectStale(normalized)) {
@@ -817,7 +973,11 @@ export default class PlayersService {
     const dbService = this._getDbService();
     if (this.reconnectModel && dbService?.executeWithRetry) {
       await dbService.executeWithRetry(async () => {
-        await this.reconnectModel.destroy({ where: {} });
+        // Scoped. An unqualified destroy here is a `DELETE FROM` with no
+        // WHERE clause, which under two servers throws away the other's
+        // reconnect memory as well — silently, and at the exact moment it is
+        // most likely to be needed.
+        await this.reconnectModel.destroy({ where: { serverID: this._serverID() } });
       });
     }
 
@@ -841,9 +1001,10 @@ export default class PlayersService {
 
     const dbService = this._getDbService();
     if (this.reconnectModel) {
-      const row = await dbService?.executeWithRetry
-        ? dbService.executeWithRetry(async () => this.reconnectModel.findByPk(key))
-        : this.reconnectModel.findByPk(key);
+      // Same composite-key lookup and the same await fix as getReconnect().
+      // The consequence differed only in degree: this path did not delete
+      // the row, it just never found one.
+      const row = await this._findReconnectRow(dbService, key);
       if (row) {
         const normalized = this._normalizeReconnectRow(row);
         if (this._isReconnectStale(normalized)) {
@@ -960,6 +1121,12 @@ export default class PlayersService {
     // `keyed`, not players.length: a roster S³ could not key a single player
     // out of has resolved nothing, and must not be reported as settled.
     const allResolved = keyed > 0 && !hasNullTeams;
+    // Who was already confirmed for this round BEFORE this tick's observations
+    // are folded in. The loop below confirms players as it walks them, so the
+    // live set cannot answer "was this a change, or the first sighting?" by the
+    // time it is asked. Both the tick diff and _reconcileProjection() need the
+    // pre-tick answer. Bounded by the roster, so the copy is cheap.
+    const confirmedBeforeTick = new Set(this._teamConfirmedKeys);
     let joinCount = 0;
     let leaveCount = 0;
     let teamChangeCount = 0;
@@ -975,6 +1142,14 @@ export default class PlayersService {
       if (!result) continue;
 
       current.add(result.key);
+
+      // Observing a player on a real team is what confirms them for this round,
+      // whatever else happens to them below (new, initial sync, mid-transition).
+      // Done before the emission gate so a player is confirmed exactly once, on
+      // the tick that first sees them.
+      if (this._isRealTeam(result.state?.teamID)) {
+        this._teamConfirmedKeys.add(result.key);
+      }
 
       if (result.isNew) {
         joinCount++;
@@ -999,23 +1174,48 @@ export default class PlayersService {
       // emissions while projection is active (or on the first tick where null teams
       // appear but projection hasn't been built yet); genuine changes during this
       // window are deferred and emitted by _reconcileProjection() on tear-down.
-      if (
-        !hasNullTeams &&
-        !this._projectedPlayers &&
+      //
+      // That gate only ever arms when RCON actually serves a null, which is a
+      // property of the server's timing rather than of the round transition — see
+      // `_teamConfirmedKeys` for the round where it never did and this diff
+      // reported the whole roster as switched. The confirmation check below is
+      // the one that does not depend on that luck.
+      const teamsTrustworthy = !hasNullTeams && !this._projectedPlayers;
+      const realTeamDiff =
         String(previousTeamID) !== String(nextTeamID) &&
         this._isRealTeam(previousTeamID) &&
-        this._isRealTeam(nextTeamID)
-      ) {
-        teamChangeCount++;
-        const attribution = this._consumeMoveAttribution(result.state, nextTeamID) || this._defaultTeamChangeSource();
+        this._isRealTeam(nextTeamID);
+
+      if (teamsTrustworthy && realTeamDiff) {
+        // Consumed only inside this branch, exactly as before: an attribution
+        // must not be burned on a diff that is never going to be reported.
+        const attribution = this._consumeMoveAttribution(result.state, nextTeamID);
         const playerName = result.state.name || result.key;
-        this.verboseLogger(1, `[Players] TEAM_CHANGE: ${playerName} (${result.key}) ${previousTeamID}→${nextTeamID}, source=${attribution}`);
-        this.server.emit('S3_PLAYER_TEAM_CHANGED', {
-          player: { ...result.state },
-          previousTeamID,
-          teamID: nextTeamID,
-          source: attribution
-        });
+
+        // ── First sighting this round is a baseline, not a change ──
+        // A player whose team has not been observed since NEW_GAME has no
+        // previous team for THIS round; `previousTeamID` is the team they held in
+        // the round that just ended, and the difference is the game reassigning
+        // sides, not a switch anybody made. The one exception is an attributed
+        // move: if a plugin recorded an intentional move to exactly this team,
+        // that is positive evidence of a real switch, and it is reported even on
+        // the first sighting.
+        if (confirmedBeforeTick.has(result.key) || attribution) {
+          teamChangeCount++;
+          const source = attribution || this._defaultTeamChangeSource();
+          this.verboseLogger(1, `[Players] TEAM_CHANGE: ${playerName} (${result.key}) ${previousTeamID}→${nextTeamID}, source=${source}`);
+          this.server.emit('S3_PLAYER_TEAM_CHANGED', {
+            player: { ...result.state },
+            previousTeamID,
+            teamID: nextTeamID,
+            source
+          });
+        } else {
+          this.verboseLogger(
+            2,
+            `[Players] Baseline (not a team change): ${playerName} (${result.key}) held ${previousTeamID} last round, first seen on ${nextTeamID} this round.`
+          );
+        }
       }
     }
 
@@ -1024,6 +1224,7 @@ export default class PlayersService {
         if (current.has(key)) continue;
         this.registry.delete(key);
         this._deindexPlayer(tracked, key);
+        this._teamConfirmedKeys.delete(key);
       }
 
       // Mark all players registered during initial sync as having join emitted.
@@ -1045,7 +1246,7 @@ export default class PlayersService {
 
       // ── Session recovery ──
       // After initial sync populates the registry with all current server players,
-      // hydrate their joinTime from S3_PlayerSessions (survives SquadJS restarts).
+      // hydrate their joinTime from S3_ServerSessions (survives SquadJS restarts).
       // Fire-and-forget — errors are logged internally.
       this._recoverSessionTimes().catch((err) => {
         this.verboseLogger(1, `[Players] Session recovery error: ${err.message}`);
@@ -1081,6 +1282,9 @@ export default class PlayersService {
 
         this.registry.delete(key);
         this._deindexPlayer(tracked, key);
+        // Forget the confirmation with the player, so a reconnect re-baselines
+        // instead of being diffed against the team they had before they left.
+        this._teamConfirmedKeys.delete(key);
 
         leaveCount++;
 
@@ -1115,7 +1319,8 @@ export default class PlayersService {
     this._refreshProjectionState({
       current,
       allResolved,
-      hasNullTeams
+      hasNullTeams,
+      confirmedBeforeTick
     });
 
     // Snapshot squad data when teams are resolved (metadata stable even during null-window)
@@ -1362,7 +1567,20 @@ export default class PlayersService {
   // all players while teams re-establish (~30-90s). Instead of blocking all
   // join/assignment logic during this window, we serve a projected player list
   // built from the last stable snapshot, with teams flipped (1↔2) to match the
-  // known round-transition swap. This design was originally specified in
+  // known round-transition swap.
+  //
+  // A null window is NOT exclusive to round transitions, though: the trigger is
+  // `hasNullTeams = blocking.size > 0`, so a single unresolved player arms all of
+  // this. The blast radius is small — `_syncProjection` runs on the same tick as
+  // the build and overwrites the projected team of everyone who DID resolve, so
+  // the flip only ever survives on players who are actually null. But for those
+  // players it is still a guess about a swap that may not have happened, so it is
+  // gated on `_transitionSinceStable`: armed by NEW_GAME, dropped as soon as a
+  // fully-resolved snapshot is taken. A player who goes null later in the round
+  // and comes back on the same team is not a switch, and must not be reported as
+  // one.
+  //
+  // This design was originally specified in
   // DesignDocs/player-state-manager-design.md and was subsumed into PlayersService
   // during initial implementation (S³ uses one lifecycle, not a separate singleton).
   //
@@ -1371,13 +1589,14 @@ export default class PlayersService {
   //      Decides whether to build, update, or tear down the projection.
   //   2. _snapshotRegistry() — copies the current registry as a stable baseline
   //      when all teamIDs are real (1/2). Used as the projection seed.
-  //   3. _buildProjection(snapshot) — flips team 1↔2 on the stable snapshot to
-  //      produce projected state representing post-swap reality.
+  //   3. _buildProjection(snapshot, { flip }) — seeds projected state from the
+  //      stable snapshot, flipping team 1↔2 only when the window follows a
+  //      NEW_GAME. A null window inside a round is not a swap (see below).
   //   4. _syncProjection(currentKeys) — keeps projected state in sync with live
   //      data (names, squad IDs, new joiners) while the null window is active.
-  //   5. _reconcileProjection() — when the null window resolves, logs mismatches
-  //      between projected and actual teams for diagnostics. No corrective RCON
-  //      commands are issued — log-only reconciliation.
+  //   5. _reconcileProjection(confirmedBeforeTick) — when the null window
+  //      resolves, emits deferred S3_PLAYER_TEAM_CHANGED for genuine mid-window
+  //      swaps and logs the mismatch. No corrective RCON commands are issued.
   //
   // Key invariants:
   //   - getPlayer()/getAllPlayers() return projected data when projection is active
@@ -1385,23 +1604,36 @@ export default class PlayersService {
   //   - _projectedPlayers is null when not in the projection window (fast path).
   //   - Team-change emissions are suppressed during the null window (both old/new
   //     team must be real before S3_PLAYER_TEAM_CHANGED fires).
+  //
+  // THIS SUBSYSTEM IS AN OPTIMISATION, NOT THE CORRECTNESS BOUNDARY. All of it is
+  // conditional on RCON actually serving a null teamID during the transition, which
+  // is a property of server timing — on 2026-09-05 a 15-player transition produced
+  // no null tick at all and none of this armed. What keeps a round transition from
+  // being read as a roster-wide team change is `_teamConfirmedKeys`: a player's
+  // first sighting on a real team in a round is a baseline, never a change. Do not
+  // reintroduce logic that depends on the null window having been observed.
   // ---------------------------------------------------------------------------
 
-  _refreshProjectionState({ current, allResolved, hasNullTeams }) {
+  _refreshProjectionState({ current, allResolved, hasNullTeams, confirmedBeforeTick = null }) {
     // When we have a fully-resolved player list, cache it as a stable baseline.
     // This baseline is flipped when the null-teamID window appears after NEW_GAME.
     if (allResolved) {
       if (this._projectedPlayers) {
-        this._reconcileProjection();
+        this._reconcileProjection(confirmedBeforeTick);
         this._projectedPlayers = null;
       }
 
       this._lastStablePlayers = this._snapshotRegistry();
+      // This snapshot IS the post-transition reality, so any later null window
+      // in this round must project teams forward as they stand, not flip them.
+      this._transitionSinceStable = false;
     }
 
     // Only build projection once per resolving window, using the last stable snapshot.
     if (hasNullTeams && this._lastStablePlayers && !this._projectedPlayers) {
-      this._projectedPlayers = this._buildProjection(this._lastStablePlayers);
+      this._projectedPlayers = this._buildProjection(this._lastStablePlayers, {
+        flip: this._transitionSinceStable
+      });
       if (this._projectedPlayers.size) {
         this.verboseLogger(2, `[Players] Projection active for ${this._projectedPlayers.size} players.`);
       }
@@ -1420,14 +1652,20 @@ export default class PlayersService {
     return new Map([...this.registry.entries()].map(([key, state]) => [key, { ...state }]));
   }
 
-  _buildProjection(snapshot) {
+  // `flip` is armed by NEW_GAME and disarmed by the next resolved snapshot,
+  // because the 1↔2 swap is a property of the round transition and of nothing
+  // else. The flip only ends up mattering for players who are genuinely null
+  // (`_syncProjection` corrects everyone who resolved), and mid-round that is
+  // typically one stuck client. Flipping them would have _reconcileProjection
+  // report a swap when they return on the team they never left.
+  _buildProjection(snapshot, { flip = false } = {}) {
     const projected = new Map();
 
     for (const [key, state] of snapshot.entries()) {
       if (!this._isRealTeam(state.teamID)) continue;
 
       // Flip teams 1 <-> 2 to match the known swap at round transition.
-      const teamID = state.teamID === 1 ? 2 : 1;
+      const teamID = flip ? (state.teamID === 1 ? 2 : 1) : state.teamID;
       projected.set(key, { ...state, teamID });
     }
 
@@ -1467,40 +1705,92 @@ export default class PlayersService {
     }
   }
 
-  _reconcileProjection() {
+  _reconcileProjection(confirmedBeforeTick = null) {
     // When the null window resolves, emit deferred S3_PLAYER_TEAM_CHANGED events
     // for any players whose actual team differs from the projected (flipped) team.
     // These represent genuine mid-window swaps — not the round-transition 1↔2 flip.
     //
     // We do NOT issue corrective RCON commands here; this is diagnostics + deferred
     // emission only. Projected-vs-actual matches (the common case) are silently correct.
+    //
+    // A projected team is a GUESS — `_buildProjection` assumes the transition
+    // flips 1↔2, which is the common shape and not a guarantee. For a player who
+    // has not been observed on a real team since NEW_GAME, that guess is the only
+    // "previous team" on offer, and reporting a change against it would invent a
+    // switch out of an assumption — the same false-flood shape, one code path
+    // over, on any round the game did not flip. Only players already confirmed
+    // this round have a previous team worth diffing against.
+    //
+    // Attribution is the exception. A plugin-initiated move names the player and
+    // the destination team, so it is evidence independent of the projection and
+    // stands even with no confirmed team this round. This path is the ONLY one
+    // that can report such a move: the tick-diff gate in handleUpdatedPlayerInfo
+    // is closed for the whole window (teamsTrustworthy is false while
+    // _projectedPlayers is set, including on the tick that resolves it, because
+    // the projection is torn down after that loop). Dropping unattributed
+    // unconfirmed players here while keeping attributed ones is the whole point.
     let deferredCount = 0;
+    let baselineCount = 0;
 
     for (const [key, projected] of this._projectedPlayers.entries()) {
       const actual = this.registry.get(key);
       if (!actual || !this._isRealTeam(actual.teamID)) continue;
 
-      if (String(projected.teamID) !== String(actual.teamID)) {
-        const name = actual.name || projected.name || key;
-        this.verboseLogger(
-          2,
-          `[Players Projection] ${name} projected team ${projected.teamID} -> actual ${actual.teamID}`
-        );
+      // Attribution is checked first, and against the player's last OBSERVED
+      // team rather than the projected one. A plugin move that happens to land
+      // where the projection guessed is still a real move, and diffing it
+      // against a guess would either hide it or misreport where it came from.
+      // _lastStablePlayers is still the pre-window snapshot here — the caller
+      // re-snapshots only after this returns.
+      const attribution = this._consumeMoveAttribution(actual, actual.teamID);
+      if (attribution) {
+        const stableTeam = this._lastStablePlayers?.get(key)?.teamID;
+        const previousTeamID = this._isRealTeam(stableTeam) ? stableTeam : projected.teamID;
 
-        // Emit deferred team-change — this player genuinely swapped during the
-        // projection window (not just the round-transition 1↔2 flip).
-        this.server.emit('S3_PLAYER_TEAM_CHANGED', {
-          player: { ...actual },
-          previousTeamID: projected.teamID,
-          teamID: actual.teamID,
-          source: 'Deferred/Projection'
-        });
-        deferredCount++;
+        if (String(previousTeamID) !== String(actual.teamID)) {
+          this.server.emit('S3_PLAYER_TEAM_CHANGED', {
+            player: { ...actual },
+            previousTeamID,
+            teamID: actual.teamID,
+            source: attribution
+          });
+          deferredCount++;
+        }
+        continue;
       }
+
+      if (String(projected.teamID) === String(actual.teamID)) continue;
+
+      if (confirmedBeforeTick && !confirmedBeforeTick.has(key)) {
+        baselineCount++;
+        continue;
+      }
+
+      const name = actual.name || projected.name || key;
+      this.verboseLogger(
+        2,
+        `[Players Projection] ${name} projected team ${projected.teamID} -> actual ${actual.teamID}`
+      );
+
+      // Emit deferred team-change — this player genuinely swapped during the
+      // projection window (not just the round-transition 1↔2 flip).
+      this.server.emit('S3_PLAYER_TEAM_CHANGED', {
+        player: { ...actual },
+        previousTeamID: projected.teamID,
+        teamID: actual.teamID,
+        source: 'Deferred/Projection'
+      });
+      deferredCount++;
     }
 
     if (deferredCount > 0) {
       this.verboseLogger(2, `[Players Projection] ${deferredCount} deferred TEAM_CHANGE(s) emitted.`);
+    }
+    if (baselineCount > 0) {
+      this.verboseLogger(
+        2,
+        `[Players Projection] ${baselineCount} projected-vs-actual mismatch(es) treated as this round's baseline — not observed on a real team since NEW_GAME.`
+      );
     }
   }
 
@@ -1652,7 +1942,7 @@ export default class PlayersService {
       this.verboseLogger(1, `[Players] NEW player: ${playerName} (eosID=${joined.eosID}, steamID=${joined.steamID}, teamID=${joined.teamID}, source=${source})`);
 
       // ── Session row creation (Bug 2 fix) ──
-      // Ensure every player in the registry has a S3_PlayerSessions row.
+      // Ensure every player in the registry has a S3_ServerSessions row.
       // Previously, only _recoverSessionTimes() (post-initial-sync) wrote
       // session rows. Players joining after initial sync never got a row,
       // which broke _bulkUpdateSessionActivity (uses UPDATE, not UPSERT)
@@ -1834,12 +2124,25 @@ export default class PlayersService {
     return updatedAt < (now - this.reconnectMaxAgeMs);
   }
 
+  /**
+   * One reconnect row for this server, through the retry wrapper when the
+   * DBService offers one. Extracted because getReconnect() and
+   * peekReconnect() had the same three lines and the same defect in them.
+   */
+  async _findReconnectRow(dbService, eosID) {
+    const where = { serverID: this._serverID(), eosID };
+    if (typeof dbService?.executeWithRetry === 'function') {
+      return dbService.executeWithRetry(async () => this.reconnectModel.findOne({ where }));
+    }
+    return this.reconnectModel.findOne({ where });
+  }
+
   async _deleteReconnectRow(eosID) {
     const dbService = this._getDbService();
     if (!this.reconnectModel || !dbService?.executeWithRetry) return;
 
     await dbService.executeWithRetry(async () => {
-      await this.reconnectModel.destroy({ where: { eosID } });
+      await this.reconnectModel.destroy({ where: { serverID: this._serverID(), eosID } });
     });
   }
 
@@ -1856,12 +2159,20 @@ export default class PlayersService {
     this._lastReconnectPruneAt = now;
     const cutoff = now - this.reconnectMaxAgeMs;
 
+    // Deliberately NOT scoped to this server, unlike every other statement
+    // in this file. This is an age prune, and `updatedAt` means the same
+    // thing on every server's rows: a row older than the cutoff is expired
+    // for whoever wrote it. Scoping it would make each server responsible
+    // for its own garbage, so a server that is switched off leaves rows
+    // behind that nothing ever collects. Deleting a neighbour’s expired row
+    // is not a cross-server read — it is the same decision they would make.
+
     const connector = dbService.getConnector?.();
     if (connector && typeof connector.query === 'function') {
       try {
         await dbService.executeWithRetry(async () => {
           await connector.query(
-            `DELETE FROM ${dbService.quoteIdentifier('S3_PlayerReconnects')} ` +
+            `DELETE FROM ${dbService.quoteIdentifier('S3_ServerReconnects')} ` +
             `WHERE ${dbService.quoteIdentifier('updatedAt')} < :cutoff`,
             { replacements: { cutoff } }
           );
@@ -1893,9 +2204,9 @@ export default class PlayersService {
   }
 
   // ---------------------------------------------------------------------------
-  // Session tracking — S3_PlayerSessions table
+  // Session tracking — S3_ServerSessions table
   //
-  // The S3_PlayerSessions table persists per-player sessionStart timestamps
+  // The S3_ServerSessions table persists per-player sessionStart timestamps
   // across SquadJS restarts. This allows consumer plugins (Switch, EloTracker)
   // to answer "how long has this player been on the server?" even after a
   // restart, preventing the time-based switch window from falsely resetting.
@@ -1914,9 +2225,9 @@ export default class PlayersService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Initialize the S3_PlayerSessions model definition (the v2 table migration is
-   * registered and run in _initReconnectPersistence() alongside v1, so both
-   * "s3-players" migrations are applied in a single call — avoiding duplicate logs).
+   * Initialize the S3_ServerSessions model definition (every "s3-players"
+   * migration is registered and run in _initReconnectPersistence(), so all
+   * three are applied in a single call — avoiding duplicate logs).
    */
   async _initSessionPersistence() {
     const dbService = this._getDbService();
@@ -1925,7 +2236,7 @@ export default class PlayersService {
     const connector = dbService.getConnector?.();
     if (!connector) return;
 
-    // Bootstrap DDL — ensures S3_PlayerSessions exists unconditionally at mount.
+    // Bootstrap DDL — ensures S3_ServerSessions exists unconditionally at mount.
     // Infrastructure table, not a migration — no confirmation needed.
     const q = (id) => dbService.quoteIdentifier(id);
     await connector.query(sessionsTableDDL(q));
@@ -1933,10 +2244,18 @@ export default class PlayersService {
     // Clean up stale session rows (>24h inactive). These are never used for
     // session recovery — _recoverSessionTimes() treats anything >30min as stale.
     // Mount-time cleanup is sufficient; no periodic timer needed.
+    //
+    // Not scoped to this server, on the same reasoning as the reconnect
+    // prune below: `lastActivity` means the same thing on every server's
+    // rows, so a row past the cutoff is expired for whoever wrote it.
+    // Scoping it would make each server responsible for its own garbage,
+    // and a server that is switched off would leave rows nothing ever
+    // collects. Every read of this table IS scoped — an age prune is the
+    // one thing here that is a fact about a row rather than about a server.
     try {
       const cutoff = Date.now() - 24 * 60 * 60 * 1000;
       await connector.query(
-        `DELETE FROM ${q('S3_PlayerSessions')} WHERE ${q('lastActivity')} < :cutoff`,
+        `DELETE FROM ${q('S3_ServerSessions')} WHERE ${q('lastActivity')} < :cutoff`,
         { replacements: { cutoff } }
       );
       this.verboseLogger(3, `[Players] Session cleanup: removed rows with lastActivity < ${new Date(cutoff).toISOString()}`);
@@ -1947,6 +2266,14 @@ export default class PlayersService {
     this.sessionModel = dbService.defineModel?.(
       'S3_PlayerSession',
       {
+        // Half of the primary key. A session belongs to one server, and the
+        // pre-rename table keyed on eosID alone — so a player joining server
+        // B overwrote their server-A session start and A read back B's.
+        serverID: {
+          type: dbService.getDataTypes().INTEGER,
+          primaryKey: true,
+          allowNull: false
+        },
         eosID: {
           type: dbService.getDataTypes().STRING,
           primaryKey: true
@@ -1969,17 +2296,26 @@ export default class PlayersService {
         }
       },
       {
-        tableName: 'S3_PlayerSessions',
+        // The MODEL name stays S3_PlayerSession while the table is renamed.
+        // Both halves are load-bearing and they point in opposite directions:
+        // the table name is what the DDL and `touches` say, the model name is
+        // what the export envelope and the import loop say.
+        tableName: 'S3_ServerSessions',
         timestamps: false,
         // Session start times are rebuilt from live play on the next tick, and
         // stale rows are pruned by the cleanup above.
-        exportTier: 'ephemeral'
+        exportTier: 'ephemeral',
+        // A session is on one server. The replacement table keys on
+        // (serverID, eosID); a composite key is still server-column, because
+        // what matters here is how a query narrows to one server and that is a
+        // predicate on the column either way.
+        scopeKind: 'server-column'
       }
     ) || null;
   }
 
   /**
-   * Recover session times from S3_PlayerSessions after initial sync.
+   * Recover session times from S3_ServerSessions after initial sync.
    * Called once after _initialSyncComplete is set to true.
    *
    * For each player in the registry:
@@ -2010,15 +2346,17 @@ export default class PlayersService {
           this.sessionModel?.sequelize?.Sequelize?.Op ||
           dbService.getConnector?.()?.constructor?.Sequelize?.Op ||
           null;
+        const serverID = this._serverID();
         if (Op) {
           return await this.sessionModel.findAll({
-            where: { eosID: { [Op.in]: eosIDs } }
+            where: { serverID, eosID: { [Op.in]: eosIDs } }
           });
         }
-        // Fallback: fetch one by one if Op not available.
+        // Fallback: fetch one by one if Op not available. findOne rather
+        // than findByPk — the key is (serverID, eosID).
         const results = [];
         for (const eosID of eosIDs) {
-          const row = await this.sessionModel.findByPk(eosID);
+          const row = await this.sessionModel.findOne({ where: { serverID, eosID } });
           if (row) results.push(row);
         }
         return results;
@@ -2059,6 +2397,7 @@ export default class PlayersService {
           // Session is stale (inactive > sessionExpiryMs) — start fresh.
           state.joinTime = now;
           upsertOps.push({
+            serverID: this._serverID(),
             eosID: state.eosID,
             steamID: state.steamID || null,
             playerName: state.name || null,
@@ -2070,6 +2409,7 @@ export default class PlayersService {
       } else {
         // No DB row — first time seeing this player. Write new session.
         upsertOps.push({
+          serverID: this._serverID(),
           eosID: state.eosID,
           steamID: state.steamID || null,
           playerName: state.name || null,
@@ -2107,6 +2447,10 @@ export default class PlayersService {
 
     await dbService.executeWithRetry(async () => {
       await this.sessionModel.upsert({
+        // Without this the upsert writes a NULL half of the primary key and
+        // the insert fails outright — which is the failure worth having,
+        // since the alternative shape silently collided across servers.
+        serverID: this._serverID(),
         eosID,
         steamID: steamID || null,
         playerName: playerName || null,
@@ -2137,11 +2481,12 @@ export default class PlayersService {
         dbService.getConnector?.()?.constructor?.Sequelize?.Op ||
         null;
 
+      const serverID = this._serverID();
       if (Op) {
         await dbService.executeWithRetry(async () => {
           await this.sessionModel.update(
             { lastActivity: now },
-            { where: { eosID: { [Op.in]: eosIDs } } }
+            { where: { serverID, eosID: { [Op.in]: eosIDs } } }
           );
         });
       } else {
@@ -2150,7 +2495,7 @@ export default class PlayersService {
           for (const p of players) {
             await this.sessionModel.update(
               { lastActivity: now },
-              { where: { eosID: p.eosID } }
+              { where: { serverID, eosID: p.eosID } }
             );
           }
         });
@@ -2283,7 +2628,7 @@ export default class PlayersService {
           up: async (qi) => {
             // Run through qi so verification sees the table on the same connection.
             // Idempotent — safe if bootstrap DDL already created it.
-            await qi.rawQuery(reconnectsTableDDL((id) => dbService.quoteIdentifier(id)));
+            await qi.rawQuery(legacyReconnectsTableDDL((id) => dbService.quoteIdentifier(id)));
           }
         },
         {
@@ -2298,6 +2643,34 @@ export default class PlayersService {
           up: async (qi) => {
             // Run through qi so verification sees the table on the same connection.
             // Idempotent — safe if bootstrap DDL already created it.
+            await qi.rawQuery(legacySessionsTableDDL((id) => dbService.quoteIdentifier(id)));
+          }
+        },
+        {
+          version: 3,
+          description: 'S3_ServerReconnects and S3_ServerSessions (per-server replacements; the old tables are abandoned in place)',
+          // Both spellings appear in this one object, deliberately.
+          // registerExpectedVersion below takes MODEL names and keeps
+          // S3PlayerReconnect / S3_PlayerSession, because the models are not
+          // renamed and an export envelope is keyed by model name — which is
+          // what makes a pre-rename backup restore into the new tables.
+          // `touches` takes TABLE names and must name the new ones, because
+          // that is what this migration actually creates.
+          touches: {
+            creates: ['S3_ServerReconnects', 'S3_ServerSessions'],
+            columns: {
+              S3_ServerReconnects: ['serverID', 'eosID', 'steamID', 'playerName', 'lastTeamID', 'lastSeenAt', 'updatedAt'],
+              S3_ServerSessions: ['serverID', 'eosID', 'steamID', 'playerName', 'sessionStart', 'lastActivity']
+            }
+          },
+          up: async (qi) => {
+            // Nothing is copied from the old tables. Both are ephemeral by
+            // declaration and by behaviour: sessions are rebuilt on the next
+            // tick and reconnect rows expire on their own within minutes, so
+            // a copy would move data that is stale before the migration
+            // finishes — and it would have to invent a serverID for rows
+            // that were written when there was only one server to be.
+            await qi.rawQuery(reconnectsTableDDL((id) => dbService.quoteIdentifier(id)));
             await qi.rawQuery(sessionsTableDDL((id) => dbService.quoteIdentifier(id)));
           }
         }
@@ -2307,16 +2680,32 @@ export default class PlayersService {
     // ── Register expected version ──────────────────────────────────
     // Makes s3-players visible in !s3 migrate status / pending.
     // Safe to call unconditionally — overwrites same value on re-mount.
-    dbService.registerExpectedVersion('s3-players', 2, {
+    // The model names do NOT change with the tables. They are the export
+    // envelope's keys and what test-export-model-registration.js asserts on,
+    // and keeping them stable is what makes a backup taken before the rename
+    // restore into the renamed tables afterwards.
+    dbService.registerExpectedVersion('s3-players', 3, {
       models: ['S3PlayerReconnect', 'S3_PlayerSession']
     });
 
     // ── Define Sequelize model ─────────────────────────────────────
     // Runs AFTER bootstrap DDL so the table exists before defineModel.
-    // tableName updated to S3_PlayerReconnects for consistency with other S³ tables.
+    // The MODEL name stays S3PlayerReconnect while the table becomes
+    // S3_ServerReconnects — see the note on registerExpectedVersion above for
+    // why the two are allowed to disagree and why the model name is the one
+    // that must not move.
     this.reconnectModel = dbService.defineModel?.(
       'S3PlayerReconnect',
       {
+        // Half of the primary key — see the session model above. Which team
+        // a player was on when they dropped is a fact about one server, and
+        // restoring server A's team on server B is worse than not restoring
+        // anything.
+        serverID: {
+          type: dbService.getDataTypes().INTEGER,
+          primaryKey: true,
+          allowNull: false
+        },
         eosID: {
           type: dbService.getDataTypes().STRING,
           primaryKey: true
@@ -2343,13 +2732,26 @@ export default class PlayersService {
         }
       },
       {
-        tableName: 'S3_PlayerReconnects',
+        tableName: 'S3_ServerReconnects',
         timestamps: false,
         // Reconnect memory — repopulated from live play, and entries expire on
         // their own.
-        exportTier: 'ephemeral'
+        exportTier: 'ephemeral',
+        // Which team a player was on when they dropped, on one server. Carrying
+        // it across servers would put someone back on a team that does not
+        // correspond to anything they were doing.
+        scopeKind: 'server-column'
       }
     ) || null;
+  }
+
+  /**
+   * Which server these rows belong to. Read from the connector at every use
+   * rather than cached, because a service can outlive a reconnect and the
+   * registry is the only thing that knows the answer.
+   */
+  _serverID() {
+    return this._getDbService()?.getServerID?.() ?? null;
   }
 
   _normalizeReconnectRow(row) {

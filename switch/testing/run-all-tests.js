@@ -47,6 +47,10 @@ const testFiles = [
   'test-seed-bonus.js',
   'test-token-queue-integration.js',
   'test-dialect-literals.js',
+  // Two Switch instances configured with different token caps against one
+  // community bucket — the only failure in the multi-server work that reaches
+  // players rather than admins, and the one that writes nothing to any log.
+  'test-community-token-cap.js',
   // Builds a flattened assembly via install.cjs so a real Switch instance can
   // be constructed — slower than the mock-harness suites, and the only one
   // that runs an event handler end to end into a real database.
@@ -67,7 +71,20 @@ const testFiles = [
   // stored round are both built from, and the backfill's dedupe — which
   // only fails on MySQL, where DATETIME drops the milliseconds the dedupe
   // used to match on.
-  'test-round-stats.js'
+  'test-round-stats.js',
+  // The admin `!switch check` reply, driven through the real onChatMessage so
+  // the assertion cannot pass against a re-implementation of the branch. The
+  // display bug it pins survived a green suite for exactly that reason:
+  // test-token-messaging.js Test 29 builds its own lastSwitchTimestamp and
+  // re-implements the legacy branch inline, so it asserted against its own
+  // simulation and never once touched the shipped code path.
+  'test-legacy-cooldown-display.js',
+  // Server labels on the Discord admin surface. `status`, `stats` and `check`
+  // broadcast, so every registered server answers the same typed message —
+  // without a label the replies are indistinguishable, which is a correctness
+  // problem for the admin reading them rather than a cosmetic one. Also pins
+  // the three single-responder sites that are deliberately left bare.
+  'test-discord-server-labels.js'
 ];
 
 console.log('═'.repeat(50));

@@ -803,6 +803,464 @@ async function runPermissionGuidanceTest(harness) {
 }
 
 /**
+ * probeDdlGrants() answers "what can this user actually do?" by trying it,
+ * rather than by parsing SHOW GRANTS — grants arrive through roles, wildcards
+ * and inheritance, so the text of a grant statement predicts little.
+ *
+ * These fixtures are the one place in the repo where the true answer is known
+ * independently: each tier's GRANT is written out a few hundred lines up. So
+ * this compares the probe against that, tier by tier. Anywhere else the probe
+ * would only be able to agree with itself.
+ *
+ * @param {object} harness
+ * @param {{create: boolean, index: boolean, alter: boolean, drop: boolean}} expected
+ */
+async function runDdlGrantProbeTest(harness, expected) {
+  const { dbService } = harness;
+
+  const grants = await dbService.probeDdlGrants();
+  const seen = `create=${grants.create} index=${grants.index} alter=${grants.alter} drop=${grants.drop}`;
+
+  assert.equal(grants.dialect, 'mysql', 'the probe must report the connected dialect');
+  assert.equal(grants.create, expected.create, `CREATE mismatch — probe said ${seen}`);
+  assert.equal(grants.index, expected.index, `INDEX mismatch — probe said ${seen}`);
+  assert.equal(grants.alter, expected.alter, `ALTER mismatch — probe said ${seen}`);
+  assert.equal(grants.drop, expected.drop, `DROP mismatch — probe said ${seen}`);
+
+  // A refusal has to arrive with the driver's reason attached. A bare `false`
+  // tells an operator that something is missing without telling them what, and
+  // this is the object the pre-flight message is built from.
+  for (const key of ['create', 'index', 'alter', 'drop']) {
+    if (expected[key]) continue;
+    assert.ok(
+      typeof grants.errors[key] === 'string' && grants.errors[key].length > 0,
+      `a refused ${key} must carry the driver's reason — got ${JSON.stringify(grants.errors)}`
+    );
+  }
+
+  // Cached for the mount. The probe issues real DDL, so re-probing on every
+  // caller would mean creating and dropping a table on a live server whenever
+  // anything asked a question about grants.
+  const again = await dbService.probeDdlGrants();
+  assert.equal(again.probedAt, grants.probedAt, 'repeat calls must return the cached probe, not re-issue DDL');
+  const forced = await dbService.probeDdlGrants({ force: true });
+  assert.equal(forced.create, expected.create, 'a forced re-probe must reach the same conclusion');
+}
+
+/**
+ * `!s3 migrate ddl` exists because on the live grant a column-adding migration
+ * cannot be applied by the plugin at all — CREATE is granted, ALTER is not. The
+ * command renders the statements so an operator can run them as a user that
+ * does hold the grant, and then record the version.
+ *
+ * The only evidence that is worth anything here is execution. Reading the
+ * emitted SQL back and asserting it looks right would re-derive the generator's
+ * own opinion of what is correct; running it asks the database. So this walks
+ * the whole operator path: fail under the real grant, generate, execute, re-run,
+ * and confirm the version is recorded and the objects are actually there.
+ *
+ * The split of who executes what is deliberate. The ADD COLUMN goes to an admin
+ * connection, because that is the situation — the operator has escalated. The
+ * CREATE INDEX statements go to the RESTRICTED connection, because the generator
+ * claims they are bare `CREATE INDEX` rather than the `ALTER TABLE ... ADD
+ * INDEX` that Sequelize's own addIndexQuery() emits on MySQL. Running them under
+ * the create-only grant is what proves that claim; a regex on the emitted text
+ * would only restate it.
+ */
+async function runHandApplyDdlTest(harness) {
+  const { engine, sequelize, dbService } = harness;
+  const qi = sequelize.getQueryInterface();
+
+  // The model carries the FINISHED shape — the column v2 adds and the index
+  // that goes with it. buildHandApplyDdl() renders from rawAttributes, so this
+  // is the same definition the migration itself would have applied.
+  dbService.defineModel('HandApplyTable', {
+    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    name: { type: DataTypes.STRING, allowNull: false },
+    addedByHand: { type: DataTypes.INTEGER, allowNull: true }
+  }, {
+    tableName: 'HandApplyTable',
+    timestamps: false,
+    exportTier: 'ephemeral',
+    indexes: [{ name: 'idx_hat_added', fields: ['addedByHand'] }]
+  });
+
+  engine.registerMigrations('test-handapply', [
+    {
+      version: 1,
+      description: 'Create HandApplyTable',
+      backup: false,
+      touches: { creates: ['HandApplyTable'], columns: { HandApplyTable: ['id', 'name'] } },
+      up: async (q) => {
+        await q.createTable('HandApplyTable', {
+          id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+          name: { type: DataTypes.STRING, allowNull: false }
+        });
+      }
+    },
+    {
+      version: 2,
+      description: 'Add addedByHand and its index',
+      backup: false,
+      touches: { columns: { HandApplyTable: ['addedByHand'] } },
+      // Idempotent, which is the house pattern and is also what makes the
+      // hand-apply route work at all: once the operator has run the DDL, this
+      // re-runs as a no-op and the version gets recorded.
+      up: async (q) => {
+        const desc = await q.describeTable('HandApplyTable');
+        if (!Object.keys(desc).some((c) => c.toLowerCase() === 'addedbyhand')) {
+          await q.addColumn('HandApplyTable', 'addedByHand', { type: DataTypes.INTEGER, allowNull: true });
+        }
+        await dbService.ensureIndexes('HandApplyTable', [{ name: 'idx_hat_added', fields: ['addedByHand'] }]);
+      }
+    }
+  ]);
+  dbService.registerExpectedVersion('test-handapply', 2, { models: ['HandApplyTable'] });
+
+  engine.confirmToken('__auto__');
+  let failure = null;
+  try {
+    await engine.runMigrations('test-handapply');
+  } catch (err) {
+    failure = err;
+  }
+  assert.ok(failure, 'v2 must fail under create-only, or this fixture no longer reproduces the live grant');
+  assert.match(failure.message, /ALTER/, `expected an ALTER-privilege failure, got: ${failure.message}`);
+
+  const before = await dbService.verifySchemaVersions();
+  assert.ok(
+    before.pending.some((x) => x.pluginName === 'test-handapply'),
+    'test-handapply must still read as pending after the ALTER failure'
+  );
+
+  const generated = await engine.buildHandApplyDdl({ pluginName: 'test-handapply' });
+  assert.equal(generated.dialect, 'mysql', 'DDL must be rendered for the connected dialect');
+
+  const columnStatements = generated.statements.filter((x) => x.kind === 'column');
+  const indexStatements = generated.statements.filter((x) => x.kind === 'index');
+  const rendered = JSON.stringify(generated.statements.map((x) => x.sql));
+
+  assert.ok(
+    !generated.statements.some((x) => x.kind === 'table'),
+    `HandApplyTable already exists, so no CREATE TABLE should be emitted — got ${rendered}`
+  );
+  assert.equal(columnStatements.length, 1, `expected exactly one ADD COLUMN — got ${rendered}`);
+  assert.match(columnStatements[0].sql, /addedByHand/, `the emitted column statement must name the missing column — got ${rendered}`);
+  assert.equal(indexStatements.length, 1, `the declared index is missing and must be emitted — got ${rendered}`);
+
+  // The operator escalates for the ALTER...
+  const adminSeq = new Sequelize({
+    dialect: 'mysql',
+    host: MYSQL_HOST,
+    port: MYSQL_PORT,
+    username: MYSQL_ROOT_USER,
+    password: MYSQL_ROOT_PASS,
+    database: sequelize.config.database,
+    logging: false
+  });
+  try {
+    for (const st of columnStatements) await adminSeq.query(st.sql);
+  } finally {
+    await adminSeq.close();
+  }
+
+  // ...and does not need to for the indexes.
+  for (const st of indexStatements) await sequelize.query(st.sql);
+
+  engine.confirmToken('__auto__');
+  const rerun = await engine.runMigrations('test-handapply');
+  assert.ok(rerun.applied >= 1, `re-running after the hand-apply should record v2 — got ${JSON.stringify(rerun)}`);
+
+  const after = await dbService.verifySchemaVersions();
+  assert.ok(
+    !after.pending.some((x) => x.pluginName === 'test-handapply'),
+    'the version must be recorded once the hand-applied DDL is in place'
+  );
+
+  const desc = await qi.describeTable('HandApplyTable');
+  assert.ok(
+    Object.keys(desc).some((c) => c.toLowerCase() === 'addedbyhand'),
+    `the hand-applied column must really exist — got ${Object.keys(desc).join(', ')}`
+  );
+  const indexes = await qi.showIndex('HandApplyTable');
+  assert.ok(
+    indexes.some((i) => i.name === 'idx_hat_added'),
+    `the hand-applied index must really exist — got ${indexes.map((i) => i.name).join(', ')}`
+  );
+}
+
+/**
+ * A column a migration adds that the CURRENT model no longer declares.
+ *
+ * This is the gap the other hand-apply tests structurally cannot see: their
+ * fixtures put every touched column on the model, so `rawAttributes` always has
+ * a type to render. Real chains diverge from their models. Switch v3 adds
+ * `seedPresenceStart` to `SwitchPlugin_PlayerCooldowns`, v7 supersedes it with
+ * `SwitchPlugin_PlayerServerState`, and no *up* ever drops the column — so a
+ * live v9 table carries a column no model declares, whose type exists only
+ * inside the migration body.
+ *
+ * Found on a live create-only MySQL grant 2026-09-07. The generated script
+ * applied cleanly, `migrate force` was re-run, and it failed with the identical
+ * ALTER denial on a column the script never mentioned. The operator's only
+ * signal was a note phrased as a `touches`-authoring suspicion, sitting under a
+ * heading that says anything already present is left out — which reads as
+ * completeness.
+ *
+ * So this asserts the generator OWNS UP. It does not assert the column is
+ * rendered: it cannot be, without reading the migration body. Rendering it is a
+ * separate change, and when that lands this test should flip to asserting the
+ * statement rather than the confession.
+ */
+async function runHandApplyIncompleteTest(harness) {
+  const { engine, dbService } = harness;
+
+  // The model is the FINISHED shape and deliberately omits `supersededCol`,
+  // exactly as SwitchPlugin_PlayerCooldowns omits seedPresenceStart today.
+  dbService.defineModel('HandApplyLegacy', {
+    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    name: { type: DataTypes.STRING, allowNull: false }
+  }, {
+    tableName: 'HandApplyLegacy',
+    timestamps: false,
+    exportTier: 'ephemeral'
+  });
+
+  engine.registerMigrations('test-handapply-legacy', [
+    {
+      version: 1,
+      description: 'Create HandApplyLegacy',
+      backup: false,
+      touches: { creates: ['HandApplyLegacy'], columns: { HandApplyLegacy: ['id', 'name'] } },
+      up: async (q) => {
+        await q.createTable('HandApplyLegacy', {
+          id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+          name: { type: DataTypes.STRING, allowNull: false }
+        });
+      }
+    },
+    {
+      version: 2,
+      description: 'Add supersededCol — a column the model does not carry',
+      backup: false,
+      touches: { columns: { HandApplyLegacy: ['supersededCol'] } },
+      // Stands in for the denied ALTER. What matters downstream is the state it
+      // leaves: the table exists, the column does not, and v2 reads as pending.
+      up: async () => {
+        throw new Error("ALTER command denied to user 'fixture'@'localhost' for table 'HandApplyLegacy'");
+      }
+    }
+  ]);
+  dbService.registerExpectedVersion('test-handapply-legacy', 2, { models: ['HandApplyLegacy'] });
+
+  engine.confirmToken('__auto__');
+  let failure = null;
+  try {
+    await engine.runMigrations('test-handapply-legacy');
+  } catch (err) {
+    failure = err;
+  }
+  assert.ok(failure, 'v2 must fail, or this fixture no longer reproduces the denied ALTER');
+
+  const status = await dbService.verifySchemaVersions();
+  assert.ok(
+    status.pending.some((x) => x.pluginName === 'test-handapply-legacy'),
+    'test-handapply-legacy must still read as pending after the failure'
+  );
+
+  const generated = await engine.buildHandApplyDdl({ pluginName: 'test-handapply-legacy' });
+  const rendered = JSON.stringify(generated.statements.map((x) => x.sql));
+
+  assert.ok(
+    !generated.statements.some((x) => /supersededCol/i.test(x.sql)),
+    `the column is not on the model, so it cannot be rendered — got ${rendered}`
+  );
+
+  assert.ok(
+    Array.isArray(generated.incomplete) && generated.incomplete.length > 0,
+    'a script that cannot render a needed column must report itself incomplete'
+  );
+  const gap = generated.incomplete.find((x) => x.column === 'supersededCol');
+  assert.ok(
+    gap,
+    `the gap must name the column an operator has to add by hand — got ${JSON.stringify(generated.incomplete)}`
+  );
+  assert.equal(gap.table, 'HandApplyLegacy', 'the gap must name the table the column belongs to');
+  assert.equal(gap.pluginName, 'test-handapply-legacy', 'the gap must name the plugin whose migration needs it');
+  assert.equal(gap.version, 2, 'the gap must name the migration version that will still fail');
+
+  // The note has to predict the consequence, not just describe the symptom —
+  // an operator who reads "will still fail" stops and escalates instead of
+  // spending a diagnostic cycle rediscovering it.
+  const note = generated.notes.find((n) => n.includes('supersededCol'));
+  assert.ok(note, `a note must name the unrenderable column — got ${JSON.stringify(generated.notes)}`);
+  assert.match(
+    note,
+    /still fail/i,
+    `the note must say the migration still fails after applying the script — got: ${note}`
+  );
+}
+
+/**
+ * The same shape as the test above, with the one difference that closes it: the
+ * migration declares the type of the column its own model no longer carries.
+ *
+ * This is the case an ALTER-less deployment actually lives in. Switch v3 adds
+ * three seed-bonus columns, v7 supersedes them, the model drops them and the
+ * table keeps them — so on a restricted grant the generator used to hand the
+ * operator a script that was missing exactly the columns the migration would
+ * then fail on, and say so in a note. `touches.columnTypes` gives it the type,
+ * and the script becomes complete instead of merely honest.
+ *
+ * Asserted against a rendered ALTER rather than against `incomplete` being
+ * empty, because "reported no gap" and "produced the statement" are different
+ * claims and only the second one is worth anything to an operator pasting SQL.
+ */
+async function runHandApplyDeclaredTypeTest(harness) {
+  const { engine, dbService } = harness;
+
+  dbService.defineModel('HandApplyDeclared', {
+    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    name: { type: DataTypes.STRING, allowNull: false }
+  }, {
+    tableName: 'HandApplyDeclared',
+    timestamps: false,
+    exportTier: 'ephemeral'
+  });
+
+  engine.registerMigrations('test-handapply-declared', [
+    {
+      version: 1,
+      description: 'Create HandApplyDeclared',
+      backup: false,
+      touches: { creates: ['HandApplyDeclared'], columns: { HandApplyDeclared: ['id', 'name'] } },
+      up: async (q) => {
+        await q.createTable('HandApplyDeclared', {
+          id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+          name: { type: DataTypes.STRING, allowNull: false }
+        });
+      }
+    },
+    {
+      version: 2,
+      description: 'Add supersededCol — not on the model, but the migration declares its type',
+      backup: false,
+      touches: {
+        columns: { HandApplyDeclared: ['supersededCol'] },
+        columnTypes: { HandApplyDeclared: { supersededCol: { type: DataTypes.STRING, allowNull: true } } }
+      },
+      up: async () => {
+        throw new Error("ALTER command denied to user 'fixture'@'localhost' for table 'HandApplyDeclared'");
+      }
+    }
+  ]);
+  dbService.registerExpectedVersion('test-handapply-declared', 2, { models: ['HandApplyDeclared'] });
+
+  engine.confirmToken('__auto__');
+  let failure = null;
+  try {
+    await engine.runMigrations('test-handapply-declared');
+  } catch (err) {
+    failure = err;
+  }
+  assert.ok(failure, 'v2 must fail, or this fixture no longer reproduces the denied ALTER');
+
+  const generated = await engine.buildHandApplyDdl({ pluginName: 'test-handapply-declared' });
+  const rendered = JSON.stringify(generated.statements.map((x) => x.sql));
+
+  const statement = generated.statements.find((x) => x.kind === 'column' && /supersededCol/i.test(x.sql));
+  assert.ok(
+    statement,
+    `the migration declares the type, so the column must render as DDL — got ${rendered}`
+  );
+  assert.match(
+    statement.sql,
+    /alter\s+table/i,
+    `the rendered statement must be the ADD COLUMN an operator can paste — got: ${statement.sql}`
+  );
+
+  assert.ok(
+    !generated.incomplete.some((x) => x.column === 'supersededCol'),
+    `a column the migration declares must not be reported as a gap — got ${JSON.stringify(generated.incomplete)}`
+  );
+  assert.ok(
+    !generated.notes.some((n) => n.includes('supersededCol')),
+    `no note should tell the operator to hand-write a column that rendered — got ${JSON.stringify(generated.notes)}`
+  );
+}
+
+/**
+ * The other half of the generator: a table that does not exist yet, so the
+ * CREATE TABLE branch renders and runs rather than being skipped as present.
+ * SQLite carries this one because it needs no Docker and the branch under test
+ * is dialect-independent — what varies by dialect is the rendering, and that
+ * comes from Sequelize's own generator either way.
+ */
+async function runHandApplyDdlCreateTest(harness) {
+  const { engine, sequelize, dbService } = harness;
+  const qi = sequelize.getQueryInterface();
+
+  dbService.defineModel('HandApplyFresh', {
+    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    label: { type: DataTypes.STRING, allowNull: false }
+  }, {
+    tableName: 'HandApplyFresh',
+    timestamps: false,
+    exportTier: 'ephemeral',
+    indexes: [{ name: 'idx_haf_label', fields: ['label'] }]
+  });
+
+  engine.registerMigrations('test-handapply-fresh', [
+    {
+      version: 1,
+      description: 'Create HandApplyFresh and index it',
+      backup: false,
+      touches: { creates: ['HandApplyFresh'], columns: { HandApplyFresh: ['id', 'label'] } },
+      up: async (q) => {
+        await q.createTable('HandApplyFresh', {
+          id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+          label: { type: DataTypes.STRING, allowNull: false }
+        });
+        await dbService.ensureIndexes('HandApplyFresh', [{ name: 'idx_haf_label', fields: ['label'] }]);
+      }
+    }
+  ]);
+  dbService.registerExpectedVersion('test-handapply-fresh', 1, { models: ['HandApplyFresh'] });
+
+  const generated = await engine.buildHandApplyDdl({ pluginName: 'test-handapply-fresh' });
+  const rendered = JSON.stringify(generated.statements.map((x) => x.sql));
+  assert.equal(
+    generated.statements.filter((x) => x.kind === 'table').length, 1,
+    `the absent table must be emitted as CREATE TABLE — got ${rendered}`
+  );
+  assert.equal(
+    generated.statements.filter((x) => x.kind === 'index').length, 1,
+    `a new table's declared index is missing by definition and must be emitted — got ${rendered}`
+  );
+
+  // Exactly what an operator would paste, in the order it was handed to them.
+  for (const st of generated.statements) await sequelize.query(st.sql);
+
+  const tables = await qi.showAllTables();
+  assert.ok(hasTable(tables, 'HandApplyFresh'), `emitted CREATE TABLE did not produce the table — found: ${tables.join(', ')}`);
+  const indexes = await qi.showIndex('HandApplyFresh');
+  assert.ok(
+    indexes.some((i) => i.name === 'idx_haf_label'),
+    `emitted CREATE INDEX did not produce the index — found: ${indexes.map((i) => i.name).join(', ')}`
+  );
+
+  // And the migration still runs clean over the hand-applied objects, which is
+  // the step that records the version.
+  engine.confirmToken('__auto__');
+  await engine.runMigrations('test-handapply-fresh');
+  const after = await dbService.verifySchemaVersions();
+  assert.ok(
+    !after.pending.some((x) => x.pluginName === 'test-handapply-fresh'),
+    'the version must be recorded once the hand-applied DDL is in place'
+  );
+}
+
+/**
  * Same guidance-enrichment contract as runPermissionGuidanceTest, exercised
  * against Postgres's SQLSTATE 42501 shape instead of MySQL's ER_*ACCESS_DENIED
  * family — confirms describePermissionError() doesn't just happen to work on
@@ -920,7 +1378,84 @@ async function registerTests() {
         await harness.teardown();
       }
     });
+
+    test('mysql create-only: emitted hand-apply DDL executes and unblocks the migration', async () => {
+      const harness = await createFixture('mysql', 'create-only');
+      try {
+        await runHandApplyDdlTest(harness);
+      } finally {
+        await harness.teardown();
+      }
+    });
+
+    test('mysql admin: the DDL grant probe reports every privilege', async () => {
+      const harness = await createFixture('mysql', 'admin');
+      try {
+        await runDdlGrantProbeTest(harness, { create: true, index: true, alter: true, drop: true });
+      } finally {
+        await harness.teardown();
+      }
+    });
+
+    test('mysql create-only: the DDL grant probe finds CREATE and INDEX but not ALTER or DROP', async () => {
+      const harness = await createFixture('mysql', 'create-only');
+      try {
+        await runDdlGrantProbeTest(harness, { create: true, index: true, alter: false, drop: false });
+      } finally {
+        await harness.teardown();
+      }
+    });
+
+    test('mysql no-ddl: the DDL grant probe finds no CREATE at all', async () => {
+      const harness = await createFixture('mysql', 'no-ddl');
+      try {
+        // CREATE fails first, so the probe returns without attempting the rest —
+        // there is no table to index, alter or drop. The three false answers are
+        // therefore "not established", and the errors object says so by carrying
+        // only the create key.
+        const grants = await harness.dbService.probeDdlGrants();
+        assert.equal(grants.create, false, `no-ddl must not be able to CREATE — got ${JSON.stringify(grants)}`);
+        assert.ok(
+          typeof grants.errors.create === 'string' && grants.errors.create.length > 0,
+          `the CREATE refusal must carry the driver's reason — got ${JSON.stringify(grants.errors)}`
+        );
+        assert.equal(grants.index, false);
+        assert.equal(grants.alter, false);
+        assert.equal(grants.drop, false);
+      } finally {
+        await harness.teardown();
+      }
+    });
   }
+
+  test('sqlite admin: emitted hand-apply DDL creates the missing table and its index', async () => {
+    const harness = await createFixture('sqlite', 'admin');
+    try {
+      await runHandApplyDdlCreateTest(harness);
+    } finally {
+      await harness.teardown();
+    }
+  });
+
+  // SQLite because the branch is dialect-independent: what varies by dialect is
+  // the rendering, and the point here is that nothing renders at all.
+  test('sqlite admin: hand-apply DDL reports itself incomplete for a column the model no longer carries', async () => {
+    const harness = await createFixture('sqlite', 'admin');
+    try {
+      await runHandApplyIncompleteTest(harness);
+    } finally {
+      await harness.teardown();
+    }
+  });
+
+  test('sqlite admin: hand-apply DDL renders a column the model dropped but the migration declares', async () => {
+    const harness = await createFixture('sqlite', 'admin');
+    try {
+      await runHandApplyDeclaredTypeTest(harness);
+    } finally {
+      await harness.teardown();
+    }
+  });
 
   if (postgresReachable) {
     test('postgres readonly: a missing-CREATE failure carries permission guidance in the error message', async () => {

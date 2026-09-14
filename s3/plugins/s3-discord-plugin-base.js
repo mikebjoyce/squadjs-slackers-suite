@@ -61,6 +61,7 @@
  */
 
 import S3PluginBase from './s3-plugin-base.js';
+import { applyServerLabel } from '../utils/s3-server-label.js';
 
 export default class S3DiscordPluginBase extends S3PluginBase {
   static get optionsSpecification() {
@@ -148,6 +149,12 @@ export default class S3DiscordPluginBase extends S3PluginBase {
       }
       message = { ...message, embeds: [message.embed] };
     }
+
+    // After the default footer above, not instead of it: that one fills a
+    // footer in when an embed has none, and this appends to whatever is
+    // there. An embed that already said something is exactly the one that
+    // must not lose its label.
+    message = applyServerLabel(message);
 
     try {
       await this.channel.send(message);

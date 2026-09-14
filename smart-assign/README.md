@@ -1,4 +1,4 @@
-# SmartAssign Plugin v2.1.2
+# SmartAssign Plugin v2.2.0
 
 **Elo-Aware Auto Assignment & Player Lifecycle Logger**
 
@@ -46,7 +46,7 @@ Tracks per-player TrueSkill ratings (μ/σ) across rounds. SmartAssign automatic
 
 S³ is a **required** supporting plugin that provides shared game state, player management, and clan services to all consumer plugins. SmartAssign consumes `gameState` (round metadata, mode checks), `players` (reconnect memory, move attribution, refresh interest), and `clans` (tag extraction, normalisation, cache) services.
 
-**Requires S³ ≥1.0.0.**
+**Requires S³ ≥1.8.0.** `SA_AssignmentLog` declares a server scope, and an S³ older than 1.8.0 accepts that declaration and ignores it: rows get an empty server column that nothing filters on, and an export carries every server's assignments while reporting itself as this server's. Nothing throws and nothing logs an error, so the version check is the only place this is catchable. The previous floor was 1.0.0.
 
 **Setup**: Install the SlackersSquadServices plugin and enable it in your SquadJS config.json before SmartAssign. It must appear in the plugins array before SmartAssign so it is mounted first.
 
@@ -228,6 +228,18 @@ It targets a specific player by EOSID and runs a full lifecycle profile:
 ```
 
 ---
+
+## Running two or more servers
+
+Several Squad servers can share one database. This plugin's only table is per-server.
+
+| Table | Scope | What that means |
+|-------|-------|-----------------|
+| `SA_AssignmentLog` | per server | Assignment decisions belong to the server that made them |
+
+The inputs it reads are scoped by whoever owns them, and two of those cross servers by design. A player's Elo rating is community-wide, so a first-time joiner on your second server is placed against the rating they earned on the first rather than as an unknown. Reconnect memory is per server, because "which team were they on" is a question about one server's round.
+
+Everything here is inert on a single-server install.
 
 ## Author
 

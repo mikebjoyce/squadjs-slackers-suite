@@ -74,10 +74,27 @@
  *   Team change events (S3_PLAYER_TEAM_CHANGED) are no longer listened to
  *   by SA — they are handled by S³ LoggingService for persistence.
  *
+ * ─── MULTI-SERVER (v2.2.0) ───────────────────────────────────────
+ *
+ * SA_AssignmentLog is per-server: an assignment decision is made
+ * about one server's teams in one server's round. The model declares
+ * scopeKind 'server-column' and rows are stamped from
+ * _s3db?.getServerID?.() ?? null at write time.
+ *
+ * This plugin is the quiet one, and that is exactly why its S³ floor
+ * is a hard 1.8.0. It makes no call an older S³ would reject — no
+ * routing gate, no confirmation arming, nothing optional-chained that
+ * could fail visibly. An older defineModel() accepts scopeKind and
+ * ignores it, and getServerID resolves to null, so every row it
+ * writes is stamped for nobody and every scoped export silently omits
+ * them. Nothing throws, nothing warns, and the damage shows up much
+ * later in a backup that turns out not to contain the rows. The
+ * version check is the entire defence here.
+ *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
  * - The comment header version and `static version` are kept in sync — both
- *   reflect the canonical plugin version (v2.1.1).
+ *   reflect the canonical plugin version (v2.2.0).
  * - Join swaps use Log-Driven triggering: the SteamID arrives from the Log Parser
  *   (~100ms after join), so the RCON command fires before RCON even knows the
  *   player exists. SASwapExecutor's forced post-command poll then verifies the result.
@@ -150,7 +167,7 @@ import SAEventLogger from '../utils/sa-event-logger.js';
 import { evaluateTeamAssignment, getRating, getPenalty, computeScore } from '../utils/sa-team-evaluator.js';
 
 export default class SmartAssign extends S3PluginBase {
-  static version = '2.1.2';
+  static version = '2.2.0';
 
   static get description() {
     return 'Smart team assignment via Elo ratings, reconnect memory, and population balance rules.';
@@ -305,7 +322,17 @@ export default class SmartAssign extends S3PluginBase {
    * Replaces the old inline mount() S³ boilerplate.
    */
   _checkS3Version() {
-    const required = '1.0.0';
+    // 1.8.0 — the multi-server surface. This plugin makes no call an older
+    // S³ would reject, which is exactly why the floor has to be a hard one.
+    // SA_AssignmentLog declares scopeKind: 'server-column', and a
+    // defineModel() older than 1.8.0 accepts that key and ignores it; the
+    // rows are stamped from _s3db?.getServerID?.() ?? null, which is null on
+    // every row there. So on a shared database the log carries an empty
+    // server column that nothing filters on, and an export carries every
+    // server's assignments while reporting itself as this server's. Nothing
+    // throws and nothing logs an error. Mount is the only place this is
+    // catchable.
+    const required = '1.8.0';
     const actual = this._s3?.version;
     if (!this._s3VersionAtLeast(required)) {
       throw new Error(
@@ -340,10 +367,19 @@ export default class SmartAssign extends S3PluginBase {
       { name: 'idx_sa_al_eventType', fields: ['eventType'] },
       { name: 'idx_sa_al_ts', fields: ['ts'] }
     ];
+    // Named for the table rather than idx_serverID, unlike the three above:
+    // Postgres scopes index names to the schema, not the table, so every
+    // Class A table wanting an idx_serverID would be one name nine times.
+    // ensureIndexes() below already runs after the migration commits, so
+    // this one needs no separate gate — by then v2 has added the column.
+    const saServerIdIndex = [{ name: 'SA_AssignmentLog_serverID', fields: ['serverID'] }];
 
     if (this._s3db?.isReady()) {
       this.defineModel('SA_AssignmentLog', {
         id: { type: this._s3db.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
+        // Nullable through this phase — see the v2 migration below for why the
+        // notNull post-condition is deferred rather than declared with it.
+        serverID: { type: this._s3db.getDataTypes().INTEGER, allowNull: true },
         matchId: { type: this._s3db.getDataTypes().STRING, allowNull: true },
         roundStartTime: { type: this._s3db.getDataTypes().BIGINT, allowNull: true },
         ts: { type: this._s3db.getDataTypes().BIGINT, allowNull: false },
@@ -366,6 +402,9 @@ export default class SmartAssign extends S3PluginBase {
         tableName: 'SA_AssignmentLog',
         timestamps: false,
         exportTier: 'historical',
+        // Every row records a move attempted on one server, in one of its
+        // rounds.
+        scopeKind: 'server-column',
         indexes: saAssignmentLogIndexes
       });
 
@@ -379,7 +418,7 @@ export default class SmartAssign extends S3PluginBase {
     // ═══════════════════════════════════════════════════════════════
     try {
       if (this._s3db?.isReady() && this._s3db.migrationEngine) {
-        this.registerExpectedVersion('smart-assign', 1, {
+        this.registerExpectedVersion('smart-assign', 2, {
           models: ['SA_AssignmentLog']
         });
         this.registerMigrations('smart-assign', [
@@ -393,6 +432,11 @@ export default class SmartAssign extends S3PluginBase {
               if (!(await qi.tableExists('SA_AssignmentLog'))) {
                 await qi.createTable('SA_AssignmentLog', {
                   id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+                  // Baseline carries every column the current code expects, so
+                  // a fresh install gets serverID from the CREATE and needs no
+                  // ALTER — which on a grant without ALTER is the difference
+                  // between installing and not. v2 guards, so it no-ops here.
+                  serverID: { type: qi.DataTypes.INTEGER, allowNull: true },
                   matchId: { type: qi.DataTypes.STRING, allowNull: true },
                   roundStartTime: { type: qi.DataTypes.BIGINT, allowNull: true },
                   ts: { type: qi.DataTypes.BIGINT, allowNull: false },
@@ -430,6 +474,37 @@ export default class SmartAssign extends S3PluginBase {
                 id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true }
               });
             }
+          },
+          {
+            version: 2,
+            description: 'Add serverID to SA_AssignmentLog for multi-server scoping',
+            // No touches.data { notNull } on serverID, and not in a follow-up
+            // either until every write path is proven to stamp it: a data
+            // post-condition is re-checked on every mount forever, so one
+            // unstamped insert becomes a rollback-and-re-gate loop.
+            touches: {
+              columns: { SA_AssignmentLog: ['serverID'] }
+            },
+            up: async (qi) => {
+              if (!(await qi.tableExists('SA_AssignmentLog'))) return;
+              const cols = await qi.describeTable('SA_AssignmentLog');
+              if (!cols.serverID) {
+                await qi.addColumn('SA_AssignmentLog', 'serverID', {
+                  type: qi.DataTypes.INTEGER,
+                  allowNull: true
+                });
+              }
+              // Outside the guard and matched on IS NULL: a database where an
+              // operator hand-applied the ALTER arrives with the column
+              // present and every row NULL, and a guarded backfill is a
+              // silent no-op on exactly that database.
+              await this._s3db.backfillServerID(qi, 'SA_AssignmentLog', this._s3db?.getServerID?.() ?? null);
+            },
+            down: async (qi) => {
+              if (!(await qi.tableExists('SA_AssignmentLog'))) return;
+              const cols = await qi.describeTable('SA_AssignmentLog');
+              if (cols.serverID) await qi.removeColumn('SA_AssignmentLog', 'serverID');
+            }
           }
         ]);
         await this.verifyAndRunMigrations('smart-assign');
@@ -440,7 +515,7 @@ export default class SmartAssign extends S3PluginBase {
         // isn't). Runs on every mount, after the migration transaction has
         // committed, so an already-deployed DB gets its indexes without a
         // version bump. See DBService.ensureIndexes() for the mechanism.
-        await this._s3db.ensureIndexes('SA_AssignmentLog', saAssignmentLogIndexes);
+        await this._s3db.ensureIndexes('SA_AssignmentLog', [...saAssignmentLogIndexes, ...saServerIdIndex]);
       } else {
         Logger.verbose('SmartAssign', 1, 'S³ DB or migrationEngine not available — skipping migration registration.');
       }
@@ -1295,6 +1370,10 @@ export default class SmartAssign extends S3PluginBase {
         return;
       }
       await model.create({
+        // Stamped here rather than by the caller that builds `event`: this is
+        // the only path into the table, so a caller cannot forget, and no
+        // caller has any business deciding which server it is running on.
+        serverID: this._s3db?.getServerID?.() ?? null,
         matchId: event.matchId || null,
         roundStartTime: event.roundStartTime || null,
         ts: event.ts || Date.now(),

@@ -5,6 +5,12 @@
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
+ * ⚠ These cases drive mock-harness.js’s COPY of the gate, not the
+ * shipped one, and the copy has drifted — see the note above it. The
+ * scramble-lock cases below in particular model a lock on the wallet row,
+ * which is not where the plugin keeps it any more. Real-engine coverage of
+ * the lock lives in test-admin-mutations.js §6b.
+ *
  * Validates _checkSwitchEligibility() — the gate that decides whether
  * a player can make a switch request. Covers token balance, scramble
  * lock override, time window, liberal mode, and the regen-makes-you-

@@ -282,7 +282,14 @@ function sinkOf(node) {
   if (/^Logger\./.test(n)) return 'log';
   if (/(?:^|\.)(?:verbose|stderrError|resetStreak)$/.test(n)) return 'log';
   if (/(?:^|\.)(?:warn|broadcast|adminBroadcast)$/.test(n)) return 'ingame';
-  if (/(?:^|\.)(?:reply|safeDiscordReply|send|sendDiscordMessage)$/.test(n)) return 'discord';
+  // labelText/labelEmbeds are pass-throughs, not sinks: they put the server's
+  // name onto an answer that is already on its way to send()/reply(). They have
+  // to be named here anyway, because pass 1 stops at the FIRST enclosing callee
+  // — wrapping a localize() in one hides the send() behind it, the key drops to
+  // "no direct evidence", and a surface whose keys are all wrapped defaults to
+  // the player tier. That is how six admin-only !switch backfill strings moved
+  // into the player template with no key added and no wording changed.
+  if (/(?:^|\.)(?:reply|safeDiscordReply|send|sendDiscordMessage|labelText|labelEmbeds)$/.test(n)) return 'discord';
   if (/[Ee]mbed/.test(n)) return 'discord';
   return null;
 }

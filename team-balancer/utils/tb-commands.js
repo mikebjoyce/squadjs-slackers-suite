@@ -302,7 +302,7 @@ const CommandHandlers = {
               try {
                 const embed = {
                   color: 0x3498db,
-                  title: tb.localize('teamBalancer.status.gameCommandTeambalancerOff'),
+                  title: tb.titleWithServer?.(tb.localize('teamBalancer.status.gameCommandTeambalancerOff')) ?? tb.localize('teamBalancer.status.gameCommandTeambalancerOff'),
                   description: tb.localize('teamBalancer.status.executedBy', { adminName }),
                 fields: [{ name: tb.localize('teamBalancer.status.response'), value: tb.localize('teamBalancer.status.winStreakTrackingDisabled', { seedScrambleOffNote: this.seedScrambleOffNote() }), inline: false }],
                   timestamp: new Date().toISOString()
@@ -504,16 +504,16 @@ const CommandHandlers = {
       const isConfirm = args.includes('confirm');
 
       if (isConfirm) {
-        if (!this.scrambleConfirmation) {
+        // Bare word, on every install. This arrived over one server's own
+        // RCON, so the process reading it is the process that armed it.
+        const taken = this._takeScrambleConfirmation(null, false);
+        if (taken.status === 'none') {
           return await this.respond(player, tb.localize('teamBalancer.warn.noPendingScrambleConfirmation'));
         }
-        const timeoutMs = (this.options.scrambleConfirmationTimeout || 60) * 1000;
-        if (Date.now() - this.scrambleConfirmation.timestamp > timeoutMs) {
-          this.scrambleConfirmation = null;
+        if (taken.status !== 'ok') {
           return await this.respond(player, tb.localize('teamBalancer.warn.scrambleConfirmationExpired'));
         }
-        args = this.scrambleConfirmation.args;
-        this.scrambleConfirmation = null;
+        args = taken.args;
       }
 
       const hasNow = args.includes('now');
@@ -541,7 +541,7 @@ const CommandHandlers = {
           if (this.discordChannel) {
             const embed = {
               color: 0x3498db,
-              title: tb.localize('teamBalancer.status.gameCommandScrambleMatchend', { value: hasElo ? ' elo' : '' }),
+              title: tb.titleWithServer?.(tb.localize('teamBalancer.status.gameCommandScrambleMatchend', { value: hasElo ? ' elo' : '' })) ?? tb.localize('teamBalancer.status.gameCommandScrambleMatchend', { value: hasElo ? ' elo' : '' }),
               description: tb.localize('teamBalancer.status.executedBy', { adminName }),
               fields: [{ name: tb.localize('teamBalancer.status.response'), value: armResponseMsg, inline: false }],
               timestamp: new Date().toISOString()
@@ -554,6 +554,7 @@ const CommandHandlers = {
         // Handle cancel subcommand
         if (isCancel) {
           this.scrambleConfirmation = null;
+          this.cancelConfirmations?.('scramble');
           const cancelled = await this.cancelPendingScramble(steamID, player, false);
           if (cancelled) {
             Logger.verbose('TeamBalancer', 2, `[TeamBalancer] Scramble cancelled by ${adminName}`);
@@ -561,7 +562,7 @@ const CommandHandlers = {
             if (this.discordChannel) {
               const embed = {
                 color: 0x3498db,
-                title: tb.localize('teamBalancer.status.gameCommandScrambleCancel'),
+                title: tb.titleWithServer?.(tb.localize('teamBalancer.status.gameCommandScrambleCancel')) ?? tb.localize('teamBalancer.status.gameCommandScrambleCancel'),
                 description: tb.localize('teamBalancer.status.executedBy', { adminName }),
                 fields: [{ name: tb.localize('teamBalancer.status.response'), value: tb.localize('teamBalancer.status.pendingScrambleCancelled'), inline: false }],
                 timestamp: new Date().toISOString()
@@ -587,16 +588,19 @@ const CommandHandlers = {
 
         // Require confirmation for live scrambles
         if (this.options.requireScrambleConfirmation && !hasDry && !isConfirm) {
-          this.scrambleConfirmation = { timestamp: Date.now(), args: args };
+          const arm = this._armScrambleConfirmation(args);
+          if (!arm.armed) return await this.respond(player, arm.refusal);
           const scrambleKind = hasElo ? 'micro' : 'full';
           const timing = hasNow
             ? tb.localize('teamBalancer.status.immediatelyWithNoCountdown')
             : tb.localize('teamBalancer.status.sAfterCountdownBroadcast', { scrambleAnnouncementDelay: this.options.scrambleAnnouncementDelay });
           const timeoutSec = this.options.scrambleConfirmationTimeout || 60;
-          return await this.respond(
-            player,
-            tb.localize('teamBalancer.warn.confirmingWillExecuteScramble', { scrambleKind, timing, timeoutSec })
-          );
+          const prompt = tb.localize('teamBalancer.warn.confirmingWillExecuteScramble', { scrambleKind, timing, timeoutSec });
+          // The token goes in the in-game reply as well as the Discord one.
+          // An admin who armed in game may finish the confirm from Discord,
+          // where the bare word is not enough once a second server exists —
+          // and carrying four characters across is the whole cost of it.
+          return await this.respond(player, arm.lines.length ? `${prompt} ${arm.lines.join(' ')}` : prompt);
         }
 
         // Dry runs are ALWAYS immediate (no countdown for simulations)
@@ -638,7 +642,7 @@ const CommandHandlers = {
         if (this.discordChannel) {
           const embed = {
             color: 0x3498db,
-            title: tb.localize('teamBalancer.status.gameCommandScramble', { value: immediate ? 'now' : '', value2: isSimulated ? 'dry' : '', value3: hasElo ? 'elo' : '' }),
+            title: tb.titleWithServer?.(tb.localize('teamBalancer.status.gameCommandScramble', { value: immediate ? 'now' : '', value2: isSimulated ? 'dry' : '', value3: hasElo ? 'elo' : '' })) ?? tb.localize('teamBalancer.status.gameCommandScramble', { value: immediate ? 'now' : '', value2: isSimulated ? 'dry' : '', value3: hasElo ? 'elo' : '' }),
             description: tb.localize('teamBalancer.status.executedBy', { adminName }),
             fields: [{ name: tb.localize('teamBalancer.status.response'), value: responseMsg, inline: false }],
             timestamp: new Date().toISOString()

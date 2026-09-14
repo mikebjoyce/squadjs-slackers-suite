@@ -56,6 +56,11 @@ import SwitchExplain from '../utils/switch-explain.js';
 import { buildAssembly, importFromAssembly, cleanAssembly } from '../../s3/testing/plugin-assembly.js';
 
 const TABLE = 'SwitchPlugin_PlayerCooldowns';
+// The seed clock, the per-round counter and the round attribution live here
+// since the split; the wallet stays on the table above. Every case below
+// still describes one player, and srv.side() is how it reads the half that
+// is this server’s.
+const STATE_TABLE = 'SwitchPlugin_PlayerServerState';
 const ASSEMBLY = buildAssembly('.tmp-switch-seed-lifecycle');
 const Switch = await importFromAssembly(ASSEMBLY, 'switch.js');
 
@@ -202,14 +207,19 @@ async function buildServer({ dialect = 'sqlite', options = {}, players = [] } = 
   await db.migrationEngine.runMigrations('switch');
 
   const model = db.getModel(TABLE);
+  const stateModel = db.getModel(STATE_TABLE);
 
   return {
-    plugin, db, seq, model, state, roster, warns,
+    plugin, db, seq, model, stateModel, state, roster, warns,
+    /** This server's half of a player, which is where the seed clock is. */
+    async side(eosID, serverID = 1) {
+      return stateModel.findOne({ where: { serverID, eosID } });
+    },
     /** Rewinds a player's presence clock so the threshold has "elapsed". */
     async backdatePresence(eosID, minutes) {
-      await model.update(
+      await stateModel.update(
         { seedPresenceStart: new Date(Date.now() - minutes * MINUTE) },
-        { where: { eosID } }
+        { where: { serverID: 1, eosID } }
       );
     },
     /** One S3_PLAYERS_UPDATED tick. */
@@ -223,6 +233,7 @@ async function buildServer({ dialect = 'sqlite', options = {}, players = [] } = 
     },
     async close() {
       try { await model?.destroy({ where: {} }); } catch { /* best effort */ }
+      try { await stateModel?.destroy({ where: {} }); } catch { /* best effort */ }
       try { await db.getModel('SwitchPlugin_Endmatches')?.destroy({ where: {} }); } catch { /* best effort */ }
       try { await db.unmount(); } catch { /* best effort */ }
       try { await seq.close(); } catch { /* best effort */ }
@@ -258,8 +269,14 @@ await onEachEngine('(a) a player present for the threshold earns a token', async
     await srv.tick();
     const bootstrapped = await srv.model.findByPk('eos-alice');
     assert.ok(bootstrapped, 'no row was created for a connected player during seed mode');
-    assert.ok(bootstrapped.seedPresenceStart instanceof Date, 'the presence clock never started');
     assert.strictEqual(bootstrapped.tokenBalance, 2, 'a fresh row should start at the ordinary cap');
+    // Both halves have to be created, and by independent decisions: a player
+    // who already has a wallet from another server still needs a row here the
+    // first time they seed on this one.
+    const bootstrappedSide = await srv.side('eos-alice');
+    assert.ok(bootstrappedSide, 'no per-server row was created for a connected player during seed mode');
+    assert.ok(bootstrappedSide.seedPresenceStart instanceof Date, 'the presence clock never started');
+    assert.strictEqual(bootstrappedSide.serverID, 1, 'the presence clock was started under the wrong server');
 
     // Not yet at the threshold: nothing may be granted.
     await srv.backdatePresence('eos-alice', 19);
@@ -275,8 +292,9 @@ await onEachEngine('(a) a player present for the threshold earns a token', async
 
     const earned = await srv.model.findByPk('eos-alice');
     assert.strictEqual(earned.tokenBalance, 3, 'no seed token was granted — failure mode (a)');
-    assert.strictEqual(earned.seedBonusTokensEarned, 1, 'the per-round counter did not record the grant');
-    assert.strictEqual(earned.lastSeedBonusRoundID, 'round-1', 'the grant was not attributed to a round');
+    const earnedSide = await srv.side('eos-alice');
+    assert.strictEqual(earnedSide.seedBonusTokensEarned, 1, 'the per-round counter did not record the grant');
+    assert.strictEqual(earnedSide.lastSeedBonusRoundID, 'round-1', 'the grant was not attributed to a round');
   } finally {
     await srv.close();
   }
@@ -291,8 +309,10 @@ await onEachEngine('(a) a player who joins mid-seed-round still accrues', async 
 
     const row = await srv.model.findByPk('eos-bob');
     assert.ok(row, 'the join handler created no row during seed mode');
-    assert.ok(row.seedPresenceStart instanceof Date, 'the joiner\'s presence clock never started');
-    assert.strictEqual(row.lastSeedBonusRoundID, 'round-1', 'presence was written without a round to pair it with');
+    const side = await srv.side('eos-bob');
+    assert.ok(side, 'the join handler created no per-server row during seed mode');
+    assert.ok(side.seedPresenceStart instanceof Date, 'the joiner\'s presence clock never started');
+    assert.strictEqual(side.lastSeedBonusRoundID, 'round-1', 'presence was written without a round to pair it with');
 
     await srv.backdatePresence('eos-bob', 21);
     await srv.tick();
@@ -322,7 +342,7 @@ await onEachEngine('(b) a second seed round grants again once the first token is
     // ── Round 2.
     await srv.newRound('round-2');
 
-    const swept = await srv.model.findByPk('eos-alice');
+    const swept = await srv.side('eos-alice');
     assert.strictEqual(
       swept.seedBonusTokensEarned, 0,
       'the per-round counter survived the round change — failure mode (b): the player can never earn again'
@@ -334,8 +354,9 @@ await onEachEngine('(b) a second seed round grants again once the first token is
 
     const second = await srv.model.findByPk('eos-alice');
     assert.strictEqual(second.tokenBalance, 3, 'the second seed round granted nothing — failure mode (b)');
-    assert.strictEqual(second.seedBonusTokensEarned, 1, 'the second round\'s grant was not recorded');
-    assert.strictEqual(second.lastSeedBonusRoundID, 'round-2', 'the grant was attributed to the wrong round');
+    const secondSide = await srv.side('eos-alice');
+    assert.strictEqual(secondSide.seedBonusTokensEarned, 1, 'the second round\'s grant was not recorded');
+    assert.strictEqual(secondSide.lastSeedBonusRoundID, 'round-2', 'the grant was attributed to the wrong round');
   } finally {
     await srv.close();
   }
@@ -382,18 +403,18 @@ await onEachEngine('(b) a disconnect mid-round does not cost the round\'s earned
     await srv.tick();
     await srv.backdatePresence('eos-alice', 21);
     await srv.tick();
-    assert.strictEqual((await srv.model.findByPk('eos-alice')).seedBonusTokensEarned, 1);
+    assert.strictEqual((await srv.side('eos-alice')).seedBonusTokensEarned, 1);
 
     // Leave stops the clock (v2.5.6) but must not touch the earned counter —
     // if it did, the bootstrap branch on rejoin would hand back the allowance.
     await srv.plugin.onS3PlayerLeft({ player: alice });
-    const left = await srv.model.findByPk('eos-alice');
+    const left = await srv.side('eos-alice');
     assert.strictEqual(left.seedPresenceStart, null, 'the presence clock kept running while disconnected');
     assert.strictEqual(left.seedBonusTokensEarned, 1, 'leaving reset the round\'s earned count');
 
     // Rejoin: clock restarts, allowance stays spent.
     await srv.plugin.onS3PlayerJoined({ player: alice });
-    const rejoined = await srv.model.findByPk('eos-alice');
+    const rejoined = await srv.side('eos-alice');
     assert.ok(rejoined.seedPresenceStart instanceof Date, 'the clock did not restart on rejoin');
     assert.strictEqual(
       rejoined.seedBonusTokensEarned, 1,
@@ -405,6 +426,220 @@ await onEachEngine('(b) a disconnect mid-round does not cost the round\'s earned
     assert.strictEqual(
       (await srv.model.findByPk('eos-alice')).tokenBalance, 3,
       'a reconnect loop earned a second token within one round'
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// (b) The endgame consolation — a claim and a credit, on two tables
+// ═══════════════════════════════════════════════════════════════════
+//
+// Before the split this was one UPDATE whose WHERE spanned the wallet and
+// the seed trio, and that single statement WAS the compare-and-swap defence
+// against a concurrent S3_PLAYERS_UPDATED tick. The columns are on two
+// tables now and Sequelize cannot express a portable cross-table conditional
+// UPDATE, so the defence is a claim on the per-server row followed by a
+// credit to the wallet, both inside one transaction and behind one promise
+// chain. These cases pin what that has to preserve.
+
+await onEachEngine('(b) the endgame consolation grants once and closes the round', async (dialect) => {
+  const alice = P('eos-alice', 'Alice');
+  const srv = await buildServer({ dialect, players: [alice] });
+  try {
+    await srv.tick();
+    await srv.backdatePresence('eos-alice', 21);
+
+    await srv.plugin._grantSeedBonusAtEndgame();
+
+    assert.strictEqual(
+      (await srv.model.findByPk('eos-alice')).tokenBalance, 3,
+      'the consolation grant never reached the wallet — the claim was spent for nothing'
+    );
+    const side = await srv.side('eos-alice');
+    assert.strictEqual(side.seedBonusTokensEarned, 1, 'the claim was not recorded on the per-server row');
+    assert.strictEqual(side.seedPresenceStart, null, 'the round was not closed — presence carries into the gap');
+    assert.strictEqual(side.lastSeedBonusRoundID, 'round-1', 'the grant was not attributed to a round');
+
+    // Running it again must find nothing: the claim predicate is the whole
+    // re-entrancy defence, and ENDGAME can be re-emitted.
+    await srv.plugin._grantSeedBonusAtEndgame();
+    assert.strictEqual(
+      (await srv.model.findByPk('eos-alice')).tokenBalance, 3,
+      'a second ENDGAME granted a second token — the claim predicate is not idempotent'
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+await onEachEngine('(b) a player at the wallet ceiling keeps their claim', async (dialect) => {
+  const alice = P('eos-alice', 'Alice');
+  const srv = await buildServer({ dialect, players: [alice] });
+  try {
+    await srv.tick();
+    await srv.backdatePresence('eos-alice', 21);
+    // Already at maxSwitchTokens + seedTokenBonusAmount.
+    await srv.model.update({ tokenBalance: 3 }, { where: { eosID: 'eos-alice' } });
+
+    await srv.plugin._grantSeedBonusAtEndgame();
+
+    assert.strictEqual(
+      (await srv.model.findByPk('eos-alice')).tokenBalance, 3,
+      'the ceiling was crossed — the credit statement must restate it'
+    );
+    const side = await srv.side('eos-alice');
+    assert.strictEqual(
+      side.seedBonusTokensEarned, 0,
+      'the claim was spent on a grant that never happened — a player at the ceiling must stay unclaimed so they can earn once they spend'
+    );
+    assert.strictEqual(
+      side.seedPresenceStart, null,
+      'the round must still close for everyone connected, granted or not'
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+await onEachEngine('(b) the endgame grant and a periodic tick cannot both pay out', async (dialect) => {
+  const alice = P('eos-alice', 'Alice');
+  const srv = await buildServer({ dialect, players: [alice] });
+  try {
+    await srv.tick();
+    await srv.backdatePresence('eos-alice', 21);
+
+    // Both reconcilers, in flight together. This is the race the single
+    // atomic UPDATE used to settle by itself. It is settled now by the claim
+    // UPDATE restating its own predicate — the second writer claims zero rows
+    // and the credit is gated on that count — with _withSeedGrantLock() as a
+    // belt on top. The case is written against the outcome rather than the
+    // mechanism for that reason: reducing the lock to fn() does not fail it,
+    // and a case that only passes because of a redundant guard would report
+    // the wrong thing when the guard was removed.
+    await Promise.all([
+      srv.plugin._grantSeedBonusAtEndgame(),
+      srv.tick()
+    ]);
+
+    assert.strictEqual(
+      (await srv.model.findByPk('eos-alice')).tokenBalance, 3,
+      'the endgame grant and the periodic tick both paid out — the grant paths are not serialised'
+    );
+    assert.strictEqual(
+      (await srv.side('eos-alice')).seedBonusTokensEarned, 1,
+      'the per-round counter was incremented twice in one round'
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+await onEachEngine('(b) the claim and the credit run under one transaction', async (dialect) => {
+  const alice = P('eos-alice', 'Alice');
+  const srv = await buildServer({ dialect, players: [alice] });
+  try {
+    await srv.tick();
+    await srv.backdatePresence('eos-alice', 21);
+
+    // S³ runs no CLS, so a statement with no handle executes outside the
+    // transaction on any pooled engine — and the pairing this whole rewrite
+    // exists to keep is exactly what that breaks: a claim that commits while
+    // its credit rolls back is a seed round spent for nothing. Asserted on
+    // the handle rather than on an effect, because SQLite backs an in-memory
+    // database with one connection and would roll the stray statement back
+    // anyway, hiding the defect the deployed engines would show.
+    const seen = [];
+    const spy = (target, label, method) => {
+      const real = target[method].bind(target);
+      target[method] = async (...args) => {
+        const opts = args[args.length - 1];
+        seen.push({ label, transaction: opts && typeof opts === 'object' ? opts.transaction : undefined });
+        return real(...args);
+      };
+    };
+    spy(srv.stateModel, 'claim', 'update');
+    spy(srv.model, 'credit', 'update');
+
+    await srv.plugin._grantSeedBonusAtEndgame();
+
+    assert.ok(seen.some((s) => s.label === 'claim'), 'no claim statement ran');
+    assert.ok(seen.some((s) => s.label === 'credit'), 'no credit statement ran');
+    for (const s of seen) {
+      assert.ok(s.transaction, `the ${s.label} statement got no transaction handle`);
+    }
+    const handles = new Set(seen.map((s) => s.transaction));
+    assert.strictEqual(handles.size, 1, `the endgame grant spanned ${handles.size} transactions`);
+  } finally {
+    await srv.close();
+  }
+});
+
+await onEachEngine('(b) a failed credit does not spend the claim', async (dialect) => {
+  const alice = P('eos-alice', 'Alice');
+  const srv = await buildServer({ dialect, players: [alice] });
+  try {
+    await srv.tick();
+    await srv.backdatePresence('eos-alice', 21);
+
+    const realUpdate = srv.model.update.bind(srv.model);
+    srv.model.update = async () => { throw new Error('engine says no'); };
+    try {
+      await srv.plugin._grantSeedBonusAtEndgame();
+    } finally {
+      srv.model.update = realUpdate;
+    }
+
+    const side = await srv.side('eos-alice');
+    assert.strictEqual(
+      side.seedBonusTokensEarned, 0,
+      'the claim was committed while the credit failed — the player\u2019s seed round is gone and no token came back for it'
+    );
+    assert.ok(
+      side.seedPresenceStart instanceof Date,
+      'the round was closed by a transaction that failed'
+    );
+    assert.strictEqual(
+      (await srv.model.findByPk('eos-alice')).tokenBalance, 2,
+      'a token appeared despite the credit failing'
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+await onEachEngine('(b) the endgame grant leaves another server\u2019s seed round alone', async (dialect) => {
+  const alice = P('eos-alice', 'Alice');
+  const srv = await buildServer({ dialect, players: [alice] });
+  try {
+    await srv.tick();
+    await srv.backdatePresence('eos-alice', 21);
+
+    // The same player, mid-seed-round on a server that is not ending. Its
+    // round is that server’s to close: this process cannot know whether the
+    // presence there is stale or live, and closing it costs a real token.
+    await srv.stateModel.create({
+      serverID: 2, eosID: 'eos-alice',
+      seedPresenceStart: new Date(Date.now() - 21 * MINUTE),
+      seedBonusTokensEarned: 0,
+      lastActiveTimestamp: new Date()
+    });
+
+    await srv.plugin._grantSeedBonusAtEndgame();
+
+    const other = await srv.side('eos-alice', 2);
+    assert.ok(
+      other.seedPresenceStart instanceof Date,
+      'this server\u2019s ENDGAME closed another server\u2019s seed round'
+    );
+    assert.strictEqual(
+      other.seedBonusTokensEarned, 0,
+      'this server\u2019s ENDGAME claimed another server\u2019s row'
+    );
+    assert.strictEqual(
+      (await srv.model.findByPk('eos-alice')).tokenBalance, 3,
+      'the shared wallet should still have been credited exactly once'
     );
   } finally {
     await srv.close();
@@ -505,7 +740,7 @@ await onEachEngine('(d) a seeder who leaves is fully drained within the retentio
     // Round turns over without them. This is what nothing used to do.
     await srv.newRound('round-2');
 
-    const swept = await srv.model.findByPk('eos-alice');
+    const swept = await srv.side('eos-alice');
     assert.strictEqual(swept.seedPresenceStart, null, 'seed presence outlived the round — failure mode (d)');
     assert.strictEqual(swept.seedBonusTokensEarned, 0, 'per-round accrual outlived the round — failure mode (d)');
 
@@ -521,6 +756,13 @@ await onEachEngine('(d) a seeder who leaves is fully drained within the retentio
     assert.strictEqual(
       await srv.model.count(), 0,
       'the row survived past pruneInactivePlayerDays — failure mode (d): the table only ever grows'
+    );
+    // The per-server row goes in the same transaction. A surviving one is a
+    // seed clock belonging to a player who no longer has a wallet, and the
+    // next reconciler tick would read it as live state.
+    assert.strictEqual(
+      await srv.stateModel.count(), 0,
+      'the per-server row outlived the wallet it belongs to'
     );
   } finally {
     await srv.close();
@@ -602,7 +844,7 @@ await onEachEngine('(d) a whole seed lobby drains after everyone leaves', async 
     srv.roster.length = 0;
     await srv.newRound('round-2');
 
-    const stranded = await srv.model.count({
+    const stranded = await srv.stateModel.count({
       where: { seedPresenceStart: { [Sequelize.Op.ne]: null } }
     });
     assert.strictEqual(stranded, 0, `${stranded} rows kept a seed clock after everyone left — failure mode (d)`);
@@ -612,6 +854,7 @@ await onEachEngine('(d) a whole seed lobby drains after everyone leaves', async 
     await srv.plugin.cleanup();
 
     assert.strictEqual(await srv.model.count(), 0, 'the table did not drain — failure mode (d)');
+    assert.strictEqual(await srv.stateModel.count(), 0, 'the per-server table did not drain — failure mode (d)');
   } finally {
     await srv.close();
   }

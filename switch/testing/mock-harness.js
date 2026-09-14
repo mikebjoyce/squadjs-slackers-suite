@@ -571,7 +571,16 @@ export function createMockHarness(opts = {}, clock = null) {
     return row;
   };
 
-  // ── _checkSwitchEligibility (exact copy of the plugin logic) ─
+  // ── _checkSwitchEligibility (a copy, and it has drifted) ─────
+  //
+  // Two known divergences from switch.js, both load-bearing:
+  //   • the shipped gate returns early for liberal/seed mode BEFORE the
+  //     scramble lock, so a stale lock cannot block a seed round;
+  //   • the shipped gate reads scrambleLockdownExpiry off the per-server
+  //     state row, not off the wallet row this copy reads.
+  // Cases here therefore pass regardless of what the real gate does. The
+  // shipped gate runs against SQLite and MySQL in test-admin-mutations.js
+  // §6b; put lock and scoping cases there.
   plugin._checkSwitchEligibility = async function (player) {
     const eosID = player?.eosID;
     if (!eosID) return { eligible: false, reason: 'missing_eos' };

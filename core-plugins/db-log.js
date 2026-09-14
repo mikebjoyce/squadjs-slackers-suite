@@ -246,13 +246,7 @@ export default class DBLog extends S3PluginBase {
   }
 
   static get optionsSpecification() {
-    return {
-      overrideServerID: {
-        required: false,
-        description: 'An overridden server ID, for multi-server setups sharing one database.',
-        default: null
-      }
-    };
+    return {};
   }
 
   constructor(server, options, connectors) {
@@ -270,15 +264,17 @@ export default class DBLog extends S3PluginBase {
     this.listeners.onPlayerRevived = this.onPlayerRevived.bind(this);
   }
 
-  /** Resolves the server id to attach to every row — a plain property read, not a DB call. */
-  get _serverId() {
-    return this.options.overrideServerID || this.server.id;
-  }
-
   _checkS3Version() {
-    // Baseline only — defineModel/registerMigrations/_withDb/_getModel have
-    // been present since S³ 1.0.0, same floor as SmartAssign/TeamBalancer.
-    const required = '1.0.0';
+    // 1.8.0 — every model this plugin defines declares a `scopeKind`, and an S³
+    // older than 1.8.0 has no `scopePredicateFor()` to turn one into a query.
+    // This plugin's own reads and writes are safe either way: it stamps rows
+    // from `this.serverID` (S³'s resolved id, inherited from S3PluginBase) and
+    // filters on that column explicitly at every call site. What breaks is the
+    // work S³ does on its behalf — the declarations are accepted and ignored,
+    // so an export carries every server's rows while reporting itself as this
+    // server's, and an import writes a sibling's rows in without noticing whose
+    // they were. Nothing throws, which is why this is checked at mount.
+    const required = '1.8.0';
     const actual = this._s3?.version;
     if (!this._s3VersionAtLeast(required)) {
       throw new Error(
@@ -304,7 +300,33 @@ export default class DBLog extends S3PluginBase {
     this._registerMigrations();
     await this.verifyAndRunMigrations(PLUGIN_NAME);
 
-    const serverId = this._serverId;
+    // Do not touch our tables until the migrations that create them have run.
+    //
+    // verifyAndRunMigrations() returns null for three different outcomes and its
+    // own docblock says so: DB unavailable, schema already current, and
+    // pending-but-unconfirmed. The last is an ordinary first boot with
+    // autoMigrate off — S³ posts the Discord prompt and waits for an operator.
+    // Reading null as "ready" and upserting anyway turns that wait into a full
+    // ERROR with a stack trace ("no such table: DBLog_Servers"), mirrored to
+    // stderr, at exactly the moment an operator is being asked to confirm.
+    // The base class is explicit that the way to tell the cases apart is to ask
+    // verifySchemaVersions() rather than infer from the return value.
+    //
+    // This plugin exists so that database trouble degrades to a logged skip
+    // rather than an unhandled failure. A schema that is not ready yet gets the
+    // same treatment: say so once, mount nothing, and let the restart after the
+    // operator confirms bring us up properly.
+    const versions = await this.s3db.verifySchemaVersions();
+    if ((versions?.pending ?? []).some((p) => p.pluginName === PLUGIN_NAME)) {
+      this.verbose(
+        1,
+        `[DBLog] Migrations for "${PLUGIN_NAME}" are not applied yet — not logging until they are. ` +
+          'Confirm them (!s3 migrate force, or !s3 confirm <token>), then restart.'
+      );
+      return;
+    }
+
+    const serverId = this.serverID;
 
     await this._withDb(async (t) => {
       await this._getModel(MODEL.SERVER).upsert(
@@ -351,7 +373,14 @@ export default class DBLog extends S3PluginBase {
     this.defineModel(MODEL.SERVER, {
       id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
       name: { type: DataTypes.STRING }
-    }, { tableName: TABLE.SERVER, timestamps: false, exportTier: 'logging' });
+    }, {
+      tableName: TABLE.SERVER,
+      timestamps: false,
+      exportTier: 'logging',
+      // The primary key is the server id — this table IS the server list every
+      // other db-log row's `server` column points at.
+      scopeKind: 'server-key'
+    });
 
     this.defineModel(MODEL.MATCH, {
       id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
@@ -364,7 +393,17 @@ export default class DBLog extends S3PluginBase {
       startTime: { type: DataTypes.DATE, allowNull: false },
       endTime: { type: DataTypes.DATE },
       winner: { type: DataTypes.STRING }
-    }, { tableName: TABLE.MATCH, timestamps: false, exportTier: 'logging' });
+    }, {
+      tableName: TABLE.MATCH,
+      timestamps: false,
+      exportTier: 'logging',
+      // db-log has always scoped its rows, and it names the column `server`
+      // rather than `serverID`. Honouring the existing name costs a parameter;
+      // renaming a column in a plugin this suite does not own costs a migration
+      // and breaks anyone reading the table directly.
+      scopeKind: 'server-column',
+      scopeColumn: 'server'
+    });
 
     this.defineModel(MODEL.TICKRATE, {
       id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
@@ -372,7 +411,7 @@ export default class DBLog extends S3PluginBase {
       match: { type: DataTypes.INTEGER, allowNull: true },
       time: { type: DataTypes.DATE, allowNull: false },
       tickRate: { type: DataTypes.FLOAT, allowNull: false }
-    }, { tableName: TABLE.TICKRATE, timestamps: false, exportTier: 'logging' });
+    }, { tableName: TABLE.TICKRATE, timestamps: false, exportTier: 'logging', scopeKind: 'server-column', scopeColumn: 'server' });
 
     this.defineModel(MODEL.PLAYERCOUNT, {
       id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
@@ -382,7 +421,7 @@ export default class DBLog extends S3PluginBase {
       players: { type: DataTypes.INTEGER, allowNull: false },
       publicQueue: { type: DataTypes.INTEGER, allowNull: false },
       reserveQueue: { type: DataTypes.INTEGER, allowNull: false }
-    }, { tableName: TABLE.PLAYERCOUNT, timestamps: false, exportTier: 'logging' });
+    }, { tableName: TABLE.PLAYERCOUNT, timestamps: false, exportTier: 'logging', scopeKind: 'server-column', scopeColumn: 'server' });
 
     this.defineModel(MODEL.PLAYER, {
       id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
@@ -390,7 +429,16 @@ export default class DBLog extends S3PluginBase {
       steamID: { type: DataTypes.STRING, allowNull: false, unique: true },
       lastName: { type: DataTypes.STRING },
       lastIP: { type: DataTypes.STRING }
-    }, { tableName: TABLE.PLAYER, timestamps: false, exportTier: 'historical', ...UTF8MB4 });
+    }, {
+      tableName: TABLE.PLAYER,
+      timestamps: false,
+      exportTier: 'historical',
+      // One row per person, keyed by their unique ids and carrying no `server`
+      // column — the only db-log table that is community-wide, and the reason
+      // this classification cannot be derived from the plugin's own convention.
+      scopeKind: 'global',
+      ...UTF8MB4
+    });
 
     const combatColumns = (DT) => ({
       id: { type: DT.INTEGER, primaryKey: true, autoIncrement: true },
@@ -411,13 +459,17 @@ export default class DBLog extends S3PluginBase {
     });
 
     this.defineModel(MODEL.WOUND, combatColumns(DataTypes), {
-      tableName: TABLE.WOUND, timestamps: false, exportTier: 'logging', ...UTF8MB4
+      tableName: TABLE.WOUND, timestamps: false, exportTier: 'logging',
+      scopeKind: 'server-column', scopeColumn: 'server', ...UTF8MB4
     });
 
     this.defineModel(MODEL.DEATH, {
       ...combatColumns(DataTypes),
       woundTime: { type: DataTypes.DATE }
-    }, { tableName: TABLE.DEATH, timestamps: false, exportTier: 'logging', ...UTF8MB4 });
+    }, {
+      tableName: TABLE.DEATH, timestamps: false, exportTier: 'logging',
+      scopeKind: 'server-column', scopeColumn: 'server', ...UTF8MB4
+    });
 
     this.defineModel(MODEL.REVIVE, {
       ...combatColumns(DataTypes),
@@ -426,7 +478,10 @@ export default class DBLog extends S3PluginBase {
       reviverName: { type: DataTypes.STRING },
       reviverTeamID: { type: DataTypes.INTEGER },
       reviverSquadID: { type: DataTypes.INTEGER }
-    }, { tableName: TABLE.REVIVE, timestamps: false, exportTier: 'logging', ...UTF8MB4 });
+    }, {
+      tableName: TABLE.REVIVE, timestamps: false, exportTier: 'logging',
+      scopeKind: 'server-column', scopeColumn: 'server', ...UTF8MB4
+    });
   }
 
   _registerMigrations() {
@@ -622,7 +677,7 @@ export default class DBLog extends S3PluginBase {
   // ═══════════════════════════════════════════════════════════════
 
   async onTickRate(info) {
-    const serverId = this._serverId;
+    const serverId = this.serverID;
     await this._withDb(async (t) => {
       await this._getModel(MODEL.TICKRATE).create({
         server: serverId,
@@ -634,7 +689,7 @@ export default class DBLog extends S3PluginBase {
   }
 
   async onUpdatedA2SInformation(info) {
-    const serverId = this._serverId;
+    const serverId = this.serverID;
     await this._withDb(async (t) => {
       await this._getModel(MODEL.PLAYERCOUNT).create({
         server: serverId,
@@ -657,7 +712,7 @@ export default class DBLog extends S3PluginBase {
    * nothing in the logs to indicate it had happened.
    */
   async onNewGame(info) {
-    const serverId = this._serverId;
+    const serverId = this.serverID;
 
     await this._withDb(async (t) => {
       await this._getModel(MODEL.MATCH).update(
@@ -695,7 +750,7 @@ export default class DBLog extends S3PluginBase {
     await this.ensurePlayer(info.attacker);
     await this.ensurePlayer(info.victim);
 
-    const serverId = this._serverId;
+    const serverId = this.serverID;
     await this._withDb(async (t) => {
       await this._getModel(MODEL.WOUND).create({
         server: serverId,
@@ -720,7 +775,7 @@ export default class DBLog extends S3PluginBase {
     await this.ensurePlayer(info.attacker);
     await this.ensurePlayer(info.victim);
 
-    const serverId = this._serverId;
+    const serverId = this.serverID;
     await this._withDb(async (t) => {
       await this._getModel(MODEL.DEATH).create({
         server: serverId,
@@ -747,7 +802,7 @@ export default class DBLog extends S3PluginBase {
     await this.ensurePlayer(info.victim);
     await this.ensurePlayer(info.reviver);
 
-    const serverId = this._serverId;
+    const serverId = this.serverID;
     await this._withDb(async (t) => {
       await this._getModel(MODEL.REVIVE).create({
         server: serverId,

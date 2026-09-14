@@ -163,9 +163,14 @@ function readS3Version() {
  * not where dialect differences belong — see
  * s3/testing/test-dialect-portability.js for those.
  *
+ * `confirmMigrations: false` leaves the engine ungated — the state a first boot
+ * with autoMigrate off is in while it waits on an operator. verifyAndRunMigrations()
+ * then returns null with nothing created, so a test can prove a plugin declines
+ * to touch its tables until migrations are confirmed.
+ *
  * @returns {Promise<DBService>} mounted service; call unmount() when done
  */
-export async function makeS3Db({ verboseLogger = () => {} } = {}) {
+export async function makeS3Db({ verboseLogger = () => {}, confirmMigrations = true } = {}) {
   // Options form, not the 'sqlite::memory:' URL: Node now emits DEP0170 for
   // that URL shape, and a deprecation warning in every test run trains people
   // to ignore warnings.
@@ -181,8 +186,9 @@ export async function makeS3Db({ verboseLogger = () => {} } = {}) {
   // Without this the engine refuses to run, verifyAndRunMigrations() returns
   // null, no tables are created, and every persistence assertion downstream
   // fails with "no such table" — which reads like a plugin bug and is not one.
-  // '__auto__' is the same token the autoMigrate config path uses.
-  db.migrationEngine?.confirmToken('__auto__');
+  // '__auto__' is the same token the autoMigrate config path uses. A test that
+  // wants the pre-confirmation state passes confirmMigrations: false.
+  if (confirmMigrations) db.migrationEngine?.confirmToken('__auto__');
 
   return db;
 }

@@ -1,4 +1,4 @@
-# EloTracker Plugin v2.1.7
+# EloTracker Plugin v2.2.0
 
 **SquadJS Plugin for Skill-Based Player Rating**
 
@@ -73,7 +73,7 @@ TeamBalancer's optional Elo-diff "micro scramble" trigger (`enableEloDiffScrambl
 
 S³ is the centralised service container for shared state across Slacker's Squad plugins. EloTracker uses it as the primary data source for game-state metadata — round start time, layer name, gamemode, and ignored-mode detection.
 
-**Requires S³ ≥1.2.4.**
+**Requires S³ ≥1.8.0.** EloTracker records community-wide options at mount and reads the community's strictest `minRoundsForLeaderboard` rather than its own, so a leaderboard drawn from a shared rating table answers the same way whichever server replies. The recording calls are plain, and an older S³ throws partway through mount; the routing and confirmation calls are optional-chained and fail quietly instead, which is why the version is checked first. The previous floor was 1.2.4, for the exact-match option on `searchPlayers()`.
 
 **Why this matters**: Rather than maintaining its own round-time tracking, EloTracker reads ground-truth data from S³'s `gameState` service — `getRoundStartTime()`, `getLayerName()`, `getGamemode()`, and `isIgnoredMode()`. This ensures cross-plugin consistency: SA and TB refer to the same roundStartTime and matchId during team assignment and balancing. EloTracker also listens for `TEAM_BALANCER_SCRAMBLE_EXECUTED` to capture a team-balance snapshot post-scramble for Discord reporting.
 
@@ -299,6 +299,26 @@ A player's rating change is scaled by their time in the round:
 - **Eligibility:** Players must reach `minRoundsForLeaderboard` to receive an official rank.
 - **Sorting:** Ranked by **Competitive Skill Rank (CSR) (μ - 3.0σ)**. This ensures that leaderboard scores require both high skill and low uncertainty, encouraging active play.
 - **Provisional:** Players below the threshold are visible but unranked.
+
+## Running two or more servers
+
+Several Squad servers can share one database. When they do, a player's rating is community-wide and the round history behind it is per-server.
+
+| Table | Scope | What that means |
+|-------|-------|-----------------|
+| `Elo_PlayerStats` | **community-wide** | One rating per player. A player who plays on both your servers carries the same skill number to each |
+| `Elo_RoundHistories` | per server | Each round is attributed to the server that played it |
+| `Elo_RoundPlayers` | per server | Same, for per-player round rows |
+
+A single rating is what makes cross-server balancing work: TeamBalancer on either server is balancing against the same number, and a player cannot reset their rating by switching servers. The cost is that a community running one 40-player server and one 100-player server pools rounds of quite different character into one rating.
+
+That is why `minPlayersForElo` and `minParticipationRatio` are allowed to differ between servers. Both gate a server's own rounds before anything shared is written, so a smaller server can set its own bar without arguing with the larger one. A mismatch is reported by `!s3 servers` and never enforced.
+
+`minRoundsForLeaderboard` is not allowed to differ, because it decides which shared rows a leaderboard shows and which the housekeeping deletes. While the servers disagree, a write that would apply one server's value to everyone's rows declines and says so; reads answer with the strictest registered value, so the same command in the same channel returns the same list whichever process replies.
+
+`!elo reset` and `!elo restore` both act on the community's ratings rather than this server's. Each takes a short-lived confirmation token that only the process which armed it will accept.
+
+Everything here is inert on a single-server install.
 
 ## Author
 

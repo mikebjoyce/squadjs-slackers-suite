@@ -78,6 +78,32 @@
  * Listened Events:
  *   - None.
  *
+ * ─── MULTI-SERVER (v4.2.0) ───────────────────────────────────────
+ *
+ * Everything this plugin persists is per-server, which is what the
+ * work amounted to. A win streak, a scramble lockdown and a round
+ * report are facts about one server's rounds; there is nothing here
+ * a community shares.
+ *
+ * TeamBalancerState is a per-server singleton whose PRIMARY KEY is
+ * the server id — scopeKind 'server-key', no serverID column. That
+ * shape is why becoming per-server cost this table no DDL, and it is
+ * also the trap: a scope check written as "does this model have a
+ * serverID attribute" reads the table as community-wide. The
+ * declaration carries the answer, not the columns.
+ *
+ * Requires S³ 1.8.0, checked at mount, and this plugin has the most
+ * to lose from an older one. Its multi-server calls are all
+ * optional-chained, so nothing throws — but the state row is keyed on
+ * getServerID?.() ?? 1, and against an older S³ that resolves to 1 on
+ * every server. Two servers then share one win streak and one
+ * scramble lockdown, quietly and plausibly. The version check is the
+ * only thing standing between an operator and that.
+ *
+ * Discord commands route through S³ so one typed !scramble is
+ * answered once, and confirmations arm through the same path, so the
+ * process that minted a token is the process that acts on it.
+ *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
  * - Two independent streak trackers run simultaneously:
@@ -269,13 +295,83 @@ import { TBDiagnostics } from '../utils/tb-diagnostics.js';
 import fs from 'fs';
 import path from 'path';
 
+/**
+ * Which server answers `!teambalancer <verb>` and `!scramble <args>`.
+ *
+ * Everything TeamBalancer does to a game is done to one game. There is no
+ * community-wide mutation on this surface at all: the balancer's state, its
+ * win streak and its scrambles are all this server's, so the interesting
+ * question here is only ever read-versus-write.
+ *
+ * **`!scramble` is order-insensitive**, which is why this reads the whole
+ * argument list rather than the first word. `handleDiscordScrambleCommand()`
+ * tests membership — `args.includes('now')`, `args.includes('elo')` — so
+ * `!scramble elo now` and `!scramble now elo` are the same command, and a
+ * classifier that read `args[0]` would tag one of them wrong.
+ *
+ * `dry` is the one read in the set: it builds and prints the teams it would
+ * have made and moves nobody.
+ *
+ * **A `confirm` is classified by whether it carries a token.** With one,
+ * it is a token confirm: the arm minted it in one process's memory, so the
+ * token is already the routing and a claim would hand the message to an
+ * arbitrary process that would reject a token it never minted. Without
+ * one — a single-server install, or an admin typing the bare word — it is
+ * an ordinary server mutation and `--server` does the routing instead.
+ *
+ * Four hex characters is what `mintPendingToken()` produces, and it is not
+ * a scramble verb, so matching on the shape is unambiguous here.
+ *
+ * @param {string} surface - 'teambalancer' or 'scramble'
+ * @param {string[]} args - Arguments with the command word removed
+ * @returns {{scope: string, selectorRequired: boolean}}
+ *
+ * The scope values are literal strings rather than the COMMAND_SCOPE
+ * constants because this file cannot import an S³ util — the suite ships
+ * flattened, and no single specifier resolves both here and at the target.
+ * `test-discord-routing.js` asserts every value this returns is one
+ * COMMAND_SCOPE declares, which is what importing them would have bought.
+ */
+export function scopeForTeamBalancerCommand(surface, args) {
+  const list = (Array.isArray(args) ? args : []).map((a) => String(a).toLowerCase());
+
+  if (surface === 'scramble') {
+    if (list.includes('dry')) return { scope: 'server-read', selectorRequired: false };
+    if (list.includes('confirm') && list.some((a) => /^[0-9a-f]{4}$/.test(a))) {
+      return { scope: 'token-confirm', selectorRequired: false };
+    }
+    return { scope: 'server-mutating', selectorRequired: false };
+  }
+
+  switch (list[0]) {
+    case 'status':
+    case 'export':
+      return { scope: 'server-read', selectorRequired: false };
+
+    // buildDiagEmbeds() returns an array and the handler loops over it, so a
+    // broadcast diag is one command answering with a screen of embeds per
+    // server. Volume, not correctness.
+    case 'diag':
+      return { scope: 'server-read', selectorRequired: true };
+
+    case 'on':
+    case 'off':
+    case 'clear':
+      return { scope: 'server-mutating', selectorRequired: false };
+
+    // `help`, and the unknown verbs that fall through to it.
+    default:
+      return { scope: 'community-read', selectorRequired: false };
+  }
+}
+
 // Bounds the saveState/incrementStreak writes inside onRoundEnded() — both sit
 // directly upstream of a scramble-trigger check in that same handler. See the
 // totalTimeoutMs note on db-service.js's executeWithRetry.
 const ROUND_END_DB_TIMEOUT_MS = 15000;
 
 export default class TeamBalancer extends S3PluginBase {
-  static version = '4.1.0';
+  static version = '4.2.0';
 
   static get description() {
     return 'Tracks dominant wins by team ID and scrambles teams if one team wins too many rounds.';
@@ -554,6 +650,10 @@ export default class TeamBalancer extends S3PluginBase {
     this.listeners.onScrambleCommand = this.onScrambleCommand.bind(this);
     this.listeners.onChatMessage = this.onChatMessage.bind(this);
     this.listeners.onDiscordMessage = this.onDiscordMessage.bind(this);
+    // DiscordHelpers is a module singleton and cannot import the label module
+    // itself — see S3PluginBase.applyServerLabel(). Read at send time, not
+    // captured, so a label published later still lands.
+    DiscordHelpers.applyServerLabel = (payload) => this.applyServerLabel(payload);
     this.discordChannel = null;
     this.discordReportChannel = null;
     
@@ -622,6 +722,13 @@ export default class TeamBalancer extends S3PluginBase {
 
     const STALE_CUTOFF_MS = 2.5 * 60 * 60 * 1000;
 
+    // `id` on TeamBalancerState is the server id, not a row number — the
+    // table is a per-server singleton keyed by scope. Resolved once here
+    // rather than per call because DBService settles it at construction:
+    // every read and write below therefore addresses the same row for the
+    // life of the process, and none of them can drift onto a neighbour’s.
+    const stateRowID = s3db.getServerID?.() ?? 1;
+
     return {
       // TBDatabase-compatible initDB() — returns { winStreakTeam, winStreakCount, ... isStale }
       initDB: async () => {
@@ -634,7 +741,7 @@ export default class TeamBalancer extends S3PluginBase {
           // down its catch, losing the win streak on every restart.
           return await s3db.withTransactionWithRetry(async (t) => {
             const [record] = await TeamBalancerStateModel.findOrCreate({
-              where: { id: 1 },
+              where: { id: stateRowID },
               defaults: {
                 winStreakTeam: null,
                 winStreakCount: 0,
@@ -701,7 +808,7 @@ export default class TeamBalancer extends S3PluginBase {
           // Upstream of the "Extreme ticket difference" scramble-trigger check further
           // down onRoundEnded() — see ROUND_END_DB_TIMEOUT_MS above.
           return await s3db.withTransactionWithRetry(async (t) => {
-            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
+            const record = await TeamBalancerStateModel.findByPk(stateRowID, { transaction: t });
             if (!record) return null;
             record.winStreakTeam = team;
             record.winStreakCount = count;
@@ -729,7 +836,7 @@ export default class TeamBalancer extends S3PluginBase {
           // Upstream of the dominant-win-streak scramble check instead — see
           // ROUND_END_DB_TIMEOUT_MS above.
           return await s3db.withTransactionWithRetry(async (t) => {
-            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
+            const record = await TeamBalancerStateModel.findByPk(stateRowID, { transaction: t });
             if (!record) return null;
             if (record.winStreakTeam === winnerID) {
               record.winStreakCount += 1;
@@ -758,7 +865,7 @@ export default class TeamBalancer extends S3PluginBase {
       saveScrambleTime: async (timestamp) => {
         try {
           return await s3db.withTransactionWithRetry(async (t) => {
-            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
+            const record = await TeamBalancerStateModel.findByPk(stateRowID, { transaction: t });
             if (!record) return null;
             record.lastScrambleTime = timestamp;
             await record.save({ transaction: t });
@@ -773,7 +880,7 @@ export default class TeamBalancer extends S3PluginBase {
       saveManuallyDisabledState: async (disabled) => {
         try {
           return await s3db.withTransactionWithRetry(async (t) => {
-            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
+            const record = await TeamBalancerStateModel.findByPk(stateRowID, { transaction: t });
             if (!record) return null;
             record.manuallyDisabled = disabled;
             await record.save({ transaction: t });
@@ -788,7 +895,7 @@ export default class TeamBalancer extends S3PluginBase {
       saveScrambleArm: async (armedBy) => {
         try {
           return await s3db.withTransactionWithRetry(async (t) => {
-            const record = await TeamBalancerStateModel.findByPk(1, { transaction: t });
+            const record = await TeamBalancerStateModel.findByPk(stateRowID, { transaction: t });
             if (!record) return null;
             record.scrambleOnRoundEndBy = armedBy || null;
             await record.save({ transaction: t });
@@ -805,6 +912,9 @@ export default class TeamBalancer extends S3PluginBase {
         try {
           return await s3db.withTransactionWithRetry(async (t) => {
             const record = await TBRoundReportModel.create({
+              // Not taken from `data`. The caller assembles a round report, not
+              // an identity, and this is the single insert into the table.
+              serverID: s3db?.getServerID?.() ?? null,
               matchId: data.matchId || null,
               roundStartTime: data.roundStartTime || null,
               ts: data.ts,
@@ -988,7 +1098,20 @@ export default class TeamBalancer extends S3PluginBase {
     // and a configured tcDominantThreshold / tcSingleRoundScrambleThreshold
     // does nothing at all — TC rounds keep being judged on the RAAS/AAS scale
     // with no complaint. Failing the mount is the loud version of that.
-    const required = '1.7.0';
+    //
+    // 1.8.0 — the multi-server surface. Every call site is optional-chained
+    // (routeDiscordCommand?.(), armConfirmation?.(), isMultiServer?.()), so
+    // an older S³ does NOT throw. It degrades instead, in the direction that
+    // looks fine: the routing gate never runs, so on a shared database every
+    // process answers every command and every server-mutating one acts
+    // without a selector, and a scramble confirmation arms with no token, so
+    // a confirm is taken by whichever process reads it first. The state row
+    // is worse than either: it is keyed on getServerID?.() ?? 1, so against
+    // an older S³ every server reads and writes id 1, which is two servers
+    // sharing one win streak and one scramble lockdown. Nothing logs an
+    // error at any point. Failing at mount is the only place this is
+    // visible.
+    const required = '1.8.0';
     const actual = this._s3?.version;
     if (!this._s3VersionAtLeast(required)) {
       throw new Error(
@@ -1020,7 +1143,16 @@ export default class TeamBalancer extends S3PluginBase {
     if (this.s3db?.isReady() && this.s3db.migrationEngine) {
       // Define models on S³ connector
       this.defineModel('TeamBalancerState', {
-        id: { type: this.s3db.getDataTypes().INTEGER, primaryKey: true, autoIncrement: false, defaultValue: 1 },
+        // `id` is the server id — see the scopeKind note below. No
+        // defaultValue: a create that fell back to one would write over
+        // server 1’s win streak, and on SQLite an id-less insert mints the
+        // rowid instead, which lands on whichever server that integer
+        // happens to name. NOT NULL makes Sequelize refuse both, on every
+        // engine, before the statement is built. The applied v1 migration
+        // still declares the old column default; it is only reachable by an
+        // insert this model now rejects, and rewriting a migration body that
+        // has already run on production is the worse trade.
+        id: { type: this.s3db.getDataTypes().INTEGER, primaryKey: true, autoIncrement: false, allowNull: false },
         winStreakTeam: { type: this.s3db.getDataTypes().INTEGER, allowNull: true },
         winStreakCount: { type: this.s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
         lastSyncTimestamp: { type: this.s3db.getDataTypes().BIGINT, allowNull: true },
@@ -1029,10 +1161,24 @@ export default class TeamBalancer extends S3PluginBase {
         consecutiveWinsCount: { type: this.s3db.getDataTypes().INTEGER, allowNull: false, defaultValue: 0 },
         manuallyDisabled: { type: this.s3db.getDataTypes().BOOLEAN, allowNull: false, defaultValue: false },
         scrambleOnRoundEndBy: { type: this.s3db.getDataTypes().JSON, allowNull: true }
-      }, { timestamps: false, tableName: 'TeamBalancerState', exportTier: 'ephemeral' });
+      }, {
+        timestamps: false,
+        tableName: 'TeamBalancerState',
+        exportTier: 'ephemeral',
+        // The primary key is the server id. A per-server singleton whose `id`
+        // carries the scope, so it needs no column and no DDL to become
+        // per-server — and so a scope test that looks for a serverID attribute
+        // would read it as community-wide and let one server's win streak
+        // overwrite another's.
+        scopeKind: 'server-key'
+      });
 
       this.defineModel('TB_RoundReport', {
         id: { type: this.s3db.getDataTypes().INTEGER, primaryKey: true, autoIncrement: true },
+        // Nullable through this phase. NOT NULL would reject the pre-upgrade
+        // rows the backfill leaves unattributed on purpose, and it would make
+        // an un-upgraded process’s INSERT fail outright.
+        serverID: { type: this.s3db.getDataTypes().INTEGER, allowNull: true },
         matchId: { type: this.s3db.getDataTypes().STRING(20), allowNull: true },
         roundStartTime: { type: this.s3db.getDataTypes().BIGINT, allowNull: true },
         ts: { type: this.s3db.getDataTypes().BIGINT, allowNull: false },
@@ -1053,10 +1199,16 @@ export default class TeamBalancer extends S3PluginBase {
         scrambled: { type: this.s3db.getDataTypes().BOOLEAN, allowNull: false, defaultValue: false },
         scrambleCondition: { type: this.s3db.getDataTypes().STRING(100), allowNull: true },
         scrambleType: { type: this.s3db.getDataTypes().STRING(100), allowNull: true }
-      }, { timestamps: false, tableName: 'TB_RoundReport', exportTier: 'historical' });
+      }, {
+        timestamps: false,
+        tableName: 'TB_RoundReport',
+        exportTier: 'historical',
+        // One row per round, and a round happens on one server.
+        scopeKind: 'server-column'
+      });
 
       // Register expected version + v1 + v2 migrations
-      this.registerExpectedVersion('team-balancer', 2, {
+      this.registerExpectedVersion('team-balancer', 3, {
         models: ['TeamBalancerState', 'TB_RoundReport']
       });
       this.registerMigrations('team-balancer', [
@@ -1090,6 +1242,10 @@ export default class TeamBalancer extends S3PluginBase {
             if (!(await qi.tableExists('TB_RoundReport'))) {
               await qi.createTable('TB_RoundReport', {
                 id: { type: qi.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+                // Present in v1 per this migration's own note above: the
+                // baseline carries every column the current code expects, and
+                // v3 guards with describeTable() so it no-ops here.
+                serverID: { type: qi.DataTypes.INTEGER, allowNull: true },
                 matchId: { type: qi.DataTypes.STRING(20), allowNull: true },
                 roundStartTime: { type: qi.DataTypes.BIGINT, allowNull: true },
                 ts: { type: qi.DataTypes.BIGINT, allowNull: false },
@@ -1145,11 +1301,55 @@ export default class TeamBalancer extends S3PluginBase {
               await qi.removeColumn('TeamBalancerState', 'scrambleOnRoundEndBy');
             }
           }
+        },
+        {
+          version: 3,
+          description: 'Add serverID to TB_RoundReport for multi-server scoping',
+          // No touches.data { notNull } on serverID. A data post-condition is
+          // re-checked on every mount forever, so it is only safe once every
+          // creating path is proven to stamp the column; until then one
+          // unstamped insert is a rollback-and-re-gate loop on a live server.
+          touches: {
+            columns: { TB_RoundReport: ['serverID'] }
+          },
+          up: async (qi) => {
+            if (!(await qi.tableExists('TB_RoundReport'))) return;
+            const cols = await qi.describeTable('TB_RoundReport');
+            if (!cols.serverID) {
+              await qi.addColumn('TB_RoundReport', 'serverID', {
+                type: qi.DataTypes.INTEGER,
+                allowNull: true
+              });
+            }
+            // Outside the guard and matched on IS NULL: a hand-migrated
+            // database arrives with the column present and every row NULL,
+            // and a guarded backfill is a silent no-op on exactly that one.
+            await this.s3db.backfillServerID(qi, 'TB_RoundReport', this.s3db?.getServerID?.() ?? null);
+          },
+          down: async (qi) => {
+            if (!(await qi.tableExists('TB_RoundReport'))) return;
+            const cols = await qi.describeTable('TB_RoundReport');
+            if (cols.serverID) await qi.removeColumn('TB_RoundReport', 'serverID');
+          }
         }
       ]);
 
       // Run pending migrations
       await this.verifyAndRunMigrations('team-balancer');
+
+      // Bare CREATE INDEX after the migration commits, never addIndex() —
+      // Sequelize emits ALTER TABLE ... ADD INDEX for that on MySQL and the
+      // live grant has no ALTER. Named for the table because Postgres scopes
+      // index names to the schema, so every Class A table wanting an
+      // idx_serverID would be one name nine times. Non-fatal and retried on
+      // the next mount: a missing index costs query time, not correctness.
+      try {
+        await this.s3db.ensureIndexes('TB_RoundReport', [
+          { name: 'TB_RoundReport_serverID', fields: ['serverID'] }
+        ]);
+      } catch (err) {
+        Logger.verbose('TeamBalancer', 1, `Could not ensure TB_RoundReport serverID index: ${err.message}`);
+      }
 
       // Build compatibility wrapper and load initial state
       this.db = this._buildS3DbWrapper(this.s3db);
@@ -1373,15 +1573,44 @@ export default class TeamBalancer extends S3PluginBase {
 
     Logger.verbose('TeamBalancer', 2, `[Discord] Received valid command: "${content.substring(0, 80)}" from ${message.author.tag} (${message.author.id}).`);
 
+    // ── Routing gate ──────────────────────────────────────────────
+    // Ahead of the permission check on purpose: a command aimed at another
+    // server should be dropped here rather than answered with this
+    // server's opinion of who the sender is, and a permission refusal
+    // that survived the gate would arrive once per process.
+    const surface = content.startsWith('!teambalancer') ? 'teambalancer' : 'scramble';
+    const rawArgs = content
+      .replace(/^!teambalancer\s*/i, '')
+      .replace(/^!scramble\s*/i, '')
+      .trim()
+      .split(/\s+/)
+      .filter((a) => a);
+    const { scope, selectorRequired } = scopeForTeamBalancerCommand(surface, rawArgs);
+    const verdict = (await this.routeDiscordCommand?.({
+      scope,
+      selectorRequired,
+      args: rawArgs,
+      messageID: message.id,
+      command: `!${surface} ${rawArgs[0] || ''}`.trim()
+    })) ?? { routing: 'act', args: rawArgs };
+
+    if (verdict.routing === 'drop') return;
+    if (verdict.routing === 'refuse') {
+      await message.channel.send({
+        embeds: [this.buildRoutingRefusalEmbed(verdict)]
+      });
+      return;
+    }
+
     if (!this.checkDiscordAdminPermission(message.member)) {
       await message.reply(this.localize('teamBalancer.errors.discordPermissionDenied'));
       return;
     }
 
-    if (content.startsWith('!teambalancer')) {
-      await this.handleDiscordTeamBalancerCommand(message);
-    } else if (content.startsWith('!scramble')) {
-      await this.handleDiscordScrambleCommand(message);
+    if (surface === 'teambalancer') {
+      await this.handleDiscordTeamBalancerCommand(message, verdict.args);
+    } else {
+      await this.handleDiscordScrambleCommand(message, verdict.args);
     }
   }
 
@@ -1390,8 +1619,14 @@ export default class TeamBalancer extends S3PluginBase {
     return this.options.discordAdminRoleIDs.some(roleID => member.roles.cache.has(roleID));
   }
 
-  async handleDiscordTeamBalancerCommand(message) {
-    const args = message.content.replace(/^!teambalancer\s*/i, '').trim().split(/\s+/);
+  /**
+   * @param {object} message
+   * @param {string[]|null} [routedArgs] - The argument list with the routing
+   *        selector already stripped. Null re-parses `message.content`, which
+   *        is what every caller outside the Discord gate does.
+   */
+  async handleDiscordTeamBalancerCommand(message, routedArgs = null) {
+    const args = routedArgs ?? message.content.replace(/^!teambalancer\s*/i, '').trim().split(/\s+/);
     const subcommand = args[0]?.toLowerCase();
 
     switch (subcommand) {
@@ -1461,8 +1696,94 @@ export default class TeamBalancer extends S3PluginBase {
     }
   }
 
-  async handleDiscordScrambleCommand(message) {
-    let args = message.content.replace(/^!scramble\s*/i, '').trim().toLowerCase().split(/\s+/).filter(a => a);
+  /**
+   * @param {object} message
+   * @param {string[]|null} [routedArgs] - The argument list with the routing
+   *        selector already stripped. It matters here rather than merely
+   *        tidying: VALID_SCRAMBLE_ARGS below refuses anything outside its
+   *        whitelist, so an unstripped `--server main` would not be ignored,
+   *        it would reject the whole command.
+   */
+  /**
+   * Take a pending scramble back out, by whichever route armed it.
+   *
+   * ─── WHY THERE ARE TWO ROUTES ───
+   *
+   * The in-game confirm arrives over this server's own RCON, so the
+   * process that armed it is by construction the only one that can be
+   * reading it. There is nothing for a token to disambiguate, and it stays
+   * the bare word it has always been on every install.
+   *
+   * A Discord confirm has no such guarantee once a second server is
+   * registered: the arm and the confirm are two independent claims, so the
+   * confirm can land on a process with nothing pending while the one that
+   * armed sits on a live window. The token is what makes the arming
+   * process the only acceptor, and it is required only there and only
+   * then.
+   *
+   * @param {string|null} token - The token typed after `confirm`, if any
+   * @param {boolean} fromDiscord - Whether this is the Discord surface
+   * @returns {{status: string, args?: string[]}} `ok`, `none`, `expired` or `unknown`
+   * @private
+   */
+  _takeScrambleConfirmation(token, fromDiscord) {
+    if (fromDiscord && this.isMultiServer?.()) {
+      // The store's own vocabulary is the caller's: nothing armed, armed
+      // and timed out, and a token that matches no entry are three
+      // different things to say back to an admin.
+      const taken = this.takeConfirmation('scramble', token);
+      if (taken.status !== 'ok') return { status: taken.status };
+      // The slot and the store are armed together, so taking one has to
+      // clear the other or an in-game `confirm` would replay a scramble
+      // that already ran.
+      this.scrambleConfirmation = null;
+      return { status: 'ok', args: taken.payload };
+    }
+
+    if (!this.scrambleConfirmation) return { status: 'none' };
+    const timeoutMs = (this.options.scrambleConfirmationTimeout || 60) * 1000;
+    if (Date.now() - this.scrambleConfirmation.timestamp > timeoutMs) {
+      this.scrambleConfirmation = null;
+      this.cancelConfirmations?.('scramble');
+      return { status: 'expired' };
+    }
+    const args = this.scrambleConfirmation.args;
+    this.scrambleConfirmation = null;
+    this.cancelConfirmations?.('scramble');
+    return { status: 'ok', args };
+  }
+
+  /**
+   * Arm a scramble on both routes, and return the lines that say so.
+   *
+   * The slot is what the in-game confirm reads and the store is what a
+   * Discord token confirms against; an arm from either surface writes
+   * both, which is what lets an admin arm in game and finish in Discord by
+   * carrying the token across. Empty lines on a single-server install, so
+   * both prompts read exactly as they did before.
+   *
+   * @param {string[]} args - The scramble arguments to replay on confirm
+   * @returns {{armed: boolean, lines: string[], refusal: string|null}}
+   * @private
+   */
+  _armScrambleConfirmation(args) {
+    const arm = this.armConfirmation?.({
+      kind: 'scramble',
+      payload: args,
+      command: '!scramble confirm',
+      ttlMs: (this.options.scrambleConfirmationTimeout || 60) * 1000
+    }) ?? { armed: true, lines: [], refusal: null };
+
+    if (!arm.armed) return { armed: false, lines: [], refusal: arm.refusal };
+
+    this.scrambleConfirmation = { timestamp: Date.now(), args };
+    return { armed: true, lines: arm.lines, refusal: null };
+  }
+
+  async handleDiscordScrambleCommand(message, routedArgs = null) {
+    let args = (routedArgs ?? message.content.replace(/^!scramble\s*/i, '').trim().split(/\s+/))
+      .map((a) => String(a).toLowerCase())
+      .filter(a => a);
 
     // ─── Unknown arg guard ──────────────────────────────────────────────
     // Reject any argument that isn't in the whitelist BEFORE touching
@@ -1470,6 +1791,16 @@ export default class TeamBalancer extends S3PluginBase {
     // otherwise fall through to the bare-scramble path, overwriting a
     // pending confirmation and triggering a live broadcast.
     const VALID_SCRAMBLE_ARGS = ['now', 'dry', 'matchend', 'cancel', 'confirm', 'elo'];
+
+    // A confirm token is not a verb, so it comes out before the whitelist
+    // sees it. That guard exists to stop a typo falling through to the
+    // bare-scramble path, and four hex characters look exactly like one.
+    let confirmToken = null;
+    if (args.includes('confirm')) {
+      const at = args.findIndex((a) => a !== 'confirm' && /^[0-9a-f]{4}$/.test(a));
+      if (at !== -1) [confirmToken] = args.splice(at, 1);
+    }
+
     const badArg = args.find(a => !VALID_SCRAMBLE_ARGS.includes(a));
     if (badArg) {
       await message.reply(this.localize('teamBalancer.discord.scramble.unknownArg', { badArg }));
@@ -1479,18 +1810,27 @@ export default class TeamBalancer extends S3PluginBase {
     const isConfirm = args.includes('confirm');
 
     if (isConfirm) {
-      if (!this.scrambleConfirmation) {
+      const taken = this._takeScrambleConfirmation(confirmToken, true);
+
+      // A token confirm was inspected by every process, because the token is
+      // the routing and a claim would have handed it to one that never
+      // minted it. Which leaves the case where nobody minted it: the claim
+      // inside picks the single process that says so.
+      if (confirmToken && !(await this.claimConfirmReply(message.id, taken.status === 'ok'))) return;
+
+      if (taken.status === 'none') {
         await message.reply(this.localize('teamBalancer.discord.scramble.noPendingConfirmation'));
         return;
       }
-      const timeoutMs = (this.options.scrambleConfirmationTimeout || 60) * 1000;
-      if (Date.now() - this.scrambleConfirmation.timestamp > timeoutMs) {
-        this.scrambleConfirmation = null;
+      if (taken.status === 'expired') {
         await message.reply(this.localize('teamBalancer.discord.scramble.confirmationExpired'));
         return;
       }
-      args = this.scrambleConfirmation.args;
-      this.scrambleConfirmation = null;
+      if (taken.status !== 'ok') {
+        await message.reply(this.localize('s3Confirm.unknownToken'));
+        return;
+      }
+      args = taken.args;
     }
 
     const hasNow = args.includes('now');
@@ -1520,6 +1860,7 @@ export default class TeamBalancer extends S3PluginBase {
 
     if (isCancel) {
       this.scrambleConfirmation = null;
+      this.cancelConfirmations?.('scramble');
       const cancelled = await this.cancelPendingScramble(null, null, false);
       if (cancelled) await message.reply(this.localize('teamBalancer.discord.scramble.cancelSuccess'));
       else if (this._scrambleInProgress) await message.reply(this.localize('teamBalancer.discord.scramble.cannotCancelExecuting'));
@@ -1532,13 +1873,18 @@ export default class TeamBalancer extends S3PluginBase {
       }
 
       if (this.options.requireScrambleConfirmation && !hasDry && !isConfirm) {
-        this.scrambleConfirmation = { timestamp: Date.now(), args: args };
+        const arm = this._armScrambleConfirmation(args);
+        if (!arm.armed) {
+          await message.reply(arm.refusal);
+          return;
+        }
         const scrambleKind = hasElo ? 'micro' : 'full';
         const timing = hasNow
           ? this.localize('teamBalancer.discord.scramble.timingImmediate')
           : this.localize('teamBalancer.discord.scramble.timingCountdown', { delay: this.options.scrambleAnnouncementDelay });
         const timeoutSec = this.options.scrambleConfirmationTimeout || 60;
-        await message.reply(this.localize('teamBalancer.discord.scramble.confirmPrompt', { scrambleKind, timing, timeoutSec }));
+        const prompt = this.localize('teamBalancer.discord.scramble.confirmPrompt', { scrambleKind, timing, timeoutSec });
+        await message.reply(arm.lines.length ? `${prompt}\n${arm.lines.join('\n')}` : prompt);
         return;
       }
 
@@ -1954,7 +2300,7 @@ export default class TeamBalancer extends S3PluginBase {
       // getGamemode(): SquadJS spells the mode "Territory Control", and that
       // is what getGamemode() returns and what lands on the round row. The key
       // accessor is the one that normalises it to 'TC'. It is guaranteed
-      // present — _checkS3Version() refuses to mount below S³ 1.7.0 precisely
+      // present — _checkS3Version() refuses to mount below S³ 1.8.0 precisely
       // so this branch cannot silently never match.
       const isInvasion = gameMode.includes('invasion');
       const isTC = gameModeKey === 'TC';

@@ -74,24 +74,39 @@ function createS3dbShim(sequelize) {
     isReady() {
       return true;
     },
+    // The shim answers this because the round writers ask it. Without it,
+    // `this._s3db?.getServerID?.() ?? null` short-circuits to null and every
+    // serverID case below would pass against a writer that stamps nothing —
+    // the optional call is there for a DBService too old to have the method,
+    // not as licence for a test double to skip it.
+    getServerID() {
+      return 7;
+    },
     getDataTypes() {
       return Sequelize.DataTypes;
     },
     async withTransaction(fn) {
       return await sequelize.transaction(fn);
     },
-    async withTransactionWithRetry(fn, maxRetries = 3) {
+    // Signature matches the real one: an OPTIONS OBJECT, not a retry count.
+    // It used to take `maxRetries`, which meant every production caller that
+    // passes `{ totalTimeoutMs }` — both round writers and the bulk stats
+    // path — evaluated `0 < {}` as false, ran no attempts at all, and threw an
+    // undefined error the caller then read `.message` off. The suite never
+    // noticed because nothing called those three methods.
+    async withTransactionWithRetry(fn, options = {}) {
+      const attempts = Number.isFinite(options?.attempts) ? options.attempts : 3;
       let lastError;
-      for (let attempt = 0; attempt < maxRetries; attempt++) {
+      for (let attempt = 0; attempt < attempts; attempt++) {
         try {
           return await sequelize.transaction(fn);
         } catch (err) {
           lastError = err;
-          const message = String(err?.message || '');
-          if (
-            message.includes('SQLITE_BUSY') ||
-            message.includes('database is locked')
-          ) {
+          // Delegated to the real static rather than re-listed here. The
+          // production classifier learned InnoDB deadlock when the first
+          // SELECT ... FOR UPDATE landed, and a shim carrying its own copy of
+          // the list would keep testing the old rule after the rule changed.
+          if (DBService.isLockError(err)) {
             // Wait 100ms before retry
             await new Promise(r => setTimeout(r, 100));
             continue;
@@ -105,13 +120,14 @@ function createS3dbShim(sequelize) {
 }
 
 /**
- * Define the 4 Elo models on a Sequelize instance, matching the
+ * Define the 3 Elo models on a Sequelize instance, matching the
  * schema from elo-tracker.js _onS3Ready().
+ *
+ * Three, not four: Elo_PluginState is no longer defined by the plugin. This
+ * fixture exists to stand in for what the plugin registers, so a model here
+ * that the plugin does not define would be testing a schema nothing runs.
  */
 function defineEloModels(sequelize) {
-  sequelize.define('Elo_PluginState', {
-    id: { type: Sequelize.DataTypes.INTEGER, primaryKey: true, autoIncrement: false, defaultValue: 1 }
-  }, { timestamps: false, tableName: 'Elo_PluginStates', freezeTableName: true });
 
   sequelize.define('Elo_PlayerStats', {
     eosID: { type: Sequelize.DataTypes.STRING, primaryKey: true, allowNull: false },
@@ -128,6 +144,7 @@ function defineEloModels(sequelize) {
 
   sequelize.define('Elo_RoundHistory', {
     id: { type: Sequelize.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    serverID: { type: Sequelize.DataTypes.INTEGER, allowNull: true },
     matchId: { type: Sequelize.DataTypes.STRING(20), allowNull: true },
     layerName: { type: Sequelize.DataTypes.STRING, allowNull: true },
     winningTeamID: { type: Sequelize.DataTypes.INTEGER, allowNull: true },
@@ -139,6 +156,7 @@ function defineEloModels(sequelize) {
 
   sequelize.define('Elo_RoundPlayers', {
     id: { type: Sequelize.DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    serverID: { type: Sequelize.DataTypes.INTEGER, allowNull: true },
     matchId: { type: Sequelize.DataTypes.STRING(20), allowNull: true },
     roundStartTime: { type: Sequelize.DataTypes.BIGINT, allowNull: true },
     roundHistoryId: { type: Sequelize.DataTypes.INTEGER, allowNull: false },
@@ -196,13 +214,14 @@ async function runSuiteBody(step, db, s3dbShim) {
     const rh = s3dbShim.getModel('Elo_RoundHistory');
     if (!rh) throw new Error('Elo_RoundHistory model missing');
 
-    const pst = s3dbShim.getModel('Elo_PluginState');
-    if (!pst) throw new Error('Elo_PluginState model missing');
-
-    // Verify PluginState row exists (id=1)
-    const state = await pst.findOne({ where: { id: 1 } });
-    if (!state) throw new Error('PluginState not initialized');
-    if (state.id !== 1) throw new Error('PluginState should have id=1');
+    // initDB() used to seed a singleton row into Elo_PluginStates on every
+    // call and this asserted it landed. Both are gone. What is asserted
+    // instead is the absence: initDB must not require a model the plugin no
+    // longer defines, which is what would happen if the name came back into
+    // elo-database.js's modelNames without the definition coming with it.
+    if (s3dbShim.getModel('Elo_PluginState')) {
+      throw new Error('Elo_PluginState is defined again — the fixture and the plugin have diverged');
+    }
   });
 
   // ────────────────────────────────────────────────────────────────
@@ -550,6 +569,128 @@ async function runSuiteBody(step, db, s3dbShim) {
 
     const model = s3dbShim.getModel('Elo_PlayerStats');
     await model.destroy({ where: { eosID: roster.map(p => p.eosID) } });
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // Test 8: the round writers stamp serverID.
+  //
+  // Both take an opaque object from a caller that is assembling a round
+  // result, and both are the only insert into their table. The stamp is
+  // therefore applied here rather than by the caller, and this pins that:
+  // the caller passes no serverID at all, and the row still comes back
+  // carrying the one the connector reports.
+  //
+  // The negative half matters more than the positive one. A caller that
+  // does supply a serverID must not win — which server a process is running
+  // on is not a property of the round it just finished, and a round report
+  // that could carry the wrong one would put unattributable rows into every
+  // per-server query built on top of it.
+  // ────────────────────────────────────────────────────────────────
+  await step('Round writers stamp serverID, and the caller cannot override it', async () => {
+    const written = await db.insertRoundHistory({
+      matchId: '7-abcdefgh', layerName: 'Yehorivka_RAAS_v1', winningTeamID: 1,
+      ticketDiff: 120, roundDuration: 2400, endedAt: Date.now(), playerCount: 78
+    });
+    if (!written) throw new Error('insertRoundHistory returned nothing');
+    if (written.serverID !== 7) {
+      throw new Error(`Round history was not stamped: serverID=${written.serverID}, expected 7`);
+    }
+
+    // A caller that thinks it knows better is overruled.
+    const overridden = await db.insertRoundHistory({
+      matchId: '7-ijklmnop', serverID: 99, layerName: 'Gorodok_AAS_v1', winningTeamID: 2,
+      ticketDiff: 40, roundDuration: 1800, endedAt: Date.now(), playerCount: 64
+    });
+    if (overridden.serverID !== 7) {
+      throw new Error(`A caller-supplied serverID won: got ${overridden.serverID}, expected 7`);
+    }
+
+    await db.insertRoundPlayers(written.id, written.endedAt, [{
+      matchId: '7-abcdefgh', roundStartTime: written.endedAt - 2400000, roundHistoryId: written.id,
+      eosID: 'eos_stamp_a', teamID: 1, participationRatio: 1,
+      muBefore: 25, sigmaBefore: 8.33, rawDeltaMu: 1, rawDeltaSigma: -0.1,
+      scaledDeltaMu: 1, scaledDeltaSigma: -0.1, muAfter: 26, sigmaAfter: 8.23
+    }, {
+      matchId: '7-abcdefgh', roundStartTime: written.endedAt - 2400000, roundHistoryId: written.id,
+      eosID: 'eos_stamp_b', serverID: 99, teamID: 2, participationRatio: 1,
+      muBefore: 25, sigmaBefore: 8.33, rawDeltaMu: -1, rawDeltaSigma: -0.1,
+      scaledDeltaMu: -1, scaledDeltaSigma: -0.1, muAfter: 24, sigmaAfter: 8.23
+    }]);
+
+    const players = await s3dbShim.getModel('Elo_RoundPlayers').findAll({
+      where: { roundHistoryId: written.id },
+      order: [['eosID', 'ASC']]
+    });
+    if (players.length !== 2) throw new Error(`Expected 2 round players, got ${players.length}`);
+    for (const row of players) {
+      if (row.serverID !== 7) {
+        throw new Error(`Round player ${row.eosID} carries serverID=${row.serverID}, expected 7`);
+      }
+    }
+
+    await s3dbShim.getModel('Elo_RoundPlayers').destroy({ where: { roundHistoryId: written.id } });
+    await s3dbShim.getModel('Elo_RoundHistory').destroy({ where: { id: [written.id, overridden.id] } });
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // Test 9: the locked read on the shared rating table.
+  //
+  // Two things are asserted, and only one of them is about locking.
+  //
+  // The first is that the clause does not break the engine that has no row
+  // locks. SQLite is the dialect most installs run, and Sequelize omits FOR
+  // UPDATE there rather than rejecting it; if that ever stopped being true,
+  // every round-end write on every SQLite install would start throwing, and
+  // this case is the thing that would say so.
+  //
+  // The second is that the read is ordered. Deterministic acquisition order
+  // is the entire defence against two servers deadlocking on overlapping
+  // rosters, and it is invisible in the result — the method returns nothing
+  // and the rows come back in whatever order the caller asked for. So the
+  // SQL itself is inspected. That is unusual here and deliberate: an
+  // assertion on the outcome could not distinguish an ordered locked read
+  // from an unordered one, which is exactly the mutation that matters.
+  // ────────────────────────────────────────────────────────────────
+  await step('bulkIncrementPlayerStats locks its read, in a fixed order, on every dialect', async () => {
+    const roster = ['eos_lock_c', 'eos_lock_a', 'eos_lock_b'];
+    for (const eosID of roster) {
+      await db.upsertPlayerStats(eosID, { eosID, name: eosID, mu: 25, sigma: 8.33, roundsPlayed: 1, wins: 0, losses: 0 });
+    }
+
+    const seen = [];
+    const previous = s3dbShim.getModel('Elo_PlayerStats').sequelize.options.logging;
+    s3dbShim.getModel('Elo_PlayerStats').sequelize.options.logging = (sql) => seen.push(sql);
+    try {
+      await db.bulkIncrementPlayerStats(roster.map((eosID) => ({
+        eosID, name: eosID, mu: 26, sigma: 8.2, wins: 1, losses: 0, roundsPlayed: 1, lastSeen: Date.now()
+      })));
+    } finally {
+      s3dbShim.getModel('Elo_PlayerStats').sequelize.options.logging = previous;
+    }
+
+    // The counters still moved. A lock that broke the write would show up
+    // here first, whatever the SQL said.
+    const after = await s3dbShim.getModel('Elo_PlayerStats').findOne({ where: { eosID: 'eos_lock_a' } });
+    if (after.roundsPlayed !== 2) {
+      throw new Error(`Expected roundsPlayed to increment to 2, got ${after.roundsPlayed}`);
+    }
+
+    const read = seen.find((sql) => /SELECT/i.test(sql) && /Elo_PlayerStats/.test(sql) && /IN \(/i.test(sql));
+    if (!read) throw new Error('Never saw the multi-row read this test is about');
+    if (!/ORDER BY[^;]*eosID/i.test(read)) {
+      throw new Error(`The locked read is unordered, so two servers can acquire in opposite order: ${read}`);
+    }
+
+    const dialect = s3dbShim.getDialect();
+    const hasForUpdate = /FOR UPDATE/i.test(read);
+    if (dialect === 'sqlite' && hasForUpdate) {
+      throw new Error('SQLite rendered FOR UPDATE, which it cannot execute');
+    }
+    if (dialect !== 'sqlite' && !hasForUpdate) {
+      throw new Error(`${dialect} did not take the row lock: ${read}`);
+    }
+
+    await s3dbShim.getModel('Elo_PlayerStats').destroy({ where: { eosID: roster } });
   });
 }
 

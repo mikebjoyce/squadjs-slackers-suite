@@ -12,6 +12,18 @@
  * TB_RoundReport (TeamBalancer's per-round outcome log, read cross-plugin
  * via the shared DBService model registry). No new schema.
  *
+ * ─── EVERY QUERY HERE ANSWERS FOR ONE SERVER ───────────────
+ *
+ * All three tables are `server-column` scoped, and on a shared database the
+ * neighbour’s rows sit beside this server’s in every one of them. Each query
+ * therefore goes through scoped(), which adds the serverID predicate — not
+ * as a style rule but because the failure is silent: an unscoped report
+ * returns a plausible number built from two servers’ rounds, and nothing in
+ * the embed would say so.
+ *
+ * That makes these functions single-server by construction. A community-wide
+ * view is assembled by asking each server, not by widening a query here.
+ *
  * ─── WHY AGGREGATION HAPPENS IN JS, NOT SQL ──────────────────────
  *
  * Every query here is a plain `findAll({ where })` against an
@@ -157,7 +169,7 @@ async function getIgnoredMatchIds(s3db, fromTs, toTs, ignoredGameModes) {
   if (needles.length === 0) return new Set();
 
   const rounds = await roundModel.findAll({
-    where: { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
+    where: scoped(s3db, { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } }),
     attributes: ['matchId', 'gameMode', 'layerName']
   });
 
@@ -167,6 +179,37 @@ async function getIgnoredMatchIds(s3db, fromTs, toTs, ignoredGameModes) {
     if (row.matchId && isIgnoredRound(row, needles)) ignored.add(row.matchId);
   }
   return ignored;
+}
+
+/**
+ * Narrow a `where` clause to this server’s rows.
+ *
+ * All three tables this module reads are `server-column` scoped, so every
+ * query here needs the predicate and a missed one fails silently — it counts
+ * the neighbour’s rounds as this server’s rather than throwing. A report is
+ * the worst place for that: the number looks plausible and nothing in the
+ * embed says where it came from.
+ *
+ * Applied to the `matchId`-keyed queries too, where it is redundant on paper
+ * because a matchId minted since multi-server support carries its server. It
+ * is not redundant in a database with history: a matchId minted before that
+ * is a bare base-36 timestamp with no server in it, so two servers that
+ * started a round in the same second share one, and the join would cross.
+ *
+ * A literal `where` — what `caseInsensitiveLikeLiteral()` returns — goes in
+ * as `{ [Op.and]: literal }` so it stays a plain object here.
+ *
+ * @param {object} s3db - DBService handle, as every export takes.
+ * @param {object} where - Plain Sequelize where clause.
+ * @returns {object}
+ */
+function scoped(s3db, where) {
+  const serverID = s3db?.getServerID?.() ?? null;
+  // Defensive only: DBService falls back to a default id, so this never
+  // fires on a mounted service. Without an id there is nothing to compare
+  // against, and an unfiltered report beats an empty one.
+  if (serverID === null) return where;
+  return { serverID, ...where };
 }
 
 function bucketSource(source) {
@@ -257,13 +300,13 @@ export async function checkLoggingAvailability(s3db, fromTs, toTs) {
   }
 
   const anyEventCount = await eventsModel.count({
-    where: { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } }
+    where: scoped(s3db, { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } })
   });
 
   const roundReportModel = s3db.getModel('TB_RoundReport');
   const hasRoundOutcomeData = !!roundReportModel;
   const anyRoundCount = hasRoundOutcomeData
-    ? await roundReportModel.count({ where: { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } } })
+    ? await roundReportModel.count({ where: scoped(s3db, { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } }) })
     : 0;
 
   return {
@@ -298,7 +341,7 @@ export async function resolvePlayers(s3db, identifier) {
 
   // Tier 0 — exact ID. Unambiguous by construction, so nothing to disambiguate.
   const byId = await model.findOne({
-    where: { [Op.or]: [{ eosID: id }, { steamID: id }] },
+    where: scoped(s3db, { [Op.or]: [{ eosID: id }, { steamID: id }] }),
     order: [['ts', 'DESC']]
   });
   if (byId) {
@@ -312,7 +355,7 @@ export async function resolvePlayers(s3db, identifier) {
   // Tier 1 (exact half) — exact trimmed name. Squad stores most names with a
   // leading space, so TRIM is load-bearing here, same reasoning as EloDatabase.
   const exactNameRows = await model.findAll({
-    where: s3db.caseInsensitiveLikeLiteral('name', id, { exact: true, trimColumn: true }),
+    where: scoped(s3db, { [Op.and]: s3db.caseInsensitiveLikeLiteral('name', id, { exact: true, trimColumn: true }) }),
     order: [['ts', 'DESC']],
     limit: LOOKUP_LIMIT
   });
@@ -327,7 +370,7 @@ export async function resolvePlayers(s3db, identifier) {
   // Fuzzy substring pass, scored in JS below — can still land tier 1 for a
   // player not caught above (e.g. tag-stripped variants), tier 2/3 otherwise.
   const fuzzyRows = await model.findAll({
-    where: s3db.caseInsensitiveLikeLiteral('name', id),
+    where: scoped(s3db, { [Op.and]: s3db.caseInsensitiveLikeLiteral('name', id) }),
     order: [['ts', 'DESC']],
     limit: LOOKUP_LIMIT
   });
@@ -381,7 +424,7 @@ export async function getGamesPlayedMap(s3db, fromTs, toTs, ignoredGameModes = D
 
   const needles = (ignoredGameModes || []).map((m) => String(m).toLowerCase()).filter(Boolean);
   const rounds = await roundModel.findAll({
-    where: { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
+    where: scoped(s3db, { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } }),
     attributes: ['matchId', 'gameMode', 'layerName']
   });
   const matchIds = [...new Set(
@@ -393,7 +436,7 @@ export async function getGamesPlayedMap(s3db, fromTs, toTs, ignoredGameModes = D
   if (matchIds.length === 0) return { perPlayer, roundsInRange: 0 };
 
   const snapshots = await snapshotModel.findAll({
-    where: { matchId: { [Op.in]: matchIds } },
+    where: scoped(s3db, { matchId: { [Op.in]: matchIds } }),
     attributes: ['matchId', 'trigger', 'playersJson']
   });
 
@@ -442,7 +485,7 @@ export async function getSwitchesMap(s3db, fromTs, toTs, ignoredGameModes = DEFA
   const ignoredMatchIds = await getIgnoredMatchIds(s3db, fromTs, toTs, ignoredGameModes);
 
   const rows = await model.findAll({
-    where: { eventType: 'TEAM_CHANGE', ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
+    where: scoped(s3db, { eventType: 'TEAM_CHANGE', ts: { [Op.gte]: fromTs, [Op.lte]: toTs } }),
     attributes: ['eosID', 'name', 'source', 'matchId']
   });
 
@@ -475,7 +518,7 @@ export async function getPlayerSwitches(s3db, eosID, fromTs, toTs, ignoredGameMo
   const ignoredMatchIds = await getIgnoredMatchIds(s3db, fromTs, toTs, ignoredGameModes);
 
   const rows = (await model.findAll({
-    where: { eventType: 'TEAM_CHANGE', eosID, ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
+    where: scoped(s3db, { eventType: 'TEAM_CHANGE', eosID, ts: { [Op.gte]: fromTs, [Op.lte]: toTs } }),
     attributes: ['name', 'source', 'matchId']
   })).map(toPlainRow).filter((row) => !(row.matchId && ignoredMatchIds.has(row.matchId)));
   if (rows.length === 0) return empty;
@@ -529,12 +572,12 @@ export async function getKarmaReport(s3db, eosID, fromTs, toTs, ignoredGameModes
   const ignoredMatchIds = await getIgnoredMatchIds(s3db, fromTs, toTs, ignoredGameModes);
 
   const switchRows = (await eventsModel.findAll({
-    where: {
+    where: scoped(s3db, {
       eventType: 'TEAM_CHANGE',
       eosID,
       ts: { [Op.gte]: fromTs, [Op.lte]: toTs },
       source: { [Op.notIn]: KARMA_EXCLUDED_SOURCES }
-    },
+    }),
     attributes: ['matchId', 'newTeamID', 'source']
   })).map(toPlainRow).filter((row) => !(row.matchId && ignoredMatchIds.has(row.matchId)));
 
@@ -544,7 +587,7 @@ export async function getKarmaReport(s3db, eosID, fromTs, toTs, ignoredGameModes
 
   const matchIds = [...new Set(switchRows.map((row) => row.matchId).filter(Boolean))];
   const rounds = await roundModel.findAll({
-    where: { matchId: { [Op.in]: matchIds } },
+    where: scoped(s3db, { matchId: { [Op.in]: matchIds } }),
     attributes: ['matchId', 'winningTeamID']
   });
   const winnerByMatch = new Map(rounds.map((r) => {
@@ -656,7 +699,7 @@ export async function getSwitchesByPeriodAndPlayer(s3db, fromTs, toTs, periodKey
   const periodIndexByMatch = new Map();
   if (roundModel) {
     const roundRows = await roundModel.findAll({
-      where: { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
+      where: scoped(s3db, { ts: { [Op.gte]: fromTs, [Op.lte]: toTs } }),
       attributes: ['matchId', 'ts', 'gameMode', 'layerName']
     });
     for (const r of roundRows) {
@@ -674,7 +717,7 @@ export async function getSwitchesByPeriodAndPlayer(s3db, fromTs, toTs, periodKey
   const snapshotModel = roundModel ? s3db.getModel('S3PlayerSnapshots') : null;
   if (snapshotModel && periodIndexByMatch.size > 0) {
     const snapshots = await snapshotModel.findAll({
-      where: { matchId: { [Op.in]: [...periodIndexByMatch.keys()] } },
+      where: scoped(s3db, { matchId: { [Op.in]: [...periodIndexByMatch.keys()] } }),
       attributes: ['matchId', 'trigger', 'playersJson']
     });
     const canonicalByMatch = new Map();
@@ -704,7 +747,7 @@ export async function getSwitchesByPeriodAndPlayer(s3db, fromTs, toTs, periodKey
   }
 
   const switchRows = await eventsModel.findAll({
-    where: { eventType: 'TEAM_CHANGE', ts: { [Op.gte]: fromTs, [Op.lte]: toTs } },
+    where: scoped(s3db, { eventType: 'TEAM_CHANGE', ts: { [Op.gte]: fromTs, [Op.lte]: toTs } }),
     attributes: ['ts', 'eosID', 'name', 'source', 'matchId']
   });
   for (const r of switchRows) {

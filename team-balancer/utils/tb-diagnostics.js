@@ -80,11 +80,17 @@ export class TBDiagnostics {
         throw new Error(this.tb.localize('teamBalancer.diagnostics.noTbModels'));
       }
 
-      // Spot-check: query TeamBalancerState to confirm read works
+      // Spot-check: query TeamBalancerState to confirm read works.
+      //
+      // Scoped to this server's row even though the result is discarded.
+      // The table is keyed by server id — one row per server — so a bare
+      // count() answers "how many servers exist", which is a different
+      // question and one this diagnostic is not asking. The value is
+      // unused either way: reaching the database at all is the check.
       const stateModel = s3db.models['TeamBalancerState'];
       if (stateModel) {
-        const count = await s3db.withTransactionWithRetry(async () => {
-          return await stateModel.count();
+        await s3db.withTransactionWithRetry(async () => {
+          return await stateModel.count({ where: { id: s3db.getServerID?.() ?? 1 } });
         });
       }
 

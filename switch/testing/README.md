@@ -27,12 +27,16 @@ switch/testing/
 ├── test-seed-bonus.js         # Stage 2 seed bonus grants (§4.1–4.4)
 ├── test-token-queue-integration.js  # Token spend at queue resolution (§3.3)
 ├── test-dialect-literals.js   # Mock/production agreement on SQL literals
+├── test-community-token-cap.js  # Two token caps, one community bucket (real instance)
 ├── test-scramble-lockdown.js  # onScrambleExecuted's real write path (real DB)
+├── test-post-switch-lockout.js  # Real post-switch lockout gate (real instance, no DB)
 ├── test-admin-mutations.js    # Admin wipe/clear/regen write paths (real DB)
-└── test-seed-token-lifecycle.js  # Four historical seed-bonus failures (real DB)
+├── test-seed-token-lifecycle.js  # Four historical seed-bonus failures (real DB)
+├── test-round-stats.js        # Round-stats schema, embed row, backfill dedupe (real DB)
+└── test-legacy-cooldown-display.js  # `!switch check` cooldown display (real DB)
 ```
 
-Most of these are **pure-logic unit tests**: no Docker, no live SquadJS server, no RCON, no Discord connection required, run with plain `node` and Node's built-in `assert` module. Three files are the exception — `test-scramble-lockdown.js`, `test-admin-mutations.js`, and `test-seed-token-lifecycle.js` build a throwaway flattened assembly (mirroring what `install.cjs` produces) and construct a real `Switch` instance against a real SQLite DB, with `test-admin-mutations.js` and `test-seed-token-lifecycle.js` also running their MySQL cases when the shared Docker test-MySQL container (`s3-test-mysql`, 127.0.0.1:3307) is reachable. Those exist because the mock harness models the database in JavaScript, which cannot reject a write for want of a DROP/ALTER grant and does not implement SQL three-valued logic — see [S3_DEVELOPER_GUIDE.md §11.4](../../s3/S3_DEVELOPER_GUIDE.md#114--testing-raw-sql-mocks-are-not-enough) for why that gap matters and how the skip-vs-pass counters are kept honest. When MySQL is unreachable those cases report as SKIPPED, not passed — read the skip count.
+Most of these are **pure-logic unit tests**: no Docker, no live SquadJS server, no RCON, no Discord connection required, run with plain `node` and Node's built-in `assert` module. Seven files are the exception — `test-community-token-cap.js`, `test-scramble-lockdown.js`, `test-post-switch-lockout.js`, `test-admin-mutations.js`, `test-seed-token-lifecycle.js`, `test-round-stats.js`, and `test-legacy-cooldown-display.js` build a throwaway flattened assembly (mirroring what `install.cjs` produces) and construct a real `Switch` instance, all but `test-post-switch-lockout.js` against a real SQLite DB, with `test-admin-mutations.js`, `test-seed-token-lifecycle.js`, `test-round-stats.js`, and `test-legacy-cooldown-display.js` also running their MySQL cases when the shared Docker test-MySQL container (`s3-test-mysql`, 127.0.0.1:3307) is reachable. Those exist because the mock harness models the database in JavaScript, which cannot reject a write for want of a DROP/ALTER grant and does not implement SQL three-valued logic — see [S3_DEVELOPER_GUIDE.md §11.4](../../s3/S3_DEVELOPER_GUIDE.md#114--testing-raw-sql-mocks-are-not-enough) for why that gap matters and how the skip-vs-pass counters are kept honest. When MySQL is unreachable those cases report as SKIPPED, not passed — read the skip count.
 
 > **The mock cannot model a database.** These tests validate WHERE clauses and
 > field updates against a hand-written mock, which by construction knows nothing
@@ -118,8 +122,9 @@ For seed bonus tests (which test the atomic UPDATE WHERE patterns), the test hel
 | Scramble lockdown (real DB) | 11 | `onScrambleExecuted` write path: `lastActiveTimestamp` on new/existing rows, queued-player exemption, EloDiff scrambles write no rows and still clear the queue / arm remediation |
 | Admin mutations (real DB, SQLite+MySQL) | 45 | `adminWipeAll`/`clearall` as real DML including a MySQL user with no DROP grant, admin failures propagating instead of being swallowed by `_withDb()`, seed-token confiscation, NULL-vs-`< cap` three-valued logic, regen write-back |
 | Seed token lifecycle (real DB, SQLite+MySQL) | 24 | The four historical seed-bonus failure modes: no grant at threshold, per-round counter not resetting (vs. the wallet-ceiling case it must not be confused with), duplicate warning spam, and players never draining from the DB after leaving |
+| Legacy cooldown display (real DB, SQLite+MySQL) | 16 | The admin `!switch check` reply, driven through the real `onChatMessage`: at `maxSwitchTokens <= 1` the Yes/No state comes from the token bucket, agrees with what `_checkSwitchEligibility()` actually enforces, and is neither faked nor masked by the abandoned `lastSwitchTimestamp` column; token-mode wording unchanged |
 
-**Total: 178 tests** (`node switch/testing/run-all-tests.js`'s own aggregate — rerun it rather than trusting this number as time passes). Requires `sequelize` on the module path (for `test-dialect-literals.js` and the three real-DB suites); the real-DB suites also need `s3-test-mysql` (127.0.0.1:3307) reachable for their MySQL cases, which otherwise report as skipped rather than passed. Everything else is Node.js stdlib.
+**Total: 296 tests** (`node switch/testing/run-all-tests.js`'s own aggregate — rerun it rather than trusting this number as time passes). Requires `sequelize` on the module path (for `test-dialect-literals.js` and the real-instance suites); the real-DB suites also need `s3-test-mysql` (127.0.0.1:3307) reachable for their MySQL cases, which otherwise report as skipped rather than passed. Everything else is Node.js stdlib.
 
 ## Running Tests
 
@@ -135,10 +140,13 @@ node switch/testing/test-admin-clear.js
 node switch/testing/test-seed-bonus.js
 node switch/testing/test-token-queue-integration.js
 node switch/testing/test-dialect-literals.js
+node switch/testing/test-community-token-cap.js
 node switch/testing/test-scramble-lockdown.js
+node switch/testing/test-post-switch-lockout.js
 node switch/testing/test-admin-mutations.js
 node switch/testing/test-seed-token-lifecycle.js
 node switch/testing/test-round-stats.js
+node switch/testing/test-legacy-cooldown-display.js
 ```
 
 ### Run one suite at a time

@@ -27,8 +27,12 @@
  *
  */
 
+import { DataTypes } from 'sequelize';
+
 import { buildAssembly, importFromAssembly, cleanAssembly } from '../../s3/testing/plugin-assembly.js';
-import { makeMockS3 } from '../../s3/testing/mock-s3.js';
+import { makeMockS3, makeS3Db } from '../../s3/testing/mock-s3.js';
+import { summariseCommunityOptions } from '../../s3/utils/community-options.js';
+import Logger from '../../core/logger.js';
 
 export default async function runTrackerTests(runTest) {
   const assembly = buildAssembly('.tmp-elo-tracker');
@@ -124,6 +128,134 @@ async function runTrackerCases(runTest, EloTracker) {
     if (!server.listeners['NEW_GAME']) throw new Error('NEW_GAME listener missing');
     if (!server.listeners['UPDATED_PLAYER_INFORMATION']) throw new Error('UPDATED_PLAYER_INFORMATION listener missing');
     if (!server.listeners['ROUND_ENDED']) throw new Error('ROUND_ENDED listener missing');
+  });
+
+  // ─── The leaderboard threshold is also a deletion predicate ───
+  //
+  // minRoundsForLeaderboard reads like a display cutoff, and it is also the
+  // discriminator in both tiers of the stale-entry delete. Against one shared
+  // rating table two servers configured differently prune each other’s players,
+  // and which retention clock a row gets depends on which server booted last.
+  // The prune declines while they disagree — by logging, not by refusing the
+  // mount, because this runs inside mount() and a leaderboard threshold is not
+  // worth taking a live game’s Elo tracking down over.
+
+  /**
+   * An S³ DB stand-in that answers only what mount() asks of it: the schema
+   * literals need getDataTypes(), and isReady() false is the shipped
+   * no-database path, so the registry summary is the only thing under test.
+   */
+  const s3dbWithRegistry = (rows) => ({
+    isReady: () => false,
+    getDataTypes: () => DataTypes,
+    communityOptions: summariseCommunityOptions(
+      rows.map(([serverID, alias, values]) => ({
+        serverID, alias, communityOptions: JSON.stringify(values)
+      }))
+    )
+  });
+
+  const mountAgainstRegistry = async (rows, minRoundsForLeaderboard) => {
+    const server = createMockServer();
+    server.plugins = [makeMockS3({ db: s3dbWithRegistry(rows) })];
+
+    let prunes = 0;
+    const db = createMockDb();
+    db.pruneStaleEntries = async () => { prunes++; return { tier1: 0, tier2: 0 }; };
+
+    const tracker = await mountTracker(
+      EloTracker, server, { ...mockOptions, minRoundsForLeaderboard }, mockConnectors,
+      (t) => { t.db = db; t.session = createMockSession(); }
+    );
+    return { tracker, prunes: () => prunes };
+  };
+
+  await runTest('Mount: the stale-entry prune declines while minRoundsForLeaderboard diverges', async () => {
+    const { tracker, prunes } = await mountAgainstRegistry(
+      [[1, 'main', { minRoundsForLeaderboard: 10 }], [2, 'event', { minRoundsForLeaderboard: 25 }]],
+      10
+    );
+
+    if (prunes() !== 0) {
+      throw new Error('rating rows were deleted while two servers disagreed about which retention tier they fall into');
+    }
+    if (!tracker.ready) {
+      throw new Error('the plugin refused to mount — a leaderboard threshold disagreement must not take Elo tracking down');
+    }
+  });
+
+  await runTest('Mount: the stale-entry prune runs once the servers agree', async () => {
+    const { prunes } = await mountAgainstRegistry(
+      [[1, 'main', { minRoundsForLeaderboard: 10 }], [2, 'event', { minRoundsForLeaderboard: 10 }]],
+      10
+    );
+
+    if (prunes() !== 1) {
+      throw new Error(`the prune did not run under agreement (${prunes()} calls) — the gate is refusing on something other than the disagreement`);
+    }
+  });
+
+  // ─── Migrations pending but unconfirmed is not "ready" ───
+  //
+  // On a genuinely empty first boot with autoMigrate off, verifyAndRunMigrations()
+  // returns null while S³ waits on an operator to confirm the token. EloTracker
+  // used to read that as "go" and prune anyway, against tables that do not exist
+  // yet — an `[DB] Error pruning stale entries: ... Elo_PlayerStats ...` logged at
+  // ERROR level at exactly the moment the operator is being asked to confirm. It
+  // now asks verifySchemaVersions() and declines to mount until its own namespace
+  // is applied, the way db-log does.
+
+  await runTest('Mount: declines to mount while its own migrations are unconfirmed', async () => {
+    const db = await makeS3Db({ confirmMigrations: false });
+    const seen = [];
+    const origVerbose = Logger.verbose;
+    Logger.verbose = (...args) => { seen.push(args); };
+
+    try {
+      const server = createMockServer();
+      server.plugins = [makeMockS3({ db })];
+
+      // No mock db/session injected on purpose: the real EloDatabase is what
+      // would hit "no such table" on the prune, so this is the real path.
+      const tracker = await mountTracker(EloTracker, server, mockOptions, mockConnectors);
+
+      const messages = seen
+        .filter(([tag]) => tag === 'EloTracker')
+        .map(([, , msg]) => String(msg));
+
+      if (tracker.ready) {
+        throw new Error('mounted as ready while elo-tracker migrations were still unconfirmed');
+      }
+      if (server.listeners['ROUND_ENDED']) {
+        throw new Error('ROUND_ENDED stayed bound — a plugin that is not ready must leave nothing listening');
+      }
+      if (messages.some((m) => /Error pruning stale entries/.test(m))) {
+        throw new Error('pruned against tables that do not exist yet — the exact ERROR line this guard removes');
+      }
+      if (!messages.some((m) => /Migrations for "elo-tracker" are not applied yet/.test(m))) {
+        throw new Error('did not say why it declined to mount — the operator needs the reason and the recovery step');
+      }
+    } finally {
+      Logger.verbose = origVerbose;
+      try { await db.unmount(); } catch { /* best effort */ }
+    }
+  });
+
+  await runTest('Mount: mounts normally once those migrations are confirmed', async () => {
+    const db = await makeS3Db({ confirmMigrations: true });
+    try {
+      const server = createMockServer();
+      server.plugins = [makeMockS3({ db })];
+
+      const tracker = await mountTracker(EloTracker, server, mockOptions, mockConnectors, (t) => {
+        t.session = createMockSession();
+      });
+
+      if (!tracker.ready) throw new Error('did not mount against a confirmed schema — the guard is refusing on something else');
+      if (!server.listeners['ROUND_ENDED']) throw new Error('ROUND_ENDED not bound after a clean mount');
+    } finally {
+      try { await db.unmount(); } catch { /* best effort */ }
+    }
   });
 
   await runTest('Event: UPDATED_PLAYER_INFORMATION (Cache Population)', async () => {

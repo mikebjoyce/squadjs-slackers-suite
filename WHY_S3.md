@@ -85,6 +85,7 @@ Most of what S³ does is deduplication — one implementation instead of three. 
 - **Team-change attribution.** SquadJS's `PLAYER_TEAM_CHANGE` event carries no source flag — there's no way to tell whether a change was a player's own `!switch`, a SmartAssign move, or a TeamBalancer scramble. A standalone plugin could only disambiguate this by having another specific plugin emit its own custom marker event for it to listen for — a pairwise, hand-wired arrangement that doesn't scale and can't include a plugin nobody has written yet. S³'s `players.recordMove()` is a single shared attribution point: every consumer calls the same method, every consumer (including third-party ones) can read the same answer.
 - **Third-party lock participation.** Legacy had no locking primitive at all — not even between the four official plugins, let alone for an outside plugin to hook into. S³'s `players.registerPriority('MyPlugin', 4)` lets any plugin join the same coordinated priority system SmartAssign, Switch, and TeamBalancer use. There was nothing standalone architecture could offer here; the primitive didn't exist to extend.
 - **Cross-plugin reconnect visibility.** Legacy SmartAssign's reconnect memory was already DB-backed and survived restarts — persistence wasn't the gap. The gap was that it was SmartAssign's alone; TeamBalancer, Switch, and EloTracker had no way to see a reconnect SmartAssign had already recorded. S³'s `players.rememberReconnect()` / `getReconnect()` is shared across every consumer, so one plugin's observation becomes every plugin's knowledge.
+- **More than one Squad server on one database.** A standalone plugin had no notion of which server it was, so pointing two of them at the same database meant two processes writing the same rows and reading each other's answers back as their own. Giving every plugin that notion separately would not have helped either, because the parts that have to agree are shared: which rows belong to which server, which tables are the community's, which process replies to a Discord command, and which one holds the migration lock while the schema moves. S³ resolves the server identity once, before any service starts, and every table declares its own scope against it. This is experimental, and [MULTI_SERVER.md](s3/MULTI_SERVER.md) is honest about what has and has not been proven.
 - **One believed team during the null-teamID window.** SmartAssign's legacy `resolving` phase shows a single plugin could reason carefully about the post-`NEW_GAME` null-teamID window on its own. But with two plugins each guessing independently, nothing guaranteed they'd guess the *same* thing for the same player — there was no shared answer to check against, only two separate correct-in-isolation guesses that could still disagree. S³'s null-teamID projection gives every consumer the same canonical answer at the same moment, closing a disagreement window that persisted even when each plugin's own logic was sound.
 
 ### S³ Event Bus
@@ -136,6 +137,7 @@ Existing features (double-switch, admin match-end switching) are now S³-aware �
 | **Schema drift protection** | None | Every mount re-checks the live database against what migrations declared, and repairs schema that has gone missing |
 | **Plugin/container compatibility** | None | `_checkS3Version()` fails a plugin that needs a newer S³ than is installed, instead of half-working |
 | **Plugin mount order** | Ad-hoc | S³-first guarantee with readiness gating |
+| **Multiple Squad servers, one database** | Not possible — no server identity, so rows collide | Per-server and community-wide tables, routed Discord replies, one migration at a time (experimental) |
 | **Testing** | Per-plugin | Per-plugin + S³ integration test suite |
 
 ### Per-Plugin Changes
@@ -236,8 +238,8 @@ Third-party plugins can register custom locking priorities via `players.register
 
 | Plugin | Legacy (Standalone) | S³ Suite |
 |--------|---------------------|----------|
-| **TeamBalancer** | [squadjs-team-balancer](https://github.com/mikebjoyce/squadjs-team-balancer) (v3.2.2) | [team-balancer/](team-balancer/) (v4.1.0) |
-| **Switch** | [squadjs-switch-teambalancer-aware](https://github.com/mikebjoyce/squadjs-switch-teambalancer-aware) | [switch/](switch/) (v2.5.7) |
+| **TeamBalancer** | [squadjs-team-balancer](https://github.com/mikebjoyce/squadjs-team-balancer) (v3.2.2) | [team-balancer/](team-balancer/) (v4.2.0) |
+| **Switch** | [squadjs-switch-teambalancer-aware](https://github.com/mikebjoyce/squadjs-switch-teambalancer-aware) | [switch/](switch/) (v2.6.0) |
 | **EloTracker** | [squadjs-elo-tracker](https://github.com/mikebjoyce/squadjs-elo-tracker) (v1.3.0) | [elo-tracker/](elo-tracker/) (v2.x) |
 | **SmartAssign** | [squadjs-smart-assign](https://github.com/mikebjoyce/squadjs-smart-assign) (v1.1.1) | [smart-assign/](smart-assign/) (v2.x) |
 | **S³** | — (no legacy equivalent) | [s3/](s3/) (v1.0+) |

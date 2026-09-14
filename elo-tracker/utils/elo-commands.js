@@ -95,7 +95,7 @@ const EloCommands = {
         ].join('\n'));
       }
 
-      const minRounds = trackerCtx.options.minRoundsForLeaderboard;
+      const minRounds = trackerCtx.leaderboardMinRounds();
       let rankLine;
       const consRating = record.mu - (EloCalculator.SIGMA_MULTIPLIER * record.sigma);
       if (record.roundsPlayed < minRounds) {
@@ -148,7 +148,7 @@ const EloCommands = {
       // !elo leaderboard
       if (sub === 'leaderboard') {
         try {
-          const players = await this.db.getLeaderboard(10, this.options.minRoundsForLeaderboard);
+          const players = await this.db.getLeaderboard(10, this.leaderboardMinRounds());
           if (!players.length) {
             return await this.respond(player, tracker.localize('eloTracker.onEloCommand.noLeaderboardDataYet'));
           }

@@ -180,7 +180,7 @@ runTest('§10.1 documents no command that does not exist', () => {
 
 // ─── 2. Subcommands ───────────────────────────────────────────────
 
-for (const [parent, variable] of [['migrate', 'migrateSub'], ['db', 'dbSub'], ['backup', 'backupSub']]) {
+for (const [parent, variable] of [['migrate', 'migrateSub'], ['db', 'dbSub'], ['backup', 'backupSub'], ['servers', 'serversSub']]) {
   runTest(`§10.1 covers every !s3 ${parent} subcommand`, () => {
     const documented = new Set(
       documentedCommands()

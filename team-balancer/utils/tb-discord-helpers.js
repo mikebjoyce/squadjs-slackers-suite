@@ -47,6 +47,22 @@
  */
 import Logger from '../../core/logger.js';
 
+/**
+ * Sticky once discovered: this discord.js only understands the singular
+ * `embed` key, so a multi-embed payload has to be sent one message at a time.
+ *
+ * Stock SquadJS 4.1.0 pins discord.js 12.5.3, which has no `embeds` key —
+ * so an embeds-only payload reads as empty to it and the API says so. Forks
+ * and manual bumps run v13/v14, and the suite installs into whichever the
+ * host already has, so the shape is discovered rather than version-sniffed.
+ *
+ * This replaced a fallback that retried as `{ embed: data.embeds[0] }` and
+ * returned success — on a v12 host every multi-embed report silently lost
+ * all but its first embed, and nothing logged it. The scramble report at
+ * tb-commands.js is the payload that hit this.
+ */
+let legacyEmbedMode = false;
+
 export const DiscordHelpers = {
   buildStatusEmbed(tb) {
     // Defensive checks
@@ -343,7 +359,13 @@ export const DiscordHelpers = {
 
     const embed = {
       color: isSimulated ? 0x9b59b6 : 0x2ecc71,
-      title: isSimulated ? tb.localize('teamBalancer.embeds.dryRunScramblePlan') : tb.localize('teamBalancer.embeds.scrambleExecutionPlan'),
+      // Server in the title rather than only the footer, per the mutation
+      // rule: this is the embed an admin reads to decide whether the
+      // teams about to be rebuilt are the ones they meant.
+      title: (() => {
+        const base = isSimulated ? tb.localize('teamBalancer.embeds.dryRunScramblePlan') : tb.localize('teamBalancer.embeds.scrambleExecutionPlan');
+        return tb.titleWithServer?.(base) ?? base;
+      })(),
       description: tb.localize('teamBalancer.embeds.totalPlayersAffectedCalculation', { value: swapPlan.length, value2: swapPlan.calculationTime || tb.localize('teamBalancer.labels.notAvailable') }),
       fields: [
         { 
@@ -624,7 +646,7 @@ export const DiscordHelpers = {
   buildScrambleTriggeredEmbed(tb, reason, teamName, count, delay) {
     const embed = {
       color: 0xf39c12,
-      title: tb.localize('teamBalancer.embeds.scrambleTriggered'),
+      title: tb.titleWithServer?.(tb.localize('teamBalancer.embeds.scrambleTriggered')) ?? tb.localize('teamBalancer.embeds.scrambleTriggered'),
       description: tb.localize('teamBalancer.embeds.reasonLine', { reason }),
       fields: [
         { name: tb.localize('teamBalancer.embeds.dominantTeam'), value: teamName || tb.localize('teamBalancer.labels.notAvailable'), inline: true },
@@ -642,7 +664,7 @@ export const DiscordHelpers = {
 
     const embed = {
       color: failedToMove > 0 ? 0xf39c12 : 0x2ecc71,
-      title: tb.localize('teamBalancer.embeds.scrambleCompleted'),
+      title: tb.titleWithServer?.(tb.localize('teamBalancer.embeds.scrambleCompleted')) ?? tb.localize('teamBalancer.embeds.scrambleCompleted'),
       fields: [
         { name: tb.localize('teamBalancer.embeds.totalMoves'), value: `${totalMoves}`, inline: true },
         { name: tb.localize('teamBalancer.embeds.movedSuccessfully'), value: `${movedSuccessfully}`, inline: true },
@@ -677,7 +699,7 @@ export const DiscordHelpers = {
 
     const embed = {
       color: 0xe74c3c,
-      title: tb.localize('teamBalancer.embeds.scrambleFailed'),
+      title: tb.titleWithServer?.(tb.localize('teamBalancer.embeds.scrambleFailed')) ?? tb.localize('teamBalancer.embeds.scrambleFailed'),
       description: tb.localize('teamBalancer.embeds.reasonLine', { reason }),
       fields: [
         { name: tb.localize('teamBalancer.embeds.calculationTime'), value: `${duration}ms`, inline: true },
@@ -733,7 +755,15 @@ export const DiscordHelpers = {
       }
     }
 
-    const executeSend = async (data, isRetry = false) => {
+    // Which server this came from, when there is more than one. `this` is
+    // DiscordHelpers, and TeamBalancer sets the function on it at mount —
+    // this file cannot import it, because the module lives in `s3/utils/` in
+    // the source tree and beside this one in the layout install.cjs
+    // produces. Absent, on a single-server install, or before mount: no
+    // label.
+    payload = this.applyServerLabel?.(payload) ?? payload;
+
+    const sendOnce = async (data, isRetry = false) => {
       try {
         await channel.send(data);
         return true;
@@ -746,23 +776,54 @@ export const DiscordHelpers = {
 
           Logger.verbose('TeamBalancer', 1, `Discord 429 Rate Limit hit. Waiting ${waitTime}ms before retry.`);
           await new Promise((resolve) => setTimeout(resolve, waitTime));
-          return executeSend(data, true);
-        }
-
-        // Compatibility: Discord.js v12 Fallback
-        if (err.message === 'Cannot send an empty message' && data.embeds && data.embeds.length > 0) {
-          const legacyData = { ...data, embed: data.embeds[0] };
-          delete legacyData.embeds;
-          return executeSend(legacyData, isRetry);
+          return sendOnce(data, true);
         }
 
         throw err;
       }
     };
 
+    // One embed per message, because that is all discord.js v12 will take.
+    // Content and files ride on the first; the rest follow in order.
+    const sendOnePerMessage = async (data) => {
+      const embeds = data.embeds || [];
+      const rest = { ...data };
+      delete rest.embeds;
+      delete rest.embed;
+
+      if (embeds.length === 0) return sendOnce(rest);
+
+      let allSent = true;
+      for (let i = 0; i < embeds.length; i++) {
+        const part = i === 0 ? { ...rest, embed: embeds[i] } : { embed: embeds[i] };
+        try {
+          await sendOnce(part);
+        } catch (err) {
+          // Losing embed 2 is no reason to also lose embed 3.
+          allSent = false;
+          Logger.verbose('TeamBalancer', 1, `Discord embed ${i + 1}/${embeds.length} failed: ${err.message}`);
+        }
+      }
+      return allSent;
+    };
+
     try {
-      await executeSend(payload);
-      return true;
+      if (legacyEmbedMode && Array.isArray(payload.embeds)) return await sendOnePerMessage(payload);
+
+      try {
+        await sendOnce(payload);
+        return true;
+      } catch (err) {
+        // The v12 tell: it has no `embeds` key, so an embeds-only payload
+        // looks empty to it. Discovered rather than version-sniffed.
+        const looksLegacy = err.message === 'Cannot send an empty message'
+          && Array.isArray(payload.embeds) && payload.embeds.length > 0;
+        if (!looksLegacy) throw err;
+
+        legacyEmbedMode = true;
+        Logger.verbose('TeamBalancer', 1, 'discord.js rejected an embeds array; switching to one embed per message for the rest of this process.');
+        return await sendOnePerMessage(payload);
+      }
     } catch (err) {
       const errMsg = `Discord send failed: ${err.message}`;
       if (!suppressErrors) throw new Error(errMsg);

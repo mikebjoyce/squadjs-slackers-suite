@@ -10,8 +10,20 @@
  * via _grantSeedBonusOnTransition, and the atomic UPDATE race-
  * condition defenses.
  *
- * These tests simulate the actual Sequelize queries the plugin
- * makes, using the mock DB's update() with Op-style WHERE clauses.
+ * ⚠ These tests RE-IMPLEMENT the plugin’s queries against the mock
+ * DB’s update() with Op-style WHERE clauses — they do not call the
+ * shipped handlers. That is deliberate: the mock lets a race be driven
+ * step by step in a way a real engine will not. But it also means a
+ * rewrite of those handlers cannot fail anything here, and one has
+ * happened: the seed trio and the lockdown expiry moved to a per-server
+ * table, so the single cross-column UPDATE these cases model is now a
+ * claim on one table and a credit on another, and _grantSeedBonusOn-
+ * Transition is now _grantSeedBonusAtEndgame. Read the shapes below as
+ * a record of the invariants, not of the SQL.
+ *
+ * The shipped handlers are exercised against SQLite and MySQL in
+ * test-seed-token-lifecycle.js, section (b). Any change to the grant
+ * paths belongs there as well as here.
  *
  * ─── USAGE ───────────────────────────────────────────────────────
  *
