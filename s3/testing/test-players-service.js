@@ -371,6 +371,93 @@ await runTest('an empty roster is handled without quarantining anything', async 
   await service.unmount();
 });
 
+// ─────────────────────────────────────────────────────────────────
+// Per-round team confirmation.
+//
+// The registry keeps its rows across NEW_GAME (reconnect memory,
+// sessions and locks all need that), so the teams in it belong to the
+// round that just ended until each player is observed again. These
+// cases pin the unit-level property; the end-to-end replay of the
+// 2026-09-05 incident lives in
+// test-round-transition-team-baseline.js.
+// ─────────────────────────────────────────────────────────────────
+
+await runTest('handleNewGame drops confirmations so last round\'s teams stop counting as resolved', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({ server });
+  await service.mount();
+
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 2, squadID: 1 }
+  ];
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.areTeamsResolved(), true);
+
+  // The rows still hold real teams — but they are last round's, and nothing has
+  // been observed for this one yet.
+  service.handleNewGame();
+  assert.equal(service.areTeamsResolved(), false);
+
+  // One observation short is still short.
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 2, squadID: 1 }
+  ];
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service.areTeamsResolved(), true); // e2 left, so e1 is the whole roster
+
+  await service.unmount();
+});
+
+await runTest('a first sighting after NEW_GAME is a baseline, a later change is a change', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({ server });
+  await service.mount();
+
+  server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 }];
+  await service.handleUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
+
+  service.handleNewGame();
+  server.take('S3_PLAYER_TEAM_CHANGED');
+  server.emitted = [];
+
+  // First sighting this round, on the other team: the round reassigned them.
+  server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 2, squadID: 1 }];
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(server.take('S3_PLAYER_TEAM_CHANGED').length, 0);
+
+  // Now they are confirmed, so the next move is a real one.
+  server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 }];
+  await service.handleUpdatedPlayerInfo();
+  const events = server.take('S3_PLAYER_TEAM_CHANGED');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].payload.previousTeamID, 2);
+  assert.equal(events[0].payload.teamID, 1);
+
+  await service.unmount();
+});
+
+await runTest('confirmations do not leak for players who leave', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({ server });
+  await service.mount();
+
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 2, squadID: 1 }
+  ];
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service._teamConfirmedKeys.size, 2);
+
+  server.players = [{ eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 }];
+  await service.handleUpdatedPlayerInfo();
+  assert.equal(service._teamConfirmedKeys.has('e2'), false);
+  assert.equal(service._teamConfirmedKeys.size, 1);
+
+  await service.unmount();
+});
+
 await runTest('areTeamsResolved stays false when nobody has a real team', async () => {
   const server = new MockServer();
   const service = new PlayersService({ server, unresolvedGraceMs: 10 });
@@ -424,6 +511,11 @@ await runTest('projection returns flipped teams during null-teamID window', asyn
   ];
   await service.handleUpdatedPlayerInfo();
 
+  // The flip is a round-transition assumption, so the round transition has to
+  // actually be signalled. Without this the null window is just an unresolved
+  // client and teams project forward unchanged.
+  service.handleNewGame();
+
   server.players = [
     { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: null, squadID: 1 },
     { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: null, squadID: 2 }
@@ -468,19 +560,110 @@ await runTest('projection keeps new joins and logs mismatches on reconcile', asy
   const charlie = snapshot.find((player) => player.eosID === 'e3');
   assert.equal(charlie.teamID, 1);
 
+  // Alpha comes back on team 2. No NEW_GAME happened, so the projection carried
+  // her forward on team 1 — the team she was actually last seen on — and this is
+  // a genuine mismatch worth reporting. Returning on team 1 would NOT be: before
+  // the flip was scoped to round transitions, that case projected Alpha onto
+  // team 2 and reported a swap she never made.
   server.players = [
-    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 },
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 2, squadID: 1 },
     { eosID: 'e3', steamID: 's3', name: 'Charlie', teamID: 1, squadID: 3 }
   ];
   await service.handleUpdatedPlayerInfo();
 
   snapshot = service.getAllPlayers();
   assert.equal(snapshot.length, 2);
-  assert.equal(snapshot.find((player) => player.eosID === 'e1').teamID, 1);
+  assert.equal(snapshot.find((player) => player.eosID === 'e1').teamID, 2);
 
   const logs = server.take('LOG');
   assert.ok(logs.some((entry) => entry.payload.message.includes('Projection active')));
   assert.ok(logs.some((entry) => entry.payload.message.includes('projected team')));
+
+  await service.unmount();
+});
+
+await runTest('a mid-round null window does not project a team swap', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({ server });
+  await service.mount();
+
+  // One unresolved player is all it takes to arm the projection — hasNullTeams
+  // is `blocking.size > 0`, not a roster-wide condition. Mid-round that is an
+  // ordinary joining or stuck client, and the projection must not conclude from
+  // it that the other players swapped sides.
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 2, squadID: 2 }
+  ];
+  await service.handleUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
+
+  server.take('S3_PLAYER_TEAM_CHANGED');
+
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 2, squadID: 2 },
+    { eosID: 'e9', steamID: 's9', name: 'Joiner', teamID: null, squadID: null }
+  ];
+  await service.handleUpdatedPlayerInfo();
+
+  // The joiner resolves; nobody moved.
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 2, squadID: 2 },
+    { eosID: 'e9', steamID: 's9', name: 'Joiner', teamID: 1, squadID: null }
+  ];
+  await service.handleUpdatedPlayerInfo();
+
+  const changes = server.take('S3_PLAYER_TEAM_CHANGED');
+  assert.equal(
+    changes.length,
+    0,
+    `a joiner resolving must not imply anyone swapped, got ${changes.length}: ` +
+      changes.map((e) => `${e.payload.player.name} ${e.payload.previousTeamID}→${e.payload.teamID} (${e.payload.source})`).join(', ')
+  );
+
+  await service.unmount();
+});
+
+await runTest('a stuck client returning on the same team mid-round is not a swap', async () => {
+  const server = new MockServer();
+  const service = new PlayersService({ server });
+  await service.mount();
+
+  // The realistic single-null case: one client's teamID goes unresolved for a
+  // few ticks and comes back exactly as it was. Alpha is confirmed on team 1
+  // before the window, so the confirmation gate does NOT cover this — only
+  // scoping the 1↔2 flip to round transitions does. Flipped, Alpha's projected
+  // team would be 2 and her return to team 1 would reconcile as a swap.
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 2, squadID: 2 }
+  ];
+  await service.handleUpdatedPlayerInfo();
+  await service.handleUpdatedPlayerInfo();
+
+  server.take('S3_PLAYER_TEAM_CHANGED');
+
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: null, squadID: 1 },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 2, squadID: 2 }
+  ];
+  await service.handleUpdatedPlayerInfo();
+
+  server.players = [
+    { eosID: 'e1', steamID: 's1', name: 'Alpha', teamID: 1, squadID: 1 },
+    { eosID: 'e2', steamID: 's2', name: 'Bravo', teamID: 2, squadID: 2 }
+  ];
+  await service.handleUpdatedPlayerInfo();
+
+  const changes = server.take('S3_PLAYER_TEAM_CHANGED');
+  assert.equal(
+    changes.length,
+    0,
+    `returning on the same team is not a switch, got ${changes.length}: ` +
+      changes.map((e) => `${e.payload.player.name} ${e.payload.previousTeamID}→${e.payload.teamID} (${e.payload.source})`).join(', ')
+  );
 
   await service.unmount();
 });
