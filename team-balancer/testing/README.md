@@ -58,7 +58,7 @@ node test-tb-elo-scramble.js
 ```
 
 **`test-elo-diff-scramble.js`**
-Covers the fourth scramble trigger — the small, budget-capped mu-gap correction fired at round end — distinct from the three ticket-margin-driven triggers `plugin-logic-test-runner.js` covers: threshold logic, budget search, `scrambleType` plumbing through `initiateScramble`/`executeScramble`/`onRoundEnded`. Stubs the randomized scrambler for determinism. Wired into `run-all-tests.js`.
+Covers the fourth scramble trigger — the small, budget-capped mu-gap correction fired at round end — distinct from the three ticket-margin-driven triggers `plugin-logic-test-runner.js` covers: threshold logic, budget search, `scrambleType` plumbing through `initiateScramble`/`executeScramble`/`onRoundEnded`, and the close-round ticket-margin floor (`eloDiffMinTicketMargin`, `eloDiffInvasionMinTicketMargin`). Stubs the randomized scrambler for determinism. Wired into `run-all-tests.js`.
 ```
 node test-elo-diff-scramble.js
 ```

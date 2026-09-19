@@ -30,6 +30,9 @@
  *   - onRoundEnded() matchend-fire     branches on armedBy.scrambleType: micro-scramble broadcast
  *                                       text, roundReport.scrambleCondition/scrambleType, and the
  *                                       scrambleType passed to the deferred initiateScramble() call
+ *   - onRoundEnded() margin floor      a close round (under eloDiffMinTicketMargin, or
+ *                                       eloDiffInvasionMinTicketMargin on Invasion) never
+ *                                       schedules the automatic trigger; 0 disables either floor
  *
  * ─── DETERMINISM ─────────────────────────────────────────────────
  *
@@ -852,6 +855,32 @@ async function runTests() {
       fs.rmSync(reportLogPath, { force: true });
     }
   }
+
+  // ── onRoundEnded(): close-round ticket-margin floor ───────────────────
+  // A margin under eloDiffMinTicketMargin (eloDiffInvasionMinTicketMargin on Invasion) must not
+  // schedule the automatic trigger at all. The harness's dominant thresholds (300/300/650) keep
+  // every margin below non-dominant, so onRoundEnded() awaits the trigger before returning.
+  console.log('\n[Section 8: close-round ticket-margin floor]');
+  async function eloDiffScheduled({ margin, layer = 'Fallujah_RAAS_v2', mode = 'RAAS', overrides = {} }) {
+    const reportLogPath = path.join(os.tmpdir(), `tb-margin-floor-${process.pid}-${Date.now()}-${Math.random()}.jsonl`);
+    const { tb, mockServer, mockS3 } = await buildPlugin({ enableEloDiffScramble: true, reportLogPath, ...overrides });
+    if (mode !== 'RAAS') mockS3.emitLayerGameModeChange(layer, mode);
+    mockServer.plugins[1].awaitRatingsCommitted = async () => ({ snapshot: new Map() });
+    let evaluated = false;
+    tb._evaluateEloDiffTrigger = async () => { evaluated = true; return false; };
+    try {
+      await tb.onRoundEnded({ winner: { team: 1, tickets: margin }, loser: { tickets: 0 } });
+    } finally {
+      fs.rmSync(reportLogPath, { force: true });
+    }
+    return evaluated;
+  }
+  assert(!(await eloDiffScheduled({ margin: 69 })), 'RAAS margin 69 (under the default floor of 70) skips the Elo-diff trigger.');
+  assert(await eloDiffScheduled({ margin: 70 }), 'RAAS margin 70 (exactly the floor) schedules the Elo-diff trigger.');
+  assert(await eloDiffScheduled({ margin: 10, overrides: { eloDiffMinTicketMargin: 0 } }), 'eloDiffMinTicketMargin: 0 disables the floor.');
+  assert(!(await eloDiffScheduled({ margin: 120, layer: 'Mutaha_Invasion_v1', mode: 'Invasion' })), 'Invasion margin 120 (under the Invasion floor of 150) skips the trigger.');
+  assert(await eloDiffScheduled({ margin: 200, layer: 'Mutaha_Invasion_v1', mode: 'Invasion' }), 'Invasion margin 200 schedules the trigger — the RAAS floor does not apply.');
+  assert(await eloDiffScheduled({ margin: 100, layer: 'Mutaha_Invasion_v1', mode: 'Invasion', overrides: { eloDiffInvasionMinTicketMargin: 0 } }), 'eloDiffInvasionMinTicketMargin: 0 disables the Invasion floor.');
 
   // ── Final Report ──────────────────────────────────────────────────────
   console.log(`\n🏁 All Elo-diff micro scramble tests completed. Result: ${passCount}/${testCount} passed.`);

@@ -1,4 +1,4 @@
-# Team Balancer Plugin v4.2.0
+# Team Balancer Plugin v4.3.0
 
 **SquadJS Plugin for Fair Match Enforcement**
 
@@ -22,9 +22,11 @@ Scramble execution swaps entire squads or unassigned players, balancing team siz
 
 * **ELO-Weighted Balancing**: Optional integration with EloTracker. When `useEloForBalance` is enabled, the scoring function switches to an ELO-weighted branch: a composite penalty (50% Mean ELO diff + 50% Top-15 ELO diff) + veteran parity penalty + numerical balance. The standard heuristic penalties (churn, anchor, cohesion, infantry overload) are replaced entirely, not supplemented.
 
+* **Elo-Diff Micro Scramble**: Optional, off by default (`enableEloDiffScramble`). When the average Elo gap between teams at round end reaches `eloDiffScrambleThreshold`, it moves a handful of players to close the gap instead of running a full scramble. It skips close rounds (under `eloDiffMinTicketMargin` tickets, or `eloDiffInvasionMinTicketMargin` on Invasion), since a close result means the teams were even in practice whatever the ratings say. Admins can also run one by hand with `!scramble elo`. Requires EloTracker.
+
 * **Discord Integration**: Administer the plugin via Discord, mirror RCON broadcasts, and view detailed swap plans.
 
-* **Multi-Mode Logic**: Distinct dominance thresholds for Standard (RAAS/AAS) and Invasion game modes.
+* **Multi-Mode Logic**: Distinct dominance thresholds for Standard (RAAS/AAS), Invasion and Territory Control.
 
 * **Squad-Preserving Algorithm**: Calculates optimal moves to balance teams while keeping squads together.
 
@@ -194,8 +196,11 @@ squad-server/
     ├── historical-scramble-test.js
     ├── historical-elo-backbone-test.js
     ├── test-tb-elo-scramble.js
+    ├── test-elo-diff-scramble.js
     ├── test-team-balancer-plugin.js
     ├── test-cross-clan-squad-collision.js
+    ├── test-readme-accuracy.js
+    ├── test-tb-discord-legacy-embeds.js
     ├── embed-format-test.js
     └── mock-data-generator.js
 ```
@@ -264,6 +269,8 @@ Admin Commands:
 | `useEloForBalance` | no | boolean | `true` | Weight scrambles by EloTracker mu ratings (requires EloTracker plugin; falls back to numerical balance if absent) |
 | `enableEloDiffScramble` | no | boolean | `false` | Trigger a small "micro scramble" when the average Elo (mu) gap between teams from the round that just ended meets `eloDiffScrambleThreshold`, independent of the three reactive triggers. Opt-in — requires EloTracker to be active. Can also be triggered manually via `!scramble elo` regardless of this setting. |
 | `eloDiffScrambleThreshold` | no | number | `1.2` | Average mu gap between teams (abs value) that arms the Elo-diff micro scramble |
+| `eloDiffMinTicketMargin` | no | number | `70` | Ticket margin a round must reach before the automatic micro scramble may fire. A closer result means the teams were even in practice, so the trigger is skipped. Applies to RAAS, AAS and Territory Control. `0` disables the floor. Does not affect `!scramble elo`. |
+| `eloDiffInvasionMinTicketMargin` | no | number | `150` | The same close-round floor for Invasion, whose margins run far larger than RAAS. `0` disables the floor. |
 | `microScrambleParityTarget` | no | number | `0.05` | Post-swap average mu gap the Elo-diff micro scramble's escalating search stops at once reached |
 | `microScrambleMaxMovePercent` | no | number | `0.20` | Safety ceiling for the Elo-diff micro scramble: max fraction of the current round's population (both teams combined) that may be moved |
 | `devMode` | no | boolean | `false` | Allow commands from any player regardless of admin status |
@@ -280,9 +287,9 @@ Admin Commands:
 
 ## Game Mode Support
 
-- **RAAS / AAS**: Uses `minTicketsToCountAsDominantWin` threshold.
-- **Invasion**: Uses separate thresholds for attackers (`invasionAttackTeamThreshold`) and defenders (`invasionDefenceTeamThreshold`).
-- **Territory Control**: Symmetric, so both teams are judged on one number — `tcDominantThreshold`, with the stomp cutoff derived from it at 1.5x, and `tcSingleRoundScrambleThreshold` for the mercy scramble. Both default to `null`, which falls back to the Standard-mode values; set them only once you have enough TC rounds on your server to know what a lopsided one looks like there.
+- **RAAS / AAS**: Uses `minTicketsToCountAsDominantWin` threshold. The Elo-diff micro scramble is skipped when the margin is under `eloDiffMinTicketMargin` (default 70).
+- **Invasion**: Uses separate thresholds for attackers (`invasionAttackTeamThreshold`) and defenders (`invasionDefenceTeamThreshold`). The micro scramble has its own close-round floor here, `eloDiffInvasionMinTicketMargin` (default 150), because Invasion margins run several times larger than RAAS ones. A typical Invasion round ends a few hundred tickets apart, where a typical RAAS round ends about 100 apart.
+- **Territory Control**: Symmetric, so both teams are judged on one number — `tcDominantThreshold`, with the stomp cutoff derived from it at 1.5x, and `tcSingleRoundScrambleThreshold` for the mercy scramble. Both default to `null`, which falls back to the Standard-mode values; set them only once you have enough TC rounds on your server to know what a lopsided one looks like there. The micro scramble uses the RAAS/AAS floor, `eloDiffMinTicketMargin`.
 - **Seed**: Excluded from win streak tracking. Optional auto-scramble at round end via `enableSeedAutoScramble`. This trigger runs on its own countdown, `seedScrambleAnnouncementDelay` (default 5s), not the global `scrambleAnnouncementDelay` — the gap between a Seed round ending and the map change is much shorter.
 - Other modes and map names can be excluded via `ignoredGameModes` (configured on S³).
 

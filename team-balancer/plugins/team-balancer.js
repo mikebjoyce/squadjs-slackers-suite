@@ -123,7 +123,9 @@
  *   escalating-budget number of players (capped by microScrambleMaxMovePercent) when the
  *   post-round average mu gap (measured from the round that just ended) meets
  *   eloDiffScrambleThreshold, stopping once
- *   microScrambleParityTarget is reached. Requires EloTracker. Lowest-precedence of all
+ *   microScrambleParityTarget is reached. Skipped when the ticket margin is under
+ *   eloDiffMinTicketMargin (eloDiffInvasionMinTicketMargin on Invasion), since a close
+ *   result means the teams were even in practice. Requires EloTracker. Lowest-precedence of all
  *   triggers: it only arms if the other three haven't already claimed the scramble slot for
  *   this round. Can also be triggered manually via "!scramble elo" regardless of this option.
  * - TEAM_BALANCER_SCRAMBLE_EXECUTED event is emitted after all RCON moves complete and are
@@ -212,6 +214,9 @@
  *   enableEloDiffScramble              - Opt-in Elo-diff micro scramble trigger, independent of
  *                                        the three win-streak triggers (default: false).
  *   eloDiffScrambleThreshold           - Average mu gap that arms the micro scramble (default: 1.2).
+ *   eloDiffMinTicketMargin             - Ticket margin below which the automatic micro scramble
+ *                                        is skipped as a close round; RAAS/AAS/TC (default: 70).
+ *   eloDiffInvasionMinTicketMargin     - The same close-round floor for Invasion (default: 150).
  *   microScrambleParityTarget          - Post-swap mu gap the micro scramble's search stops
  *                                        at once reached (default: 0.05).
  *   microScrambleMaxMovePercent        - Safety ceiling: max fraction of the round's population
@@ -268,6 +273,8 @@
  *   "useEloForBalance": true,
  *   "enableEloDiffScramble": false,
  *   "eloDiffScrambleThreshold": 1.2,
+ *   "eloDiffMinTicketMargin": 70,
+ *   "eloDiffInvasionMinTicketMargin": 150,
  *   "microScrambleParityTarget": 0.05,
  *   "microScrambleMaxMovePercent": 0.20,
  *   "devMode": false,
@@ -371,7 +378,7 @@ export function scopeForTeamBalancerCommand(surface, args) {
 const ROUND_END_DB_TIMEOUT_MS = 15000;
 
 export default class TeamBalancer extends S3PluginBase {
-  static version = '4.2.0';
+  static version = '4.3.0';
 
   static get description() {
     return 'Tracks dominant wins by team ID and scrambles teams if one team wins too many rounds.';
@@ -520,6 +527,16 @@ export default class TeamBalancer extends S3PluginBase {
         default: 1.2,
         type: 'number',
         description: 'Average mu gap between teams (abs value) that arms the Elo-diff micro scramble. Calibrated against real round history to target roughly the top quartile of real imbalance rather than firing on nearly every round.'
+      },
+      eloDiffMinTicketMargin: {
+        default: 70,
+        type: 'number',
+        description: 'Ticket margin a round must reach before the automatic Elo-diff micro scramble may fire. A closer result means the teams were even in practice, so the trigger is skipped. Applies to RAAS, AAS and Territory Control. 0 disables the floor. Does not affect "!scramble elo".'
+      },
+      eloDiffInvasionMinTicketMargin: {
+        default: 150,
+        type: 'number',
+        description: 'The same close-round floor for Invasion, whose margins run far larger than RAAS. 0 disables the floor.'
       },
       microScrambleParityTarget: {
         default: 0.05,
@@ -2350,8 +2367,18 @@ export default class TeamBalancer extends S3PluginBase {
       // the same round. It stays unawaited here, on the dominant path, deliberately: the
       // win-streak-threshold scramble check further down is synchronous and must keep winning
       // that race, which the fire-and-forget timing already guaranteed before this change.
+      //
+      // A close ticket result is the game saying the teams were even in practice, whatever
+      // the mu gap claims, so a margin under the per-mode floor skips the trigger outright.
+      // Checked here rather than inside _evaluateEloDiffTrigger() so a skipped round never
+      // waits on EloTracker and the non-dominant narrative below goes out as normal.
       let eloDiffPromise = null;
-      if (this.options.enableEloDiffScramble && !this._s3?.gameState?.isSeedMode?.()) {
+      const eloDiffMinMargin = this._eloDiffMinTicketMargin(isInvasion);
+      const eloDiffCloseRound = margin < eloDiffMinMargin;
+      if (this.options.enableEloDiffScramble && eloDiffCloseRound) {
+        Logger.verbose('TeamBalancer', 2, `[EloDiff] Skipped: margin ${margin} is under the ${isInvasion ? 'Invasion ' : ''}close-round floor of ${eloDiffMinMargin}.`);
+      }
+      if (this.options.enableEloDiffScramble && !eloDiffCloseRound && !this._s3?.gameState?.isSeedMode?.()) {
         const eloTrackerPlugin = this.server.plugins?.find(p => p.constructor.name === 'EloTracker');
         if (eloTrackerPlugin?.awaitRatingsCommitted) {
           const currentPlayers = this._s3?.players?.getAllPlayers?.() ?? this.server.players ?? [];
@@ -2699,6 +2726,18 @@ export default class TeamBalancer extends S3PluginBase {
     } catch (err) {
       Logger.verbose('TeamBalancer', 1, `[DB] resetStreak saveState failed: ${err.message}`);
     }
+  }
+
+  /**
+   * The ticket margin a round must reach before the automatic Elo-diff trigger may fire.
+   * Invasion gets its own floor because its margins run on a far larger scale than RAAS/AAS;
+   * Territory Control is symmetric and shares the standard one. An unset, negative or
+   * non-numeric option reads as 0, which lets every margin through.
+   */
+  _eloDiffMinTicketMargin(isInvasion) {
+    const raw = isInvasion ? this.options.eloDiffInvasionMinTicketMargin : this.options.eloDiffMinTicketMargin;
+    const floor = Number(raw);
+    return Number.isFinite(floor) && floor > 0 ? floor : 0;
   }
 
   /**
