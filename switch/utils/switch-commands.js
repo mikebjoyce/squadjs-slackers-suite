@@ -242,7 +242,7 @@ const SwitchCommands = {
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
               pl = plugin.getPlayerByUsernameOrSteamID(eosID, commandSplit.splice(1).join(' '))
               if (pl) {
-                plugin._taggedSwitchPlayer(pl.eosID, 'Admin-Force').catch(err => {
+                plugin._taggedSwitchPlayer(pl.eosID, 'Admin-Force', plugin._oppositeTeamOf(pl.eosID)).catch(err => {
                   plugin.verbose(1, `Admin switch now failed: ${err.message}`);
                 });
               }
@@ -260,8 +260,11 @@ const SwitchCommands = {
                 const p1 = plugin.getPlayerByUsernameOrSteamID(eosID, name1);
                 const p2 = plugin.getPlayerByUsernameOrSteamID(eosID, name2);
                 if (p1 && p2) {
-                  await plugin._taggedSwitchPlayer(p1.eosID, 'Admin-Force');
-                  await plugin._taggedSwitchPlayer(p2.eosID, 'Admin-Force');
+                  // Both targets read first: if p1 leads p2's party, p1's move drags p2.
+                  const p1Target = plugin._oppositeTeamOf(p1.eosID);
+                  const p2Target = plugin._oppositeTeamOf(p2.eosID);
+                  await plugin._taggedSwitchPlayer(p1.eosID, 'Admin-Force', p1Target);
+                  await plugin._taggedSwitchPlayer(p2.eosID, 'Admin-Force', p2Target);
                   plugin.warn(steamID, plugin.localize('switch.warn.swapped', { name: p1.name, name2: p2.name }));
                 } else {
                   plugin.warn(steamID, plugin.localize('switch.warn.oneBothPlayersNot'));
@@ -815,7 +818,7 @@ const SwitchCommands = {
           let switchSuccess = false;
           let preSwitchTeam = teamID;
           try {
-            await plugin._taggedSwitchPlayer(eosID, 'Player-Self');
+            await plugin._taggedSwitchPlayer(eosID, 'Player-Self', targetTeam);
 
             await delay(1000);
             await plugin.server.updatePlayerList();

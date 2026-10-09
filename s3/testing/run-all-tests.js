@@ -200,6 +200,7 @@ const CATEGORY_TESTS = {
     'test-player-session-persistence.js',
     'test-team-change-retry.js',
     'test-request-team-change-eosid.js',
+    'test-team-change-target.js',
     'test-migration-pipeline.js',
     'test-migrate-flag-safety.js',
     'test-migration-prompt-identity.js',

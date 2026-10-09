@@ -921,6 +921,7 @@ const player = this.server.players.find(p => p.name === name);
 ```js
 // ✅ CORRECT — base class handles retry + S³ verification
 const result = await this._requestTeamChange(eosID, {
+  targetTeamID: 2,
   maxAttempts: 5,
   source: 'MyPlugin'
 });
@@ -1212,12 +1213,15 @@ flattened layout `install.cjs` produces.
 Options:
 ```js
 {
+  targetTeamID: 2,      // Where the player should end up (1 or 2)
   maxAttempts: 5,       // RCON send retry count
   warnPlayer: false,    // Send rcon.warn on success
   warnMessage: 'You have been scrambled',
   source: 'S3PluginBase' // Source identifier
 }
 ```
+
+Always pass `targetTeamID`. Squad parties make the old default (the team opposite the player's current one) unsafe: force-moving a party's leader drags the whole party, so a mate the caller moves next may already be on the wanted team, and "the opposite team" is the one they just left. With a target, a player already there succeeds with no command sent. Omitting it keeps the old toggle and logs at level 2; a target other than 1 or 2 returns `null` without a command. When moving several players, read every target before moving anyone, and never move two players in parallel: `AdminForceTeamChange` toggles, so two commands in flight can undo each other.
 
 After each RCON attempt, the method calls `players.refreshNow(source)` to force a fresh player-list read before checking whether the move landed — verification queries S³'s player registry, not SquadJS's `server.players` cache, eliminating stale-cache false failures.
 
@@ -2251,6 +2255,7 @@ node s3/testing/test-game-state-service.js
 | `test-inspection-embeds.js` | Inspection/embed builders render without throwing on sparse data |
 | `test-sa-per-player-lock.js` | Per-player lock acquisition/release under contention |
 | `test-team-change-retry.js` | Team-change retry loop and give-up conditions |
+| `test-team-change-target.js` | `_requestTeamChange()`'s `targetTeamID` against a fake RCON that drags Squad parties (`fake-party-rcon.js`): an already-there player costs no command, bad targets are refused, no target keeps the toggle; TeamBalancer's `SwapExecutor` keeps a party together whichever member the plan reaches first; Switch's squad and double-switch paths pass explicit targets. Loads the shipped files via `plugin-assembly.js` |
 | `test-request-team-change-eosid.js` | `_requestTeamChange()` sends RCON `switchTeam(eosID)` — a single unambiguous arg, never playerName or a second targetTeamID arg |
 | `test-developer-guide-accuracy.js` | This guide's command table, option defaults and test catalog still match the source — see 11.8 |
 | `test-s3-switch-reports.js` | `!s3 switches`/`!s3 karma`/`!s3 switches export` query layer: range/period parsing, player resolution, source bucketing, games-played, karma, and periodic aggregation, on **SQLite and MySQL** |

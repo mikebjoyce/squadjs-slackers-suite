@@ -185,6 +185,7 @@ export default class SASwapExecutor {
           if (this._requestTeamChange) {
             Logger.verbose('SmartAssign', 2, `[SwapExecutor] Sending RCON move for ${moveData.playerName} (${playerKey}) -> Team ${moveData.targetTeamID}`);
             const result = await this._requestTeamChange(moveData.eosID || playerKey, {
+              targetTeamID: moveData.targetTeamID,
               maxAttempts: 6,
               retryIntervalMs: 500,
               timeoutMs: this.options.maxCompletionTimeMs,

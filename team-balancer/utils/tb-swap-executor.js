@@ -130,11 +130,14 @@ export default class SwapExecutor {
         ? 'TeamBalancer:Micro'
         : 'TeamBalancer:Full';
 
-      for (const [eosID] of this.pendingPlayerMoves.entries()) {
+      for (const [eosID, moveData] of this.pendingPlayerMoves.entries()) {
         try {
-          // Delegate to the base class method which handles retry/verify/warn
+          // Delegate to the base class method which handles retry/verify/warn.
+          // The plan's target goes along so a party mate already dragged
+          // there by their leader's move is left alone, not moved back.
           if (this._requestTeamChange) {
             const result = await this._requestTeamChange(eosID, {
+              targetTeamID: moveData.targetTeamID,
               maxAttempts: 5,
               retryIntervalMs: this.options.changeTeamRetryInterval || 50,
               timeoutMs: this.options.maxScrambleCompletionTime || 15000,

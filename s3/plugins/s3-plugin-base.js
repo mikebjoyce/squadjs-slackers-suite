@@ -1227,7 +1227,7 @@ export default class S3PluginBase extends BasePlugin {
    *
    * Sends AdminForceTeamChange, trying eosID, then steamID, then playerName
    * until one is accepted (see _sendTeamChangeCommand), then uses S³'s
-   * players service to verify the player landed on the opposite team.
+   * players service to verify the player landed on the target team.
    * After each RCON attempt, `refreshNow()` forces
    * an immediate player-list refresh via S³ so verification reads fresh
    * data instead of stale cache. Retries on failure up to maxAttempts,
@@ -1245,7 +1245,11 @@ export default class S3PluginBase extends BasePlugin {
    *   (default: 'You have been scrambled').
    * @param {string} [options.source='S3PluginBase'] - Source identifier
    *   passed to S³'s refreshNow() and the result object.
-   * @returns {Promise<object|null>} Result object, or null if player not found.
+   * @param {number} [options.targetTeamID] - The team the player should end
+   *   up on (1 or 2). A player already there succeeds without a command.
+   *   Omitted, the target is the team opposite the one they're on at entry.
+   * @returns {Promise<object|null>} Result object, or null if player not found
+   *   or targetTeamID is given but isn't 1 or 2.
    *   - success {boolean}: true if verification passed.
    *   - eosID {string}: The player's EOS ID.
    *   - teamID {string|number|null}: The team the player ended up on
@@ -1260,7 +1264,8 @@ export default class S3PluginBase extends BasePlugin {
       maxAttempts = 5,
       warnPlayer = false,
       warnMessage = defaultWarnMessage,
-      source = 'S3PluginBase'
+      source = 'S3PluginBase',
+      targetTeamID: requestedTeamID = null
     } = options;
 
     // ── Resolve player via S³ ─────────────────────────────────
@@ -1270,13 +1275,31 @@ export default class S3PluginBase extends BasePlugin {
       return null;
     }
 
-    // Strict === is safe here: teamID is documented as number|null (see
-    // docs/.agents/skills/creating-squadjs-plugins/references/event-reliability.md),
-    // never a string. Below, current/final-team comparisons go through
-    // String() instead because they compare against targetTeamID, a value
-    // this file computed itself and could just as easily have left numeric.
-    const targetTeamID = playerState.teamID === 1 ? 2 : 1;
     const playerName = playerState.name;
+
+    // Callers should say where the player is going. Squad parties make the
+    // old "move to the other team" default unsafe: force-moving a party's
+    // leader drags the whole party to the leader's new team, so by the time
+    // a mate's own move starts they may already be where the caller wanted,
+    // and "the other team" is the one they just left. With an explicit
+    // target, the already-on-target check below returns success before any
+    // command is sent.
+    let targetTeamID;
+    if (requestedTeamID != null) {
+      targetTeamID = Number(requestedTeamID);
+      if (targetTeamID !== 1 && targetTeamID !== 2) {
+        this.verbose(1, `[TC] Invalid targetTeamID ${requestedTeamID} for ${playerName} (source: ${source}) — aborting.`);
+        return null;
+      }
+    } else {
+      // Strict === is safe here: teamID is documented as number|null (see
+      // docs/.agents/skills/creating-squadjs-plugins/references/event-reliability.md),
+      // never a string. Below, current/final-team comparisons go through
+      // String() anyway, so a stray string teamID on the registry row can't
+      // make an on-target player look off-target.
+      targetTeamID = playerState.teamID === 1 ? 2 : 1;
+      this.verbose(2, `[TC] No targetTeamID from ${source} for ${playerName} — defaulting to the other team (T${targetTeamID}).`);
+    }
 
     this.verbose(
       3,

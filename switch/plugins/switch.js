@@ -800,12 +800,22 @@ export default class Switch extends S3DiscordPluginBase {
                 : Switch.MATCHEND_WARN_DELAY_MS;
             if (warnMs > 0) await delay(warnMs);
 
-            const outcomes = await Promise.allSettled(resolved.map(async (r) => {
-                if (!r.eosID) {
-                    throw new Error(this.localize('switch.errors.noEosIDResolved', { steamID: r.steamID || 'none' }));
+            // One at a time, with every target read before anyone moves. Run
+            // together, two members of one Squad party could undo each other:
+            // AdminForceTeamChange toggles, and a leader's move drags the
+            // party, so a mate's command landing just after flips them back.
+            const targets = resolved.map((r) => (r.eosID ? this._oppositeTeamOf(r.eosID) : null));
+            const outcomes = [];
+            for (const [i, r] of resolved.entries()) {
+                try {
+                    if (!r.eosID) {
+                        throw new Error(this.localize('switch.errors.noEosIDResolved', { steamID: r.steamID || 'none' }));
+                    }
+                    outcomes.push({ status: 'fulfilled', value: await this._taggedSwitchPlayer(r.eosID, 'Admin-Force', targets[i]) });
+                } catch (err) {
+                    outcomes.push({ status: 'rejected', reason: err });
                 }
-                return this._taggedSwitchPlayer(r.eosID, 'Admin-Force');
-            }));
+            }
 
             let failed = 0;
             outcomes.forEach((o, i) => {
@@ -1634,10 +1644,13 @@ export default class Switch extends S3DiscordPluginBase {
                 this.recentDoubleSwitches.push({ eosID: playerEosID, datetime: new Date() });
         }
 
+        // Explicit targets for both hops: over, then back to where they started.
+        const awayTeamID = this._oppositeTeamOf(playerEosID);
+        const homeTeamID = awayTeamID === null ? null : 3 - awayTeamID;
         try {
-            await this._taggedSwitchPlayer(playerEosID, 'Switch-Double-Swap');
+            await this._taggedSwitchPlayer(playerEosID, 'Switch-Double-Swap', awayTeamID);
             await delay(this.options.doubleSwitchDelaySeconds * 1000);
-            await this._taggedSwitchPlayer(playerEosID, 'Switch-Double-Swap');
+            await this._taggedSwitchPlayer(playerEosID, 'Switch-Double-Swap', homeTeamID);
 
             if (forced && senderSteamID) this.warn(senderSteamID, this.localize('switch.warn.playerDoubleSwitched'));
         } catch (err) {
@@ -1651,9 +1664,10 @@ export default class Switch extends S3DiscordPluginBase {
     async switchSquad(number, team) {
         const players = this.getPlayersFromSquad(number, team);
         if (!players) return;
+        const targetTeamID = +team === 1 ? 2 : +team === 2 ? 1 : null;
         for (let p of players) {
             try {
-                await this._taggedSwitchPlayer(p.eosID, 'Admin-Force');
+                await this._taggedSwitchPlayer(p.eosID, 'Admin-Force', targetTeamID);
             } catch (err) {
                 this.verbose(1, `Failed to switch squad member ${p.name}: ${err.message}`);
             }
@@ -1672,10 +1686,12 @@ export default class Switch extends S3DiscordPluginBase {
     async doubleSwitchSquad(number, team) {
         const players = this.getPlayersFromSquad(number, team);
         if (!players) return;
+        const homeTeamID = +team === 1 || +team === 2 ? +team : null;
+        const awayTeamID = homeTeamID === null ? null : 3 - homeTeamID;
         
         for (let p of players) {
             try {
-                await this._taggedSwitchPlayer(p.eosID, 'Switch-Double-Swap');
+                await this._taggedSwitchPlayer(p.eosID, 'Switch-Double-Swap', awayTeamID);
             } catch (err) {
                 this.verbose(1, `First double-switch hop failed for ${p.name}: ${err.message}`);
             }
@@ -1685,7 +1701,7 @@ export default class Switch extends S3DiscordPluginBase {
         
         for (let p of players) {
             try {
-                await this._taggedSwitchPlayer(p.eosID, 'Switch-Double-Swap');
+                await this._taggedSwitchPlayer(p.eosID, 'Switch-Double-Swap', homeTeamID);
             } catch (err) {
                 this.verbose(1, `Second double-switch hop failed for ${p.name}: ${err.message}`);
             }
@@ -1769,9 +1785,24 @@ export default class Switch extends S3DiscordPluginBase {
         return this._enqueueMatchendSwitch(player);
     }
 
-    async _taggedSwitchPlayer(eosID, source) {
+    /**
+     * The team opposite the one S³ has the player on right now, or null when
+     * they're on neither (null leaves _requestTeamChange to its own default).
+     * Callers moving several players read every target before moving anyone:
+     * a party leader's move drags the party, so a mate's "opposite team" read
+     * after that would point back where they came from.
+     */
+    _oppositeTeamOf(eosID) {
+        const teamID = this._s3?.players?.getPlayer?.(eosID)?.teamID;
+        if (teamID === 1) return 2;
+        if (teamID === 2) return 1;
+        return null;
+    }
+
+    async _taggedSwitchPlayer(eosID, source, targetTeamID = null) {
         // Delegate to the base class method which handles retry/verify/recordMove
         const result = await this._requestTeamChange(eosID, {
+            targetTeamID,
             maxAttempts: 3,
             retryIntervalMs: 200,
             timeoutMs: 2000,
@@ -1795,7 +1826,7 @@ export default class Switch extends S3DiscordPluginBase {
 
     switchPlayer(eosID) {
         // Delegate to the base class method
-        return this._taggedSwitchPlayer(eosID, 'SwitchPlayer');
+        return this._taggedSwitchPlayer(eosID, 'SwitchPlayer', this._oppositeTeamOf(eosID));
     }
 
     onNewGame = async () => {

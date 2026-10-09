@@ -217,7 +217,7 @@ const SwitchQueue = {
 
       try {
         plugin.warn(entry.eosID, plugin.localize('switch.warn.switchQueueSwapPartner'));
-        await plugin._taggedSwitchPlayer(eosID, 'Handshake-Swap');
+        await plugin._taggedSwitchPlayer(eosID, 'Handshake-Swap', entry.targetTeamID);
 
         if (!plugin.isLiberalMode()) {
           const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
@@ -446,8 +446,8 @@ const SwitchQueue = {
           plugin.warn(p1.eosID, plugin.localize('switch.warn.switchQueueSwapPartner'));
           plugin.warn(p2.eosID, plugin.localize('switch.warn.switchQueueSwapPartner'));
 
-          await plugin._taggedSwitchPlayer(p1.eosID, 'Player-Queue');
-          await plugin._taggedSwitchPlayer(p2.eosID, 'Player-Queue');
+          await plugin._taggedSwitchPlayer(p1.eosID, 'Player-Queue', p1.targetTeamID);
+          await plugin._taggedSwitchPlayer(p2.eosID, 'Player-Queue', p2.targetTeamID);
 
           if (!plugin.isLiberalMode()) {
             const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
@@ -602,7 +602,7 @@ const SwitchQueue = {
             plugin._removePlayerFromQueue(entry.eosID);
 
             plugin.warn(entry.eosID, timedOut ? plugin.localize('switch.warn.switchQueueQueueTimeout') : plugin.localize('switch.warn.switchQueueBalanceSlot'));
-            await plugin._taggedSwitchPlayer(entry.eosID, 'Player-Queue');
+            await plugin._taggedSwitchPlayer(entry.eosID, 'Player-Queue', entry.targetTeamID);
 
             if (!plugin.isLiberalMode()) {
               const PlayerCooldowns = plugin._getModel('SwitchPlugin_PlayerCooldowns');
