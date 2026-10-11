@@ -54,9 +54,10 @@
  *   - gameState: getRoundStartTime(), getMatchId(), getLayerName(),
  *               getGamemode(), isIgnoredMode(), isFactionVoteInProgress(),
  *               getRoundSnapshot() — round lifecycle and game-mode detection.
- *   - players:   getAllPlayers(), getReconnect(), recordMove(),
- *               rememberReconnect(),
- *               unregisterRefreshInterest() — player state and move tracking.
+ *   - players:   getAllPlayers(), getPlayer(), getReconnect(), recordMove(),
+ *               rememberReconnect(), getJoinPrediction(),
+ *               unregisterRefreshInterest() — player state, move tracking
+ *               and the Squad party signal for a joiner.
  *   - clans:     isEnabled(), extractRawPrefix(), normalizeTag(),
  *               getPlayerTagCache() — clan tag grouping lookups.
  *
@@ -101,6 +102,11 @@
  * - Disconnect detection is delta-diff only (no PLAYER_DISCONNECTED listener) because
  *   that event is unreliable in current Squad/SquadJS. Every forced join refresh also
  *   speeds up disconnect detection for all other players as a side-effect.
+ * - Squad parties: a joiner S³ predicts to be arriving with a party
+ *   (joinPrediction 'party' or 'likely-party') is never assigned, reconnect
+ *   memory included. The executor drops a queued move if a party ID shows up
+ *   before it is sent, and the Switch handshake skips a candidate who is in a
+ *   party. A party joiner who looked solo and was moved is put back by S³.
  * - Algorithm uses a 3-Metric Composite Scoring System aligned with TeamBalancer:
  *     1. Hard Pop Cap: Prevents imbalance beyond dynamic thresholds.
  *     2. Physical Server Cap: Hard limit (50 players per team).
@@ -732,6 +738,20 @@ export default class SmartAssign extends S3PluginBase {
         this._sessionJoinTimes.set(playerKey, Date.now());
       }
 
+      // ═══════════════════════════════════════════════════════════════════════════
+      // SQUAD PARTIES: a party joiner stays where the game put them.
+      // ═══════════════════════════════════════════════════════════════════════════
+      // The game seats a joining party member on their party's team, and a forced
+      // move would split the party. This comes before everything else, reconnect
+      // memory included: a party member who rejoins on the other team is with
+      // their party by choice, so there is no "correct team" to restore and no
+      // blocked reconnect to remediate.
+      const partySignal = this._partyJoinSignal(player);
+      if (partySignal) {
+        Logger.verbose('SmartAssign', 2, `[SmartAssign] ${player.name} left on Team ${player.teamID}: joining with a Squad party (${partySignal}).`);
+        return;
+      }
+
        // ═══════════════════════════════════════════════════════════════════════════
        // CLAN GROUPING: Compute tag locally for SA's own evaluation.
        // ═══════════════════════════════════════════════════════════════════════════
@@ -948,6 +968,31 @@ export default class SmartAssign extends S3PluginBase {
     }
   }
 
+  /**
+   * Whether a joiner is arriving with a Squad party, and how we know.
+   *
+   * The party ID itself shows on the player row several seconds after the
+   * player is listed, which is later than a join move can wait. So the signal
+   * is S³'s join prediction, made when the join was announced: 'party' (the ID
+   * was already there) or 'likely-party' (no ID yet, but already in a squad,
+   * which a solo joiner never is). The live row is read as well, for an ID that
+   * landed between the announcement and this call.
+   *
+   * A joiner who arrives squadless and gets their ID late reads as solo here.
+   * S³ moves them back to their party if this plugin then moves them away.
+   *
+   * @param {object} player - The joining player, from the S3_PLAYER_JOINED payload.
+   * @returns {'party'|'likely-party'|null} null for a joiner to assign as usual.
+   */
+  _partyJoinSignal(player) {
+    const players = this._s3?.players;
+    const prediction = player?.joinPrediction ?? players?.getJoinPrediction?.(player?.eosID) ?? null;
+    if (prediction === 'party' || prediction === 'likely-party') return prediction;
+
+    const partyID = players?.getPlayer?.(player?.eosID)?.partyID ?? player?.partyID ?? null;
+    return partyID !== null ? 'party' : null;
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════════════
   // S³ PLAYER EVENTS
   // ═══════════════════════════════════════════════════════════════════════════════════
@@ -1146,6 +1191,12 @@ export default class SmartAssign extends S3PluginBase {
     // F4: Candidate must NOT be in _joiningPlayers (mid-rejoin)
     if (this._joiningPlayers.has(candidate.eosID)) {
       return { shouldOverride: false, reason: `F4: ${candidate.playerName} is mid-rejoin` };
+    }
+
+    // F4b: Candidate must NOT be in a Squad party. The swap moves one player,
+    // which would split the party, or drag all of it if the candidate leads it.
+    if ((livePlayer.partyID ?? null) !== null) {
+      return { shouldOverride: false, reason: `F4b: ${candidate.playerName} is in a Squad party` };
     }
 
     // --- Virtual constraint checks (F5-F6) ---

@@ -1,6 +1,6 @@
 /**
  * ─────────────────────────────────────────────────────────────────
- *  PLAYER-FACING TRANSLATION TEMPLATE — 320 strings
+ *  PLAYER-FACING TRANSLATION TEMPLATE — 335 strings
  * ─────────────────────────────────────────────────────────────────
  *
  *  GENERATED FILE — do not edit in place.
@@ -40,7 +40,7 @@
  *  Every string here can be read by any player, whether or not they asked to
  *  be: broadcasts the whole server sees at once, AdminWarn popups a single
  *  player reads mid-round, and the public Discord replies anyone in the
- *  channel gets from !elo stats or the leaderboard. 320 strings —
+ *  channel gets from !elo stats or the leaderboard. 335 strings —
  *  the smallest tier, and the only one where an untranslated string lands in
  *  front of someone who never chose the server's language.
  *
@@ -61,6 +61,10 @@ export const MESSAGES = {
     },
   },
   slackersSquadServices: {
+    warn: {
+      // EN: Moved to your party's team.
+      partyReunited: '',
+    },
     driftViolations: {
       // EN: {offenders} row(s) with empty `{column}`
       emptyRows: '',
@@ -194,6 +198,34 @@ export const MESSAGES = {
       switchQueueQueueTimeout: '',
       // EN: [Switch Queue] Balance slot opened — switching now.
       switchQueueBalanceSlot: '',
+      // EN: [Switch] Your party is too large to change teams ({size} players, limit {max}).\nLeave the party to switch on your own.
+      partyTooLarge: '',
+      // EN: [Switch] Your party can't change teams right now: a party member is locked out of switching.
+      partyMemberLockedOut: '',
+      // EN: [Switch] Your party switched to Team {teamID}.
+      partySwitched: '',
+      // EN: [Switch] Only {moved} of {total} party members could be moved.\nThe others can type !switch to follow.
+      partySwitchedPartial: '',
+      // EN: [Switch Queue]\nYour party is already in the queue (position {pos}).\n~{remaining}m auto-expiry | Team {currentTeamID} → Team {targetTeamID}\nType !switch cancel to leave.
+      partyAlreadyQueued: '',
+      // EN: [Switch Queue]\nYour party ({size} players) was added to position {enqueuePos} in the queue.\n~{remainingQueueMs}m auto-expiry | Team {teamID} → Team {targetTeam}\n{reason}\nType !switch cancel to leave.
+      partyQueueAdded: '',
+      // EN: [Switch Queue]\nYour party is at position {pos} in the queue.\n~{remaining}m remaining | Team {currentTeamID} → Team {targetTeamID}\nType !switch cancel to leave.
+      partyQueuePosition: '',
+      // EN: [Switch Queue] Room opened for your party. Switching now.
+      partyQueueSlotOpened: '',
+      // EN: [Switch Queue] Queue timeout. Switching your party now.
+      partyQueueTimeout: '',
+      // EN: [Switch Queue] You joined a party, so your switch request was cancelled.\nType !switch again to move your whole party.
+      partyQueueCancelledJoined: '',
+      // EN: [Switch Queue] Your party changed while you were queued, so its switch request was cancelled.\nType !switch again.
+      partyQueueCancelledChanged: '',
+      // EN: [Switch Queue] {name} cancelled your party's switch request.
+      partyQueueCancelledByMember: '',
+      // EN: Double switch isn't available while you're in a party.
+      doubleSwitchParty: '',
+      // EN: {name} is in a party with {mates}. If {name} leads it, they moved too.
+      adminPartyNotice: '',
       // EN: [Switch] Team switching is open. Use '!switch help' for details. Window: ~{remainingMin}m.
       switchTeamSwitchingOpen: '',
       // EN: [Switch] ~{remainingMin}m remaining to request a team change. Use '!switch check' to see your eligibility.

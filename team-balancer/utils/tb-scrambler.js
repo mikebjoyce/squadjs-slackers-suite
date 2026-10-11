@@ -16,7 +16,7 @@
  *   Object with one public method:
  *     scrambleTeamsPreservingSquads({ squads, players, winStreakTeam,
  *       scramblePercentage, eloMap, debug, clanGroups, pullEntireSquads,
- *       minPlayersToMove, maxPlayersToMove })
+ *       membersOnlyTags, minPlayersToMove, maxPlayersToMove })
  *       Returns an Array of { eosID, targetTeamID } move objects,
  *       with a calculationTime property attached to the array, plus a
  *       virtualSquads property when clan grouping built at least one
@@ -45,6 +45,9 @@
  *     veteranPenalty      — Imbalanced regular player counts (ELO mode only).
  *     clanCohesionConstraint — Hard constraint: candidates that split any clan are rejected (score = Infinity).
  *     anchorPenalty       — Moving >2 large squads from one team (Heuristic mode only).
+ * - clanGroups carries every group that must stay on one team: clan groups and Squad parties, already
+ *   merged where they share a player (tb-party-groups.js). The names below say "clan" for both.
+ *   membersOnlyTags names the groups that never pull a whole extra squad along (parties).
  * - clanGroups is optional. When present, builds virtual squads to keep same-team clan members together.
  *   Clan cohesion is a hard constraint — candidates that would split a clan group are rejected outright
  *   (score = Infinity). Runs identically in both ELO and heuristic modes.
@@ -73,7 +76,8 @@ export const Scrambler = {
     minPlayersToMove = 0,
     maxPlayersToMove = 0,
     clanGroups = null,
-    pullEntireSquads = false
+    pullEntireSquads = false,
+    membersOnlyTags = null
   }) {
     const startTime = Date.now();
     const totalPlayers = players.length;
@@ -188,6 +192,11 @@ export const Scrambler = {
           if (sameTeamMembers.length < PER_TEAM_MIN) continue;
 
           const memberSet = new Set(sameTeamMembers);
+          // A group in membersOnlyTags (a Squad party with no clan in it) takes only its
+          // own members out of any squad other than its anchor, whatever pullEntireSquads
+          // says. A party is a few friends; pulling a second whole squad along with one of
+          // them builds a unit too big to balance with.
+          const pullWhole = pullEntireSquads && !membersOnlyTags?.has(tag);
 
            // Squads (real or unassigned-pseudo) currently in candidates that hold any clan member.
            // A squad already claimed as a prior clan's anchor stays a valid *source* — this
@@ -229,7 +238,7 @@ export const Scrambler = {
           const seen = new Set(anchor.players);
           const newPlayers = [...anchor.players];
           for (const s of others) {
-            const absorbWhole = pullEntireSquads && !claimedAnchorIds.has(s.id);
+            const absorbWhole = pullWhole && !claimedAnchorIds.has(s.id);
             for (const p of s.players) {
               const include = absorbWhole || memberSet.has(p);
               if (include && !seen.has(p)) {
@@ -280,7 +289,7 @@ export const Scrambler = {
                 claimedAnchorIds.add(s.id);
                 continue;
               }
-              if (pullEntireSquads && !claimedAnchorIds.has(s.id)) {
+              if (pullWhole && !claimedAnchorIds.has(s.id)) {
                 teamCandidates.splice(i, 1);
               } else {
                 const remaining = s.players.filter((p) => !memberSet.has(p));

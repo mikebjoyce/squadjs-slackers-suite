@@ -46,6 +46,7 @@
  * ═══════════════════════════════════════════════════════════════
  */
 import Logger from '../../core/logger.js';
+import { PARTY_TAG_PREFIX } from './tb-party-groups.js';
 
 /**
  * Sticky once discovered: this discord.js only understands the singular
@@ -491,6 +492,8 @@ export const DiscordHelpers = {
       ['★', tb.localize('teamBalancer.embeds.regular10Rounds')],
       ['◆', tb.localize('teamBalancer.embeds.clanMemberVirtualSquad')],
       ['◇', tb.localize('teamBalancer.embeds.pulledWithSquad')],
+      // PARTY_TAG_PREFIX from tb-party-groups.js: the tag of a unit made of a Squad party.
+      [PARTY_TAG_PREFIX.trim(), tb.localize('teamBalancer.embeds.squadParty')],
       ['⚓', tb.localize('teamBalancer.embeds.anchorSquad')]
     ].filter(([symbol]) => body.includes(symbol)).map(([symbol, text]) => `${symbol} ${text}`);
 

@@ -699,7 +699,7 @@ function assertTable(label, verbs, classify) {
 test('every scope !s3 can return is a COMMAND_SCOPE value', () => {
   const verbs = [
     ['status'], ['services'], ['gamestate'], ['factions'], ['locks'], ['config'],
-    ['switches'], ['karma'], ['diag'], ['players'], ['clans'],
+    ['switches'], ['karma'], ['diag'], ['players'], ['clans'], ['parties'],
     ['servers'], ['servers', 'alias'], ['servers', 'forget'],
     ['db'], ['db', 'export'], ['db', 'import'], ['db', 'orphans'],
     ['backup'], ['backup', 'list'], ['backup', 'restore'], ['backup', 'create'],
@@ -777,6 +777,9 @@ test('the multi-embed reads are the ones that ask for a target', () => {
   assert.equal(scopeForTeamBalancerCommand('teambalancer', ['diag']).selectorRequired, true);
   assert.equal(scopeForS3Command(['players']).selectorRequired, true);
   assert.equal(scopeForS3Command(['clans']).selectorRequired, true);
+  // One embed, but a busy server fills it, so it asks for a target too.
+  assert.equal(scopeForS3Command(['parties']).scope, COMMAND_SCOPE.SERVER_READ);
+  assert.equal(scopeForS3Command(['parties']).selectorRequired, true);
   assert.equal(scopeForS3Command(['status']).selectorRequired, false);
 });
 

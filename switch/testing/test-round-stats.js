@@ -60,6 +60,7 @@ import DBService from '../../s3/utils/db-service.js';
 import SwitchDB from '../utils/switch-db.js';
 import SwitchOutput from '../utils/switch-output.js';
 import SwitchQueue from '../utils/switch-queue.js';
+import SwitchParties from '../utils/switch-parties.js';
 import SwitchCommands from '../utils/switch-commands.js';
 import SwitchExplain from '../utils/switch-explain.js';
 import { buildAssembly, importFromAssembly, cleanAssembly } from '../../s3/testing/plugin-assembly.js';
@@ -267,6 +268,7 @@ async function buildPlugin({ dialect = 'sqlite', options = {}, matchId = 'round-
 
   SwitchOutput.register(plugin);
   SwitchQueue.register(plugin);
+  SwitchParties.register(plugin);
   SwitchCommands.register(plugin);
   SwitchExplain.register(plugin);
   await SwitchDB.register(plugin);

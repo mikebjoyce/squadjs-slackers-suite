@@ -166,6 +166,14 @@ The Switch Handshake feature allows SmartAssign to optionally include Switch-que
 
 SmartAssign uses a hierarchical decision process optimised for competitive parity and real-world stability:
 
+### Squad Parties Are Left Alone
+
+A player who joins with a Squad party is never moved. The game already seats them on their party's team, and a forced move would split the party. This check runs before every rule below, reconnect memory included, so a party member who rejoins on the other team stays with their party.
+
+The game shows a joiner's party ID a few seconds after they connect, which is later than a join move can wait. S³ predicts it at the moment of joining: a joiner who already carries a party ID, or who is already in a squad, is treated as a party joiner. Solo joiners arrive squadless, so they're assigned as usual, with no added delay. If a party ID turns up after the decision but before the move is sent, the move is dropped. The Switch handshake skips a queued player who is in a party for the same reason.
+
+One case slips through. A party joiner whose mates' squad is full or locked arrives squadless, looks solo, and can be moved away from their party. S³ puts them back once the party ID shows, if its `partyReunite` option is on (the default). `!s3 parties` shows how often the prediction misses.
+
 ### 1. Hard Population Cap (Dynamic)
 
 The hard cap is a safety net that prevents extreme imbalance regardless of the Elo scoring outcome:

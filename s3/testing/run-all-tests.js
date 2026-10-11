@@ -201,6 +201,7 @@ const CATEGORY_TESTS = {
     'test-team-change-retry.js',
     'test-request-team-change-eosid.js',
     'test-team-change-target.js',
+    'test-parties-service.js',
     'test-migration-pipeline.js',
     'test-migrate-flag-safety.js',
     'test-migration-prompt-identity.js',

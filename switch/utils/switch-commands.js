@@ -242,9 +242,12 @@ const SwitchCommands = {
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
               pl = plugin.getPlayerByUsernameOrSteamID(eosID, commandSplit.splice(1).join(' '))
               if (pl) {
+                // Read before the move: the notice is about who is tied to whom now.
+                const partyNotice = plugin._partyNotice([pl.eosID]);
                 plugin._taggedSwitchPlayer(pl.eosID, 'Admin-Force', plugin._oppositeTeamOf(pl.eosID)).catch(err => {
                   plugin.verbose(1, `Admin switch now failed: ${err.message}`);
                 });
+                if (partyNotice) plugin.warn(eosID, partyNotice);
               }
               break;
             case 'swap':
@@ -263,9 +266,11 @@ const SwitchCommands = {
                   // Both targets read first: if p1 leads p2's party, p1's move drags p2.
                   const p1Target = plugin._oppositeTeamOf(p1.eosID);
                   const p2Target = plugin._oppositeTeamOf(p2.eosID);
+                  const partyNotice = plugin._partyNotice([p1.eosID, p2.eosID]);
                   await plugin._taggedSwitchPlayer(p1.eosID, 'Admin-Force', p1Target);
                   await plugin._taggedSwitchPlayer(p2.eosID, 'Admin-Force', p2Target);
                   plugin.warn(steamID, plugin.localize('switch.warn.swapped', { name: p1.name, name2: p2.name }));
+                  if (partyNotice) plugin.warn(eosID, partyNotice);
                 } else {
                   plugin.warn(steamID, plugin.localize('switch.warn.oneBothPlayersNot'));
                 }
@@ -279,7 +284,9 @@ const SwitchCommands = {
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
               pl = plugin.getPlayerByUsernameOrSteamID(eosID, commandSplit.splice(1).join(' '))
               if (pl) {
+                const partyNotice = plugin._partyNotice([pl.eosID]);
                 await plugin.doubleSwitchPlayer(pl.eosID, true);
+                if (partyNotice) plugin.warn(eosID, partyNotice);
               }
               break;
             case 'squad':
@@ -290,7 +297,11 @@ const SwitchCommands = {
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
               await plugin.server.updateSquadList();
               await plugin.server.updatePlayerList();
-              await plugin.switchSquad(+commandSplit[1], commandSplit[2]);
+              {
+                const squadPartyNotice = plugin._partyNotice((plugin.getPlayersFromSquad(+commandSplit[1], commandSplit[2]) || []).map(p => p.eosID));
+                await plugin.switchSquad(+commandSplit[1], commandSplit[2]);
+                if (squadPartyNotice) plugin.warn(eosID, squadPartyNotice);
+              }
               break;
             case 'refresh':
               await plugin.server.updateSquadList();
@@ -333,7 +344,11 @@ const SwitchCommands = {
               plugin.verbose(1, `[Admin] Command '${subCommand}' accepted from ${playerName}`);
               await plugin.server.updateSquadList();
               await plugin.server.updatePlayerList();
-              await plugin.doubleSwitchSquad(+commandSplit[1], commandSplit[2]);
+              {
+                const squadPartyNotice = plugin._partyNotice((plugin.getPlayersFromSquad(+commandSplit[1], commandSplit[2]) || []).map(p => p.eosID));
+                await plugin.doubleSwitchSquad(+commandSplit[1], commandSplit[2]);
+                if (squadPartyNotice) plugin.warn(eosID, squadPartyNotice);
+              }
               break;
             case "matchendsquad":
               if (!isAdmin) {
@@ -669,6 +684,13 @@ const SwitchCommands = {
                 const cancelEntry = plugin._findQueueEntry(info.player?.eosID);
                 if (plugin._removePlayerFromQueue(info.player?.eosID)) {
                   plugin.warn(eosID, plugin.localize('switch.warn.switchQueueRemovedLeft'));
+                  // A party's entry belongs to all of its members, and any of
+                  // them can cancel it. The others are told who did.
+                  if (cancelEntry?.entry.kind === 'party') {
+                    for (const id of cancelEntry.entry.memberEosIDs) {
+                      if (id !== eosID) plugin.warn(id, plugin.localize('switch.warn.partyQueueCancelledByMember', { name: playerName }));
+                    }
+                  }
                   if (plugin._roundStats && cancelEntry) {
                     const dur = Math.round((Date.now() - cancelEntry.entry.queuedAt) / 1000);
                     plugin._trackRoundStat('queueCancels', {
@@ -712,6 +734,15 @@ const SwitchCommands = {
           // handled by enqueuing instead of a dead-end return.
           if (!eosID) {
             plugin.verbose(1, `[PlayerCooldowns] Missing eosID for player ${playerName}, skipping switch validation`);
+            return;
+          }
+
+          // A Squad party switches as a group or not at all, under its own
+          // rules: every member is checked, and tokens never bar a party.
+          // See switch-parties.js.
+          const switchParty = plugin._partyForSwitch(eosID);
+          if (switchParty) {
+            await plugin._handlePartySwitchRequest(info.player, teamID, switchParty);
             return;
           }
 

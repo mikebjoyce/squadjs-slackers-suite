@@ -41,6 +41,13 @@
  * - _periodicProcessingActive gates the S3_PLAYERS_UPDATED handler.
  * - Pair trading fires when opposing-team players are both queued.
  * - Solo slot consumption fires when balance opens for one side.
+ * - A Squad party queues as one entry (kind: 'party', see
+ *   switch-parties.js) holding every member who moves. It is found from
+ *   any member's eosID, is never one side of a pair trade, and is served
+ *   by the slot path only when all of its members fit at once. While it
+ *   waits at the head of a sub-queue, the first solo entry behind it may
+ *   be served. An entry voided by a party change is cancelled before any
+ *   move: a solo whose player joined a party, or a party that changed.
  *
  * Author:
  * Discord: `real_slacker`
@@ -132,28 +139,34 @@ const SwitchQueue = {
       );
       plugin.verbose(1, `[Queue] ${playerName} (T${teamID} → T${targetTeam}) enqueued at position ${enqueuePos}. Queue size: ${plugin._getQueueSize()}`);
 
-      // Conditional refresh registration: register 5s interest when queue transitions
-      // from empty to non-empty, so _processQueue polls frequently while people wait.
-      if (plugin._getQueueSize() === 1) {
-        if (plugin._s3?.players?.registerRefreshInterest) {
-          plugin._s3.players.registerRefreshInterest('Switch', { maxStalenessMs: 5000 });
-          plugin.verbose(2, '[S3] Registered Switch refresh interest (maxStalenessMs=5000) — queue became active.');
-        }
-        // Also listen to S3_PLAYERS_UPDATED for periodic processing heartbeat
-        // while the queue is non-empty. This hooks into S3's existing refresh polling
-        // rather than creating a separate timer.
-        // Guard: only register if not already active to prevent listener accumulation.
-        // Without this guard, rapid queue transitions (empty→non-empty→empty→non-empty)
-        // would stack multiple S3_PLAYERS_UPDATED listeners, causing the
-        // MaxListenersExceededWarning and duplicate _processQueue invocations.
-        if (!plugin._periodicProcessingActive) {
-          plugin.server.on('S3_PLAYERS_UPDATED', plugin._onPlayerInfoUpdated);
-          plugin._periodicProcessingActive = true;
-          plugin.verbose(2, '[S3] Started periodic queue processing via S3_PLAYERS_UPDATED events.');
-        }
-      }
+      if (plugin._getQueueSize() === 1) plugin._activateQueueProcessing();
 
       plugin._requestQueueRefresh();
+    };
+
+    /**
+     * Start polling and processing for a queue that just went from empty to
+     * non-empty. Shared by the solo and party enqueue paths.
+     */
+    plugin._activateQueueProcessing = function () {
+      // Conditional refresh registration: register 5s interest when queue transitions
+      // from empty to non-empty, so _processQueue polls frequently while people wait.
+      if (plugin._s3?.players?.registerRefreshInterest) {
+        plugin._s3.players.registerRefreshInterest('Switch', { maxStalenessMs: 5000 });
+        plugin.verbose(2, '[S3] Registered Switch refresh interest (maxStalenessMs=5000) — queue became active.');
+      }
+      // Also listen to S3_PLAYERS_UPDATED for periodic processing heartbeat
+      // while the queue is non-empty. This hooks into S3's existing refresh polling
+      // rather than creating a separate timer.
+      // Guard: only register if not already active to prevent listener accumulation.
+      // Without this guard, rapid queue transitions (empty→non-empty→empty→non-empty)
+      // would stack multiple S3_PLAYERS_UPDATED listeners, causing the
+      // MaxListenersExceededWarning and duplicate _processQueue invocations.
+      if (!plugin._periodicProcessingActive) {
+        plugin.server.on('S3_PLAYERS_UPDATED', plugin._onPlayerInfoUpdated);
+        plugin._periodicProcessingActive = true;
+        plugin.verbose(2, '[S3] Started periodic queue processing via S3_PLAYERS_UPDATED events.');
+      }
     };
 
     plugin._getRemainingQueueMs = function (queuedAt) {
@@ -178,14 +191,38 @@ const SwitchQueue = {
       plugin.verbose(2, `[Queue] All entries cleared: ${reason}`);
     };
 
+    // Solo entries only. The snapshot feeds SmartAssign's join handshake, which
+    // trades one joiner for one queued player; a party entry is several
+    // players who move together or not at all.
     plugin.getQueueSnapshot = function () {
+      const solo = (arr) => arr.filter(e => e.kind !== 'party');
       return {
-        t1ToT2: plugin._switchQueue.t1.map(e => ({ eosID: e.eosID, steamID: e.steamID, playerName: e.playerName, currentTeamID: e.currentTeamID, targetTeamID: e.targetTeamID, queuedAt: e.queuedAt })),
-        t2ToT1: plugin._switchQueue.t2.map(e => ({ eosID: e.eosID, steamID: e.steamID, playerName: e.playerName, currentTeamID: e.currentTeamID, targetTeamID: e.targetTeamID, queuedAt: e.queuedAt }))
+        t1ToT2: solo(plugin._switchQueue.t1).map(e => ({ eosID: e.eosID, steamID: e.steamID, playerName: e.playerName, currentTeamID: e.currentTeamID, targetTeamID: e.targetTeamID, queuedAt: e.queuedAt })),
+        t2ToT1: solo(plugin._switchQueue.t2).map(e => ({ eosID: e.eosID, steamID: e.steamID, playerName: e.playerName, currentTeamID: e.currentTeamID, targetTeamID: e.targetTeamID, queuedAt: e.queuedAt }))
       };
     };
 
+    /**
+     * Whether the handshake may take this player's entry. It moves exactly one
+     * player, so it may not take a party's entry, nor a solo entry whose
+     * player has joined a party since (that entry is cancelled on the spot).
+     */
+    plugin._handshakeMayTake = function (eosID) {
+      const found = plugin._findQueueEntry(eosID);
+      if (!found) return true;
+      if (found.entry.kind === 'party') {
+        plugin.verbose(1, `[Queue] Handshake refused for ${eosID}: the entry is a party's.`);
+        return false;
+      }
+      if (plugin._cancelIfPartyChanged?.(found.entry)) {
+        plugin.verbose(1, `[Queue] Handshake refused for ${found.entry.playerName}: joined a party while queued.`);
+        return false;
+      }
+      return true;
+    };
+
     plugin.consumeQueueEntry = function (eosID) {
+      if (!plugin._handshakeMayTake(eosID)) return null;
       const entry = plugin._removePlayerFromQueue(eosID);
       if (entry) {
         plugin.verbose(1, `[Queue] ${entry.playerName} consumed externally via handshake. Queue size: ${plugin._getQueueSize()}`);
@@ -208,6 +245,7 @@ const SwitchQueue = {
     };
 
     plugin.forceQueueSwap = async function (eosID) {
+      if (!plugin._handshakeMayTake(eosID)) return false;
       const entry = plugin._removePlayerFromQueue(eosID);
       if (!entry) {
         plugin.verbose(1, `[Queue] forceQueueSwap: ${eosID} not found in queue (already consumed/cancelled/disconnected).`);
@@ -332,7 +370,9 @@ const SwitchQueue = {
                   gamePhase
                 });
               }
-              plugin.warn(entry.eosID, plugin.localize('switch.warn.switchQueueRemovedQueue', { queueTimeoutMinutes: plugin.options.queueTimeoutMinutes }));
+              for (const id of entry.kind === 'party' ? entry.memberEosIDs : [entry.eosID]) {
+                plugin.warn(id, plugin.localize('switch.warn.switchQueueRemovedQueue', { queueTimeoutMinutes: plugin.options.queueTimeoutMinutes }));
+              }
               plugin.verbose(2, `[Queue] ${entry.playerName} expired and removed from queue.`);
             }
           }
@@ -358,13 +398,21 @@ const SwitchQueue = {
           && prevSnapshot.t2 === t2;
         plugin._lastTeamSnapshot = { t1, t2 };
 
-        const t1Candidates = [...plugin._switchQueue.t1];
-        const t2Candidates = [...plugin._switchQueue.t2];
+        // Pair trades are solo for solo. A party entry is several players, so
+        // it is never one side of a trade; it waits for the slot path below.
+        const t1Candidates = plugin._switchQueue.t1.filter(e => e.kind !== 'party');
+        const t2Candidates = plugin._switchQueue.t2.filter(e => e.kind !== 'party');
         const pairCount = Math.min(t1Candidates.length, t2Candidates.length);
 
         for (let i = 0; i < pairCount; i++) {
           const p1 = t1Candidates[i];
           const p2 = t2Candidates[i];
+
+          // An earlier trade in this loop awaited RCON, so either entry may
+          // have been removed since the candidate lists were copied: by a
+          // disconnect, a cancel, or a party change.
+          if (plugin._findQueueEntry(p1.eosID)?.entry !== p1 || plugin._findQueueEntry(p2.eosID)?.entry !== p2) continue;
+          if (plugin._cancelIfPartyChanged?.(p1) || plugin._cancelIfPartyChanged?.(p2)) continue;
 
           // Use S³'s authoritative player registry for live checks — handles null-teamID
           // projection and deduped state. _processQueue only runs in response to
@@ -536,10 +584,30 @@ const SwitchQueue = {
           plugin.verbose(2, `[Queue] T1: ${t1Queued} queued | T2: ${t2Queued} queued | Teams: ${t1}v${t2} | Diff: ${t1 - t2}`);
         }
 
-        const firstT1 = plugin._switchQueue.t1[0] || null;
-        const firstT2 = plugin._switchQueue.t2[0] || null;
+        // Who the slot path may serve from one sub-queue: its head, and when the
+        // head is a party, the first solo entry behind it as well. A party
+        // needs room for all of its members at once and can wait a long time
+        // for it; a solo player behind it should not wait with it. The party
+        // keeps its place either way.
+        const slotCandidates = (arr) => {
+          const head = arr[0];
+          if (!head) return [];
+          if (head.kind !== 'party') return [head];
+          const solo = arr.find(e => e.kind !== 'party');
+          return solo ? [head, solo] : [head];
+        };
 
-        for (const entry of [firstT1, firstT2].filter(Boolean)) {
+        for (const entry of [...slotCandidates(plugin._switchQueue.t1), ...slotCandidates(plugin._switchQueue.t2)]) {
+          if (entry.kind === 'party') {
+            const partyTimedOut = plugin.timeLimitEnabled && plugin.options.queueTimeoutSwitchEnabled && (nowTs - entry.queuedAt) >= queueTimeoutMs;
+            const outcome = await plugin._servePartyQueueEntry(entry, partyTimedOut);
+            if (outcome === 'served') break;
+            continue;
+          }
+          // The pair trades above awaited RCON, and a tick may have landed
+          // in that time: this player may have joined a party since.
+          if (plugin._cancelIfPartyChanged?.(entry)) continue;
+
           // Use S³'s authoritative player registry — handles null-teamID projection
           // and deduped state. _processQueue only runs in response to S3_PLAYERS_UPDATED,
           // which fires AFTER S³ has committed its internal state from the tick.
@@ -693,9 +761,11 @@ const SwitchQueue = {
       }
     };
 
+    // A party entry is found from any of its members, so a second member's
+    // !switch, a member's cancel and a member's disconnect all reach it.
     plugin._findQueueEntry = function (eosID) {
       for (const subQueue of ['t1', 't2']) {
-        const idx = plugin._switchQueue[subQueue].findIndex(e => e.eosID === eosID);
+        const idx = plugin._switchQueue[subQueue].findIndex(e => e.eosID === eosID || (e.kind === 'party' && e.memberEosIDs.includes(eosID)));
         if (idx !== -1) {
           return { entry: plugin._switchQueue[subQueue][idx], subQueue, index: idx };
         }

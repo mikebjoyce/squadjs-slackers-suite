@@ -146,8 +146,9 @@ The `!s3` admin command surface is organised across:
 
 | Command | Handler | Description |
 |---------|---------|-------------|
-| `!s3 players` | `s3-commands.js` | Population overview + one embed per team, broken down by squad. Marks squad leaders (👑), locked squads, and per-player locks. "Unassigned" means not in a squad. |
+| `!s3 players` | `s3-commands.js` | Population overview + one embed per team, broken down by squad. Marks squad leaders (👑), locked squads, per-player locks, and Squad party members (`ᴾ1`, `ᴾ2`: same number, same party). "Unassigned" means not in a squad. |
 | `!s3 clans` | `s3-commands.js` | Active clan groups, plus a second embed explaining why every other tag was excluded (below `minSize`, above `maxSize`, on `ignoreList`, unnormalizable) and every Damerau-Levenshtein merge and recruit-suffix strip |
+| `!s3 parties` | `s3-commands.js` | Squad parties, largest first: members, team (or a split marker with who is on which team), squads, size and age. Each party is named after a member, because the game's own party number changes whenever another party forms or dissolves. Also the join prediction counts and the reunite counts |
 | `!s3 switches [ident] [range]` | `s3-commands.js` | Team-switch leaderboard (no ident — Legacy pre-split Balancer moves fold into Full, since they're definitionally non-micro), or one player's breakdown grouped into Balancer/Scrambles vs. Manual/Switch |
 | `!s3 switches export [range] [period] [--json]` | `s3-commands.js` | One row per `daily`/`weekly`/`monthly` period per active player — games played, total switches, and the full source breakdown — as a CSV (default) or JSON file attachment. Players silent all period get no row |
 | `!s3 karma <ident> [range]` | `s3-commands.js` | Win-rate of a player's own switch decisions (self/untracked only — excludes balancer and SmartAssign moves) vs. the eventual round winner, with switch frequency context (N switches in G games — P% of rounds) and a directional verdict |
@@ -289,6 +290,12 @@ current number.
 | `clanTagIgnoreList` | no | array | `[]` | Clan tags excluded from grouping |
 | `clanRecruitSuffixes` | no | array | `["r", "-r"]` | Suffixes to strip from clan tags when the base tag (without suffix) exists on other players. Enabled by default for common recruit tags (case-insensitive, so "R" and "-R" are also matched). Set to `[]` to disable. Stripping only occurs when the base tag is present on at least one other player in the data set. |
 | `clanGroupingPullEntireSquads` | no | boolean | `true` | Pull non-clan teammates with clan members |
+| `partyReunite` | no | boolean | `true` | Move a player who has just joined to their Squad party's team when they landed on the other one. Once per connection. Set `false` to stop S³ moving players itself |
+| `partyReuniteWindowSeconds` | no | number | `90` | How long after joining a player can still be moved to their party. A party ID can take close to a minute to show after a join |
+| `partyReuniteMaxTeamDiff` | no | number | `3` | A player is not moved to their party when that would leave the party's team ahead by more than this many players. Keep it no looser than the server's own `NumPlayersDiffForTeamChanges` |
+| `partyJoinCheckSeconds` | no | number | `60` | How long after a join S³ waits before checking its join-time party prediction against whether a party ID showed |
+| `partyFalseAlarmWarnPercent` | no | number | `30` | Log a warning, at most once an hour, when more than this percentage of joiners who arrived in a squad never showed a party ID |
+| `partyMissWarnPercent` | no | number | `25` | Log a warning, at most once an hour, when more than this percentage of party joiners arrived squadless and were treated as solo |
 | `enableDatabaseLogging` | no | boolean | `true` | Enable shared S³ logging tables (S3_PlayerEvents, S3_GameStateEvents, S3_PlayerSnapshots). When false, LoggingService runs in no-op mode. |
 | `enableFileLogging` | no | boolean | `false` | Enable JSONL file mirror for S³ logging events. Each DB write is also appended as a self-contained JSONL line to the logPath file. |
 | `logPath` | no | string | `"./s3-log.jsonl"` | Path to JSONL file for S³ event mirror. Only used when enableFileLogging is true. |

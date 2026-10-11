@@ -103,6 +103,7 @@ Add the following to your SquadJS `config.json`:
     "doubleSwitchEnabledMinutes": 10,
     "endMatchSwitchSlots": 3,
     "maxUnbalancedSlots": 1,
+    "maxPartySwitchSize": 3,
     "scrambleLockdownDurationMinutes": 30,
     "liberalSwitchGameModes": ["Seed", "Jensen"],
     "liberalSwitchMaxUnbalancedSlots": 6,
@@ -133,6 +134,7 @@ squad-server/
 │   ├── switch-db.js
 │   ├── switch-output.js
 │   ├── switch-queue.js
+│   ├── switch-parties.js
 │   ├── switch-explain.js
 │   └── switch-commands.js
 ```
@@ -196,6 +198,26 @@ When `explainChannelID` is set, the full explain embed sequence plus a 7-day rel
 
 ---
 
+## Squad Parties
+
+A player in a Squad party can't be switched on their own. Force-moving the party's leader takes the whole party to the other team, force-moving anyone else leaves the party split, and the game doesn't say which member leads. So `!switch` from a party member is a request for the party: every member on the requester's team moves together, or nobody does. Party tracking comes from S³.
+
+What that changes for players:
+
+* Parties of up to `maxPartySwitchSize` (default 3) can switch. A larger party is refused and told to leave the party to switch alone.
+* One member under scramble lockdown, the post-switch lockout or a closed switch window blocks the whole party. The refusal doesn't name them.
+* Tokens never block a party. Each member who moves pays one token, and a member with none still moves and stays at zero.
+* The balance check asks whether the whole group fits. If it doesn't, the party queues as one entry, and any member typing `!switch` again is told its position. A party waits until there's room for all of it; solo players queued behind it can still be served.
+* A party already split across teams is put back together by one of its members asking: only the members on the requester's team move.
+* If a party changes while it's queued (someone joins, leaves or disconnects), its request is cancelled and the members are asked to type `!switch` again. A solo player who joins a party while queued is cancelled the same way.
+* `!bug` / `!stuck` / `!doubleswitch` aren't available to a player in a party.
+
+Admin commands still move exactly the players named. When one of them is in a party with someone who isn't being moved, the admin is told who, since the rest of the party follows if that player leads it.
+
+A party is never traded against queued solo players on the other team (two party members for two solos, say). On a full server that would be the likeliest way for a party to get through, and it isn't built yet.
+
+---
+
 ## Handshake Integration
 
 The Switch plugin exposes a public API for external consumers (such as SmartAssign) to read and consume queue entries. This is used by the **SA-Switch Handshake** feature: when SmartAssign evaluates a joining player, it may swap them with a Switch-queued player for a more balanced outcome that also satisfies the Switch player's request.
@@ -204,8 +226,8 @@ The Switch plugin exposes a public API for external consumers (such as SmartAssi
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `getQueueSnapshot()` | `() → { t1ToT2: Array, t2ToT1: Array }` | Returns shallow copies of both directional sub-queues. Read-only — no side effects. Each entry exposes `{ eosID, steamID, playerName, currentTeamID, targetTeamID, queuedAt }`. `warnInterval` is NOT exposed. |
-| `forceQueueSwap(eosID)` | `(String) → boolean` | Removes the player from the queue, clears warn intervals, and executes the RCON switch. Returns `true` on success, `false` if player was already consumed/cancelled/disconnected. |
+| `getQueueSnapshot()` | `() → { t1ToT2: Array, t2ToT1: Array }` | Returns shallow copies of both directional sub-queues. Read-only — no side effects. Each entry exposes `{ eosID, steamID, playerName, currentTeamID, targetTeamID, queuedAt }`. `warnInterval` is NOT exposed. A Squad party's queue entry is left out: the handshake trades one player for one. |
+| `forceQueueSwap(eosID)` | `(String) → boolean` | Removes the player from the queue, clears warn intervals, and executes the RCON switch. Returns `true` on success, `false` if player was already consumed/cancelled/disconnected, or is in a Squad party. |
 | `consumeQueueEntry(eosID)` | `(String) → Entry \| null` | _(Alternative)_ Removes queue bookkeeping only — does NOT execute RCON. Returns the entry or null. |
 
 ### Version Compatibility
@@ -247,6 +269,7 @@ External plugins discover Switch at runtime via `this.server.plugins.find(p => p
 | `switchEnabledMinutes` | Time window (minutes) after join/match start to request a switch | `10` |
 | `queueTimeoutMinutes` | Minutes a player can wait in the switch queue before removal | `15` |
 | `maxUnbalancedSlots` | Max player difference between teams to allow a switch | `1` |
+| `maxPartySwitchSize` | Largest Squad party `!switch` will move. A bigger party is refused and told to leave the party to switch alone. Not applied in liberal mode. | `3` |
 | `scrambleLockdownDurationMinutes` | Duration to block switching after a scramble | `30` |
 | `scrambleLockdownMinPlayers` | Minimum total players required to apply scramble lockdown. Below this threshold, scrambles clear the queue but do not lock switching. | `60` |
 

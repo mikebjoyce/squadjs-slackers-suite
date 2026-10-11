@@ -30,13 +30,14 @@ switch/testing/
 ├── test-community-token-cap.js  # Two token caps, one community bucket (real instance)
 ├── test-scramble-lockdown.js  # onScrambleExecuted's real write path (real DB)
 ├── test-post-switch-lockout.js  # Real post-switch lockout gate (real instance, no DB)
+├── test-party-switch.js       # Squad parties: group !switch, party queue entries, cancel on party change (real instance, no DB)
 ├── test-admin-mutations.js    # Admin wipe/clear/regen write paths (real DB)
 ├── test-seed-token-lifecycle.js  # Four historical seed-bonus failures (real DB)
 ├── test-round-stats.js        # Round-stats schema, embed row, backfill dedupe (real DB)
 └── test-legacy-cooldown-display.js  # `!switch check` cooldown display (real DB)
 ```
 
-Most of these are **pure-logic unit tests**: no Docker, no live SquadJS server, no RCON, no Discord connection required, run with plain `node` and Node's built-in `assert` module. Seven files are the exception — `test-community-token-cap.js`, `test-scramble-lockdown.js`, `test-post-switch-lockout.js`, `test-admin-mutations.js`, `test-seed-token-lifecycle.js`, `test-round-stats.js`, and `test-legacy-cooldown-display.js` build a throwaway flattened assembly (mirroring what `install.cjs` produces) and construct a real `Switch` instance, all but `test-post-switch-lockout.js` against a real SQLite DB, with `test-admin-mutations.js`, `test-seed-token-lifecycle.js`, `test-round-stats.js`, and `test-legacy-cooldown-display.js` also running their MySQL cases when the shared Docker test-MySQL container (`s3-test-mysql`, 127.0.0.1:3307) is reachable. Those exist because the mock harness models the database in JavaScript, which cannot reject a write for want of a DROP/ALTER grant and does not implement SQL three-valued logic — see [S3_DEVELOPER_GUIDE.md §11.4](../../s3/S3_DEVELOPER_GUIDE.md#114--testing-raw-sql-mocks-are-not-enough) for why that gap matters and how the skip-vs-pass counters are kept honest. When MySQL is unreachable those cases report as SKIPPED, not passed — read the skip count.
+Most of these are **pure-logic unit tests**: no Docker, no live SquadJS server, no RCON, no Discord connection required, run with plain `node` and Node's built-in `assert` module. Eight files are the exception — `test-community-token-cap.js`, `test-scramble-lockdown.js`, `test-post-switch-lockout.js`, `test-party-switch.js`, `test-admin-mutations.js`, `test-seed-token-lifecycle.js`, `test-round-stats.js`, and `test-legacy-cooldown-display.js` build a throwaway flattened assembly (mirroring what `install.cjs` produces) and construct a real `Switch` instance, all but `test-post-switch-lockout.js` and `test-party-switch.js` against a real SQLite DB, with `test-admin-mutations.js`, `test-seed-token-lifecycle.js`, `test-round-stats.js`, and `test-legacy-cooldown-display.js` also running their MySQL cases when the shared Docker test-MySQL container (`s3-test-mysql`, 127.0.0.1:3307) is reachable. Those exist because the mock harness models the database in JavaScript, which cannot reject a write for want of a DROP/ALTER grant and does not implement SQL three-valued logic — see [S3_DEVELOPER_GUIDE.md §11.4](../../s3/S3_DEVELOPER_GUIDE.md#114--testing-raw-sql-mocks-are-not-enough) for why that gap matters and how the skip-vs-pass counters are kept honest. When MySQL is unreachable those cases report as SKIPPED, not passed — read the skip count.
 
 > **The mock cannot model a database.** These tests validate WHERE clauses and
 > field updates against a hand-written mock, which by construction knows nothing
@@ -143,6 +144,7 @@ node switch/testing/test-dialect-literals.js
 node switch/testing/test-community-token-cap.js
 node switch/testing/test-scramble-lockdown.js
 node switch/testing/test-post-switch-lockout.js
+node switch/testing/test-party-switch.js
 node switch/testing/test-admin-mutations.js
 node switch/testing/test-seed-token-lifecycle.js
 node switch/testing/test-round-stats.js

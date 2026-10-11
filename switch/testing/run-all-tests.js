@@ -60,6 +60,10 @@ const testFiles = [
   // whose mock-harness copy in mock-harness.js is hand-maintained and can
   // drift from the production code it mirrors.
   'test-post-switch-lockout.js',
+  // Same approach again, with a fake RCON that drags a Squad party when its
+  // leader is moved: a party member's !switch as a group request, the
+  // party's queue entry, and its cancellation when the party changes.
+  'test-party-switch.js',
   // Same approach, run against SQLite AND MySQL. These two are where the
   // v2.5.6 admin/seed behaviour is actually pinned; the mock-harness suites
   // above cannot see permission errors or three-valued logic. MySQL cases

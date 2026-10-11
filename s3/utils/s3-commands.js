@@ -30,11 +30,11 @@
  * know that. Two cases are worth reading the comments for. !s3 locks
  * and !s3 config look community-wide from their names and are not:
  * both render THIS process's answer, and on a multi-server install
- * the answers genuinely differ. And !s3 players / !s3 clans are
- * ordinary server reads that ask for a target anyway, because a full
- * roster is several embeds and three servers answering at once is a
- * screen of them. That one is a volume exception, not a correctness
- * one.
+ * the answers genuinely differ. And !s3 players / !s3 clans /
+ * !s3 parties are ordinary server reads that ask for a target anyway,
+ * because a full roster is several embeds and three servers answering
+ * at once is a screen of them. That one is a volume exception, not a
+ * correctness one.
  *
  * On a single-server install none of this is reachable in a way an
  * admin would notice: one live server means one responder, and the
@@ -55,7 +55,8 @@
  *           buildKarmaEmbed, buildSwitchesExport, buildServersEmbed,
  *           buildHelpEmbed
  * Embed sets (return an array — one Discord message, several embeds):
- *           buildPlayersEmbeds, buildClansEmbeds, buildSwitchesEmbed
+ *           buildPlayersEmbeds, buildClansEmbeds, buildPartiesEmbeds,
+ *           buildSwitchesEmbed
  * Tests:    runDiagnostic  (inject sendDiscordMessage)
  *
  * ─── DEPRECATED ─────────────────────────────────────────────────
@@ -369,6 +370,23 @@ export function buildStatusEmbed(plugin) {
     });
   }
 
+  // Parties have no mount state of their own. They are tracked by the players
+  // service from the same tick, so they are ready when it is mounted.
+  if (players?._isMounted) {
+    const partyList = players.getParties?.() ?? [];
+    fields.push({
+      name: plugin.localize('slackersSquadServices.status.parties'),
+      value: plugin.localize('slackersSquadServices.status.partiesCounts', {
+        parties: partyList.length,
+        players: countPartyMembers(partyList),
+        reunite: players.parties?.options?.reuniteEnabled
+          ? plugin.localize('slackersSquadServices.status.reuniteOn')
+          : plugin.localize('slackersSquadServices.status.reuniteOff')
+      }),
+      inline: true
+    });
+  }
+
   return {
     color: 0x3498db,
     title: plugin.localize('slackersSquadServices.status.sStatus'),
@@ -476,6 +494,21 @@ export function buildServicesEmbed(plugin) {
     } else {
       entries.push(plugin.localize('slackersSquadServices.services.clansDisabled'));
     }
+  }
+
+  // ── Parties ───────────────────────────────────────────────────
+  // Not a service in its own right: the players service owns the tracker,
+  // so its state here follows that mount.
+  if (!players || !players._isMounted) {
+    entries.push(plugin.localize('slackersSquadServices.services.partiesWaiting'));
+  } else {
+    const partyList = players.getParties?.() ?? [];
+    entries.push(plugin.localize('slackersSquadServices.services.parties', { count: partyList.length, players: countPartyMembers(partyList) }));
+    entries.push(plugin.localize('slackersSquadServices.services.partiesReunite', {
+      state: players.parties?.options?.reuniteEnabled
+        ? plugin.localize('slackersSquadServices.services.reuniteOn')
+        : plugin.localize('slackersSquadServices.services.reuniteOff')
+    }));
   }
 
   // ── Players ───────────────────────────────────────────────────
@@ -686,18 +719,62 @@ function escapeMarkdown(str) {
 }
 
 /**
+ * Squad parties in display order: largest first, then oldest first.
+ *
+ * `!s3 parties` lists them in this order and `!s3 players` numbers its party
+ * markers from it, so the two replies agree when they are read together. The
+ * position is only a display index. It moves as parties form and dissolve, the
+ * same way the game's own party number does, which is why neither is used to
+ * name a party.
+ *
+ * @param {object} players - PlayersService instance.
+ * @returns {object[]} Party objects from getParties(), sorted.
+ */
+function sortedParties(players) {
+  const parties = players?.getParties?.() ?? [];
+  const sizeOf = (party) => party.size ?? party.members?.length ?? 0;
+  return [...parties].sort((a, b) =>
+    sizeOf(b) - sizeOf(a) ||
+    (a.formedAt ?? 0) - (b.formedAt ?? 0) ||
+    String(a.key).localeCompare(String(b.key), undefined, { numeric: true })
+  );
+}
+
+/** Players across a list of parties. A player is in at most one party. */
+function countPartyMembers(parties) {
+  return parties.reduce((n, party) => n + (party.size ?? party.members?.length ?? 0), 0);
+}
+
+/** Marker for the party at a 1-based position in sortedParties(). */
+function partyMarker(index) {
+  return `ᴾ${index}`;
+}
+
+/** Compact age: `45s`, `12m`, `1h 5m`. */
+function formatAge(ms) {
+  const seconds = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+/**
  * Format one player line for the team embeds.
  *
  * @param {object} p - Player state from PlayersService.
  * @param {object} players - PlayersService instance (for lock lookup).
  * @param {boolean} [asLeader=false] - Render with the squad-leader marker.
+ * @param {number|null} [partyIndex=null] - 1-based position of the player's
+ *   party in sortedParties(), or null for a player in no party.
  * @returns {string}
  */
-function formatPlayerLine(p, players, asLeader = false) {
+function formatPlayerLine(p, players, asLeader = false, partyIndex = null) {
   const marker = asLeader ? '👑' : '·';
   const lockOwner = players.isLockedBy?.(p.eosID || p.steamID);
   const lockStr = lockOwner ? ` 🔒${truncate(String(lockOwner), 14)}` : '';
-  return `${marker} ${escapeMarkdown(truncate(p.name ?? p.eosID ?? '?', 26))}${lockStr}`;
+  const partyStr = partyIndex ? ` ${partyMarker(partyIndex)}` : '';
+  return `${marker} ${escapeMarkdown(truncate(p.name ?? p.eosID ?? '?', 26))}${partyStr}${lockStr}`;
 }
 
 /**
@@ -729,6 +806,16 @@ export function buildPlayersEmbeds(plugin) {
 
   const team1 = all.filter((p) => p.teamID === 1);
   const team2 = all.filter((p) => p.teamID === 2);
+
+  // Party members carry a ᴾn marker so one party reads as a group across
+  // squads and across the two team embeds. n is the party's position in the
+  // `!s3 parties` list, never the game's party number, which is renumbered
+  // whenever any other party forms or dissolves.
+  const partyIndexOf = new Map();
+  sortedParties(players).forEach((party, i) => {
+    for (const id of party.members ?? []) partyIndexOf.set(id, i + 1);
+  });
+  const playerLine = (p, asLeader = false) => formatPlayerLine(p, players, asLeader, partyIndexOf.get(p.eosID) ?? null);
 
   // Every connected player in Squad is on team 1 or 2 — there is no teamless
   // state in-game. A null teamID here is therefore a *tracking* gap, not a
@@ -835,8 +922,8 @@ export function buildPlayersEmbeds(plugin) {
     pushLineField(
       plugin,
       metaFields,
-      'Awaiting teamID',
-      awaiting.map((p) => formatPlayerLine(p, players)),
+      plugin.localize('slackersSquadServices.playersEmbeds.awaitingTeamId'),
+      awaiting.map((p) => playerLine(p)),
       { maxFields: 1 }
     );
   }
@@ -852,8 +939,8 @@ export function buildPlayersEmbeds(plugin) {
     pushLineField(
       plugin,
       metaFields,
-      'Ignored for resolution',
-      stuck.map((p) => formatPlayerLine(p, players)),
+      plugin.localize('slackersSquadServices.playersEmbeds.ignoredForResolution'),
+      stuck.map((p) => playerLine(p)),
       { maxFields: 1 }
     );
   }
@@ -861,7 +948,9 @@ export function buildPlayersEmbeds(plugin) {
   const embeds = [{
     color: 0x1abc9c,
     title: plugin.localize('slackersSquadServices.playersEmbeds.playersOverview'),
-    description: plugin.localize('slackersSquadServices.playersEmbeds.phasePhasePhase2Layer', { phase: phaseEmoji(phase), phase2: phase, layer: truncate(layer, 60) }),
+    description: plugin.localize('slackersSquadServices.playersEmbeds.phasePhasePhase2Layer', { phase: phaseEmoji(phase), phase2: phase, layer: truncate(layer, 60) })
+      // The roster has no other legend. This line only appears when a marker does.
+      + (partyIndexOf.size > 0 ? `\n${plugin.localize('slackersSquadServices.playersEmbeds.partyLegend')}` : ''),
     fields: metaFields,
     timestamp: new Date().toISOString()
   }];
@@ -878,7 +967,7 @@ export function buildPlayersEmbeds(plugin) {
       if (members.length === 0) continue;
 
       // getSquads() returns leaders first, so the head of the list is the SL.
-      const lines = members.map((p) => formatPlayerLine(p, players, p.isLeader === true));
+      const lines = members.map((p) => playerLine(p, p.isLeader === true));
       const lockIcon = s.locked ? ' 🔒' : '';
       const name = `#${s.squadID} · ${truncate(s.squadName || 'Unnamed', 40)} (${members.length})${lockIcon}`;
 
@@ -896,7 +985,7 @@ export function buildPlayersEmbeds(plugin) {
         plugin,
         fields,
         label,
-        leftover.map((p) => formatPlayerLine(p, players)),
+        leftover.map((p) => playerLine(p)),
         { maxFields: 2 }
       );
     }
@@ -1176,6 +1265,207 @@ export function buildClansEmbeds(plugin) {
   }
 
   return embeds;
+}
+
+// Names listed per party before the rest collapse into a count. A Squad party
+// is a handful of players; this only bites if the game ever hands out one
+// number to a much larger group.
+const PARTY_NAMES_SHOWN = 12;
+
+/**
+ * Build the `!s3 parties` reply: every tracked Squad party, where its members
+ * are, and how the join prediction and the reunite have been doing.
+ *
+ * A party is named after one of its members. The game's own party number is
+ * never shown, because it is a position and not an identity: every party
+ * after one that forms or dissolves is renumbered.
+ *
+ * One embed, returned as an array like the other roster builders. Discord
+ * counts 6000 characters across every embed in a message, not per embed, so a
+ * second embed would buy fields and no room. The list is capped instead, and
+ * the cap falls on the smallest and newest parties because the list is sorted
+ * largest first.
+ *
+ * @param {object} plugin - The S³ plugin instance.
+ * @returns {object[]} Array of Discord embed objects.
+ */
+export function buildPartiesEmbeds(plugin) {
+  const players = plugin.services.players;
+  if (!players) {
+    return [{ color: 0xe74c3c, title: plugin.localize('slackersSquadServices.partiesEmbeds.playersServiceNotAvailable') }];
+  }
+
+  // Parties are tracked by the players service and have no mount of their own.
+  if (!(players._isMounted ?? players.isReady?.() ?? false)) {
+    return [{
+      color: 0x95a5a6,
+      title: plugin.localize('slackersSquadServices.partiesEmbeds.playersServiceNotMounted'),
+      description: plugin.localize('slackersSquadServices.partiesEmbeds.partiesNeedPlayers')
+    }];
+  }
+
+  const NA = plugin.localize('slackersSquadServices.labels.notAvailable');
+  const byEosID = new Map();
+  for (const p of players.getAllPlayers?.() ?? []) {
+    if (p?.eosID) byEosID.set(p.eosID, p);
+  }
+
+  // Squad numbers restart per team, so a squad is looked up by both.
+  const squadKey = (teamID, squadID) => `${Number(teamID)}:${Number(squadID)}`;
+  const squadNames = new Map();
+  for (const s of players.getSquads?.() ?? []) {
+    squadNames.set(squadKey(s.teamID, s.squadID), s.squadName);
+  }
+
+  const teamOf = (id) => {
+    const teamID = byEosID.get(id)?.teamID;
+    return teamID === 1 || teamID === 2 ? teamID : null;
+  };
+  const nameOf = (id) => escapeMarkdown(truncate(String(byEosID.get(id)?.name ?? id), 22));
+  const teamTag = (teamID) => (teamID === null
+    ? plugin.localize('slackersSquadServices.partiesEmbeds.teamUnknown')
+    : plugin.localize('slackersSquadServices.partiesEmbeds.teamShort', { teamID }));
+  const squadTag = (teamID, squadID) => {
+    if (squadID === null || squadID === undefined) return plugin.localize('slackersSquadServices.partiesEmbeds.noSquad');
+    const squadName = squadNames.get(squadKey(teamID, squadID));
+    return squadName
+      ? plugin.localize('slackersSquadServices.partiesEmbeds.squadNamed', { squadID, squadName: escapeMarkdown(truncate(String(squadName), 20)) })
+      : plugin.localize('slackersSquadServices.partiesEmbeds.squadNumber', { squadID });
+  };
+
+  const now = Date.now();
+  const parties = sortedParties(players);
+  let splitCount = 0;
+
+  const entries = parties.map((party, i) => {
+    const members = party.members ?? [];
+
+    // Members grouped by team and squad, so the line says who is where.
+    const groups = new Map();
+    for (const id of members) {
+      const teamID = teamOf(id);
+      const squadID = byEosID.get(id)?.squadID ?? null;
+      const key = `${teamID}:${squadID}`;
+      if (!groups.has(key)) groups.set(key, { teamID, squadID, ids: [] });
+      groups.get(key).ids.push(id);
+    }
+    // Team 1, team 2, then unresolved. Within a team by squad number, squadless last.
+    const rank = (group) => (group.teamID ?? 3) * 1000 + (group.squadID === null ? 999 : Number(group.squadID) || 0);
+    const ordered = [...groups.values()].sort((a, b) => rank(a) - rank(b));
+
+    const teams = new Set(ordered.map((group) => group.teamID));
+    const isSplit = teams.has(1) && teams.has(2);
+    if (isSplit) splitCount++;
+    // More than one team value means each group has to carry its own.
+    const perGroupTeam = teams.size > 1;
+
+    let namesLeft = PARTY_NAMES_SHOWN;
+    const where = ordered.map((group) => {
+      const shown = group.ids.slice(0, namesLeft);
+      namesLeft -= shown.length;
+      const hidden = group.ids.length - shown.length;
+      const parts = shown.map(nameOf);
+      if (hidden > 0) parts.push(plugin.localize('slackersSquadServices.partiesEmbeds.moreMembers', { count: hidden }));
+      const names = parts.join(', ');
+      const squad = squadTag(group.teamID, group.squadID);
+      return perGroupTeam
+        ? plugin.localize('slackersSquadServices.partiesEmbeds.groupWithTeam', { team: teamTag(group.teamID), squad, names })
+        : plugin.localize('slackersSquadServices.partiesEmbeds.group', { squad, names });
+    }).join(' · ');
+
+    const team = isSplit
+      ? plugin.localize('slackersSquadServices.partiesEmbeds.split')
+      : teamTag(teams.has(1) ? 1 : teams.has(2) ? 2 : null);
+
+    // Two rows per party. The second is cut, not the first, if a party is
+    // ever large enough to pass one field's 1024 characters.
+    const head = plugin.localize('slackersSquadServices.partiesEmbeds.partyHead', {
+      marker: partyMarker(i + 1),
+      label: plugin.localize('slackersSquadServices.partiesEmbeds.partyLabel', { name: nameOf(members[0]), others: Math.max(0, members.length - 1) }),
+      size: members.length,
+      team,
+      age: formatAge(now - (party.formedAt ?? now))
+    });
+    return `${head}\n${truncate(plugin.localize('slackersSquadServices.partiesEmbeds.partyMembers', { where }), 1000 - head.length)}`;
+  });
+
+  const fields = [];
+  if (entries.length > 0) {
+    pushLineField(
+      plugin,
+      fields,
+      plugin.localize('slackersSquadServices.partiesEmbeds.partyList', { count: entries.length }),
+      entries,
+      { maxFields: 4 }
+    );
+  } else {
+    fields.push({
+      name: plugin.localize('slackersSquadServices.partiesEmbeds.partyList', { count: 0 }),
+      value: plugin.localize('slackersSquadServices.partiesEmbeds.noParties'),
+      inline: false
+    });
+  }
+
+  // ── Join prediction ─────────────────────────────────────────────
+  const prediction = players.getJoinPredictionStats?.() ?? {};
+  const percent = (share) => (share === null || share === undefined ? NA : `${Math.round(share * 100)}%`);
+  fields.push({
+    name: plugin.localize('slackersSquadServices.partiesEmbeds.joinPrediction'),
+    value: [
+      plugin.localize('slackersSquadServices.partiesEmbeds.predictionCounts', {
+        hit: prediction.hit ?? 0,
+        falseAlarm: prediction.falseAlarm ?? 0,
+        miss: prediction.miss ?? 0,
+        correct: prediction.correct ?? 0,
+        confirmed: prediction.confirmed ?? 0
+      }),
+      plugin.localize('slackersSquadServices.partiesEmbeds.predictionShares', {
+        falseAlarmShare: percent(prediction.falseAlarmShare),
+        missShare: percent(prediction.missShare)
+      }),
+      plugin.localize('slackersSquadServices.partiesEmbeds.predictionJudged', {
+        judged: prediction.judged ?? 0,
+        pending: prediction.pending ?? 0
+      })
+    ].join('\n'),
+    inline: false
+  });
+
+  // ── Reunite ─────────────────────────────────────────────────────
+  const reunite = players.parties?.getReuniteStats?.() ?? {};
+  const partyOptions = players.parties?.options ?? {};
+  const reuniteWindow = Number.isFinite(partyOptions.reuniteWindowMs)
+    ? `${Math.round(partyOptions.reuniteWindowMs / 1000)}s`
+    : NA;
+  fields.push({
+    name: plugin.localize('slackersSquadServices.partiesEmbeds.reunite'),
+    value: [
+      partyOptions.reuniteEnabled
+        ? plugin.localize('slackersSquadServices.partiesEmbeds.reuniteEnabled')
+        : plugin.localize('slackersSquadServices.partiesEmbeds.reuniteDisabled'),
+      plugin.localize('slackersSquadServices.partiesEmbeds.reuniteCounts', {
+        moved: reunite.moved ?? 0,
+        failed: reunite.failed ?? 0,
+        skippedBalance: reunite.skippedBalance ?? 0
+      }),
+      plugin.localize('slackersSquadServices.partiesEmbeds.reuniteLimits', {
+        window: reuniteWindow,
+        maxTeamDiff: partyOptions.reuniteMaxTeamDiff ?? NA
+      })
+    ].join('\n'),
+    inline: false
+  });
+
+  return [{
+    color: 0x9b59b6,
+    title: plugin.localize('slackersSquadServices.partiesEmbeds.squadParties'),
+    description: [
+      plugin.localize('slackersSquadServices.partiesEmbeds.summary', { parties: parties.length, players: countPartyMembers(parties), split: splitCount }),
+      plugin.localize('slackersSquadServices.partiesEmbeds.namingNote')
+    ].join('\n'),
+    fields,
+    timestamp: new Date().toISOString()
+  }];
 }
 
 export function buildLocksEmbed(plugin) {
@@ -2237,6 +2527,7 @@ export function buildHelpEmbed(plugin) {
           plugin.localize('slackersSquadServices.help.s3FactionsTeamNames'),
           plugin.localize('slackersSquadServices.help.s3PlayersPopulationOverview'),
           plugin.localize('slackersSquadServices.help.s3ClansClanGroups'),
+          plugin.localize('slackersSquadServices.help.s3PartiesSquadParties'),
           plugin.localize('slackersSquadServices.help.s3LocksGlobalAnd'),
           plugin.localize('slackersSquadServices.help.s3ConfigServerConfiguration'),
           plugin.localize('slackersSquadServices.help.s3ServersRegistry')
@@ -2471,7 +2762,7 @@ export async function runDiagnostic(plugin, message, sendDiscordMessage) {
 /**
  * Which server answers `!s3 <verb>`, and whether it may answer unasked.
  *
- * Sixteen live verbs, not eighteen: `watch` and `unwatch` sit inside the
+ * Seventeen live verbs, not nineteen: `watch` and `unwatch` sit inside the
  * S3_WATCH_DEPRECATED block comment above and are not registered, so they
  * are not tagged. A grep for `handlers.set(` returns them anyway, which is
  * exactly the kind of counting this table is meant to stop.
@@ -2523,8 +2814,10 @@ export function scopeForS3Command(args) {
     // servers broadcasting a roster apiece is a screen of embeds from one
     // typed command, so these ask for a target instead of answering
     // together. That is a volume exception, not a correctness one.
+    // `parties` is one embed, but a busy server fills it, so it asks too.
     case 'players':
     case 'clans':
+    case 'parties':
       return { scope: COMMAND_SCOPE.SERVER_READ, selectorRequired: true };
 
     // ── The registry ──
@@ -2626,6 +2919,11 @@ export function createCommandHandlers(context) {
 
   handlers.set('clans', async (plugin, message, args) => {
     const embeds = buildClansEmbeds(plugin);
+    await sendDiscordMessage(message.channel, { embeds }, 'S3', (...a) => plugin.verbose(...a));
+  });
+
+  handlers.set('parties', async (plugin, message, args) => {
+    const embeds = buildPartiesEmbeds(plugin);
     await sendDiscordMessage(message.channel, { embeds }, 'S3', (...a) => plugin.verbose(...a));
   });
 

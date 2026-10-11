@@ -24,6 +24,12 @@ Two regression checks around clans that share a squad, both wired into `scramble
 - `runCrossClanSquadDecompositionTest` — 30 randomized runs where a third clan spans two squads already claimed by other clans. Squads must stay atomic, and no player may appear in two of the reported virtual squads.
 - `runAnchorFallbackTagTest` — deterministic: when a clan's members sit entirely inside an earlier clan's virtual squad, the merged unit must keep both tags and count every real clan member as a member rather than as someone pulled along.
 
+**`test-party-groups.js`**
+Squad parties through the scrambler. Covers `buildScrambleGroups()` in `tb-party-groups.js` (parties merged with clan groups wherever they share a player, parties already split across teams left out, groups always disjoint), 40 randomised scrambles each for a party spread over two squads and a party with a squadless member, the members-only rule for a party unit, and the party marker in the scramble report. Each scrambler scenario has a control run without party grouping that must split the party at least once. Standalone — no server required.
+```
+node test-party-groups.js
+```
+
 **`embed-format-test.js`**
 Standalone assertions for the Discord scramble report (`DiscordHelpers.createScrambleDetailsMessage`): one row per listed player, one block per virtual squad, no player listed twice, correct `◆`/`◇`/`⚓` markers, and no field over Discord's 1024-character limit. Add `--print` to dump sample embeds for eyeballing column alignment. Standalone — no server required.
 ```

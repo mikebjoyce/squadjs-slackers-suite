@@ -283,7 +283,8 @@ Tracks player state (name, team, squad, join time), manages per-player and globa
   eosID, steamID, name, teamID, squadID, squadName,
   isLeader, role, joinTime, isAlive,
   isInWaitingForRespawn, wasKilled, deathTime,
-  isDisconnected, disconnectTime
+  isDisconnected, disconnectTime,
+  partyID, joinedInSquad, joinPrediction   // see 2.3.1
 }
 ```
 
@@ -293,6 +294,56 @@ leadership *now* — promotions and handovers both land on the next tick. Source
 that carry no leadership field (the `PLAYER_CONNECTED` payload) leave the flag
 alone rather than clearing it. `getSquads()` uses this to order each squad's
 `players` array leaders-first.
+
+### 2.3.1 — Squad Parties
+
+`PlayersService` tracks Squad's in-game parties from the `partyID` on each player-list tick. The tracker is `PartiesService` (`utils/parties-service.js`), owned by the players service and reached through it. It has no mount of its own: it is ready when `players` is.
+
+| Member | Returns | Notes |
+|--------|---------|-------|
+| `getParties()` | `object[]` | Every party with two or more connected members: `{ key, partyID, members, size, formedAt, changedAt }`. `members` is an array of eosIDs |
+| `getParty(eosID)` | `object\|null` | The party a player is in right now, same shape |
+| `isInParty(eosID)` | `boolean` | Shares a party ID with at least one other connected player |
+| `getJoinPrediction(eosID)` | `string\|null` | The player's join prediction (see below) |
+| `getJoinPredictionStats()` | `object` | `{ confirmed, hit, falseAlarm, miss, correct, judged, pending, falseAlarmShare, missShare }` over the last 100 judged joins. The two shares are `0..1`, or `null` until there is something to divide by |
+| `onPartiesChanged(callback)` | `Function` (unsubscribe) | Fires after a tick in which a party formed, changed members or dissolved, with `{ formed, changed, dissolved }` |
+| `parties.getReuniteStats()` | `object` | `{ moved, failed, skippedBalance }` since this process started |
+| `parties.options` | `object` | Resolved settings, read-only for consumers: `{ reuniteEnabled, reuniteWindowMs, reuniteMaxTeamDiff, joinCheckMs, ... }` |
+
+Each player row from `getPlayer()` and `getAllPlayers()` also carries three fields:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `partyID` | `number\|null` | The game's party number this tick, or `null` for a player in no party |
+| `joinedInSquad` | `boolean` | Whether the player was already in a squad the first time S³ saw them |
+| `joinPrediction` | `'party'\|'likely-party'\|'solo'\|null` | Set once at registration, never refreshed. `null` for a player who was on the server before S³ started |
+
+**Use `key`, never `partyID`, to remember a party.** The game's party number is a position. When any party forms or dissolves, every party after it is renumbered, so a `partyID` only means something within one tick. `key` follows the party by its members and stays the same through renumbering. A merge keeps the larger party's key, and a split leaves the key on the larger half.
+
+**A party can span both teams.** Numbering is server-wide, so one party with members on team 1 and team 2 is still one party. Read each member's team from their own player row.
+
+**A lone player is not a party.** A player whose party ID nobody else on the server shares is not in `getParties()`, and `isInParty()` is `false` for them.
+
+**Join prediction.** A joiner's party ID usually shows several seconds after they are first listed, which is later than a join-time decision can wait. A party joiner normally arrives already in a squad, so that stands in for it:
+
+| Prediction | At registration |
+|------------|-----------------|
+| `'party'` | Already carried a party ID |
+| `'likely-party'` | No party ID, but in a squad |
+| `'solo'` | Neither |
+
+The prediction is fixed at registration and does not change when the party ID shows up later. S³ checks each one `partyJoinCheckSeconds` after the join and logs a warning when the false alarm or miss share passes its limit. For what is true now, ask `isInParty()`.
+
+**Reuniting a party split at join.** With `partyReunite` on, S³ moves a fresh joiner who is on the other team from their party. It only does so when all of these hold:
+
+- Every player on the smaller side joined within `partyReuniteWindowSeconds`. Only the smaller side moves. An even split moves nobody.
+- None of them has been moved by an admin or by Switch since joining.
+- None of them has already had a reunite move this connection, whether it succeeded or not.
+- None of them is locked by another plugin.
+- The move would not leave the party's team ahead by more than `partyReuniteMaxTeamDiff` players. Those players stay candidates until the window closes.
+- No scramble holds the global lock, teams are not still resolving after a new game, and the round is not ending.
+
+A consumer plugin does not need to do anything for this. The move goes through the same `_requestTeamChange()` target-team path the other plugins use, with source `S3:PartyReunite`, and the player gets an in-game warning saying why they were moved.
 
 ---
 
@@ -1941,8 +1992,9 @@ All commands in the configured `channelID` Discord channel:
 | `!s3 services` | Per-service detail with ready state |
 | `!s3 gamestate` | Phase, mode, layer, sub-state, round timing |
 | `!s3 factions` | Team 1/2 abbreviations, faction IDs |
-| `!s3 players` | Population overview embed + one embed per team, broken down by squad with squad leaders marked (👑), squad locks, per-player locks, and an "Unassigned" (not in a squad) bucket |
+| `!s3 players` | Population overview embed + one embed per team, broken down by squad with squad leaders marked (👑), squad locks, per-player locks, Squad party members tagged `ᴾ1`, `ᴾ2` (same number, same party, numbered in `!s3 parties` order), and an "Unassigned" (not in a squad) bucket |
 | `!s3 clans` | Active clan groups, plus a second embed explaining every exclusion (size bounds, `ignoreList`, unnormalizable tag) and every Damerau-Levenshtein merge and recruit-suffix strip |
+| `!s3 parties` | Tracked Squad parties, largest first then oldest first: members, team (or a split marker with each group's team), squads, size and age. A party is named after a member, never by the game's party number. Then the join prediction counts with the false alarm and miss shares, and the reunite counts with whether reunite is on. One embed; a list too long for it is cut from the small end and the cut is counted |
 | `!s3 locks` | Global lock + per-player locks |
 | `!s3 servers` | Every server registered against this database — alias, id, name, live/stale with the age of the last heartbeat, suite version, address, measured clock skew against the database clock, and the community-affecting option values behind that row. Registered and live are both reported because they answer different questions: the count is what the `--server` selectors use, and a stale row is still a server the community owns |
 | `!s3 servers alias <server> <newAlias>` | Rename a registered server. `<server>` is an existing alias or a numeric id. The new alias is lowercased and stripped to `[a-z0-9_-]`, must be unique, and must be at least two edits from every *other* alias — the row being renamed is exempt from its own check, or `main` could never become `mains` |
@@ -2203,6 +2255,7 @@ node s3/testing/test-game-state-service.js
 | `test-round-clock-ordering.js` | What a consumer reads when it pulls `roundStartTime`/`matchId` from its own `NEW_GAME` handler — see §7.14 |
 | `test-db-service.js` | Model registration, migration workflow, schema versioning |
 | `test-players-service.js` | Player tracking, reconnect detection, locks, team change attribution, per-round team confirmation |
+| `test-parties-service.js` | `PartiesService` and its wiring into `PlayersService`: stable party keys through renumbering, merges and splits, parties split across teams, the per-team-numbering warning, join prediction and its 60 s self-check with the accuracy warnings, `partyID` at the four registry touch points, and every limit on reuniting a party split at join (window, smaller side only, intentional moves, once per connection, team balance, locks and unsettled teams). Mock harness, with reunite moves going through `fake-party-rcon.js`; the last section loads the shipped S³ plugin from a throwaway assembly (`plugin-assembly.js`) to check the borrowed team-change move |
 | `test-round-transition-team-baseline.js` | Replays the 2026-09-05 round transition: a new round's team assignment must never be reported as a roster-wide team change, and `resolving` must outlive the first post-NEW_GAME tick |
 | `test-clans-service.js` | Tag extraction, normalisation, grouping, clan team detection |
 | `test-factions-service.js` | Team abbreviation resolution, faction caching |
@@ -2252,7 +2305,7 @@ node s3/testing/test-game-state-service.js
 | `test-migration-batch-isolation.js` | One plugin's failed migration does not abandon the rest of the batch, on both operator paths — `!s3 migrate force` and `!s3 confirm <token>`. Asserts the **recorded schema version per plugin**, not the reply embed, since the embed reported success during the flag-safety incident. Covers two independent failures both being named, the verdict staying red while the plugins that could migrate did, a lock lost to a live process being isolated, and the one deliberate exception — locking unavailable at the service level stops the batch rather than reporting one missing grant once per plugin. Also the confirmation latch: being *armed* is not the same fact as a token being *valid*, so a wrong `!s3 confirm` after a `!s3 migrate force` is refused rather than accepted and re-run, while the latch still outlives the batch it was armed for |
 | `test-migration-prompt-identity.js` | Which server a migration prompt came from, when several share one database and one Discord channel. The identity is the prompt's first line and is unconditional — not gated on the multi-server footer label, which goes silent in the exact first-shared-boot window where two processes race to post. The registry id is always rendered because it is the only field two loopback installs cannot share. On the reply side: a `!s3 confirm` for a token this process did not mint, while it still holds a live token of its own, answers grey and claims only that it did not issue this one; a process holding no live token answers red and names itself. Four-way mutation-verified — branch selection and body text are pinned separately |
 | `test-command-routing.js` | `!s3` subcommand dispatch and argument parsing |
-| `test-inspection-embeds.js` | Inspection/embed builders render without throwing on sparse data |
+| `test-inspection-embeds.js` | `!s3 players`, `!s3 clans` and `!s3 parties` embed builders against the real services: sparse data, Discord's embed limits on a full server, party naming and the party marker |
 | `test-sa-per-player-lock.js` | Per-player lock acquisition/release under contention |
 | `test-team-change-retry.js` | Team-change retry loop and give-up conditions |
 | `test-team-change-target.js` | `_requestTeamChange()`'s `targetTeamID` against a fake RCON that drags Squad parties (`fake-party-rcon.js`): an already-there player costs no command, bad targets are refused, no target keeps the toggle; TeamBalancer's `SwapExecutor` keeps a party together whichever member the plan reaches first; Switch's squad and double-switch paths pass explicit targets. Loads the shipped files via `plugin-assembly.js` |
@@ -2497,6 +2550,12 @@ S³ must appear **before** consumer plugins:
 | `clanTagIgnoreList` | array | `[]` | Tags excluded from grouping |
 | `clanRecruitSuffixes` | array | `["r", "-r"]` | Suffixes to strip from clan tags when the base tag (without suffix) exists on other players. Enabled by default for common recruit tags (case-insensitive, so "R" and "-R" are also matched). Set to `[]` to disable. Stripping only occurs when the base tag is present on at least one other player in the data set. |
 | `clanGroupingPullEntireSquads` | boolean | `true` | Pull full squads when preserving clan groups |
+| `partyReunite` | boolean | `true` | Move a player who has just joined to their Squad party's team when they landed on the other one, once per connection. `false` stops S³ moving players itself. See §2.3.1 |
+| `partyReuniteWindowSeconds` | number | `90` | How long after joining a player can still be moved to their party. A party ID can take close to a minute to show after a join, and the player-list tick that sees it can be up to 30 seconds behind that |
+| `partyReuniteMaxTeamDiff` | number | `3` | No reunite move when it would leave the party's team ahead by more than this many players. Keep it no looser than the server's own `NumPlayersDiffForTeamChanges` |
+| `partyJoinCheckSeconds` | number | `60` | How long after a join S³ waits before checking its join-time party prediction against whether a party ID showed |
+| `partyFalseAlarmWarnPercent` | number | `30` | Log a warning, at most once an hour, when more than this percentage of joiners who arrived in a squad never showed a party ID |
+| `partyMissWarnPercent` | number | `25` | Log a warning, at most once an hour, when more than this percentage of party joiners arrived squadless and were treated as solo |
 | `enableDatabaseLogging` | boolean | `true` | Enable `S3_PlayerEvents`/`S3_GameStateEvents`/`S3_PlayerSnapshots` tables. `false` → LoggingService runs no-op. |
 | `enableFileLogging` | boolean | `false` | Mirror each DB log write as a JSONL line at `logPath` |
 | `logPath` | string | `'./s3-log.jsonl'` | JSONL mirror path, used only when `enableFileLogging` is true |

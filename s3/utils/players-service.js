@@ -22,6 +22,9 @@
  *   Attribution:  recordMove()
  *   Reconnects:   rememberReconnect(), getReconnect(), peekReconnect(),
  *                 clearReconnects()
+ *   Parties:      getParty(), isInParty(), getParties(),
+ *                 onPartiesChanged(), getJoinPrediction(),
+ *                 getJoinPredictionStats()
  *   Sessions:     getJoinTime(eosID)
  *   Refresh:      registerRefreshInterest(), unregisterRefreshInterest(),
  *                 requestRefresh(), refresh(), refreshNow()
@@ -30,14 +33,23 @@
  *
  * ─── DEPENDENCIES ────────────────────────────────────────────────
  *
- * (No local imports — depends on parent, server, and verboseLogger
- *  injected via constructor.)
+ * PartiesService (./parties-service.js)
+ *   Squad party tracking, owned by this service and fed from its tick.
+ * (Otherwise depends on parent, server, and verboseLogger injected via
+ *  constructor.)
  *
  * ─── NOTES ───────────────────────────────────────────────────────
  *
- * - Registry rows are refreshed in place every tick: name, teamID, squadID
- *   and isLeader all track the live server.players entry, so leadership
- *   reflects the current SL rather than the state at first registration.
+ * - Registry rows are refreshed in place every tick: name, teamID, squadID,
+ *   partyID and isLeader all track the live server.players entry, so
+ *   leadership reflects the current SL rather than the state at first
+ *   registration.
+ * - Two row fields are set once, at registration, and never refreshed:
+ *   joinedInSquad (was the player in a squad the first time S³ saw them)
+ *   and joinPrediction ('party' | 'likely-party' | 'solo', or null for
+ *   players found on the server at initial sync). They describe how the
+ *   player arrived, which is what a join-time decision needs. See
+ *   PartiesService for why the squad stands in for the party ID.
  * - Lock priority ordering: TeamBalancer(3) > SmartAssign(2) > Switch(1).
  * - registerPriority('MyPlugin', 4) allows third-party plugins to
  *   register a custom priority level — extensible beyond the hardcoded map.
@@ -84,6 +96,8 @@
 // - During map load around NEW_GAME, players can briefly report teamID=null (sometimes
 //   a tick before NEW_GAME). Treat this as transient while teams resolve; prior teams
 //   remain valid unless a player actually swaps during this window.
+
+import PartiesService, { predictJoin } from './parties-service.js';
 
 const DEFAULT_ATTRIBUTION_TTL_MS = 90000;
 const DEFAULT_LOCK_TTL_MS = 3000;
@@ -244,11 +258,29 @@ export default class PlayersService {
     refreshNowFloorMs = DEFAULT_REFRESH_NOW_FLOOR_MS,
     sessionExpiryMs = DEFAULT_SESSION_EXPIRY_MS,
     sessionUpdateIntervalMs = DEFAULT_SESSION_UPDATE_INTERVAL_MS,
-    unresolvedGraceMs = DEFAULT_UNRESOLVED_GRACE_MS
+    unresolvedGraceMs = DEFAULT_UNRESOLVED_GRACE_MS,
+    partyOptions = {}
   } = {}) {
     this.parent = parent;
     this.server = server;
     this.verboseLogger = verboseLogger;
+
+    // Squad party tracking. Owned here because it is derived from the same
+    // rows on the same tick and costs no RCON of its own. It reads the real
+    // registry, never the null-window projection: a projected row's team is
+    // a guess, and the only thing parties does with teams (reuniting a split
+    // party) is switched off while that guess is in play.
+    this.parties = new PartiesService({
+      verboseLogger,
+      options: partyOptions,
+      getRows: () => [...this.registry.values()],
+      isGloballyLocked: () => !!this.isGloballyLockedBy(),
+      isPlayerLocked: (eosID) => !!this.isLockedBy(eosID),
+      isTeamDataSettled: () => {
+        const gameState = this.parent?.services?.gameState;
+        return !this._projectedPlayers && !gameState?.isResolving?.() && !gameState?.isEnding?.();
+      }
+    });
 
     this.attributionTtlMs = Number.isFinite(attributionTtlMs) ? attributionTtlMs : DEFAULT_ATTRIBUTION_TTL_MS;
     this.defaultLockTtlMs = Number.isFinite(defaultLockTtlMs) ? defaultLockTtlMs : DEFAULT_LOCK_TTL_MS;
@@ -430,6 +462,7 @@ export default class PlayersService {
     // vouch for teams this process has not actually seen.
     this._teamConfirmedKeys.clear();
     this._transitionSinceStable = false;
+    this.parties.reset();
     this.verboseLogger(2, '[Players] Unmounted.');
   }
 
@@ -612,6 +645,55 @@ export default class PlayersService {
         };
       })
       .filter((s) => s.players.length > 0);
+  }
+
+  // ── Squad parties ─────────────────────────────────────────────────
+  // Thin pass-throughs to PartiesService, so consumers reach parties the
+  // way they reach everything else about a player: through `players`.
+
+  /**
+   * The party a player is in right now, or null.
+   * @returns {{key: string, partyID: number, members: string[], size: number,
+   *   formedAt: number, changedAt: number}|null} `key` is stable for as long
+   *   as the party keeps overlapping members; `partyID` is the game's number
+   *   this tick and changes whenever any other party forms or dissolves.
+   */
+  getParty(eosID) {
+    return this.parties.getParty(eosID);
+  }
+
+  /** True when the player shares a party ID with at least one other connected player. */
+  isInParty(eosID) {
+    return this.parties.isInParty(eosID);
+  }
+
+  /** Every party with two or more connected members. */
+  getParties() {
+    return this.parties.getParties();
+  }
+
+  /**
+   * How the player looked when they joined: 'party' (carried a party ID),
+   * 'likely-party' (no ID yet, but already in a squad), 'solo', or null for a
+   * player who was on the server before S³ started. Fixed at registration.
+   */
+  getJoinPrediction(eosID) {
+    return this.parties.getJoinPrediction(eosID);
+  }
+
+  /** How the join prediction has held up over the last 100 judged joins. */
+  getJoinPredictionStats() {
+    return this.parties.getJoinPredictionStats();
+  }
+
+  /**
+   * Register a callback for party changes. Fires after a tick in which any
+   * party formed, changed members or dissolved.
+   * @param {Function} callback - Receives { formed, changed, dissolved }
+   * @returns {Function} unsubscribe function
+   */
+  onPartiesChanged(callback) {
+    return this.parties.onPartiesChanged(callback);
   }
 
   /**
@@ -1066,7 +1148,12 @@ export default class PlayersService {
       steamID: player?.steamID || data?.steamID || null,
       name: player?.name || data?.name || 'Unknown',
       teamID: player?.teamID ?? null,
-      squadID: player?.squadID ?? null
+      squadID: player?.squadID ?? null,
+      // Left undefined when the payload has no party field, which
+      // _registerPlayer reads as "this source didn't say" and keeps what the
+      // row already holds. A null here would wipe a party ID the tick had
+      // just delivered.
+      partyID: player?.partyID
     };
 
     const playerName = rawPlayer.name;
@@ -1204,6 +1291,7 @@ export default class PlayersService {
           teamChangeCount++;
           const source = attribution || this._defaultTeamChangeSource();
           this.verboseLogger(1, `[Players] TEAM_CHANGE: ${playerName} (${result.key}) ${previousTeamID}→${nextTeamID}, source=${source}`);
+          this.parties.noteTeamChange(result.state.eosID, source);
           this.server.emit('S3_PLAYER_TEAM_CHANGED', {
             player: { ...result.state },
             previousTeamID,
@@ -1226,6 +1314,10 @@ export default class PlayersService {
         this._deindexPlayer(tracked, key);
         this._teamConfirmedKeys.delete(key);
       }
+
+      // Parties for the players already here. They get no join prediction:
+      // nothing is known about how they arrived.
+      this.parties.handleTick(now);
 
       // Mark all players registered during initial sync as having join emitted.
       // This prevents them from emitting S3_PLAYER_JOINED on the very next tick.
@@ -1285,6 +1377,7 @@ export default class PlayersService {
         // Forget the confirmation with the player, so a reconnect re-baselines
         // instead of being diffed against the team they had before they left.
         this._teamConfirmedKeys.delete(key);
+        this.parties.noteLeave(tracked.eosID);
 
         leaveCount++;
 
@@ -1334,6 +1427,10 @@ export default class PlayersService {
     this._lastTickTeamChangeCount = teamChangeCount;
 
     this.verboseLogger(2, `[Players] Tick: ${joinCount} joined, ${leaveCount} left, ${this.registry.size} tracked`);
+
+    // Before S3_PLAYERS_UPDATED, so a consumer reacting to that event reads
+    // this tick's parties and not the last one's.
+    this.parties.handleTick(now);
 
     // ── Periodic session activity update ──
     // Bulk-update lastActivity for all tracked players every sessionUpdateIntervalMs.
@@ -1688,6 +1785,7 @@ export default class PlayersService {
       projected.eosID = registryState.eosID;
       projected.steamID = registryState.steamID;
       projected.squadID = registryState.squadID;
+      projected.partyID = registryState.partyID;
       projected.isLeader = registryState.isLeader;
       projected.lastSeenAt = registryState.lastSeenAt;
 
@@ -1748,6 +1846,7 @@ export default class PlayersService {
         const previousTeamID = this._isRealTeam(stableTeam) ? stableTeam : projected.teamID;
 
         if (String(previousTeamID) !== String(actual.teamID)) {
+          this.parties.noteTeamChange(actual.eosID, attribution);
           this.server.emit('S3_PLAYER_TEAM_CHANGED', {
             player: { ...actual },
             previousTeamID,
@@ -1774,6 +1873,7 @@ export default class PlayersService {
 
       // Emit deferred team-change — this player genuinely swapped during the
       // projection window (not just the round-transition 1↔2 flip).
+      this.parties.noteTeamChange(actual.eosID, 'Deferred/Projection');
       this.server.emit('S3_PLAYER_TEAM_CHANGED', {
         player: { ...actual },
         previousTeamID: projected.teamID,
@@ -1802,10 +1902,17 @@ export default class PlayersService {
       name: player?.name || 'Unknown',
       teamID: player?.teamID ?? null,
       squadID: player?.squadID ?? null,
+      // The game's party number this tick, or null for a player in no party.
+      // Only meaningful within one tick: see PartiesService.
+      partyID: player?.partyID ?? null,
       isLeader: normalizeIsLeader(player?.isLeader, false),
       joinTime: now,
       lastSeenAt: now,
-      joinEmitted
+      joinEmitted,
+      // Both fixed here and never refreshed. joinPrediction is filled in by
+      // _registerPlayer for a real join and stays null for initial sync.
+      joinedInSquad: (player?.squadID ?? null) !== null,
+      joinPrediction: null
     };
   }
 
@@ -1955,6 +2062,14 @@ export default class PlayersService {
       }
 
       if (emitJoin) {
+        // Decided before the join is announced and carried on the row, so a
+        // listener reads it from the S3_PLAYER_JOINED payload whatever order
+        // the listeners run in. It never waits for a later tick: SmartAssign
+        // acts within seconds of the join, and most party IDs arrive later
+        // than that.
+        joined.joinPrediction = predictJoin(joined);
+        this.parties.noteJoin(joined, now);
+
         // Synchronous in-memory peek for reconnect data to provide previousTeamID
         // in the join payload. Only checks the in-memory cache (prune already ran
         // before _registerPlayer is called), avoiding an async DB lookup.
@@ -2000,6 +2115,10 @@ export default class PlayersService {
     state.name = rawPlayer?.name || state.name;
     state.teamID = rawPlayer?.teamID ?? null;
     state.squadID = rawPlayer?.squadID ?? state.squadID;
+    // null is a real value here (the player is in no party), so there is no
+    // keep-the-old-value fallback for it. undefined means the source carried
+    // no party field at all, as the PLAYER_CONNECTED payload may not.
+    if (rawPlayer?.partyID !== undefined) state.partyID = rawPlayer.partyID ?? null;
     state.eosID = rawPlayer?.eosID || state.eosID;
     state.steamID = rawPlayer?.steamID || state.steamID;
     // Leadership is per-tick state, not join-time state: a player connects as a

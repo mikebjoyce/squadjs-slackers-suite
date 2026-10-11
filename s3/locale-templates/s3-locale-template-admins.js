@@ -1,6 +1,6 @@
 /**
  * ─────────────────────────────────────────────────────────────────
- *  ADMIN-FACING TRANSLATION TEMPLATE — 1318 strings
+ *  ADMIN-FACING TRANSLATION TEMPLATE — 1362 strings
  * ─────────────────────────────────────────────────────────────────
  *
  *  GENERATED FILE — do not edit in place.
@@ -39,7 +39,7 @@
  *
  *  Strings only your staff can reach: replies to admin-gated commands, the
  *  scramble and diagnostic reports in your staff channel, and the admin half
- *  of !elo. 1318 strings — the bulk of what an admin reads day to day,
+ *  of !elo. 1362 strings — the bulk of what an admin reads day to day,
  *  but read by a handful of people who opted into running the thing, so a
  *  missed one costs far less than a missed broadcast.
  *
@@ -236,6 +236,14 @@ export const MESSAGES = {
       clans: '',
       // EN: 🟢 Enabled (min {minSize}, max {maxSize})
       enabledMinMax: '',
+      // EN: 🤝 Parties
+      parties: '',
+      // EN: Parties: **{parties}**\nPlayers in a party: **{players}**\nReunite: {reunite}
+      partiesCounts: '',
+      // EN: 🟢 On
+      reuniteOn: '',
+      // EN: ⚫ Off
+      reuniteOff: '',
       // EN: 📊 S³ Status
       sStatus: '',
       // EN: Phase: {phase} **{phase2}**{subState}
@@ -328,6 +336,16 @@ export const MESSAGES = {
       clans: '',
       // EN: ⚫ **Clans** — disabled in config
       clansDisabled: '',
+      // EN: 🟢 **Parties** — {count} tracked, {players} player(s)
+      parties: '',
+      // EN: ⚪ **Parties** — waiting for the players service
+      partiesWaiting: '',
+      // EN:    Reunite: {state}
+      partiesReunite: '',
+      // EN: 🟢 On
+      reuniteOn: '',
+      // EN: ⚫ Off
+      reuniteOff: '',
       // EN: {emoji} **Players** — {count} tracked
       players: '',
       // EN:    Initial Sync: {sync} | Teams: {teams}
@@ -484,6 +502,12 @@ export const MESSAGES = {
       delta: '',
       // EN: Per-player: {count} active
       perPlayer: '',
+      // EN: Awaiting teamID
+      awaitingTeamId: '',
+      // EN: Ignored for resolution
+      ignoredForResolution: '',
+      // EN: ᴾn marks a party member. Same number, same party. The numbers follow the `!s3 parties` list.
+      partyLegend: '',
     },
     team: {
       // EN: *No players on this team.*
@@ -562,6 +586,66 @@ export const MESSAGES = {
       recruitsuffixesOptions: '',
       // EN: ignoreList: `{options}`
       ignorelistOptions: '',
+    },
+    partiesEmbeds: {
+      // EN: 🔴 Players Service Not Available
+      playersServiceNotAvailable: '',
+      // EN: 🤝 Parties — ⚪ Players Service Not Mounted
+      playersServiceNotMounted: '',
+      // EN: Parties are tracked by the players service, which is not mounted yet.
+      partiesNeedPlayers: '',
+      // EN: 🤝 Squad Parties
+      squadParties: '',
+      // EN: Parties: **{parties}** · Players in a party: **{players}** · Split across teams: **{split}**
+      summary: '',
+      // EN: A party is named after one of its members. ᴾn is its place in this list and matches `!s3 players`. Neither is the game's party number, which changes when other parties form or dissolve.
+      namingNote: '',
+      // EN: Parties ({count})
+      partyList: '',
+      // EN: No parties on the server right now.
+      noParties: '',
+      // EN: {marker} **{label}** ({size}) · {team} · {age}
+      partyHead: '',
+      // EN: {name} + {others}
+      partyLabel: '',
+      // EN: ↳ {where}
+      partyMembers: '',
+      // EN: T{teamID}
+      teamShort: '',
+      // EN: T?
+      teamUnknown: '',
+      // EN: ⚠️ split
+      split: '',
+      // EN: {squad}: {names}
+      group: '',
+      // EN: {team} {squad}: {names}
+      groupWithTeam: '',
+      // EN: #{squadID} {squadName}
+      squadNamed: '',
+      // EN: #{squadID}
+      squadNumber: '',
+      // EN: no squad
+      noSquad: '',
+      // EN: +{count} more
+      moreMembers: '',
+      // EN: 🔮 Join Prediction
+      joinPrediction: '',
+      // EN: Hit: **{hit}** · False alarm: **{falseAlarm}** · Miss: **{miss}** · Correct: **{correct}** · Confirmed: **{confirmed}**
+      predictionCounts: '',
+      // EN: False alarm share: {falseAlarmShare} · Miss share: {missShare}
+      predictionShares: '',
+      // EN: Judged: {judged} · Pending: {pending}
+      predictionJudged: '',
+      // EN: 🔁 Reunite
+      reunite: '',
+      // EN: 🟢 Enabled
+      reuniteEnabled: '',
+      // EN: ⚫ Disabled
+      reuniteDisabled: '',
+      // EN: Moved: **{moved}** · Failed: **{failed}** · Skipped for balance: **{skippedBalance}**
+      reuniteCounts: '',
+      // EN: Window: {window} · Max team difference: {maxTeamDiff}
+      reuniteLimits: '',
     },
     locks: {
       // EN: 🔴 Players Service Not Available
@@ -1274,6 +1358,8 @@ export const MESSAGES = {
       s3PlayersPopulationOverview: '',
       // EN: `!s3 clans` — Clan groups, plus why tags were excluded or merged
       s3ClansClanGroups: '',
+      // EN: `!s3 parties` — Squad parties and where their members are, plus join prediction and reunite counts
+      s3PartiesSquadParties: '',
       // EN: `!s3 locks` — Global and per-player locks
       s3LocksGlobalAnd: '',
       // EN: `!s3 config` — Server configuration values
@@ -1590,6 +1676,8 @@ export const MESSAGES = {
       queueReasonOthersWaiting: '',
       // EN: Teams are currently full on that side.
       queueReasonTeamsFull: '',
+      // EN: There's no room for your whole party on that side yet.
+      queueReasonPartyNoRoom: '',
       // EN: none
       none: '',
       // EN: Liberal (Seed/Jensen)
@@ -2410,10 +2498,12 @@ export const MESSAGES = {
       furtherLinesOmittedStay: '',
       // EN: regular (10+ rounds)
       regular10Rounds: '',
-      // EN: clan member (virtual squad)
+      // EN: clan or party member (virtual squad)
       clanMemberVirtualSquad: '',
       // EN: pulled with squad
       pulledWithSquad: '',
+      // EN: Squad party
+      squadParty: '',
       // EN: anchor squad
       anchorSquad: '',
       // EN: scramble calculation

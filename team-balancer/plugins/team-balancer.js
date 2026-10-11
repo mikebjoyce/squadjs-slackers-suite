@@ -62,9 +62,9 @@
  *   - gameState: isIgnoredMode(), getGamemode(), getLayerName(),
  *               getRoundStartTime() — match/mode/round identification.
  *   - factions:  isEnabled(), getTeamName(teamID) — faction name lookup.
- *   - players:   getAllPlayers(), getSquads(), lockGlobal(),
- *               unlockGlobal() — player data
- *               and concurrency control during scrambles.
+ *   - players:   getAllPlayers(), getSquads(), getParties(),
+ *               lockGlobal(), unlockGlobal() — player data, Squad
+ *               parties, and concurrency control during scrambles.
  *   - clans:     isEnabled(), extractClanGroups(),
  *               options.pullEntireSquads — clan tag grouping for scrambles.
  *
@@ -296,6 +296,7 @@ import S3PluginBase from './s3-plugin-base.js';
 import { DiscordHelpers } from '../utils/tb-discord-helpers.js';
 import Scrambler from '../utils/tb-scrambler.js';
 import SwapExecutor from '../utils/tb-swap-executor.js';
+import { buildScrambleGroups } from '../utils/tb-party-groups.js';
 import CommandHandlers from '../utils/tb-commands.js';
 import Logger from '../../core/logger.js';
 import { TBDiagnostics } from '../utils/tb-diagnostics.js';
@@ -2955,7 +2956,7 @@ export default class TeamBalancer extends S3PluginBase {
    * (SQUAD_FIT_GRACE, pullEntireSquads) can hand back more players than asked for, and any plan
    * that overshoots the ceiling is discarded rather than accepted.
    */
-  async _runEloDiffMicroScrambleSearch({ transformedSquads, transformedPlayers, eloMap, clanGroups }) {
+  async _runEloDiffMicroScrambleSearch({ transformedSquads, transformedPlayers, eloMap, clanGroups, membersOnlyTags = null }) {
     // No ratings, no micro scramble — must never silently fall back to the default
     // scramblePercentage budget (a near-full scramble), which is exactly what this feature
     // exists to avoid. See "Second high-risk finding".
@@ -2982,6 +2983,7 @@ export default class TeamBalancer extends S3PluginBase {
         minPlayersToMove: budget,
         maxPlayersToMove: budget,
         clanGroups,
+        membersOnlyTags,
         pullEntireSquads: this._s3?.clans?.options?.pullEntireSquads || false
       });
 
@@ -3205,6 +3207,31 @@ export default class TeamBalancer extends S3PluginBase {
         }
       }
 
+      // Squad parties ride in the same groups as clans, merged wherever a party and a clan
+      // (or two parties) share a player, because the scrambler needs its groups disjoint.
+      // This runs whether or not clan grouping is on: a party with a member in another
+      // squad, or in none, is otherwise free to be split by the plan.
+      let membersOnlyTags = null;
+      try {
+        const parties = this._s3?.players?.getParties?.() ?? [];
+        if (parties.length > 0) {
+          const playersForParties = this._s3?.players?.getAllPlayers
+            ? this._s3.players.getAllPlayers()
+            : this.server.players;
+          const built = buildScrambleGroups({ clanGroups, parties, players: playersForParties });
+          clanGroups = built.groups;
+          membersOnlyTags = built.membersOnlyTags;
+          Logger.verbose(
+            'TeamBalancer',
+            2,
+            `[TeamBalancer] Party grouping: ${built.partyCount} party(ies) kept together` +
+            (built.splitPartyCount ? `, ${built.splitPartyCount} already split across teams left alone.` : '.')
+          );
+        }
+      } catch (err) {
+        Logger.verbose('TeamBalancer', 1, `[TeamBalancer] Party grouping failed, scrambling without it: ${err.message}`);
+      }
+
       Logger.verbose('TeamBalancer', 4, `Calling scrambler with ${transformedSquads.length} squads and ${transformedPlayers.length} players`);
 
       if (scrambleType === 'EloDiff') {
@@ -3215,7 +3242,8 @@ export default class TeamBalancer extends S3PluginBase {
           transformedSquads,
           transformedPlayers,
           eloMap,
-          clanGroups
+          clanGroups,
+          membersOnlyTags
         });
       } else {
         swapPlan = await Scrambler.scrambleTeamsPreservingSquads({
@@ -3228,6 +3256,7 @@ export default class TeamBalancer extends S3PluginBase {
           minPlayersToMove,
           maxPlayersToMove,
           clanGroups,
+          membersOnlyTags,
           pullEntireSquads: this._s3?.clans?.options?.pullEntireSquads || false
         });
       }

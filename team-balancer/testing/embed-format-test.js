@@ -146,7 +146,7 @@ const noElo = await build(withPlan(CLAN_MOVES, { virtualSquads: [VS_3DP] }),
 
 check('the legend covers every symbol actually used, and only those', () => {
   assert.strictEqual(withClans.footer?.text,
-    '★ regular (10+ rounds) · ◆ clan member (virtual squad) · ◇ pulled with squad · ⚓ anchor squad');
+    '★ regular (10+ rounds) · ◆ clan or party member (virtual squad) · ◇ pulled with squad · ⚓ anchor squad');
   assert.ok(!noPulled.footer.text.includes('◇'), `stale ◇: ${noPulled.footer.text}`);
   assert.ok(noPulled.footer.text.includes('◆'), 'clan marker legend missing');
   assert.ok(!noElo.footer.text.includes('★'), `stale ★ without ELO: ${noElo.footer.text}`);

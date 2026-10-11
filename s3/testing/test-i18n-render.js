@@ -320,8 +320,43 @@ const flipped = {
 const S3_BUILDERS = [
   'buildStatusEmbed', 'buildServicesEmbed', 'buildGameStateEmbed',
   'buildFactionsEmbed', 'buildPlayersEmbeds', 'buildClansEmbeds',
-  'buildLocksEmbed', 'buildConfigEmbed', 'buildHelpEmbed'
+  'buildPartiesEmbeds', 'buildLocksEmbed', 'buildConfigEmbed', 'buildHelpEmbed'
 ];
+
+/**
+ * A players service that is tracking parties. None of the three stubs above
+ * is, so on its own the builder loop only ever renders the "no parties" path
+ * of `!s3 parties` and no party marker in `!s3 players`. One party here is
+ * split across teams and one member has no resolved team, which is every
+ * branch of the party line.
+ */
+const withParties = {
+  ...populated,
+  services: {
+    ...populated.services,
+    players: {
+      ...populated.services.players,
+      getAllPlayers: () => [
+        { name: 'Alpha', eosID: 'e1', teamID: 1, squadID: 1, isLeader: true },
+        { name: 'Bravo', eosID: 'e2', teamID: 2, squadID: null },
+        { name: 'Alice', eosID: 'e3', teamID: 1, squadID: 1 },
+        { name: 'Bob', eosID: 'e4', teamID: null, squadID: 2 }
+      ],
+      getSquads: () => [{ squadID: 1, teamID: 1, squadName: 'INFANTRY', locked: false, players: ['e1', 'e3'] }],
+      getParties: () => [
+        { key: 'p1', partyID: 4, members: ['e1', 'e2'], size: 2, formedAt: Date.now() - 720000, changedAt: Date.now() },
+        { key: 'p2', partyID: 5, members: ['e3', 'e4'], size: 2, formedAt: Date.now() - 4000000, changedAt: Date.now() }
+      ],
+      getJoinPredictionStats: () => ({
+        confirmed: 4, hit: 3, falseAlarm: 1, miss: 1, correct: 9, judged: 18, pending: 2, falseAlarmShare: 0.25, missShare: null
+      }),
+      parties: {
+        options: { reuniteEnabled: true, reuniteWindowMs: 90000, reuniteMaxTeamDiff: 3 },
+        getReuniteStats: () => ({ moved: 2, failed: 1, skippedBalance: 3 })
+      }
+    }
+  }
+};
 
 const S3_STUBS = [['bare', bare], ['populated', populated], ['flipped', flipped]];
 
@@ -412,6 +447,18 @@ describe('i18n render — S³ command embeds', () => {
       });
     }
   }
+
+  for (const name of ['buildPartiesEmbeds', 'buildPlayersEmbeds', 'buildStatusEmbed', 'buildServicesEmbed']) {
+    test(`${name} (with parties) renders no unlocalized prose`, () => {
+      assertFullyLocalized(`${name}/withParties`, cmds[name](withParties));
+    });
+  }
+
+  test('the party stub reached the party line, not the empty state', () => {
+    // The four cases above pass vacuously if the builder never lists a party.
+    const rendered = JSON.stringify(cmds.buildPartiesEmbeds(withParties));
+    assert.ok(rendered.includes('Alpha') && rendered.includes('INFANTRY'), 'no party line was rendered');
+  });
 
   test('the pseudo-locale actually reached the builders', () => {
     // Guards against the whole suite passing vacuously: if localize() were

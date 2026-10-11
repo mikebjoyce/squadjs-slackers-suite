@@ -144,6 +144,7 @@
  *   !s3 factions             → Team 1/2 names, polling status, resolving gate.
  *   !s3 players              → Full player list with teamID, clan tag, locks.
  *   !s3 clans                → Detected clan groups.
+ *   !s3 parties              → Squad parties: members, team or split, squads, join prediction and reunite counts.
  *   !s3 locks                → Global lock + per-player locks + priority table.
  *   !s3 servers              → The server registry: who else writes to this database, with
  *                              each row’s suite version, clock skew and community options.
@@ -173,6 +174,7 @@
  */
 
 import BasePlugin from './base-plugin.js';
+import S3PluginBase from './s3-plugin-base.js';
 import GameStateService from '../utils/game-state-service.js';
 import FactionsService from '../utils/factions-service.js';
 import ClansService from '../utils/clans-service.js';
@@ -332,6 +334,42 @@ export default class SlackersSquadServices extends BasePlugin {
         description: 'When true, clan grouping during scrambles pulls entire squads containing clan members rather than just the clan members themselves.',
         default: true
       },
+      partyReunite: {
+        required: false,
+        type: 'boolean',
+        description: 'When true, a player who has just joined and turns out to be on the other team from their Squad party is moved to the party, once. Covers the game placing one member of a joining party on the wrong team, and SmartAssign moving a party member before their party ID showed. Set false to stop S³ moving players itself.',
+        default: true
+      },
+      partyReuniteWindowSeconds: {
+        required: false,
+        type: 'number',
+        description: 'How long after joining a player can still be moved to their party. A party ID can take close to a minute to show after a join, and the player-list tick that sees it can be up to 30 seconds behind that.',
+        default: 90
+      },
+      partyReuniteMaxTeamDiff: {
+        required: false,
+        type: 'number',
+        description: "A player is not moved to their party when that would leave the party's team ahead by more than this many players. Keep it no looser than the server's own NumPlayersDiffForTeamChanges.",
+        default: 3
+      },
+      partyJoinCheckSeconds: {
+        required: false,
+        type: 'number',
+        description: 'How long after a join S³ waits before checking its join-time party prediction (in a squad at first sighting means in a party) against whether a party ID showed.',
+        default: 60
+      },
+      partyFalseAlarmWarnPercent: {
+        required: false,
+        type: 'number',
+        description: 'Log a warning, at most once an hour, when more than this percentage of joiners who arrived in a squad never showed a party ID.',
+        default: 30
+      },
+      partyMissWarnPercent: {
+        required: false,
+        type: 'number',
+        description: 'Log a warning, at most once an hour, when more than this percentage of party joiners arrived squadless and were treated as solo.',
+        default: 25
+      },
       enableDatabaseLogging: {
         required: false,
         type: 'boolean',
@@ -402,6 +440,9 @@ export default class SlackersSquadServices extends BasePlugin {
     // refuse to mount; S³ itself stays up so the operator can diagnose.
     this._serverIdentityBlocked = null;
     this._serverIDError = null;
+
+    // Built on first use by _requestTeamChange().
+    this._teamChangeHost = null;
 
     this._s3DiscordCleanup = null;
     this._migrationDiscordCleanup = null;
@@ -545,7 +586,22 @@ export default class SlackersSquadServices extends BasePlugin {
     this.services.players = new PlayersService({
       parent: this,
       server: this.server,
-      verboseLogger: (...args) => this.verbose(...args)
+      verboseLogger: (...args) => this.verbose(...args),
+      partyOptions: {
+        reuniteEnabled: this.options.partyReunite,
+        reuniteWindowMs: Number(this.options.partyReuniteWindowSeconds) * 1000,
+        reuniteMaxTeamDiff: this.options.partyReuniteMaxTeamDiff,
+        joinCheckMs: Number(this.options.partyJoinCheckSeconds) * 1000,
+        falseAlarmWarnShare: Number(this.options.partyFalseAlarmWarnPercent) / 100,
+        missWarnShare: Number(this.options.partyMissWarnPercent) / 100
+      }
+    });
+
+    // The parties tracker decides when a split party should be reunited;
+    // the move itself is sent from here.
+    this.services.players.parties.setReuniteHandlers({
+      move: (eosID, options) => this._requestTeamChange(eosID, options),
+      warn: (player) => this._warnPartyReunited(player)
     });
 
     this.services.serverConfig = new ServerConfigService({
@@ -564,6 +620,38 @@ export default class SlackersSquadServices extends BasePlugin {
       enableFileLogging: this.options.enableFileLogging,
       logPath: this.options.logPath
     });
+  }
+
+  /**
+   * Move a player to a stated team, with retry and verification.
+   *
+   * This is S3PluginBase._requestTeamChange, the one every consumer plugin
+   * uses, run against a stand-in built from that class's prototype. S³
+   * extends BasePlugin, so it does not inherit the method, and a second copy
+   * of the identifier cascade and the name-collision guard would be a second
+   * place for an RCON bug to live. The stand-in points back at this plugin
+   * for the server, the logger and the services.
+   *
+   * @param {string} eosID
+   * @param {object} options - As S3PluginBase._requestTeamChange. Always
+   *   pass targetTeamID.
+   */
+  _requestTeamChange(eosID, options = {}) {
+    if (!this._teamChangeHost) {
+      const host = Object.create(S3PluginBase.prototype);
+      host._s3 = this;
+      host.server = this.server;
+      host.verbose = (...args) => this.verbose(...args);
+      this._teamChangeHost = host;
+    }
+    return this._teamChangeHost._requestTeamChange(eosID, options);
+  }
+
+  /** Tell a player S³ moved them, and why. */
+  async _warnPartyReunited(player) {
+    const identifier = player?.steamID || player?.name;
+    if (!identifier || typeof this.server?.rcon?.warn !== 'function') return;
+    await this.server.rcon.warn(identifier, this.localize('slackersSquadServices.warn.partyReunited'));
   }
 
   /**

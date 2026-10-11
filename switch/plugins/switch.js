@@ -6,6 +6,7 @@ import SwitchDB from '../utils/switch-db.js';
 // ── Utility modules (extracted during refactor) ─────────────────
 import SwitchOutput from '../utils/switch-output.js';
 import SwitchQueue from '../utils/switch-queue.js';
+import SwitchParties from '../utils/switch-parties.js';
 import SwitchCommands from '../utils/switch-commands.js';
 import SwitchExplain from '../utils/switch-explain.js';
 
@@ -50,6 +51,7 @@ const POST_SWITCH_LOCKOUT_MS = 10_000;
  *     getSecondsFromMatchStart()       — Seconds since current layer started.
  *     getTeamBalanceDifference()       — Returns signed team-size delta (Team1 − Team2).
  *     getSwitchSlotsPerTeam(teamID, effectiveCap) — Available switch slots for a given team.
+ *     getSwitchGroupSlots(teamID, n, effectiveCap) — The same question for n players at once (a Squad party).
  *     addPlayerToMatchendSwitches(p)   — Queues a player for end-of-round team switch.
  *     addSquadToMatchendSwitches(n, t) — Queues an entire squad for end-of-round switch.
  *     onChatMessage(info)              — Handles all in-game !switch / !change / double-switch commands.
@@ -319,6 +321,11 @@ export default class Switch extends S3DiscordPluginBase {
                 required: false,
                 description: "Number of player of difference between the two teams to allow a team switch",
                 default: 1
+            },
+            maxPartySwitchSize: {
+                required: false,
+                description: "Largest Squad party !switch will move. A party member's !switch moves every member on their team together; a bigger party is refused and told to leave the party to switch alone. Not applied in liberal mode (Seed/Jensen).",
+                default: 3
             },
             discordChannelID: {
                 required: false,
@@ -649,8 +656,11 @@ export default class Switch extends S3DiscordPluginBase {
         //    so other plugins discover them during their _onS3Ready().
         SwitchOutput.register(this);
         SwitchQueue.register(this);
+        SwitchParties.register(this);
         SwitchCommands.register(this);
         SwitchExplain.register(this);
+        // Queue entries are cancelled when the party behind them changes.
+        this._startPartyWatch();
         // Then do async DB registration (can yield safely now)
         await SwitchDB.register(this);
 
@@ -805,6 +815,9 @@ export default class Switch extends S3DiscordPluginBase {
             // AdminForceTeamChange toggles, and a leader's move drags the
             // party, so a mate's command landing just after flips them back.
             const targets = resolved.map((r) => (r.eosID ? this._oppositeTeamOf(r.eosID) : null));
+            // No admin is waiting on this one, so the party notice goes to the log.
+            const partyNotice = this._partyNotice(resolved.map((r) => r.eosID).filter(Boolean));
+            if (partyNotice) this.verbose(1, `[Switch] Matchend switches include Squad party members:\n${partyNotice}`);
             const outcomes = [];
             for (const [i, r] of resolved.entries()) {
                 try {
@@ -967,6 +980,47 @@ export default class Switch extends S3DiscordPluginBase {
 
          return 1;
      }
+
+    /**
+     * Whether `n` players can leave a team together, under the same rules
+     * getSwitchSlotsPerTeam() applies to one.
+     *
+     * A Squad party moves as a group or not at all, so the question is never
+     * "is there a slot" but "is there room for all of them": the difference
+     * after all n have moved must stay within the cap, and the receiving team
+     * must have n free places.
+     *
+     * @param {number} teamID — The team the players are leaving (1 or 2).
+     * @param {number} n — How many players would move.
+     * @param {number|null} effectiveCap — As for getSwitchSlotsPerTeam().
+     * @param {boolean} skipHardCap — As for getSwitchSlotsPerTeam().
+     * @returns {number} — n when all of them fit, otherwise 0.
+     */
+    getSwitchGroupSlots(teamID, n, effectiveCap = null, skipHardCap = false) {
+        if (!(n >= 1)) return 0;
+
+        let cap = effectiveCap !== null ? effectiveCap : this.options.maxUnbalancedSlots;
+        cap += this.getDynamicExtraSlots();
+
+        const balanceDifference = this.getTeamBalanceDifference();
+        const postSwitchDiff = teamID === 1
+            ? balanceDifference - 2 * n
+            : balanceDifference + 2 * n;
+        if (Math.abs(postSwitchDiff) > cap) return 0;
+
+        let teamPlayerCount = [null, 0, 0];
+        for (let p of this.server.players)
+            teamPlayerCount[+p.teamID]++;
+
+        const receivingTeam = teamID === 1 ? 2 : 1;
+        const effectiveMax = this?._s3?.serverConfig?.isReady()
+            ? this._s3.serverConfig.getMaxPlayers() - this._s3.serverConfig.getNumReservedSlots()
+            : 98;
+        const maxTeamSize = Math.floor(effectiveMax / 2);
+        if (!skipHardCap && (teamPlayerCount[receivingTeam] || 0) + n > maxTeamSize) return 0;
+
+        return n;
+    }
 
     /**
      * Point this.options at the community's resolved token settings.
@@ -1591,7 +1645,14 @@ export default class Switch extends S3DiscordPluginBase {
         // the live entry while it still exists in the queue; after
         // _removePlayerFromQueue it would already be null.
         const queueEntry = this._findQueueEntry(eosID)?.entry;
-        if (this._removePlayerFromQueue(eosID)) {
+        if (queueEntry?.kind === 'party') {
+            // A member leaving is a change to the party, not a queued player
+            // disconnecting: the rest are still here and are told to ask again.
+            // S³ has usually dropped the leaver from the party by now, and the
+            // check sees that; if it has not yet, the parties-changed
+            // subscription cancels the entry when it does.
+            this._cancelIfPartyChanged(queueEntry);
+        } else if (this._removePlayerFromQueue(eosID)) {
             this.verbose(2, `[Queue] ${playerName} disconnected — removed from queue.`);
             // Deduplicate by eosID: a player can only DC from the queue once per round.
             // Without this guard, delayed async cascades (e.g. onChatMessage finishing
@@ -1627,6 +1688,15 @@ export default class Switch extends S3DiscordPluginBase {
         const cooldownHoursLeft = (Date.now() - +recentSwitch?.datetime) / (60 * 60 * 1000);
 
         if (!forced) {
+            // A double switch is two forced moves of one player. For a party
+            // leader each hop drags the whole party and empties their squads;
+            // for any other member it ends with them squadless. An admin's
+            // forced double switch still runs.
+            if (this._partyForSwitch(playerEosID)) {
+                this.warn(playerEosID, this.localize('switch.warn.doubleSwitchParty'));
+                return;
+            }
+
             const joinSeconds = await this.getSecondsFromJoin(playerEosID);
             if (joinSeconds / 60 > this.options.doubleSwitchEnabledMinutes && this.getSecondsFromMatchStart() / 60 > this.options.doubleSwitchEnabledMinutes) {
                 this.warn(playerEosID, this.localize('switch.warn.doubleSwitchTimeLimit', { minutes: this.options.doubleSwitchEnabledMinutes }));
@@ -2301,6 +2371,7 @@ export default class Switch extends S3DiscordPluginBase {
      */
     async _onUnmount() {
         this._stopPeriodicProcessing();
+        this._stopPartyWatch();
 
         // v2.0.0: Clear broadcast timers
         this._clearBroadcastTimers();

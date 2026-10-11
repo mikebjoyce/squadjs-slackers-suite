@@ -5,17 +5,20 @@
  *
  * ─── PURPOSE ─────────────────────────────────────────────────────
  *
- * Validates the `!s3 players` and `!s3 clans` embed builders:
+ * Validates the `!s3 players`, `!s3 clans` and `!s3 parties` embed builders:
  *
  *   - buildPlayersEmbeds()  — meta/population embed + one embed per team,
- *                             broken down by squad with leaders marked.
+ *                             broken down by squad with leaders marked and
+ *                             party members tagged.
  *   - buildClansEmbeds()    — active clan groups plus the exclusion and
  *                             merge trace from ClansService.
+ *   - buildPartiesEmbeds()  — tracked Squad parties, where their members
+ *                             are, and the join prediction and reunite counts.
  *
- * Both builders run against the REAL PlayersService and ClansService
+ * The builders run against the REAL PlayersService and ClansService
  * (registry and squad cache populated directly) rather than hand-rolled
- * stubs, so a change to getSquads() or the clan grouping pipeline surfaces
- * here instead of silently drifting.
+ * stubs, so a change to getSquads(), the clan grouping pipeline or the party
+ * tracker surfaces here instead of silently drifting.
  *
  * Also enforces Discord's embed limits against a full 100-player server,
  * which is the case that actually breaks in production:
@@ -36,7 +39,7 @@ import assert from 'node:assert/strict';
 import { localize as lookupMessage } from '../utils/s3-i18n.js';
 import ClansService from '../utils/clans-service.js';
 import PlayersService from '../utils/players-service.js';
-import { buildPlayersEmbeds, buildClansEmbeds } from '../utils/s3-commands.js';
+import { buildPlayersEmbeds, buildClansEmbeds, buildPartiesEmbeds } from '../utils/s3-commands.js';
 
 async function runTest(name, fn) {
   try {
@@ -657,6 +660,267 @@ await runTest('buildClansEmbeds stays within Discord limits on a full 100-player
   const plugin = makePlugin({ ...fullServerFixture(), clanOptions: { minSize: 2, maxSize: 4 } });
   const embeds = buildClansEmbeds(plugin);
   assertWithinDiscordLimits(embeds, 'clans');
+});
+
+// ---------------------------------------------------------------------------
+// buildPartiesEmbeds, and the party marker in buildPlayersEmbeds
+// ---------------------------------------------------------------------------
+
+const MINUTE = 60 * 1000;
+
+/** Discord counts this across every embed in one message, not per embed. */
+function messageCharCount(embeds) {
+  return embeds.reduce((n, embed) => n + embedCharCount(embed), 0);
+}
+
+/**
+ * A plugin whose real PartiesService has been ticked into this state:
+ *
+ *   party 77  Mandela Caos, Bravo, Charlie on T1 and Delta on T2  (split, 12m old)
+ *   party 88  Echo, Foxtrot on T2                                 (5m old)
+ *   party 99  LoneCarrier only, so not a tracked party
+ *   Solo, Wanderer in no party
+ *
+ * The game numbers are two digits that appear nowhere else in the fixture, so
+ * a test can assert neither reaches the reply. Parties are formed by
+ * handleTick() from the registry rows, the way a real player-list tick does
+ * it. No reunite handler is installed, so nothing is moved.
+ */
+function partyPlugin() {
+  const players = [
+    { eosID: 'p1', name: 'Mandela Caos', teamID: 1, squadID: '1', isLeader: true, partyID: 77 },
+    { eosID: 'p2', name: 'Bravo', teamID: 1, squadID: '1', partyID: 77 },
+    { eosID: 'p3', name: 'Charlie', teamID: 1, squadID: '2', isLeader: true, partyID: 77 },
+    { eosID: 'p4', name: 'Delta', teamID: 2, squadID: null, partyID: 77 },
+    { eosID: 'p5', name: 'Echo', teamID: 2, squadID: '1', isLeader: true, partyID: null },
+    { eosID: 'p6', name: 'Foxtrot', teamID: 2, squadID: '1', partyID: null },
+    { eosID: 'p7', name: 'Solo', teamID: 1, squadID: null, partyID: null },
+    { eosID: 'p8', name: 'LoneCarrier', teamID: 2, squadID: null, partyID: 99 },
+    { eosID: 'p9', name: 'Wanderer', teamID: 1, squadID: null, partyID: null }
+  ];
+  const squads = [
+    { squadID: '1', teamID: 1, squadName: 'INFANTRY', locked: 'False' },
+    { squadID: '2', teamID: 1, squadName: 'ARMOR', locked: 'False' },
+    { squadID: '1', teamID: 2, squadName: 'CMD', locked: 'False' }
+  ];
+  const plugin = makePlugin({ players, squads });
+  const svc = plugin.services.players;
+  svc._isMounted = true;
+
+  const now = Date.now();
+  const firstTick = now - 12 * MINUTE;
+  const secondTick = now - 5 * MINUTE;
+  const joinedAt = firstTick - 2 * MINUTE;
+
+  // One join of each outcome, judged on the first tick, plus one still pending.
+  svc.parties.noteJoin({ eosID: 'p1', squadID: '1', partyID: 77 }, joinedAt);     // party        -> confirmed
+  svc.parties.noteJoin({ eosID: 'p2', squadID: '1', partyID: null }, joinedAt);   // likely-party -> hit
+  svc.parties.noteJoin({ eosID: 'p7', squadID: '3', partyID: null }, joinedAt);   // likely-party -> false alarm
+  svc.parties.noteJoin({ eosID: 'p4', squadID: null, partyID: null }, joinedAt);  // solo         -> miss
+  svc.parties.noteJoin({ eosID: 'p9', squadID: null, partyID: null }, joinedAt);  // solo         -> correct
+  svc.parties.handleTick(firstTick);
+
+  svc.registry.get('p5').partyID = 88;
+  svc.registry.get('p6').partyID = 88;
+  svc.parties.noteJoin({ eosID: 'p6', squadID: '1', partyID: null }, secondTick - 1000); // pending
+  svc.parties.handleTick(secondTick);
+
+  return plugin;
+}
+
+const partyListField = (embed) => embed.fields.find((f) => f.name.startsWith('Parties ('));
+
+await runTest('buildPartiesEmbeds degrades gracefully with no players service', async () => {
+  const embeds = buildPartiesEmbeds({ verbose: () => {}, localize: (key, vars) => lookupMessage(key, vars), services: {} });
+  assert.equal(embeds.length, 1);
+  assert.match(embeds[0].title, /Players Service Not Available/);
+});
+
+await runTest('buildPartiesEmbeds says so when the players service is not mounted', async () => {
+  // makePlayersService() never mounts the service, which is exactly this case.
+  const plugin = makePlugin(smallServerFixture());
+  assert.equal(plugin.services.players._isMounted, false);
+
+  const embeds = buildPartiesEmbeds(plugin);
+  assert.equal(embeds.length, 1);
+  assert.match(embeds[0].title, /Not Mounted/);
+  assert.equal(embeds[0].fields, undefined, 'an unmounted tracker has no counts worth showing');
+});
+
+await runTest('buildPartiesEmbeds says plainly when there are no parties', async () => {
+  const plugin = makePlugin(smallServerFixture());
+  plugin.services.players._isMounted = true;
+  plugin.services.players.parties.handleTick(Date.now());
+
+  const [embed] = buildPartiesEmbeds(plugin);
+  assert.match(embed.description, /Parties: \*\*0\*\* · Players in a party: \*\*0\*\* · Split across teams: \*\*0\*\*/);
+  assert.equal(partyListField(embed).name, 'Parties (0)');
+  assert.equal(partyListField(embed).value, 'No parties on the server right now.');
+  // The counters are still shown: an empty server is when a drifting
+  // prediction is easiest to read.
+  assert.ok(embed.fields.find((f) => f.name.includes('Join Prediction')));
+  assert.ok(embed.fields.find((f) => f.name.includes('Reunite')));
+  assertWithinDiscordLimits([embed], 'parties (none)');
+});
+
+await runTest('buildPartiesEmbeds lists two parties, largest first, with one split across teams', async () => {
+  const [embed] = buildPartiesEmbeds(partyPlugin());
+
+  assert.match(embed.description, /Parties: \*\*2\*\* · Players in a party: \*\*6\*\* · Split across teams: \*\*1\*\*/);
+
+  const list = partyListField(embed);
+  assert.equal(list.name, 'Parties (2)');
+  const rows = list.value.split('\n');
+  assert.equal(rows.length, 4, 'two rows per party');
+
+  // The split party is the larger one, so it leads. Each group carries its
+  // team because the party has no single team to print once.
+  assert.equal(rows[0], 'ᴾ1 **Mandela Caos + 3** (4) · ⚠️ split · 12m');
+  assert.equal(rows[1], '↳ T1 #1 INFANTRY: Mandela Caos, Bravo · T1 #2 ARMOR: Charlie · T2 no squad: Delta');
+
+  // One team, so it is printed once and the groups are squads only.
+  assert.equal(rows[2], 'ᴾ2 **Echo + 1** (2) · T2 · 5m');
+  assert.equal(rows[3], '↳ #1 CMD: Echo, Foxtrot');
+
+  // A lone player carrying a party ID is not a party.
+  assert.ok(!list.value.includes('LoneCarrier'));
+});
+
+await runTest('buildPartiesEmbeds names a party after a member, never by the game number', async () => {
+  // The game renumbers every later party when one forms or dissolves, so its
+  // number in a reply would point at a different party a minute later.
+  const [embed] = buildPartiesEmbeds(partyPlugin());
+  const shown = [embed.title, embed.description, ...embed.fields.flatMap((f) => [f.name, f.value])].join('\n');
+
+  assert.match(shown, /\*\*Mandela Caos \+ 3\*\*/);
+  assert.match(shown, /\*\*Echo \+ 1\*\*/);
+  for (const partyID of ['77', '88', '99']) {
+    assert.ok(!shown.includes(partyID), `game party number ${partyID} reached the reply`);
+  }
+});
+
+await runTest('buildPartiesEmbeds reports the join prediction and reunite counts', async () => {
+  const plugin = partyPlugin();
+  plugin.services.players.parties.getReuniteStats = () => ({ moved: 2, failed: 1, skippedBalance: 3 });
+
+  const [embed] = buildPartiesEmbeds(plugin);
+  const prediction = embed.fields.find((f) => f.name.includes('Join Prediction')).value.split('\n');
+
+  assert.equal(prediction[0], 'Hit: **1** · False alarm: **1** · Miss: **1** · Correct: **1** · Confirmed: **1**');
+  // 1 false alarm of 2 likely-party calls; 1 miss of 3 party joiners.
+  assert.equal(prediction[1], 'False alarm share: 50% · Miss share: 33%');
+  assert.equal(prediction[2], 'Judged: 5 · Pending: 1');
+
+  const reunite = embed.fields.find((f) => f.name.includes('Reunite')).value.split('\n');
+  assert.equal(reunite[0], '🟢 Enabled');
+  assert.equal(reunite[1], 'Moved: **2** · Failed: **1** · Skipped for balance: **3**');
+  assert.equal(reunite[2], 'Window: 90s · Max team difference: 3');
+});
+
+await runTest('buildPartiesEmbeds shows a share as N/A until there is something to divide by', async () => {
+  const plugin = makePlugin(smallServerFixture());
+  plugin.services.players._isMounted = true;
+  plugin.services.players.parties.options.reuniteEnabled = false;
+
+  const [embed] = buildPartiesEmbeds(plugin);
+  assert.match(embed.fields.find((f) => f.name.includes('Join Prediction')).value, /False alarm share: N\/A · Miss share: N\/A/);
+  assert.match(embed.fields.find((f) => f.name.includes('Reunite')).value, /^⚫ Disabled/);
+});
+
+await runTest('buildPartiesEmbeds marks a member with no resolved team instead of guessing one', async () => {
+  const plugin = partyPlugin();
+  plugin.services.players.registry.get('p6').teamID = null;
+
+  const rows = partyListField(buildPartiesEmbeds(plugin)[0]).value.split('\n');
+  assert.equal(rows[2], 'ᴾ2 **Echo + 1** (2) · T2 · 5m', 'one known team is not a split');
+  assert.equal(rows[3], '↳ T2 #1 CMD: Echo · T? #1: Foxtrot');
+});
+
+await runTest('buildPartiesEmbeds stays within Discord limits with fifty parties on a full server', async () => {
+  // The worst list a 100-player server can produce: every player in a party
+  // of two, long names full of markdown, every pair in its own named squad.
+  const players = [];
+  const squads = [];
+  for (let i = 0; i < 50; i++) {
+    const teamID = (i % 2) + 1;
+    const squadID = `${Math.floor(i / 2) + 1}`;
+    squads.push({ squadID, teamID, squadName: `SQUAD_NAME_THAT_IS_LONG_${i}`, locked: 'False' });
+    for (const half of ['a', 'b']) {
+      players.push({ eosID: `pair-${i}${half}`, name: `[*TAG*] Long_Player_Name_${i}${half}`, teamID, squadID, partyID: i + 1 });
+    }
+  }
+  const plugin = makePlugin({ players, squads });
+  plugin.services.players._isMounted = true;
+  plugin.services.players.parties.handleTick(Date.now() - 90 * MINUTE);
+  assert.equal(plugin.services.players.getParties().length, 50);
+
+  const embeds = buildPartiesEmbeds(plugin);
+  assertWithinDiscordLimits(embeds, 'parties (50)');
+  assert.ok(messageCharCount(embeds) <= DISCORD.MAX_EMBED_TOTAL,
+    `${messageCharCount(embeds)} chars across the message exceeds ${DISCORD.MAX_EMBED_TOTAL}`);
+
+  // Whatever did not fit is counted, not dropped silently.
+  const [embed] = embeds;
+  assert.match(embed.description, /Parties: \*\*50\*\*/);
+  const shown = embed.fields
+    .filter((f) => f.name.startsWith('Parties ('))
+    .reduce((n, f) => n + f.value.split('\n').filter((row) => row.startsWith('ᴾ')).length, 0);
+  assert.ok(shown > 0 && shown < 50, `expected a capped list, got ${shown} of 50`);
+  const overflow = embed.fields.find((f) => /more \(output truncated\)/.test(f.value));
+  assert.ok(overflow, 'expected an overflow count for the parties that did not fit');
+  assert.match(overflow.value, new RegExp(`and ${50 - shown} more`));
+});
+
+await runTest('buildPartiesEmbeds stays within Discord limits when one party is the whole server', async () => {
+  // Not a real party, but it is what the reply would be handed if the game
+  // ever gave one number to everybody.
+  const players = [];
+  for (let i = 0; i < 100; i++) {
+    players.push({ eosID: `big-${i}`, name: `[*TAG*] Long_Player_Name_${i}`, teamID: (i % 2) + 1, squadID: `${(i % 9) + 1}`, partyID: 5 });
+  }
+  const plugin = makePlugin({ players, squads: [] });
+  plugin.services.players._isMounted = true;
+  plugin.services.players.parties.handleTick(Date.now());
+
+  const embeds = buildPartiesEmbeds(plugin);
+  assertWithinDiscordLimits(embeds, 'parties (one of 100)');
+  const list = partyListField(embeds[0]);
+  assert.match(list.value, /\(100\) · ⚠️ split/);
+  assert.match(list.value, /\+\d+ more/);
+});
+
+await runTest('buildPlayersEmbeds tags party members with the party list position', async () => {
+  const [meta, team1, team2] = buildPlayersEmbeds(partyPlugin());
+
+  const infantry = team1.fields.find((f) => f.name.includes('INFANTRY'));
+  assert.match(infantry.value, /👑 Mandela Caos ᴾ1/);
+  assert.match(infantry.value, /· Bravo ᴾ1/);
+  // Same party, another squad and the other team: the marker is what ties them.
+  assert.match(team1.fields.find((f) => f.name.includes('ARMOR')).value, /Charlie ᴾ1/);
+  assert.match(team2.fields.find((f) => f.name.includes('Unassigned')).value, /· Delta ᴾ1/);
+  assert.match(team2.fields.find((f) => f.name.includes('CMD')).value, /👑 Echo ᴾ2\n· Foxtrot ᴾ2/);
+
+  // No party, no marker. That includes a lone player carrying a party ID.
+  const everything = JSON.stringify([team1.fields, team2.fields]);
+  assert.match(everything, /· Solo(\\n|")/);
+  assert.match(everything, /· LoneCarrier(\\n|")/);
+  assert.ok(!/ᴾ(77|88|99)/.test(everything), 'the marker must not be the game party number');
+
+  assert.match(meta.description, /ᴾn marks a party member/);
+});
+
+await runTest('buildPlayersEmbeds puts the party marker before a per-player lock', async () => {
+  const plugin = partyPlugin();
+  plugin.services.players.lock('p2', 'SmartAssign');
+
+  const [, team1] = buildPlayersEmbeds(plugin);
+  assert.match(team1.fields.find((f) => f.name.includes('INFANTRY')).value, /· Bravo ᴾ1 🔒SmartAssign/);
+});
+
+await runTest('buildPlayersEmbeds carries no party legend when nobody is in a party', async () => {
+  const [meta, team1] = buildPlayersEmbeds(makePlugin(smallServerFixture()));
+  assert.ok(!meta.description.includes('ᴾ'));
+  assert.ok(!JSON.stringify(team1.fields).includes('ᴾ'));
 });
 
 // ---------------------------------------------------------------------------

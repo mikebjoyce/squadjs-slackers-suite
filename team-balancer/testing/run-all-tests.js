@@ -56,6 +56,7 @@ const SUITES = [
   { file: 'test-tb-elo-scramble.js', desc: 'ELO-weighted scramble, squad atomicity' },
   { file: 'test-elo-diff-scramble.js', desc: 'Elo-diff micro scramble trigger, budget search, scrambleType plumbing' },
   { file: 'test-cross-clan-squad-collision.js', desc: 'cross-clan squad collisions' },
+  { file: 'test-party-groups.js', desc: 'Squad parties merged with clan groups and kept together by the scrambler' },
   { file: 'embed-format-test.js', desc: 'Discord embed chunking' },
   // ~4 minutes: thousands of randomised scrambles looking for cohesion
   // failures. Real coverage, but too slow for a tight edit loop — hence --fast.

@@ -38,6 +38,9 @@
  * - State locking prevents bounce-loops: only one RCON command is
  *   in-flight per player. The base _requestTeamChange handles retries
  *   internally, but the executor manages the queue lifecycle.
+ * - A queued move is dropped, reported as 'JoinedParty', if S³'s row for the
+ *   player shows a Squad party ID when the move comes up to be sent. The
+ *   game put that player with their party and a forced move would split it.
  * - queueMove() accepts (playerKey, playerName, eosID, targetTeamID).
  *   playerKey is typically eosID || steamID and is used internally for
  *   move tracking and duplicate detection.
@@ -167,6 +170,16 @@ export default class SASwapExecutor {
               teamID: moveData.targetTeamID,
               name: player.name
             });
+            playersToRemove.push(playerKey);
+            continue;
+          }
+
+          // LAST-MOMENT PARTY CHECK: a party ID that showed up since the move was
+          // decided means the game put this player with their party, and moving
+          // them now would split it. Read from S³'s row, which carries partyID.
+          if (moveData.eosID && (this._s3?.players?.getPlayer?.(moveData.eosID)?.partyID ?? null) !== null) {
+            Logger.verbose('SmartAssign', 2, `[SwapExecutor] ${moveData.playerName} turned out to be in a Squad party. Move abandoned.`);
+            this.callbacks.onFailed?.({ playerKey, playerName: moveData.playerName, reason: 'JoinedParty' });
             playersToRemove.push(playerKey);
             continue;
           }

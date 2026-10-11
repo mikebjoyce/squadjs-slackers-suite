@@ -122,6 +122,16 @@ When clan tag grouping is enabled on S³, the scrambler keeps players who share 
 
 **Cross-team clans are intentionally not consolidated** — if a clan starts split across teams, each side is treated independently.
 
+### Squad Parties
+
+Players in an in-game Squad party are kept on one team by the scramble, the same way a clan group is. S³ tracks the parties; TeamBalancer needs no option for it, and it works with clan tag grouping on or off.
+
+* **When it matters**: party members usually share a squad, and squads already move as blocks. Party grouping covers the rest: a party spread over two squads, or with a member in no squad.
+* **Merged with clans**: a party that shares a player with a clan group joins that group, and one party can bridge two clans into a single unit. No player is ever in two units.
+* **Only its members**: a unit made of a party alone takes just the party's members out of a second squad. It doesn't pull that whole squad along, even when `clanGroupingPullEntireSquads` is on, because that turns three friends into an 18-player block.
+* **Already split**: a party with members on both teams when the scramble runs is left alone. The scramble doesn't reunite it and doesn't treat either half as a unit.
+* **In the Discord report**: a party unit is named `⚑` plus one member's name and the number of others (`⚑ Mandela +2`), never the in-game party number, which changes whenever another party forms or breaks up.
+
 **In the Discord report**, every unit the scrambler moves is one block, naming each clan tag merged into it, its anchor squad (`⚓`) when the unit spans several in-game squads, and each player's original squad — `◆` for players carrying one of the block's tags, `◇` for the ones pulled along:
 
 ```text
@@ -199,6 +209,7 @@ squad-server/
     ├── test-elo-diff-scramble.js
     ├── test-team-balancer-plugin.js
     ├── test-cross-clan-squad-collision.js
+    ├── test-party-groups.js
     ├── test-readme-accuracy.js
     ├── test-tb-discord-legacy-embeds.js
     ├── embed-format-test.js

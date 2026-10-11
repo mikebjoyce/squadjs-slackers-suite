@@ -38,6 +38,7 @@ import assert from 'node:assert/strict';
 
 import SwitchOutput from '../utils/switch-output.js';
 import SwitchQueue from '../utils/switch-queue.js';
+import SwitchParties from '../utils/switch-parties.js';
 import { buildAssembly, importFromAssembly, cleanAssembly } from '../../s3/testing/plugin-assembly.js';
 
 const ASSEMBLY = buildAssembly('.tmp-switch-post-lockout');
@@ -81,6 +82,7 @@ function buildPlugin({ players, onSend } = {}) {
   // it runs the shipped path rather than throwing on an unregistered method.
   SwitchOutput.register(plugin);
   SwitchQueue.register(plugin);
+  SwitchParties.register(plugin);
 
   Object.assign(plugin, {
     verbose: () => {},
