@@ -292,7 +292,22 @@ await runTest("the requester's own lockdown gets the ordinary, specific message"
   assert.deepStrictEqual(s.warnsTo('Lead'), ['switch.warn.switchScrambleLockActive']);
 });
 
-await runTest('tokens never bar a party: a member with none still moves and stays at zero', async () => {
+await runTest('the requester needs a token: without one the party is refused and not queued', async () => {
+  const s = pairWithRoom();
+  s.wallets.set('Lead', { eosID: 'Lead', tokenBalance: 0, tokenRegenAnchor: new Date() });
+  await s.chat('Lead', '!switch');
+  assert.deepStrictEqual(s.world.commands, []);
+  assert.deepStrictEqual(s.warnsTo('Lead'), ['switch.warn.switchOutSwitchTokens']);
+  assert.strictEqual(s.plugin._getQueueSize(), 0);
+
+  // The same with no room to move: out of tokens means no place in the queue either.
+  const full = pairWithoutRoom();
+  full.wallets.set('Lead', { eosID: 'Lead', tokenBalance: 0, tokenRegenAnchor: new Date() });
+  await full.chat('Lead', '!switch');
+  assert.strictEqual(full.plugin._getQueueSize(), 0);
+});
+
+await runTest("a mate's empty wallet does not bar the party: they still move and stay at zero", async () => {
   const s = pairWithRoom();
   s.wallets.set('Mate', { eosID: 'Mate', tokenBalance: 0, tokenRegenAnchor: new Date() });
   await s.chat('Lead', '!switch');

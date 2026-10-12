@@ -2555,7 +2555,7 @@ S³ must appear **before** consumer plugins:
 | `partyReuniteMaxTeamDiff` | number | `3` | No reunite move when it would leave the party's team ahead by more than this many players. Keep it no looser than the server's own `NumPlayersDiffForTeamChanges` |
 | `partyJoinCheckSeconds` | number | `60` | How long after a join S³ waits before checking its join-time party prediction against whether a party ID showed |
 | `partyFalseAlarmWarnPercent` | number | `30` | Log a warning, at most once an hour, when more than this percentage of joiners who arrived in a squad never showed a party ID |
-| `partyMissWarnPercent` | number | `25` | Log a warning, at most once an hour, when more than this percentage of party joiners arrived squadless and were treated as solo |
+| `partyMissWarnPercent` | number | `40` | Log a warning, at most once an hour, when more than this percentage of party joiners arrived squadless and were treated as solo |
 | `enableDatabaseLogging` | boolean | `true` | Enable `S3_PlayerEvents`/`S3_GameStateEvents`/`S3_PlayerSnapshots` tables. `false` → LoggingService runs no-op. |
 | `enableFileLogging` | boolean | `false` | Mirror each DB log write as a JSONL line at `logPath` |
 | `logPath` | string | `'./s3-log.jsonl'` | JSONL mirror path, used only when `enableFileLogging` is true |

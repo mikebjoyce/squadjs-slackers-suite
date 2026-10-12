@@ -345,7 +345,7 @@ test('the miss warning fires when too many party joiners arrive squadless; a hea
   const noisy = tracker();
   const run = ({ service, tick }, misses) => {
     const rows = [];
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 10; i++) {
       const squadless = i < misses;
       const r = row(`P${i}`, 1, null, squadless ? null : 1);
       service.noteJoin(r, T0);
@@ -354,10 +354,10 @@ test('the miss warning fires when too many party joiners arrive squadless; a hea
     }
     tick(rows, T0 + 60 * SEC);
   };
-  run(quiet, 3);  // 3 of 12 = 25%, not past the limit
-  run(noisy, 4);  // 4 of 12 = 33%
+  run(quiet, 4);  // 4 of 10 = 40%, not past the limit
+  run(noisy, 5);  // 5 of 10 = 50%
   assert.equal(level(quiet.state.logs, 1).length, 0);
-  assert.match(level(noisy.state.logs, 1)[0], /4 of 12 party joiners arrived squadless/);
+  assert.match(level(noisy.state.logs, 1)[0], /5 of 10 party joiners arrived squadless/);
 });
 
 test('the counts cover the last 100 judged joins only', () => {
@@ -899,7 +899,7 @@ try {
     assert.equal(spec.partyReuniteMaxTeamDiff.default, 3);
     assert.equal(spec.partyJoinCheckSeconds.default, 60);
     assert.equal(spec.partyFalseAlarmWarnPercent.default, 30);
-    assert.equal(spec.partyMissWarnPercent.default, 25);
+    assert.equal(spec.partyMissWarnPercent.default, 40);
   });
 
   for (const { name, fn } of tests) {

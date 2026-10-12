@@ -48,11 +48,13 @@
  * - Movers are the party members on the requester's team. A party
  *   already split across teams is reunited by one of its members
  *   asking: the half on the other side is where they are going.
- * - Lockouts are the party's, tokens are not. One member under
- *   scramble lockdown, the post-switch lockout or a closed time window
- *   bars the whole party, or a locked player would get out by partying
- *   with a free friend. Tokens never bar a party: each member who moves
- *   pays one, and a member with none still moves and stays at zero.
+ * - Lockouts are the party's. One member under scramble lockdown, the
+ *   post-switch lockout or a closed time window bars the whole party,
+ *   or a locked player would get out by partying with a free friend.
+ * - Tokens are the requester's to have. The player who types !switch
+ *   needs a token, as they would alone, and is refused without one.
+ *   Every member who moves then pays one; a mate with none still moves
+ *   and stays at zero, since they did not ask and cannot be left behind.
  * - The refusal for another member's lockout names nobody.
  * - A queue entry is cancelled, not repaired, when the party behind it
  *   changes. Re-checking a changed group (new size, new lockouts) is
@@ -152,11 +154,17 @@ const SwitchParties = {
       const ordered = [...movers].sort((a, b) => (b.eosID === eosID) - (a.eosID === eosID));
       for (const mover of ordered) {
         const eligibility = await plugin._checkSwitchEligibility(mover);
-        // 'cooldown' means out of tokens. That never stops a party.
-        if (eligibility.eligible || eligibility.reason === 'cooldown') continue;
+        // 'cooldown' means out of tokens. The player asking has to have one,
+        // exactly as they would alone. A mate who has none comes along anyway:
+        // they did not ask, and leaving them behind would split the party.
+        if (eligibility.eligible || (eligibility.reason === 'cooldown' && mover.eosID !== eosID)) continue;
 
         if (mover.eosID !== eosID) {
           plugin.warn(eosID, plugin.localize('switch.warn.partyMemberLockedOut'));
+        } else if (eligibility.reason === 'cooldown') {
+          plugin.warn(eosID, plugin.options.maxSwitchTokens > 1
+            ? plugin.localize('switch.warn.switchOutSwitchTokens', { remaining: eligibility.remaining })
+            : plugin.localize('switch.warn.switchCooldownAvailableM', { remaining: eligibility.remaining }));
         } else if (eligibility.reason === 'recent_switch') {
           plugin.warn(eosID, plugin.localize('switch.warn.switchJustSwitchedWait', { remaining: eligibility.remaining }));
         } else if (eligibility.reason === 'scramble_lock') {

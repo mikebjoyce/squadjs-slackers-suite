@@ -141,6 +141,7 @@ const CFG = {
   queueTimeoutExtraSlots:            rawConfig.queueTimeoutExtraSlots ?? 2,
   doubleSwitchEnabledMinutes:        rawConfig.doubleSwitchEnabledMinutes ?? 10,
   maxUnbalancedSlots:                rawConfig.maxUnbalancedSlots ?? 1,
+  maxPartySwitchSize:                rawConfig.maxPartySwitchSize ?? 3,
   scrambleLockdownDurationMinutes:   rawConfig.scrambleLockdownDurationMinutes ?? 30,
   scrambleLockdownMinPlayers:        rawConfig.scrambleLockdownMinPlayers ?? 60,
   liberalSwitchGameModes:            rawConfig.liberalSwitchGameModes ?? ['Seed', 'Jensen'],
@@ -539,6 +540,7 @@ function generate() {
   tips.push(`**4. Check before you act.** **\`!switch check\`** tells you exactly what is blocking you: time window, tokens, scramble lock, or balance. This helps you make an informed decision.`);
   tips.push(`**5. Squads and clans stay together.** The scrambler preserves squads and clan groups. Even if a scramble fires, your group will not be split up.`);
   tips.push(`**6. The system has your back.** Even when things go wrong (a scramble fails to move you, or you reconnect to the wrong team), your restrictions are cleared and you may receive bonus tokens so you can fix it yourself. You are never permanently stranded.`);
+  tips.push(`**7. A party switches together.** If you are in a Squad party, one **\`!switch\`** moves every party member on your team (parties of up to **${CFG.maxPartySwitchSize}**). Whoever types it needs a token, and nobody in the party can be under a lockout. If your party gets split across teams, the players on the wrong side type **\`!switch\`** to rejoin.`);
 
   for (const tip of tips) {
     lines.push(tip);
@@ -566,6 +568,7 @@ function generate() {
     lines.push(`| \`switchEnabledMinutes\` | ${CFG.switchEnabledMinutes} | Time window (minutes) after join/match start to request a switch |`);
     lines.push(`| \`queueTimeoutMinutes\` | ${CFG.queueTimeoutMinutes} | Minutes a player can wait in the switch queue before removal |`);
     lines.push(`| \`maxUnbalancedSlots\` | ${CFG.maxUnbalancedSlots} | Max player difference between teams to allow a switch |`);
+    lines.push(`| \`maxPartySwitchSize\` | ${CFG.maxPartySwitchSize} | Largest Squad party \`!switch\` will move together |`);
     lines.push(`| \`scrambleLockdownDurationMinutes\` | ${CFG.scrambleLockdownDurationMinutes} | Duration to block switching after a scramble |`);
     lines.push(`| \`scrambleLockdownMinPlayers\` | ${CFG.scrambleLockdownMinPlayers} | Minimum total players to apply scramble lockdown |`);
     lines.push(``);

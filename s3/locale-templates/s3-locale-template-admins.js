@@ -1,6 +1,6 @@
 /**
  * ─────────────────────────────────────────────────────────────────
- *  ADMIN-FACING TRANSLATION TEMPLATE — 1362 strings
+ *  ADMIN-FACING TRANSLATION TEMPLATE — 1363 strings
  * ─────────────────────────────────────────────────────────────────
  *
  *  GENERATED FILE — do not edit in place.
@@ -39,7 +39,7 @@
  *
  *  Strings only your staff can reach: replies to admin-gated commands, the
  *  scramble and diagnostic reports in your staff channel, and the admin half
- *  of !elo. 1362 strings — the bulk of what an admin reads day to day,
+ *  of !elo. 1363 strings — the bulk of what an admin reads day to day,
  *  but read by a handful of people who opted into running the thing, so a
  *  missed one costs far less than a missed broadcast.
  *
@@ -1898,6 +1898,8 @@ export const MESSAGES = {
       '5SquadsClansStay': '',
       // EN: **6. The system has your back.** Even when things go wrong (a scramble fails to move you, or you reconnect to the wrong team), your restrictions are cleared and you may receive bonus tokens so you can fix it yourself. You are never permanently stranded.
       '6SystemHasBack': '',
+      // EN: **7. A party switches together.** If you are in a Squad party, one **`!switch`** moves every party member on your team (parties of up to **{maxPartySwitchSize}**). Whoever types it needs a token, and nobody in the party can be under a lockout. If your party gets split across teams, the players on the wrong side type **`!switch`** to rejoin.
+      '7PartySwitchesTogether': '',
       // EN: Tips for Playing With Friends
       tipsPlayingWithFriends: '',
       // EN: The system is designed to help you end up on the same team as your friends. Here is how to make the most of it.

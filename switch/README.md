@@ -206,7 +206,7 @@ What that changes for players:
 
 * Parties of up to `maxPartySwitchSize` (default 3) can switch. A larger party is refused and told to leave the party to switch alone.
 * One member under scramble lockdown, the post-switch lockout or a closed switch window blocks the whole party. The refusal doesn't name them.
-* Tokens never block a party. Each member who moves pays one token, and a member with none still moves and stays at zero.
+* The player who types `!switch` needs a token, the same as when switching alone. Each member who moves then pays one. A party mate with no tokens still moves, and stays at zero.
 * The balance check asks whether the whole group fits. If it doesn't, the party queues as one entry, and any member typing `!switch` again is told its position. A party waits until there's room for all of it; solo players queued behind it can still be served.
 * A party already split across teams is put back together by one of its members asking: only the members on the requester's team move.
 * If a party changes while it's queued (someone joins, leaves or disconnects), its request is cancelled and the members are asked to type `!switch` again. A solo player who joins a party while queued is cancelled the same way.

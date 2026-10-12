@@ -2098,7 +2098,7 @@ export default class PlayersService {
           this.parent.services.clans.addPlayerToCache(joined.eosID, joined.name);
         }
 
-        this.verboseLogger(1, `[Players] JOIN emitted: ${playerName} (eosID=${joined.eosID}, teamID=${joined.teamID}, source=${source})`);
+        this.verboseLogger(1, `[Players] JOIN emitted: ${playerName} (eosID=${joined.eosID}, teamID=${joined.teamID}, source=${source}, joinPrediction=${joined.joinPrediction})`);
       }
 
       return {

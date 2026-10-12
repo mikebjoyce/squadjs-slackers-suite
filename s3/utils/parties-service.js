@@ -62,7 +62,7 @@
 const DEFAULT_JOIN_CHECK_MS = 60000;
 const DEFAULT_STATS_WINDOW = 100;
 const DEFAULT_FALSE_ALARM_WARN_SHARE = 0.3;
-const DEFAULT_MISS_WARN_SHARE = 0.25;
+const DEFAULT_MISS_WARN_SHARE = 0.4;
 const DEFAULT_REUNITE_WINDOW_MS = 90000;
 const DEFAULT_REUNITE_MAX_TEAM_DIFF = 3;
 // A share over a handful of joins swings on one player. Below this many

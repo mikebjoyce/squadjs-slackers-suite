@@ -748,7 +748,7 @@ export default class SmartAssign extends S3PluginBase {
       // blocked reconnect to remediate.
       const partySignal = this._partyJoinSignal(player);
       if (partySignal) {
-        Logger.verbose('SmartAssign', 2, `[SmartAssign] ${player.name} left on Team ${player.teamID}: joining with a Squad party (${partySignal}).`);
+        Logger.verbose('SmartAssign', 1, `[SmartAssign] ${player.name} left on Team ${player.teamID}: joining with a Squad party (${partySignal}).`);
         return;
       }
 

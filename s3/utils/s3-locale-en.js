@@ -1107,6 +1107,7 @@ export const MESSAGES = {
       "4CheckBeforeAct": "**4. Check before you act.** **`'!switch check'`** tells you exactly what is blocking you: time window, tokens, scramble lock, or balance. This helps you make an informed decision.",
       "5SquadsClansStay": "**5. Squads and clans stay together.** The scrambler preserves squads and clan groups. Even if a scramble fires, your group will not be split up.",
       "6SystemHasBack": "**6. The system has your back.** Even when things go wrong (a scramble fails to move you, or you reconnect to the wrong team), your restrictions are cleared and you may receive bonus tokens so you can fix it yourself. You are never permanently stranded.",
+      "7PartySwitchesTogether": "**7. A party switches together.** If you are in a Squad party, one **`!switch`** moves every party member on your team (parties of up to **{maxPartySwitchSize}**). Whoever types it needs a token, and nobody in the party can be under a lockout. If your party gets split across teams, the players on the wrong side type **`!switch`** to rejoin.",
       "tipsPlayingWithFriends": "Tips for Playing With Friends",
       "systemDesignedHelpEnd": "The system is designed to help you end up on the same team as your friends. Here is how to make the most of it.",
       "bestPractices": "Best Practices",

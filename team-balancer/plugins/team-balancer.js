@@ -3221,12 +3221,18 @@ export default class TeamBalancer extends S3PluginBase {
           const built = buildScrambleGroups({ clanGroups, parties, players: playersForParties });
           clanGroups = built.groups;
           membersOnlyTags = built.membersOnlyTags;
+          // Level 1, and it names the units: a scramble is rare, and this line is
+          // how a log shows afterwards which parties the plan was told to keep whole.
+          const partyUnits = [...built.membersOnlyTags];
           Logger.verbose(
             'TeamBalancer',
-            2,
+            1,
             `[TeamBalancer] Party grouping: ${built.partyCount} party(ies) kept together` +
+            (partyUnits.length ? ` (${partyUnits.join(', ')}` + (built.partyCount > partyUnits.length ? `, ${built.partyCount - partyUnits.length} merged into a clan group)` : ')') : '') +
             (built.splitPartyCount ? `, ${built.splitPartyCount} already split across teams left alone.` : '.')
           );
+        } else {
+          Logger.verbose('TeamBalancer', 1, '[TeamBalancer] Party grouping: no Squad parties on the server.');
         }
       } catch (err) {
         Logger.verbose('TeamBalancer', 1, `[TeamBalancer] Party grouping failed, scrambling without it: ${err.message}`);

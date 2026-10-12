@@ -295,7 +295,7 @@ current number.
 | `partyReuniteMaxTeamDiff` | no | number | `3` | A player is not moved to their party when that would leave the party's team ahead by more than this many players. Keep it no looser than the server's own `NumPlayersDiffForTeamChanges` |
 | `partyJoinCheckSeconds` | no | number | `60` | How long after a join S³ waits before checking its join-time party prediction against whether a party ID showed |
 | `partyFalseAlarmWarnPercent` | no | number | `30` | Log a warning, at most once an hour, when more than this percentage of joiners who arrived in a squad never showed a party ID |
-| `partyMissWarnPercent` | no | number | `25` | Log a warning, at most once an hour, when more than this percentage of party joiners arrived squadless and were treated as solo |
+| `partyMissWarnPercent` | no | number | `40` | Log a warning, at most once an hour, when more than this percentage of party joiners arrived squadless and were treated as solo |
 | `enableDatabaseLogging` | no | boolean | `true` | Enable shared S³ logging tables (S3_PlayerEvents, S3_GameStateEvents, S3_PlayerSnapshots). When false, LoggingService runs in no-op mode. |
 | `enableFileLogging` | no | boolean | `false` | Enable JSONL file mirror for S³ logging events. Each DB write is also appended as a self-contained JSONL line to the logPath file. |
 | `logPath` | no | string | `"./s3-log.jsonl"` | Path to JSONL file for S³ event mirror. Only used when enableFileLogging is true. |

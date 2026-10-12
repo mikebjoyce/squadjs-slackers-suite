@@ -368,7 +368,7 @@ export default class SlackersSquadServices extends BasePlugin {
         required: false,
         type: 'number',
         description: 'Log a warning, at most once an hour, when more than this percentage of party joiners arrived squadless and were treated as solo.',
-        default: 25
+        default: 40
       },
       enableDatabaseLogging: {
         required: false,

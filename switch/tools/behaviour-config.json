@@ -22,6 +22,7 @@
   "queueTimeoutMinutes":                  15,
   "doubleSwitchEnabledMinutes":           10,
   "maxUnbalancedSlots":                   1,
+  "maxPartySwitchSize":                   3,
   "scrambleLockdownDurationMinutes":      30,
   "scrambleLockdownMinPlayers":           60,
 

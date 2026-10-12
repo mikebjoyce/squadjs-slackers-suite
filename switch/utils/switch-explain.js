@@ -52,6 +52,9 @@
  * ═══════════════════════════════════════════════════════════════
  */
 
+// Discord's cap on one embed field value.
+const EMBED_FIELD_VALUE_MAX = 1024;
+
 const SwitchExplain = {
   /**
    * Attaches _buildExplainMessages() to the plugin instance.
@@ -595,13 +598,34 @@ function _buildTipsEmbed(plugin) {
 
   tips.push(plugin.localize('switch.explain.6SystemHasBack'));
 
+  tips.push(plugin.localize('switch.explain.7PartySwitchesTogether', { maxPartySwitchSize: plugin.options.maxPartySwitchSize }));
+
+  // Discord rejects the whole message when one field value passes 1024
+  // characters, and the tips together run past that. They are packed into as
+  // many fields as they need: the first carries the heading, the rest a
+  // zero-width name, because Discord refuses an empty one.
+  const values = [];
+  let current = '';
+  for (const tip of tips) {
+    const joined = current ? `${current}\n\n${tip}` : tip;
+    if (current && joined.length > EMBED_FIELD_VALUE_MAX) {
+      values.push(current);
+      current = tip;
+    } else {
+      current = joined;
+    }
+  }
+  if (current) values.push(current);
+
   return {
     title: plugin.localize('switch.explain.tipsPlayingWithFriends'),
     description: plugin.localize('switch.explain.systemDesignedHelpEnd'),
     color: 0x1ABC9C,
-    fields: [
-      { name: plugin.localize('switch.explain.bestPractices'), value: tips.join('\n\n'), inline: false }
-    ]
+    fields: values.map((value, index) => ({
+      name: index === 0 ? plugin.localize('switch.explain.bestPractices') : '\u200b',
+      value,
+      inline: false
+    }))
   };
 }
 

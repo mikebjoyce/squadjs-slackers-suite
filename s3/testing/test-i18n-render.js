@@ -664,6 +664,33 @@ describe('i18n render — Switch explain embeds', () => {
     const plugin = makeExplainPlugin({ _isSeedBonusEnabled: () => false });
     assertFullyLocalized('explain/noSeedBonus', plugin._buildExplainMessages());
   });
+
+  test('every explain embed fits Discord\'s size limits', () => {
+    // Discord rejects a whole message when any one part is over its cap, and
+    // the channel post stops at the first rejected embed. A new tip pushed
+    // the tips field past 1024 this way, so each variant is measured.
+    const variants = {
+      tokens: makeExplainPlugin({ options: { maxPartySwitchSize: 3 } }),
+      flatCooldown: makeExplainPlugin({ options: { maxSwitchTokens: 0, switchCooldownMinutes: 15, maxPartySwitchSize: 3 } }),
+      noSeedBonus: makeExplainPlugin({ _isSeedBonusEnabled: () => false, options: { maxPartySwitchSize: 3 } })
+    };
+    for (const [label, plugin] of Object.entries(variants)) {
+      for (const embed of plugin._buildExplainMessages()) {
+        const where = `explain/${label} "${embed.title}"`;
+        const fields = embed.fields || [];
+        assert.ok((embed.title || '').length <= 256, `${where}: title over 256`);
+        assert.ok((embed.description || '').length <= 4096, `${where}: description over 4096`);
+        assert.ok(fields.length <= 25, `${where}: more than 25 fields`);
+        let total = (embed.title || '').length + (embed.description || '').length;
+        for (const field of fields) {
+          assert.ok(field.name.length >= 1 && field.name.length <= 256, `${where}: field name must be 1 to 256 characters`);
+          assert.ok(field.value.length >= 1 && field.value.length <= 1024, `${where}: field "${field.name}" value is ${field.value.length} characters, cap 1024`);
+          total += field.name.length + field.value.length;
+        }
+        assert.ok(total <= 6000, `${where}: embed totals ${total} characters, cap 6000`);
+      }
+    }
+  });
 });
 
 // ── Team Balancer embeds ─────────────────────────────────────────

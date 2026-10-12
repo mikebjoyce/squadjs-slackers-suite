@@ -182,6 +182,8 @@ The system is designed to help you end up on the same team as your friends. Here
 
 **6. The system has your back.** Even when things go wrong (a scramble fails to move you, or you reconnect to the wrong team), your restrictions are cleared and you may receive bonus tokens so you can fix it yourself. You are never permanently stranded.
 
+**7. A party switches together.** If you are in a Squad party, one **`!switch`** moves every party member on your team (parties of up to **3**). Whoever types it needs a token, and nobody in the party can be under a lockout. If your party gets split across teams, the players on the wrong side type **`!switch`** to rejoin.
+
 ---
 
 ## Configuration Values
@@ -198,6 +200,7 @@ The following table lists every configuration option with the value used to gene
 | `switchEnabledMinutes` | 10 | Time window (minutes) after join/match start to request a switch |
 | `queueTimeoutMinutes` | 15 | Minutes a player can wait in the switch queue before removal |
 | `maxUnbalancedSlots` | 1 | Max player difference between teams to allow a switch |
+| `maxPartySwitchSize` | 3 | Largest Squad party `!switch` will move together |
 | `scrambleLockdownDurationMinutes` | 30 | Duration to block switching after a scramble |
 | `scrambleLockdownMinPlayers` | 60 | Minimum total players to apply scramble lockdown |
 
